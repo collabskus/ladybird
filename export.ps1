@@ -7,11 +7,12 @@
 #
 # 2. Writes Documentation/llm/dump.NNN.txt — full source dump in 25 MB chunks
 #
-# 3. Syncs with upstream and force-pushes to mine:
+# 3. Commits our files, syncs with upstream, force-pushes to mine:
+#      - commit our changes first
 #      - fetch origin/master
-#      - hard-reset local master to origin/master  (upstream always wins)
-#      - restore our files on top (they were never in upstream, so no conflicts)
-#      - commit + force-push to mine
+#      - merge origin/master into our branch using -s ours
+#        (this fast-forwards the history pointer but keeps ALL our file content)
+#      - force-push to mine
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -173,6 +174,7 @@ Write-Host "Writing context chunks (LLM-optimised, ≤20 MB each)..."
 
 $ctxIndex = 1
 $ctxBytes = [long]0
+$ctxTotal = 0
 
 function New-CtxPath([int]$idx) { Join-Path $outputDir ("context.{0:D3}.txt" -f $idx) }
 function Open-CtxChunk([int]$idx) {
@@ -198,6 +200,7 @@ function Write-Ctx([string]$line) {
     $script:ctxBytes += $lb
 }
 
+# Header
 Write-Ctx ("=" * 80)
 Write-Ctx "LADYBIRD BROWSER — LLM CONTEXT DUMP"
 Write-Ctx "Generated  : $timestamp"
@@ -206,6 +209,8 @@ Write-Ctx "Purpose    : Build-system, dependencies, CI/CD, and project structure
 Write-Ctx "             context for an LLM. Test fixtures excluded."
 Write-Ctx ("=" * 80)
 Write-Ctx ""
+
+# Build hints
 Write-Ctx ("=" * 80)
 Write-Ctx "BUILD SYSTEM OVERVIEW"
 Write-Ctx ("=" * 80)
@@ -251,6 +256,7 @@ vcpkg binary cache: https://vcpkg-cache.app.ladybird.org/
 "@
 Write-Ctx ""
 
+# File tree
 Write-Ctx ("=" * 80)
 Write-Ctx "FULL FILE TREE  (* = content included below)"
 Write-Ctx ("=" * 80)
@@ -269,6 +275,7 @@ Write-Ctx ""
 Write-Ctx ("Total: {0} files, {1:N0} bytes  |  * files have content below" -f $fileCount, $totalSize)
 Write-Ctx ""
 
+# File contents
 Write-Ctx ("=" * 80)
 Write-Ctx "RELEVANT FILE CONTENTS"
 Write-Ctx ("=" * 80)
@@ -398,45 +405,45 @@ $totalDumpChunks = $dChunkIndex
 Write-Host ("Full dump written: {0} chunk(s)" -f $totalDumpChunks)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 3: Git — sync with upstream, commit our files, force-push to mine
+# SECTION 3: Git — commit our files, sync with upstream, force-push to mine
 #
-# Strategy (replaces the problematic rebase loop):
-#   1. Fetch origin/master
-#   2. Hard-reset local master to origin/master  ← upstream always wins
-#   3. Our files (export.ps1, Documentation/llm/**, .github/workflows/**)
-#      are brand-new files that never existed in upstream, so they survive
-#      the hard-reset untouched on disk (git reset --hard only resets tracked
-#      files; our new files are untracked at this point)
-#   4. Stage + commit our files on top of the fresh upstream HEAD
-#   5. Force-push to mine
+# Strategy:
+#   1. Stage + commit our files
+#   2. Fetch origin/master
+#   3. If origin/master is already an ancestor of HEAD (i.e. we're already
+#      ahead of or at upstream), nothing extra needed.
+#      Otherwise: merge origin/master with -s ours — this records upstream
+#      as merged into our history WITHOUT changing any file on disk.
+#      Our files are untouched. No conflicts possible. No loop.
+#   4. Force-push to mine with --force-with-lease
 # ─────────────────────────────────────────────────────────────────────────────
 Push-Location $repoRoot
 try {
 
-    # Build the list of our files
+    # Collect all our owned paths
     $ourFiles = [System.Collections.Generic.List[string]]@("export.ps1")
     for ($i = 1; $i -le $totalCtxChunks;  $i++) { $ourFiles.Add("Documentation/llm/context.{0:D3}.txt" -f $i) }
     for ($i = 1; $i -le $totalDumpChunks; $i++) { $ourFiles.Add("Documentation/llm/dump.{0:D3}.txt"    -f $i) }
 
-    # Also include any workflow files we own that are already tracked
-    $trackedWorkflows = & git ls-files -- ".github/workflows/" 2>$null | Where-Object {
-        $_ -match "collabskus"
+    # Also pick up ALL workflow files we own (tracked or untracked)
+    # — tracked ones already in git
+    $trackedWorkflows = Invoke-GitSafe @("ls-files", "--", ".github/workflows/")
+    if ($trackedWorkflows.ExitCode -eq 0 -and $trackedWorkflows.Output) {
+        foreach ($f in $trackedWorkflows.Output) {
+            $fn = $f.Trim()
+            if ($fn -and -not $ourFiles.Contains($fn)) { $ourFiles.Add($fn) }
+        }
     }
-    if ($trackedWorkflows) { foreach ($f in $trackedWorkflows) { $ourFiles.Add($f) } }
+    # — untracked workflow files (newly added)
+    $untrackedWorkflows = & git ls-files --others --exclude-standard -- ".github/workflows/" 2>$null
+    if ($untrackedWorkflows) {
+        foreach ($f in $untrackedWorkflows) {
+            $fn = $f.Trim()
+            if ($fn -and -not $ourFiles.Contains($fn)) { $ourFiles.Add($fn) }
+        }
+    }
 
-    # ── Step 1: Fetch upstream ────────────────────────────────────────────────
-    Write-Host ""
-    Write-Host "Fetching from origin..."
-    Invoke-Git @("fetch", "origin")
-
-    # ── Step 2: Hard-reset to upstream ───────────────────────────────────────
-    # This moves master to exactly origin/master.
-    # Our files are NOT tracked by upstream so they stay on disk untouched.
-    Write-Host "Resetting local master to origin/master (upstream wins)..."
-    Invoke-Git @("reset", "--hard", "origin/master")
-    Write-Host "Reset complete. Now at: $((Invoke-Git @('rev-parse','--short','HEAD')).Trim())"
-
-    # ── Step 3: Stage our files ───────────────────────────────────────────────
+    # ── Stage all our files ───────────────────────────────────────────────────
     Write-Host ""
     Write-Host "Staging our files..."
     foreach ($f in $ourFiles) {
@@ -447,22 +454,45 @@ try {
         }
     }
 
-    # ── Step 4: Commit ────────────────────────────────────────────────────────
+    # ── Commit if anything staged ─────────────────────────────────────────────
     $status = & git status --porcelain 2>&1
     if ($status) {
         Write-Host ""
-        Write-Host "Committing our files..."
+        Write-Host "Committing..."
         Invoke-Git @("commit", "-m", "chore: update dump and export tooling [$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')]")
         Write-Host "Committed."
     } else {
-        Write-Host "Nothing to commit — our files match what is already in history."
+        Write-Host "Nothing new to commit."
     }
 
-    # ── Step 5: Force-push to mine ────────────────────────────────────────────
+    # ── Fetch upstream ────────────────────────────────────────────────────────
+    Write-Host ""
+    Write-Host "Fetching from origin..."
+    Invoke-Git @("fetch", "origin")
+
+    # ── Sync with upstream using -s ours (no file changes, no conflicts) ──────
+    # Check if origin/master is already an ancestor of our HEAD.
+    # If yes, we're already ahead — nothing to merge.
+    # If no, merge it in with -s ours so it becomes part of our history
+    # without touching a single file on disk.
+    Write-Host "Syncing with origin/master..."
+    $mergeBase = Invoke-GitSafe @("merge-base", "--is-ancestor", "origin/master", "HEAD")
+    if ($mergeBase.ExitCode -eq 0) {
+        Write-Host "Already up to date with origin/master."
+    } else {
+        Write-Host "Merging origin/master into history (keeping our files)..."
+        # -s ours: our tree wins entirely — upstream commits recorded as merged,
+        # zero file changes, zero conflicts, instant.
+        Invoke-Git @("merge", "-s", "ours", "--no-edit",
+                     "-m", "chore: merge upstream origin/master [$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')]",
+                     "origin/master")
+        Write-Host "Merge complete."
+    }
+
+    # ── Force-push to mine ────────────────────────────────────────────────────
     Write-Host ""
     Write-Host "Force-pushing to 'mine' (--force-with-lease)..."
-    # Fetch mine first so --force-with-lease has fresh tracking data
-    Invoke-GitSafe @("fetch", "mine") | Out-Null
+    Invoke-GitSafe @("fetch", "mine") | Out-Null   # refresh tracking so lease check works
     Invoke-Git @("push", "--force-with-lease", "mine", "master")
     Write-Host "Push complete."
 
