@@ -9,6 +9,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/HashMap.h>
 #include <AK/RefPtr.h>
 #include <AK/StdLibExtras.h>
 #include <AK/TypeCasts.h>
@@ -36,6 +37,7 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMouseEvent>
+#include <QPlatformSurfaceEvent>
 #include <QPropertyAnimation>
 #include <QPushButton>
 #include <QScreen>
@@ -52,6 +54,29 @@ namespace Ladybird {
 
 static constexpr auto AUDIO_STATE_BUTTON_POSITION = QTabBar::LeftSide;
 static constexpr auto TAB_CLOSE_BUTTON_POSITION = QTabBar::RightSide;
+
+static bool should_use_screen_signal_for_dpi_changes()
+{
+#if QT_VERSION >= QT_VERSION_CHECK(6, 6, 0)
+    return QGuiApplication::platformName() != "wayland";
+#else
+    return true;
+#endif
+}
+
+static Optional<u64> display_id_for_screen(QScreen* screen)
+{
+    if (!screen)
+        return {};
+
+    // Qt does not expose a portable physical display identifier. The compositor only
+    // needs a stable per-process grouping key for Qt-backed windows.
+    static u64 next_display_id = 1;
+    static HashMap<QScreen*, u64> display_ids;
+    return display_ids.ensure(screen, [] {
+        return next_display_id++;
+    });
+}
 
 static QString reopen_recently_closed_action_text(Optional<WebView::RecentlyClosedEntry const&> entry)
 {
@@ -205,28 +230,16 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
     // Listen for DPI changes
     m_device_pixel_ratio = devicePixelRatio();
     m_current_screen = screen();
-    m_refresh_rate = m_current_screen->refreshRate();
+    m_display_id = display_id_for_screen(m_current_screen);
+    if (m_current_screen)
+        m_refresh_rate = m_current_screen->refreshRate();
 
-    if (QT_VERSION < QT_VERSION_CHECK(6, 6, 0) || QGuiApplication::platformName() != "wayland") {
+    if (should_use_screen_signal_for_dpi_changes()) {
         setAttribute(Qt::WA_NativeWindow);
         setAttribute(Qt::WA_DontCreateNativeAncestors);
-        QObject::connect(m_current_screen, &QScreen::logicalDotsPerInchChanged, this, &BrowserWindow::device_pixel_ratio_changed);
-        QObject::connect(m_current_screen, &QScreen::refreshRateChanged, this, &BrowserWindow::refresh_rate_changed);
-        QObject::connect(windowHandle(), &QWindow::screenChanged, this, [this](QScreen* screen) {
-            if (m_device_pixel_ratio != devicePixelRatio())
-                device_pixel_ratio_changed(devicePixelRatio());
-
-            if (m_refresh_rate != screen->refreshRate())
-                refresh_rate_changed(screen->refreshRate());
-
-            // Listen for logicalDotsPerInchChanged and refreshRateChanged signals on new screen
-            QObject::disconnect(m_current_screen, &QScreen::logicalDotsPerInchChanged, nullptr, nullptr);
-            QObject::disconnect(m_current_screen, &QScreen::refreshRateChanged, nullptr, nullptr);
-            m_current_screen = screen;
-            QObject::connect(m_current_screen, &QScreen::logicalDotsPerInchChanged, this, &BrowserWindow::device_pixel_ratio_changed);
-            QObject::connect(m_current_screen, &QScreen::refreshRateChanged, this, &BrowserWindow::refresh_rate_changed);
-        });
     }
+    connect_screen_signals(m_current_screen);
+    connect_window_screen_changed_signal();
 
     m_hamburger_menu = new QMenu(this);
 
@@ -586,7 +599,7 @@ void BrowserWindow::adopt_tab(Tab& tab, int index)
     tab_title_changed(index, tab.title());
 
     tab.view().set_device_pixel_ratio(m_device_pixel_ratio);
-    tab.view().set_maximum_frames_per_second(m_refresh_rate);
+    tab.view().set_display_metadata(m_display_id, m_refresh_rate);
 
     m_tabs_container->set_current_tab(&tab);
 }
@@ -715,11 +728,80 @@ void BrowserWindow::device_pixel_ratio_changed(qreal dpi)
     });
 }
 
+bool BrowserWindow::connect_window_screen_changed_signal()
+{
+    auto* window = windowHandle();
+    if (!window)
+        return false;
+    if (m_window_screen_changed_signal_window == window)
+        return true;
+
+    disconnect_window_screen_changed_signal();
+
+    m_window_screen_changed_signal_window = window;
+    QObject::connect(window, &QWindow::screenChanged, this, [this](QScreen* screen) {
+        screen_changed(screen);
+    });
+    screen_changed(window->screen());
+    return true;
+}
+
+void BrowserWindow::disconnect_window_screen_changed_signal()
+{
+    if (!m_window_screen_changed_signal_window)
+        return;
+
+    QObject::disconnect(m_window_screen_changed_signal_window, &QWindow::screenChanged, this, nullptr);
+    m_window_screen_changed_signal_window = nullptr;
+}
+
+void BrowserWindow::connect_screen_signals(QScreen* screen)
+{
+    if (!screen)
+        return;
+
+    if (should_use_screen_signal_for_dpi_changes())
+        QObject::connect(screen, &QScreen::logicalDotsPerInchChanged, this, &BrowserWindow::device_pixel_ratio_changed);
+    QObject::connect(screen, &QScreen::refreshRateChanged, this, &BrowserWindow::refresh_rate_changed);
+}
+
+void BrowserWindow::disconnect_screen_signals(QScreen* screen)
+{
+    if (!screen)
+        return;
+
+    QObject::disconnect(screen, &QScreen::logicalDotsPerInchChanged, this, &BrowserWindow::device_pixel_ratio_changed);
+    QObject::disconnect(screen, &QScreen::refreshRateChanged, this, &BrowserWindow::refresh_rate_changed);
+}
+
+void BrowserWindow::screen_changed(QScreen* screen)
+{
+    if (m_current_screen != screen) {
+        disconnect_screen_signals(m_current_screen);
+        m_current_screen = screen;
+        connect_screen_signals(m_current_screen);
+    }
+
+    if (m_device_pixel_ratio != devicePixelRatio())
+        device_pixel_ratio_changed(devicePixelRatio());
+
+    auto display_id = display_id_for_screen(m_current_screen);
+    auto refresh_rate = m_current_screen ? m_current_screen->refreshRate() : m_refresh_rate;
+    if (m_display_id != display_id || m_refresh_rate != refresh_rate)
+        display_metadata_changed(display_id, refresh_rate);
+}
+
 void BrowserWindow::refresh_rate_changed(qreal refresh_rate)
 {
+    display_metadata_changed(m_display_id, refresh_rate);
+}
+
+void BrowserWindow::display_metadata_changed(Optional<u64> display_id, qreal refresh_rate)
+{
+    m_display_id = display_id;
     m_refresh_rate = refresh_rate;
     for_each_tab([this](auto& tab) {
-        tab.view().set_maximum_frames_per_second(m_refresh_rate);
+        tab.view().set_display_metadata(m_display_id, m_refresh_rate);
     });
 }
 
@@ -976,6 +1058,17 @@ bool BrowserWindow::event(QEvent* event)
             device_pixel_ratio_changed(devicePixelRatio());
     }
 #endif
+    if (event->type() == QEvent::WinIdChange)
+        connect_window_screen_changed_signal();
+    if (event->type() == QEvent::PlatformSurface) {
+        auto* platform_surface_event = static_cast<QPlatformSurfaceEvent*>(event);
+        if (platform_surface_event->surfaceEventType() == QPlatformSurfaceEvent::SurfaceCreated)
+            connect_window_screen_changed_signal();
+        else if (platform_surface_event->surfaceEventType() == QPlatformSurfaceEvent::SurfaceAboutToBeDestroyed)
+            disconnect_window_screen_changed_signal();
+    }
+    if (event->type() == QEvent::ScreenChangeInternal)
+        screen_changed(screen());
 
     if (event->type() == QEvent::WindowActivate)
         Application::the().set_active_window(*this);

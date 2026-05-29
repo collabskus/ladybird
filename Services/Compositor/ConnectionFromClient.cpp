@@ -74,6 +74,11 @@ void ConnectionFromClient::viewport_size_updated(Web::Compositor::CompositorCont
     m_compositor_state->viewport_size_updated(context_id, viewport_size, window_resize_in_progress);
 }
 
+void ConnectionFromClient::set_display_metadata(Web::Compositor::CompositorContextId context_id, Optional<u64> display_id, double refresh_rate)
+{
+    m_compositor_state->set_display_metadata(context_id, display_id, refresh_rate);
+}
+
 Messages::CompositorControlServer::HandleMouseEventResponse ConnectionFromClient::handle_mouse_event(Web::Compositor::CompositorContextId context_id, Web::MouseEvent event)
 {
     return m_compositor_state->handle_mouse_event(context_id, event);
@@ -86,15 +91,7 @@ Messages::CompositorControlServer::DispatchMouseEventToWebContentResponse Connec
 
 Messages::CompositorControlServer::AsyncScrollByResponse ConnectionFromClient::async_scroll_by(Web::Compositor::CompositorContextId context_id, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_device_pixels)
 {
-    auto handled = m_compositor_state->async_scroll_by(context_id, position, delta_in_device_pixels);
-    if (handled) {
-        deferred_invoke([this, context_id] {
-            if (!is_open())
-                return;
-            m_compositor_state->present_deferred_async_scroll_frame(context_id);
-        });
-    }
-    return handled;
+    return m_compositor_state->async_scroll_by(context_id, position, delta_in_device_pixels);
 }
 
 void ConnectionFromClient::presented_bitmap_ready_to_paint(Web::Compositor::CompositorContextId context_id, i32 bitmap_id)
