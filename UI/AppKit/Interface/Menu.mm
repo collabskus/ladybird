@@ -187,6 +187,27 @@ private:
     __weak id m_control { nil };
 };
 
+class MenuObserver final : public WebView::Menu::Observer {
+public:
+    static NonnullOwnPtr<MenuObserver> create(NSMenuItem* item)
+    {
+        return adopt_own(*new MenuObserver(item));
+    }
+
+    virtual void on_visible_state_changed(WebView::Menu& menu) override
+    {
+        [m_item setHidden:!menu.visible()];
+    }
+
+private:
+    explicit MenuObserver(NSMenuItem* item)
+        : m_item(item)
+    {
+    }
+
+    __weak NSMenuItem* m_item { nil };
+};
+
 static void initialize_native_icon(WebView::Action& action, id control)
 {
     static constexpr CGFloat const MENU_ICON_SIZE = 16;
@@ -357,30 +378,33 @@ static void initialize_native_control(WebView::Action& action, id control)
     action.add_observer(move(observer));
 }
 
-static void add_items_to_menu(NSMenu* menu, Span<WebView::Menu::MenuItem> menu_items)
+static void initialize_native_menu(WebView::Menu& menu, NSMenuItem* item)
 {
-    for (auto& menu_item : menu_items) {
+    auto observer = MenuObserver::create(item);
+
+    auto* guard = [[DeallocGuard alloc] init:[menu = menu.make_weak_ptr(), observer = observer.ptr()]() {
+        if (menu)
+            menu->remove_observer(*observer);
+    }];
+
+    static char guard_key = 0;
+    objc_setAssociatedObject(item, &guard_key, guard, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    menu.add_observer(move(observer));
+}
+
+static void add_items_to_menu(NSMenu* nsmenu, WebView::Menu& menu)
+{
+    for (auto& menu_item : menu.items()) {
         menu_item.visit(
             [&](NonnullRefPtr<WebView::Action>& action) {
-                [menu addItem:create_application_menu_item(action)];
+                [nsmenu addItem:create_application_menu_item(action)];
             },
             [&](NonnullRefPtr<WebView::Menu> const& submenu) {
-                auto* application_submenu = [[NSMenu alloc] init];
-                set_properties(application_submenu, *submenu);
-                add_items_to_menu(application_submenu, submenu->items());
-
-                auto* item = [[NSMenuItem alloc] initWithTitle:string_to_ns_string(submenu->title())
-                                                        action:nil
-                                                 keyEquivalent:@""];
-                [item setSubmenu:application_submenu];
-
-                if (submenu->render_group_icon())
-                    set_control_image(item, @"folder");
-
-                [menu addItem:item];
+                [nsmenu addItem:create_application_menu_item(*submenu)];
             },
             [&](WebView::Separator) {
-                [menu addItem:[NSMenuItem separatorItem]];
+                [nsmenu addItem:[NSMenuItem separatorItem]];
             });
     }
 }
@@ -389,14 +413,14 @@ NSMenu* create_application_menu(WebView::Menu& menu)
 {
     auto* application_menu = [[NSMenu alloc] initWithTitle:string_to_ns_string(menu.title())];
     set_properties(application_menu, menu);
-    add_items_to_menu(application_menu, menu.items());
+    add_items_to_menu(application_menu, menu);
     return application_menu;
 }
 
 void repopulate_application_menu(NSMenu* menu, WebView::Menu& source)
 {
     [menu removeAllItems];
-    add_items_to_menu(menu, source.items());
+    add_items_to_menu(menu, source);
 }
 
 NSMenu* create_context_menu(LadybirdWebView* view, WebView::Menu& menu)
@@ -424,6 +448,20 @@ NSMenuItem* create_application_menu_item(WebView::Action& action)
     auto* item = [[NSMenuItem alloc] init];
     initialize_native_control(action, item);
     set_properties(item, action);
+    return item;
+}
+
+NSMenuItem* create_application_menu_item(WebView::Menu& menu)
+{
+    auto* item = [[NSMenuItem alloc] initWithTitle:string_to_ns_string(menu.title())
+                                            action:nil
+                                     keyEquivalent:@""];
+    [item setSubmenu:create_application_menu(menu)];
+    initialize_native_menu(menu, item);
+
+    if (menu.render_group_icon())
+        set_control_image(item, @"folder");
+
     return item;
 }
 

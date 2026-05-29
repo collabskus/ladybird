@@ -101,6 +101,7 @@ enum class ActionID {
     DumpWasmStats,
     ShowLineBoxBorders,
     CollectGarbage,
+    CrashCurrentPage,
     SpoofUserAgent,
     NavigatorCompatibilityMode,
     EnableScripting,
@@ -224,6 +225,9 @@ public:
     void set_render_group_icon(bool render_group_icon) { m_render_group_icon = render_group_icon; }
     bool render_group_icon() const { return m_render_group_icon; }
 
+    bool visible() const { return m_visible; }
+    void set_visible(bool);
+
     template<typename Callback>
     void for_each_action(Callback const& callback)
     {
@@ -234,6 +238,15 @@ public:
                 [&](Separator) {});
         }
     }
+
+    struct Observer {
+        virtual ~Observer() = default;
+
+        virtual void on_visible_state_changed(Menu&) { }
+    };
+
+    void add_observer(NonnullOwnPtr<Observer>);
+    void remove_observer(Observer const& observer);
 
     Function<void(Gfx::IntPoint)> on_activation;
 
@@ -247,9 +260,11 @@ private:
     Vector<MenuItem> m_items;
 
     HashMap<StringView, String> m_properties;
+    Vector<NonnullOwnPtr<Observer>, 1> m_observers;
 
     bool m_is_group { false };
     bool m_render_group_icon { false };
+    bool m_visible { true };
 };
 
 }

@@ -88,6 +88,14 @@ struct ApplicationSettingsObserver final : public SettingsObserver {
                 Application::request_server_client().async_set_dns_server(dns_over_udp.server_address, dns_over_udp.port, false, dns_over_udp.validate_dnssec_locally);
             });
     }
+
+    virtual void config_variable_changed(ConfigVariableID variable) override
+    {
+        if (variable == ConfigVariableID::ShowAdvancedDebugMenu) {
+            auto enabled = Application::settings().config_variable_as_bool(ConfigVariableID::ShowAdvancedDebugMenu);
+            Application::the().debug_menu().set_visible(enabled);
+        }
+    }
 };
 
 struct ApplicationBookmarkStoreObserver final : public BookmarkStoreObserver {
@@ -1478,6 +1486,7 @@ void Application::initialize_actions()
     m_inspect_menu->add_action(*m_toggle_devtools_action);
 
     m_debug_menu = Menu::create("Debug"sv);
+    m_debug_menu->set_visible(m_settings.config_variable_as_bool(ConfigVariableID::ShowAdvancedDebugMenu));
     m_debug_menu->add_action(Action::create("Dump Session History Tree"sv, ActionID::DumpSessionHistoryTree, debug_request("dump-session-history"sv)));
     m_debug_menu->add_action(Action::create("Dump DOM Tree"sv, ActionID::DumpDOMTree, debug_request("dump-dom-tree"sv)));
     m_debug_menu->add_action(Action::create("Dump Layout Tree"sv, ActionID::DumpLayoutTree, debug_request("dump-layout-tree"sv)));
@@ -1509,6 +1518,7 @@ void Application::initialize_actions()
     m_debug_menu->add_separator();
 
     m_debug_menu->add_action(Action::create("Collect Garbage"sv, ActionID::CollectGarbage, debug_request("collect-garbage"sv)));
+    m_debug_menu->add_action(Action::create("Crash Current Page"sv, ActionID::CrashCurrentPage, debug_request("crash-current-page"sv)));
     m_debug_menu->add_separator();
 
     auto spoof_user_agent_menu = Menu::create_group("Spoof User Agent"sv);
@@ -1839,6 +1849,24 @@ void Application::clear_inspected_dom_node(DevTools::TabDescription const& descr
 {
     if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
         view->clear_inspected_dom_node();
+}
+
+void Application::start_node_picker(DevTools::TabDescription const& description, OnNodePickerEvent on_node_picker_event) const
+{
+    if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
+        view->start_node_picker(move(on_node_picker_event));
+}
+
+void Application::stop_node_picker(DevTools::TabDescription const& description) const
+{
+    if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
+        view->stop_node_picker();
+}
+
+void Application::clear_node_picker(DevTools::TabDescription const& description) const
+{
+    if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
+        view->clear_node_picker();
 }
 
 void Application::highlight_dom_node(DevTools::TabDescription const& description, Web::UniqueNodeID node_id, Optional<Web::CSS::PseudoElement> pseudo_element) const

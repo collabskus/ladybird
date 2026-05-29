@@ -449,6 +449,13 @@ void ConnectionFromClient::debug_request(u64 page_id, ByteString request, ByteSt
         return;
     }
 
+    if (request == "crash-current-page") {
+        Core::deferred_invoke([] {
+            VERIFY_NOT_REACHED();
+        });
+        return;
+    }
+
     if (request == "set-line-box-borders") {
         bool state = argument == "on";
         auto traversable = page->page().top_level_traversable();
@@ -1113,6 +1120,17 @@ void ConnectionFromClient::get_hovered_node_id(u64 page_id)
     }
 
     async_did_get_hovered_node_id(page_id, node_id);
+}
+
+void ConnectionFromClient::get_node_id_at_position(u64 page_id, u64 request_id, Web::DevicePixelPoint position)
+{
+    auto page = this->page(page_id);
+    if (!page.has_value()) {
+        async_did_get_node_id_at_position(page_id, request_id, 0);
+        return;
+    }
+
+    async_did_get_node_id_at_position(page_id, request_id, page->page().node_id_at_position(position));
 }
 
 void ConnectionFromClient::list_style_sheets(u64 page_id)
