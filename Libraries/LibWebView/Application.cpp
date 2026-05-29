@@ -28,6 +28,7 @@
 #include <LibWebView/Application.h>
 #include <LibWebView/CompositorClient.h>
 #include <LibWebView/CookieJar.h>
+#include <LibWebView/HSTSStore.h>
 #include <LibWebView/HeadlessWebView.h>
 #include <LibWebView/HelperProcess.h>
 #include <LibWebView/HistoryStore.h>
@@ -710,12 +711,14 @@ ErrorOr<void> Application::launch_services()
 
         m_cookie_jar = TRY(CookieJar::create(*m_database));
         m_history_store = TRY(HistoryStore::create(*m_history_database));
+        m_hsts_store = TRY(HSTSStore::create(*m_database));
         m_storage_jar = TRY(StorageJar::create(*m_database));
     } else {
         dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] SQL history is disabled, disabling browsing history");
 
         m_cookie_jar = CookieJar::create();
         m_history_store = HistoryStore::create_disabled();
+        m_hsts_store = HSTSStore::create();
         m_storage_jar = StorageJar::create();
     }
 
@@ -1200,6 +1203,7 @@ void Application::clear_browsing_data(ClearBrowsingDataOptions const& options)
     if (options.delete_site_data == ClearBrowsingDataOptions::Delete::Yes) {
         m_cookie_jar->expire_cookies_accessed_since(options.since);
         m_storage_jar->remove_items_accessed_since(options.since);
+        m_hsts_store->remove_policies_observed_since(options.since);
     }
 
     if (did_change_history)
