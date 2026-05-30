@@ -334,6 +334,7 @@ set(SOURCES
     DOM/AnchorNameMap.cpp
     DOM/Attr.cpp
     DOM/CDATASection.cpp
+    DOM/CaretPosition.cpp
     DOM/CharacterData.cpp
     DOM/Comment.cpp
     DOM/CustomEvent.cpp
@@ -782,6 +783,7 @@ set(SOURCES
     Layout/NavigableContainerViewport.cpp
     Layout/Node.cpp
     Layout/RadioButton.cpp
+    Layout/RangeInputBox.cpp
     Layout/ReplacedBox.cpp
     Layout/ReplacedWithChildrenFormattingContext.cpp
     Layout/SVGBox.cpp
@@ -868,6 +870,7 @@ set(SOURCES
     Painting/DisplayListResourceStorage.cpp
     Painting/FieldSetPaintable.cpp
     Painting/GradientPainting.cpp
+    Painting/HitTestDisplayList.cpp
     Painting/ImagePaintable.cpp
     Painting/MarkerPaintable.cpp
     Painting/NavigableContainerViewportPaintable.cpp
