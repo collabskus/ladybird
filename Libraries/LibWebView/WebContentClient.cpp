@@ -46,16 +46,11 @@ static Optional<String> history_title(Utf16String const& title, URL::URL const& 
     return title_utf8;
 }
 
-WebContentClient::WebContentClient(NonnullOwnPtr<IPC::Transport> transport, ViewImplementation& view)
+WebContentClient::WebContentClient(NonnullOwnPtr<IPC::Transport> transport, u64 initial_page_id)
     : IPC::ConnectionToServer<WebContentClientEndpoint, WebContentServerEndpoint>(*this, move(transport))
+    , m_initial_page_id(initial_page_id)
 {
-    s_clients.set(this);
-    m_views.set(0, view);
-}
-
-WebContentClient::WebContentClient(NonnullOwnPtr<IPC::Transport> transport)
-    : IPC::ConnectionToServer<WebContentClientEndpoint, WebContentServerEndpoint>(*this, move(transport))
-{
+    VERIFY(m_initial_page_id > 0);
     s_clients.set(this);
 }
 
@@ -84,21 +79,24 @@ void WebContentClient::die()
 
 Web::Compositor::CompositorContextId WebContentClient::compositor_context_id_for_page(u64 page_id)
 {
-    if (auto context_id = m_page_compositor_context_ids.get(page_id); context_id.has_value())
-        return *context_id;
+    auto context_id = Web::Compositor::compositor_context_id_for_page(page_id);
+    if (auto registered_page_id = m_compositor_contexts.get(context_id); registered_page_id.has_value()) {
+        VERIFY(registered_page_id->has_value());
+        VERIFY(**registered_page_id == page_id);
+        return context_id;
+    }
 
-    auto context_id = Web::Compositor::allocate_compositor_context_id();
-    VERIFY(!Web::Compositor::is_page_presenting_compositor_context_id(context_id));
-    remember_compositor_context(context_id, page_id, Web::Compositor::PagePresentationRegistration::Yes);
-    Application::the().register_compositor_context(*this, context_id, page_id, Web::Compositor::PagePresentationRegistration::Yes);
+    remember_compositor_context(context_id, page_id);
+    Application::the().register_compositor_context(*this, context_id, page_id);
     return context_id;
 }
 
 Optional<u64> WebContentClient::page_id_for_compositor_context_id(Web::Compositor::CompositorContextId context_id) const
 {
-    if (auto page_id = m_page_ids_for_compositor_context_ids.get(context_id); page_id.has_value())
-        return *page_id;
-    return {};
+    auto page_id = m_compositor_contexts.get(context_id);
+    if (!page_id.has_value())
+        return {};
+    return *page_id;
 }
 
 Messages::WebContentClient::AllocateCompositorContextIdResponse WebContentClient::allocate_compositor_context_id(u64 page_id, Web::Compositor::PagePresentationRegistration page_presentation_registration)
@@ -106,10 +104,9 @@ Messages::WebContentClient::AllocateCompositorContextIdResponse WebContentClient
     if (page_presentation_registration == Web::Compositor::PagePresentationRegistration::Yes)
         return compositor_context_id_for_page(page_id);
 
-    auto context_id = Web::Compositor::allocate_compositor_context_id();
-    VERIFY(!Web::Compositor::is_page_presenting_compositor_context_id(context_id));
-    remember_compositor_context(context_id, {}, page_presentation_registration);
-    Application::the().register_compositor_context(*this, context_id, {}, page_presentation_registration);
+    auto context_id = Application::the().allocate_compositor_context_id();
+    remember_compositor_context(context_id, {});
+    Application::the().register_compositor_context(*this, context_id, {});
     return context_id;
 }
 
@@ -122,28 +119,19 @@ bool WebContentClient::forget_compositor_context(Web::Compositor::CompositorCont
 {
     if (!m_compositor_contexts.remove(context_id))
         return false;
-    if (auto page_id = m_page_ids_for_compositor_context_ids.take(context_id); page_id.has_value())
-        m_page_compositor_context_ids.remove(*page_id);
     return true;
 }
 
-void WebContentClient::remember_compositor_context(Web::Compositor::CompositorContextId context_id, Optional<u64> page_id, Web::Compositor::PagePresentationRegistration page_presentation_registration)
+void WebContentClient::remember_compositor_context(Web::Compositor::CompositorContextId context_id, Optional<u64> page_id)
 {
-    m_compositor_contexts.set(context_id, CompositorContextRegistration {
-                                              .page_id = page_id,
-                                              .page_presentation_registration = page_presentation_registration,
-                                          });
-
-    if (page_id.has_value()) {
-        m_page_compositor_context_ids.set(*page_id, context_id);
-        m_page_ids_for_compositor_context_ids.set(context_id, *page_id);
-    }
+    m_compositor_contexts.set(context_id, page_id);
 }
 
 void WebContentClient::assign_view(Badge<Application>, ViewImplementation& view)
 {
     VERIFY(m_views.is_empty());
-    m_views.set(0, view);
+    view.m_client_state.page_index = m_initial_page_id;
+    m_views.set(m_initial_page_id, view);
 }
 
 void WebContentClient::set_compositor_connection_id(Badge<Application>, i32 compositor_connection_id)
@@ -157,14 +145,14 @@ void WebContentClient::register_view(u64 page_id, ViewImplementation& view)
     if (m_detached_page_close_timer)
         m_detached_page_close_timer->stop();
     Application::process_manager().cancel_forced_exit(pid());
+    view.m_client_state.page_index = page_id;
     m_views.set(page_id, view);
     m_history_recorded_urls_for_current_load.remove(page_id);
 }
 
 void WebContentClient::unregister_view(u64 page_id)
 {
-    if (auto context_id = m_page_compositor_context_ids.get(page_id); context_id.has_value())
-        forget_compositor_context(*context_id);
+    forget_compositor_context(Web::Compositor::compositor_context_id_for_page(page_id));
 
     // A page that still needs a beforeunload check is not a detached
     // background close. It is being closed without waiting for WebContent,
@@ -226,8 +214,6 @@ void WebContentClient::web_ui_disconnected(Badge<WebUI>)
 void WebContentClient::destroy_all_compositor_contexts()
 {
     m_compositor_contexts.clear();
-    m_page_compositor_context_ids.clear();
-    m_page_ids_for_compositor_context_ids.clear();
 }
 
 ErrorOr<void> WebContentClient::reconnect_to_compositor_process(Badge<Application>)
@@ -245,8 +231,8 @@ ErrorOr<void> WebContentClient::recreate_compositor_contexts(Badge<Application>)
     if (!is_open())
         return {};
 
-    for (auto const& [context_id, registration] : m_compositor_contexts)
-        TRY(Application::the().try_register_compositor_context(*this, context_id, registration.page_id, registration.page_presentation_registration));
+    for (auto const& [context_id, page_id] : m_compositor_contexts)
+        TRY(Application::the().try_register_compositor_context(*this, context_id, page_id));
 
     return {};
 }
@@ -257,10 +243,10 @@ void WebContentClient::update_compositor_viewports_after_reconnect(Badge<Applica
         return;
 
     for (auto const& [page_id, view] : m_views) {
-        auto context_id = m_page_compositor_context_ids.get(page_id);
-        if (!context_id.has_value())
+        auto context_id = Web::Compositor::compositor_context_id_for_page(page_id);
+        if (!m_compositor_contexts.contains(context_id))
             continue;
-        Application::the().update_compositor_viewport(*context_id, view->viewport_size().to_type<int>());
+        Application::the().update_compositor_viewport(context_id, view->viewport_size().to_type<int>());
     }
 }
 
@@ -320,25 +306,20 @@ bool WebContentClient::handle_mouse_event_in_compositor(u64 page_id, Web::MouseE
 
 void WebContentClient::dispatch_mouse_event_to_web_content(u64 page_id, Web::MouseEvent const& event)
 {
-    auto context_id = m_page_compositor_context_ids.get(page_id);
-    if (context_id.has_value() && Application::the().dispatch_mouse_event_to_web_content(*context_id, event))
+    auto context_id = compositor_context_id_for_page(page_id);
+    if (Application::the().dispatch_mouse_event_to_web_content(context_id, event))
         return;
-    if (!context_id.has_value()) {
-        auto new_context_id = compositor_context_id_for_page(page_id);
-        if (Application::the().dispatch_mouse_event_to_web_content(new_context_id, event))
-            return;
-    }
 
     async_mouse_event(page_id, event.clone_without_browser_data());
 }
 
 void WebContentClient::notify_presented_bitmap_ready_to_paint(u64 page_id, i32 bitmap_id)
 {
-    auto context_id = m_page_compositor_context_ids.get(page_id);
-    if (!context_id.has_value())
+    auto context_id = Web::Compositor::compositor_context_id_for_page(page_id);
+    if (!m_compositor_contexts.contains(context_id))
         return;
 
-    Application::the().notify_compositor_presented_bitmap_ready_to_paint(*context_id, bitmap_id);
+    Application::the().notify_compositor_presented_bitmap_ready_to_paint(context_id, bitmap_id);
 }
 
 void WebContentClient::did_present_bitmap(u64 page_id, Gfx::IntRect rect, i32 bitmap_id)
@@ -405,7 +386,7 @@ void WebContentClient::did_start_loading(u64 page_id, URL::URL url, bool is_redi
 void WebContentClient::did_finish_loading(u64 page_id, URL::URL url)
 {
     if (url.scheme() == "about"sv && url.paths().size() == 1) {
-        if (auto web_ui = WebUI::create(*this, url.paths().first()); web_ui.is_error())
+        if (auto web_ui = WebUI::create(*this, page_id, url.paths().first()); web_ui.is_error())
             warnln("Could not create WebUI for {}: {}", url, web_ui.error());
         else
             m_web_ui = web_ui.release_value();
@@ -1016,14 +997,16 @@ void WebContentClient::did_post_broadcast_channel_message(u64, Web::HTML::Broadc
     WorkerProcessManager::the().broadcast_channel_message_from_web_content(message);
 }
 
-Messages::WebContentClient::DidRequestNewWebViewResponse WebContentClient::did_request_new_web_view(u64 page_id, Web::HTML::ActivateTab activate_tab, Web::HTML::WebViewHints hints, Optional<u64> page_index)
+Messages::WebContentClient::DidRequestNewWebViewResponse WebContentClient::did_request_new_web_view(u64 page_id, Web::HTML::ActivateTab activate_tab, Web::HTML::WebViewHints hints)
 {
+    auto new_page_id = Application::the().allocate_page_id();
+    String handle;
     if (auto view = view_for_page_id(page_id); view.has_value()) {
         if (view->on_new_web_view)
-            return view->on_new_web_view(activate_tab, hints, page_index);
+            handle = view->on_new_web_view(activate_tab, hints, new_page_id);
     }
 
-    return String {};
+    return { new_page_id, move(handle) };
 }
 
 void WebContentClient::did_request_activate_tab(u64 page_id)
