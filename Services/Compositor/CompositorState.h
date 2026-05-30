@@ -12,11 +12,9 @@
 #include <AK/Optional.h>
 #include <AK/OwnPtr.h>
 #include <AK/RefCounted.h>
-#include <AK/Vector.h>
-#include <Compositor/BackingStoreManager.h>
+#include <Compositor/ContextState.h>
 #include <Compositor/VSyncScheduler.h>
 #include <LibCore/Forward.h>
-#include <LibGfx/PaintingSurface.h>
 #include <LibGfx/Point.h>
 #include <LibGfx/Rect.h>
 #include <LibGfx/ShareableBitmap.h>
@@ -24,14 +22,11 @@
 #include <LibGfx/Size.h>
 #include <LibGfx/SkiaBackendContext.h>
 #include <LibMedia/Forward.h>
-#include <LibWeb/Compositor/AsyncScrollTree.h>
-#include <LibWeb/Compositor/AsyncScrollingState.h>
 #include <LibWeb/Compositor/Types.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/Painting/AccumulatedVisualContext.h>
 #include <LibWeb/Painting/DisplayList.h>
 #include <LibWeb/Painting/DisplayListPlayerSkia.h>
-#include <LibWeb/Painting/DisplayListResourceStorage.h>
 #include <LibWeb/Painting/ScrollState.h>
 
 namespace Web {
@@ -100,63 +95,6 @@ public:
 private:
     CompositorState(RefPtr<Gfx::SkiaBackendContext>, bool async_scrolling_enabled);
 
-    struct ViewportScrollbarDrag {
-        size_t scrollbar_index { 0 };
-        float primary_position { 0 };
-        float thumb_grab_position { 0 };
-    };
-
-    struct ContextState {
-        ~ContextState();
-
-        struct PublishedSurface {
-            Web::Compositor::CompositorContextId parent_context_id;
-            Web::Painting::CompositorSurfaceId surface_id;
-        };
-
-        CompositorStateWebContentClient* web_content_client { nullptr };
-        Optional<u64> page_id;
-
-        Web::Compositor::PresentationMode presentation_mode { Empty {} };
-        Optional<PublishedSurface> published_surface;
-        HashMap<Web::Painting::CompositorSurfaceId, Web::Compositor::CompositorContextId> child_contexts_by_surface_id;
-
-        RefPtr<Web::Painting::DisplayList const> display_list;
-        Optional<Web::Painting::AccumulatedVisualContextTree> visual_context_tree;
-        Web::Painting::DisplayListResourceStorage display_list_resource_storage;
-        Web::Painting::ScrollStateSnapshot scroll_state_snapshot;
-        BackingStoreManager backing_store_manager;
-
-        Web::Compositor::AsyncScrollTree async_scroll_tree;
-        Vector<Web::Compositor::ViewportScrollbar> viewport_scrollbars;
-        Optional<size_t> hovered_viewport_scrollbar_index;
-        Optional<size_t> captured_viewport_scrollbar_index;
-        float viewport_scrollbar_thumb_grab_position { 0 };
-
-        Vector<Web::Compositor::AsyncScrollOffset> pending_async_scroll_offsets;
-        Vector<Web::Compositor::AsyncScrollOperationID> completed_async_scroll_operation_ids;
-        Web::Compositor::AsyncScrollOperationID next_async_scroll_operation_id { 0 };
-        Gfx::IntRect async_scrolling_viewport_rect;
-        bool has_async_scrolling_state { false };
-        bool can_accept_async_wheel_events { false };
-        u64 wheel_event_listener_state_generation { 0 };
-        Web::Compositor::WheelRoutingAdmission wheel_routing_admission { Web::Compositor::WheelRoutingAdmission::NoAsyncScrollingState };
-
-        Gfx::IntSize viewport_size;
-        Web::Compositor::WindowResizingInProgress window_resize_in_progress { Web::Compositor::WindowResizingInProgress::No };
-        RefPtr<Core::Timer> backing_store_shrink_timer;
-        Optional<u64> display_id;
-        double display_refresh_rate { 60.0 };
-
-        Optional<Gfx::IntRect> pending_present_frame;
-        bool pending_present_frame_scheduled { false };
-        Optional<Gfx::IntRect> presented_frame;
-        Optional<i32> gpu_present_bitmap_id_awaiting_completion;
-        Optional<i32> presented_bitmap_id_awaiting_ack;
-
-        void stop_backing_store_shrink_timer();
-    };
-
     struct PendingAsyncPresent {
         PendingAsyncPresent(Web::Compositor::CompositorContextId context_id, Gfx::IntRect viewport_rect, i32 bitmap_id)
             : context_id(context_id)
@@ -175,23 +113,15 @@ private:
     ContextState const* context_if_present(Web::Compositor::CompositorContextId) const;
     void detach_from_parent_surface(Web::Compositor::CompositorContextId, ContextState&);
     void remove_child_surface(ContextState&, Web::Compositor::CompositorContextId parent_context_id, Web::Painting::CompositorSurfaceId);
-    void install_display_list_update(ContextState&, NonnullRefPtr<Web::Painting::DisplayList>, Web::Painting::AccumulatedVisualContextTree, Web::Painting::ScrollStateSnapshot&&);
-    Optional<Gfx::FloatPoint> viewport_scroll_offset_from(ContextState&, Vector<Web::Compositor::AsyncScrollOffset> const&) const;
-    Optional<Gfx::FloatPoint> reapply_pending_async_scroll_offsets(ContextState&, Vector<Web::Compositor::AsyncScrollOffset> const&);
-    void store_pending_async_scroll_offsets(ContextState&, Vector<Web::Compositor::AsyncScrollOffset> const&, Optional<Web::Compositor::AsyncScrollOperationID> = {});
-    Optional<size_t> hit_test_viewport_scrollbar(ContextState&, Gfx::FloatPoint position) const;
-    Optional<ViewportScrollbarDrag> begin_viewport_scrollbar_drag(ContextState&, Gfx::FloatPoint position);
-    Optional<ViewportScrollbarDrag> captured_viewport_scrollbar_drag(ContextState&, Gfx::FloatPoint position);
-    Optional<ViewportScrollbarDrag> release_captured_viewport_scrollbar_drag(ContextState&, Gfx::FloatPoint position);
-    void set_hovered_viewport_scrollbar(Web::Compositor::CompositorContextId, ContextState&, Optional<size_t>);
-    bool apply_viewport_scrollbar_drag(Web::Compositor::CompositorContextId, ContextState&, size_t scrollbar_index, float primary_position, float thumb_grab_position);
-    void present_viewport_scrollbar_overlay(Web::Compositor::CompositorContextId, ContextState&);
-    bool paint_viewport_scrollbar_overlay(ContextState&, Gfx::PaintingSurface&);
     void schedule_backing_store_shrink(Web::Compositor::CompositorContextId, ContextState&);
     void shrink_backing_stores_after_resize(Web::Compositor::CompositorContextId);
     void resize_backing_stores_if_needed(Web::Compositor::CompositorContextId, ContextState&);
     void present_current_frame(Web::Compositor::CompositorContextId, ContextState&);
     void publish_to_parent_surface(ContextState&, Web::Compositor::PublishToCompositorSurface const&);
+    bool apply_context_update_result(
+        Web::Compositor::CompositorContextId,
+        ContextState&,
+        ContextState::ContextUpdateResult const&);
     void present_frame(Web::Compositor::CompositorContextId, ContextState&, Gfx::IntRect);
     void schedule_present_frame(Web::Compositor::CompositorContextId, ContextState&, Gfx::IntRect);
     void schedule_pending_present_frame_on_vsync(Web::Compositor::CompositorContextId, ContextState&);
