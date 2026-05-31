@@ -75,17 +75,6 @@ GC::Ref<OffscreenCanvas> OffscreenCanvasRenderingContext2D::canvas()
     return m_canvas;
 }
 
-OffscreenCanvas& OffscreenCanvasRenderingContext2D::canvas_element()
-{
-    return *m_canvas;
-}
-
-OffscreenCanvas const& OffscreenCanvasRenderingContext2D::canvas_element() const
-{
-
-    return *m_canvas;
-}
-
 void OffscreenCanvasRenderingContext2D::fill_rect(float, float, float, float)
 {
     dbgln("(STUBBED) OffscreenCanvasRenderingContext2D::fill_rect()");
@@ -295,16 +284,14 @@ void OffscreenCanvasRenderingContext2D::set_shadow_color(String color)
     // 1. Let context be this's canvas attribute's value, if that is an element; otherwise null.
 
     // 2. Let parsedValue be the result of parsing the given value with context if non-null.
-    auto style_value = parse_css_value(CSS::Parser::ParsingParams { CSS::Parser::SpecialContext::CanvasContextGenericValue }, color, CSS::PropertyID::Color);
-    if (style_value && style_value->has_color()) {
-        auto parsedValue = style_value->to_color({}).value_or(Color::Black);
+    auto parsed_value = parse_a_css_color_value(color);
 
-        // 4. Set this's shadow color to parsedValue.
-        drawing_state().shadow_color = parsedValue;
-    } else {
-        // 3. If parsedValue is failure, then return.
+    // 3. If parsedValue is failure, then return.
+    if (!parsed_value.has_value())
         return;
-    }
+
+    // 4. Set this's shadow color to parsedValue.
+    drawing_state().shadow_color = parsed_value.value();
 }
 
 float OffscreenCanvasRenderingContext2D::global_alpha() const

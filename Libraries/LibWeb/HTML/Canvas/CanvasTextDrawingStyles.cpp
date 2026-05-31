@@ -16,7 +16,6 @@
 #include <LibWeb/CSS/StyleValues/PercentageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ShorthandStyleValue.h>
 #include <LibWeb/DOM/Document.h>
-#include <LibWeb/HTML/Canvas/CanvasState.h>
 #include <LibWeb/HTML/CanvasRenderingContext2D.h>
 #include <LibWeb/HTML/OffscreenCanvas.h>
 #include <LibWeb/HTML/OffscreenCanvasRenderingContext2D.h>
@@ -25,21 +24,21 @@
 
 namespace Web::HTML {
 
-template<typename IncludingClass, typename CanvasType>
-ByteString CanvasTextDrawingStyles<IncludingClass, CanvasType>::font() const
+template<typename CanvasType>
+ByteString CanvasTextDrawingStyles<CanvasType>::font() const
 {
     // When font style value is empty return default string
-    if (!my_drawing_state().font_style_value) {
+    if (!drawing_state().font_style_value) {
         return "10px sans-serif";
     }
 
     // On getting, the font attribute must return the serialized form of the current font of the context (with no 'line-height' component).
-    return my_drawing_state().font_style_value->to_string(CSS::SerializationMode::ResolvedValue).to_byte_string();
+    return drawing_state().font_style_value->to_string(CSS::SerializationMode::ResolvedValue).to_byte_string();
 }
 
 // https://html.spec.whatwg.org/multipage/canvas.html#font-style-source-object
-template<typename IncludingClass, typename CanvasType>
-Variant<DOM::Document*, HTML::WorkerGlobalScope*> CanvasTextDrawingStyles<IncludingClass, CanvasType>::get_font_source_for_font_style_source_object(CanvasType& font_style_source_object)
+template<typename CanvasType>
+Variant<DOM::Document*, HTML::WorkerGlobalScope*> CanvasTextDrawingStyles<CanvasType>::get_font_source_for_font_style_source_object(CanvasType& font_style_source_object)
 {
     // Font resolution for the font style source object requires a font source. This is determined for a given object implementing CanvasTextDrawingStyles by the following steps: [CSSFONTLOAD]
 
@@ -65,8 +64,8 @@ Variant<DOM::Document*, HTML::WorkerGlobalScope*> CanvasTextDrawingStyles<Includ
         return &(as<HTML::WorkerGlobalScope>(global_object));
     };
 }
-template<typename IncludingClass, typename CanvasType>
-void CanvasTextDrawingStyles<IncludingClass, CanvasType>::set_font(StringView font)
+template<typename CanvasType>
+void CanvasTextDrawingStyles<CanvasType>::set_font(StringView font)
 {
     // The font IDL attribute, on setting, must be parsed as a CSS <'font'> value (but without supporting property-independent style sheet syntax like 'inherit'),
     // and the resulting font must be assigned to the context, with the 'line-height' component forced to 'normal', with the 'font-size' component converted to CSS pixels,
@@ -88,7 +87,7 @@ void CanvasTextDrawingStyles<IncludingClass, CanvasType>::set_font(StringView fo
 
     // Load font with font style value properties
     auto const& font_style_value = font_style_value_result->as_shorthand();
-    auto& canvas_element = static_cast<IncludingClass&>(*this).canvas_element();
+    auto& canvas_element = *this->canvas_element().template get<GC::Ref<CanvasType>>();
 
     auto computed_math_depth = CSS::InitialValues::math_depth();
 
@@ -121,7 +120,7 @@ void CanvasTextDrawingStyles<IncludingClass, CanvasType>::set_font(StringView fo
     //     a keyword value
     auto const& computed_font_variant = font_style_value.longhand(CSS::PropertyID::FontVariant).release_nonnull();
 
-    my_drawing_state().font_style_value = CSS::ShorthandStyleValue::create(
+    drawing_state().font_style_value = CSS::ShorthandStyleValue::create(
         CSS::PropertyID::Font,
         {
             // Set explicitly https://drafts.csswg.org/css-fonts/#set-explicitly
@@ -188,35 +187,43 @@ void CanvasTextDrawingStyles<IncludingClass, CanvasType>::set_font(StringView fo
     if (!font_list)
         return;
 
-    my_drawing_state().current_font_cascade_list = font_list;
+    drawing_state().current_font_cascade_list = font_list;
 }
 
 // https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-letterspacing
-template<typename IncludingClass, typename CanvasType>
-String CanvasTextDrawingStyles<IncludingClass, CanvasType>::letter_spacing() const
+template<typename CanvasType>
+String CanvasTextDrawingStyles<CanvasType>::letter_spacing() const
 {
     // The letterSpacing getter steps are to return the serialized form of this's letter spacing.
     StringBuilder builder;
-    my_drawing_state().letter_spacing.serialize(builder);
+    drawing_state().letter_spacing->serialize(builder, CSS::SerializationMode::Normal);
     return MUST(builder.to_string());
 }
 
 // https://html.spec.whatwg.org/multipage/canvas.html#dom-context-2d-letterspacing
-template<typename IncludingClass, typename CanvasType>
-void CanvasTextDrawingStyles<IncludingClass, CanvasType>::set_letter_spacing(StringView letter_spacing)
+template<typename CanvasType>
+void CanvasTextDrawingStyles<CanvasType>::set_letter_spacing(StringView letter_spacing)
 {
     // 1. Let parsed be the result of parsing the given value as a CSS <length>.
     auto parsed = parse_css_type(CSS::Parser::ParsingParams { CSS::Parser::SpecialContext::CanvasContextGenericValue }, letter_spacing, CSS::ValueType::Length);
 
     // 2. If parsed is failure, then return.
-    if (!parsed || !parsed->is_length())
+    if (!parsed)
         return;
 
     // 3. Set this's letter spacing to parsed.
-    my_drawing_state().letter_spacing = parsed->as_length().length();
+    drawing_state().letter_spacing = parsed.release_nonnull();
 }
 
-template class CanvasTextDrawingStyles<CanvasRenderingContext2D, HTMLCanvasElement>;
-template class CanvasTextDrawingStyles<OffscreenCanvasRenderingContext2D, HTML::OffscreenCanvas>;
+template<typename CanvasType>
+float CanvasTextDrawingStyles<CanvasType>::resolved_letter_spacing() const
+{
+    auto absolutized_length = CSS::Length::from_style_value(drawing_state().letter_spacing->absolutized(computation_context_for_drawing_state()), {});
+
+    return static_cast<float>(absolutized_length.absolute_length_to_px().to_double());
+}
+
+template class CanvasTextDrawingStyles<HTMLCanvasElement>;
+template class CanvasTextDrawingStyles<HTML::OffscreenCanvas>;
 
 }

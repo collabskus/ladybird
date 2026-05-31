@@ -478,11 +478,13 @@ set(SOURCES
     HTML/BroadcastChannelMessage.cpp
     HTML/BrowsingContext.cpp
     HTML/BrowsingContextGroup.cpp
+    HTML/Canvas/AbstractCanvasMixin.cpp
     HTML/Canvas/CanvasDrawImage.cpp
     HTML/Canvas/CanvasFillStrokeStyles.cpp
     HTML/Canvas/CanvasPath.cpp
     HTML/Canvas/CanvasState.cpp
     HTML/Canvas/CanvasTextDrawingStyles.cpp
+    HTML/Canvas/DrawingState.cpp
     HTML/Canvas/SerializeBitmap.cpp
     HTML/CanvasGradient.cpp
     HTML/CanvasPattern.cpp

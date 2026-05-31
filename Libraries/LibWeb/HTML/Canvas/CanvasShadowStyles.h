@@ -14,7 +14,6 @@
 namespace Web::HTML {
 
 // https://html.spec.whatwg.org/multipage/canvas.html#canvasshadowstyles
-template<typename IncludingClass>
 class CanvasShadowStyles {
 public:
     ~CanvasShadowStyles() = default;
@@ -33,10 +32,6 @@ public:
 
 protected:
     CanvasShadowStyles() = default;
-
-private:
-    CanvasState::DrawingState& my_drawing_state() { return static_cast<IncludingClass&>(*this).drawing_state(); }
-    CanvasState::DrawingState const& my_drawing_state() const { return static_cast<IncludingClass const&>(*this).drawing_state(); }
 };
 
 }
