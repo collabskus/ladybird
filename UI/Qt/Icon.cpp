@@ -109,6 +109,40 @@ static void draw_star_icon(QPainter& painter, QColor const& color, bool filled)
     painter.drawPath(path);
 }
 
+static void draw_vertical_tab_bar_icon(QPainter& painter, QColor const& color, bool expanded)
+{
+    painter.setPen(chrome_icon_pen(color, 1.55));
+    painter.setBrush(Qt::NoBrush);
+    painter.drawRoundedRect(QRectF(3.8, 4.2, 12.4, 11.6), 1.6, 1.6);
+    painter.drawLine(QPointF(7.8, 4.6), QPointF(7.8, 15.4));
+
+    QPainterPath arrow;
+    if (expanded) {
+        arrow.moveTo(12.6, 7.2);
+        arrow.lineTo(9.8, 10.0);
+        arrow.lineTo(12.6, 12.8);
+    } else {
+        arrow.moveTo(10.2, 7.2);
+        arrow.lineTo(13.0, 10.0);
+        arrow.lineTo(10.2, 12.8);
+    }
+    draw_stroked_icon_path(painter, arrow, color, 1.85);
+}
+
+static void draw_globe_icon(QPainter& painter, QColor const& color)
+{
+    painter.setPen(chrome_icon_pen(color, 1.55));
+    painter.setBrush(Qt::NoBrush);
+
+    auto outline_rect = QRectF(3.5, 3.5, 13, 13);
+    painter.drawEllipse(outline_rect);
+    painter.drawLine(QPointF(outline_rect.left() + 1.3, 10), QPointF(outline_rect.right() - 1.3, 10));
+
+    QRectF meridian_rect(6.5, outline_rect.top(), 7.0, outline_rect.height());
+    painter.drawArc(meridian_rect, 90 * 16, 180 * 16);
+    painter.drawArc(meridian_rect, 270 * 16, 180 * 16);
+}
+
 static QPixmap create_transparent_icon_pixmap(QSize logical_size, qreal device_pixel_ratio)
 {
     QPixmap pixmap(physical_size_for_device_pixel_ratio(logical_size, device_pixel_ratio));
@@ -168,11 +202,7 @@ static QPixmap create_chrome_icon_pixmap(ChromeIcon icon, QColor color, qreal de
         painter.drawLine(QPointF(12.1, 12.1), QPointF(16.0, 16.0));
         break;
     case ChromeIcon::Globe:
-        painter.setPen(chrome_icon_pen(color, 1.55));
-        painter.drawEllipse(QRectF(4.4, 4.4, 11.2, 11.2));
-        painter.drawLine(QPointF(5.5, 10.0), QPointF(14.5, 10.0));
-        painter.drawArc(QRectF(7.1, 4.4, 5.8, 11.2), 90 * 16, 180 * 16);
-        painter.drawArc(QRectF(7.1, 4.4, 5.8, 11.2), 270 * 16, 180 * 16);
+        draw_globe_icon(painter, color);
         break;
     case ChromeIcon::Folder: {
         painter.setPen(chrome_icon_pen(color, 1.6));
@@ -201,6 +231,12 @@ static QPixmap create_chrome_icon_pixmap(ChromeIcon icon, QColor color, qreal de
         painter.setPen(chrome_icon_pen(color, 1.85));
         painter.drawLine(QPointF(5.0, 7.6), QPointF(10.0, 12.6));
         painter.drawLine(QPointF(10.0, 12.6), QPointF(15.0, 7.6));
+        break;
+    case ChromeIcon::VerticalTabBarCollapse:
+        draw_vertical_tab_bar_icon(painter, color, true);
+        break;
+    case ChromeIcon::VerticalTabBarExpand:
+        draw_vertical_tab_bar_icon(painter, color, false);
         break;
     case ChromeIcon::WindowMinimize:
         painter.setPen(chrome_icon_pen(color, 1.65));
