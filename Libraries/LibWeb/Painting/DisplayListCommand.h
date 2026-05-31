@@ -64,6 +64,8 @@ class DisplayList;
     V(CompositorScrollNode, compositor_scroll_node)                                    \
     V(CompositorStickyArea, compositor_sticky_area)                                    \
     V(CompositorWheelHitTestTarget, compositor_wheel_hit_test_target)                  \
+    V(CompositorWheelHitTestTargetWithCornerRadii,                                     \
+        compositor_wheel_hit_test_target_with_corner_radii)                            \
     V(CompositorMainThreadWheelEventRegion, compositor_main_thread_wheel_event_region) \
     V(CompositorViewportScrollbar, compositor_viewport_scrollbar)                      \
     V(CompositorBlockingWheelEventRegion, compositor_blocking_wheel_event_region)      \
@@ -103,6 +105,11 @@ struct DisplayListCommandHeader {
     bool has_bounding_rect { false };
     bool is_clip { false };
     Gfx::IntRect bounding_rect {};
+};
+
+struct DisplayListGlyph {
+    Gfx::FloatPoint position;
+    u32 glyph_id { 0 };
 };
 
 struct DrawGlyphRun {
@@ -569,6 +576,17 @@ struct CompositorWheelHitTestTarget {
     UniqueNodeID document_id;
     ScrollFrameIndex target_scroll_frame_index;
     Gfx::FloatRect rect;
+
+    void dump(StringBuilder&) const;
+};
+
+struct CompositorWheelHitTestTargetWithCornerRadii {
+    static constexpr StringView command_name = "CompositorWheelHitTestTargetWithCornerRadii"sv;
+    static constexpr DisplayListCommandType command_type = DisplayListCommandType::CompositorWheelHitTestTargetWithCornerRadii;
+
+    UniqueNodeID document_id;
+    ScrollFrameIndex target_scroll_frame_index;
+    Gfx::FloatRect rect;
     Gfx::CornerRadii corner_radii;
 
     void dump(StringBuilder&) const;
@@ -709,6 +727,7 @@ inline int display_list_command_nesting_level_change(DisplayListCommandType comm
 }
 
 static_assert(IsTriviallyCopyable<DisplayListCommandHeader>);
+static_assert(IsTriviallyCopyable<DisplayListGlyph>);
 
 #define VERIFY_DISPLAY_LIST_COMMAND(command, player_method) static_assert(IsTriviallyCopyable<command>);
 ENUMERATE_DISPLAY_LIST_COMMANDS(VERIFY_DISPLAY_LIST_COMMAND)

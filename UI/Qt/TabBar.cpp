@@ -75,7 +75,7 @@ TabBar::TabBar(TabWidget* tab_widget)
     setAcceptDrops(true);
     setFocusPolicy(Qt::NoFocus);
     setIconSize({ 16, 16 });
-    setMinimumHeight(42);
+    setMinimumHeight(39);
 
     m_hover_animation = new QVariantAnimation(this);
     m_hover_animation->setDuration(120);
@@ -110,7 +110,7 @@ QSize TabBar::tabSizeHint(int index) const
         hint.setWidth(width);
     }
 
-    hint.setHeight(39);
+    hint.setHeight(36);
     return hint;
 }
 
@@ -124,7 +124,7 @@ void TabBar::paintEvent(QPaintEvent* event)
     auto border = ChromeStyle::chrome_border(palette());
     auto dark = ChromeStyle::is_dark(palette());
 
-    auto text_color = palette().color(QPalette::Text);
+    auto text_color = ChromeStyle::chrome_text(palette());
 
     for (int index = 0; index < count(); ++index) {
         auto tab_rect = tabRect(index);
@@ -135,8 +135,8 @@ void TabBar::paintEvent(QPaintEvent* event)
         auto hover_progress = index == m_hover_animation_tab_index ? m_hover_progress : (index == m_hovered_tab_index ? 1.0 : 0.0);
         bool is_hovered = hover_progress > 0.0;
 
-        auto shape_rect = QRectF(tab_rect).adjusted(3.0, 1.5, -3.0, 0.5);
-        auto tab_path = tab_shape_path(shape_rect, 10.0, 9.0);
+        auto shape_rect = QRectF(tab_rect).adjusted(3.0, 2.0, -3.0, 1.0);
+        auto tab_path = tab_shape_path(shape_rect, 9.0, 8.0);
         auto surface = ChromeStyle::chrome_surface(palette());
 
         if (is_selected) {
@@ -144,7 +144,7 @@ void TabBar::paintEvent(QPaintEvent* event)
             selected_gradient.setColorAt(0.0, ChromeStyle::chrome_active_tab_surface_top(palette()));
             selected_gradient.setColorAt(1.0, ChromeStyle::chrome_active_tab_surface_bottom(palette()));
             auto active_border = border;
-            active_border.setAlpha(38);
+            active_border.setAlpha(dark ? 62 : 72);
             painter.setBrush(selected_gradient);
             painter.setPen(QPen(active_border, 1));
             painter.drawPath(tab_path);
@@ -152,15 +152,15 @@ void TabBar::paintEvent(QPaintEvent* event)
             auto hover = dark ? ChromeStyle::chrome_surface_hover(palette()) : ChromeStyle::mix(surface, ChromeStyle::chrome_surface_hover(palette()), 0.28);
             hover.setAlpha(static_cast<int>((dark ? 120 : 136) * hover_progress));
             auto hover_border = border;
-            hover_border.setAlpha(static_cast<int>(44 * hover_progress));
+            hover_border.setAlpha(static_cast<int>((dark ? 58 : 64) * hover_progress));
             painter.setBrush(hover);
             painter.setPen(QPen(hover_border, 1));
             painter.drawPath(tab_path);
         } else {
             auto inactive = ChromeStyle::chrome_surface_recessed(palette());
-            inactive.setAlpha(dark ? 48 : 118);
+            inactive.setAlpha(dark ? 104 : 150);
             auto inactive_border = border;
-            inactive_border.setAlpha(14);
+            inactive_border.setAlpha(dark ? 38 : 26);
             painter.setBrush(inactive);
             painter.setPen(QPen(inactive_border, 1));
             painter.drawPath(tab_path);
@@ -168,9 +168,9 @@ void TabBar::paintEvent(QPaintEvent* event)
 
         if (!is_selected && !is_hovered && index > 0 && index != currentIndex() + 1) {
             auto separator = border;
-            separator.setAlpha(32);
+            separator.setAlpha(dark ? 42 : 36);
             painter.setPen(separator);
-            painter.drawLine(QPoint(tab_rect.left(), 17), QPoint(tab_rect.left(), height() - 17));
+            painter.drawLine(QPoint(tab_rect.left(), 15), QPoint(tab_rect.left(), height() - 15));
         }
 
         auto contents_rect = shape_rect.toAlignedRect().adjusted(16, 0, -14, 0);
@@ -212,7 +212,7 @@ void TabBar::paintEvent(QPaintEvent* event)
         indicator_color.setAlpha(220);
 
         painter.setPen(QPen(indicator_color, 3, Qt::SolidLine, Qt::RoundCap));
-        painter.drawLine(QPointF(indicator_x, 9), QPointF(indicator_x, height() - 7));
+        painter.drawLine(QPointF(indicator_x, 8), QPointF(indicator_x, height() - 6));
     }
 }
 
@@ -501,7 +501,7 @@ TabWidget::TabWidget(QWidget* parent)
 
     m_new_tab_button = new QToolButton(this);
     m_new_tab_button->setObjectName("LadybirdNewTabButton");
-    m_new_tab_button->setIconSize(QSize(20, 20));
+    m_new_tab_button->setIconSize(QSize(18, 18));
     m_new_tab_button->setFixedSize(32, 32);
     m_new_tab_button->setFocusPolicy(Qt::NoFocus);
     m_new_tab_button->setToolTip("New Tab");
@@ -514,7 +514,7 @@ TabWidget::TabWidget(QWidget* parent)
 
     auto* tab_bar_row_layout = new QHBoxLayout();
     tab_bar_row_layout->setSpacing(4);
-    tab_bar_row_layout->setContentsMargins(12, 3, 4, 1);
+    tab_bar_row_layout->setContentsMargins(12, 2, 4, 1);
     tab_bar_row_layout->addWidget(m_tab_bar);
     tab_bar_row_layout->addWidget(m_new_tab_button, 0, Qt::AlignVCenter);
     tab_bar_row_layout->addStretch(1);
@@ -524,7 +524,7 @@ TabWidget::TabWidget(QWidget* parent)
 
     m_tab_bar_row = new QWidget(this);
     m_tab_bar_row->setObjectName("LadybirdTabStrip");
-    m_tab_bar_row->setMinimumHeight(46);
+    m_tab_bar_row->setMinimumHeight(43);
     m_tab_bar_row->setLayout(tab_bar_row_layout);
     m_tab_bar_row->installEventFilter(this);
 

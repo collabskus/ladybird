@@ -69,12 +69,6 @@ private:
     }
 };
 
-static QIcon default_favicon()
-{
-    static QIcon icon = load_icon_from_uri("resource://icons/48x48/app-browser.png"sv);
-    return icon;
-}
-
 static QToolButton* create_toolbar_button(QWidget& parent, QAction& action)
 {
     auto* button = new QToolButton(&parent);
@@ -82,7 +76,7 @@ static QToolButton* create_toolbar_button(QWidget& parent, QAction& action)
     button->setAutoRaise(true);
     button->setFocusPolicy(Qt::NoFocus);
     button->setIconSize({ 20, 20 });
-    button->setFixedSize(38, 38);
+    button->setFixedSize(36, 36);
     return button;
 }
 
@@ -109,7 +103,7 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
 
     m_toolbar = new QWidget(this);
     m_toolbar->setObjectName("LadybirdNavigationToolbar");
-    m_toolbar->setFixedHeight(47);
+    m_toolbar->setFixedHeight(42);
     m_toolbar->setSizePolicy(QSizePolicy::MinimumExpanding, QSizePolicy::Fixed);
 
     auto* toolbar_container_layout = new QVBoxLayout(m_toolbar_container);
@@ -118,7 +112,7 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
 
     auto* toolbar_layout = new QHBoxLayout(m_toolbar);
     toolbar_layout->setSpacing(6);
-    toolbar_layout->setContentsMargins(12, 3, 12, 3);
+    toolbar_layout->setContentsMargins(12, 2, 12, 2);
 
     m_location_edit = new LocationEdit(this);
     m_bookmarks_bar = new BookmarksBar(this);
@@ -151,9 +145,9 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
     m_hamburger_button = new HamburgerButton(m_toolbar);
     m_hamburger_button->setText("Show &Menu");
     m_hamburger_button->setToolTip("Show Menu");
-    m_hamburger_button->setIcon(create_tvg_icon_with_theme_colors("hamburger", palette()));
+    m_hamburger_button->setIcon(create_chrome_icon(ChromeIcon::Menu, palette()));
     m_hamburger_button->setIconSize({ 20, 20 });
-    m_hamburger_button->setFixedSize(38, 38);
+    m_hamburger_button->setFixedSize(36, 36);
     m_hamburger_button->setAutoRaise(true);
     m_hamburger_button->setFocusPolicy(Qt::NoFocus);
     m_hamburger_button->setPopupMode(QToolButton::InstantPopup);
@@ -166,19 +160,24 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
 
     recreate_toolbar_icons();
 
-    m_favicon = default_favicon();
-
     m_page_context_menu = create_context_menu(*this, view(), view().page_context_menu());
     m_link_context_menu = create_context_menu(*this, view(), view().link_context_menu());
     m_image_context_menu = create_context_menu(*this, view(), view().image_context_menu());
     m_media_context_menu = create_context_menu(*this, view(), view().media_context_menu());
 
-    toolbar_layout->addWidget(create_toolbar_button(*m_toolbar, *m_navigate_back_action));
-    toolbar_layout->addWidget(create_toolbar_button(*m_toolbar, *m_navigate_forward_action));
-    toolbar_layout->addWidget(create_toolbar_button(*m_toolbar, *m_reload_action));
+    auto* navigation_button_cluster = new QWidget(m_toolbar);
+    auto* navigation_button_layout = new QHBoxLayout(navigation_button_cluster);
+    navigation_button_layout->setSpacing(2);
+    navigation_button_layout->setContentsMargins(0, 0, 0, 0);
+    navigation_button_layout->addWidget(create_toolbar_button(*navigation_button_cluster, *m_navigate_back_action));
+    navigation_button_layout->addWidget(create_toolbar_button(*navigation_button_cluster, *m_navigate_forward_action));
+    navigation_button_layout->addWidget(create_toolbar_button(*navigation_button_cluster, *m_reload_action));
+
+    toolbar_layout->addWidget(navigation_button_cluster, 0, Qt::AlignTop);
     m_location_edit->set_trailing_action(create_application_action(*m_location_edit, view().toggle_bookmark_action()));
+    m_location_edit->set_zoom_action(create_application_action(*m_location_edit, view().reset_zoom_action(), IncludeActionIcon::No));
     toolbar_layout->addWidget(m_location_edit, 1);
-    toolbar_layout->addWidget(m_hamburger_button);
+    toolbar_layout->addWidget(m_hamburger_button, 0, Qt::AlignTop);
 
     update_chrome_style();
 
@@ -212,22 +211,18 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
         m_title = url_serialized;
         update_tab_title();
 
-        m_favicon = default_favicon();
+        m_favicon = {};
         set_loading(true);
 
-        m_location_edit->set_favicon({});
-        m_location_edit->set_loading(true);
         m_location_edit->set_url(url);
     };
 
     view().on_load_finish = [this](auto const&) {
         set_loading(false);
-        m_location_edit->set_loading(false);
     };
 
     view().on_web_content_crashed = [this] {
         set_loading(false);
-        m_location_edit->set_loading(false);
     };
 
     view().on_url_change = [this](auto const& url) {
@@ -251,7 +246,6 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
 
         m_favicon = qpixmap;
         update_tab_icon();
-        m_location_edit->set_favicon(m_favicon);
     };
 
     view().on_request_alert = [this](auto const& message) {

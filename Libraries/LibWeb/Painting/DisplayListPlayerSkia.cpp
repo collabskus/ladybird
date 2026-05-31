@@ -158,7 +158,7 @@ void DisplayListPlayerSkia::paint_scrollbar(Gfx::PaintingSurface& surface, Paint
 void DisplayListPlayerSkia::draw_glyph_run(DrawGlyphRun const& command)
 {
     auto const& font = resource_storage().font(command.font_id);
-    auto glyphs = inline_objects<Gfx::DrawGlyph>(command.glyphs);
+    auto glyphs = inline_objects<DisplayListGlyph>(command.glyphs);
     if (glyphs.is_empty())
         return;
 
@@ -874,6 +874,10 @@ void DisplayListPlayerSkia::compositor_sticky_area(CompositorStickyArea const&)
 }
 
 void DisplayListPlayerSkia::compositor_wheel_hit_test_target(CompositorWheelHitTestTarget const&)
+{
+}
+
+void DisplayListPlayerSkia::compositor_wheel_hit_test_target_with_corner_radii(CompositorWheelHitTestTargetWithCornerRadii const&)
 {
 }
 
