@@ -50,6 +50,35 @@ void TabActor::handle_message(Message const& message)
         return;
     }
 
+    if (message.type == "reloadDescriptor"sv) {
+        auto bypass_cache = message.data.get_bool("bypassCache"sv).value_or(false);
+        devtools().delegate().reload_tab(m_description, bypass_cache);
+        send_response(message, move(response));
+        return;
+    }
+
+    if (message.type == "navigateTo"sv) {
+        auto url = get_required_parameter<String>(message, "url"sv);
+        if (!url.has_value())
+            return;
+
+        devtools().delegate().navigate_tab(m_description, *url);
+        send_response(message, move(response));
+        return;
+    }
+
+    if (message.type == "goBack"sv) {
+        devtools().delegate().traverse_the_history_by_delta(m_description, -1);
+        send_response(message, move(response));
+        return;
+    }
+
+    if (message.type == "goForward"sv) {
+        devtools().delegate().traverse_the_history_by_delta(m_description, 1);
+        send_response(message, move(response));
+        return;
+    }
+
     send_unrecognized_packet_type_error(message);
 }
 
@@ -58,6 +87,7 @@ JsonObject TabActor::serialize_description() const
     JsonObject traits;
     traits.set("watcher"sv, true);
     traits.set("supportsReloadDescriptor"sv, true);
+    traits.set("supportsNavigation"sv, true);
 
     // FIXME: We are using the tab's ID multiple times here. This is likely not correct, as both Firefox and Servo
     //        provide different IDs for browserId, browsingContextID, and outerWindowID.
@@ -76,6 +106,13 @@ void TabActor::reset_selected_node()
 {
     devtools().delegate().clear_highlighted_dom_node(description());
     devtools().delegate().clear_inspected_dom_node(description());
+}
+
+void TabActor::navigate_to(String url, String title)
+{
+    m_description.url = move(url);
+    m_description.title = move(title);
+    ++m_inner_window_id;
 }
 
 }

@@ -131,6 +131,40 @@ static JsonObject make_dom_tree()
     return document;
 }
 
+static JsonObject make_navigation_dom_tree()
+{
+    JsonObject heading = make_node(105, "element"sv, "H1"sv);
+    heading.set("visible"sv, true);
+
+    JsonObject main = make_node(104, "element"sv, "MAIN"sv);
+    main.set("visible"sv, true);
+
+    JsonArray main_children;
+    main_children.must_append(move(heading));
+    main.set("children"sv, move(main_children));
+
+    JsonArray body_children;
+    body_children.must_append(move(main));
+
+    JsonObject body = make_node(103, "element"sv, "BODY"sv);
+    body.set("visible"sv, true);
+    body.set("children"sv, move(body_children));
+
+    JsonArray html_children;
+    html_children.must_append(move(body));
+
+    JsonObject html = make_node(102, "element"sv, "HTML"sv);
+    html.set("visible"sv, true);
+    html.set("children"sv, move(html_children));
+
+    JsonArray document_children;
+    document_children.must_append(move(html));
+
+    JsonObject document = make_node(101, "document"sv, "#document"sv);
+    document.set("children"sv, move(document_children));
+    return document;
+}
+
 static JsonObject make_accessibility_tree()
 {
     JsonObject button = make_node(4, "element"sv, "Target button"sv);
@@ -342,10 +376,28 @@ public:
         return properties;
     }
 
+    virtual void reload_tab(DevTools::TabDescription const&, bool bypass_cache) const override
+    {
+        ++reload_tab_call_count;
+        last_reload_bypass_cache = bypass_cache;
+    }
+
+    virtual void navigate_tab(DevTools::TabDescription const&, String const& url) const override
+    {
+        ++navigate_tab_call_count;
+        last_navigated_url = url;
+    }
+
+    virtual void traverse_the_history_by_delta(DevTools::TabDescription const&, int delta) const override
+    {
+        ++traverse_the_history_by_delta_call_count;
+        last_history_delta = delta;
+    }
+
     virtual void inspect_tab(DevTools::TabDescription const&, OnTabInspectionComplete callback) const override
     {
         ++inspect_tab_call_count;
-        callback(make_dom_tree());
+        callback(use_navigation_dom_tree ? make_navigation_dom_tree() : make_dom_tree());
     }
 
     virtual void inspect_accessibility_tree(DevTools::TabDescription const&, OnAccessibilityTreeInspectionComplete callback) const override
@@ -610,11 +662,15 @@ public:
     virtual void listen_for_navigation_events(DevTools::TabDescription const&, OnNavigationStarted on_started, OnNavigationFinished on_finished) const override
     {
         ++listen_for_navigation_events_call_count;
-        on_navigation_started = move(on_started);
-        on_navigation_finished = move(on_finished);
+        navigation_listeners.append({ move(on_started), move(on_finished) });
     }
 
-    virtual void stop_listening_for_navigation_events(DevTools::TabDescription const&) const override { ++stop_listening_for_navigation_events_call_count; }
+    virtual void stop_listening_for_navigation_events(DevTools::TabDescription const&) const override
+    {
+        ++stop_listening_for_navigation_events_call_count;
+        if (!navigation_listeners.is_empty())
+            navigation_listeners.take_first();
+    }
     virtual void did_connect_devtools_client(DevTools::TabDescription const&) const override { ++did_connect_devtools_client_call_count; }
     virtual void did_disconnect_devtools_client(DevTools::TabDescription const&) const override { ++did_disconnect_devtools_client_call_count; }
 
@@ -691,10 +747,34 @@ public:
 
     void emit_navigation() const
     {
-        VERIFY(on_navigation_started);
-        VERIFY(on_navigation_finished);
-        on_navigation_started("https://example.test/next"_string);
-        on_navigation_finished("https://example.test/next"_string, "Next page"_string);
+        emit_navigation_start();
+        emit_navigation_finish();
+    }
+
+    void emit_navigation_start() const
+    {
+        VERIFY(!navigation_listeners.is_empty());
+        auto listener_count = navigation_listeners.size();
+        for (size_t i = 0; i < listener_count; ++i)
+            navigation_listeners[i].on_navigation_started("https://example.test/next"_string);
+    }
+
+    void emit_navigation_finish() const
+    {
+        VERIFY(!navigation_listeners.is_empty());
+        auto listener_count = navigation_listeners.size();
+        for (size_t i = 0; i < listener_count; ++i)
+            navigation_listeners[i].on_navigation_finished("https://example.test/next"_string, "Next page"_string);
+    }
+
+    size_t navigation_listener_count() const
+    {
+        return navigation_listeners.size();
+    }
+
+    void switch_to_navigation_dom_tree() const
+    {
+        use_navigation_dom_tree = true;
     }
 
     void emit_node_picker_event(DevToolsDelegate::NodePickerEvent event) const
@@ -711,9 +791,15 @@ public:
     mutable Function<void(DevToolsDelegate::NetworkResponseData)> on_network_response_headers_received;
     mutable Function<void(u64, ByteBuffer)> on_network_response_body_received;
     mutable Function<void(DevToolsDelegate::NetworkRequestCompleteData)> on_network_request_finished;
-    mutable Function<void(String)> on_navigation_started;
-    mutable Function<void(String, String)> on_navigation_finished;
     mutable Function<void(DevToolsDelegate::NodePickerEvent)> on_node_picker_event;
+
+    struct NavigationListener {
+        Function<void(String)> on_navigation_started;
+        Function<void(String, String)> on_navigation_finished;
+    };
+    mutable Vector<NavigationListener> navigation_listeners;
+
+    mutable bool use_navigation_dom_tree { false };
 
     mutable size_t inspect_tab_call_count { 0 };
     mutable size_t inspect_accessibility_tree_call_count { 0 };
@@ -758,6 +844,9 @@ public:
     mutable size_t stop_listening_for_navigation_events_call_count { 0 };
     mutable size_t did_connect_devtools_client_call_count { 0 };
     mutable size_t did_disconnect_devtools_client_call_count { 0 };
+    mutable size_t navigate_tab_call_count { 0 };
+    mutable size_t reload_tab_call_count { 0 };
+    mutable size_t traverse_the_history_by_delta_call_count { 0 };
 
     mutable Optional<Web::UniqueNodeID> last_highlighted_dom_node;
     mutable Optional<Web::CSS::PseudoElement> last_highlighted_pseudo_element;
@@ -781,6 +870,9 @@ public:
     mutable Optional<String> last_tag;
     mutable Optional<String> last_attribute;
     mutable size_t last_attribute_count { 0 };
+    mutable Optional<String> last_navigated_url;
+    mutable Optional<bool> last_reload_bypass_cache;
+    mutable Optional<int> last_history_delta;
 };
 
 class ProtocolClient {
@@ -850,7 +942,9 @@ private:
             || *type == "pickerNodeHovered"sv
             || *type == "pickerNodePicked"sv
             || *type == "pickerNodePreviewed"sv
-            || *type == "tabListChanged"sv;
+            || *type == "tabListChanged"sv
+            || *type == "target-available-form"sv
+            || *type == "target-destroyed-form"sv;
     }
 
     JsonObject request(JsonObject message, StringView response_actor)
@@ -944,9 +1038,13 @@ static JsonObject get_frame_target(ProtocolClient& client, StringView tab_actor)
     request.set("type"sv, "watchTargets"sv);
     request.set("targetType"sv, "frame"sv);
 
-    auto response = client.request(move(request));
-    VERIFY(response.get_string("type"sv).value() == "target-available-form"sv);
-    return response.get_object("target"sv).release_value();
+    EXPECT_EQ(client.request(move(request)).get_string("from"sv).value(), watcher_actor);
+
+    while (true) {
+        auto message = client.read_message();
+        if (message.get_string("type"sv).value_or({}) == "target-available-form"sv)
+            return message.get_object("target"sv).release_value();
+    }
 }
 
 static JsonObject get_walker(ProtocolClient& client, StringView inspector_actor)
@@ -1023,6 +1121,9 @@ TEST_CASE(root_actor_and_connection_errors)
     auto tab_actor = actor_from(tab, "actor"sv);
     EXPECT_EQ(tab.get_string("title"sv).value(), "Fixture page"sv);
     EXPECT_EQ(tab.get_integer<u64>("browserId"sv).value(), 1u);
+    auto tab_traits = tab.get_object("traits"sv).release_value();
+    EXPECT(tab_traits.get_bool("supportsReloadDescriptor"sv).value());
+    EXPECT(tab_traits.get_bool("supportsNavigation"sv).value());
 
     JsonObject get_tab_request;
     get_tab_request.set("to"sv, "root"sv);
@@ -1062,6 +1163,43 @@ TEST_CASE(root_actor_and_connection_errors)
     client.send(move(second));
     EXPECT(client.read_message().has_array("workers"sv));
     EXPECT(client.read_message().has_array("addons"sv));
+}
+
+TEST_CASE(history_navigation_requests)
+{
+    auto session = create_session();
+    auto& client = *session->client;
+    (void)client.read_message();
+
+    auto tab_actor = actor_from(get_tab(client), "actor"sv);
+
+    JsonObject navigate_to;
+    navigate_to.set("to"sv, tab_actor);
+    navigate_to.set("type"sv, "navigateTo"sv);
+    navigate_to.set("url"sv, "https://example.test/from-devtools"sv);
+    navigate_to.set("waitForLoad"sv, false);
+    EXPECT_EQ(client.request(move(navigate_to)).get_string("from"sv).value(), tab_actor);
+    EXPECT_EQ(session->delegate.navigate_tab_call_count, 1u);
+    EXPECT_EQ(session->delegate.last_navigated_url.value(), "https://example.test/from-devtools"sv);
+
+    EXPECT_EQ(client.request(tab_actor, "goBack"sv).get_string("from"sv).value(), tab_actor);
+    EXPECT_EQ(session->delegate.traverse_the_history_by_delta_call_count, 1u);
+    EXPECT_EQ(session->delegate.last_history_delta.value(), -1);
+
+    EXPECT_EQ(client.request(tab_actor, "goForward"sv).get_string("from"sv).value(), tab_actor);
+    EXPECT_EQ(session->delegate.traverse_the_history_by_delta_call_count, 2u);
+    EXPECT_EQ(session->delegate.last_history_delta.value(), 1);
+
+    auto target = get_frame_target(client, tab_actor);
+    auto target_actor = actor_from(target, "actor"sv);
+
+    EXPECT_EQ(client.request(target_actor, "goBack"sv).get_string("from"sv).value(), target_actor);
+    EXPECT_EQ(session->delegate.traverse_the_history_by_delta_call_count, 3u);
+    EXPECT_EQ(session->delegate.last_history_delta.value(), -1);
+
+    EXPECT_EQ(client.request(target_actor, "goForward"sv).get_string("from"sv).value(), target_actor);
+    EXPECT_EQ(session->delegate.traverse_the_history_by_delta_call_count, 4u);
+    EXPECT_EQ(session->delegate.last_history_delta.value(), 1);
 }
 
 TEST_CASE(target_bootstrap_and_lifetime)
@@ -1190,6 +1328,141 @@ TEST_CASE(walker_node_picker)
     children.set("type"sv, "children"sv);
     children.set("node"sv, root_node_actor);
     EXPECT_EQ(client.request(move(children)).get_array("nodes"sv)->size(), 1u);
+}
+
+TEST_CASE(inspector_walker_navigation_reloads_root)
+{
+    auto session = create_session();
+    auto& client = *session->client;
+    (void)client.read_message();
+
+    auto tab = get_tab(client);
+    auto tab_actor = actor_from(tab, "actor"sv);
+    auto target = get_frame_target(client, tab_actor);
+    auto inspector_actor = actor_from(target, "inspectorActor"sv);
+    auto walker = get_walker(client, inspector_actor);
+    auto walker_actor = actor_from(walker, "actor"sv);
+    auto root_node = walker.get_object("root"sv).release_value();
+    auto root_node_actor = actor_from(root_node, "actor"sv);
+    EXPECT_EQ(session->delegate.navigation_listener_count(), 1u);
+
+    auto div_actor = query_selector(client, walker_actor, root_node_actor, "div"sv);
+
+    JsonObject watch_root;
+    watch_root.set("to"sv, walker_actor);
+    watch_root.set("type"sv, "watchRootNode"sv);
+    EXPECT_EQ(client.request(move(watch_root)).get_string("type"sv).value(), "root-available"sv);
+
+    session->delegate.emit_navigation_start();
+
+    auto root_destroyed = read_packet_with_type(client, "root-destroyed"sv);
+    auto destroyed_node = root_destroyed.get_object("node"sv).release_value();
+    EXPECT_EQ(destroyed_node.get_string("actor"sv).value(), root_node_actor);
+    EXPECT(destroyed_node.get_bool("isTopLevelDocument"sv).value());
+
+    JsonObject is_in_dom_tree;
+    is_in_dom_tree.set("to"sv, walker_actor);
+    is_in_dom_tree.set("type"sv, "isInDOMTree"sv);
+    is_in_dom_tree.set("node"sv, div_actor);
+    EXPECT(!client.request(move(is_in_dom_tree)).get_bool("attached"sv).value());
+
+    EXPECT_EQ(session->delegate.clear_highlighted_dom_node_call_count, 1u);
+    EXPECT_EQ(session->delegate.clear_inspected_dom_node_call_count, 1u);
+
+    auto will_navigate = read_resource(client, "document-event"sv);
+    EXPECT_EQ(will_navigate.get_string("name"sv).value(), "will-navigate"sv);
+    EXPECT_EQ(will_navigate.get_string("newURI"sv).value(), "https://example.test/next"sv);
+    EXPECT(!will_navigate.has_string("url"sv));
+
+    session->delegate.switch_to_navigation_dom_tree();
+    session->delegate.emit_navigation_finish();
+
+    auto root_available = read_packet_with_type(client, "root-available"sv);
+    auto new_root_node = root_available.get_object("node"sv).release_value();
+    auto new_root_node_actor = actor_from(new_root_node, "actor"sv);
+    auto main_actor = query_selector(client, walker_actor, new_root_node_actor, "main"sv);
+
+    JsonObject main_is_in_dom_tree;
+    main_is_in_dom_tree.set("to"sv, walker_actor);
+    main_is_in_dom_tree.set("type"sv, "isInDOMTree"sv);
+    main_is_in_dom_tree.set("node"sv, main_actor);
+    EXPECT(client.request(move(main_is_in_dom_tree)).get_bool("attached"sv).value());
+
+    EXPECT_EQ(session->delegate.inspect_tab_call_count, 2u);
+
+    auto target_destroyed = read_packet_with_type(client, "target-destroyed-form"sv);
+    auto destroyed_target = target_destroyed.get_object("target"sv).release_value();
+    EXPECT_EQ(actor_from(destroyed_target, "actor"sv), actor_from(target, "actor"sv));
+    auto options = target_destroyed.get_object("options"sv).release_value();
+    EXPECT(options.get_bool("isTargetSwitching"sv).value());
+    EXPECT(options.get_bool("shouldDestroyTargetFront"sv).value());
+
+    auto new_target_available = read_packet_with_type(client, "target-available-form"sv);
+    auto new_target = new_target_available.get_object("target"sv).release_value();
+    EXPECT_NE(actor_from(new_target, "actor"sv), actor_from(target, "actor"sv));
+    EXPECT_EQ(new_target.get_string("url"sv).value(), "https://example.test/next"sv);
+    EXPECT_NE(
+        new_target.get_integer<u64>("innerWindowId"sv).value(),
+        target.get_integer<u64>("innerWindowId"sv).value());
+
+    EXPECT_EQ(client.request(actor_from(new_target, "actor"sv), "listFrames"sv).get_string("from"sv).value(), actor_from(new_target, "actor"sv));
+
+    auto dom_loading = read_resource(client, "document-event"sv);
+    EXPECT_EQ(dom_loading.get_string("name"sv).value(), "dom-loading"sv);
+    EXPECT_EQ(dom_loading.get_string("url"sv).value(), "https://example.test/next"sv);
+    EXPECT(!dom_loading.has_string("title"sv));
+
+    auto dom_interactive = read_resource(client, "document-event"sv);
+    EXPECT_EQ(dom_interactive.get_string("name"sv).value(), "dom-interactive"sv);
+    EXPECT_EQ(dom_interactive.get_string("url"sv).value(), "https://example.test/next"sv);
+    EXPECT_EQ(dom_interactive.get_string("title"sv).value(), "Next page"sv);
+
+    auto dom_complete = read_resource(client, "document-event"sv);
+    EXPECT_EQ(dom_complete.get_string("name"sv).value(), "dom-complete"sv);
+    EXPECT(!dom_complete.has_string("url"sv));
+    EXPECT(!dom_complete.has_string("title"sv));
+
+    EXPECT_EQ(session->delegate.navigation_listener_count(), 1u);
+    EXPECT_EQ(session->delegate.listen_for_navigation_events_call_count, 2u);
+    EXPECT_EQ(session->delegate.stop_listening_for_navigation_events_call_count, 1u);
+    EXPECT_EQ(session->delegate.did_connect_devtools_client_call_count, 1u);
+    EXPECT_EQ(session->delegate.did_disconnect_devtools_client_call_count, 0u);
+
+    auto new_walker = get_walker(client, actor_from(new_target, "inspectorActor"sv));
+    auto new_walker_root = new_walker.get_object("root"sv).release_value();
+    auto new_walker_root_actor = actor_from(new_walker_root, "actor"sv);
+    auto heading_actor = query_selector(client, actor_from(new_walker, "actor"sv), new_walker_root_actor, "h1"sv);
+    EXPECT(!heading_actor.is_empty());
+
+    JsonObject reload_descriptor;
+    reload_descriptor.set("to"sv, tab_actor);
+    reload_descriptor.set("type"sv, "reloadDescriptor"sv);
+    reload_descriptor.set("bypassCache"sv, true);
+    EXPECT_EQ(client.request(move(reload_descriptor)).get_string("from"sv).value(), tab_actor);
+    EXPECT_EQ(session->delegate.reload_tab_call_count, 1u);
+    EXPECT(session->delegate.last_reload_bypass_cache.value());
+
+    session->delegate.emit_navigation_start();
+    (void)read_packet_with_type(client, "root-destroyed"sv);
+
+    session->delegate.emit_navigation_finish();
+    (void)read_packet_with_type(client, "root-available"sv);
+
+    auto refreshed_target_destroyed = read_packet_with_type(client, "target-destroyed-form"sv);
+    auto refreshed_destroyed_target = refreshed_target_destroyed.get_object("target"sv).release_value();
+    EXPECT_EQ(actor_from(refreshed_destroyed_target, "actor"sv), actor_from(new_target, "actor"sv));
+
+    auto refreshed_target_available = read_packet_with_type(client, "target-available-form"sv);
+    auto refreshed_target = refreshed_target_available.get_object("target"sv).release_value();
+    EXPECT_NE(actor_from(refreshed_target, "actor"sv), actor_from(new_target, "actor"sv));
+    EXPECT_NE(
+        refreshed_target.get_integer<u64>("innerWindowId"sv).value(),
+        new_target.get_integer<u64>("innerWindowId"sv).value());
+    EXPECT_EQ(session->delegate.navigation_listener_count(), 1u);
+    EXPECT_EQ(session->delegate.listen_for_navigation_events_call_count, 3u);
+    EXPECT_EQ(session->delegate.stop_listening_for_navigation_events_call_count, 2u);
+    EXPECT_EQ(session->delegate.did_connect_devtools_client_call_count, 1u);
+    EXPECT_EQ(session->delegate.did_disconnect_devtools_client_call_count, 0u);
 }
 
 TEST_CASE(inspector_walker_highlighter_layout_and_editing)
@@ -1669,11 +1942,17 @@ TEST_CASE(console_network_navigation_and_accessibility)
 
     session->delegate.emit_navigation();
     EXPECT_EQ(read_resource(client, "document-event"sv).get_string("name"sv).value(), "will-navigate"sv);
-    while (true) {
-        auto packet = client.read_message();
-        if (packet.get_string("type"sv).value_or({}) == "tabNavigated"sv && packet.get_string("state"sv).value_or({}) == "stop"sv)
-            break;
-    }
+
+    (void)read_packet_with_type(client, "target-destroyed-form"sv);
+    auto new_target_available = read_packet_with_type(client, "target-available-form"sv);
+    target = new_target_available.get_object("target"sv).release_value();
+    accessibility_actor = actor_from(target, "accessibilityActor"sv);
+
+    EXPECT_EQ(client.request(actor_from(target, "actor"sv), "listFrames"sv).get_string("from"sv).value(), actor_from(target, "actor"sv));
+
+    EXPECT_EQ(read_resource(client, "document-event"sv).get_string("name"sv).value(), "dom-loading"sv);
+    EXPECT_EQ(read_resource(client, "document-event"sv).get_string("name"sv).value(), "dom-interactive"sv);
+    EXPECT_EQ(read_resource(client, "document-event"sv).get_string("name"sv).value(), "dom-complete"sv);
 
     EXPECT(client.request(accessibility_actor, "bootstrap"sv).has_object("state"sv));
     EXPECT(client.request(accessibility_actor, "getTraits"sv).get_object("traits"sv)->get_bool("tabbingOrder"sv).value());

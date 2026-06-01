@@ -49,6 +49,8 @@ namespace Ladybird {
 static constexpr auto LADYBIRD_TAB_MIME_TYPE = "application/x-ladybird-tab";
 static constexpr int HORIZONTAL_TAB_STRIP_HEIGHT = 43;
 static constexpr int HORIZONTAL_TAB_HEIGHT = 36;
+static constexpr int HORIZONTAL_TAB_MIN_WIDTH = 128;
+static constexpr int HORIZONTAL_TAB_MAX_WIDTH = 240;
 static constexpr int VERTICAL_TAB_HEIGHT = 38;
 static constexpr int VERTICAL_TABS_COLLAPSED_WIDTH = 52;
 static constexpr int VERTICAL_TABS_DEFAULT_EXPANDED_WIDTH = 232;
@@ -288,8 +290,8 @@ QSize TabBar::tabSizeHint(int index) const
 
     if (auto count = this->count(); count > 0) {
         auto width = (m_available_width > 0 ? m_available_width : this->width()) / count;
-        width = min(240, width);
-        width = max(128, width);
+        width = min(HORIZONTAL_TAB_MAX_WIDTH, width);
+        width = max(HORIZONTAL_TAB_MIN_WIDTH, width);
 
         hint.setWidth(width);
     }
@@ -1007,7 +1009,6 @@ void TabWidget::insert_tab(int index, Tab* widget, QString const& label)
 
     widget->set_toolbar_window_controls_visible(m_window_controls_visible && m_vertical_tabs_enabled);
     widget->set_vertical_tabs_enabled(m_vertical_tabs_enabled);
-    widget->set_vertical_tabs_expanded(m_vertical_tabs_expanded);
 
     update_tab_layout();
     update_tab_button_visibility();
@@ -1069,10 +1070,6 @@ void TabWidget::set_tab_bar_visible(bool visible)
 void TabWidget::set_window_controls_visible(bool visible)
 {
     m_window_controls_visible = visible;
-    auto show_tab_strip_window_controls = visible && m_tab_bar->tab_layout() == TabLayout::Horizontal;
-    m_minimize_window_button->setVisible(show_tab_strip_window_controls);
-    m_maximize_window_button->setVisible(show_tab_strip_window_controls);
-    m_close_window_button->setVisible(show_tab_strip_window_controls);
     for (int index = 0; index < m_stacked_widget->count(); ++index)
         tab(index)->set_toolbar_window_controls_visible(visible && m_vertical_tabs_enabled);
     update_tab_chrome_visibility();
@@ -1098,8 +1095,6 @@ void TabWidget::set_vertical_tabs_expanded(bool expanded)
         return;
 
     m_vertical_tabs_expanded = expanded;
-    for (int index = 0; index < m_stacked_widget->count(); ++index)
-        tab(index)->set_vertical_tabs_expanded(expanded);
     rebuild_layout();
 }
 
@@ -1289,7 +1284,6 @@ void TabWidget::rebuild_layout()
         m_main_layout->addWidget(m_tab_bar_row);
         m_main_layout->addWidget(m_stacked_widget, 1);
         m_vertical_tabs_content->hide();
-        m_vertical_tab_bar_column->hide();
     }
 
     update_tab_button_visibility();
@@ -1299,16 +1293,12 @@ void TabWidget::rebuild_layout()
 
 void TabWidget::rebuild_layout_for_horizontal_tabs()
 {
-    clear_layout(*m_tab_bar_row_layout);
-
     m_tab_bar_row->setMinimumHeight(HORIZONTAL_TAB_STRIP_HEIGHT);
     m_tab_bar_row_layout->setSpacing(4);
     m_tab_bar_row_layout->setContentsMargins(12, 2, 4, 1);
 
     m_new_tab_button->setText({});
     m_new_tab_button->setProperty(VERTICAL_TABS_EXPANDED_PROPERTY, false);
-    m_new_tab_button->style()->unpolish(m_new_tab_button);
-    m_new_tab_button->style()->polish(m_new_tab_button);
     m_new_tab_button->setToolButtonStyle(Qt::ToolButtonIconOnly);
     m_new_tab_button->setFixedSize(32, 32);
     m_new_tab_button->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
@@ -1323,9 +1313,6 @@ void TabWidget::rebuild_layout_for_horizontal_tabs()
 
 void TabWidget::rebuild_layout_for_vertical_tabs()
 {
-    clear_layout(*m_tab_bar_row_layout);
-    clear_layout(*m_vertical_tab_bar_column_layout);
-
     auto side_bar_width = current_vertical_tabs_width();
     m_vertical_tab_bar_column->setFixedWidth(side_bar_width);
 
@@ -1336,8 +1323,6 @@ void TabWidget::rebuild_layout_for_vertical_tabs()
     m_new_tab_button->setToolButtonStyle(m_vertical_tabs_expanded ? Qt::ToolButtonTextBesideIcon : Qt::ToolButtonIconOnly);
     update_vertical_tabs_action_labels();
     m_new_tab_button->setProperty(VERTICAL_TABS_EXPANDED_PROPERTY, m_vertical_tabs_expanded);
-    m_new_tab_button->style()->unpolish(m_new_tab_button);
-    m_new_tab_button->style()->polish(m_new_tab_button);
     m_vertical_tabs_new_tab_separator->setVisible(!m_vertical_tabs_expanded);
     if (m_vertical_tabs_expanded) {
         m_new_tab_button->setFixedHeight(VERTICAL_TAB_HEIGHT);
@@ -1435,6 +1420,9 @@ void TabWidget::update_tab_layout()
     auto available_for_tabs = width() - controls_width - 36;
 
     m_tab_bar->set_available_width(available_for_tabs);
+
+    auto tab_bar_width = min(available_for_tabs, m_tab_bar->count() * HORIZONTAL_TAB_MAX_WIDTH);
+    m_tab_bar->setFixedWidth(max(0, tab_bar_width));
 }
 
 void TabWidget::update_tab_button_visibility()

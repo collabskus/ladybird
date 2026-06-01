@@ -91,6 +91,38 @@ void InspectorActor::received_dom_tree(JsonObject& response, JsonObject dom_tree
     response.set("walker"sv, move(walker));
 }
 
+void InspectorActor::on_navigation_started()
+{
+    if (auto walker = m_walker.strong_ref())
+        walker->document_unloaded();
+    if (auto tab = m_tab.strong_ref())
+        tab->reset_selected_node();
+}
+
+void InspectorActor::on_navigation_finished()
+{
+    auto walker = m_walker.strong_ref();
+    auto tab = m_tab.strong_ref();
+    if (!walker || !tab)
+        return;
+
+    devtools().delegate().inspect_tab(tab->description(),
+        weak_callback(*this, [walker](auto&, auto dom_tree) {
+            if (dom_tree.is_error()) {
+                dbgln_if(DEVTOOLS_DEBUG, "Error inspecting tab after navigation: {}", dom_tree.error());
+                return;
+            }
+
+            auto value = dom_tree.release_value();
+            if (!WalkerActor::is_suitable_for_dom_inspection(value)) {
+                dbgln_if(DEVTOOLS_DEBUG, "Did not receive a suitable DOM tree: {}", value);
+                return;
+            }
+
+            walker->replace_dom_tree(move(value.as_object()));
+        }));
+}
+
 RefPtr<TabActor> InspectorActor::tab_for(WeakPtr<InspectorActor> const& weak_inspector)
 {
     if (auto inspector = weak_inspector.strong_ref())

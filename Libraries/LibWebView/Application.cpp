@@ -1797,6 +1797,31 @@ Vector<DevTools::CSSProperty> Application::css_property_list() const
     return property_list;
 }
 
+void Application::reload_tab(DevTools::TabDescription const& description, bool) const
+{
+    if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
+        view->reload();
+}
+
+void Application::navigate_tab(DevTools::TabDescription const& description, String const& url) const
+{
+    auto view = ViewImplementation::find_view_by_id(description.id);
+    if (!view.has_value())
+        return;
+
+    auto parsed_url = sanitize_url(url, Application::settings().search_engine());
+    if (!parsed_url.has_value())
+        return;
+
+    view->load(*parsed_url);
+}
+
+void Application::traverse_the_history_by_delta(DevTools::TabDescription const& description, int delta) const
+{
+    if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
+        view->traverse_the_history_by_delta(delta);
+}
+
 void Application::inspect_tab(DevTools::TabDescription const& description, OnTabInspectionComplete on_complete) const
 {
     auto view = ViewImplementation::find_view_by_id(description.id);

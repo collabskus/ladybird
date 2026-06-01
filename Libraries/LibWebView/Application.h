@@ -266,6 +266,9 @@ private:
 
     virtual Vector<DevTools::TabDescription> tab_list() const override;
     virtual Vector<DevTools::CSSProperty> css_property_list() const override;
+    virtual void navigate_tab(DevTools::TabDescription const&, String const&) const override;
+    virtual void reload_tab(DevTools::TabDescription const&, bool) const override;
+    virtual void traverse_the_history_by_delta(DevTools::TabDescription const&, int) const override;
     virtual void inspect_tab(DevTools::TabDescription const&, OnTabInspectionComplete) const override;
     virtual void inspect_accessibility_tree(DevTools::TabDescription const&, OnAccessibilityTreeInspectionComplete) const override;
     virtual void listen_for_dom_properties(DevTools::TabDescription const&, OnDOMNodePropertiesReceived) const override;
