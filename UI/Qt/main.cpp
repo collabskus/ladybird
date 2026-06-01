@@ -13,6 +13,9 @@
 #include <UI/Qt/BrowserWindow.h>
 #include <UI/Qt/Settings.h>
 
+#include <QCoreApplication>
+#include <QtGlobal>
+
 #if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
 #    include <QStyleHints>
 #endif
@@ -42,6 +45,12 @@ bool is_using_dark_system_theme(QWidget& widget)
 ErrorOr<int> ladybird_main(Main::Arguments arguments)
 {
     AK::set_rich_debug_enabled(true);
+
+#ifdef AK_OS_MACOS
+    // The web content view is a native QRhiWidget child. Keep it from forcing
+    // every sibling in the tab UI to become native as well.
+    QCoreApplication::setAttribute(Qt::AA_DontCreateNativeWidgetSiblings);
+#endif
 
     auto app = TRY(Ladybird::Application::create(arguments));
     WebView::BrowserProcess browser_process;

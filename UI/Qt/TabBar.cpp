@@ -55,7 +55,10 @@ static constexpr int VERTICAL_TABS_DEFAULT_EXPANDED_WIDTH = 232;
 static constexpr int VERTICAL_TABS_MIN_EXPANDED_WIDTH = 190;
 static constexpr int VERTICAL_TABS_MAX_EXPANDED_WIDTH = 400;
 static constexpr int VERTICAL_TABS_RESIZE_HIT_AREA_WIDTH = 5;
-static constexpr int VERTICAL_TABS_SIDE_MARGIN = 6;
+static constexpr int VERTICAL_TABS_COLLAPSED_SIDE_MARGIN = 6;
+static constexpr int VERTICAL_TABS_EXPANDED_SIDE_MARGIN = 5;
+static constexpr int VERTICAL_TAB_SHAPE_HORIZONTAL_INSET = 5;
+static constexpr int VERTICAL_TAB_CONTENT_HORIZONTAL_INSET = 8;
 static constexpr int TAB_ICON_SIZE = 16;
 static constexpr auto VERTICAL_TABS_EXPANDED_PROPERTY = "verticalTabsExpanded";
 static constexpr auto VERTICAL_TABS_RESIZE_HANDLE_HOVERED_PROPERTY = "hovered";
@@ -91,12 +94,17 @@ static void clear_layout(QLayout& layout)
         delete item;
 }
 
+static constexpr int vertical_tabs_side_margin(bool expanded)
+{
+    return expanded ? VERTICAL_TABS_EXPANDED_SIDE_MARGIN : VERTICAL_TABS_COLLAPSED_SIDE_MARGIN;
+}
+
 static constexpr int vertical_tab_width(int available_width, TabLayout tab_layout)
 {
     if (available_width > 0)
         return available_width;
     auto width = tab_layout == TabLayout::VerticalCollapsed ? VERTICAL_TABS_COLLAPSED_WIDTH : VERTICAL_TABS_DEFAULT_EXPANDED_WIDTH;
-    return width - (VERTICAL_TABS_SIDE_MARGIN * 2);
+    return width - (vertical_tabs_side_margin(tab_layout != TabLayout::VerticalCollapsed) * 2);
 }
 
 static constexpr int clamp_vertical_tabs_expanded_width(int width)
@@ -104,9 +112,23 @@ static constexpr int clamp_vertical_tabs_expanded_width(int width)
     return clamp(width, VERTICAL_TABS_MIN_EXPANDED_WIDTH, VERTICAL_TABS_MAX_EXPANDED_WIDTH);
 }
 
+static QRectF expanded_vertical_tab_shape_rect(QRectF const& rect)
+{
+    return rect.adjusted(VERTICAL_TAB_SHAPE_HORIZONTAL_INSET, 3.0, -VERTICAL_TAB_SHAPE_HORIZONTAL_INSET, -3.0);
+}
+
+static QRect expanded_vertical_tab_shape_rect(QRect const& rect)
+{
+    return rect.adjusted(VERTICAL_TAB_SHAPE_HORIZONTAL_INSET, 3, -VERTICAL_TAB_SHAPE_HORIZONTAL_INSET, -3);
+}
+
 class NewTabButton final : public QToolButton {
 public:
-    using QToolButton::QToolButton;
+    explicit NewTabButton(QTabBar& tab_bar, QWidget* parent)
+        : QToolButton(parent)
+        , m_tab_bar(tab_bar)
+    {
+    }
 
 private:
     virtual void paintEvent(QPaintEvent* event) override
@@ -121,7 +143,7 @@ private:
 
         auto dark = ChromeStyle::is_dark(palette());
         auto surface = ChromeStyle::chrome_surface(palette());
-        auto shape_rect = QRectF(rect()).adjusted(7.0, 3.0, -7.0, -3.0);
+        auto shape_rect = expanded_vertical_tab_shape_rect(QRectF(rect()));
         auto tab_path = tab_shape_path(shape_rect, 9.0, 9.0);
 
         if (isDown()) {
@@ -136,7 +158,7 @@ private:
             painter.drawPath(tab_path);
         }
 
-        auto contents_rect = shape_rect.toAlignedRect().adjusted(12, 0, -12, 0);
+        auto contents_rect = shape_rect.toAlignedRect().adjusted(VERTICAL_TAB_CONTENT_HORIZONTAL_INSET, 0, -VERTICAL_TAB_CONTENT_HORIZONTAL_INSET, 0);
         QRect icon_rect {
             contents_rect.left(),
             contents_rect.top() + ((contents_rect.height() - TAB_ICON_SIZE) / 2),
@@ -153,13 +175,16 @@ private:
         if (underMouse() || isDown())
             text_color = ChromeStyle::chrome_button_text(palette());
         painter.setPen(text_color);
-        painter.setFont(font());
+        auto text_font = m_tab_bar.font();
+        painter.setFont(text_font);
 
-        QFontMetrics font_metrics(font());
+        QFontMetrics font_metrics(text_font);
         auto title = font_metrics.elidedText(text(), Qt::ElideRight, max(0, contents_rect.width()));
         contents_rect.translate(0, -1);
         painter.drawText(contents_rect, Qt::AlignLeft | Qt::AlignVCenter, title);
     }
+
+    QTabBar& m_tab_bar;
 };
 
 TabBar::TabBar(TabWidget* tab_widget)
@@ -171,6 +196,7 @@ TabBar::TabBar(TabWidget* tab_widget)
     setFocusPolicy(Qt::NoFocus);
     setIconSize({ 16, 16 });
     setMinimumHeight(39);
+    recreate_icons();
 
     m_hover_animation = new QVariantAnimation(this);
     m_hover_animation->setDuration(120);
@@ -185,6 +211,7 @@ TabBar::TabBar(TabWidget* tab_widget)
     });
     connect(this, &QTabBar::currentChanged, this, [this](int index) {
         ensure_tab_visible(index);
+        update_tab_button_geometry();
     });
 }
 
@@ -226,6 +253,12 @@ void TabBar::refresh_tab_layout()
     set_vertical_scroll_offset(m_vertical_scroll_offset);
     updateGeometry();
     update_tab_button_geometry();
+    update();
+}
+
+void TabBar::recreate_icons()
+{
+    m_fallback_tab_icon = create_chrome_icon(ChromeIcon::Globe, palette());
     update();
 }
 
@@ -282,8 +315,6 @@ void TabBar::tabLayoutChange()
 
 void TabBar::paintEvent(QPaintEvent*)
 {
-    update_tab_button_geometry();
-
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing, true);
 
@@ -311,7 +342,7 @@ void TabBar::paintEvent(QPaintEvent*)
         if (is_collapsed_vertical)
             shape_rect = QRectF(tab_rect).adjusted(4.0, 3.0, -4.0, -3.0);
         else if (is_vertical)
-            shape_rect = QRectF(tab_rect).adjusted(7.0, 3.0, -7.0, -3.0);
+            shape_rect = expanded_vertical_tab_shape_rect(QRectF(tab_rect));
         else
             shape_rect = QRectF(tab_rect).adjusted(3.0, 2.0, -3.0, 1.0);
         auto tab_path = tab_shape_path(shape_rect, 9.0, is_vertical ? 9.0 : 8.0);
@@ -359,7 +390,7 @@ void TabBar::paintEvent(QPaintEvent*)
 
         auto icon = tabIcon(index);
         if (icon.isNull())
-            icon = create_chrome_icon(ChromeIcon::Globe, palette());
+            icon = m_fallback_tab_icon;
 
         if (is_collapsed_vertical) {
             QRect icon_rect {
@@ -372,7 +403,7 @@ void TabBar::paintEvent(QPaintEvent*)
             continue;
         }
 
-        auto contents_rect = shape_rect.toAlignedRect().adjusted(is_vertical ? 12 : 16, 0, is_vertical ? -12 : -14, 0);
+        auto contents_rect = shape_rect.toAlignedRect().adjusted(is_vertical ? VERTICAL_TAB_CONTENT_HORIZONTAL_INSET : 16, 0, is_vertical ? -VERTICAL_TAB_CONTENT_HORIZONTAL_INSET : -14, 0);
         if (auto* left_button = tabButton(index, QTabBar::LeftSide); left_button && left_button->isVisible())
             contents_rect.setLeft(max(contents_rect.left(), left_button->geometry().right() + 6));
         if (auto* right_button = tabButton(index, QTabBar::RightSide); right_button && right_button->isVisible())
@@ -516,11 +547,7 @@ void TabBar::mousePressEvent(QMouseEvent* event)
 
 void TabBar::mouseMoveEvent(QMouseEvent* event)
 {
-    if (auto hovered_tab = tab_index_at(event->pos()); hovered_tab != m_hovered_tab_index) {
-        m_hovered_tab_index = hovered_tab;
-        start_hover_animation(hovered_tab, hovered_tab >= 0 ? 1.0 : 0.0);
-        update();
-    }
+    set_hovered_tab_index(tab_index_at(event->pos()));
 
     if (count() == 0) {
         if (tab_layout() == TabLayout::Horizontal)
@@ -547,10 +574,7 @@ void TabBar::mouseMoveEvent(QMouseEvent* event)
 
 void TabBar::leaveEvent(QEvent* event)
 {
-    auto previous_hovered_tab = m_hovered_tab_index;
-    m_hovered_tab_index = -1;
-    start_hover_animation(previous_hovered_tab, 0.0);
-    update();
+    set_hovered_tab_index(-1);
     QTabBar::leaveEvent(event);
 }
 
@@ -798,16 +822,36 @@ void TabBar::ensure_tab_visible(int index)
         set_vertical_scroll_offset(tab_bottom - height());
 }
 
+void TabBar::set_hovered_tab_index(int index)
+{
+    if (m_hovered_tab_index == index)
+        return;
+
+    auto previous_hovered_tab = m_hovered_tab_index;
+    m_hovered_tab_index = index;
+    update_tab_button_geometry();
+    start_hover_animation(index >= 0 ? index : previous_hovered_tab, index >= 0 ? 1.0 : 0.0);
+    update();
+}
+
 void TabBar::update_tab_button_geometry()
 {
     if (tab_layout() == TabLayout::Horizontal || tab_layout() == TabLayout::VerticalCollapsed)
         return;
 
+    // Keep this out of paintEvent(): setVisible(), setGeometry(), and raise()
+    // dirty child widgets, and doing that while painting can schedule another
+    // tab bar repaint before the current one has finished flushing.
     auto place_button = [&](int index, QTabBar::ButtonPosition position, QRect shape_rect) {
         auto* button = tabButton(index, position);
         if (!button)
             return;
-        button->setVisible(position != QTabBar::RightSide || index == currentIndex() || index == m_hovered_tab_index);
+        auto should_be_visible = position != QTabBar::RightSide || index == currentIndex() || index == m_hovered_tab_index;
+        bool did_update_button = false;
+        if (button->isVisible() != should_be_visible) {
+            button->setVisible(should_be_visible);
+            did_update_button = true;
+        }
 
         auto button_size = button->size();
         if (button_size.isEmpty())
@@ -817,8 +861,14 @@ void TabBar::update_tab_button_geometry()
 
         auto x = position == QTabBar::RightSide ? shape_rect.right() - button_size.width() - 6 : shape_rect.left() + 6;
         auto y = shape_rect.top() + ((shape_rect.height() - button_size.height()) / 2);
-        button->setGeometry({ { x, y }, button_size });
-        button->raise();
+        QRect button_geometry { { x, y }, button_size };
+        if (button->geometry() != button_geometry) {
+            button->setGeometry(button_geometry);
+            did_update_button = true;
+        }
+
+        if (did_update_button)
+            button->raise();
     };
 
     for (int index = 0; index < count(); ++index) {
@@ -826,7 +876,7 @@ void TabBar::update_tab_button_geometry()
         if (!tab_rect.isValid())
             continue;
 
-        auto shape_rect = tab_rect.adjusted(7, 3, -7, -3);
+        auto shape_rect = expanded_vertical_tab_shape_rect(tab_rect);
         place_button(index, QTabBar::LeftSide, shape_rect);
         place_button(index, QTabBar::RightSide, shape_rect);
     }
@@ -868,7 +918,7 @@ TabWidget::TabWidget(QWidget* parent)
 
     m_stacked_widget = new QStackedWidget(this);
 
-    m_new_tab_button = new NewTabButton(this);
+    m_new_tab_button = new NewTabButton(*m_tab_bar, this);
     m_new_tab_button->setObjectName("LadybirdNewTabButton");
     m_new_tab_button->setIconSize(QSize(18, 18));
     m_new_tab_button->setFixedSize(32, 32);
@@ -1280,7 +1330,8 @@ void TabWidget::rebuild_layout_for_vertical_tabs()
     m_vertical_tab_bar_column->setFixedWidth(side_bar_width);
 
     m_vertical_tab_bar_column_layout->setSpacing(m_vertical_tabs_expanded ? 0 : 4);
-    m_vertical_tab_bar_column_layout->setContentsMargins(VERTICAL_TABS_SIDE_MARGIN, 8, VERTICAL_TABS_SIDE_MARGIN, 8);
+    auto side_margin = vertical_tabs_side_margin(m_vertical_tabs_expanded);
+    m_vertical_tab_bar_column_layout->setContentsMargins(side_margin, 8, side_margin, 8);
 
     m_new_tab_button->setToolButtonStyle(m_vertical_tabs_expanded ? Qt::ToolButtonTextBesideIcon : Qt::ToolButtonIconOnly);
     update_vertical_tabs_action_labels();
@@ -1366,7 +1417,7 @@ void TabWidget::update_tab_layout()
     if (m_tab_bar->tab_layout() != TabLayout::Horizontal) {
         auto side_bar_width = current_vertical_tabs_width();
         m_vertical_tab_bar_column->setFixedWidth(side_bar_width);
-        m_tab_bar->set_available_width(side_bar_width - (VERTICAL_TABS_SIDE_MARGIN * 2));
+        m_tab_bar->set_available_width(side_bar_width - (vertical_tabs_side_margin(m_vertical_tabs_expanded) * 2));
         update_vertical_tabs_resize_handle();
         return;
     }
@@ -1413,6 +1464,7 @@ void TabWidget::update_tab_chrome_visibility()
 
 void TabWidget::recreate_icons()
 {
+    m_tab_bar->recreate_icons();
     m_new_tab_button->setIcon(create_chrome_icon(ChromeIcon::NewTab, palette()));
     update_vertical_tabs_action_labels();
     update_window_button_icons();

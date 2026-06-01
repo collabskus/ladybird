@@ -55,6 +55,7 @@ public:
     TabLayout tab_layout() const { return m_tab_layout; }
     void set_tab_layout(TabLayout);
     void refresh_tab_layout();
+    void recreate_icons();
 
 private:
     virtual QSize sizeHint() const override;
@@ -92,6 +93,7 @@ private:
     int max_vertical_scroll_offset() const;
     void set_vertical_scroll_offset(int);
 
+    void set_hovered_tab_index(int);
     void ensure_tab_visible(int index);
     void update_tab_button_geometry();
 
@@ -105,6 +107,7 @@ private:
     qreal m_hover_progress { 0.0 };
     int m_drop_indicator_index { -1 };
     QVariantAnimation* m_hover_animation { nullptr };
+    QIcon m_fallback_tab_icon;
     QPointer<Tab> m_pressed_tab;
     QPoint m_position_in_selected_tab_while_dragging;
     QPoint m_drag_start_position;
