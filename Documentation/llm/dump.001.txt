@@ -456573,11 +456573,9 @@ Optional<StyleProperty> CSSStyleProperties::get_direct_property(PropertyNameAndI
         if (abstract_element.document().element_needs_style_update(abstract_element))
             abstract_element.document().update_style_for_element(abstract_element);
 
-        // Size container queries need layout to resolve. Avoid forcing layout for every getComputedStyle() call in
-        // a scope with size queries; only elements that actually matched a potentially relevant rule need the
-        // post-layout style.
-        bool const needs_layout_for_container_queries = abstract_element.style_scope().have_size_container_queries()
-            && abstract_element.element().style_depends_on_size_container_query()
+        // Container queries and container-relative units need layout to resolve. Avoid forcing layout for every
+        // getComputedStyle() call; only elements that actually depend on a query container need the post-layout style.
+        bool const needs_layout_for_container_queries = abstract_element.element().style_depends_on_size_container_query()
             && !abstract_element.document().layout_is_up_to_date();
         if (needs_layout_for_container_queries) {
             abstract_element.document().update_layout(DOM::UpdateLayoutReason::ResolvedCSSStyleDeclarationProperty);
@@ -457972,6 +457970,7 @@ FILE: Libraries/LibWeb/CSS/CSSStyleSheet.cpp
 #include <LibWeb/CSS/CSSImportRule.h>
 #include <LibWeb/CSS/CSSKeyframesRule.h>
 #include <LibWeb/CSS/CSSNestedDeclarations.h>
+#include <LibWeb/CSS/CSSScopeRule.h>
 #include <LibWeb/CSS/CSSStyleRule.h>
 #include <LibWeb/CSS/CSSStyleSheet.h>
 #include <LibWeb/CSS/FontComputer.h>
@@ -458421,17 +458420,31 @@ SelectorInsights const& CSSStyleSheet::selector_insights() const
         return *m_selector_insights;
 
     SelectorInsights insights;
-    for_each_effective_style_producing_rule([&](auto const& rule) {
-        SelectorList const& absolutized_selectors = [&]() -> SelectorList const& {
-            if (rule.type() == CSSRule::Type::Style)
-                return static_cast<CSSStyleRule const&>(rule).absolutized_selectors();
-            if (rule.type() == CSSRule::Type::NestedDeclarations)
-                return static_cast<CSSNestedDeclarations const&>(rule).absolutized_selectors();
-            VERIFY_NOT_REACHED();
-        }();
+    for_each_effective_rule(TraversalOrder::Preorder, [&](CSSRule const& rule) {
+        auto collect_selector_list = [&](SelectorList const& selectors) {
+            for (auto const& selector : selectors)
+                StyleScope::collect_selector_insights(selector, insights);
+        };
+        auto collect_optional_selector_list = [&](Optional<SelectorList> const& selectors) {
+            if (!selectors.has_value())
+                return;
+            collect_selector_list(*selectors);
+        };
 
-        for (auto const& selector : absolutized_selectors)
-            StyleScope::collect_selector_insights(selector, insights);
+        if (rule.type() == CSSRule::Type::Scope) {
+            auto const& scope_rule = as<CSSScopeRule>(rule);
+            collect_optional_selector_list(scope_rule.start_selectors_for_matching());
+            collect_optional_selector_list(scope_rule.end_selectors_for_matching());
+            return;
+        }
+
+        if (rule.type() == CSSRule::Type::Style) {
+            collect_selector_list(static_cast<CSSStyleRule const&>(rule).absolutized_selectors());
+            return;
+        }
+
+        if (rule.type() == CSSRule::Type::NestedDeclarations)
+            collect_selector_list(static_cast<CSSNestedDeclarations const&>(rule).absolutized_selectors());
     });
     m_selector_insights = insights;
     return *m_selector_insights;
@@ -474714,8 +474727,10 @@ void invalidate_element_if_affected_by_has(DOM::Element& element)
 {
     if (element.affected_by_has_pseudo_class_in_subject_position())
         element.set_needs_style_update(true);
-    if (element.affected_by_has_pseudo_class_in_non_subject_position())
+    if (element.affected_by_has_pseudo_class_in_subject_position()
+        || element.affected_by_has_pseudo_class_in_non_subject_position()) {
         element.invalidate_style(DOM::StyleInvalidationReason::Other, { { InvalidationSet::Property::Type::PseudoClass, PseudoClass::Has } }, {});
+    }
 }
 
 static bool is_in_has_scope(DOM::Element const& element)
@@ -477717,26 +477732,100 @@ FILE: Libraries/LibWeb/CSS/Length.cpp
 /*
  * Copyright (c) 2020-2024, Andreas Kling <andreas@ladybird.org>
  * Copyright (c) 2021, Tobias Christiansen <tobyase@serenityos.org>
- * Copyright (c) 2022-2025, Sam Atkins <sam@ladybird.org>
+ * Copyright (c) 2022-2026, Sam Atkins <sam@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
 #include <AK/NonnullOwnPtr.h>
 #include <AK/Variant.h>
+#include <LibGC/Cell.h>
 #include <LibGfx/Font/Font.h>
 #include <LibGfx/Rect.h>
 #include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/FontComputer.h>
 #include <LibWeb/CSS/Length.h>
 #include <LibWeb/CSS/Percentage.h>
+#include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/Document.h>
-#include <LibWeb/HTML/BrowsingContext.h>
+#include <LibWeb/DOM/Element.h>
 #include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/Layout/Node.h>
+#include <LibWeb/Painting/PaintableBox.h>
 
 namespace Web::CSS {
+
+void Length::ResolutionContext::visit_edges(GC::Cell::Visitor& visitor) const
+{
+    visitor.visit(subject_element);
+    visitor.visit(cached_width_query_container);
+    visitor.visit(cached_height_query_container);
+}
+
+enum class ContainerRelativeAxis {
+    Width,
+    Height,
+};
+
+static bool inline_axis_is_horizontal(WritingMode writing_mode)
+{
+    return writing_mode == WritingMode::HorizontalTb;
+}
+
+static ContainerRelativeAxis logical_axis_to_physical_axis(bool inline_axis_is_horizontal, ContainerRelativeAxis logical_axis)
+{
+    if (inline_axis_is_horizontal)
+        return logical_axis;
+    return logical_axis == ContainerRelativeAxis::Width ? ContainerRelativeAxis::Height : ContainerRelativeAxis::Width;
+}
+
+static bool query_container_is_eligible_for_axis(DOM::Element const& container, ContainerRelativeAxis axis)
+{
+    auto style = container.computed_properties();
+    if (!style)
+        return false;
+
+    auto container_type = style->container_type();
+    auto container_inline_axis_is_horizontal = inline_axis_is_horizontal(style->writing_mode());
+
+    if (axis == ContainerRelativeAxis::Width) {
+        if (container_inline_axis_is_horizontal)
+            return container_type.is_size_container || container_type.is_inline_size_container;
+        return container_type.is_size_container;
+    }
+
+    if (container_inline_axis_is_horizontal)
+        return container_type.is_size_container;
+    return container_type.is_size_container || container_type.is_inline_size_container;
+}
+
+static DOM::Element const* nearest_query_container_for_axis(DOM::Element const& subject, ContainerRelativeAxis axis)
+{
+    for (auto const* container = subject.flat_tree_parent_element(); container; container = container->flat_tree_parent_element()) {
+        if (query_container_is_eligible_for_axis(*container, axis))
+            return container;
+    }
+    return nullptr;
+}
+
+static Optional<GC::Ptr<DOM::Element const>>& cached_query_container_for_axis(Length::ResolutionContext const& context, ContainerRelativeAxis axis)
+{
+    if (axis == ContainerRelativeAxis::Width)
+        return context.cached_width_query_container;
+    return context.cached_height_query_container;
+}
+
+static GC::Ptr<DOM::Element const> get_or_compute_query_container_for_axis(Length::ResolutionContext const& context, ContainerRelativeAxis axis)
+{
+    auto& cached_query_container = cached_query_container_for_axis(context, axis);
+    if (!cached_query_container.has_value()) {
+        cached_query_container = nullptr;
+        if (context.subject_element)
+            cached_query_container = nearest_query_container_for_axis(*context.subject_element, axis);
+    }
+    return cached_query_container.value();
+}
 
 Length::FontMetrics::FontMetrics(CSSPixels font_size, Gfx::FontPixelMetrics const& pixel_metrics, CSSPixels line_height)
     : font_size(font_size)
@@ -477838,6 +477927,69 @@ double Length::viewport_relative_length_to_px_without_rounding(CSSPixelRect cons
     }
 }
 
+double Length::container_relative_length_to_px_without_rounding(ResolutionContext const& context) const
+{
+    // https://drafts.csswg.org/css-conditional-5/#container-lengths
+    auto resolve_physical_axis_basis_length = [&](ContainerRelativeAxis physical_axis) {
+        // The query container for each axis is the nearest ancestor container that accepts container size queries on
+        // that axis. If no eligible query container is available, then use the small viewport size for that axis.
+        if (!context.subject_element) {
+            context.record_viewport_relative_length_resolution();
+            auto viewport_length = physical_axis == ContainerRelativeAxis::Width ? context.viewport_rect.width() : context.viewport_rect.height();
+            return viewport_length.to_double();
+        }
+
+        auto& subject = *context.subject_element;
+        const_cast<DOM::Element&>(subject).set_style_depends_on_size_container_query();
+
+        auto query_container = get_or_compute_query_container_for_axis(context, physical_axis);
+        if (!query_container) {
+            context.record_viewport_relative_length_resolution();
+            auto viewport_length = physical_axis == ContainerRelativeAxis::Width ? context.viewport_rect.width() : context.viewport_rect.height();
+            return viewport_length.to_double();
+        }
+
+        auto paintable_box = query_container->unsafe_paintable_box();
+        if (!paintable_box) {
+            if (!subject.document().layout_is_up_to_date())
+                const_cast<DOM::Document&>(subject.document()).set_needs_container_query_evaluation_after_layout(*query_container);
+            return 0.0;
+        }
+
+        auto container_length = physical_axis == ContainerRelativeAxis::Width ? paintable_box->content_width() : paintable_box->content_height();
+        return container_length.to_double();
+    };
+
+    auto resolve_physical_axis_length = [&](ContainerRelativeAxis physical_axis) {
+        return resolve_physical_axis_basis_length(physical_axis) * m_value / 100;
+    };
+
+    auto resolve_logical_axis_basis_length = [&](ContainerRelativeAxis logical_axis) {
+        return resolve_physical_axis_basis_length(logical_axis_to_physical_axis(context.subject_inline_axis_is_horizontal, logical_axis));
+    };
+
+    auto resolve_logical_axis_length = [&](ContainerRelativeAxis logical_axis) {
+        return resolve_logical_axis_basis_length(logical_axis) * m_value / 100;
+    };
+
+    switch (m_unit) {
+    case LengthUnit::Cqw:
+        return resolve_physical_axis_length(ContainerRelativeAxis::Width);
+    case LengthUnit::Cqh:
+        return resolve_physical_axis_length(ContainerRelativeAxis::Height);
+    case LengthUnit::Cqi:
+        return resolve_logical_axis_length(ContainerRelativeAxis::Width);
+    case LengthUnit::Cqb:
+        return resolve_logical_axis_length(ContainerRelativeAxis::Height);
+    case LengthUnit::Cqmin:
+        return min(resolve_logical_axis_basis_length(ContainerRelativeAxis::Width), resolve_logical_axis_basis_length(ContainerRelativeAxis::Height)) * m_value / 100;
+    case LengthUnit::Cqmax:
+        return max(resolve_logical_axis_basis_length(ContainerRelativeAxis::Width), resolve_logical_axis_basis_length(ContainerRelativeAxis::Height)) * m_value / 100;
+    default:
+        VERIFY_NOT_REACHED();
+    }
+}
+
 Length::ResolutionContext Length::ResolutionContext::for_element(DOM::AbstractElement const& element)
 {
     auto const* root_element = element.element().document().document_element();
@@ -477852,6 +478004,8 @@ Length::ResolutionContext Length::ResolutionContext::for_element(DOM::AbstractEl
         .root_font_metrics = { root_element->computed_properties()->font_size(), root_element->computed_properties()->first_available_computed_font(element.document().font_computer())->pixel_metrics(), element.computed_properties()->line_height() },
         .font_metrics_depend_on_viewport_metrics = element.computed_properties()->font_metrics_depend_on_viewport_metrics(),
         .root_font_metrics_depend_on_viewport_metrics = root_element->computed_properties()->font_metrics_depend_on_viewport_metrics(),
+        .subject_inline_axis_is_horizontal = inline_axis_is_horizontal(element.computed_properties()->writing_mode()),
+        .subject_element = &element.element(),
     };
 }
 
@@ -477869,12 +478023,14 @@ Length::ResolutionContext Length::ResolutionContext::for_document(DOM::Document 
         .viewport_rect = viewport_rect,
         .font_metrics = font_metrics,
         .root_font_metrics = font_metrics,
+        .subject_inline_axis_is_horizontal = true,
     };
 }
 
 Length::ResolutionContext Length::ResolutionContext::for_layout_node(Layout::Node const& node)
 {
     Layout::Node const* root_layout_node;
+    DOM::Element const* subject_element = nullptr;
 
     if (is<DOM::Document>(node.dom_node())) {
         root_layout_node = &node;
@@ -477886,10 +478042,15 @@ Length::ResolutionContext Length::ResolutionContext::for_layout_node(Layout::Nod
         root_layout_node = root_element->unsafe_layout_node();
     }
 
+    if (auto const* dom_node = node.dom_node(); dom_node && is<DOM::Element>(*dom_node))
+        subject_element = &as<DOM::Element>(*dom_node);
+
     return Length::ResolutionContext {
         .viewport_rect = node.navigable()->viewport_rect(),
         .font_metrics = { node.computed_values().font_size(), node.first_available_font().pixel_metrics(), node.computed_values().line_height() },
         .root_font_metrics = { root_layout_node->computed_values().font_size(), root_layout_node->first_available_font().pixel_metrics(), node.computed_values().line_height() },
+        .subject_inline_axis_is_horizontal = inline_axis_is_horizontal(node.computed_values().writing_mode()),
+        .subject_element = subject_element,
     };
 }
 
@@ -477902,30 +478063,7 @@ CSSPixels Length::to_px_slow_case(Layout::Node const& layout_node) const
 {
     if (!layout_node.document().browsing_context())
         return 0;
-
-    if (is_font_relative()) {
-        auto* root_element = layout_node.document().document_element();
-        // NB: Called during CSS length resolution, which may happen during style recalculation.
-        if (!root_element || !root_element->unsafe_layout_node())
-            return 0;
-
-        FontMetrics font_metrics {
-            layout_node.computed_values().font_size(),
-            layout_node.first_available_font().pixel_metrics(),
-            layout_node.computed_values().line_height()
-        };
-        FontMetrics root_font_metrics {
-            root_element->unsafe_layout_node()->computed_values().font_size(),
-            root_element->unsafe_layout_node()->first_available_font().pixel_metrics(),
-            layout_node.computed_values().line_height()
-        };
-
-        return font_relative_length_to_px(font_metrics, root_font_metrics);
-    }
-
-    VERIFY(is_viewport_relative());
-    auto const& viewport_rect = layout_node.document().viewport_rect();
-    return viewport_relative_length_to_px(viewport_rect);
+    return to_px(ResolutionContext::for_layout_node(layout_node));
 }
 
 void Length::serialize(StringBuilder& builder, SerializationMode serialization_mode) const
@@ -478011,7 +478149,7 @@ Length Length::resolve_calculated(NonnullRefPtr<CalculatedStyleValue const> cons
 FILE: Libraries/LibWeb/CSS/Length.h
 /*
  * Copyright (c) 2018-2024, Andreas Kling <andreas@ladybird.org>
- * Copyright (c) 2021-2025, Sam Atkins <sam@ladybird.org>
+ * Copyright (c) 2021-2026, Sam Atkins <sam@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -478020,6 +478158,8 @@ FILE: Libraries/LibWeb/CSS/Length.h
 
 #include <AK/String.h>
 #include <AK/StringBuilder.h>
+#include <LibGC/Cell.h>
+#include <LibGC/Ptr.h>
 #include <LibGfx/Forward.h>
 #include <LibGfx/Rect.h>
 #include <LibWeb/CSS/SerializationMode.h>
@@ -478059,10 +478199,10 @@ public:
 
     bool is_absolute() const { return CSS::is_absolute(m_unit); }
     bool is_font_relative() const { return CSS::is_font_relative(m_unit); }
+    bool is_container_relative() const { return CSS::is_container_relative(m_unit); }
     bool is_viewport_relative() const { return CSS::is_viewport_relative(m_unit); }
     bool is_relative() const { return CSS::is_relative(m_unit); }
-    // FIXME: Mark container query units as not computationally independent once we support them
-    bool is_computationally_independent() const { return !is_font_relative(); }
+    bool is_computationally_independent() const { return !is_font_relative() && !is_container_relative(); }
 
     double raw_value() const { return m_value; }
     LengthUnit unit() const { return m_unit; }
@@ -478078,6 +478218,10 @@ public:
         FontMetrics root_font_metrics;
         bool font_metrics_depend_on_viewport_metrics { false };
         bool root_font_metrics_depend_on_viewport_metrics { false };
+        bool subject_inline_axis_is_horizontal { true };
+        GC::Ptr<DOM::Element const> subject_element { nullptr };
+        mutable Optional<GC::Ptr<DOM::Element const>> cached_width_query_container {};
+        mutable Optional<GC::Ptr<DOM::Element const>> cached_height_query_container {};
 
         void set_did_resolve_viewport_relative_length(bool& did_resolve_viewport_relative_length) const
         {
@@ -478125,8 +478269,12 @@ public:
                 && font_metrics == other.font_metrics
                 && root_font_metrics == other.root_font_metrics
                 && font_metrics_depend_on_viewport_metrics == other.font_metrics_depend_on_viewport_metrics
-                && root_font_metrics_depend_on_viewport_metrics == other.root_font_metrics_depend_on_viewport_metrics;
+                && root_font_metrics_depend_on_viewport_metrics == other.root_font_metrics_depend_on_viewport_metrics
+                && subject_inline_axis_is_horizontal == other.subject_inline_axis_is_horizontal
+                && subject_element == other.subject_element;
         }
+
+        void visit_edges(GC::Cell::Visitor&) const;
 
         mutable bool* m_did_resolve_viewport_relative_length { nullptr };
     };
@@ -478152,6 +478300,8 @@ public:
             context.record_viewport_relative_length_resolution();
             return viewport_relative_length_to_px_without_rounding(context.viewport_rect);
         }
+        if (is_container_relative())
+            return container_relative_length_to_px_without_rounding(context);
 
         VERIFY_NOT_REACHED();
     }
@@ -478164,6 +478314,14 @@ public:
             return font_relative_length_to_px(font_metrics, root_font_metrics);
         if (is_viewport_relative())
             return viewport_relative_length_to_px(viewport_rect);
+        if (is_container_relative()) {
+            ResolutionContext context {
+                .viewport_rect = viewport_rect,
+                .font_metrics = font_metrics,
+                .root_font_metrics = root_font_metrics,
+            };
+            return CSSPixels::nearest_value_for(container_relative_length_to_px_without_rounding(context));
+        }
 
         VERIFY_NOT_REACHED();
     }
@@ -478190,6 +478348,7 @@ public:
     double font_relative_length_to_px_without_rounding(FontMetrics const& font_metrics, FontMetrics const& root_font_metrics) const;
     CSSPixels viewport_relative_length_to_px(CSSPixelRect const& viewport_rect) const;
     double viewport_relative_length_to_px_without_rounding(CSSPixelRect const& viewport_rect) const;
+    double container_relative_length_to_px_without_rounding(ResolutionContext const&) const;
 
     // Returns empty optional if it's already absolute.
     Optional<Length> absolutize(ResolutionContext const&) const;
@@ -517338,12 +517497,13 @@ Vector<HasInvalidationMetadata> const* StyleComputer::has_invalidation_metadata_
     return nullptr;
 }
 
-static bool scope_selector_matches(Selector const& selector, DOM::Element const& element, MatchingRule const& rule, GC::Ptr<DOM::Element const> shadow_host, GC::Ptr<DOM::ShadowRoot const> rule_root, GC::Ptr<DOM::ParentNode const> scope)
+static bool scope_selector_matches(Selector const& selector, DOM::Element const& element, DOM::Element const& subject, MatchingRule const& rule, GC::Ptr<DOM::Element const> shadow_host, GC::Ptr<DOM::ShadowRoot const> rule_root, GC::Ptr<DOM::ParentNode const> scope)
 {
     SelectorEngine::MatchContext context {
         .style_sheet_for_rule = *rule.sheet,
-        .subject = element,
+        .subject = subject,
         .rule_shadow_root = rule_root,
+        .collect_per_element_selector_involvement_metadata = true,
     };
     return SelectorEngine::matches(selector, DOM::AbstractElement(element), shadow_host, context, scope);
 }
@@ -517366,7 +517526,7 @@ static Optional<ResolvedScope> resolve_single_scope(DOM::AbstractElement abstrac
             if (outer_root && !outer_root->is_inclusive_ancestor_of(*candidate))
                 break;
             for (auto const& selector : *scope_rule.start_selectors_for_matching()) {
-                if (scope_selector_matches(selector, *candidate, rule, shadow_host, rule_root, outer_root)) {
+                if (scope_selector_matches(selector, *candidate, abstract_element.element(), rule, shadow_host, rule_root, outer_root)) {
                     root = candidate;
                     break;
                 }
@@ -517410,7 +517570,7 @@ static Optional<ResolvedScope> resolve_single_scope(DOM::AbstractElement abstrac
     if (scope_rule.end_selectors_for_matching().has_value()) {
         for (auto const* candidate = &abstract_element.element(); candidate; candidate = candidate->parent_element().ptr()) {
             for (auto const& selector : *scope_rule.end_selectors_for_matching()) {
-                if (scope_selector_matches(selector, *candidate, rule, shadow_host, rule_root, root))
+                if (scope_selector_matches(selector, *candidate, abstract_element.element(), rule, shadow_host, rule_root, root))
                     return {};
             }
             if (candidate == root)
@@ -518792,6 +518952,16 @@ void StyleComputer::compute_property_values(ComputedProperties& style, Optional<
 
 ComputationContext const& StyleComputer::get_computation_context_for_property(PropertyID property_id, ComputedProperties const& style, Optional<DOM::AbstractElement> abstract_element) const
 {
+    auto subject_inline_axis_is_horizontal = [&]() {
+        if (!abstract_element.has_value())
+            return true;
+        if (auto computed_properties = abstract_element->computed_properties(); computed_properties)
+            return computed_properties->writing_mode() == WritingMode::HorizontalTb;
+        if (auto inheritance_parent = abstract_element->element_to_inherit_style_from(); inheritance_parent.has_value() && inheritance_parent->computed_properties())
+            return inheritance_parent->computed_properties()->writing_mode() == WritingMode::HorizontalTb;
+        return true;
+    }();
+
     switch (property_id) {
     // FIXME: While `color-scheme` doesn't actually require a computation context (since it only takes keyword values)
     //        we still try to generate one in `compute_property_values()` and since we need `color-scheme` to be
@@ -518817,11 +518987,14 @@ ComputationContext const& StyleComputer::get_computation_context_for_property(Pr
     case PropertyID::TextRendering: {
         if (!m_cached_font_computation_context.has_value()) {
             auto inheritance_parent = abstract_element.map([](auto& element) { return element.element_to_inherit_style_from(); }).value_or(OptionalNone {});
+            auto length_resolution_context = inheritance_parent.has_value()
+                ? Length::ResolutionContext::for_element(inheritance_parent.value())
+                : Length::ResolutionContext::for_document(m_document);
+            length_resolution_context.subject_inline_axis_is_horizontal = subject_inline_axis_is_horizontal;
+            length_resolution_context.subject_element = abstract_element.has_value() ? &abstract_element->element() : nullptr;
 
             m_cached_font_computation_context = {
-                .length_resolution_context = inheritance_parent.has_value()
-                    ? Length::ResolutionContext::for_element(inheritance_parent.value())
-                    : Length::ResolutionContext::for_document(m_document),
+                .length_resolution_context = length_resolution_context,
                 .abstract_element = abstract_element
             };
         }
@@ -518849,6 +519022,8 @@ ComputationContext const& StyleComputer::get_computation_context_for_property(Pr
                     .root_font_metrics_depend_on_viewport_metrics = abstract_element.has_value() && abstract_element->element().is_html_html_element()
                         ? style.font_metrics_depend_on_viewport_metrics()
                         : m_root_element_font_metrics_depend_on_viewport_metrics,
+                    .subject_inline_axis_is_horizontal = subject_inline_axis_is_horizontal,
+                    .subject_element = abstract_element.has_value() ? &abstract_element->element() : nullptr,
                 },
                 .abstract_element = abstract_element
             };
@@ -518868,6 +519043,8 @@ ComputationContext const& StyleComputer::get_computation_context_for_property(Pr
                     .root_font_metrics = m_root_element_font_metrics,
                     .font_metrics_depend_on_viewport_metrics = style.font_metrics_depend_on_viewport_metrics(),
                     .root_font_metrics_depend_on_viewport_metrics = abstract_element.has_value() && abstract_element->element().is_html_html_element() ? style.font_metrics_depend_on_viewport_metrics() : m_root_element_font_metrics_depend_on_viewport_metrics,
+                    .subject_inline_axis_is_horizontal = subject_inline_axis_is_horizontal,
+                    .subject_element = abstract_element.has_value() ? &abstract_element->element() : nullptr,
                 },
                 .abstract_element = abstract_element,
                 .color_scheme = style.color_scheme(document().page().preferred_color_scheme(), document().supported_color_schemes())
@@ -519380,6 +519557,8 @@ RefPtr<StyleValue const> StyleComputer::recascade_font_size_if_needed(DOM::Abstr
             .root_font_metrics = m_root_element_font_metrics,
             .font_metrics_depend_on_viewport_metrics = current_size_depends_on_viewport_metrics || inherited_font_metrics_depend_on_viewport_metrics,
             .root_font_metrics_depend_on_viewport_metrics = m_root_element_font_metrics_depend_on_viewport_metrics,
+            .subject_inline_axis_is_horizontal = ancestor.computed_properties()->writing_mode() == WritingMode::HorizontalTb,
+            .subject_element = &ancestor.element(),
         };
         resolution_context.set_did_resolve_viewport_relative_length(did_resolve_viewport_relative_length);
         current_size_in_px = font_size_value->as_length().length().to_px(resolution_context);
@@ -521311,7 +521490,7 @@ static bool selector_contains_featureless_subtree_sensitive_selector(Selector co
     return false;
 }
 
-static InvalidationSet build_invalidation_sets_for_selector_impl(StyleInvalidationData& style_invalidation_data, Selector const& selector, InsideNthChildPseudoClass inside_nth_child_pseudo_class);
+static InvalidationSet build_invalidation_sets_for_selector_impl(StyleInvalidationData& style_invalidation_data, Selector const& selector, InsideNthChildPseudoClass inside_nth_child_pseudo_class, InvalidationPlan const& root_invalidation_plan);
 
 static void add_invalidation_sets_to_cover_scope_leakage_of_relative_selector_in_has_pseudo_class(Selector const& selector, StyleInvalidationData& style_invalidation_data);
 
@@ -521321,6 +521500,7 @@ static bool should_register_invalidation_property(InvalidationSet::Property cons
 }
 
 static void collect_guard_properties_for_simple_selector(Selector::SimpleSelector const&, InvalidationSet&);
+static void build_invalidation_sets_for_simple_selector_impl(Selector::SimpleSelector const&, InvalidationSet&, ExcludePropertiesNestedInNotPseudoClass, StyleInvalidationData&, InsideNthChildPseudoClass, InvalidationPlan const&);
 
 static Optional<InvalidationSet> build_invalidation_guard_property_set_for_selector_subject(Selector const& selector)
 {
@@ -521377,11 +521557,11 @@ static InvalidationGuard build_invalidation_guard_for_simple_selectors(Vector<Se
     return guard;
 }
 
-static InvalidationSet build_invalidation_set_for_simple_selectors(Vector<Selector::SimpleSelector const&> const& simple_selectors, ExcludePropertiesNestedInNotPseudoClass exclude_properties_nested_in_not_pseudo_class, StyleInvalidationData& style_invalidation_data, InsideNthChildPseudoClass inside_nth_child_pseudo_class)
+static InvalidationSet build_invalidation_set_for_simple_selectors(Vector<Selector::SimpleSelector const&> const& simple_selectors, ExcludePropertiesNestedInNotPseudoClass exclude_properties_nested_in_not_pseudo_class, StyleInvalidationData& style_invalidation_data, InsideNthChildPseudoClass inside_nth_child_pseudo_class, InvalidationPlan const& root_invalidation_plan)
 {
     InvalidationSet invalidation_set;
     for (auto const& simple_selector : simple_selectors)
-        build_invalidation_sets_for_simple_selector(simple_selector, invalidation_set, exclude_properties_nested_in_not_pseudo_class, style_invalidation_data, inside_nth_child_pseudo_class);
+        build_invalidation_sets_for_simple_selector_impl(simple_selector, invalidation_set, exclude_properties_nested_in_not_pseudo_class, style_invalidation_data, inside_nth_child_pseudo_class, root_invalidation_plan);
     return invalidation_set;
 }
 
@@ -521466,7 +521646,7 @@ static NonnullRefPtr<InvalidationPlan> build_invalidation_for_combinator(Selecto
     return invalidation;
 }
 
-void build_invalidation_sets_for_simple_selector(Selector::SimpleSelector const& selector, InvalidationSet& invalidation_set, ExcludePropertiesNestedInNotPseudoClass exclude_properties_nested_in_not_pseudo_class, StyleInvalidationData& style_invalidation_data, InsideNthChildPseudoClass inside_nth_child_selector)
+static void build_invalidation_sets_for_simple_selector_impl(Selector::SimpleSelector const& selector, InvalidationSet& invalidation_set, ExcludePropertiesNestedInNotPseudoClass exclude_properties_nested_in_not_pseudo_class, StyleInvalidationData& style_invalidation_data, InsideNthChildPseudoClass inside_nth_child_selector, InvalidationPlan const& root_invalidation_plan)
 {
     switch (selector.type) {
     case Selector::SimpleSelector::Type::Class:
@@ -521530,7 +521710,7 @@ void build_invalidation_sets_for_simple_selector(Selector::SimpleSelector const&
         if (AK::first_is_one_of(pseudo_class.type, PseudoClass::NthChild, PseudoClass::NthLastChild, PseudoClass::NthOfType, PseudoClass::NthLastOfType))
             inside_nth_child_pseudo_class_for_nested = InsideNthChildPseudoClass::Yes;
         for (auto const& nested_selector : pseudo_class.argument_selector_list) {
-            auto rightmost_invalidation_set_for_selector = build_invalidation_sets_for_selector_impl(style_invalidation_data, *nested_selector, inside_nth_child_pseudo_class_for_nested);
+            auto rightmost_invalidation_set_for_selector = build_invalidation_sets_for_selector_impl(style_invalidation_data, *nested_selector, inside_nth_child_pseudo_class_for_nested, root_invalidation_plan);
             invalidation_set.include_all_from(rightmost_invalidation_set_for_selector);
 
             // Propagate :has() from inner selectors where it appears in non-rightmost compounds.
@@ -521560,7 +521740,7 @@ void build_invalidation_sets_for_simple_selector(Selector::SimpleSelector const&
         if (pseudo_element.type() == PseudoElement::Slotted) {
             for (auto const& compound_selector : pseudo_element.compound_selector().compound_selectors()) {
                 for (auto const& nested_simple : compound_selector.simple_selectors)
-                    build_invalidation_sets_for_simple_selector(nested_simple, invalidation_set, exclude_properties_nested_in_not_pseudo_class, style_invalidation_data, inside_nth_child_selector);
+                    build_invalidation_sets_for_simple_selector_impl(nested_simple, invalidation_set, exclude_properties_nested_in_not_pseudo_class, style_invalidation_data, inside_nth_child_selector, root_invalidation_plan);
             }
         }
         break;
@@ -521568,6 +521748,11 @@ void build_invalidation_sets_for_simple_selector(Selector::SimpleSelector const&
     default:
         break;
     }
+}
+
+void build_invalidation_sets_for_simple_selector(Selector::SimpleSelector const& selector, InvalidationSet& invalidation_set, ExcludePropertiesNestedInNotPseudoClass exclude_properties_nested_in_not_pseudo_class, StyleInvalidationData& style_invalidation_data, InsideNthChildPseudoClass inside_nth_child_selector)
+{
+    build_invalidation_sets_for_simple_selector_impl(selector, invalidation_set, exclude_properties_nested_in_not_pseudo_class, style_invalidation_data, inside_nth_child_selector, *make_invalidate_self_invalidation());
 }
 
 static void add_invalidation_sets_to_cover_scope_leakage_of_relative_selector_in_has_pseudo_class(Selector const& selector, StyleInvalidationData& style_invalidation_data)
@@ -521583,7 +521768,7 @@ static void add_invalidation_sets_to_cover_scope_leakage_of_relative_selector_in
             if (rightmost)
                 return;
 
-            auto invalidation_set = build_invalidation_set_for_simple_selectors(simple_selectors, ExcludePropertiesNestedInNotPseudoClass::No, style_invalidation_data, InsideNthChildPseudoClass::No);
+            auto invalidation_set = build_invalidation_set_for_simple_selectors(simple_selectors, ExcludePropertiesNestedInNotPseudoClass::No, style_invalidation_data, InsideNthChildPseudoClass::No, *make_invalidate_self_invalidation());
             add_invalidation_plan_for_properties(style_invalidation_data, invalidation_set, *make_invalidate_whole_subtree_invalidation());
         });
     };
@@ -521601,7 +521786,7 @@ static void add_invalidation_sets_to_cover_scope_leakage_of_relative_selector_in
     });
 }
 
-static InvalidationSet build_invalidation_sets_for_selector_impl(StyleInvalidationData& style_invalidation_data, Selector const& selector, InsideNthChildPseudoClass inside_nth_child_pseudo_class)
+static InvalidationSet build_invalidation_sets_for_selector_impl(StyleInvalidationData& style_invalidation_data, Selector const& selector, InsideNthChildPseudoClass inside_nth_child_pseudo_class, InvalidationPlan const& root_invalidation_plan)
 {
     auto const& compound_selectors = selector.compound_selectors();
     int compound_selector_index = compound_selectors.size() - 1;
@@ -521617,8 +521802,8 @@ static InvalidationSet build_invalidation_sets_for_selector_impl(StyleInvalidati
             collect_properties_used_in_has(simple_selector, style_invalidation_data, {});
         }
 
-        auto invalidation_properties = build_invalidation_set_for_simple_selectors(simple_selectors, ExcludePropertiesNestedInNotPseudoClass::No, style_invalidation_data, inside_nth_child_pseudo_class);
-        auto subject_match_set = build_invalidation_set_for_simple_selectors(simple_selectors, ExcludePropertiesNestedInNotPseudoClass::Yes, style_invalidation_data, inside_nth_child_pseudo_class);
+        auto invalidation_properties = build_invalidation_set_for_simple_selectors(simple_selectors, ExcludePropertiesNestedInNotPseudoClass::No, style_invalidation_data, inside_nth_child_pseudo_class, root_invalidation_plan);
+        auto subject_match_set = build_invalidation_set_for_simple_selectors(simple_selectors, ExcludePropertiesNestedInNotPseudoClass::Yes, style_invalidation_data, inside_nth_child_pseudo_class, root_invalidation_plan);
         auto subject_guard = build_invalidation_guard_for_simple_selectors(simple_selectors);
         bool subject_matches_any = subject_match_set.is_empty() && simple_selector_group_matches_any(simple_selectors);
 
@@ -521631,7 +521816,7 @@ static InvalidationSet build_invalidation_sets_for_selector_impl(StyleInvalidati
             //   :not(.foo) => produce invalidation set .foo { $ } ($ = invalidate self)
             //   .bar :not(.foo) => produce invalidation sets .foo { $ } and .bar { * } (* = invalidate subtree)
             //                      which means invalidation_set_for_rightmost_selector should be empty
-            auto root_plan = make_invalidate_self_invalidation();
+            auto root_plan = copy_invalidation_plan(root_invalidation_plan);
             if (inside_nth_child_pseudo_class == InsideNthChildPseudoClass::Yes) {
                 // When invalidation property is nested in nth-child selector like p:nth-child(even of #t1, #t2, #t3)
                 // we need to make sure all affected siblings are invalidated.
@@ -521667,7 +521852,12 @@ static InvalidationSet build_invalidation_sets_for_selector_impl(StyleInvalidati
 
 void StyleInvalidationData::build_invalidation_sets_for_selector(Selector const& selector)
 {
-    (void)build_invalidation_sets_for_selector_impl(*this, selector, InsideNthChildPseudoClass::No);
+    (void)build_invalidation_sets_for_selector_impl(*this, selector, InsideNthChildPseudoClass::No, *make_invalidate_self_invalidation());
+}
+
+void StyleInvalidationData::build_invalidation_sets_for_scope_boundary_selector(Selector const& selector)
+{
+    (void)build_invalidation_sets_for_selector_impl(*this, selector, InsideNthChildPseudoClass::No, *make_invalidate_whole_subtree_invalidation());
 }
 
 }
@@ -521783,6 +521973,7 @@ struct StyleInvalidationData {
     bool has_selectors_sensitive_to_featureless_subtree_changes { false };
 
     void build_invalidation_sets_for_selector(Selector const& selector);
+    void build_invalidation_sets_for_scope_boundary_selector(Selector const& selector);
 };
 
 }
@@ -522732,6 +522923,23 @@ static GC::Ptr<CSSContainerRule const> current_container_rule(Vector<GC::Ptr<CSS
     return container_rule_stack.last();
 }
 
+static void collect_scope_boundary_selector_dependencies(CSSScopeRule const& scope_rule, StyleCache& style_cache)
+{
+    auto collect_selector_list = [&](Optional<SelectorList> const& selector_list) {
+        if (!selector_list.has_value())
+            return;
+        for (auto const& selector : *selector_list) {
+            style_cache.style_invalidation_data.build_invalidation_sets_for_scope_boundary_selector(selector);
+            StyleScope::collect_selector_insights(selector, style_cache.selector_insights);
+        }
+    };
+
+    for (auto const* current_scope_rule = &scope_rule; current_scope_rule; current_scope_rule = current_scope_rule->nearest_ancestor_scope_rule().ptr()) {
+        collect_selector_list(current_scope_rule->start_selectors_for_matching());
+        collect_selector_list(current_scope_rule->end_selectors_for_matching());
+    }
+}
+
 using RuleCacheStyleRuleCallback = Function<void(CSSRule const&, GC::Ptr<CSSContainerRule const>, GC::Ptr<CSSScopeRule const>)>;
 
 static void for_each_style_producing_rule_for_rule_cache(
@@ -522872,6 +523080,8 @@ void StyleScope::make_rule_cache_for_cascade_origin(CascadeOrigin cascade_origin
             for (auto const& selector : absolutized_selectors) {
                 style_cache.style_invalidation_data.build_invalidation_sets_for_selector(selector);
             }
+            if (scope_rule)
+                collect_scope_boundary_selector_dependencies(*scope_rule, style_cache);
 
             for (CSS::Selector const& selector : absolutized_selectors) {
                 MatchingRule matching_rule {
@@ -532880,6 +533090,7 @@ struct ComputationContext {
 
     void visit_edges(GC::Cell::Visitor& visitor)
     {
+        length_resolution_context.visit_edges(visitor);
         if (abstract_element.has_value())
             abstract_element->visit(visitor);
     }
@@ -537166,7 +537377,7 @@ public:
     virtual void serialize(StringBuilder& builder, SerializationMode mode) const override { m_length.serialize(builder, mode); }
     virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
 
-    virtual bool is_computationally_independent() const override { return !m_length.is_font_relative(); }
+    virtual bool is_computationally_independent() const override { return m_length.is_computationally_independent(); }
 
     bool equals(StyleValue const& other) const override;
 
@@ -544381,6 +544592,24 @@ FILE: Libraries/LibWeb/CSS/Units.json
     },
     "cm": {
       "number-of-canonical-unit": 37.7952755905511811023622047244094488188976377952755905511811023622047244094
+    },
+    "cqb": {
+      "relative-to": "container"
+    },
+    "cqh": {
+      "relative-to": "container"
+    },
+    "cqi": {
+      "relative-to": "container"
+    },
+    "cqmax": {
+      "relative-to": "container"
+    },
+    "cqmin": {
+      "relative-to": "container"
+    },
+    "cqw": {
+      "relative-to": "container"
     },
     "dvb": {
       "relative-to": "viewport"
@@ -553446,6 +553675,8 @@ GC::Ref<DOM::Document> Document::appropriate_template_contents_owner_document()
 
 String Document::dump_accessibility_tree_as_json()
 {
+    update_layout(UpdateLayoutReason::InspectAccessibilityTree);
+
     StringBuilder builder;
     auto accessibility_tree = AccessibilityTreeNode::create(this, nullptr);
     build_accessibility_tree(*&accessibility_tree);
@@ -556981,6 +557212,7 @@ enum class InvalidateLayoutTreeReason {
     X(HTMLInputElementWidth)                 \
     X(HTMLLabelElementActivationBehavior)    \
     X(HostedDocumentBeforePaint)             \
+    X(InspectAccessibilityTree)              \
     X(InspectDOMTree)                        \
     X(InspectFlexboxLayout)                  \
     X(InspectGridLayout)                     \
@@ -649282,240 +649514,3 @@ void HTMLInputElement::clear_algorithm()
     if (m_selected_files)
         m_selected_files = FileAPI::FileList::create(realm());
 
-    // and then invoke the value sanitization algorithm iff the type attribute's current state defines one.
-    m_value = value_sanitization_algorithm(m_value);
-
-    // Unlike their associated reset algorithms, changes made to form controls as part of these algorithms do count as
-    // changes caused by the user (and thus, e.g. do cause input events to fire).
-    user_interaction_did_change_input_value();
-
-    if (m_value != old_value)
-        relevant_value_was_changed();
-
-    if (m_text_node) {
-        m_text_node->set_data(m_value);
-        update_placeholder_visibility();
-    }
-
-    update_shadow_tree();
-}
-
-void HTMLInputElement::form_associated_element_was_inserted()
-{
-    create_shadow_tree_if_needed();
-
-    if (is_connected()) {
-        // https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type=radio)
-        // When any of the following phenomena occur, if the element's checkedness state is true after the occurrence,
-        // the checkedness state of all the other elements in the same radio button group must be set to false:
-        // ...
-        // - The element becomes connected.
-        if (type_state() == TypeAttributeState::RadioButton && checked()) {
-            root().for_each_in_inclusive_subtree_of_type<HTMLInputElement>([&](auto& element) {
-                if (element.checked() && &element != this && is_in_same_radio_button_group(*this, element))
-                    element.set_checked(false);
-                return TraversalDecision::Continue;
-            });
-        }
-    }
-}
-
-EventResult HTMLInputElement::handle_return_key(FlyString const&)
-{
-    if (auto* form = this->form())
-        form->implicitly_submit_form().release_value_but_fixme_should_propagate_errors();
-    else
-        commit_pending_changes();
-    return EventResult::Handled;
-}
-
-bool HTMLInputElement::is_presentational_hint(FlyString const& name) const
-{
-    if (Base::is_presentational_hint(name))
-        return true;
-
-    if (type_state() != TypeAttributeState::ImageButton)
-        return false;
-
-    return first_is_one_of(name,
-        HTML::AttributeNames::align,
-        HTML::AttributeNames::border,
-        HTML::AttributeNames::height,
-        HTML::AttributeNames::hspace,
-        HTML::AttributeNames::vspace,
-        HTML::AttributeNames::width);
-}
-
-void HTMLInputElement::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
-{
-    Base::apply_presentational_hints(properties);
-
-    if (type_state() != TypeAttributeState::ImageButton)
-        return;
-
-    for_each_attribute([&](auto& name, auto& value) {
-        if (name == HTML::AttributeNames::align) {
-            // https://html.spec.whatwg.org/multipage/rendering.html#attributes-for-embedded-content-and-images
-            // When an embed, iframe, img, or object element, or an input element whose type attribute is in the Image Button state,
-            // has an align attribute whose value is an ASCII case-insensitive match for the string "center" or the string "middle",
-            // the user agent is expected to act as if the element's 'vertical-align' property was set to a value that aligns the
-            // vertical middle of the element with the parent element's baseline.
-            // FIXME: This should use legacy baseline-middle alignment instead of CSS vertical-align: middle,
-            //        as Firefox and Chrome do with engine-specific legacy values.
-            if (value.equals_ignoring_ascii_case("center"sv) || value.equals_ignoring_ascii_case("middle"sv))
-                properties.append({ .property_id = CSS::PropertyID::VerticalAlign, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Middle) });
-        } else if (name == HTML::AttributeNames::border) {
-            if (auto parsed_value = parse_non_negative_integer(value); parsed_value.has_value()) {
-                auto width_style_value = CSS::LengthStyleValue::create(CSS::Length::make_px(*parsed_value));
-                properties.append({ .property_id = CSS::PropertyID::BorderTopWidth, .value = width_style_value });
-                properties.append({ .property_id = CSS::PropertyID::BorderRightWidth, .value = width_style_value });
-                properties.append({ .property_id = CSS::PropertyID::BorderBottomWidth, .value = width_style_value });
-                properties.append({ .property_id = CSS::PropertyID::BorderLeftWidth, .value = width_style_value });
-
-                auto border_style_value = CSS::KeywordStyleValue::create(CSS::Keyword::Solid);
-                properties.append({ .property_id = CSS::PropertyID::BorderTopStyle, .value = border_style_value });
-                properties.append({ .property_id = CSS::PropertyID::BorderRightStyle, .value = border_style_value });
-                properties.append({ .property_id = CSS::PropertyID::BorderBottomStyle, .value = border_style_value });
-                properties.append({ .property_id = CSS::PropertyID::BorderLeftStyle, .value = border_style_value });
-            }
-        } else if (name == HTML::AttributeNames::height) {
-            if (auto parsed_value = parse_dimension_value(value)) {
-                properties.append({ .property_id = CSS::PropertyID::Height, .value = *parsed_value });
-            }
-        }
-        // https://html.spec.whatwg.org/multipage/rendering.html#attributes-for-embedded-content-and-images:maps-to-the-dimension-property
-        else if (name == HTML::AttributeNames::hspace) {
-            if (auto parsed_value = parse_dimension_value(value)) {
-                properties.append({ .property_id = CSS::PropertyID::MarginLeft, .value = *parsed_value });
-                properties.append({ .property_id = CSS::PropertyID::MarginRight, .value = *parsed_value });
-            }
-        } else if (name == HTML::AttributeNames::vspace) {
-            if (auto parsed_value = parse_dimension_value(value)) {
-                properties.append({ .property_id = CSS::PropertyID::MarginTop, .value = *parsed_value });
-                properties.append({ .property_id = CSS::PropertyID::MarginBottom, .value = *parsed_value });
-            }
-        } else if (name == HTML::AttributeNames::width) {
-            if (auto parsed_value = parse_dimension_value(value)) {
-                properties.append({ .property_id = CSS::PropertyID::Width, .value = *parsed_value });
-            }
-        }
-    });
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-input-element%3Aconcept-node-clone-ext
-WebIDL::ExceptionOr<void> HTMLInputElement::cloned(DOM::Node& copy, bool subtree) const
-{
-    TRY(Base::cloned(copy, subtree));
-
-    // The cloning steps for input elements given node, copy, and subtree are to propagate the value, dirty value flag, checkedness, and dirty checkedness flag from node to copy.
-    auto& input_clone = as<HTMLInputElement>(copy);
-    input_clone.m_value = m_value;
-    input_clone.m_dirty_value = m_dirty_value;
-    input_clone.m_checked = m_checked;
-    input_clone.m_dirty_checkedness = m_dirty_checkedness;
-
-    // AD-HOC: The spec doesn't mention propagating this state, but there is a WPT test that expects cloned nodes to preserve it.
-    input_clone.m_indeterminate = m_indeterminate;
-
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#radio-button-group
-static bool is_in_same_radio_button_group(HTML::HTMLInputElement const& a, HTML::HTMLInputElement const& b)
-{
-    auto non_empty_equals = [](auto const& value_a, auto const& value_b) {
-        return !value_a.is_empty() && value_a == value_b;
-    };
-    // The radio button group that contains an input element a also contains all the
-    // other input elements b that fulfill all of the following conditions:
-    return (
-        // - Both a and b are in the same tree.
-        &a.root() == &b.root()
-        // - The input element b's type attribute is in the Radio Button state.
-        && a.type_state() == b.type_state()
-        && b.type_state() == HTMLInputElement::TypeAttributeState::RadioButton
-        // - Either a and b have the same form owner, or they both have no form owner.
-        && a.form() == b.form()
-        // - They both have a name attribute, their name attributes are not empty, and the
-        // value of a's name attribute equals the value of b's name attribute.
-        && a.name().has_value()
-        && b.name().has_value()
-        && non_empty_equals(a.name().value(), b.name().value()));
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type=radio)
-void HTMLInputElement::set_checked_within_group()
-{
-    if (checked())
-        return;
-
-    set_checked(true);
-
-    // No point iterating the tree if we have an empty name.
-    if (!name().has_value() || name()->is_empty())
-        return;
-
-    root().for_each_in_inclusive_subtree_of_type<HTML::HTMLInputElement>([&](auto& element) {
-        if (element.checked() && &element != this && is_in_same_radio_button_group(*this, element))
-            element.set_checked(false);
-        return TraversalDecision::Continue;
-    });
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-input-element:legacy-pre-activation-behavior
-void HTMLInputElement::legacy_pre_activation_behavior()
-{
-    m_before_legacy_pre_activation_behavior_checked = checked();
-    m_before_legacy_pre_activation_behavior_indeterminate = indeterminate();
-
-    // 1. If this element's type attribute is in the Checkbox state, then set
-    // this element's checkedness to its opposite value (i.e. true if it is
-    // false, false if it is true) and set this element's indeterminate IDL
-    // attribute to false.
-    if (type_state() == TypeAttributeState::Checkbox) {
-        set_checked(!checked());
-        set_indeterminate(false);
-    }
-
-    // 2. If this element's type attribute is in the Radio Button state, then
-    // get a reference to the element in this element's radio button group that
-    // has its checkedness set to true, if any, and then set this element's
-    // checkedness to true.
-    if (type_state() == TypeAttributeState::RadioButton) {
-        root().for_each_in_inclusive_subtree_of_type<HTML::HTMLInputElement>([&](auto& element) {
-            if (element.checked() && is_in_same_radio_button_group(*this, element)) {
-                m_legacy_pre_activation_behavior_checked_element_in_group = &element;
-                return TraversalDecision::Break;
-            }
-            return TraversalDecision::Continue;
-        });
-
-        set_checked_within_group();
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-input-element:legacy-canceled-activation-behavior
-void HTMLInputElement::legacy_cancelled_activation_behavior()
-{
-    // 1. If the element's type attribute is in the Checkbox state, then set the
-    // element's checkedness and the element's indeterminate IDL attribute back
-    // to the values they had before the legacy-pre-activation behavior was run.
-    if (type_state() == TypeAttributeState::Checkbox) {
-        set_checked(m_before_legacy_pre_activation_behavior_checked);
-        set_indeterminate(m_before_legacy_pre_activation_behavior_indeterminate);
-    }
-
-    // 2. If this element's type attribute is in the Radio Button state, then
-    // if the element to which a reference was obtained in the
-    // legacy-pre-activation behavior, if any, is still in what is now this
-    // element' s radio button group, if it still has one, and if so, set
-    // that element 's checkedness to true; or else, if there was no such
-    // element, or that element is no longer in this element' s radio button
-    // group, or if this element no longer has a radio button group, set
-    // this element's checkedness to false.
-    if (type_state() == TypeAttributeState::RadioButton) {
-        bool did_reselect_previous_element = false;
-        if (m_legacy_pre_activation_behavior_checked_element_in_group) {
-            auto& element_in_group = *m_legacy_pre_activation_behavior_checked_element_in_group;
-            if (is_in_same_radio_button_group(*this, element_in_group)) {
-                element_in_group.set_checked_within_group();
