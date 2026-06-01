@@ -26,6 +26,7 @@ class QTimer;
 namespace Ladybird {
 
 class BrowserWindow;
+class WindowControlButton;
 
 class HyperlinkLabel final : public QLabel {
     Q_OBJECT
@@ -79,7 +80,12 @@ public:
 
     QToolButton* hamburger_button() const { return m_hamburger_button; }
 
+    void set_vertical_tabs_enabled(bool);
+    void set_vertical_tabs_expanded(bool);
     void set_window(BrowserWindow&);
+    void set_toolbar_window_controls_visible(bool);
+    void set_toolbar_window_drag_enabled(bool);
+    void update_window_control_icons();
     void update_hover_label();
 
     bool url_is_hidden() const { return m_location_edit->url_is_hidden(); }
@@ -109,7 +115,13 @@ private:
 
     QWidget* m_toolbar_container { nullptr };
     QWidget* m_toolbar { nullptr };
+    QWidget* m_toolbar_window_controls_separator { nullptr };
+    QWidget* m_toolbar_window_controls { nullptr };
+    WindowControlButton* m_minimize_window_button { nullptr };
+    WindowControlButton* m_maximize_window_button { nullptr };
+    WindowControlButton* m_close_window_button { nullptr };
     BookmarksBar* m_bookmarks_bar { nullptr };
+    QToolButton* m_toggle_vertical_tabs_expanded_button { nullptr };
     QToolButton* m_hamburger_button { nullptr };
     LocationEdit* m_location_edit { nullptr };
     WebContentView* m_view { nullptr };
@@ -130,10 +142,10 @@ private:
     QMenu* m_media_context_menu { nullptr };
     QMenu* m_select_dropdown { nullptr };
 
-    QAction* m_toggle_vertical_tabs_expanded_action { nullptr };
     QAction* m_navigate_back_action { nullptr };
     QAction* m_navigate_forward_action { nullptr };
     QAction* m_reload_action { nullptr };
+    QAction* m_toggle_vertical_tabs_expanded_action { nullptr };
 
     QPointer<QDialog> m_dialog;
 

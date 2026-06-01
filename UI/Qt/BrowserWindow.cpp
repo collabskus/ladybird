@@ -54,6 +54,7 @@ namespace Ladybird {
 
 static constexpr auto AUDIO_STATE_BUTTON_POSITION = QTabBar::LeftSide;
 static constexpr auto TAB_CLOSE_BUTTON_POSITION = QTabBar::RightSide;
+static constexpr auto WINDOW_DRAG_REGION_PROPERTY = "LadybirdWindowDragRegion";
 
 static bool should_use_screen_signal_for_dpi_changes()
 {
@@ -839,7 +840,7 @@ void BrowserWindow::initialize_tab_buttons(Tab* tab)
     auto index = m_tabs_container->index_of(tab);
     m_tabs_container->set_tab_icon(index, tab->tab_icon());
 
-    auto* close_button = new TabBarButton(create_chrome_icon(ChromeIcon::Close, palette()));
+    auto* close_button = new TabBarButton(create_chrome_icon(ChromeIcon::TabClose, palette()));
     close_button->setToolTip("Close Tab");
 
     connect(close_button, &QPushButton::clicked, this, [this, tab]() {
@@ -860,7 +861,7 @@ void BrowserWindow::update_tab_close_button_icons()
             return;
 
         if (auto* tab_bar_button = qobject_cast<TabBarButton*>(button))
-            tab_bar_button->setIcon(create_chrome_icon(ChromeIcon::Close, palette()));
+            tab_bar_button->setIcon(create_chrome_icon(ChromeIcon::TabClose, palette()));
     }
 }
 
@@ -1135,6 +1136,18 @@ bool BrowserWindow::eventFilter(QObject* object, QEvent* event)
             return true;
     }
 
+    auto is_empty_window_drag_region = widget->property(WINDOW_DRAG_REGION_PROPERTY).toBool()
+        && widget->childAt(mouse_event->position().toPoint()) == nullptr;
+    if (is_empty_window_drag_region && !isFullScreen()) {
+        if (event->type() == QEvent::MouseButtonDblClick) {
+            toggle_window_maximized();
+            return true;
+        }
+
+        if (start_window_move())
+            return true;
+    }
+
     if (isFullScreen() || widget != menuBar() || menuBar()->actionAt(mouse_event->position().toPoint()) != nullptr)
         return QMainWindow::eventFilter(object, event);
 
@@ -1230,6 +1243,7 @@ void BrowserWindow::changeEvent(QEvent* event)
         update_tab_close_button_icons();
     } else if (event->type() == QEvent::WindowStateChange) {
         update_menu_bar_window_control_icons();
+        m_tabs_container->update_window_button_icons();
 
         QWindowStateChangeEvent* stateChangeEvent = static_cast<QWindowStateChangeEvent*>(event);
         bool was_fullscreen = stateChangeEvent->oldState() & Qt::WindowFullScreen;

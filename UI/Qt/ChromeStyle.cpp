@@ -179,7 +179,7 @@ static QColor chrome_control_surface_pressed(QPalette const& palette)
     return mix(chrome_surface(palette), material_color_anchors(dark).pressed, dark ? 0.86 : 0.66);
 }
 
-static QColor chrome_control_border(QPalette const& palette)
+QColor chrome_control_border(QPalette const& palette)
 {
     auto dark = is_dark(palette);
     if (dark)
@@ -319,8 +319,11 @@ QString toolbar_container_style_sheet(QPalette const& palette)
     auto separator = dark
         ? background_bottom
         : style_sheet_color(mix(chrome_background(palette), chrome_border(palette), 0.56));
+    auto window_controls_separator = style_sheet_color(mix(chrome_active_tab_surface_bottom(palette), chrome_border(palette), dark ? 0.36 : 0.46));
     auto text = style_sheet_color(chrome_button_text(palette));
     auto disabled_text = style_sheet_color(chrome_muted_text(palette));
+    auto close_hover = style_sheet_color(chrome_destructive_hover());
+    auto close_text = style_sheet_color(chrome_destructive_text());
 
     return qformatted(R"(
 QWidget#LadybirdToolbarContainer {{
@@ -360,8 +363,50 @@ QWidget#LadybirdNavigationToolbar QToolButton:disabled {{
 QWidget#LadybirdNavigationToolbar QToolButton::menu-indicator {{
     image: none;
 }}
+
+QWidget#LadybirdToolbarWindowControlsSeparator {{
+    background: {10};
+}}
+
+QWidget#LadybirdNavigationToolbar QToolButton#LadybirdWindowButton,
+QWidget#LadybirdNavigationToolbar QToolButton#LadybirdCloseWindowButton {{
+    color: {6};
+    background: transparent;
+    border: 0;
+    border-radius: 0;
+    min-width: 38px;
+    min-height: 38px;
+    max-width: 38px;
+    max-height: 38px;
+    margin: 0;
+    padding: 0;
+}}
+
+QWidget#LadybirdNavigationToolbar QToolButton#LadybirdWindowButton:hover {{
+    background: {2};
+}}
+
+QWidget#LadybirdNavigationToolbar QToolButton#LadybirdWindowButton:pressed {{
+    background: {3};
+}}
+
+QWidget#LadybirdNavigationToolbar QToolButton#LadybirdCloseWindowButton:hover {{
+    color: {9};
+    background: {8};
+}}
+
+QWidget#LadybirdNavigationToolbar QToolButton#LadybirdCloseWindowButton:pressed {{
+    color: {9};
+    background: {8};
+}}
+
+QWidget#LadybirdNavigationToolbar QToolButton#LadybirdWindowButton[pressedOutside="true"],
+QWidget#LadybirdNavigationToolbar QToolButton#LadybirdCloseWindowButton[pressedOutside="true"] {{
+    color: {6};
+    background: transparent;
+}}
 )",
-        background, background_bottom, surface_hover, surface_pressed, control_border, separator, text, disabled_text);
+        background, background_bottom, surface_hover, surface_pressed, control_border, separator, text, disabled_text, close_hover, close_text, window_controls_separator);
 }
 
 QString menu_bar_style_sheet(QPalette const& palette)
@@ -556,7 +601,8 @@ QToolButton#LadybirdLocationZoomIndicator:pressed {{
 QToolButton#LadybirdLocationAction {{
     background: transparent;
     border: 0;
-    border-radius: 12px;
+    border-radius: 11px;
+    margin: 1px;
     padding: 0;
 }}
 
@@ -705,6 +751,7 @@ QString tab_widget_style_sheet(QPalette const& palette)
     auto tab_strip_bottom = chrome_tab_strip_background_bottom(palette);
     auto background = style_sheet_color(chrome_tab_strip_background(palette));
     auto background_bottom = style_sheet_color(tab_strip_bottom);
+    auto sidebar_background = style_sheet_color(dark ? tab_strip_bottom : mix(tab_strip_bottom, chrome_active_tab_surface_bottom(palette), 0.34));
     auto hover = style_sheet_color(chrome_control_surface_hover(palette));
     auto pressed = style_sheet_color(chrome_control_surface_pressed(palette));
     auto control_border = style_sheet_color(chrome_control_border(palette));
@@ -712,7 +759,8 @@ QString tab_widget_style_sheet(QPalette const& palette)
     auto close_hover = style_sheet_color(chrome_destructive_hover());
     auto close_text = style_sheet_color(chrome_destructive_text());
     auto strip_separator = dark ? background_bottom : control_border;
-
+    auto sidebar_separator = style_sheet_color(mix(tab_strip_bottom, chrome_border(palette), dark ? 0.44 : 0.58));
+    auto sidebar_separator_hover = style_sheet_color(mix(tab_strip_bottom, chrome_border(palette), dark ? 0.64 : 0.76));
     return qformatted(R"(
 QWidget#LadybirdTabStrip {{
     color: {5};
@@ -723,8 +771,24 @@ QWidget#LadybirdTabStrip {{
 
 QWidget#LadybirdVerticalTabBar {{
     color: {5};
-    background: {1};
-    border-right: 1px solid {8};
+    background: {11};
+    border-right: 1px solid {9};
+}}
+
+QWidget#LadybirdVerticalTabBar[hovered="true"],
+QWidget#LadybirdVerticalTabBar[active="true"] {{
+    border-right: 1px solid {10};
+}}
+
+QWidget#LadybirdVerticalTabsResizeHandle {{
+    background: transparent;
+    border: 0;
+}}
+
+QWidget#LadybirdVerticalTabsSeparator {{
+    background: {9};
+    min-height: 1px;
+    max-height: 1px;
 }}
 
 QToolButton#LadybirdNewTabButton,
@@ -742,11 +806,6 @@ QToolButton#LadybirdNewTabButton {{
     border-radius: 16px;
 }}
 
-QToolButton#LadybirdNewTabButton[verticalTabsExpanded="true"] {{
-    padding-left: 14px;
-    text-align: left;
-}}
-
 QPushButton#LadybirdTabButton {{
     min-width: 22px;
     min-height: 22px;
@@ -756,6 +815,7 @@ QPushButton#LadybirdTabButton {{
 
 QToolButton#LadybirdNewTabButton:hover,
 QPushButton#LadybirdTabButton:hover {{
+    color: {5};
     background: {2};
     border-color: {4};
 }}
@@ -763,6 +823,7 @@ QPushButton#LadybirdTabButton:hover {{
 QToolButton#LadybirdNewTabButton:pressed,
 QPushButton#LadybirdTabButton:pressed,
 QPushButton#LadybirdTabButton:checked {{
+    color: {5};
     background: {3};
     border-color: {4};
 }}
@@ -802,7 +863,8 @@ QToolButton#LadybirdCloseWindowButton[pressedOutside="true"] {{
     background: transparent;
 }}
 )",
-        background, background_bottom, hover, pressed, control_border, text, close_hover, close_text, strip_separator);
+        background, background_bottom, hover, pressed, control_border, text, close_hover, close_text, strip_separator,
+        sidebar_separator, sidebar_separator_hover, sidebar_background);
 }
 
 QString autocomplete_popup_style_sheet(QPalette const& palette)
