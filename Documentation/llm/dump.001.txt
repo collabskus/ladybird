@@ -85111,6 +85111,7 @@ FILE: Libraries/LibDevTools/Actors/FrameActor.cpp
 #include <AK/Enumerate.h>
 #include <AK/JsonArray.h>
 #include <AK/JsonObject.h>
+#include <LibCore/EventLoop.h>
 #include <LibDevTools/Actors/AccessibilityActor.h>
 #include <LibDevTools/Actors/CSSPropertiesActor.h>
 #include <LibDevTools/Actors/ConsoleActor.h>
@@ -85120,20 +85121,22 @@ FILE: Libraries/LibDevTools/Actors/FrameActor.cpp
 #include <LibDevTools/Actors/StyleSheetsActor.h>
 #include <LibDevTools/Actors/TabActor.h>
 #include <LibDevTools/Actors/ThreadActor.h>
+#include <LibDevTools/Actors/WatcherActor.h>
 #include <LibDevTools/DevToolsDelegate.h>
 #include <LibDevTools/DevToolsServer.h>
 #include <LibWebView/ConsoleOutput.h>
 
 namespace DevTools {
 
-NonnullRefPtr<FrameActor> FrameActor::create(DevToolsServer& devtools, String name, WeakPtr<TabActor> tab, WeakPtr<CSSPropertiesActor> css_properties, WeakPtr<ConsoleActor> console, WeakPtr<InspectorActor> inspector, WeakPtr<StyleSheetsActor> style_sheets, WeakPtr<ThreadActor> thread, WeakPtr<AccessibilityActor> accessibility)
+NonnullRefPtr<FrameActor> FrameActor::create(DevToolsServer& devtools, String name, WeakPtr<TabActor> tab, WeakPtr<WatcherActor> watcher, WeakPtr<CSSPropertiesActor> css_properties, WeakPtr<ConsoleActor> console, WeakPtr<InspectorActor> inspector, WeakPtr<StyleSheetsActor> style_sheets, WeakPtr<ThreadActor> thread, WeakPtr<AccessibilityActor> accessibility)
 {
-    return adopt_ref(*new FrameActor(devtools, move(name), move(tab), move(css_properties), move(console), move(inspector), move(style_sheets), move(thread), move(accessibility)));
+    return adopt_ref(*new FrameActor(devtools, move(name), move(tab), move(watcher), move(css_properties), move(console), move(inspector), move(style_sheets), move(thread), move(accessibility)));
 }
 
-FrameActor::FrameActor(DevToolsServer& devtools, String name, WeakPtr<TabActor> tab, WeakPtr<CSSPropertiesActor> css_properties, WeakPtr<ConsoleActor> console, WeakPtr<InspectorActor> inspector, WeakPtr<StyleSheetsActor> style_sheets, WeakPtr<ThreadActor> thread, WeakPtr<AccessibilityActor> accessibility)
+FrameActor::FrameActor(DevToolsServer& devtools, String name, WeakPtr<TabActor> tab, WeakPtr<WatcherActor> watcher, WeakPtr<CSSPropertiesActor> css_properties, WeakPtr<ConsoleActor> console, WeakPtr<InspectorActor> inspector, WeakPtr<StyleSheetsActor> style_sheets, WeakPtr<ThreadActor> thread, WeakPtr<AccessibilityActor> accessibility)
     : Actor(devtools, move(name))
     , m_tab(move(tab))
+    , m_watcher(move(watcher))
     , m_css_properties(move(css_properties))
     , m_console(move(console))
     , m_inspector(move(inspector))
@@ -85142,11 +85145,6 @@ FrameActor::FrameActor(DevToolsServer& devtools, String name, WeakPtr<TabActor> 
     , m_accessibility(move(accessibility))
 {
     if (auto tab = m_tab.strong_ref()) {
-        // NB: We must notify WebContent that DevTools is connected before setting up listeners,
-        //     so that WebContent knows to start sending network response bodies over IPC.
-        //     IPC messages are processed in order, so this is guaranteed to arrive first.
-        devtools.delegate().did_connect_devtools_client(tab->description());
-
         devtools.delegate().listen_for_console_messages(
             tab->description(),
             weak_callback(*this, [](auto& self, WebView::ConsoleOutput console_output) {
@@ -85154,10 +85152,14 @@ FrameActor::FrameActor(DevToolsServer& devtools, String name, WeakPtr<TabActor> 
             }));
 
         // FIXME: We should adopt WebContent to inform us when style sheets are available or removed.
-        devtools.delegate().retrieve_style_sheets(tab->description(),
-            async_handler<FrameActor>({}, [](auto& self, auto style_sheets, auto& response) {
-                self.style_sheets_available(response, move(style_sheets));
-            }));
+        Core::deferred_invoke([weak_self = make_weak_ptr<FrameActor>(), tab] {
+            if (auto self = weak_self.strong_ref()) {
+                self->devtools().delegate().retrieve_style_sheets(tab->description(),
+                    self->async_handler<FrameActor>({}, [](auto& self, auto style_sheets, auto& response) {
+                        self.style_sheets_available(response, move(style_sheets));
+                    }));
+            }
+        });
 
         devtools.delegate().listen_for_network_events(
             tab->description(),
@@ -85182,17 +85184,28 @@ FrameActor::FrameActor(DevToolsServer& devtools, String name, WeakPtr<TabActor> 
             weak_callback(*this, [](auto& self, String url, String title) {
                 self.on_navigation_finished(move(url), move(title));
             }));
+
+        m_is_listening = true;
     }
 }
 
 FrameActor::~FrameActor()
 {
+    stop_listening();
+}
+
+void FrameActor::stop_listening()
+{
+    if (!m_is_listening)
+        return;
+
     if (auto tab = m_tab.strong_ref()) {
         devtools().delegate().stop_listening_for_console_messages(tab->description());
         devtools().delegate().stop_listening_for_network_events(tab->description());
         devtools().delegate().stop_listening_for_navigation_events(tab->description());
-        devtools().delegate().did_disconnect_devtools_client(tab->description());
     }
+
+    m_is_listening = false;
 }
 
 void FrameActor::handle_message(Message const& message)
@@ -85212,8 +85225,37 @@ void FrameActor::handle_message(Message const& message)
         return;
     }
 
+    if (message.type == "reload"sv) {
+        bool bypass_cache = false;
+        if (auto options = message.data.get_object("options"sv); options.has_value())
+            bypass_cache = options->get_bool("force"sv).value_or(false);
+
+        if (auto tab = m_tab.strong_ref())
+            devtools().delegate().reload_tab(tab->description(), bypass_cache);
+
+        send_response(message, move(response));
+        return;
+    }
+
+    if (message.type == "goBack"sv) {
+        if (auto tab = m_tab.strong_ref())
+            devtools().delegate().traverse_the_history_by_delta(tab->description(), -1);
+
+        send_response(message, move(response));
+        return;
+    }
+
+    if (message.type == "goForward"sv) {
+        if (auto tab = m_tab.strong_ref())
+            devtools().delegate().traverse_the_history_by_delta(tab->description(), 1);
+
+        send_response(message, move(response));
+        return;
+    }
+
     if (message.type == "listFrames"sv) {
         send_response(message, move(response));
+        send_pending_navigation_document_events_after_target_switch();
         return;
     }
 
@@ -85238,6 +85280,25 @@ void FrameActor::send_frame_update_message()
     send_message(move(message));
 }
 
+void FrameActor::set_pending_navigation_document_events_after_target_switch(String const& url, String const& title)
+{
+    m_pending_navigation_document_events_after_target_switch = PendingNavigationDocumentEvents {
+        .url = url,
+        .title = title,
+    };
+}
+
+void FrameActor::send_pending_navigation_document_events_after_target_switch()
+{
+    if (!m_pending_navigation_document_events_after_target_switch.has_value())
+        return;
+
+    auto pending_events = m_pending_navigation_document_events_after_target_switch.release_value();
+    send_document_event("dom-loading"sv, pending_events.url);
+    send_document_event("dom-interactive"sv, pending_events.url, pending_events.title);
+    send_document_event("dom-complete"sv, pending_events.url);
+}
+
 JsonObject FrameActor::serialize_target() const
 {
     JsonObject traits;
@@ -85256,7 +85317,13 @@ JsonObject FrameActor::serialize_target() const
         target.set("title"sv, tab_actor->description().title);
         target.set("url"sv, tab_actor->description().url);
         target.set("browsingContextID"sv, tab_actor->description().id);
+        target.set("followWindowGlobalLifeCycle"sv, true);
+        target.set("innerWindowId"sv, tab_actor->inner_window_id());
+        target.set("isPopup"sv, false);
+        target.set("isPrivate"sv, false);
         target.set("outerWindowID"sv, tab_actor->description().id);
+        target.set("processID"sv, 1);
+        target.set("topInnerWindowId"sv, tab_actor->inner_window_id());
         target.set("isTopLevelTarget"sv, true);
     }
 
@@ -85610,18 +85677,20 @@ void FrameActor::on_network_request_finished(DevToolsDelegate::NetworkRequestCom
     send_message(move(message));
 }
 
-void FrameActor::on_navigation_started(String url)
+void FrameActor::send_document_event(StringView name, String const& url, Optional<StringView> title)
 {
-    // Clear our internal tracking of network events
-    m_network_events.clear();
-
-    // Send will-navigate document event to trigger network panel clear
     JsonObject document_event;
     document_event.set("resourceType"sv, "document-event"sv);
-    document_event.set("name"sv, "will-navigate"sv);
+    document_event.set("name"sv, name);
     document_event.set("time"sv, UnixDateTime::now().milliseconds_since_epoch());
-    document_event.set("newURI"sv, url);
     document_event.set("isFrameSwitching"sv, false);
+
+    if (name == "will-navigate"sv)
+        document_event.set("newURI"sv, url);
+    if (name == "dom-loading"sv || name == "dom-interactive"sv)
+        document_event.set("url"sv, url);
+    if (title.has_value())
+        document_event.set("title"sv, title.value());
 
     JsonArray events;
     events.must_append(move(document_event));
@@ -85637,34 +85706,37 @@ void FrameActor::on_navigation_started(String url)
     resources_message.set("type"sv, "resources-available-array"sv);
     resources_message.set("array"sv, move(array));
     send_message(move(resources_message));
+}
 
-    // Also send tabNavigated for backwards compatibility
-    JsonObject message;
-    message.set("type"sv, "tabNavigated"sv);
-    message.set("url"sv, move(url));
-    message.set("state"sv, "start"sv);
-    message.set("isFrameSwitching"sv, false);
-    send_message(move(message));
+void FrameActor::on_navigation_started(String url)
+{
+    if (auto inspector = m_inspector.strong_ref())
+        inspector->on_navigation_started();
+
+    // Clear our internal tracking of network events
+    m_network_events.clear();
+
+    send_document_event("will-navigate"sv, url);
 }
 
 void FrameActor::on_navigation_finished(String url, String title)
 {
     // Update the tab description with the new URL and title
-    if (auto tab = m_tab.strong_ref()) {
-        tab->set_url(url);
-        tab->set_title(title);
-    }
+    if (auto tab = m_tab.strong_ref())
+        tab->navigate_to(url, title);
 
-    JsonObject message;
-    message.set("type"sv, "tabNavigated"sv);
-    message.set("url"sv, move(url));
-    message.set("title"sv, move(title));
-    message.set("state"sv, "stop"sv);
-    message.set("isFrameSwitching"sv, false);
-    send_message(move(message));
+    if (auto inspector = m_inspector.strong_ref())
+        inspector->on_navigation_finished();
 
-    // Also send a frameUpdate message to update the frame info
-    send_frame_update_message();
+    auto finished_url = url;
+    auto finished_title = title;
+
+    Core::deferred_invoke([watcher = m_watcher, target = make_weak_ptr<FrameActor>(), url = move(finished_url), title = move(finished_title)] {
+        auto strong_watcher = watcher.strong_ref();
+        auto strong_target = target.strong_ref();
+        if (strong_watcher && strong_target)
+            strong_watcher->switch_frame_target(*strong_target, url, title);
+    });
 }
 
 }
@@ -85694,15 +85766,17 @@ class DEVTOOLS_API FrameActor final : public Actor {
 public:
     static constexpr auto base_name = "frame"sv;
 
-    static NonnullRefPtr<FrameActor> create(DevToolsServer&, String name, WeakPtr<TabActor>, WeakPtr<CSSPropertiesActor>, WeakPtr<ConsoleActor>, WeakPtr<InspectorActor>, WeakPtr<StyleSheetsActor>, WeakPtr<ThreadActor>, WeakPtr<AccessibilityActor>);
+    static NonnullRefPtr<FrameActor> create(DevToolsServer&, String name, WeakPtr<TabActor>, WeakPtr<WatcherActor>, WeakPtr<CSSPropertiesActor>, WeakPtr<ConsoleActor>, WeakPtr<InspectorActor>, WeakPtr<StyleSheetsActor>, WeakPtr<ThreadActor>, WeakPtr<AccessibilityActor>);
     virtual ~FrameActor() override;
 
     void send_frame_update_message();
+    void set_pending_navigation_document_events_after_target_switch(String const& url, String const& title);
+    void stop_listening();
 
     JsonObject serialize_target() const;
 
 private:
-    FrameActor(DevToolsServer&, String name, WeakPtr<TabActor>, WeakPtr<CSSPropertiesActor>, WeakPtr<ConsoleActor>, WeakPtr<InspectorActor>, WeakPtr<StyleSheetsActor>, WeakPtr<ThreadActor>, WeakPtr<AccessibilityActor>);
+    FrameActor(DevToolsServer&, String name, WeakPtr<TabActor>, WeakPtr<WatcherActor>, WeakPtr<CSSPropertiesActor>, WeakPtr<ConsoleActor>, WeakPtr<InspectorActor>, WeakPtr<StyleSheetsActor>, WeakPtr<ThreadActor>, WeakPtr<AccessibilityActor>);
 
     void style_sheets_available(JsonObject& response, Vector<Web::CSS::StyleSheetIdentifier> style_sheets);
 
@@ -85717,8 +85791,16 @@ private:
 
     void on_navigation_started(String url);
     void on_navigation_finished(String url, String title);
+    void send_document_event(StringView name, String const& url, Optional<StringView> title = {});
+    void send_pending_navigation_document_events_after_target_switch();
+
+    struct PendingNavigationDocumentEvents {
+        String url;
+        String title;
+    };
 
     WeakPtr<TabActor> m_tab;
+    WeakPtr<WatcherActor> m_watcher;
 
     WeakPtr<CSSPropertiesActor> m_css_properties;
     WeakPtr<ConsoleActor> m_console;
@@ -85727,7 +85809,9 @@ private:
     WeakPtr<ThreadActor> m_thread;
     WeakPtr<AccessibilityActor> m_accessibility;
 
+    Optional<PendingNavigationDocumentEvents> m_pending_navigation_document_events_after_target_switch;
     HashMap<u64, NonnullRefPtr<NetworkEventActor>> m_network_events;
+    bool m_is_listening { false };
 };
 
 }
@@ -85988,6 +86072,38 @@ void InspectorActor::received_dom_tree(JsonObject& response, JsonObject dom_tree
     response.set("walker"sv, move(walker));
 }
 
+void InspectorActor::on_navigation_started()
+{
+    if (auto walker = m_walker.strong_ref())
+        walker->document_unloaded();
+    if (auto tab = m_tab.strong_ref())
+        tab->reset_selected_node();
+}
+
+void InspectorActor::on_navigation_finished()
+{
+    auto walker = m_walker.strong_ref();
+    auto tab = m_tab.strong_ref();
+    if (!walker || !tab)
+        return;
+
+    devtools().delegate().inspect_tab(tab->description(),
+        weak_callback(*this, [walker](auto&, auto dom_tree) {
+            if (dom_tree.is_error()) {
+                dbgln_if(DEVTOOLS_DEBUG, "Error inspecting tab after navigation: {}", dom_tree.error());
+                return;
+            }
+
+            auto value = dom_tree.release_value();
+            if (!WalkerActor::is_suitable_for_dom_inspection(value)) {
+                dbgln_if(DEVTOOLS_DEBUG, "Did not receive a suitable DOM tree: {}", value);
+                return;
+            }
+
+            walker->replace_dom_tree(move(value.as_object()));
+        }));
+}
+
 RefPtr<TabActor> InspectorActor::tab_for(WeakPtr<InspectorActor> const& weak_inspector)
 {
     if (auto inspector = weak_inspector.strong_ref())
@@ -86028,6 +86144,9 @@ public:
 
     static RefPtr<TabActor> tab_for(WeakPtr<InspectorActor> const&);
     static RefPtr<WalkerActor> walker_for(WeakPtr<InspectorActor> const&);
+
+    void on_navigation_started();
+    void on_navigation_finished();
 
 private:
     InspectorActor(DevToolsServer&, String name, WeakPtr<TabActor>);
@@ -88174,6 +88293,35 @@ void TabActor::handle_message(Message const& message)
         return;
     }
 
+    if (message.type == "reloadDescriptor"sv) {
+        auto bypass_cache = message.data.get_bool("bypassCache"sv).value_or(false);
+        devtools().delegate().reload_tab(m_description, bypass_cache);
+        send_response(message, move(response));
+        return;
+    }
+
+    if (message.type == "navigateTo"sv) {
+        auto url = get_required_parameter<String>(message, "url"sv);
+        if (!url.has_value())
+            return;
+
+        devtools().delegate().navigate_tab(m_description, *url);
+        send_response(message, move(response));
+        return;
+    }
+
+    if (message.type == "goBack"sv) {
+        devtools().delegate().traverse_the_history_by_delta(m_description, -1);
+        send_response(message, move(response));
+        return;
+    }
+
+    if (message.type == "goForward"sv) {
+        devtools().delegate().traverse_the_history_by_delta(m_description, 1);
+        send_response(message, move(response));
+        return;
+    }
+
     send_unrecognized_packet_type_error(message);
 }
 
@@ -88182,6 +88330,7 @@ JsonObject TabActor::serialize_description() const
     JsonObject traits;
     traits.set("watcher"sv, true);
     traits.set("supportsReloadDescriptor"sv, true);
+    traits.set("supportsNavigation"sv, true);
 
     // FIXME: We are using the tab's ID multiple times here. This is likely not correct, as both Firefox and Servo
     //        provide different IDs for browserId, browsingContextID, and outerWindowID.
@@ -88200,6 +88349,13 @@ void TabActor::reset_selected_node()
 {
     devtools().delegate().clear_highlighted_dom_node(description());
     devtools().delegate().clear_inspected_dom_node(description());
+}
+
+void TabActor::navigate_to(String url, String title)
+{
+    m_description.url = move(url);
+    m_description.title = move(title);
+    ++m_inner_window_id;
 }
 
 }
@@ -88235,9 +88391,9 @@ public:
 
     TabDescription const& description() const { return m_description; }
     JsonObject serialize_description() const;
+    u64 inner_window_id() const { return m_inner_window_id; }
 
-    void set_url(String url) { m_description.url = move(url); }
-    void set_title(String title) { m_description.title = move(title); }
+    void navigate_to(String url, String title);
 
     void reset_selected_node();
 
@@ -88247,6 +88403,7 @@ private:
     virtual void handle_message(Message const&) override;
 
     TabDescription m_description;
+    u64 m_inner_window_id { 1 };
     WeakPtr<WatcherActor> m_watcher;
 };
 
@@ -89047,6 +89204,9 @@ bool WalkerActor::is_suitable_for_dom_inspection(JsonValue const& node)
 
 JsonValue WalkerActor::serialize_root() const
 {
+    if (!m_has_live_dom_tree)
+        return {};
+
     return serialize_node(m_dom_tree);
 }
 
@@ -89176,6 +89336,9 @@ Optional<Node> WalkerActor::dom_node_for(WeakPtr<WalkerActor> const& weak_walker
 
 Optional<Node> WalkerActor::dom_node(StringView actor)
 {
+    if (!m_has_live_dom_tree)
+        return {};
+
     auto tab = m_tab.strong_ref();
     if (!tab)
         return {};
@@ -89192,6 +89355,9 @@ Optional<Node> WalkerActor::dom_node(StringView actor)
 
 Optional<String> WalkerActor::node_actor_name_for(Web::UniqueNodeID node_id) const
 {
+    if (!m_has_live_dom_tree)
+        return {};
+
     return m_dom_node_id_to_actor_map.get(node_id).copy();
 }
 
@@ -89418,6 +89584,9 @@ Optional<JsonObject const&> WalkerActor::remove_node(JsonObject const& node)
 
 void WalkerActor::new_dom_node_mutation(WebView::Mutation mutation)
 {
+    if (!m_has_live_dom_tree)
+        return;
+
     auto serialized_target = JsonValue::from_string(mutation.serialized_target);
     if (serialized_target.is_error() || !serialized_target.value().is_object()) {
         dbgln_if(DEVTOOLS_DEBUG, "Unable to parse serialized target as JSON object: {}", serialized_target.error());
@@ -89508,11 +89677,59 @@ bool WalkerActor::replace_node_in_tree(JsonObject replacement)
 
 void WalkerActor::populate_dom_tree_cache()
 {
+    clear_dom_tree_cache();
+
+    if (!m_has_live_dom_tree)
+        return;
+
+    populate_dom_tree_cache(m_dom_tree, nullptr);
+}
+
+void WalkerActor::document_unloaded()
+{
+    if (!m_has_live_dom_tree)
+        return;
+
+    auto root = serialize_root();
+
+    stop_node_picker();
+    clear_dom_tree_state();
+    m_has_live_dom_tree = false;
+
+    JsonObject message;
+    message.set("type"sv, "root-destroyed"sv);
+    message.set("node"sv, move(root));
+    send_message(move(message));
+}
+
+void WalkerActor::replace_dom_tree(JsonObject dom_tree)
+{
+    stop_node_picker();
+    clear_dom_tree_state();
+
+    m_dom_tree = move(dom_tree);
+    m_has_live_dom_tree = true;
+    populate_dom_tree_cache();
+
+    JsonObject message;
+    message.set("type"sv, "root-available"sv);
+    message.set("node"sv, serialize_root());
+    send_message(move(message));
+}
+
+void WalkerActor::clear_dom_tree_state()
+{
+    m_dom_node_mutations.clear();
+    m_has_new_mutations_since_last_mutations_request = false;
+    clear_dom_tree_cache();
+    m_node_actors.clear();
+}
+
+void WalkerActor::clear_dom_tree_cache()
+{
     m_dom_node_to_parent_map.clear();
     m_actor_to_dom_node_map.clear();
     m_dom_node_id_to_actor_map.clear();
-
-    populate_dom_tree_cache(m_dom_tree, nullptr);
 }
 
 void WalkerActor::populate_dom_tree_cache(JsonObject& node, JsonObject const* parent)
@@ -89592,6 +89809,8 @@ public:
     static Optional<Node> dom_node_for(WeakPtr<WalkerActor> const&, StringView actor);
     Optional<Node> dom_node(StringView actor);
     Optional<String> node_actor_name_for(Web::UniqueNodeID) const;
+    void document_unloaded();
+    void replace_dom_tree(JsonObject);
 
 private:
     WalkerActor(DevToolsServer&, String name, WeakPtr<TabActor>, JsonObject dom_tree);
@@ -89611,6 +89830,8 @@ private:
 
     bool replace_node_in_tree(JsonObject replacement);
 
+    void clear_dom_tree_cache();
+    void clear_dom_tree_state();
     void populate_dom_tree_cache();
     void populate_dom_tree_cache(JsonObject& node, JsonObject const* parent);
 
@@ -89624,6 +89845,7 @@ private:
     WeakPtr<LayoutInspectorActor> m_layout_inspector;
 
     JsonObject m_dom_tree;
+    bool m_has_live_dom_tree { true };
 
     Vector<WebView::Mutation> m_dom_node_mutations;
     bool m_has_new_mutations_since_last_mutations_request { false };
@@ -89662,6 +89884,7 @@ FILE: Libraries/LibDevTools/Actors/WatcherActor.cpp
 #include <LibDevTools/Actors/ThreadActor.h>
 #include <LibDevTools/Actors/ThreadConfigurationActor.h>
 #include <LibDevTools/Actors/WatcherActor.h>
+#include <LibDevTools/DevToolsDelegate.h>
 #include <LibDevTools/DevToolsServer.h>
 
 namespace DevTools {
@@ -89677,7 +89900,14 @@ WatcherActor::WatcherActor(DevToolsServer& devtools, String name, WeakPtr<TabAct
 {
 }
 
-WatcherActor::~WatcherActor() = default;
+WatcherActor::~WatcherActor()
+{
+    if (!m_is_watching_frame_targets)
+        return;
+
+    if (auto tab = m_tab.strong_ref())
+        devtools().delegate().did_disconnect_devtools_client(tab->description());
+}
 
 void WatcherActor::handle_message(Message const& message)
 {
@@ -89743,23 +89973,18 @@ void WatcherActor::handle_message(Message const& message)
             return;
 
         if (target_type == "frame"sv) {
-            auto& css_properties = devtools().register_actor<CSSPropertiesActor>();
-            auto& console = devtools().register_actor<ConsoleActor>(m_tab);
-            auto& inspector = devtools().register_actor<InspectorActor>(m_tab);
-            auto& style_sheets = devtools().register_actor<StyleSheetsActor>(m_tab);
-            auto& thread = devtools().register_actor<ThreadActor>();
-            auto& accessibility = devtools().register_actor<AccessibilityActor>(m_tab);
+            if (!m_is_watching_frame_targets) {
+                if (auto tab = m_tab.strong_ref())
+                    devtools().delegate().did_connect_devtools_client(tab->description());
+                m_is_watching_frame_targets = true;
+            }
 
-            auto& target = devtools().register_actor<FrameActor>(m_tab, css_properties, console, inspector, style_sheets, thread, accessibility);
-            m_target = target;
+            auto& target = create_frame_target();
 
-            response.set("type"sv, "target-available-form"sv);
-            response.set("target"sv, target.serialize_target());
             send_response(message, move(response));
 
+            send_frame_target_available_message(target);
             target.send_frame_update_message();
-
-            send_message({});
             return;
         }
     }
@@ -89806,6 +90031,63 @@ JsonObject WatcherActor::serialize_description() const
     return description;
 }
 
+FrameActor& WatcherActor::create_frame_target()
+{
+    auto& css_properties = devtools().register_actor<CSSPropertiesActor>();
+    auto& console = devtools().register_actor<ConsoleActor>(m_tab);
+    auto& inspector = devtools().register_actor<InspectorActor>(m_tab);
+    auto& style_sheets = devtools().register_actor<StyleSheetsActor>(m_tab);
+    auto& thread = devtools().register_actor<ThreadActor>();
+    auto& accessibility = devtools().register_actor<AccessibilityActor>(m_tab);
+
+    auto& target = devtools().register_actor<FrameActor>(m_tab, make_weak_ptr<WatcherActor>(), css_properties, console, inspector, style_sheets, thread, accessibility);
+    m_target = target;
+    return target;
+}
+
+void WatcherActor::send_frame_target_available_message()
+{
+    auto& target = create_frame_target();
+    send_frame_target_available_message(target);
+}
+
+void WatcherActor::switch_frame_target(FrameActor& previous_target, String const& url, String const& title)
+{
+    auto previous_target_ref = m_target.strong_ref();
+    if (!previous_target_ref || previous_target_ref.ptr() != &previous_target)
+        return;
+
+    send_frame_target_destroyed_message(*previous_target_ref);
+    previous_target_ref->stop_listening();
+    devtools().unregister_actor(previous_target_ref->name());
+
+    auto& target = create_frame_target();
+    send_frame_target_available_message(target);
+    target.send_frame_update_message();
+    target.set_pending_navigation_document_events_after_target_switch(url, title);
+}
+
+void WatcherActor::send_frame_target_available_message(FrameActor& target)
+{
+    JsonObject message;
+    message.set("type"sv, "target-available-form"sv);
+    message.set("target"sv, target.serialize_target());
+    send_message(move(message));
+}
+
+void WatcherActor::send_frame_target_destroyed_message(FrameActor& target)
+{
+    JsonObject options;
+    options.set("isTargetSwitching"sv, true);
+    options.set("shouldDestroyTargetFront"sv, true);
+
+    JsonObject message;
+    message.set("type"sv, "target-destroyed-form"sv);
+    message.set("target"sv, target.serialize_target());
+    message.set("options"sv, move(options));
+    send_message(move(message));
+}
+
 }
 
 FILE: Libraries/LibDevTools/Actors/WatcherActor.h
@@ -89831,17 +90113,24 @@ public:
     virtual ~WatcherActor() override;
 
     JsonObject serialize_description() const;
+    void send_frame_target_available_message();
+    void switch_frame_target(FrameActor&, String const& url, String const& title);
 
 private:
     WatcherActor(DevToolsServer&, String name, WeakPtr<TabActor>);
 
     virtual void handle_message(Message const&) override;
 
+    FrameActor& create_frame_target();
+    void send_frame_target_available_message(FrameActor&);
+    void send_frame_target_destroyed_message(FrameActor&);
+
     WeakPtr<TabActor> m_tab;
-    WeakPtr<Actor> m_target;
+    WeakPtr<FrameActor> m_target;
     WeakPtr<TargetConfigurationActor> m_target_configuration;
     WeakPtr<ThreadConfigurationActor> m_thread_configuration;
     WeakPtr<NetworkParentActor> m_network_parent;
+    bool m_is_watching_frame_targets { false };
 };
 
 }
@@ -90066,6 +90355,9 @@ public:
 
     virtual Vector<TabDescription> tab_list() const { return {}; }
     virtual Vector<CSSProperty> css_property_list() const { return {}; }
+    virtual void navigate_tab(TabDescription const&, String const&) const { }
+    virtual void reload_tab(TabDescription const&, bool bypass_cache) const { (void)bypass_cache; }
+    virtual void traverse_the_history_by_delta(TabDescription const&, int) const { }
 
     using OnTabInspectionComplete = Function<void(ErrorOr<JsonValue>)>;
     virtual void inspect_tab(TabDescription const&, OnTabInspectionComplete) const { }
@@ -649339,178 +649631,3 @@ Utf16String HTMLInputElement::value_sanitization_algorithm(Utf16String const& va
         }
 
         // 1. Split on commas the element's value, strip leading and trailing ASCII whitespace from each resulting token,
-        //    if any, and let the element's values be the (possibly empty) resulting list of (possibly empty) tokens,
-        //    maintaining the original order.
-        auto values = value.split_view(',', SplitBehavior::KeepEmpty);
-
-        for (auto& value : values)
-            value = value.trim(Infra::ASCII_WHITESPACE);
-
-        // 2. Set the element's value to the result of concatenating the element's values, separating each value from
-        //    the next by a single U+002C COMMA character (,), maintaining the list's order.
-        return Utf16String::join(',', values);
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#number-state-(type=number):value-sanitization-algorithm
-    if (type_state() == HTMLInputElement::TypeAttributeState::Number) {
-        // If the value of the element is not a valid floating-point number, then set it to the empty string instead.
-        if (!is_valid_floating_point_number(value))
-            return {};
-
-        // AD-HOC: The spec doesn't require these checks - but other engines do them, and there's a WPT case which tests
-        // that the value is less than Number.MAX_VALUE.
-        if (auto maybe_value = parse_floating_point_number(value); !maybe_value.has_value() || !isfinite(maybe_value.value()))
-            return {};
-    }
-    // https://html.spec.whatwg.org/multipage/input.html#date-state-(type=date):value-sanitization-algorithm
-    else if (type_state() == HTMLInputElement::TypeAttributeState::Date) {
-        // If the value of the element is not a valid date string, then set it to the empty string instead.
-        if (!is_valid_date_string(value))
-            return {};
-    }
-    // https://html.spec.whatwg.org/multipage/input.html#month-state-(type=month):value-sanitization-algorithm
-    else if (type_state() == HTMLInputElement::TypeAttributeState::Month) {
-        // If the value of the element is not a valid month string, then set it to the empty string instead.
-        if (!is_valid_month_string(value))
-            return {};
-    }
-    // https://html.spec.whatwg.org/multipage/input.html#week-state-(type=week):value-sanitization-algorithm
-    else if (type_state() == HTMLInputElement::TypeAttributeState::Week) {
-        if (!is_valid_week_string(value))
-            return {};
-    }
-    // https://html.spec.whatwg.org/multipage/input.html#time-state-(type=time):value-sanitization-algorithm
-    else if (type_state() == HTMLInputElement::TypeAttributeState::Time) {
-        // If the value of the element is not a valid week string, then set it to the empty string instead.
-        if (!is_valid_time_string(value))
-            return {};
-    }
-    // https://html.spec.whatwg.org/multipage/input.html#local-date-and-time-state-(type=datetime-local):value-sanitization-algorithm
-    else if (type_state() == HTMLInputElement::TypeAttributeState::LocalDateAndTime) {
-        // If the value of the element is a valid local date and time string, then set it to a valid normalized local
-        // date and time string representing the same date and time; otherwise, set it to the empty string instead.
-        if (is_valid_local_date_and_time_string(value))
-            return normalize_local_date_and_time_string(value);
-        return {};
-    }
-    // https://html.spec.whatwg.org/multipage/input.html#range-state-(type=range):value-sanitization-algorithm
-    else if (type_state() == HTMLInputElement::TypeAttributeState::Range) {
-        auto minimum = *min();
-        auto maximum = *max();
-        auto number_value = [&value, &minimum, &maximum, this] {
-            // If the value of the element is not a valid floating-point number, then set it to the best representation,
-            // as a floating-point number, of the default value.
-            auto maybe_value = parse_floating_point_number(value);
-            if (!is_valid_floating_point_number(value) ||
-                // AD-HOC: Use the default value if the value has not been set.
-                (!m_dirty_value && !has_attribute(AttributeNames::value)) ||
-                // AD-HOC: The spec doesn't require these checks - but other engines do them.
-                !maybe_value.has_value() || !isfinite(maybe_value.value())) {
-                // The default value is the minimum plus half the difference between the minimum and the maximum, unless
-                // the maximum is less than the minimum, in which case the default value is the minimum.
-                if (maximum < minimum)
-                    return minimum;
-                return minimum + ((maximum - minimum) / 2.0);
-            }
-            return maybe_value.value();
-        }();
-
-        // When the element is suffering from an overflow, if the maximum is not less than the minimum, the user agent
-        // must set the element's value to a valid floating-point number that represents the maximum.
-        if (is_number_overflowing(number_value)) {
-            number_value = max().value();
-        }
-
-        // When the element is suffering from an underflow, the user agent must set the element's value to the best
-        // representation, as a floating-point number, of the minimum.
-        if (is_number_underflowing(number_value)) {
-            number_value = min().value();
-        }
-
-        // When the element is suffering from a step mismatch, the user agent must round the element's value to the
-        // nearest number for which the element would not suffer from a step mismatch, and which is greater than or
-        // equal to the minimum, and, if the maximum is not less than the minimum, which is less than or equal to the
-        // maximum, if there is a number that matches these constraints. If two numbers match these constraints, then
-        // user agents must use the one nearest to positive infinity.
-        if (is_number_mismatching_step(number_value)) {
-            auto allowed_step = allowed_value_step().value();
-            auto minimum = min().value();
-            auto maximum = max().value();
-            auto step_mismatch = ((number_value - step_base()) / allowed_step) - floor((number_value - step_base()) / allowed_step);
-            if (step_mismatch >= 0.5) {
-                auto nearest_number = step_base() + (allowed_step * ceil((number_value - step_base()) / allowed_step));
-                if (nearest_number >= minimum && (maximum <= minimum || nearest_number <= maximum))
-                    return JS::number_to_utf16_string(nearest_number);
-            }
-            if (step_mismatch <= 0.5) {
-                auto nearest_number = step_base() + (allowed_step * floor((number_value - step_base()) / allowed_step));
-                if (nearest_number >= minimum && (maximum <= minimum || nearest_number <= maximum))
-                    return JS::number_to_utf16_string(nearest_number);
-            }
-        }
-
-        return JS::number_to_utf16_string(number_value);
-    }
-    // https://html.spec.whatwg.org/multipage/input.html#color-state-(type=color):value-sanitization-algorithm
-    else if (type_state() == HTMLInputElement::TypeAttributeState::Color) {
-        // If the value of the element is a valid simple color, then set it to the value of the element converted to
-        // ASCII lowercase; otherwise, set it to the string "#000000".
-        if (is_valid_simple_color(value))
-            return value.to_ascii_lowercase();
-        return "#000000"_utf16;
-    }
-
-    return value;
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-input-element:concept-form-reset-control
-void HTMLInputElement::reset_algorithm()
-{
-    // The reset algorithm for input elements is to set its user validity, dirty value flag, and dirty checkedness flag back to false,
-    m_user_validity = false;
-    m_dirty_value = false;
-    m_dirty_checkedness = false;
-
-    // set the value of the element to the value of the value content attribute, if there is one, or the empty string otherwise,
-    auto old_value = move(m_value);
-    m_value = Utf16String::from_utf8(get_attribute_value(AttributeNames::value));
-
-    // set the checkedness of the element to true if the element has a checked content attribute and false if it does not,
-    m_checked = has_attribute(AttributeNames::checked);
-
-    // empty the list of selected files,
-    if (m_selected_files)
-        m_selected_files = FileAPI::FileList::create(realm());
-
-    // and then invoke the value sanitization algorithm, if the type attribute's current state defines one.
-    m_value = value_sanitization_algorithm(m_value);
-
-    if (m_value != old_value)
-        relevant_value_was_changed();
-
-    if (m_text_node) {
-        m_text_node->set_data(m_value);
-        update_placeholder_visibility();
-    }
-
-    update_shadow_tree();
-}
-
-// https://w3c.github.io/webdriver/#dfn-clear-algorithm
-void HTMLInputElement::clear_algorithm()
-{
-    // The clear algorithm for input elements is to set the dirty value flag and dirty checkedness flag back to false,
-    m_dirty_value = false;
-    m_dirty_checkedness = false;
-
-    // set the value of the element to an empty string,
-    auto old_value = move(m_value);
-    m_value = {};
-
-    // set the checkedness of the element to true if the element has a checked content attribute and false if it does not,
-    m_checked = has_attribute(AttributeNames::checked);
-
-    // empty the list of selected files,
-    if (m_selected_files)
-        m_selected_files = FileAPI::FileList::create(realm());
-
