@@ -322362,7 +322362,11 @@ DisplayingVideoSinkUpdateResult DisplayingVideoSink::update()
         result = DisplayingVideoSinkUpdateResult::NewFrameAvailable;
     }
 
-    dispatch_state_if_changed(last_status);
+    // Dispatch the new state with a deferred invoke to avoid reentrancy. This prevents a seek from resolving while
+    // an update is being processed.
+    Core::deferred_invoke([self = NonnullRefPtr(*this), last_status] {
+        self->dispatch_state_if_changed(last_status);
+    });
 
     return result;
 }
@@ -448811,6 +448815,13 @@ void CSSImportRule::fetch()
 
     // AD-HOC: Track pending import rules to block rendering until they are done.
     m_document->add_pending_css_import_rule({}, *this);
+    // FIXME: This dedicated load-event delayer shouldn't be needed. The style-sheet critical-subresource mechanism
+    //        already delays the document load event via the owning element. However, it only does that delay when
+    //        contributes_a_script_blocking_style_sheet() is true. But HTMLStyleElement currently always returns false
+    //        for that. Once HTMLStyleElement actually has working contributes_a_script_blocking_style_sheet() behavior
+    //        implemented (as HTMLLinkElement element already does), the owning style element's delayer will cover the
+    //        @import fetch — and then at that time, this dedicated load-event delayer can go away.
+    m_load_event_delayer.emplace(*m_document);
     set_loading_state(CSSStyleSheet::LoadingState::Loading);
 
     // 3. Fetch a style resource from rule’s URL, with ruleOrDeclaration rule, destination "style", CORS mode "no-cors", and
@@ -448826,6 +448837,7 @@ void CSSImportRule::fetch()
             // AD-HOC: Stop delaying the load event.
             ScopeGuard guard = [strong_this, document] {
                 document->remove_pending_css_import_rule({}, strong_this);
+                strong_this->m_load_event_delayer.clear();
                 if (strong_this->loading_state() != CSSStyleSheet::LoadingState::Error) {
                     // If we have no critical subresources, or they're loaded already, we can report that immediately.
                     auto sheet_loading_state = strong_this->m_style_sheet->loading_state();
@@ -448995,6 +449007,7 @@ FILE: Libraries/LibWeb/CSS/CSSImportRule.h
 #include <LibWeb/CSS/CSSRule.h>
 #include <LibWeb/CSS/CSSStyleSheet.h>
 #include <LibWeb/CSS/URL.h>
+#include <LibWeb/DOM/DocumentLoadEventDelayer.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 
@@ -449050,6 +449063,7 @@ private:
     RefPtr<Supports> m_supports;
     GC::Ref<MediaList> m_media;
     GC::Ptr<CSSStyleSheet> m_style_sheet;
+    Optional<DOM::DocumentLoadEventDelayer> m_load_event_delayer;
 };
 
 template<>
@@ -547583,17 +547597,21 @@ WebIDL::ExceptionOr<void> CharacterData::replace_data(size_t offset, size_t coun
         return {};
 
     // NB: Called during DOM text mutation, layout is stale.
-    if (auto* text = as_if<Text>(*this)) {
-        Layout::TextOffsetMapping mapping { *text };
-        mapping.for_each_fragment([](Layout::TextNode& slice) {
+    if (is<Text>(*this)) {
+        if (is<Layout::TextSliceNode>(unsafe_layout_node())) {
+            // NB: Slice nodes cache data that is calculated at layout tree construction time.
+            // So for them, we need to invalidate the layout tree, not just layout.
+            if (parent())
+                parent()->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::CharacterDataReplaceData);
+        } else if (auto* text_layout_node = as_if<Layout::TextNode>(unsafe_layout_node())) {
             // NB: Since the text node's data has changed, we need to invalidate the text for rendering.
             //     This ensures that the new text is reflected in layout, even if we don't end up doing a full layout
             //     tree rebuild.
-            slice.invalidate_text_for_rendering();
+            text_layout_node->invalidate_text_for_rendering();
 
             // We also need to relayout.
-            slice.set_needs_layout_update(SetNeedsLayoutReason::CharacterDataReplaceData);
-        });
+            text_layout_node->set_needs_layout_update(SetNeedsLayoutReason::CharacterDataReplaceData);
+        }
     }
 
     document().bump_character_data_version();
@@ -563061,6 +563079,9 @@ Vector<CSSPixelRect> Element::get_client_rects() const
     // NOTE: Ensure that layout is up-to-date before looking at metrics.
     const_cast<Document&>(document()).update_layout_if_needed_for_node(*this, UpdateLayoutReason::ElementGetClientRects);
 
+    if (!layout_node())
+        return {};
+
     // NOTE: Make sure CSS transforms are resolved before they are used to calculate the rect position.
     const_cast<Document&>(document()).update_paint_and_hit_testing_properties_if_needed();
 
@@ -575818,6 +575839,7 @@ enum class SetNeedsLayoutReason {
 [[nodiscard]] StringView to_string(SetNeedsLayoutReason);
 
 #define ENUMERATE_SET_NEEDS_LAYOUT_TREE_UPDATE_REASONS(X) \
+    X(CharacterDataReplaceData)                           \
     X(ElementSetInnerHTML)                                \
     X(ElementSetShadowRoot)                               \
     X(DetailsElementOpenedOrClosed)                       \
@@ -649598,39 +649620,3 @@ static bool is_valid_simple_color(Utf16View const& value)
     // if it is exactly seven characters long,
     if (value.length_in_code_units() != 7)
         return false;
-    // and the first character is a U+0023 NUMBER SIGN character (#),
-    if (!value.starts_with('#'))
-        return false;
-    // and the remaining six characters are all ASCII hex digits
-    for (size_t i = 1; i < value.length_in_code_units(); i++)
-        if (!is_ascii_hex_digit(value.code_unit_at(i)))
-            return false;
-
-    return true;
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#value-sanitization-algorithm
-Utf16String HTMLInputElement::value_sanitization_algorithm(Utf16String const& value) const
-{
-    auto strip_newlines = [&]() {
-        if (!value.contains('\r') && !value.contains('\n'))
-            return value;
-
-        StringBuilder builder(StringBuilder::Mode::UTF16);
-
-        for (size_t i = 0; i < value.length_in_code_units(); ++i) {
-            auto code_unit = value.code_unit_at(i);
-            if (code_unit != '\r' && code_unit != '\n')
-                builder.append_code_unit(code_unit);
-        }
-
-        return builder.to_utf16_string();
-    };
-
-    auto strip_newlines_and_trim = [&]() {
-        return strip_newlines().trim(Infra::ASCII_WHITESPACE);
-    };
-
-    // https://html.spec.whatwg.org/multipage/input.html#text-(type=text)-state-and-search-state-(type=search):value-sanitization-algorithm
-    // https://html.spec.whatwg.org/multipage/input.html#telephone-state-(type=tel):value-sanitization-algorithm
-    // https://html.spec.whatwg.org/multipage/input.html#password-state-(type=password):value-sanitization-algorithm
