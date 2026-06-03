@@ -42,7 +42,7 @@ use crate::bytecode::validator::validate_bytecode;
 use crate::u32_from_usize;
 
 const MAGIC: &[u8; 8] = b"LBJSBC\0\0";
-const FORMAT_VERSION: u32 = 12;
+const FORMAT_VERSION: u32 = 13;
 const SOURCE_HASH_SIZE: usize = 32;
 const BYTECODE_ALIGNMENT: usize = 8;
 const COMPLETION_TYPE_VARIANT_COUNT: u32 = 6;
@@ -668,7 +668,7 @@ impl Encode for Utf16<'_> {
 struct CacheBlob<'a> {
     compiled: &'a CompiledProgram,
     program_type: ast::ProgramType,
-    // Fingerprint of the decoded source text the blob was generated from. Cache writes happen asynchronously after the
+    // Fingerprint of the encoded source bytes the blob was generated from. Cache writes happen asynchronously after the
     // HTTP response has been served, so the entry on disk may have been replaced for the same (URL, vary key) by the
     // time we go to attach the sidecar. Embedding the source hash makes a stale write harmless: a later read whose
     // source no longer matches will reject the blob and fall through to source compilation.
@@ -681,6 +681,7 @@ impl Encode for CacheBlob<'_> {
         FORMAT_VERSION.encode(encoder);
         self.program_type.encode(encoder);
         encoder.bytes(self.source_hash);
+        u32_from_usize(self.compiled.source_len).encode(encoder);
         self.compiled.parsed.has_top_level_await.encode(encoder);
         self.compiled.parsed.is_strict_mode.encode(encoder);
         DeclarationMetadataRecord {
@@ -703,8 +704,10 @@ impl CacheBlob<'_> {
         let program_type = ast::ProgramType::decode(decoder)?;
         (program_type == expected_program_type).then_some(())?;
         (decoder.bytes(SOURCE_HASH_SIZE)? == expected_source_hash).then_some(())?;
+        let source_len = u32::decode(decoder)? as usize;
         Some(DecodedCacheBlob {
             program_type,
+            source_len,
             has_top_level_await: bool::decode(decoder)?,
             is_strict_mode: bool::decode(decoder)?,
             metadata: DeclarationMetadataRecord::decode(decoder)?,
@@ -715,6 +718,7 @@ impl CacheBlob<'_> {
 
 pub(crate) struct DecodedCacheBlob {
     program_type: ast::ProgramType,
+    source_len: usize,
     has_top_level_await: bool,
     is_strict_mode: bool,
     metadata: DecodedDeclarationMetadata,
@@ -724,9 +728,14 @@ pub(crate) struct DecodedCacheBlob {
 impl DecodedCacheBlob {
     fn validate(&self) {
         let _ = self.program_type as u8;
+        let _ = self.source_len;
         let _ = self.has_top_level_await || self.is_strict_mode;
         self.metadata.validate();
         self.program.validate();
+    }
+
+    pub(crate) fn source_len(&self) -> usize {
+        self.source_len
     }
 
     pub(crate) fn source_ranges_are_valid(&self, source_len: usize) -> bool {
@@ -734,6 +743,11 @@ impl DecodedCacheBlob {
             && self.metadata.indices_are_valid()
             && self.program.source_ranges_are_valid(source_len)
             && self.program.indices_are_valid()
+    }
+
+    pub(crate) fn validate_cached_bytecode(&self) -> Result<(), ValidationErrorKind> {
+        self.metadata.validate_cached_bytecode()?;
+        self.program.validate_cached_bytecode()
     }
 
     pub(crate) unsafe fn materialize_script(
@@ -1344,10 +1358,6 @@ unsafe fn materialize_function(
     shared_function_data_owner: crate::bytecode::ffi::SharedFunctionDataOwner,
 ) -> *mut c_void {
     unsafe {
-        if function.precompiled.validate_cached_bytecode().is_err() {
-            return std::ptr::null_mut();
-        }
-
         let (_parameter_name_storage, parameter_names): (Vec<Vec<u16>>, Vec<FFIUtf16Slice>) = function
             .parameter_names
             .as_ref()
@@ -1469,10 +1479,6 @@ unsafe fn prepare_function_install(
         }
 
         if crate::bytecode::ffi::rust_sfd_executable(existing_sfd_ptr).is_null() {
-            if function.precompiled.validate_cached_bytecode().is_err() {
-                return std::ptr::null_mut();
-            }
-
             pending_function_installs.push(PendingFunctionInstall {
                 existing_sfd_ptr,
                 replacement: PendingFunctionInstallReplacement::CachedBytecode(function.precompiled),
@@ -1484,9 +1490,6 @@ unsafe fn prepare_function_install(
         let Some(executable) = function.precompiled.decode_executable() else {
             return std::ptr::null_mut();
         };
-        if executable.validate_cached_bytecode().is_err() {
-            return std::ptr::null_mut();
-        }
         let executable_ptr = materialize_executable_for_install(
             executable,
             Some(existing_shared_function_data),
@@ -1523,9 +1526,6 @@ pub(crate) unsafe fn materialize_cached_function(
         let Some(executable) = cached_executable.decode_executable() else {
             return std::ptr::null_mut();
         };
-        if executable.validate_cached_bytecode().is_err() {
-            return std::ptr::null_mut();
-        }
         let shared_function_data_owner = if shared_function_data_list_ptr.is_null() {
             crate::bytecode::ffi::SharedFunctionDataOwner::None
         } else {
@@ -1832,6 +1832,22 @@ impl DecodedDeclarationMetadata {
                             || usize::try_from(binding.function_index)
                                 .is_ok_and(|index| index < declaration_functions.len())
                     })
+            }
+        }
+    }
+
+    fn validate_cached_bytecode(&self) -> Result<(), ValidationErrorKind> {
+        match self {
+            Self::Script {
+                declaration_functions, ..
+            }
+            | Self::Module {
+                declaration_functions, ..
+            } => {
+                for function in declaration_functions {
+                    function.precompiled.validate_cached_bytecode()?;
+                }
+                Ok(())
             }
         }
     }
@@ -2709,6 +2725,10 @@ impl DecodedProgramRecord {
 
     fn indices_are_valid(&self) -> bool {
         self.executable.indices_are_valid()
+    }
+
+    fn validate_cached_bytecode(&self) -> Result<(), ValidationErrorKind> {
+        self.executable.validate_cached_bytecode()
     }
 }
 

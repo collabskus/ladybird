@@ -44,17 +44,44 @@ using namespace AK::SIMD;
 
 namespace {
 
+enum class CompiledFaultKind : u8 {
+    None,
+    Memory,
+    CraneliftTrap,
+};
+
 struct CompiledFaultRecoveryContext {
     Wasm::BytecodeInterpreter* interpreter { nullptr };
     Wasm::Configuration* configuration { nullptr };
     CompiledFaultRecoveryContext* previous { nullptr };
     jmp_buf jump_buffer;
     bool faulted { false };
+    CompiledFaultKind fault_kind { CompiledFaultKind::None };
+    u8 cranelift_trap_code { 0 };
 };
 
 thread_local CompiledFaultRecoveryContext* s_compiled_fault_recovery = nullptr;
 
 #if WASM_COMPILED_FAULT_RECOVERY_SUPPORTED
+
+static StringView cranelift_trap_message(u8 trap_code)
+{
+    // Cranelift reserves trap codes at the high end of u8:
+    // stack_overflow=251, int_overflow=252, heap_oob=253, int_divz=254, bad_toint=255.
+    switch (trap_code) {
+    case 251:
+        return Wasm::Constants::stack_exhaustion_message;
+    case 252:
+    case 254:
+        return "Integer division overflow"sv;
+    case 253:
+        return "Memory access out of bounds"sv;
+    case 255:
+        return "Truncation out of range"sv;
+    default:
+        return "unreachable executed"sv;
+    }
+}
 
 static bool is_wasm_memory_fault(Wasm::Configuration& configuration, void* address)
 {
@@ -111,6 +138,7 @@ static void install_compiled_fault_handlers()
 
 static struct sigaction s_old_sigsegv;
 static struct sigaction s_old_sigbus;
+static struct sigaction s_old_sigill;
 
 [[noreturn]] static void chain_fault_signal(int signal, siginfo_t* info, void* context, struct sigaction const& previous_action)
 {
@@ -141,12 +169,10 @@ no_handler:
 
 static void compiled_fault_signal_handler(int signal, siginfo_t* info, void* context)
 {
-    if (auto* recovery = s_compiled_fault_recovery; recovery && info && is_wasm_memory_fault(*recovery->configuration, info->si_addr)) {
-        recovery->faulted = true;
-        // Redirect the resumed PC to our trampoline and return.
-        // sigreturn (or the platform equivalent) will take the flow to the trampoline on the faulting thread's "normal" stack,
-        // from where we can then longjmp to the recovery code.
-        auto* uc = static_cast<ucontext_t*>(context);
+    auto* recovery = s_compiled_fault_recovery;
+    auto* uc = static_cast<ucontext_t*>(context);
+
+    auto redirect_to_trampoline = [&] {
 #        if defined(AK_OS_MACOS)
 #            if ARCH(AARCH64)
         uc->uc_mcontext->__ss.__pc = reinterpret_cast<uintptr_t>(&wasm_compiled_fault_trampoline);
@@ -160,11 +186,60 @@ static void compiled_fault_signal_handler(int signal, siginfo_t* info, void* con
         uc->uc_mcontext.gregs[REG_RIP] = reinterpret_cast<greg_t>(&wasm_compiled_fault_trampoline);
 #            endif
 #        endif
+    };
+
+    if (recovery && info && (signal == SIGSEGV || signal == SIGBUS) && is_wasm_memory_fault(*recovery->configuration, info->si_addr)) {
+        recovery->faulted = true;
+        recovery->fault_kind = CompiledFaultKind::Memory;
+        // Redirect the resumed PC to our trampoline and return.
+        // sigreturn (or the platform equivalent) will take the flow to the trampoline on the faulting thread's "normal" stack,
+        // from where we can then longjmp to the recovery code.
+        redirect_to_trampoline();
         return;
+    }
+
+    if (recovery && signal == SIGILL) {
+#        if defined(AK_OS_MACOS)
+#            if ARCH(AARCH64)
+        auto pc = static_cast<FlatPtr>(uc->uc_mcontext->__ss.__pc);
+#            elif ARCH(X86_64)
+        auto pc = static_cast<FlatPtr>(uc->uc_mcontext->__ss.__rip);
+#            else
+        auto pc = static_cast<FlatPtr>(0);
+#            endif
+#        else
+#            if ARCH(AARCH64)
+        auto pc = static_cast<FlatPtr>(uc->uc_mcontext.pc);
+#            elif ARCH(X86_64)
+        auto pc = static_cast<FlatPtr>(uc->uc_mcontext.gregs[REG_RIP]);
+#            else
+        auto pc = static_cast<FlatPtr>(0);
+#            endif
+#        endif
+
+        auto const& compiled = recovery->configuration->frame().expression().compiled_instructions;
+        auto const code_start = compiled.dispatches.is_empty() ? 0 : compiled.dispatches[0].handler_ptr;
+        auto const code_size = compiled.cranelift_code_size;
+        if (compiled.cranelift_compiled && code_start != 0 && pc >= code_start && pc < code_start + code_size) {
+            auto const offset = static_cast<u32>(pc - code_start);
+            for (size_t i = 0; i < compiled.cranelift_trap_count; ++i) {
+                auto const& trap = compiled.cranelift_traps[i];
+                if (trap.offset != offset)
+                    continue;
+
+                recovery->faulted = true;
+                recovery->fault_kind = CompiledFaultKind::CraneliftTrap;
+                recovery->cranelift_trap_code = trap.code;
+                redirect_to_trampoline();
+                return;
+            }
+        }
     }
 
     if (signal == SIGSEGV)
         chain_fault_signal(signal, info, context, s_old_sigsegv);
+    if (signal == SIGILL)
+        chain_fault_signal(signal, info, context, s_old_sigill);
     chain_fault_signal(signal, info, context, s_old_sigbus);
 }
 
@@ -180,6 +255,7 @@ static void install_compiled_fault_handlers()
     sigemptyset(&action.sa_mask);
     sigaction(SIGSEGV, &action, &s_old_sigsegv);
     sigaction(SIGBUS, &action, &s_old_sigbus);
+    sigaction(SIGILL, &action, &s_old_sigill);
 }
 
 #    endif
@@ -189,43 +265,6 @@ static void install_compiled_fault_handlers()
 static void install_compiled_fault_handlers() { }
 
 #endif
-
-class ScopedCompiledFaultRecovery {
-public:
-    ScopedCompiledFaultRecovery(Wasm::BytecodeInterpreter& interpreter, Wasm::Configuration& configuration)
-    {
-        m_context.interpreter = &interpreter;
-        m_context.configuration = &configuration;
-        m_context.previous = s_compiled_fault_recovery;
-    }
-
-    ~ScopedCompiledFaultRecovery()
-    {
-        if (m_armed)
-            s_compiled_fault_recovery = m_context.previous;
-    }
-
-    bool arm()
-    {
-        install_compiled_fault_handlers();
-        s_compiled_fault_recovery = &m_context;
-        m_armed = true;
-        if (setjmp(m_context.jump_buffer) != 0) {
-            // Disarm immediately after longjmp return; the compiled code may
-            // have corrupted our stack frame, so the destructor must be a no-op.
-            s_compiled_fault_recovery = m_context.previous;
-            m_armed = false;
-            return false;
-        }
-        return true;
-    }
-
-    bool faulted() const { return m_context.faulted; }
-
-private:
-    CompiledFaultRecoveryContext m_context;
-    bool m_armed { false };
-};
 
 }
 
@@ -354,26 +393,46 @@ void BytecodeInterpreter::interpret(Configuration& configuration)
 {
     m_trap = Empty {};
     auto& expression = configuration.frame().expression();
-    Optional<ScopedCompiledFaultRecovery> compiled_fault_recovery;
+    CompiledFaultRecoveryContext compiled_fault_recovery;
+    bool did_install_compiled_fault_recovery = false;
     if (expression.compiled_instructions.cranelift_compiled && !s_compiled_fault_recovery) {
-        compiled_fault_recovery.emplace(*this, configuration);
-        if (!compiled_fault_recovery->arm()) {
-            m_trap = Trap::from_string("Memory access out of bounds");
+        install_compiled_fault_handlers();
+        compiled_fault_recovery.interpreter = this;
+        compiled_fault_recovery.configuration = &configuration;
+        compiled_fault_recovery.previous = s_compiled_fault_recovery;
+        s_compiled_fault_recovery = &compiled_fault_recovery;
+        did_install_compiled_fault_recovery = true;
+        if (setjmp(compiled_fault_recovery.jump_buffer) != 0) {
+            s_compiled_fault_recovery = compiled_fault_recovery.previous;
+            if (compiled_fault_recovery.fault_kind == CompiledFaultKind::CraneliftTrap)
+                m_trap = Trap::from_string(cranelift_trap_message(compiled_fault_recovery.cranelift_trap_code));
+            else
+                m_trap = Trap::from_string("Memory access out of bounds");
             return;
         }
     }
     auto const should_limit_instruction_count = configuration.should_limit_instruction_count();
     if (!expression.compiled_instructions.dispatches.is_empty()) {
         if (expression.compiled_instructions.direct) {
-            if (should_limit_instruction_count)
-                return interpret_impl<true, true, true>(configuration, expression);
-            return interpret_impl<true, false, true>(configuration, expression);
+            if (should_limit_instruction_count) {
+                interpret_impl<true, true, true>(configuration, expression);
+                goto done;
+            }
+            interpret_impl<true, false, true>(configuration, expression);
+            goto done;
         }
-        return interpret_impl<true, false, false>(configuration, expression);
+        interpret_impl<true, false, false>(configuration, expression);
+        goto done;
     }
-    if (should_limit_instruction_count)
-        return interpret_impl<false, true, false>(configuration, expression);
-    return interpret_impl<false, false, false>(configuration, expression);
+    if (should_limit_instruction_count) {
+        interpret_impl<false, true, false>(configuration, expression);
+        goto done;
+    }
+    interpret_impl<false, false, false>(configuration, expression);
+
+done:
+    if (did_install_compiled_fault_recovery)
+        s_compiled_fault_recovery = compiled_fault_recovery.previous;
 }
 
 constexpr static u32 default_sources_and_destination = (to_underlying(Dispatch::RegisterOrStack::Stack) | (to_underlying(Dispatch::RegisterOrStack::Stack) << 2) | (to_underlying(Dispatch::RegisterOrStack::Stack) << 4));
