@@ -206891,6 +206891,9 @@ static void write_indent(StringBuilder& builder, StringView gap, size_t depth)
 // 25.5.2.4 SerializeJSONObject ( state, value ), https://tc39.es/ecma262/#sec-serializejsonobject
 ThrowCompletionOr<void> JSONObject::serialize_json_object(VM& vm, StringifyState& state, Object& object)
 {
+    if (vm.did_reach_stack_space_limit())
+        return vm.throw_completion<InternalError>(ErrorType::CallStackSizeExceeded);
+
     if (state.seen_objects.contains(&object))
         return vm.throw_completion<TypeError>(ErrorType::JsonCircular);
 
@@ -206964,6 +206967,9 @@ ThrowCompletionOr<void> JSONObject::serialize_json_object(VM& vm, StringifyState
 // 25.5.2.5 SerializeJSONArray ( state, value ), https://tc39.es/ecma262/#sec-serializejsonarray
 ThrowCompletionOr<void> JSONObject::serialize_json_array(VM& vm, StringifyState& state, Object& object)
 {
+    if (vm.did_reach_stack_space_limit())
+        return vm.throw_completion<InternalError>(ErrorType::CallStackSizeExceeded);
+
     if (state.seen_objects.contains(&object))
         return vm.throw_completion<TypeError>(ErrorType::JsonCircular);
 
@@ -226793,10 +226799,10 @@ GC::Ref<Shape> Shape::create_configure_transition(PropertyKey const& property_ke
 
 GC::Ref<Shape> Shape::create_prototype_transition(Object* new_prototype)
 {
-    if (new_prototype)
-        new_prototype->convert_to_prototype_if_needed();
     if (auto existing_shape = get_or_prune_cached_prototype_transition(new_prototype))
         return *existing_shape;
+    if (new_prototype)
+        new_prototype->convert_to_prototype_if_needed();
     auto new_shape = heap().allocate<Shape>(*this, new_prototype);
     if (m_dictionary && m_property_count > DescriptorArray::max_descriptor_count) {
         new_shape->become_dictionary_shape();
@@ -227013,8 +227019,11 @@ GC::Ref<Shape> Shape::clone_for_prototype()
     if (m_dictionary && m_property_count > DescriptorArray::max_descriptor_count) {
         new_shape->become_dictionary_shape();
         copy_properties_to_dictionary_shape(*new_shape);
-    } else {
+    } else if (m_dictionary) {
         new_shape->set_descriptors(copy_descriptors());
+        new_shape->m_property_count = m_property_count;
+    } else {
+        new_shape->set_descriptors(descriptors());
         new_shape->m_property_count = m_property_count;
     }
     new_shape->m_prototype_chain_validity = heap().allocate<PrototypeChainValidity>();
@@ -264269,7 +264278,7 @@ use crate::bytecode::validator::validate_bytecode;
 use crate::u32_from_usize;
 
 const MAGIC: &[u8; 8] = b"LBJSBC\0\0";
-const FORMAT_VERSION: u32 = 12;
+const FORMAT_VERSION: u32 = 13;
 const SOURCE_HASH_SIZE: usize = 32;
 const BYTECODE_ALIGNMENT: usize = 8;
 const COMPLETION_TYPE_VARIANT_COUNT: u32 = 6;
@@ -264895,7 +264904,7 @@ impl Encode for Utf16<'_> {
 struct CacheBlob<'a> {
     compiled: &'a CompiledProgram,
     program_type: ast::ProgramType,
-    // Fingerprint of the decoded source text the blob was generated from. Cache writes happen asynchronously after the
+    // Fingerprint of the encoded source bytes the blob was generated from. Cache writes happen asynchronously after the
     // HTTP response has been served, so the entry on disk may have been replaced for the same (URL, vary key) by the
     // time we go to attach the sidecar. Embedding the source hash makes a stale write harmless: a later read whose
     // source no longer matches will reject the blob and fall through to source compilation.
@@ -264908,6 +264917,7 @@ impl Encode for CacheBlob<'_> {
         FORMAT_VERSION.encode(encoder);
         self.program_type.encode(encoder);
         encoder.bytes(self.source_hash);
+        u32_from_usize(self.compiled.source_len).encode(encoder);
         self.compiled.parsed.has_top_level_await.encode(encoder);
         self.compiled.parsed.is_strict_mode.encode(encoder);
         DeclarationMetadataRecord {
@@ -264930,8 +264940,10 @@ impl CacheBlob<'_> {
         let program_type = ast::ProgramType::decode(decoder)?;
         (program_type == expected_program_type).then_some(())?;
         (decoder.bytes(SOURCE_HASH_SIZE)? == expected_source_hash).then_some(())?;
+        let source_len = u32::decode(decoder)? as usize;
         Some(DecodedCacheBlob {
             program_type,
+            source_len,
             has_top_level_await: bool::decode(decoder)?,
             is_strict_mode: bool::decode(decoder)?,
             metadata: DeclarationMetadataRecord::decode(decoder)?,
@@ -264942,6 +264954,7 @@ impl CacheBlob<'_> {
 
 pub(crate) struct DecodedCacheBlob {
     program_type: ast::ProgramType,
+    source_len: usize,
     has_top_level_await: bool,
     is_strict_mode: bool,
     metadata: DecodedDeclarationMetadata,
@@ -264951,9 +264964,14 @@ pub(crate) struct DecodedCacheBlob {
 impl DecodedCacheBlob {
     fn validate(&self) {
         let _ = self.program_type as u8;
+        let _ = self.source_len;
         let _ = self.has_top_level_await || self.is_strict_mode;
         self.metadata.validate();
         self.program.validate();
+    }
+
+    pub(crate) fn source_len(&self) -> usize {
+        self.source_len
     }
 
     pub(crate) fn source_ranges_are_valid(&self, source_len: usize) -> bool {
@@ -264961,6 +264979,11 @@ impl DecodedCacheBlob {
             && self.metadata.indices_are_valid()
             && self.program.source_ranges_are_valid(source_len)
             && self.program.indices_are_valid()
+    }
+
+    pub(crate) fn validate_cached_bytecode(&self) -> Result<(), ValidationErrorKind> {
+        self.metadata.validate_cached_bytecode()?;
+        self.program.validate_cached_bytecode()
     }
 
     pub(crate) unsafe fn materialize_script(
@@ -265571,10 +265594,6 @@ unsafe fn materialize_function(
     shared_function_data_owner: crate::bytecode::ffi::SharedFunctionDataOwner,
 ) -> *mut c_void {
     unsafe {
-        if function.precompiled.validate_cached_bytecode().is_err() {
-            return std::ptr::null_mut();
-        }
-
         let (_parameter_name_storage, parameter_names): (Vec<Vec<u16>>, Vec<FFIUtf16Slice>) = function
             .parameter_names
             .as_ref()
@@ -265696,10 +265715,6 @@ unsafe fn prepare_function_install(
         }
 
         if crate::bytecode::ffi::rust_sfd_executable(existing_sfd_ptr).is_null() {
-            if function.precompiled.validate_cached_bytecode().is_err() {
-                return std::ptr::null_mut();
-            }
-
             pending_function_installs.push(PendingFunctionInstall {
                 existing_sfd_ptr,
                 replacement: PendingFunctionInstallReplacement::CachedBytecode(function.precompiled),
@@ -265711,9 +265726,6 @@ unsafe fn prepare_function_install(
         let Some(executable) = function.precompiled.decode_executable() else {
             return std::ptr::null_mut();
         };
-        if executable.validate_cached_bytecode().is_err() {
-            return std::ptr::null_mut();
-        }
         let executable_ptr = materialize_executable_for_install(
             executable,
             Some(existing_shared_function_data),
@@ -265750,9 +265762,6 @@ pub(crate) unsafe fn materialize_cached_function(
         let Some(executable) = cached_executable.decode_executable() else {
             return std::ptr::null_mut();
         };
-        if executable.validate_cached_bytecode().is_err() {
-            return std::ptr::null_mut();
-        }
         let shared_function_data_owner = if shared_function_data_list_ptr.is_null() {
             crate::bytecode::ffi::SharedFunctionDataOwner::None
         } else {
@@ -266059,6 +266068,22 @@ impl DecodedDeclarationMetadata {
                             || usize::try_from(binding.function_index)
                                 .is_ok_and(|index| index < declaration_functions.len())
                     })
+            }
+        }
+    }
+
+    fn validate_cached_bytecode(&self) -> Result<(), ValidationErrorKind> {
+        match self {
+            Self::Script {
+                declaration_functions, ..
+            }
+            | Self::Module {
+                declaration_functions, ..
+            } => {
+                for function in declaration_functions {
+                    function.precompiled.validate_cached_bytecode()?;
+                }
+                Ok(())
             }
         }
     }
@@ -266936,6 +266961,10 @@ impl DecodedProgramRecord {
 
     fn indices_are_valid(&self) -> bool {
         self.executable.indices_are_valid()
+    }
+
+    fn validate_cached_bytecode(&self) -> Result<(), ValidationErrorKind> {
+        self.executable.validate_cached_bytecode()
     }
 }
 
@@ -283929,6 +283958,7 @@ pub struct CompiledProgram {
     parsed: ParsedProgram,
     bytecode: CompiledProgramBytecode,
     declaration_functions: Vec<PendingSharedFunctionData>,
+    source_len: usize,
 }
 
 pub struct CompiledFunction {
@@ -284537,6 +284567,7 @@ fn compile_parsed_program_off_thread_impl(
                 parsed: *parsed,
                 bytecode,
                 declaration_functions,
+                source_len,
             }))
         })
     }
@@ -284710,6 +284741,20 @@ pub unsafe extern "C" fn rust_free_decoded_bytecode_cache_blob(blob: *mut Decode
     }
 }
 
+/// Return the decoded source length carried by a decoded bytecode cache blob.
+///
+/// # Safety
+/// `blob` must be a valid pointer from `rust_decode_bytecode_cache_blob_with_owner()`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_decoded_bytecode_cache_source_len(blob: *const DecodedBytecodeCacheBlob) -> usize {
+    unsafe {
+        if blob.is_null() {
+            return 0;
+        }
+        (*blob)._blob.source_len()
+    }
+}
+
 /// Materialize a decoded script bytecode cache blob. Consumes and frees the blob.
 ///
 /// # Safety
@@ -284733,6 +284778,9 @@ pub unsafe extern "C" fn rust_materialize_bytecode_cache_script(
             }
             let blob = Box::from_raw(blob);
             if !blob._blob.source_ranges_are_valid(source_len) {
+                return std::ptr::null_mut();
+            }
+            if blob._blob.validate_cached_bytecode().is_err() {
                 return std::ptr::null_mut();
             }
             blob._blob
@@ -284767,6 +284815,9 @@ pub unsafe extern "C" fn rust_materialize_bytecode_cache_module(
             }
             let blob = Box::from_raw(blob);
             if !blob._blob.source_ranges_are_valid(source_len) {
+                return std::ptr::null_mut();
+            }
+            if blob._blob.validate_cached_bytecode().is_err() {
                 return std::ptr::null_mut();
             }
             blob._blob.materialize_module(
@@ -284819,6 +284870,9 @@ pub unsafe extern "C" fn rust_install_bytecode_cache_script(
             if !blob._blob.source_ranges_are_valid(source_len) {
                 return std::ptr::null_mut();
             }
+            if blob._blob.validate_cached_bytecode().is_err() {
+                return std::ptr::null_mut();
+            }
             blob._blob.install_script(
                 vm_ptr,
                 source_code_ptr,
@@ -284868,6 +284922,9 @@ pub unsafe extern "C" fn rust_install_bytecode_cache_module(
                 std::slice::from_raw_parts(existing_declaration_function_ptrs, existing_declaration_function_count)
             };
             if !blob._blob.source_ranges_are_valid(source_len) {
+                return std::ptr::null_mut();
+            }
+            if blob._blob.validate_cached_bytecode().is_err() {
                 return std::ptr::null_mut();
             }
             blob._blob.install_module(
@@ -297422,6 +297479,11 @@ DecodedBytecodeCacheBlob* decode_bytecode_cache_blob(Core::ImmutableBytes bytes,
     return rust_decode_bytecode_cache_blob_with_owner(owner->bytes().data(), owner->bytes().size(), static_cast<u8>(expected_type), source_hash.data(), source_hash.size(), owner, clone_bytecode_cache_blob_owner, free_bytecode_cache_blob_owner);
 }
 
+size_t decoded_bytecode_cache_source_length(DecodedBytecodeCacheBlob const* blob)
+{
+    return rust_decoded_bytecode_cache_source_len(blob);
+}
+
 void free_decoded_bytecode_cache_blob(DecodedBytecodeCacheBlob* blob)
 {
     rust_free_decoded_bytecode_cache_blob(blob);
@@ -298850,6 +298912,9 @@ JS_API ByteBuffer serialize_compiled_program_for_bytecode_cache(FFI::CompiledPro
 
 // Decode an ImmutableBytes-backed bytecode cache blob into a parser-free cache handle.
 JS_API FFI::DecodedBytecodeCacheBlob* decode_bytecode_cache_blob(Core::ImmutableBytes, ProgramType, ReadonlyBytes source_hash);
+
+// Return the decoded source length carried by a bytecode cache blob.
+JS_API size_t decoded_bytecode_cache_source_length(FFI::DecodedBytecodeCacheBlob const*);
 
 // Free a decoded bytecode cache blob.
 JS_API void free_decoded_bytecode_cache_blob(FFI::DecodedBytecodeCacheBlob*);
@@ -340982,6 +341047,19 @@ ErrorOr<String> convert_input_to_utf8_using_given_decoder_unless_there_is_a_byte
     return output;
 }
 
+ErrorOr<size_t> convert_input_to_utf16_length_using_given_decoder_unless_there_is_a_byte_order_mark(Decoder& fallback_decoder, StringView input)
+{
+    Decoder* actual_decoder = &fallback_decoder;
+
+    if (auto unicode_decoder = bom_sniff_to_decoder(input); unicode_decoder.has_value()) {
+        actual_decoder = &unicode_decoder.value();
+        input = input.substring_view(&unicode_decoder.value() == &s_utf8_decoder ? 3 : 2);
+    }
+
+    VERIFY(actual_decoder);
+    return actual_decoder->length_in_utf16_code_units(input);
+}
+
 // https://encoding.spec.whatwg.org/#get-an-output-encoding
 StringView get_output_encoding(StringView encoding)
 {
@@ -341009,6 +341087,16 @@ ErrorOr<String> Decoder::to_utf8(StringView input)
     StringBuilder builder(input.length());
     TRY(process(input, [&builder](u32 c) { return builder.try_append_code_point(c); }));
     return builder.to_string_without_validation();
+}
+
+ErrorOr<size_t> Decoder::length_in_utf16_code_units(StringView input)
+{
+    size_t length = 0;
+    TRY(process(input, [&](u32 code_point) -> ErrorOr<void> {
+        length += code_point <= 0xffff ? 1 : 2;
+        return {};
+    }));
+    return length;
 }
 
 ErrorOr<void> Decoder::process_code_points(StringView input, Function<ErrorOr<void>(u32)> on_code_point)
@@ -341451,6 +341539,83 @@ static ErrorOr<void> process_utf8_with_replacement_character(StringView input, F
     return {};
 }
 
+static size_t utf8_length_in_utf16_code_units_with_replacement_character(StringView input)
+{
+    auto bytes = input.bytes();
+    size_t length = 0;
+
+    for (size_t i = 0; i < bytes.size();) {
+        auto byte = bytes[i];
+        if (byte <= 0x7f) {
+            ++length;
+            ++i;
+            continue;
+        }
+
+        size_t sequence_length = 0;
+        u32 code_point = 0;
+        u32 minimum_code_point = 0;
+
+        if (byte >= 0xc2 && byte <= 0xdf) {
+            sequence_length = 2;
+            code_point = byte & 0x1f;
+            minimum_code_point = 0x80;
+        } else if (byte >= 0xe0 && byte <= 0xef) {
+            sequence_length = 3;
+            code_point = byte & 0x0f;
+            minimum_code_point = 0x800;
+        } else if (byte >= 0xf0 && byte <= 0xf4) {
+            sequence_length = 4;
+            code_point = byte & 0x07;
+            minimum_code_point = 0x10000;
+        } else {
+            ++length;
+            ++i;
+            continue;
+        }
+
+        if (i + 1 < bytes.size() && !is_utf8_second_byte_in_range(byte, bytes[i + 1])) {
+            ++length;
+            ++i;
+            continue;
+        }
+
+        if (i + sequence_length > bytes.size()) {
+            ++length;
+            i = bytes.size();
+            continue;
+        }
+
+        Optional<size_t> invalid_continuation_offset;
+        for (size_t offset = 1; offset < sequence_length; ++offset) {
+            auto continuation_byte = bytes[i + offset];
+            if (!is_utf8_continuation_byte(continuation_byte)) {
+                invalid_continuation_offset = offset;
+                break;
+            }
+            code_point <<= 6;
+            code_point |= continuation_byte & 0x3f;
+        }
+
+        if (invalid_continuation_offset.has_value()) {
+            ++length;
+            i += *invalid_continuation_offset;
+            continue;
+        }
+
+        if (code_point < minimum_code_point || code_point > 0x10ffff || is_unicode_surrogate(code_point)) {
+            ++length;
+            ++i;
+            continue;
+        }
+
+        length += code_point <= 0xffff ? 1 : 2;
+        i += sequence_length;
+    }
+
+    return length;
+}
+
 ErrorOr<void> UTF8Decoder::process(StringView input, Function<ErrorOr<void>(u32)> on_code_point)
 {
     return process_utf8_with_replacement_character(input, move(on_code_point));
@@ -341473,11 +341638,31 @@ ErrorOr<String> UTF8Decoder::to_utf8(StringView input)
     return builder.to_string_without_validation();
 }
 
+ErrorOr<size_t> UTF8Decoder::length_in_utf16_code_units(StringView input)
+{
+    if (auto bytes = input.bytes(); bytes.starts_with({ { 0xEF, 0xBB, 0xBF } }))
+        input = input.substring_view(3);
+
+    return utf8_length_in_utf16_code_units_with_replacement_character(input);
+}
+
 bool UTF16BEDecoder::validate(StringView input)
 {
     if (input.bytes().size() % 2 != 0)
         return false;
     return AK::validate_utf16_be(input.bytes());
+}
+
+static size_t utf16_length_in_utf16_code_units(StringView input, bool big_endian)
+{
+    auto bytes = input.bytes();
+    if (bytes.size() >= 2) {
+        if ((big_endian && bytes[0] == 0xFE && bytes[1] == 0xFF)
+            || (!big_endian && bytes[0] == 0xFF && bytes[1] == 0xFE))
+            bytes = bytes.slice(2);
+    }
+
+    return (bytes.size() + 1) / 2;
 }
 
 static ErrorOr<void> process_utf16(StringView input, bool big_endian, Function<ErrorOr<void>(u32)> on_code_point)
@@ -341534,6 +341719,11 @@ ErrorOr<String> UTF16BEDecoder::to_utf8(StringView input)
     return Decoder::to_utf8(input);
 }
 
+ErrorOr<size_t> UTF16BEDecoder::length_in_utf16_code_units(StringView input)
+{
+    return utf16_length_in_utf16_code_units(input, true);
+}
+
 bool UTF16LEDecoder::validate(StringView input)
 {
     if (input.bytes().size() % 2 != 0)
@@ -341551,6 +341741,11 @@ ErrorOr<String> UTF16LEDecoder::to_utf8(StringView input)
     return Decoder::to_utf8(input);
 }
 
+ErrorOr<size_t> UTF16LEDecoder::length_in_utf16_code_units(StringView input)
+{
+    return utf16_length_in_utf16_code_units(input, false);
+}
+
 ErrorOr<void> Latin1Decoder::process(StringView input, Function<ErrorOr<void>(u32)> on_code_point)
 {
     for (u8 ch : input) {
@@ -341559,6 +341754,11 @@ ErrorOr<void> Latin1Decoder::process(StringView input, Function<ErrorOr<void>(u3
     }
 
     return {};
+}
+
+ErrorOr<size_t> Latin1Decoder::length_in_utf16_code_units(StringView input)
+{
+    return input.length();
 }
 
 ErrorOr<void> PDFDocEncodingDecoder::process(StringView input, Function<ErrorOr<void>(u32)> on_code_point)
@@ -341608,6 +341808,11 @@ ErrorOr<void> PDFDocEncodingDecoder::process(StringView input, Function<ErrorOr<
     return {};
 }
 
+ErrorOr<size_t> PDFDocEncodingDecoder::length_in_utf16_code_units(StringView input)
+{
+    return input.length();
+}
+
 // https://encoding.spec.whatwg.org/#x-user-defined-decoder
 ErrorOr<void> XUserDefinedDecoder::process(StringView input, Function<ErrorOr<void>(u32)> on_code_point)
 {
@@ -341632,6 +341837,11 @@ ErrorOr<void> XUserDefinedDecoder::process(StringView input, Function<ErrorOr<vo
     return {};
 }
 
+ErrorOr<size_t> XUserDefinedDecoder::length_in_utf16_code_units(StringView input)
+{
+    return input.length();
+}
+
 // https://encoding.spec.whatwg.org/#single-byte-decoder
 template<Integral ArrayType>
 ErrorOr<void> SingleByteDecoder<ArrayType>::process(StringView input, Function<ErrorOr<void>(u32)> on_code_point)
@@ -341653,6 +341863,12 @@ ErrorOr<void> SingleByteDecoder<ArrayType>::process(StringView input, Function<E
     }
     // 1. If byte is end-of-queue, return finished.
     return {};
+}
+
+template<Integral ArrayType>
+ErrorOr<size_t> SingleByteDecoder<ArrayType>::length_in_utf16_code_units(StringView input)
+{
+    return input.length();
 }
 
 // https://encoding.spec.whatwg.org/#index-gb18030-ranges-code-point
@@ -342409,6 +342625,11 @@ ErrorOr<void> ReplacementDecoder::process(StringView input, Function<ErrorOr<voi
     return {};
 }
 
+ErrorOr<size_t> ReplacementDecoder::length_in_utf16_code_units(StringView input)
+{
+    return input.is_empty() ? 0 : 1;
+}
+
 // https://infra.spec.whatwg.org/#isomorphic-decode
 String isomorphic_decode(StringView input)
 {
@@ -342450,6 +342671,7 @@ class TEXTCODEC_API Decoder {
 public:
     virtual bool validate(StringView);
     virtual ErrorOr<String> to_utf8(StringView);
+    virtual ErrorOr<size_t> length_in_utf16_code_units(StringView);
     ErrorOr<void> process_code_points(StringView, Function<ErrorOr<void>(u32)>);
 
     // Returns the number of trailing bytes that form an incomplete sequence and must be buffered
@@ -342466,6 +342688,7 @@ public:
     virtual ErrorOr<void> process(StringView, Function<ErrorOr<void>(u32)> on_code_point) override;
     virtual bool validate(StringView) override;
     virtual ErrorOr<String> to_utf8(StringView) override;
+    virtual ErrorOr<size_t> length_in_utf16_code_units(StringView) override;
     virtual size_t incomplete_tail_length(ReadonlyBytes) const override;
 };
 
@@ -342473,6 +342696,7 @@ class TEXTCODEC_API UTF16BEDecoder final : public Decoder {
 public:
     virtual bool validate(StringView) override;
     virtual ErrorOr<String> to_utf8(StringView) override;
+    virtual ErrorOr<size_t> length_in_utf16_code_units(StringView) override;
     virtual size_t incomplete_tail_length(ReadonlyBytes) const override;
 
 private:
@@ -342483,6 +342707,7 @@ class TEXTCODEC_API UTF16LEDecoder final : public Decoder {
 public:
     virtual bool validate(StringView) override;
     virtual ErrorOr<String> to_utf8(StringView) override;
+    virtual ErrorOr<size_t> length_in_utf16_code_units(StringView) override;
     virtual size_t incomplete_tail_length(ReadonlyBytes) const override;
 
 private:
@@ -342498,6 +342723,7 @@ public:
     }
 
     virtual ErrorOr<void> process(StringView, Function<ErrorOr<void>(u32)> on_code_point) override;
+    virtual ErrorOr<size_t> length_in_utf16_code_units(StringView) override;
 
 private:
     Array<ArrayType, 128> m_translation_table;
@@ -342507,18 +342733,21 @@ class TEXTCODEC_API Latin1Decoder final : public Decoder {
 public:
     virtual ErrorOr<void> process(StringView, Function<ErrorOr<void>(u32)> on_code_point) override;
     virtual bool validate(StringView) override { return true; }
+    virtual ErrorOr<size_t> length_in_utf16_code_units(StringView) override;
 };
 
 class TEXTCODEC_API PDFDocEncodingDecoder final : public Decoder {
 public:
     virtual ErrorOr<void> process(StringView, Function<ErrorOr<void>(u32)> on_code_point) override;
     virtual bool validate(StringView) override { return true; }
+    virtual ErrorOr<size_t> length_in_utf16_code_units(StringView) override;
 };
 
 class TEXTCODEC_API XUserDefinedDecoder final : public Decoder {
 public:
     virtual ErrorOr<void> process(StringView, Function<ErrorOr<void>(u32)> on_code_point) override;
     virtual bool validate(StringView) override { return true; }
+    virtual ErrorOr<size_t> length_in_utf16_code_units(StringView) override;
 };
 
 class TEXTCODEC_API GB18030Decoder final : public Decoder {
@@ -342561,6 +342790,7 @@ class TEXTCODEC_API ReplacementDecoder final : public Decoder {
 public:
     virtual ErrorOr<void> process(StringView, Function<ErrorOr<void>(u32)> on_code_point) override;
     virtual bool validate(StringView input) override { return input.is_empty(); }
+    virtual ErrorOr<size_t> length_in_utf16_code_units(StringView) override;
 };
 
 // Preserves incomplete trailing decoder tokens when callers provide input in chunks.
@@ -342592,6 +342822,7 @@ TEXTCODEC_API Optional<Decoder&> bom_sniff_to_decoder(StringView);
 // NOTE: This has an obnoxious name to discourage usage. Only use this if you absolutely must! For example, XHR in LibWeb uses this.
 // This will use the given decoder unless there is a byte order mark in the input, in which we will instead use the appropriate Unicode decoder.
 TEXTCODEC_API ErrorOr<String> convert_input_to_utf8_using_given_decoder_unless_there_is_a_byte_order_mark(Decoder&, StringView);
+TEXTCODEC_API ErrorOr<size_t> convert_input_to_utf16_length_using_given_decoder_unless_there_is_a_byte_order_mark(Decoder&, StringView);
 
 TEXTCODEC_API StringView get_output_encoding(StringView encoding);
 
@@ -365233,7 +365464,7 @@ ExceptionInstance* Store::get(ExceptionAddress address)
     return &m_exceptions[value];
 }
 
-ErrorOr<void, ValidationError> AbstractMachine::validate(Module& module, Optional<CompileCacheConfig> cache_config)
+ErrorOr<void, ValidationError> AbstractMachine::validate(Module& module, Optional<CompileCacheConfig> cache_config, CompileToNative compile_to_native)
 {
     if (module.validation_status() != Module::ValidationStatus::Unchecked) {
         if (module.validation_status() == Module::ValidationStatus::Valid)
@@ -365245,11 +365476,14 @@ ErrorOr<void, ValidationError> AbstractMachine::validate(Module& module, Optiona
     Validator validator;
     if (cache_config.has_value())
         validator.set_cache_config(cache_config.release_value());
+    validator.set_compile_to_native(compile_to_native);
     auto result = validator.validate(module);
     if (result.is_error()) {
         module.set_validation_error(result.error().error_string);
         return result.release_error();
     }
+    if (compile_to_native == CompileToNative::Yes)
+        module.set_has_attempted_cranelift_compilation(true);
 
     return {};
 }
@@ -366532,7 +366766,7 @@ public:
     explicit AbstractMachine() = default;
 
     // Validate a module; permanently sets the module's validity status.
-    ErrorOr<void, ValidationError> validate(Module&, Optional<CompileCacheConfig> cache_config = {});
+    ErrorOr<void, ValidationError> validate(Module&, Optional<CompileCacheConfig> cache_config = {}, CompileToNative = CompileToNative::Yes);
     // Load and instantiate a module, and link it into this interpreter.
     InstantiationResult instantiate(Module const&, Vector<ExternValue>);
     Result invoke(FunctionAddress, Vector<Value>);
@@ -366676,17 +366910,44 @@ using namespace AK::SIMD;
 
 namespace {
 
+enum class CompiledFaultKind : u8 {
+    None,
+    Memory,
+    CraneliftTrap,
+};
+
 struct CompiledFaultRecoveryContext {
     Wasm::BytecodeInterpreter* interpreter { nullptr };
     Wasm::Configuration* configuration { nullptr };
     CompiledFaultRecoveryContext* previous { nullptr };
     jmp_buf jump_buffer;
     bool faulted { false };
+    CompiledFaultKind fault_kind { CompiledFaultKind::None };
+    u8 cranelift_trap_code { 0 };
 };
 
 thread_local CompiledFaultRecoveryContext* s_compiled_fault_recovery = nullptr;
 
 #if WASM_COMPILED_FAULT_RECOVERY_SUPPORTED
+
+static StringView cranelift_trap_message(u8 trap_code)
+{
+    // Cranelift reserves trap codes at the high end of u8:
+    // stack_overflow=251, int_overflow=252, heap_oob=253, int_divz=254, bad_toint=255.
+    switch (trap_code) {
+    case 251:
+        return Wasm::Constants::stack_exhaustion_message;
+    case 252:
+    case 254:
+        return "Integer division overflow"sv;
+    case 253:
+        return "Memory access out of bounds"sv;
+    case 255:
+        return "Truncation out of range"sv;
+    default:
+        return "unreachable executed"sv;
+    }
+}
 
 static bool is_wasm_memory_fault(Wasm::Configuration& configuration, void* address)
 {
@@ -366743,6 +367004,7 @@ static void install_compiled_fault_handlers()
 
 static struct sigaction s_old_sigsegv;
 static struct sigaction s_old_sigbus;
+static struct sigaction s_old_sigill;
 
 [[noreturn]] static void chain_fault_signal(int signal, siginfo_t* info, void* context, struct sigaction const& previous_action)
 {
@@ -366773,12 +367035,10 @@ no_handler:
 
 static void compiled_fault_signal_handler(int signal, siginfo_t* info, void* context)
 {
-    if (auto* recovery = s_compiled_fault_recovery; recovery && info && is_wasm_memory_fault(*recovery->configuration, info->si_addr)) {
-        recovery->faulted = true;
-        // Redirect the resumed PC to our trampoline and return.
-        // sigreturn (or the platform equivalent) will take the flow to the trampoline on the faulting thread's "normal" stack,
-        // from where we can then longjmp to the recovery code.
-        auto* uc = static_cast<ucontext_t*>(context);
+    auto* recovery = s_compiled_fault_recovery;
+    auto* uc = static_cast<ucontext_t*>(context);
+
+    auto redirect_to_trampoline = [&] {
 #        if defined(AK_OS_MACOS)
 #            if ARCH(AARCH64)
         uc->uc_mcontext->__ss.__pc = reinterpret_cast<uintptr_t>(&wasm_compiled_fault_trampoline);
@@ -366792,11 +367052,60 @@ static void compiled_fault_signal_handler(int signal, siginfo_t* info, void* con
         uc->uc_mcontext.gregs[REG_RIP] = reinterpret_cast<greg_t>(&wasm_compiled_fault_trampoline);
 #            endif
 #        endif
+    };
+
+    if (recovery && info && (signal == SIGSEGV || signal == SIGBUS) && is_wasm_memory_fault(*recovery->configuration, info->si_addr)) {
+        recovery->faulted = true;
+        recovery->fault_kind = CompiledFaultKind::Memory;
+        // Redirect the resumed PC to our trampoline and return.
+        // sigreturn (or the platform equivalent) will take the flow to the trampoline on the faulting thread's "normal" stack,
+        // from where we can then longjmp to the recovery code.
+        redirect_to_trampoline();
         return;
+    }
+
+    if (recovery && signal == SIGILL) {
+#        if defined(AK_OS_MACOS)
+#            if ARCH(AARCH64)
+        auto pc = static_cast<FlatPtr>(uc->uc_mcontext->__ss.__pc);
+#            elif ARCH(X86_64)
+        auto pc = static_cast<FlatPtr>(uc->uc_mcontext->__ss.__rip);
+#            else
+        auto pc = static_cast<FlatPtr>(0);
+#            endif
+#        else
+#            if ARCH(AARCH64)
+        auto pc = static_cast<FlatPtr>(uc->uc_mcontext.pc);
+#            elif ARCH(X86_64)
+        auto pc = static_cast<FlatPtr>(uc->uc_mcontext.gregs[REG_RIP]);
+#            else
+        auto pc = static_cast<FlatPtr>(0);
+#            endif
+#        endif
+
+        auto const& compiled = recovery->configuration->frame().expression().compiled_instructions;
+        auto const code_start = compiled.dispatches.is_empty() ? 0 : compiled.dispatches[0].handler_ptr;
+        auto const code_size = compiled.cranelift_code_size;
+        if (compiled.cranelift_compiled && code_start != 0 && pc >= code_start && pc < code_start + code_size) {
+            auto const offset = static_cast<u32>(pc - code_start);
+            for (size_t i = 0; i < compiled.cranelift_trap_count; ++i) {
+                auto const& trap = compiled.cranelift_traps[i];
+                if (trap.offset != offset)
+                    continue;
+
+                recovery->faulted = true;
+                recovery->fault_kind = CompiledFaultKind::CraneliftTrap;
+                recovery->cranelift_trap_code = trap.code;
+                redirect_to_trampoline();
+                return;
+            }
+        }
     }
 
     if (signal == SIGSEGV)
         chain_fault_signal(signal, info, context, s_old_sigsegv);
+    if (signal == SIGILL)
+        chain_fault_signal(signal, info, context, s_old_sigill);
     chain_fault_signal(signal, info, context, s_old_sigbus);
 }
 
@@ -366812,6 +367121,7 @@ static void install_compiled_fault_handlers()
     sigemptyset(&action.sa_mask);
     sigaction(SIGSEGV, &action, &s_old_sigsegv);
     sigaction(SIGBUS, &action, &s_old_sigbus);
+    sigaction(SIGILL, &action, &s_old_sigill);
 }
 
 #    endif
@@ -366821,43 +367131,6 @@ static void install_compiled_fault_handlers()
 static void install_compiled_fault_handlers() { }
 
 #endif
-
-class ScopedCompiledFaultRecovery {
-public:
-    ScopedCompiledFaultRecovery(Wasm::BytecodeInterpreter& interpreter, Wasm::Configuration& configuration)
-    {
-        m_context.interpreter = &interpreter;
-        m_context.configuration = &configuration;
-        m_context.previous = s_compiled_fault_recovery;
-    }
-
-    ~ScopedCompiledFaultRecovery()
-    {
-        if (m_armed)
-            s_compiled_fault_recovery = m_context.previous;
-    }
-
-    bool arm()
-    {
-        install_compiled_fault_handlers();
-        s_compiled_fault_recovery = &m_context;
-        m_armed = true;
-        if (setjmp(m_context.jump_buffer) != 0) {
-            // Disarm immediately after longjmp return; the compiled code may
-            // have corrupted our stack frame, so the destructor must be a no-op.
-            s_compiled_fault_recovery = m_context.previous;
-            m_armed = false;
-            return false;
-        }
-        return true;
-    }
-
-    bool faulted() const { return m_context.faulted; }
-
-private:
-    CompiledFaultRecoveryContext m_context;
-    bool m_armed { false };
-};
 
 }
 
@@ -366986,26 +367259,46 @@ void BytecodeInterpreter::interpret(Configuration& configuration)
 {
     m_trap = Empty {};
     auto& expression = configuration.frame().expression();
-    Optional<ScopedCompiledFaultRecovery> compiled_fault_recovery;
+    CompiledFaultRecoveryContext compiled_fault_recovery;
+    bool did_install_compiled_fault_recovery = false;
     if (expression.compiled_instructions.cranelift_compiled && !s_compiled_fault_recovery) {
-        compiled_fault_recovery.emplace(*this, configuration);
-        if (!compiled_fault_recovery->arm()) {
-            m_trap = Trap::from_string("Memory access out of bounds");
+        install_compiled_fault_handlers();
+        compiled_fault_recovery.interpreter = this;
+        compiled_fault_recovery.configuration = &configuration;
+        compiled_fault_recovery.previous = s_compiled_fault_recovery;
+        s_compiled_fault_recovery = &compiled_fault_recovery;
+        did_install_compiled_fault_recovery = true;
+        if (setjmp(compiled_fault_recovery.jump_buffer) != 0) {
+            s_compiled_fault_recovery = compiled_fault_recovery.previous;
+            if (compiled_fault_recovery.fault_kind == CompiledFaultKind::CraneliftTrap)
+                m_trap = Trap::from_string(cranelift_trap_message(compiled_fault_recovery.cranelift_trap_code));
+            else
+                m_trap = Trap::from_string("Memory access out of bounds");
             return;
         }
     }
     auto const should_limit_instruction_count = configuration.should_limit_instruction_count();
     if (!expression.compiled_instructions.dispatches.is_empty()) {
         if (expression.compiled_instructions.direct) {
-            if (should_limit_instruction_count)
-                return interpret_impl<true, true, true>(configuration, expression);
-            return interpret_impl<true, false, true>(configuration, expression);
+            if (should_limit_instruction_count) {
+                interpret_impl<true, true, true>(configuration, expression);
+                goto done;
+            }
+            interpret_impl<true, false, true>(configuration, expression);
+            goto done;
         }
-        return interpret_impl<true, false, false>(configuration, expression);
+        interpret_impl<true, false, false>(configuration, expression);
+        goto done;
     }
-    if (should_limit_instruction_count)
-        return interpret_impl<false, true, false>(configuration, expression);
-    return interpret_impl<false, false, false>(configuration, expression);
+    if (should_limit_instruction_count) {
+        interpret_impl<false, true, false>(configuration, expression);
+        goto done;
+    }
+    interpret_impl<false, false, false>(configuration, expression);
+
+done:
+    if (did_install_compiled_fault_recovery)
+        s_compiled_fault_recovery = compiled_fault_recovery.previous;
 }
 
 constexpr static u32 default_sources_and_destination = (to_underlying(Dispatch::RegisterOrStack::Stack) | (to_underlying(Dispatch::RegisterOrStack::Stack) << 2) | (to_underlying(Dispatch::RegisterOrStack::Stack) << 4));
@@ -374016,6 +374309,7 @@ FILE: Libraries/LibWasm/AbstractMachine/Configuration.cpp
 #include <AK/MemoryStream.h>
 #include <LibWasm/AbstractMachine/Configuration.h>
 #include <LibWasm/AbstractMachine/Interpreter.h>
+#include <LibWasm/AbstractMachine/Validator.h>
 #include <LibWasm/Printer/Printer.h>
 
 namespace Wasm {
@@ -374069,6 +374363,31 @@ ErrorOr<Optional<HostFunction&>, Trap> Configuration::prepare_call(FunctionAddre
     }
 
     return function->get<HostFunction>();
+}
+
+ErrorOr<void, Trap> Configuration::prepare_wasm_call(WasmFunction const& wasm_function, Vector<Value, ArgumentsStaticSize>& arguments, bool is_tailcall)
+{
+    if (auto module = wasm_function.module_ref()) {
+        if (auto result = ensure_cranelift_compiled(const_cast<Module&>(*module)); result.is_error())
+            return Trap::from_string(ByteString::formatted("Cranelift compilation failed: {}", result.error().error_string));
+    }
+
+    if (is_tailcall)
+        unwind_impl();
+
+    arguments.ensure_capacity(arguments.size() + wasm_function.code().func().total_local_count());
+    for (auto const& local : wasm_function.code().func().locals()) {
+        for (size_t i = 0; i < local.n(); ++i)
+            arguments.unchecked_append(Value(local.type()));
+    }
+
+    set_frame(
+        is_tailcall ? IsTailcall::Yes : IsTailcall::No,
+        wasm_function.module(),
+        move(arguments),
+        wasm_function.code().func().body(),
+        wasm_function.type().results().size());
+    return {};
 }
 
 Result Configuration::execute(Interpreter& interpreter)
@@ -374301,25 +374620,7 @@ public:
 
     void unwind(Badge<CallFrameHandle>, CallFrameHandle const&) { unwind_impl(); }
     ErrorOr<Optional<HostFunction&>, Trap> prepare_call(FunctionAddress, Vector<Value, ArgumentsStaticSize>& arguments, bool is_tailcall = false);
-    ALWAYS_INLINE ErrorOr<void, Trap> prepare_wasm_call(WasmFunction const& wasm_function, Vector<Value, ArgumentsStaticSize>& arguments, bool is_tailcall = false)
-    {
-        if (is_tailcall)
-            unwind_impl();
-
-        arguments.ensure_capacity(arguments.size() + wasm_function.code().func().total_local_count());
-        for (auto const& local : wasm_function.code().func().locals()) {
-            for (size_t i = 0; i < local.n(); ++i)
-                arguments.unchecked_append(Value(local.type()));
-        }
-
-        set_frame(
-            is_tailcall ? IsTailcall::Yes : IsTailcall::No,
-            wasm_function.module(),
-            move(arguments),
-            wasm_function.code().func().body(),
-            wasm_function.type().results().size());
-        return {};
-    }
+    ErrorOr<void, Trap> prepare_wasm_call(WasmFunction const& wasm_function, Vector<Value, ArgumentsStaticSize>& arguments, bool is_tailcall = false);
     Result call(Interpreter&, FunctionAddress, Vector<Value, ArgumentsStaticSize>& arguments);
     Result execute(Interpreter&);
     ErrorOr<void, Trap> execute_for_compiled_call(Interpreter&, Value* single_result = nullptr);
@@ -375765,7 +376066,8 @@ ErrorOr<void, ValidationError> Validator::validate(Module& module)
 {
     // Pre-emptively make invalid. The module will be set to `Valid` at the end
     // of validation.
-    module.set_validation_status(Module::ValidationStatus::Invalid, {});
+    if (m_updates_module_validation_status)
+        module.set_validation_status(Module::ValidationStatus::Invalid, {});
 
     // Note: The spec performs this after populating the context, but there's no real reason to do so,
     //       as this has no dependency.
@@ -375899,8 +376201,39 @@ ErrorOr<void, ValidationError> Validator::validate(Module& module)
     for (auto& entry : module.code_section().functions())
         module.set_minimum_call_record_allocation_size(max(entry.func().body().compiled_instructions.max_call_rec_size, module.minimum_call_record_allocation_size()));
 
-    module.set_validation_status(Module::ValidationStatus::Valid, {});
+    if (m_updates_module_validation_status)
+        module.set_validation_status(Module::ValidationStatus::Valid, {});
     return {};
+}
+
+ErrorOr<void, ValidationError> ensure_cranelift_compiled(Module& module)
+{
+    if (!module.try_begin_cranelift_compilation()) {
+        module.wait_for_cranelift_compilation();
+        return {};
+    }
+
+    if (module.validation_status() == Module::ValidationStatus::Invalid) {
+        module.finish_cranelift_compilation();
+        return ValidationError { module.validation_error() };
+    }
+
+    Validator validator;
+    validator.set_updates_module_validation_status(false);
+    auto result = validator.validate(module);
+    if (result.is_error()) {
+        module.set_validation_error(result.error().error_string);
+        module.finish_cranelift_compilation();
+        return result.release_error();
+    }
+
+    module.finish_cranelift_compilation();
+    return {};
+}
+
+void start_cranelift_compilation(Module& module)
+{
+    (void)ensure_cranelift_compiled(module);
 }
 
 ErrorOr<void, ValidationError> Validator::validate(ImportSection const& section)
@@ -376020,7 +376353,7 @@ ErrorOr<void, ValidationError> Validator::validate(CodeSection const& section)
     bool capturing = false;
     bool validation_succeeded = false;
 
-    if (m_cache_config.has_value()) {
+    if (m_compile_to_native == CompileToNative::Yes && m_cache_config.has_value()) {
         auto hash = ReadonlyBytes { m_cache_config->wasm_hash.data(), 32 };
         if (!m_cache_config->existing_blob.is_empty())
             installing = try_install_cranelift_cache_blob(hash, m_cache_config->existing_blob);
@@ -376034,7 +376367,10 @@ ErrorOr<void, ValidationError> Validator::validate(CodeSection const& section)
 
     ScopeGuard cleanup = [&] {
         auto cranelift_start = MonotonicTime::now();
-        flush_cranelift_batch();
+        if (validation_succeeded)
+            flush_cranelift_batch();
+        else
+            discard_cranelift_batch();
         auto cranelift_duration = MonotonicTime::now() - cranelift_start;
 
         if (installing)
@@ -376082,6 +376418,7 @@ ErrorOr<void, ValidationError> Validator::validate(CodeSection const& section)
         auto& function = entry.func();
 
         auto function_validator = fork();
+        function_validator.set_compile_to_native(m_compile_to_native);
         function_validator.m_context.locals = {};
         function_validator.m_context.locals.extend(function_type.parameters());
         function_validator.m_context.current_function_parameter_count = function_type.parameters().size();
@@ -380207,7 +380544,7 @@ ErrorOr<Validator::ExpressionTypeResult, ValidationError> Validator::validate(Ex
     expression.compiled_instructions = try_compile_instructions(expression, m_context.functions.span());
 
     // Optionally compile with Cranelift (skip constant expressions and unsupported types).
-    if (expression.compiled_instructions.direct && !is_constant_expression) {
+    if (m_compile_to_native == CompileToNative::Yes && expression.compiled_instructions.direct && !is_constant_expression) {
         bool has_unsupported_types = false;
         for (auto& type : m_context.locals) {
             if (type.is_reference() || type.kind() == ValueType::V128) {
@@ -380336,6 +380673,8 @@ public:
     // Drives the Cranelift disk-cache hooks around validate(CodeSection). Set on the
     // top-level Validator (the one AbstractMachine creates); forks do not propagate it.
     void set_cache_config(CompileCacheConfig config) { m_cache_config = move(config); }
+    void set_compile_to_native(CompileToNative compile_to_native) { m_compile_to_native = compile_to_native; }
+    void set_updates_module_validation_status(bool value) { m_updates_module_validation_status = value; }
 
     // Module
     ErrorOr<void, ValidationError> validate(Module&);
@@ -380696,6 +381035,8 @@ private:
     size_t m_max_frame_size { 0 };
     COWVector<GlobalType> m_globals_without_internal_globals;
     Optional<CompileCacheConfig> m_cache_config;
+    CompileToNative m_compile_to_native { CompileToNative::Yes };
+    bool m_updates_module_validation_status { true };
 };
 
 }
@@ -380936,12 +381277,15 @@ struct OutputFunctionEntry {
     // with the live address of helper N for the current process.
     u64 reloc_offset;
     u32 reloc_count;
+    u64 trap_offset;
+    u32 trap_count;
     u32 _pad;
 };
 
 struct CodeMapping {
     void* mapping;
     size_t size;
+    Vector<CraneliftTrap> traps;
 };
 
 static constexpr size_t oop_code_region_min_size = 256 * KiB;
@@ -380967,7 +381311,7 @@ struct BatchInput {
 // any rebuild that changes those will simply miss the cache rather than try to
 // execute incompatible bytes.
 constexpr u64 cache_blob_magic = 0x4354494A4D534157ULL; // "WASMJITC" little-endian
-constexpr u32 cache_blob_format_version = 1;
+constexpr u32 cache_blob_format_version = 3;
 
 struct CacheBlobHeader {
     u64 magic;
@@ -380984,7 +381328,7 @@ struct CacheBlobFunctionEntry {
     u32 function_index;
     u32 code_size;
     u32 reloc_count;
-    u32 _pad;
+    u32 trap_count;
 };
 static_assert(sizeof(CacheBlobFunctionEntry) == 16);
 
@@ -380992,6 +381336,7 @@ struct CacheRecord {
     u32 function_index;
     ByteBuffer unpatched_code;
     Vector<HelperReloc> relocs;
+    Vector<CraneliftTrap> traps;
 };
 
 // On a cache miss we capture every successful compile so we can hand the blob to a
@@ -381013,7 +381358,7 @@ struct CacheState {
     Vector<BatchInput> pending_batch;
 };
 
-static CacheState s_cranelift_cache_state;
+static thread_local CacheState s_cranelift_cache_state;
 static thread_local u32 s_active_function_index = NumericLimits<u32>::max();
 
 static u64 compute_layout_hash(RuntimeHelpers const& h)
@@ -381059,7 +381404,7 @@ static bool apply_helper_relocs(u8* code_bytes, size_t code_size, HelperReloc co
 // helper-address patches, and install the resulting function pointer into `target`.
 // Used by both the fresh-compile path (bytes come from the subprocess shm) and the
 // cache-install path (bytes come from a `.wasmjit` blob).
-static bool install_compiled_function(CompiledInstructions& target, ReadonlyBytes code_bytes, HelperReloc const* relocs, size_t reloc_count, RuntimeHelpers const& helpers)
+static bool install_compiled_function(CompiledInstructions& target, ReadonlyBytes code_bytes, HelperReloc const* relocs, size_t reloc_count, ReadonlySpan<CraneliftTrap> traps, RuntimeHelpers const& helpers)
 {
     if (target.dispatches.is_empty())
         return false;
@@ -381085,7 +381430,7 @@ static bool install_compiled_function(CompiledInstructions& target, ReadonlyByte
     VirtualProtect(jit_mem, rx_aligned_size, PAGE_EXECUTE_READ, &old_protect);
     FlushInstructionCache(GetCurrentProcess(), jit_mem, code_size);
     auto* func_ptr = static_cast<u8 const*>(jit_mem);
-    auto* handle = new CodeMapping { jit_mem, rx_aligned_size };
+    auto* handle = new CodeMapping { jit_mem, rx_aligned_size, {} };
 #elif defined(AK_OS_MACOS)
     auto const page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     auto const rx_aligned_size = (code_size + page_size - 1) & ~(page_size - 1);
@@ -381102,7 +381447,7 @@ static bool install_compiled_function(CompiledInstructions& target, ReadonlyByte
     pthread_jit_write_protect_np(1);
     sys_icache_invalidate(jit_mapping, code_size);
     auto* func_ptr = static_cast<u8 const*>(jit_mapping);
-    auto* handle = new CodeMapping { jit_mapping, rx_aligned_size };
+    auto* handle = new CodeMapping { jit_mapping, rx_aligned_size, {} };
 #else
     auto const page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     auto const rx_aligned_size = (code_size + page_size - 1) & ~(page_size - 1);
@@ -381116,12 +381461,18 @@ static bool install_compiled_function(CompiledInstructions& target, ReadonlyByte
     }
     __builtin___clear_cache(static_cast<char*>(rw_mapping), static_cast<char*>(rw_mapping) + code_size);
     auto* func_ptr = static_cast<u8 const*>(rw_mapping);
-    auto* handle = new CodeMapping { rw_mapping, rx_aligned_size };
+    auto* handle = new CodeMapping { rw_mapping, rx_aligned_size, {} };
 #endif
+
+    handle->traps.ensure_capacity(traps.size());
+    for (auto const& trap : traps)
+        handle->traps.unchecked_append(trap);
 
     target.dispatches[0].handler_ptr = bit_cast<FlatPtr>(func_ptr);
     target.cranelift_code_handle = handle;
     target.cranelift_code_size = code_size;
+    target.cranelift_traps = handle->traps.data();
+    target.cranelift_trap_count = handle->traps.size();
     target.cranelift_compiled = true;
     return true;
 }
@@ -381278,138 +381629,161 @@ static inline MemoryInstance* wasm_cl_get_memory(void* config_ptr, i32 mem_idx)
 
 static inline u8 const* wasm_cl_memory_data_if_in_bounds(MemoryInstance* memory, u64 instance_addr, size_t size)
 {
-    if (instance_addr + size > memory->size())
+    if (instance_addr > memory->size() || size > memory->size() - instance_addr)
         return nullptr;
     return memory->data().offset_pointer(instance_addr);
 }
 
-i64 wasm_cl_memory_load8_s(void* config_ptr, i32 mem_idx, i64 addr);
-i64 wasm_cl_memory_load8_s(void* config_ptr, i32 mem_idx, i64 addr)
+i32 wasm_cl_memory_load8_s(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out);
+i32 wasm_cl_memory_load8_s(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out)
 {
     auto* memory = wasm_cl_get_memory(config_ptr, mem_idx);
     auto const* data = wasm_cl_memory_data_if_in_bounds(memory, static_cast<u64>(addr), 1);
-    if (!data)
-        return 0;
-    return static_cast<i64>(static_cast<i8>(data[0]));
+    if (!data) {
+        static_cast<BytecodeInterpreter*>(interp_ptr)->set_trap("Memory access out of bounds"sv);
+        return 1;
+    }
+    *out = static_cast<i64>(static_cast<i8>(data[0]));
+    return 0;
 }
 
-i64 wasm_cl_memory_load8_u(void* config_ptr, i32 mem_idx, i64 addr);
-i64 wasm_cl_memory_load8_u(void* config_ptr, i32 mem_idx, i64 addr)
+i32 wasm_cl_memory_load8_u(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out);
+i32 wasm_cl_memory_load8_u(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out)
 {
     auto* memory = wasm_cl_get_memory(config_ptr, mem_idx);
     auto const* data = wasm_cl_memory_data_if_in_bounds(memory, static_cast<u64>(addr), 1);
-    if (!data)
-        return 0;
-    return static_cast<i64>(data[0]);
+    if (!data) {
+        static_cast<BytecodeInterpreter*>(interp_ptr)->set_trap("Memory access out of bounds"sv);
+        return 1;
+    }
+    *out = static_cast<i64>(data[0]);
+    return 0;
 }
 
-i64 wasm_cl_memory_load16_s(void* config_ptr, i32 mem_idx, i64 addr);
-i64 wasm_cl_memory_load16_s(void* config_ptr, i32 mem_idx, i64 addr)
+i32 wasm_cl_memory_load16_s(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out);
+i32 wasm_cl_memory_load16_s(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out)
 {
     auto* memory = wasm_cl_get_memory(config_ptr, mem_idx);
     auto const* data = wasm_cl_memory_data_if_in_bounds(memory, static_cast<u64>(addr), 2);
-    if (!data)
-        return 0;
+    if (!data) {
+        static_cast<BytecodeInterpreter*>(interp_ptr)->set_trap("Memory access out of bounds"sv);
+        return 1;
+    }
     u16 val;
     __builtin_memcpy(&val, data, sizeof(val));
-    return static_cast<i64>(static_cast<i16>(val));
+    *out = static_cast<i64>(static_cast<i16>(val));
+    return 0;
 }
 
-i64 wasm_cl_memory_load16_u(void* config_ptr, i32 mem_idx, i64 addr);
-i64 wasm_cl_memory_load16_u(void* config_ptr, i32 mem_idx, i64 addr)
+i32 wasm_cl_memory_load16_u(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out);
+i32 wasm_cl_memory_load16_u(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out)
 {
     auto* memory = wasm_cl_get_memory(config_ptr, mem_idx);
     auto const* data = wasm_cl_memory_data_if_in_bounds(memory, static_cast<u64>(addr), 2);
-    if (!data)
-        return 0;
+    if (!data) {
+        static_cast<BytecodeInterpreter*>(interp_ptr)->set_trap("Memory access out of bounds"sv);
+        return 1;
+    }
     u16 val;
     __builtin_memcpy(&val, data, sizeof(val));
-    return static_cast<i64>(val);
+    *out = static_cast<i64>(val);
+    return 0;
 }
 
-i64 wasm_cl_memory_load32_s(void* config_ptr, i32 mem_idx, i64 addr);
-i64 wasm_cl_memory_load32_s(void* config_ptr, i32 mem_idx, i64 addr)
+i32 wasm_cl_memory_load32_s(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out);
+i32 wasm_cl_memory_load32_s(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out)
 {
     auto* memory = wasm_cl_get_memory(config_ptr, mem_idx);
     auto const* data = wasm_cl_memory_data_if_in_bounds(memory, static_cast<u64>(addr), 4);
-    if (!data)
-        return 0;
+    if (!data) {
+        static_cast<BytecodeInterpreter*>(interp_ptr)->set_trap("Memory access out of bounds"sv);
+        return 1;
+    }
     u32 val;
     __builtin_memcpy(&val, data, sizeof(val));
-    return static_cast<i64>(static_cast<i32>(val));
+    *out = static_cast<i64>(static_cast<i32>(val));
+    return 0;
 }
 
-i64 wasm_cl_memory_load32_u(void* config_ptr, i32 mem_idx, i64 addr);
-i64 wasm_cl_memory_load32_u(void* config_ptr, i32 mem_idx, i64 addr)
+i32 wasm_cl_memory_load32_u(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out);
+i32 wasm_cl_memory_load32_u(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out)
 {
     auto* memory = wasm_cl_get_memory(config_ptr, mem_idx);
     auto const* data = wasm_cl_memory_data_if_in_bounds(memory, static_cast<u64>(addr), 4);
-    if (!data)
-        return 0;
+    if (!data) {
+        static_cast<BytecodeInterpreter*>(interp_ptr)->set_trap("Memory access out of bounds"sv);
+        return 1;
+    }
     u32 val;
     __builtin_memcpy(&val, data, sizeof(val));
-    return static_cast<i64>(val);
+    *out = static_cast<i64>(val);
+    return 0;
 }
 
-i64 wasm_cl_memory_load64(void* config_ptr, i32 mem_idx, i64 addr);
-i64 wasm_cl_memory_load64(void* config_ptr, i32 mem_idx, i64 addr)
+i32 wasm_cl_memory_load64(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out);
+i32 wasm_cl_memory_load64(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64* out)
 {
     auto* memory = wasm_cl_get_memory(config_ptr, mem_idx);
     auto const* data = wasm_cl_memory_data_if_in_bounds(memory, static_cast<u64>(addr), 8);
-    if (!data)
-        return 0;
+    if (!data) {
+        static_cast<BytecodeInterpreter*>(interp_ptr)->set_trap("Memory access out of bounds"sv);
+        return 1;
+    }
     u64 val;
     __builtin_memcpy(&val, data, sizeof(val));
-    return static_cast<i64>(val);
+    *out = static_cast<i64>(val);
+    return 0;
 }
 
-static inline bool wasm_cl_memory_store_in_bounds(void* config_ptr, i32 mem_idx, i64 addr, size_t size, u8*& data)
+static inline bool wasm_cl_memory_store_in_bounds(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, size_t size, u8*& data)
 {
     auto* memory = wasm_cl_get_memory(config_ptr, mem_idx);
     auto instance_addr = static_cast<u64>(addr);
-    if (instance_addr + size > memory->size())
+    if (instance_addr > memory->size() || size > memory->size() - instance_addr) {
+        static_cast<BytecodeInterpreter*>(interp_ptr)->set_trap("Memory access out of bounds"sv);
         return false;
+    }
     data = memory->data().offset_pointer(instance_addr);
     return true;
 }
 
-i32 wasm_cl_memory_store8(void* config_ptr, i32 mem_idx, i64 addr, i64 value);
-i32 wasm_cl_memory_store8(void* config_ptr, i32 mem_idx, i64 addr, i64 value)
+i32 wasm_cl_memory_store8(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64 value);
+i32 wasm_cl_memory_store8(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64 value)
 {
     u8* data;
-    if (!wasm_cl_memory_store_in_bounds(config_ptr, mem_idx, addr, 1, data))
+    if (!wasm_cl_memory_store_in_bounds(interp_ptr, config_ptr, mem_idx, addr, 1, data))
         return 1; // OOB trap
     data[0] = static_cast<u8>(value);
     return 0;
 }
 
-i32 wasm_cl_memory_store16(void* config_ptr, i32 mem_idx, i64 addr, i64 value);
-i32 wasm_cl_memory_store16(void* config_ptr, i32 mem_idx, i64 addr, i64 value)
+i32 wasm_cl_memory_store16(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64 value);
+i32 wasm_cl_memory_store16(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64 value)
 {
     u8* data;
-    if (!wasm_cl_memory_store_in_bounds(config_ptr, mem_idx, addr, 2, data))
+    if (!wasm_cl_memory_store_in_bounds(interp_ptr, config_ptr, mem_idx, addr, 2, data))
         return 1;
     u16 val = static_cast<u16>(value);
     __builtin_memcpy(data, &val, sizeof(val));
     return 0;
 }
 
-i32 wasm_cl_memory_store32(void* config_ptr, i32 mem_idx, i64 addr, i64 value);
-i32 wasm_cl_memory_store32(void* config_ptr, i32 mem_idx, i64 addr, i64 value)
+i32 wasm_cl_memory_store32(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64 value);
+i32 wasm_cl_memory_store32(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64 value)
 {
     u8* data;
-    if (!wasm_cl_memory_store_in_bounds(config_ptr, mem_idx, addr, 4, data))
+    if (!wasm_cl_memory_store_in_bounds(interp_ptr, config_ptr, mem_idx, addr, 4, data))
         return 1;
     u32 val = static_cast<u32>(value);
     __builtin_memcpy(data, &val, sizeof(val));
     return 0;
 }
 
-i32 wasm_cl_memory_store64(void* config_ptr, i32 mem_idx, i64 addr, i64 value);
-i32 wasm_cl_memory_store64(void* config_ptr, i32 mem_idx, i64 addr, i64 value)
+i32 wasm_cl_memory_store64(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64 value);
+i32 wasm_cl_memory_store64(void* interp_ptr, void* config_ptr, i32 mem_idx, i64 addr, i64 value)
 {
     u8* data;
-    if (!wasm_cl_memory_store_in_bounds(config_ptr, mem_idx, addr, 8, data))
+    if (!wasm_cl_memory_store_in_bounds(interp_ptr, config_ptr, mem_idx, addr, 8, data))
         return 1;
     u64 val = static_cast<u64>(value);
     __builtin_memcpy(data, &val, sizeof(val));
@@ -381651,7 +382025,7 @@ static ALWAYS_INLINE i32 wasm_cl_direct_call_impl(BytecodeInterpreter& interpret
     auto const& entry = (*table)[index];
 
     if (config.depth() > 500) [[unlikely]] {
-        interpreter.set_trap("call stack exhausted"sv);
+        interpreter.set_trap(Constants::stack_exhaustion_message);
         return 1;
     }
 
@@ -382071,6 +382445,8 @@ static void try_cranelift_compile_batch(Vector<BatchInput>& batch)
 
         auto code_offset = static_cast<size_t>(output->code_offset);
         auto code_size = static_cast<size_t>(output->code_size);
+        if (code_offset > code_region_size || code_size > code_region_size - code_offset)
+            continue;
         auto code_start = code_base_offset + code_offset;
         if (code_start + code_size > total_size)
             continue;
@@ -382078,13 +382454,30 @@ static void try_cranelift_compile_batch(Vector<BatchInput>& batch)
         auto const reloc_offset = static_cast<size_t>(output->reloc_offset);
         auto const reloc_count = static_cast<size_t>(output->reloc_count);
         auto const reloc_bytes = reloc_count * sizeof(HelperReloc);
+        if (reloc_count != 0 && reloc_bytes / sizeof(HelperReloc) != reloc_count)
+            continue;
+        if (reloc_offset > reloc_region_size || reloc_bytes > reloc_region_size - reloc_offset)
+            continue;
         if (reloc_region_start + reloc_offset + reloc_bytes > total_size)
+            continue;
+
+        auto const trap_offset = static_cast<size_t>(output->trap_offset);
+        auto const trap_count = static_cast<size_t>(output->trap_count);
+        auto const trap_bytes = trap_count * sizeof(CraneliftTrap);
+        if (trap_count != 0 && trap_bytes / sizeof(CraneliftTrap) != trap_count)
+            continue;
+        if (trap_offset > reloc_region_size || trap_bytes > reloc_region_size - trap_offset)
+            continue;
+        if (reloc_region_start + trap_offset + trap_bytes > total_size)
             continue;
 
         auto code_bytes = ReadonlyBytes { base + code_start, code_size };
         auto const* relocs = reloc_count == 0
             ? nullptr
             : reinterpret_cast<HelperReloc const*>(base + reloc_region_start + reloc_offset);
+        auto traps = trap_count == 0
+            ? ReadonlySpan<CraneliftTrap> {}
+            : ReadonlySpan<CraneliftTrap> { reinterpret_cast<CraneliftTrap const*>(base + reloc_region_start + trap_offset), trap_count };
 
         auto& capture = s_cranelift_cache_state.cache_capture;
         if (capture.capturing && batch[i].function_index != NumericLimits<u32>::max()) {
@@ -382095,11 +382488,14 @@ static void try_cranelift_compile_batch(Vector<BatchInput>& batch)
                 rec.relocs.ensure_capacity(reloc_count);
                 for (size_t j = 0; j < reloc_count; ++j)
                     rec.relocs.unchecked_append(relocs[j]);
+                rec.traps.ensure_capacity(trap_count);
+                for (size_t j = 0; j < trap_count; ++j)
+                    rec.traps.unchecked_append(traps[j]);
                 capture.records.append(move(rec));
             }
         }
 
-        install_compiled_function(*batch[i].target, code_bytes, relocs, reloc_count, helpers);
+        install_compiled_function(*batch[i].target, code_bytes, relocs, reloc_count, traps, helpers);
     }
 }
 
@@ -382121,6 +382517,9 @@ bool try_cranelift_compile(CompiledInstructions& compiled, u32 result_arity)
     if (compiled.cranelift_compiled)
         return true;
 
+    if (s_active_function_index == NumericLimits<u32>::max())
+        return false;
+
     // Cache hit: install from the parsed blob instead of going through cranelift.
     //            dispatches[] has just been populated by try_compile_instructions, so handler_ptr is ready to be set.
     if (s_cranelift_cache_state.pending_install.active && s_active_function_index != NumericLimits<u32>::max()) {
@@ -382131,7 +382530,9 @@ bool try_cranelift_compile(CompiledInstructions& compiled, u32 result_arity)
                     compiled,
                     record->unpatched_code.bytes(),
                     record->relocs.is_empty() ? nullptr : record->relocs.data(),
-                    record->relocs.size(), cache_install_helpers)) {
+                    record->relocs.size(),
+                    record->traps.span(),
+                    cache_install_helpers)) {
                 return true;
             }
             // Put it back so we can try later.
@@ -382264,6 +382665,11 @@ void flush_cranelift_batch()
     s_cranelift_cache_state.pending_batch.clear();
 }
 
+void discard_cranelift_batch()
+{
+    s_cranelift_cache_state.pending_batch.clear();
+}
+
 void free_cranelift_code(void* handle)
 {
     if (handle) {
@@ -382321,6 +382727,7 @@ Optional<ByteBuffer> serialize_cranelift_cache_blob(ReadonlyBytes wasm_hash)
         total_size += sizeof(CacheBlobFunctionEntry);
         total_size += align_up(r.unpatched_code.size(), 16);
         total_size += r.relocs.size() * sizeof(HelperReloc);
+        total_size += r.traps.size() * sizeof(CraneliftTrap);
     }
 
     auto blob_or_error = ByteBuffer::create_zeroed(total_size);
@@ -382343,6 +382750,7 @@ Optional<ByteBuffer> serialize_cranelift_cache_blob(ReadonlyBytes wasm_hash)
         entry->function_index = r.function_index;
         entry->code_size = static_cast<u32>(r.unpatched_code.size());
         entry->reloc_count = static_cast<u32>(r.relocs.size());
+        entry->trap_count = static_cast<u32>(r.traps.size());
         offset += sizeof(CacheBlobFunctionEntry);
 
         __builtin_memcpy(out + offset, r.unpatched_code.data(), r.unpatched_code.size());
@@ -382352,6 +382760,11 @@ Optional<ByteBuffer> serialize_cranelift_cache_blob(ReadonlyBytes wasm_hash)
         if (reloc_bytes > 0)
             __builtin_memcpy(out + offset, r.relocs.data(), reloc_bytes);
         offset += reloc_bytes;
+
+        auto trap_bytes = r.traps.size() * sizeof(CraneliftTrap);
+        if (trap_bytes > 0)
+            __builtin_memcpy(out + offset, r.traps.data(), trap_bytes);
+        offset += trap_bytes;
     }
 
     return blob;
@@ -382397,6 +382810,12 @@ bool try_install_cranelift_cache_blob(ReadonlyBytes expected_wasm_hash, Readonly
             return false;
         offset += reloc_bytes;
 
+        auto trap_off = offset;
+        auto trap_bytes = static_cast<size_t>(entry->trap_count) * sizeof(CraneliftTrap);
+        if (trap_off + trap_bytes > blob.size())
+            return false;
+        offset += trap_bytes;
+
         auto code_copy = ByteBuffer::copy(blob.data() + code_off, entry->code_size);
         if (code_copy.is_error())
             return false;
@@ -382409,6 +382828,12 @@ bool try_install_cranelift_cache_blob(ReadonlyBytes expected_wasm_hash, Readonly
             HelperReloc reloc;
             __builtin_memcpy(&reloc, blob.data() + reloc_off + j * sizeof(HelperReloc), sizeof(HelperReloc));
             rec.relocs.unchecked_append(reloc);
+        }
+        rec.traps.ensure_capacity(entry->trap_count);
+        for (u32 j = 0; j < entry->trap_count; ++j) {
+            CraneliftTrap trap;
+            __builtin_memcpy(&trap, blob.data() + trap_off + j * sizeof(CraneliftTrap), sizeof(CraneliftTrap));
+            rec.traps.unchecked_append(trap);
         }
         s_cranelift_cache_state.pending_install.records.set(entry->function_index, move(rec));
     }
@@ -382432,6 +382857,7 @@ namespace Wasm {
 
 bool try_cranelift_compile(CompiledInstructions&, u32) { return false; }
 void flush_cranelift_batch() { }
+void discard_cranelift_batch() { }
 void free_cranelift_code(void*) { }
 void set_cranelift_active_function_index(u32) { }
 void begin_cranelift_cache_capture() { }
@@ -386221,6 +386647,7 @@ FILE: Libraries/LibWasm/Rust/src/bin/cranelift-compiler.rs
 
 use libwasm_cranelift::CompiledFunction;
 use libwasm_cranelift::CraneliftInsn;
+use libwasm_cranelift::CraneliftTrap;
 use libwasm_cranelift::HelperReloc;
 use libwasm_cranelift::RuntimeHelpers;
 use libwasm_cranelift::compile_to_bytes;
@@ -386264,6 +386691,8 @@ struct OutputFunctionEntry {
     compiled: u32,
     reloc_offset: u64,
     reloc_count: u32,
+    trap_offset: u64,
+    trap_count: u32,
     _pad: u32,
 }
 
@@ -386520,12 +386949,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for (i, compiled) in chunk {
             let code = compiled.code;
             let relocs = compiled.relocs;
+            let traps = compiled.traps;
             let aligned = (code.len() + 15) & !15;
             let reloc_bytes_len = relocs.len() * size_of::<HelperReloc>();
+            let trap_bytes_len = traps.len() * size_of::<CraneliftTrap>();
             if code_cursor + aligned > code_capacity {
                 continue;
             }
-            if reloc_cursor + reloc_bytes_len > reloc_capacity {
+            if reloc_cursor + reloc_bytes_len + trap_bytes_len > reloc_capacity {
                 continue;
             }
             let code_offset = code_cursor;
@@ -386538,12 +386969,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 mapped[reloc_dst..reloc_dst + reloc_bytes_len].copy_from_slice(as_bytes_slice(&relocs));
             }
 
+            let trap_offset = reloc_cursor + reloc_bytes_len;
+            if !traps.is_empty() {
+                let trap_dst = reloc_region_start + trap_offset;
+                mapped[trap_dst..trap_dst + trap_bytes_len].copy_from_slice(as_bytes_slice(&traps));
+            }
+
             let entry = OutputFunctionEntry {
                 code_offset: u64::try_from(code_offset).map_err(|_| "code offset overflow")?,
                 code_size: u32::try_from(code.len()).map_err(|_| "code size overflow")?,
                 compiled: 1,
                 reloc_offset: u64::try_from(reloc_offset).map_err(|_| "reloc offset overflow")?,
                 reloc_count: u32::try_from(relocs.len()).map_err(|_| "reloc count overflow")?,
+                trap_offset: u64::try_from(trap_offset).map_err(|_| "trap offset overflow")?,
+                trap_count: u32::try_from(traps.len()).map_err(|_| "trap count overflow")?,
                 _pad: 0,
             };
             let entry_dst = out_entries_offset + i * size_of::<OutputFunctionEntry>();
@@ -386551,7 +386990,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             mapped[entry_dst..entry_dst + size_of::<OutputFunctionEntry>()].copy_from_slice(entry_bytes);
 
             code_cursor += aligned;
-            reloc_cursor += reloc_bytes_len;
+            reloc_cursor += reloc_bytes_len + trap_bytes_len;
         }
     }
 
@@ -386601,6 +387040,7 @@ FILE: Libraries/LibWasm/Rust/src/compiler.rs
 
 use crate::CompiledFunction;
 use crate::CraneliftInsn;
+use crate::CraneliftTrap;
 use crate::HelperId;
 use crate::HelperReloc;
 use crate::RuntimeHelpers;
@@ -386777,8 +387217,8 @@ impl CraneliftCompiler {
             call_indirect_sig: i32 fn(ptr, ptr, i32, i32, i32);
             memory_copy_sig:   i32 fn(ptr, ptr, i32, i32, i32, i32, i32);
             memory_fill_sig:   i32 fn(ptr, ptr, i32, i32, i32, i32);
-            mem_load_sig:      i64 fn(ptr, i32, i64);
-            mem_store_sig:     i32 fn(ptr, i32, i64, i64);
+            mem_load_sig:      i32 fn(ptr, ptr, i32, i64, ptr);
+            mem_store_sig:     i32 fn(ptr, ptr, i32, i64, i64);
             mem_size_sig:      i64 fn(ptr, i32);
             mem_grow_sig:      i32 fn(ptr, i32, i32);
             read_global_sig:   i64 fn(ptr, i32);
@@ -387159,6 +387599,27 @@ impl CraneliftCompiler {
                 $builder.def_var(default_memory_base_var, new_default_memory_base);
             }};
         }
+        macro_rules! set_trap {
+            ($builder:expr, $msg:expr) => {{
+                let msg = $msg.as_bytes();
+                let ss = $builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    msg.len() as u32,
+                    0,
+                ));
+                for (i, &byte) in msg.iter().enumerate() {
+                    let b = $builder.ins().iconst(types::I8, i64::from(byte));
+                    $builder.ins().stack_store(b, ss, i as i32);
+                }
+                let msg_ptr = $builder.ins().stack_addr(ptr_type, ss, 0);
+                let msg_len = $builder.ins().iconst(types::I32, msg.len() as i64);
+                let st_ptr = $builder.ins().func_addr(ptr_type, h_set_trap);
+                let interp = $builder.use_var(interp_var);
+                $builder
+                    .ins()
+                    .call_indirect(set_trap_sig, st_ptr, &[interp, msg_ptr, msg_len]);
+            }};
+        }
 
         let mut ip = 0usize;
         while ip < insns.len() {
@@ -387177,23 +387638,7 @@ impl CraneliftCompiler {
                         value_size,
                         &dirty_regs,
                     );
-                    let msg = b"unreachable executed";
-                    let ss = builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot,
-                        msg.len() as u32,
-                        0,
-                    ));
-                    for (i, &byte) in msg.iter().enumerate() {
-                        let b = builder.ins().iconst(types::I8, i64::from(byte));
-                        builder.ins().stack_store(b, ss, i as i32);
-                    }
-                    let msg_ptr = builder.ins().stack_addr(ptr_type, ss, 0);
-                    let msg_len = builder.ins().iconst(types::I32, msg.len() as i64);
-                    let st_ptr = builder.ins().func_addr(ptr_type, h_set_trap);
-                    let interp = builder.use_var(interp_var);
-                    builder
-                        .ins()
-                        .call_indirect(set_trap_sig, st_ptr, &[interp, msg_ptr, msg_len]);
+                    set_trap!(builder, "unreachable executed");
                     builder.ins().jump(trap_block, &[]);
                     is_unreachable = true;
                     let dead = builder.create_block();
@@ -387898,7 +388343,8 @@ impl CraneliftCompiler {
                     let result = builder.ins().bitcast(types::I64, MemFlags::new(), f64_val);
                     write_dst!(builder, insn.destination, result);
                 }
-                // Truncation conversions (these can trap in wasm)
+                // Truncation conversions (these can trap in wasm).
+                // Cranelift's fcvt_to_sint/fcvt_to_uint trap on overflow/NaN; the handler then maps the resulting "BadConversionToInteger" trap back to a wasm trap.
                 op::I32_TRUNC_SF32
                 | op::I32_TRUNC_UF32
                 | op::I32_TRUNC_SF64
@@ -387907,7 +388353,6 @@ impl CraneliftCompiler {
                 | op::I64_TRUNC_UF32
                 | op::I64_TRUNC_SF64
                 | op::I64_TRUNC_UF64 => {
-                    // Use cranelift's fcvt_to_sint/fcvt_to_uint which traps on overflow/NaN.
                     let src = read_src!(builder, insn.sources[0]);
                     let is_f32_src = matches!(
                         opc,
@@ -388070,13 +388515,25 @@ impl CraneliftCompiler {
                             _ => unreachable!(),
                         }
                     } else {
+                        let result_slot =
+                            builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 0));
+                        let result_ptr = builder.ins().stack_addr(ptr_type, result_slot, 0);
                         let mem_idx = builder.ins().iconst(types::I32, i64::from(insn.imm3 & 0x7fff_ffff));
-                        let _xv_config_var = builder.use_var(config_var);
+                        let interp = builder.use_var(interp_var);
+                        let config = builder.use_var(config_var);
                         let _xc_0 = builder.ins().func_addr(ptr_type, memory_load_helper);
-                        let call = builder
-                            .ins()
-                            .call_indirect(mem_load_sig, _xc_0, &[_xv_config_var, mem_idx, addr]);
-                        builder.inst_results(call)[0]
+                        let call = builder.ins().call_indirect(
+                            mem_load_sig,
+                            _xc_0,
+                            &[interp, config, mem_idx, addr, result_ptr],
+                        );
+                        let trapped = builder.inst_results(call)[0];
+                        let is_trap = builder.ins().icmp_imm(IntCC::NotEqual, trapped, 0);
+                        let cont = builder.create_block();
+                        builder.ins().brif(is_trap, trap_block, &[], cont, &[]);
+                        builder.switch_to_block(cont);
+                        builder.seal_block(cont);
+                        builder.ins().stack_load(types::I64, result_slot, 0)
                     };
                     write_dst!(builder, insn.destination, result);
                 }
@@ -388134,12 +388591,14 @@ impl CraneliftCompiler {
                         }
                     } else {
                         let mem_idx = builder.ins().iconst(types::I32, i64::from(insn.imm3 & 0x7fff_ffff));
+                        let interp = builder.use_var(interp_var);
                         let _xv_config_var = builder.use_var(config_var);
                         let _xc_0 = builder.ins().func_addr(ptr_type, memory_store_helper);
-                        let call =
-                            builder
-                                .ins()
-                                .call_indirect(mem_store_sig, _xc_0, &[_xv_config_var, mem_idx, addr, val]);
+                        let call = builder.ins().call_indirect(
+                            mem_store_sig,
+                            _xc_0,
+                            &[interp, _xv_config_var, mem_idx, addr, val],
+                        );
                         let trapped = builder.inst_results(call)[0];
                         let is_trap = builder.ins().icmp_imm(IntCC::NotEqual, trapped, 0);
                         let cont = builder.create_block();
@@ -388447,12 +388906,14 @@ impl CraneliftCompiler {
                         } else {
                             h_mem_store64
                         };
+                        let interp = builder.use_var(interp_var);
                         let _uv_config_var = builder.use_var(config_var);
                         let _ic_0 = builder.ins().func_addr(ptr_type, memory_store_helper);
-                        let call =
-                            builder
-                                .ins()
-                                .call_indirect(mem_store_sig, _ic_0, &[_uv_config_var, mem_idx, addr, val]);
+                        let call = builder.ins().call_indirect(
+                            mem_store_sig,
+                            _ic_0,
+                            &[interp, _uv_config_var, mem_idx, addr, val],
+                        );
                         let trapped = builder.inst_results(call)[0];
                         let is_trap = builder.ins().icmp_imm(IntCC::NotEqual, trapped, 0);
                         let cont = builder.create_block();
@@ -388510,13 +388971,23 @@ impl CraneliftCompiler {
         let mut ctx = Context::for_function(func);
         // Snapshot the code bytes + raw reloc list before we drop the borrow on ctx so we
         // can map UserExternalNameRefs back to helper ids via ctx.func.params below.
-        let (bytes, raw_relocs) = {
+        let (bytes, raw_relocs, traps) = {
             let code = ctx
                 .compile(&*isa, &mut Default::default())
                 .map_err(|_| "cranelift compilation failed")?;
+            let traps = code
+                .buffer
+                .traps()
+                .iter()
+                .map(|trap| CraneliftTrap {
+                    offset: trap.offset,
+                    code: trap.code.as_raw().get(),
+                    _padding: [0; 3],
+                })
+                .collect();
             let bytes = code.code_buffer().to_vec();
             let raw = code.buffer.relocs().to_vec();
-            (bytes, raw)
+            (bytes, raw, traps)
         };
 
         let mut relocs: Vec<HelperReloc> = Vec::with_capacity(raw_relocs.len());
@@ -388542,7 +389013,11 @@ impl CraneliftCompiler {
             });
         }
 
-        Ok(CompiledFunction { code: bytes, relocs })
+        Ok(CompiledFunction {
+            code: bytes,
+            relocs,
+            traps,
+        })
     }
 
     fn is_supported(insn: &CraneliftInsn) -> bool {
@@ -388776,10 +389251,19 @@ pub struct HelperReloc {
     pub addend: i64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CraneliftTrap {
+    pub offset: u32,
+    pub code: u8,
+    pub _padding: [u8; 3],
+}
+
 /// Output of `compile_to_bytes`: the machine code plus the patch table.
 pub struct CompiledFunction {
     pub code: Vec<u8>,
     pub relocs: Vec<HelperReloc>,
+    pub traps: Vec<CraneliftTrap>,
 }
 
 pub fn compile_to_bytes(
@@ -389148,6 +389632,7 @@ FILE: Libraries/LibWasm/Types.h
 
 #pragma once
 
+#include <AK/AtomicRefCounted.h>
 #include <AK/Badge.h>
 #include <AK/ByteString.h>
 #include <AK/DistinctNumeric.h>
@@ -390010,6 +390495,13 @@ private:
 
 void free_cranelift_code(void* handle);
 
+struct CraneliftTrap {
+    u32 offset { 0 };
+    u8 code { 0 };
+    u8 _padding[3] { 0, 0, 0 };
+};
+static_assert(sizeof(CraneliftTrap) == 8);
+
 struct CompiledInstructions {
     Vector<Dispatch> dispatches;
     Vector<SourcesAndDestination> src_dst_mappings;
@@ -390018,6 +390510,8 @@ struct CompiledInstructions {
     bool cranelift_compiled = false;
     void* cranelift_code_handle = nullptr; // Owned; freed when the owning Module is destroyed.
     size_t cranelift_code_size = 0;
+    CraneliftTrap const* cranelift_traps = nullptr; // Owned by cranelift_code_handle.
+    size_t cranelift_trap_count = 0;
     size_t max_call_arg_count = 0;
     size_t max_call_rec_size = 0;
 };
@@ -390609,7 +391103,12 @@ private:
     Vector<TagType> m_tags;
 };
 
-class WASM_API Module : public RefCounted<Module>
+enum class CompileToNative : u8 {
+    No,
+    Yes,
+};
+
+class WASM_API Module : public AtomicRefCounted<Module>
     , public Weakable<Module> {
 public:
     enum class ValidationStatus {
@@ -390656,6 +391155,25 @@ public:
     ValidationStatus validation_status() const { return m_validation_status; }
     StringView validation_error() const LIFETIME_BOUND { return *m_validation_error; }
     void set_validation_error(ByteString error) { m_validation_error = move(error); }
+    bool has_attempted_cranelift_compilation() const { return m_cranelift_compilation_state.load(AK::MemoryOrder::memory_order_acquire) == 2; }
+    void set_has_attempted_cranelift_compilation(bool value) const
+    {
+        m_cranelift_compilation_state.store(value ? 2 : 0, AK::MemoryOrder::memory_order_release);
+    }
+    bool try_begin_cranelift_compilation() const
+    {
+        u8 not_started = 0;
+        return m_cranelift_compilation_state.compare_exchange_strong(not_started, 1, AK::MemoryOrder::memory_order_acq_rel);
+    }
+    void finish_cranelift_compilation() const
+    {
+        m_cranelift_compilation_state.store(2, AK::MemoryOrder::memory_order_release);
+    }
+    void wait_for_cranelift_compilation() const
+    {
+        while (m_cranelift_compilation_state.load(AK::MemoryOrder::memory_order_acquire) == 1)
+            AK::atomic_pause();
+    }
 
     static ParseResult<NonnullRefPtr<Module>> parse(Stream& stream);
 
@@ -390683,13 +391201,17 @@ private:
 
     ValidationStatus m_validation_status { ValidationStatus::Unchecked };
     Optional<ByteString> m_validation_error;
+    mutable Atomic<u8> m_cranelift_compilation_state { 0 };
 
     size_t m_minimum_call_record_allocation_size { 0 };
 };
 
 CompiledInstructions try_compile_instructions(Expression const&, Span<FunctionType const> functions);
+ErrorOr<void, ValidationError> ensure_cranelift_compiled(Module&);
+WASM_API void start_cranelift_compilation(Module&);
 bool try_cranelift_compile(CompiledInstructions& compiled, u32 result_arity = 0);
 void flush_cranelift_batch();
+void discard_cranelift_batch();
 
 // Caller-supplied hooks for the Cranelift on-disk cache.
 //   - `wasm_hash` is a 32-byte digest of the wasm bytes; embedded in produced blobs
@@ -411014,7 +411536,12 @@ ladybird_lib(LibWeb web EXPLICIT_SYMBOL_EXPORT)
 target_link_libraries(LibWeb PRIVATE LibCore LibCompress LibCrypto LibJS LibHTTP LibGfx LibIPC LibRegex LibSyntax LibTextCodec LibUnicode LibMedia LibWasm LibXML LibIDL LibURL LibTLS LibRequests LibGC LibSync LibThreading skia ${ANGLE_TARGETS} SDL3::SDL3 LibXml2::LibXml2)
 
 import_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libweb_rust FFI_HEADER RustFFI.h)
-import_rust_crate(MANIFEST_PATH ContentBlocker/Rust/Cargo.toml CRATE_NAME libweb_content_blocker_rust FFI_HEADER ContentBlockerRustFFI.h)
+
+set(content_blocker_rust_features "")
+if (NOT BUILD_SHARED_LIBS)
+    set(content_blocker_rust_features FEATURES allocator)
+endif()
+import_rust_crate(MANIFEST_PATH ContentBlocker/Rust/Cargo.toml CRATE_NAME libweb_content_blocker_rust ${content_blocker_rust_features} FFI_HEADER ContentBlockerRustFFI.h)
 target_link_libraries(LibWeb PRIVATE libweb_rust libweb_content_blocker_rust)
 get_target_property(_libweb_rust_lib libweb_rust IMPORTED_LOCATION)
 get_target_property(_libweb_content_blocker_rust_lib libweb_content_blocker_rust IMPORTED_LOCATION)
@@ -412980,6 +413507,10 @@ crate-type = ["staticlib"]
 adblock = "0.12.5"
 serde_json = "1.0"
 
+[features]
+default = []
+allocator = []
+
 [build-dependencies]
 cbindgen = "0.29"
 
@@ -413020,6 +413551,10 @@ FILE: Libraries/LibWeb/ContentBlocker/Rust/src/lib.rs
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
+
+#[cfg(feature = "allocator")]
+#[path = "../../../../RustAllocator.rs"]
+mod rust_allocator;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -518775,8 +519310,11 @@ void StyleComputer::start_needed_transitions(ComputedProperties const& previous_
 
     // For each element and property, the implementation must act as follows:
     // NB: We know that a DocumentTimeline's current time is always in milliseconds
-    VERIFY(m_document->timeline()->current_time()->type == Animations::TimeValue::Type::Milliseconds);
-    auto style_change_event_time = m_document->timeline()->current_time()->value;
+    auto current_time = m_document->timeline()->current_time();
+    if (!current_time.has_value())
+        return;
+    VERIFY(current_time->type == Animations::TimeValue::Type::Milliseconds);
+    auto style_change_event_time = current_time->value;
 
     // FIXME: Add some transition helpers to AbstractElement.
     auto& element = abstract_element.element();
@@ -629365,7 +629903,7 @@ void EventLoop::process_input_events() const
                 [&](KeyEvent const& key_event) {
                     switch (key_event.type) {
                     case KeyEvent::Type::KeyDown:
-                        return page.handle_keydown(key_event.key, key_event.modifiers, key_event.code_point, key_event.repeat);
+                        return page.handle_keydown(key_event.key, key_event.modifiers, key_event.code_point, key_event.repeat, key_event.should_insert_text);
                     case KeyEvent::Type::KeyUp:
                         return page.handle_keyup(key_event.key, key_event.modifiers, key_event.code_point, key_event.repeat);
                     }
@@ -649215,405 +649753,3 @@ void HTMLInputElement::create_range_input_shadow_tree()
     shadow_root->set_user_agent_internal(true);
     set_shadow_root(shadow_root);
 
-    m_slider_runnable_track = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
-    MUST(shadow_root->append_child(*m_slider_runnable_track));
-    m_slider_runnable_track->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::SliderTrack);
-
-    m_slider_progress_element = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
-    MUST(m_slider_runnable_track->append_child(*m_slider_progress_element));
-    m_slider_progress_element->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::SliderFill);
-
-    m_slider_thumb = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
-    MUST(m_slider_runnable_track->append_child(*m_slider_thumb));
-    m_slider_thumb->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::SliderThumb);
-
-    update_slider_shadow_tree_elements();
-
-    auto keydown_callback_function = JS::NativeFunction::create(
-        realm(), [this](JS::VM& vm) {
-            if (type_state() != TypeAttributeState::Range)
-                return JS::js_undefined();
-            if (!allowed_value_step().has_value())
-                return JS::js_undefined();
-            auto key_value = MUST(vm.argument(0).get(vm, "key"_utf16_fly_string));
-            if (!key_value.is_string())
-                return JS::js_undefined();
-            auto key = key_value.as_string().utf8_string();
-
-            if (key == "ArrowLeft" || key == "ArrowDown")
-                MUST(step_down());
-            if (key == "PageDown")
-                MUST(step_down(10));
-
-            if (key == "ArrowRight" || key == "ArrowUp")
-                MUST(step_up());
-            if (key == "PageUp")
-                MUST(step_up(10));
-
-            user_interaction_did_change_input_value();
-            return JS::js_undefined();
-        },
-        0, Utf16FlyString {}, &realm());
-    auto keydown_callback = realm().heap().allocate<WebIDL::CallbackType>(*keydown_callback_function, realm());
-    add_event_listener_without_options(UIEvents::EventNames::keydown, DOM::IDLEventListener::create(realm(), keydown_callback));
-
-    auto wheel_callback_function = JS::NativeFunction::create(
-        realm(), [this](JS::VM& vm) {
-            if (type_state() != TypeAttributeState::Range)
-                return JS::js_undefined();
-            if (!allowed_value_step().has_value())
-                return JS::js_undefined();
-            auto delta_y_value = MUST(vm.argument(0).get(vm, "deltaY"_utf16_fly_string));
-            if (!delta_y_value.is_finite_number())
-                return JS::js_undefined();
-            if (delta_y_value.as_double() > 0) {
-                MUST(step_down());
-            } else {
-                MUST(step_up());
-            }
-            user_interaction_did_change_input_value();
-            return JS::js_undefined();
-        },
-        0, Utf16FlyString {}, &realm());
-    auto wheel_callback = realm().heap().allocate<WebIDL::CallbackType>(*wheel_callback_function, realm());
-    add_event_listener_without_options(UIEvents::EventNames::wheel, DOM::IDLEventListener::create(realm(), wheel_callback));
-
-    auto update_slider_by_mouse = [this](JS::VM& vm) {
-        if (type_state() != TypeAttributeState::Range)
-            return;
-        auto client_x_value = MUST(vm.argument(0).get(vm, "clientX"_utf16_fly_string));
-        if (!client_x_value.is_finite_number())
-            return;
-        auto client_x = client_x_value.as_double();
-        auto rect = get_bounding_client_rect();
-        if (rect.width().to_double() <= 0)
-            return;
-        double minimum = *min();
-        double maximum = *max();
-        if (minimum > maximum)
-            return;
-        // FIXME: Snap new value to input steps
-        MUST(set_value_as_number(clamp(round(((client_x - rect.left().to_double()) / rect.width().to_double()) * (maximum - minimum) + minimum), minimum, maximum)));
-        user_interaction_did_change_input_value();
-    };
-
-    auto mousedown_callback_function = JS::NativeFunction::create(
-        realm(), [this, update_slider_by_mouse](JS::VM& vm) {
-            update_slider_by_mouse(vm);
-
-            auto mousemove_callback_function = JS::NativeFunction::create(
-                realm(), [update_slider_by_mouse](JS::VM& vm) {
-                    update_slider_by_mouse(vm);
-                    return JS::js_undefined();
-                },
-                0, Utf16FlyString {}, &realm());
-            auto mousemove_callback = realm().heap().allocate<WebIDL::CallbackType>(*mousemove_callback_function, realm());
-            auto mousemove_listener = DOM::IDLEventListener::create(realm(), mousemove_callback);
-            auto& window = static_cast<HTML::Window&>(relevant_global_object(*this));
-            window.add_event_listener_without_options(UIEvents::EventNames::mousemove, mousemove_listener);
-
-            auto mouseup_callback_function = JS::NativeFunction::create(
-                realm(), [this, mousemove_listener](JS::VM&) {
-                    auto& window = static_cast<HTML::Window&>(relevant_global_object(*this));
-                    window.remove_event_listener_without_options(UIEvents::EventNames::mousemove, mousemove_listener);
-                    return JS::js_undefined();
-                },
-                0, Utf16FlyString {}, &realm());
-            auto mouseup_callback = realm().heap().allocate<WebIDL::CallbackType>(*mouseup_callback_function, realm());
-            Bindings::AddEventListenerOptions mouseup_listener_options;
-            mouseup_listener_options.once = true;
-            window.add_event_listener(UIEvents::EventNames::mouseup, DOM::IDLEventListener::create(realm(), mouseup_callback), mouseup_listener_options);
-
-            return JS::js_undefined();
-        },
-        0, Utf16FlyString {}, &realm());
-    auto mousedown_callback = realm().heap().allocate<WebIDL::CallbackType>(*mousedown_callback_function, realm());
-    add_event_listener_without_options(UIEvents::EventNames::mousedown, DOM::IDLEventListener::create(realm(), mousedown_callback));
-}
-
-void HTMLInputElement::user_interaction_did_change_input_value(FlyString const& input_type, Optional<Utf16String> const& data)
-{
-    // https://html.spec.whatwg.org/multipage/input.html#common-input-element-events
-    // For input elements without a defined input activation behavior, but to which these events apply,
-    // and for which the user interface involves both interactive manipulation and an explicit commit action,
-    // then when the user changes the element's value, the user agent must queue an element task on the user interaction task source
-    // given the input element to fire an event named input at the input element, with the bubbles and composed attributes initialized to true
-    queue_an_element_task(HTML::Task::Source::UserInteraction, [this, input_type, data] {
-        // https://w3c.github.io/uievents/#event-type-input
-        Bindings::InputEventInit input_event_init;
-        input_event_init.bubbles = true;
-        input_event_init.composed = true;
-        input_event_init.input_type = input_type.to_string();
-        input_event_init.data = data;
-        auto input_event = UIEvents::InputEvent::create_from_platform_event(realm(), HTML::EventNames::input, input_event_init);
-        dispatch_event(*input_event);
-    });
-    // and any time the user commits the change, the user agent must queue an element task on the user interaction task source given the input
-    // element to set its user validity to true and fire an event named change at the input element, with the bubbles attribute initialized to true.
-    // NOTE: This is done manually as needed
-}
-
-void HTMLInputElement::update_slider_shadow_tree_elements()
-{
-    double value = convert_string_to_number(value_sanitization_algorithm(m_value)).value_or(0);
-    double minimum = *min();
-    double maximum = *max();
-    double position = (value - minimum) / (maximum - minimum) * 100;
-
-    if (m_slider_progress_element)
-        MUST(m_slider_progress_element->style_for_bindings()->set_property(CSS::PropertyID::Width, MUST(String::formatted("{}%", position))));
-
-    if (m_slider_thumb)
-        MUST(m_slider_thumb->style_for_bindings()->set_property(CSS::PropertyID::MarginLeft, MUST(String::formatted("{}%", position))));
-}
-
-void HTMLInputElement::did_receive_focus()
-{
-    if (!m_text_node)
-        return;
-    m_text_node->set_needs_repaint();
-
-    if (m_placeholder_text_node)
-        m_placeholder_text_node->set_needs_repaint();
-
-    if (has_selectable_text()) {
-        if (document().last_focus_trigger() == FocusTrigger::Key)
-            MUST(select());
-        else
-            document().get_selection()->remove_all_ranges();
-    }
-}
-
-void HTMLInputElement::did_lose_focus()
-{
-    if (m_text_node)
-        m_text_node->set_needs_repaint();
-
-    if (m_placeholder_text_node)
-        m_placeholder_text_node->set_needs_repaint();
-
-    commit_pending_changes();
-}
-
-void HTMLInputElement::form_associated_element_attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
-{
-    PopoverTargetAttributes::associated_attribute_changed(name, value, namespace_);
-
-    if (name == HTML::AttributeNames::checked) {
-        // https://html.spec.whatwg.org/multipage/input.html#the-input-element:concept-input-checked-dirty-2
-        // When the checked content attribute is added, if the control does not have dirty checkedness, the user agent must set the checkedness of the element to true;
-        // when the checked content attribute is removed, if the control does not have dirty checkedness, the user agent must set the checkedness of the element to false.
-        if (!m_dirty_checkedness) {
-            set_checked(value.has_value());
-            // set_checked() sets the dirty checkedness flag. We reset it here sinceit shouldn't be set when updating the attribute value
-            m_dirty_checkedness = false;
-        }
-    } else if (name == HTML::AttributeNames::type) {
-        auto new_type_attribute_state = parse_type_attribute(value.value_or(String {}));
-        type_attribute_changed(m_type, new_type_attribute_state);
-
-        // https://html.spec.whatwg.org/multipage/input.html#image-button-state-(type=image):the-input-element-4
-        // the input element's type attribute is changed back to the Image Button state, and the src attribute is present,
-        // and its value has changed since the last time the type attribute was in the Image Button state
-        if (type_state() == TypeAttributeState::ImageButton) {
-            if (auto src = attribute(AttributeNames::src); src.has_value() && src != m_last_src_value)
-                handle_src_attribute(*src).release_value_but_fixme_should_propagate_errors();
-        }
-
-    } else if (name == HTML::AttributeNames::value) {
-        if (!m_dirty_value) {
-            auto old_value = move(m_value);
-
-            if (value.has_value())
-                m_value = value_sanitization_algorithm(Utf16String::from_utf8(*value));
-            else
-                m_value = {};
-
-            if (m_value != old_value)
-                relevant_value_was_changed();
-
-            update_shadow_tree();
-        }
-    } else if (name == HTML::AttributeNames::placeholder) {
-        if (m_placeholder_text_node) {
-            m_placeholder_text_node->set_data(Utf16String::from_utf8(placeholder()));
-            update_placeholder_visibility();
-        }
-    } else if (name == HTML::AttributeNames::src) {
-        handle_src_attribute(value.value_or({})).release_value_but_fixme_should_propagate_errors();
-    } else if (name == HTML::AttributeNames::alt) {
-        if (unsafe_layout_node() && type_state() == TypeAttributeState::ImageButton)
-            did_update_alt_text(as<Layout::ImageBox>(*unsafe_layout_node()));
-    } else if (name == HTML::AttributeNames::maxlength) {
-        handle_maxlength_attribute();
-    } else if (name == HTML::AttributeNames::multiple) {
-        if (type_state() == TypeAttributeState::Email && old_value.has_value() != value.has_value()) {
-            m_value = value_sanitization_algorithm(m_value);
-        }
-        update_shadow_tree();
-    } else if (name == HTML::AttributeNames::min || name == HTML::AttributeNames::max || name == HTML::AttributeNames::step) {
-        if (type_state() == TypeAttributeState::Range) {
-            m_value = value_sanitization_algorithm(m_value);
-            update_shadow_tree();
-        }
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#input-type-change
-void HTMLInputElement::type_attribute_changed(TypeAttributeState old_state, TypeAttributeState new_state)
-{
-    auto new_value_attribute_mode = value_attribute_mode_for_type_state(new_state);
-    auto old_value_attribute_mode = value_attribute_mode_for_type_state(old_state);
-
-    if (checked_applies(old_state) != checked_applies(new_state)) {
-        CSS::Invalidation::invalidate_style_after_checked_state_change(*this, DOM::StyleInvalidationReason::HTMLInputElementSetType);
-    }
-
-    // 1. If the previous state of the element's type attribute put the value IDL attribute in the value mode, and the element's
-    //    value is not the empty string, and the new state of the element's type attribute puts the value IDL attribute in either
-    //    the default mode or the default/on mode, then set the element's value content attribute to the element's value.
-    if (old_value_attribute_mode == ValueAttributeMode::Value && !m_value.is_empty() && (first_is_one_of(new_value_attribute_mode, ValueAttributeMode::Default, ValueAttributeMode::DefaultOn))) {
-        set_attribute_value(HTML::AttributeNames::value, m_value.to_utf8_but_should_be_ported_to_utf16());
-    }
-
-    // 2. Otherwise, if the previous state of the element's type attribute put the value IDL attribute in any mode other
-    //    than the value mode, and the new state of the element's type attribute puts the value IDL attribute in the value mode,
-    //    then set the value of the element to the value of the value content attribute, if there is one, or the empty string
-    //    otherwise, and then set the control's dirty value flag to false.
-    else if (old_value_attribute_mode != ValueAttributeMode::Value && new_value_attribute_mode == ValueAttributeMode::Value) {
-        m_value = Utf16String::from_utf8(attribute(HTML::AttributeNames::value).value_or({}));
-        m_dirty_value = false;
-    }
-
-    // 3. Otherwise, if the previous state of the element's type attribute put the value IDL attribute in any mode other
-    //    than the filename mode, and the new state of the element's type attribute puts the value IDL attribute in the filename mode,
-    //    then set the value of the element to the empty string.
-    else if (old_value_attribute_mode != ValueAttributeMode::Filename && new_value_attribute_mode == ValueAttributeMode::Filename) {
-        m_value = {};
-    }
-
-    // 4. Update the element's rendering and behavior to the new state's.
-    m_type = new_state;
-    clear_element_reference_pseudo_elements();
-    set_shadow_root(nullptr);
-    create_shadow_tree_if_needed();
-
-    // 5. Signal a type change for the element. (The Radio Button state uses this, in particular.)
-    signal_a_type_change();
-
-    // 6. Invoke the value sanitization algorithm, if one is defined for the type attribute's new state.
-    m_value = value_sanitization_algorithm(m_value);
-
-    // 7. Let previouslySelectable be true if setRangeText() previously applied to the element, and false otherwise.
-    auto previously_selectable = selection_or_range_applies_for_type_state(old_state);
-
-    // 8. Let nowSelectable be true if setRangeText() now applies to the element, and false otherwise.
-    auto now_selectable = selection_or_range_applies_for_type_state(new_state);
-
-    // 9. If previouslySelectable is false and nowSelectable is true, set the element's text entry cursor position to the
-    //    beginning of the text control, and set its selection direction to "none".
-    if (!previously_selectable && now_selectable) {
-        set_the_selection_range(0, 0);
-        set_selection_direction(OptionalNone {});
-    }
-}
-
-void HTMLInputElement::computed_properties_changed()
-{
-    create_shadow_tree_if_needed();
-    update_shadow_tree();
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type=radio):signal-a-type-change
-void HTMLInputElement::signal_a_type_change()
-{
-    // https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type=radio)
-    // When any of the following phenomena occur, if the element's checkedness state is true after the occurrence,
-    // the checkedness state of all the other elements in the same radio button group must be set to false:
-    // ...
-    // - A type change is signalled for the element.
-    if (type_state() == TypeAttributeState::RadioButton && checked()) {
-        root().for_each_in_inclusive_subtree_of_type<HTMLInputElement>([&](auto& element) {
-            if (element.checked() && &element != this && is_in_same_radio_button_group(*this, element))
-                element.set_checked(false);
-            return TraversalDecision::Continue;
-        });
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#attr-input-src
-WebIDL::ExceptionOr<void> HTMLInputElement::handle_src_attribute(String const& value)
-{
-    auto& realm = this->realm();
-    auto& vm = realm.vm();
-
-    if (type_state() != TypeAttributeState::ImageButton)
-        return {};
-
-    m_last_src_value = value;
-
-    // 1. Let url be the result of encoding-parsing a URL given the src attribute's value, relative to the element's
-    //    node document.
-    auto url = document().encoding_parse_url(value);
-
-    // 2. If url is failure, then return.
-    if (!url.has_value())
-        return {};
-
-    // 3. Let request be a new request whose URL is url, client is the element's node document's relevant settings
-    //    object, destination is "image", initiator type is "input", credentials mode is "include", and whose
-    //    use-URL-credentials flag is set.
-    auto request = Fetch::Infrastructure::Request::create(vm);
-    request->set_url(url.release_value());
-    request->set_client(&document().relevant_settings_object());
-    request->set_destination(Fetch::Infrastructure::Request::Destination::Image);
-    request->set_initiator_type(Fetch::Infrastructure::Request::InitiatorType::Input);
-    request->set_credentials_mode(Fetch::Infrastructure::Request::CredentialsMode::Include);
-    request->set_use_url_credentials(true);
-
-    // 4. Fetch request, with processResponseEndOfBody set to the following steps given response response:
-    m_resource_request = SharedResourceRequest::get_or_create(realm, document().page(), request->url());
-    m_resource_request->add_callbacks(
-        [this, &realm]() {
-            // 1. If the download was successful and the image is available, queue an element task on the user interaction
-            //    task source given the input element to fire an event named load at the input element.
-            queue_an_element_task(HTML::Task::Source::UserInteraction, [this, &realm]() {
-                dispatch_event(DOM::Event::create(realm, HTML::EventNames::load));
-            });
-
-            m_load_event_delayer.clear();
-            set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::HTMLInputElementSrcAttribute);
-        },
-        [this, &realm]() {
-            // 2. Otherwise, if the fetching process fails without a response from the remote server, or completes but the
-            //    image is not a valid or supported image, then queue an element task on the user interaction task source
-            //    given the input element to fire an event named error on the input element.
-            queue_an_element_task(HTML::Task::Source::UserInteraction, [this, &realm]() {
-                dispatch_event(DOM::Event::create(realm, HTML::EventNames::error));
-            });
-
-            m_load_event_delayer.clear();
-        });
-
-    if (m_resource_request->needs_fetching()) {
-        m_resource_request->fetch_resource(realm, request);
-    }
-
-    // Fetching the image must delay the load event of the element's node document until the task that is queued by the
-    // networking task source once the resource has been fetched (defined below) has been run.
-    m_load_event_delayer.emplace(document());
-
-    return {};
-}
-
-HTMLInputElement::TypeAttributeState HTMLInputElement::parse_type_attribute(StringView type)
-{
-#define __ENUMERATE_HTML_INPUT_TYPE_ATTRIBUTE(keyword, state) \
-    if (type.equals_ignoring_ascii_case(keyword##sv))         \
-        return HTMLInputElement::TypeAttributeState::state;
-    ENUMERATE_HTML_INPUT_TYPE_ATTRIBUTES
-#undef __ENUMERATE_HTML_INPUT_TYPE_ATTRIBUTE
-
-    // The missing value default and the invalid value default are the Text state.
-    // https://html.spec.whatwg.org/multipage/input.html#the-input-element:missing-value-default
-    // https://html.spec.whatwg.org/multipage/input.html#the-input-element:invalid-value-default
