@@ -2912,8 +2912,7 @@ CSSPixelPoint Navigable::to_top_level_position(CSSPixelPoint a_position)
         if (!paintable)
             return {};
 
-        if (auto const* paintable_box = as_if<Painting::PaintableBox>(*paintable);
-            paintable_box && paintable_box->accumulated_visual_context_index().value()) {
+        if (auto const* paintable_box = as_if<Painting::PaintableBox>(*paintable)) {
             auto point = paintable_box->absolute_position();
             point.translate_by(position);
             position = paintable_box->transform_rect_to_viewport({ point, { 0, 0 } }).location();
@@ -3238,6 +3237,8 @@ void Navigable::inform_the_navigation_api_about_aborting_navigation()
 
 bool Navigable::is_focused() const
 {
+    if (!m_page->client().has_focus())
+        return false;
     return &m_page->focused_navigable() == this;
 }
 
@@ -3472,6 +3473,7 @@ bool Navigable::record_display_list_and_scroll_state(PaintConfig paint_config)
         return false;
 
     adopt_pending_async_scroll_offsets();
+    document->update_paint_and_hit_testing_properties_if_needed();
 
     auto should_record_display_list = m_needs_to_record_display_list
         || !m_compositor_display_list_paint_config.has_value()
@@ -3497,16 +3499,22 @@ bool Navigable::record_display_list_and_scroll_state(PaintConfig paint_config)
 
     auto document_paintable = document->paintable();
     VERIFY(document_paintable);
+    auto visual_context_tree_needs_compositor_update = document_paintable->visual_context_tree_needs_compositor_update();
     document_paintable->refresh_scroll_state();
 
     Painting::ScrollStateSnapshot scroll_state_snapshot { document_paintable->scroll_state_snapshot() };
     if (should_record_display_list) {
         compositor_context().update_display_list(*display_list, visual_context_tree.release_value(), move(resource_transaction), move(scroll_state_snapshot));
+        document_paintable->did_update_visual_context_tree_in_compositor();
         m_display_list_resource_storage.retain_only(display_list_resources);
         m_compositor_display_list_resources = move(display_list_resources);
         m_needs_to_record_display_list = false;
         m_compositor_display_list_paint_config = paint_config;
     } else {
+        if (visual_context_tree_needs_compositor_update) {
+            compositor_context().update_visual_context_tree(document_paintable->visual_context_tree());
+            document_paintable->did_update_visual_context_tree_in_compositor();
+        }
         compositor_context().update_scroll_state(move(scroll_state_snapshot));
     }
     return true;
@@ -3646,12 +3654,8 @@ GC::Ref<WebIDL::Promise> Navigable::perform_a_scroll_of_the_viewport(CSSPixelPoi
     //     from this step.
     // FIXME: Get a Promise from this.
     vv->scroll_by({ visual_dx, visual_dy });
-    if (visual_dx != 0.0 || visual_dy != 0.0) {
-        doc->set_needs_accumulated_visual_contexts_update(true);
-        doc->set_needs_repaint(Badge<HTML::Navigable> {}, InvalidateDisplayList::Yes);
-    } else {
+    if (visual_dx == 0.0 && visual_dy == 0.0)
         doc->set_needs_repaint(Badge<HTML::Navigable> {}, InvalidateDisplayList::No);
-    }
 
     // 16. Let scrollPromise be a new Promise.
     auto scroll_promise = WebIDL::create_promise(doc->realm());
