@@ -22,6 +22,7 @@
 #include <LibWeb/CSS/Selector.h>
 #include <LibWeb/CSS/SelectorInsights.h>
 #include <LibWeb/CSS/StyleInvalidationData.h>
+#include <LibWeb/CSS/StyleSheetIdentifier.h>
 #include <LibWeb/Forward.h>
 
 namespace Web::CSS {
@@ -32,9 +33,10 @@ struct MatchingRule {
     GC::Ptr<CSSRule const> rule; // Either CSSStyleRule or CSSNestedDeclarations
     GC::Ptr<CSSStyleSheet const> sheet;
     GC::Ptr<CSSContainerRule const> container_rule;
-    GC::Ptr<CSSScopeRule const> scope_rule;
+    GC::Ptr<CSSRule const> scope_rule; // Either CSSScopeRule or CSSImportRule
     Optional<FlyString> default_namespace;
     Selector const& selector;
+    size_t selector_index { 0 };
     size_t style_sheet_index { 0 };
     size_t rule_index { 0 };
 
@@ -122,6 +124,8 @@ public:
     [[nodiscard]] RuleCache const& get_pseudo_class_rule_cache(PseudoClass) const;
 
     void for_each_stylesheet(CascadeOrigin, Function<void(CSS::CSSStyleSheet&)> const&) const;
+    static WEB_API void for_each_user_agent_stylesheet(bool include_quirks_mode_stylesheet, Function<void(CSS::CSSStyleSheet&, StyleSheetIdentifier const&)> const&);
+    static Optional<StyleSheetIdentifier> user_agent_style_sheet_identifier(CSS::CSSStyleSheet const&);
     void build_user_style_sheet_if_needed();
 
     void make_rule_cache_for_cascade_origin(CascadeOrigin, StyleCache&);

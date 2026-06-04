@@ -755,6 +755,7 @@ Variant<Empty, QualifiedRule, Parser::InvalidRuleError> Parser::consume_a_qualif
         .prelude = {},
         .declarations = {},
         .child_rules = {},
+        .source_position = {},
     };
 
     // NOTE: Qualified rules inside @keyframes are a keyframe rule.
@@ -831,7 +832,10 @@ Variant<Empty, QualifiedRule, Parser::InvalidRuleError> Parser::consume_a_qualif
         // anything else
         {
             // Consume a component value from input and append the result to rule’s prelude.
-            rule.prelude.append(consume_a_component_value(input));
+            auto component_value = consume_a_component_value(input);
+            if (!rule.source_position.has_value() && !component_value.is(Token::Type::Whitespace))
+                rule.source_position = component_value.start_position();
+            rule.prelude.append(move(component_value));
         }
     }
 }
@@ -1250,12 +1254,18 @@ Optional<Declaration> Parser::consume_a_declaration(TokenStream<T>& input, Neste
     Declaration declaration {
         .name {},
         .value {},
+        .important = Important::No,
+        .original_value_text = {},
+        .original_full_text = {},
+        .source_position = {},
     };
     auto start_token_index = input.current_index();
 
     // 1. If the next token is an <ident-token>, consume a token from input and set decl’s name to the token’s value.
     if (input.next_token().is(Token::Type::Ident)) {
-        declaration.name = ((Token)input.consume_a_token()).ident();
+        auto token = (Token)input.consume_a_token();
+        declaration.source_position = token.start_position();
+        declaration.name = token.ident();
     }
     //    Otherwise, consume the remnants of a bad declaration from input, with nested, and return nothing.
     else {
@@ -1643,6 +1653,45 @@ Parser::PropertiesAndCustomProperties Parser::parse_as_property_declaration_bloc
 
     // 4. Return parsed declarations.
     return parsed_declarations;
+}
+
+Vector<DevToolsStyleDeclaration> Parser::parse_as_devtools_property_declaration_block()
+{
+    auto declarations_and_at_rules = parse_a_blocks_contents(m_token_stream);
+
+    Vector<DevToolsStyleDeclaration> parsed_declarations;
+    for (auto const& rule_or_list : declarations_and_at_rules) {
+        if (auto* rule_declarations = rule_or_list.get_pointer<Vector<Declaration>>()) {
+            for (auto const& declaration : *rule_declarations) {
+                auto property = PropertyNameAndID::from_name(declaration.name);
+
+                StringBuilder value_builder;
+                for (auto const& value : declaration.value)
+                    value_builder.append(value.original_source_text());
+
+                parsed_declarations.append(DevToolsStyleDeclaration {
+                    .name = declaration.name,
+                    .value = value_builder.to_string_without_validation(),
+                    .important = declaration.important,
+                    .is_custom_property = property.has_value() && property->is_custom_property(),
+                    .is_name_valid = property.has_value(),
+                    .is_valid = property.has_value() && convert_to_style_property(declaration).has_value(),
+                });
+            }
+        }
+    }
+
+    return parsed_declarations;
+}
+
+Vector<DevToolsStyleDeclaration> parse_css_declaration_block_for_devtools(ParsingParams const& parsing_params, StringView declaration_block)
+{
+    auto devtools_parsing_params = parsing_params;
+    if (devtools_parsing_params.rule_context.is_empty())
+        devtools_parsing_params.rule_context.append(RuleContext::Style);
+
+    auto parser = Parser::create(devtools_parsing_params, declaration_block);
+    return parser.parse_as_devtools_property_declaration_block();
 }
 
 // https://drafts.csswg.org/cssom/#parse-a-css-declaration-block

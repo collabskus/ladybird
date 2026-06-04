@@ -3547,8 +3547,8 @@ DocumentType const* Document::doctype() const
 
 String const& Document::compat_mode() const
 {
-    static String const back_compat = "BackCompat"_string;
-    static String const css1_compat = "CSS1Compat"_string;
+    static String const& back_compat = *new String("BackCompat"_string);
+    static String const& css1_compat = *new String("CSS1Compat"_string);
 
     if (m_quirks_mode == QuirksMode::Yes)
         return back_compat;
@@ -7664,11 +7664,11 @@ Optional<String> Document::get_style_sheet_source(CSS::StyleSheetIdentifier cons
             if (auto* node = Node::from_unique_id(*identifier.dom_element_unique_id)) {
                 if (node->is_html_style_element()) {
                     if (auto* sheet = as<HTML::HTMLStyleElement>(*node).sheet())
-                        return sheet->source_text({});
+                        return sheet->source_text();
                 }
                 if (node->is_svg_style_element()) {
                     if (auto* sheet = as<SVG::SVGStyleElement>(*node).sheet())
-                        return sheet->source_text({});
+                        return sheet->source_text();
                 }
             }
         }
@@ -7683,7 +7683,7 @@ Optional<String> Document::get_style_sheet_source(CSS::StyleSheetIdentifier cons
         if (m_style_sheets) {
             for (auto& style_sheet : m_style_sheets->sheets()) {
                 if (auto match = find_style_sheet_with_url(identifier.url.value(), style_sheet); match.has_value())
-                    return match->source_text({});
+                    return match->source_text();
             }
         }
 
@@ -7694,7 +7694,7 @@ Optional<String> Document::get_style_sheet_source(CSS::StyleSheetIdentifier cons
                     return;
 
                 if (auto match = find_style_sheet_with_url(identifier.url.value(), style_sheet); match.has_value())
-                    result = match->source_text({});
+                    result = match->source_text();
             });
             return result;
         }

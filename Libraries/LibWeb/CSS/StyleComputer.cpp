@@ -15,9 +15,12 @@
 #include <AK/FixedBitmap.h>
 #include <AK/Function.h>
 #include <AK/HashMap.h>
+#include <AK/JsonObject.h>
 #include <AK/Math.h>
+#include <AK/NeverDestroyed.h>
 #include <AK/NonnullRawPtr.h>
 #include <AK/QuickSort.h>
+#include <AK/Utf8View.h>
 #include <LibGfx/Font/FontDatabase.h>
 #include <LibWeb/Animations/AnimationEffect.h>
 #include <LibWeb/Animations/DocumentTimeline.h>
@@ -32,6 +35,7 @@
 #include <LibWeb/CSS/CSSScopeRule.h>
 #include <LibWeb/CSS/CSSStyleProperties.h>
 #include <LibWeb/CSS/CSSStyleRule.h>
+#include <LibWeb/CSS/CSSStyleSheet.h>
 #include <LibWeb/CSS/CSSTransition.h>
 #include <LibWeb/CSS/CascadedProperties.h>
 #include <LibWeb/CSS/ComputedProperties.h>
@@ -45,7 +49,9 @@
 #include <LibWeb/CSS/SelectorEngine.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleProperty.h>
+#include <LibWeb/CSS/StyleScope.h>
 #include <LibWeb/CSS/StyleSheet.h>
+#include <LibWeb/CSS/StyleSheetIdentifier.h>
 #include <LibWeb/CSS/StyleValues/AngleStyleValue.h>
 #include <LibWeb/CSS/StyleValues/BorderRadiusStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
@@ -80,6 +86,7 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/ShadowRoot.h>
+#include <LibWeb/HTML/AttributeNames.h>
 #include <LibWeb/HTML/HTMLBRElement.h>
 #include <LibWeb/HTML/HTMLHtmlElement.h>
 #include <LibWeb/HTML/HTMLImageElement.h>
@@ -158,10 +165,10 @@ void StyleComputer::visit_edges(Visitor& visitor)
 
 Optional<String> StyleComputer::user_agent_style_sheet_source(StringView name)
 {
-    extern String default_stylesheet_source;
-    extern String quirks_mode_stylesheet_source;
-    extern String mathml_stylesheet_source;
-    extern String svg_stylesheet_source;
+    extern String const& default_stylesheet_source;
+    extern String const& quirks_mode_stylesheet_source;
+    extern String const& mathml_stylesheet_source;
+    extern String const& svg_stylesheet_source;
 
     if (name == "CSS/Default.css"sv)
         return default_stylesheet_source;
@@ -251,10 +258,10 @@ Vector<HasInvalidationMetadata> const* StyleComputer::has_invalidation_metadata_
     return nullptr;
 }
 
-static bool scope_selector_matches(Selector const& selector, DOM::Element const& element, DOM::Element const& subject, MatchingRule const& rule, GC::Ptr<DOM::Element const> shadow_host, GC::Ptr<DOM::ShadowRoot const> rule_root, GC::Ptr<DOM::ParentNode const> scope)
+static bool scope_selector_matches(Selector const& selector, DOM::Element const& element, DOM::Element const& subject, CSSStyleSheet const& scope_style_sheet, GC::Ptr<DOM::Element const> shadow_host, GC::Ptr<DOM::ShadowRoot const> rule_root, GC::Ptr<DOM::ParentNode const> scope)
 {
     SelectorEngine::MatchContext context {
-        .style_sheet_for_rule = *rule.sheet,
+        .style_sheet_for_rule = scope_style_sheet,
         .subject = subject,
         .rule_shadow_root = rule_root,
         .collect_per_element_selector_involvement_metadata = true,
@@ -267,20 +274,22 @@ struct ResolvedScope {
     size_t proximity { NumericLimits<size_t>::max() };
 };
 
-static Optional<ResolvedScope> resolve_single_scope(DOM::AbstractElement abstract_element, MatchingRule const& rule, GC::Ptr<DOM::Element const> shadow_host, GC::Ptr<DOM::ShadowRoot const> rule_root, CSSScopeRule const& scope_rule, GC::Ptr<DOM::Element const> outer_root)
+static Optional<ResolvedScope> resolve_single_scope(DOM::AbstractElement abstract_element, GC::Ptr<DOM::Element const> shadow_host, GC::Ptr<DOM::ShadowRoot const> rule_root, CSSRule const& scope_rule, GC::Ptr<DOM::Element const> outer_root)
 {
     GC::Ptr<DOM::Element const> root;
     size_t proximity = 0;
+    auto const* owner_style_sheet = scope_rule.parent_style_sheet();
+    VERIFY(owner_style_sheet);
 
     // https://drafts.csswg.org/css-cascade-6/#scope-limits
     // Finding the scoping root(s)
     // For each element matched by <scope-start>, create a scope using that element as the scoping root.
-    if (scope_rule.start_selectors_for_matching().has_value()) {
+    if (scope_start_selectors_for_matching(scope_rule).has_value()) {
         for (auto const* candidate = &abstract_element.element(); candidate; candidate = candidate->parent_element().ptr(), ++proximity) {
             if (outer_root && !outer_root->is_inclusive_ancestor_of(*candidate))
                 break;
-            for (auto const& selector : *scope_rule.start_selectors_for_matching()) {
-                if (scope_selector_matches(selector, *candidate, abstract_element.element(), rule, shadow_host, rule_root, outer_root)) {
+            for (auto const& selector : *scope_start_selectors_for_matching(scope_rule)) {
+                if (scope_selector_matches(selector, *candidate, abstract_element.element(), *owner_style_sheet, shadow_host, rule_root, outer_root)) {
                     root = candidate;
                     break;
                 }
@@ -292,7 +301,7 @@ static Optional<ResolvedScope> resolve_single_scope(DOM::AbstractElement abstrac
         root = [&] -> GC::Ptr<DOM::Element const> {
             // If no <scope-start> is specified, the scoping root is the parent element of the owner node of the
             // stylesheet where the @scope rule is defined.
-            if (auto* owner_node = const_cast<CSSStyleSheet&>(*rule.sheet).owner_node()) {
+            if (auto* owner_node = const_cast<CSSStyleSheet&>(*owner_style_sheet).owner_node()) {
                 if (auto parent = owner_node->parent_element())
                     return parent;
             }
@@ -303,7 +312,7 @@ static Optional<ResolvedScope> resolve_single_scope(DOM::AbstractElement abstrac
                 return rule_root->host();
 
             // Otherwise, the scoping root is the root of the containing node tree.
-            if (auto document = rule.sheet->owning_document())
+            if (auto document = owner_style_sheet->owning_document())
                 return document->document_element();
             return nullptr;
         }();
@@ -321,10 +330,10 @@ static Optional<ResolvedScope> resolve_single_scope(DOM::AbstractElement abstrac
     // Finding any scoping limits
     // For each scope created by a scoping root, its scoping limits are set to all elements that are descendants of
     // the scoping root and that match <scope-end>, interpreting :scope and & exactly as in scoped style rules.
-    if (scope_rule.end_selectors_for_matching().has_value()) {
+    if (scope_end_selectors_for_matching(scope_rule).has_value()) {
         for (auto const* candidate = &abstract_element.element(); candidate; candidate = candidate->parent_element().ptr()) {
-            for (auto const& selector : *scope_rule.end_selectors_for_matching()) {
-                if (scope_selector_matches(selector, *candidate, abstract_element.element(), rule, shadow_host, rule_root, root))
+            for (auto const& selector : *scope_end_selectors_for_matching(scope_rule)) {
+                if (scope_selector_matches(selector, *candidate, abstract_element.element(), *owner_style_sheet, shadow_host, rule_root, root))
                     return {};
             }
             if (candidate == root)
@@ -335,7 +344,7 @@ static Optional<ResolvedScope> resolve_single_scope(DOM::AbstractElement abstrac
     return ResolvedScope { root, proximity };
 }
 
-static Optional<ResolvedScope> resolve_scope_chain(DOM::AbstractElement abstract_element, MatchingRule const& rule, GC::Ptr<DOM::Element const> shadow_host, GC::Ptr<DOM::ShadowRoot const> rule_root, CSSScopeRule const& scope_rule)
+static Optional<ResolvedScope> resolve_scope_chain(DOM::AbstractElement abstract_element, MatchingRule const& rule, GC::Ptr<DOM::Element const> shadow_host, GC::Ptr<DOM::ShadowRoot const> rule_root, CSSRule const& scope_rule)
 {
     // https://drafts.csswg.org/css-cascade-6/#cascade-proximity
     // Scope Proximity
@@ -343,7 +352,7 @@ static Optional<ResolvedScope> resolve_scope_chain(DOM::AbstractElement abstract
     // the fewest generational or sibling-element hops between the scoping root and the scoped style rule subject wins.
     // For this purpose, style rules without a scoping root are considered to have infinite proximity hops.
     GC::Ptr<DOM::Element const> outer_root;
-    if (auto ancestor_scope_rule = scope_rule.nearest_ancestor_scope_rule()) {
+    if (auto ancestor_scope_rule = nearest_ancestor_scope_rule_for_matching(scope_rule)) {
         auto resolved_ancestor_scope = resolve_scope_chain(abstract_element, rule, shadow_host, rule_root, *ancestor_scope_rule);
         if (!resolved_ancestor_scope.has_value())
             return {};
@@ -351,7 +360,7 @@ static Optional<ResolvedScope> resolve_scope_chain(DOM::AbstractElement abstract
         outer_root = resolved_ancestor_scope->root;
     }
 
-    return resolve_single_scope(abstract_element, rule, shadow_host, rule_root, scope_rule, outer_root);
+    return resolve_single_scope(abstract_element, shadow_host, rule_root, scope_rule, outer_root);
 }
 
 static Optional<ResolvedScope> resolve_scope(DOM::AbstractElement abstract_element, MatchingRule const& rule, GC::Ptr<DOM::Element const> shadow_host, GC::Ptr<DOM::ShadowRoot const> rule_root)
@@ -1488,6 +1497,436 @@ StyleComputer::MatchingRuleSet StyleComputer::build_matching_rule_set(DOM::Abstr
     return matching_rule_set;
 }
 
+static bool custom_property_inherits(DOM::Document const& document, FlyString const& name)
+{
+    // A custom property inherits unless it has been registered with an explicit `inherits: false`.
+    auto registration = document.get_registered_custom_property(name);
+    return !registration.has_value() || registration->inherit;
+}
+
+enum class IsCustomProperty : u8 {
+    No,
+    Yes,
+};
+
+enum class Inherits : u8 {
+    No,
+    Yes,
+};
+
+enum class NameIsValid : u8 {
+    No,
+    Yes,
+};
+
+enum class IsValid : u8 {
+    No,
+    Yes,
+};
+
+static JsonObject serialize_devtools_style_declaration(
+    String name,
+    String value,
+    Important important,
+    IsCustomProperty is_custom_property,
+    Inherits inherits,
+    NameIsValid is_name_valid,
+    IsValid is_valid)
+{
+    JsonObject serialized_property;
+    serialized_property.set("name"sv, move(name));
+    serialized_property.set("value"sv, move(value));
+    serialized_property.set("priority"sv, important == Important::Yes ? "important"sv : ""sv);
+    serialized_property.set("isCustomProperty"sv, is_custom_property == IsCustomProperty::Yes);
+    serialized_property.set("inherits"sv, inherits == Inherits::Yes);
+    serialized_property.set("isNameValid"sv, is_name_valid == NameIsValid::Yes);
+    serialized_property.set("isValid"sv, is_valid == IsValid::Yes);
+    return serialized_property;
+}
+
+static JsonArray serialize_devtools_style_declarations(DOM::Document const& document, CSSStyleProperties const& declaration)
+{
+    JsonArray declarations;
+
+    auto serialize_property = [&](String name, StyleProperty const& property, IsCustomProperty is_custom_property, Inherits inherits) {
+        declarations.must_append(serialize_devtools_style_declaration(
+            move(name),
+            property.value->to_string(SerializationMode::Normal),
+            property.important,
+            is_custom_property,
+            inherits,
+            NameIsValid::Yes,
+            IsValid::Yes));
+    };
+
+    for (auto const& property : declaration.properties()) {
+        serialize_property(
+            string_from_property_id(property.property_id).to_string(),
+            property,
+            IsCustomProperty::No,
+            is_inherited_property(property.property_id) ? Inherits::Yes : Inherits::No);
+    }
+
+    for (auto const& custom_property : declaration.custom_properties())
+        serialize_property(
+            custom_property.key.to_string(),
+            custom_property.value,
+            IsCustomProperty::Yes,
+            custom_property_inherits(document, custom_property.key) ? Inherits::Yes : Inherits::No);
+
+    return declarations;
+}
+
+static JsonArray serialize_devtools_style_declarations(DOM::Document const& document, Vector<Parser::DevToolsStyleDeclaration> const& declarations)
+{
+    JsonArray serialized_declarations;
+
+    for (auto const& declaration : declarations) {
+        bool inherits = declaration.is_custom_property
+            ? custom_property_inherits(document, declaration.name)
+            : PropertyNameAndID::from_name(declaration.name)
+                  .map([](auto const& property) { return !property.is_custom_property() && is_inherited_property(property.id()); })
+                  .value_or(false);
+
+        serialized_declarations.must_append(serialize_devtools_style_declaration(
+            declaration.name.to_string(),
+            declaration.value,
+            declaration.important,
+            declaration.is_custom_property ? IsCustomProperty::Yes : IsCustomProperty::No,
+            inherits ? Inherits::Yes : Inherits::No,
+            declaration.is_name_valid ? NameIsValid::Yes : NameIsValid::No,
+            declaration.is_valid ? IsValid::Yes : IsValid::No));
+    }
+
+    return serialized_declarations;
+}
+
+static Vector<Parser::DevToolsStyleDeclaration> parse_devtools_style_declarations(DOM::Document const& document, StringView declaration_block)
+{
+    return Parser::parse_css_declaration_block_for_devtools(Parser::ParsingParams(document), declaration_block);
+}
+
+static Optional<size_t> source_offset_for_line_and_column(StringView source, SourcePosition const& position)
+{
+    size_t line = 0;
+    size_t column = 0;
+
+    Utf8View source_code_points { source };
+    for (auto it = source_code_points.begin(); it != source_code_points.end();) {
+        auto offset = source_code_points.byte_offset_of(it);
+        if (line == position.line && column == position.column)
+            return offset;
+
+        auto code_point = *it;
+        ++it;
+
+        if (code_point == '\r') {
+            if (offset + 1 < source.length() && source[offset + 1] == '\n')
+                ++it;
+            ++line;
+            column = 0;
+        } else if (code_point == '\n' || code_point == '\f') {
+            ++line;
+            column = 0;
+        } else {
+            ++column;
+        }
+    }
+
+    if (line == position.line && column == position.column)
+        return source.length();
+
+    return {};
+}
+
+static Optional<String> extract_css_declaration_block_from_source(CSSRule const& rule)
+{
+    if (rule.type() != CSSRule::Type::Style)
+        return {};
+
+    auto const* style_sheet = rule.parent_style_sheet();
+    if (!style_sheet)
+        return {};
+
+    auto const source_text = style_sheet->source_text();
+    if (!source_text.has_value())
+        return {};
+
+    auto const& source = *source_text;
+    auto source_view = source.bytes_as_string_view();
+    auto const& source_location = rule.source_location();
+    if (!source_location.has_value())
+        return {};
+
+    auto maybe_offset = source_offset_for_line_and_column(source_view, *source_location);
+    if (!maybe_offset.has_value())
+        return {};
+
+    Optional<u8> string_quote;
+    bool in_comment = false;
+    bool escaped = false;
+    Optional<size_t> block_start;
+    size_t block_depth = 0;
+
+    for (size_t offset = *maybe_offset; offset < source_view.length(); ++offset) {
+        auto ch = source_view[offset];
+        auto next_ch = offset + 1 < source_view.length() ? source_view[offset + 1] : '\0';
+
+        if (in_comment) {
+            if (ch == '*' && next_ch == '/') {
+                in_comment = false;
+                ++offset;
+            }
+            continue;
+        }
+
+        if (string_quote.has_value()) {
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            if (ch == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (ch == *string_quote)
+                string_quote = {};
+            continue;
+        }
+
+        if (ch == '/' && next_ch == '*') {
+            in_comment = true;
+            ++offset;
+            continue;
+        }
+
+        if (ch == '"' || ch == '\'') {
+            string_quote = ch;
+            continue;
+        }
+
+        if (ch == '{') {
+            if (!block_start.has_value())
+                block_start = offset + 1;
+            ++block_depth;
+            continue;
+        }
+
+        if (ch == '}' && block_start.has_value()) {
+            VERIFY(block_depth > 0);
+            --block_depth;
+            if (block_depth == 0)
+                return MUST(String::from_utf8(source_view.substring_view(*block_start, offset - *block_start)));
+        }
+    }
+
+    return {};
+}
+
+static bool has_inherited_declaration(DOM::Document const& document, CSSStyleProperties const& declaration)
+{
+    if (any_of(declaration.properties(), [](auto const& property) {
+            return CSS::is_inherited_property(property.property_id);
+        })) {
+        return true;
+    }
+
+    return any_of(declaration.custom_properties(), [&](auto const& custom_property) {
+        return custom_property_inherits(document, custom_property.key);
+    });
+}
+
+static JsonArray serialize_devtools_selectors(MatchingRule const& rule)
+{
+    JsonArray selectors;
+    for (auto const& selector : rule.absolutized_selectors())
+        selectors.must_append(selector->serialize());
+    return selectors;
+}
+
+static JsonArray serialize_devtools_selector_specificities(MatchingRule const& rule)
+{
+    JsonArray specificities;
+    for (auto const& selector : rule.absolutized_selectors())
+        specificities.must_append(selector->specificity());
+    return specificities;
+}
+
+static JsonObject serialize_devtools_style_sheet_identifier(StyleSheetIdentifier const& identifier)
+{
+    JsonObject serialized_identifier;
+    serialized_identifier.set("type"sv, style_sheet_identifier_type_to_string(identifier.type));
+    if (identifier.dom_element_unique_id.has_value())
+        serialized_identifier.set("domElementUniqueId"sv, identifier.dom_element_unique_id->value());
+    if (identifier.url.has_value())
+        serialized_identifier.set("url"sv, *identifier.url);
+    serialized_identifier.set("ruleCount"sv, identifier.rule_count);
+    return serialized_identifier;
+}
+
+static Optional<StyleSheetIdentifier> devtools_style_sheet_identifier_for_matching_rule(MatchingRule const& rule)
+{
+    if (rule.cascade_origin == CascadeOrigin::User) {
+        return StyleSheetIdentifier {
+            .type = StyleSheetIdentifier::Type::UserStyle,
+        };
+    }
+
+    if (rule.cascade_origin == CascadeOrigin::UserAgent) {
+        if (!rule.sheet)
+            return {};
+        return StyleScope::user_agent_style_sheet_identifier(*rule.sheet);
+    }
+
+    if (auto const* style_sheet = rule.rule->parent_style_sheet())
+        return style_sheet_identifier_for(*style_sheet);
+
+    return {};
+}
+
+static JsonObject serialize_devtools_matching_rule(DOM::Document const& document, MatchingRule const& rule)
+{
+    auto const& declaration = rule.declaration();
+    auto authored_text = extract_css_declaration_block_from_source(*rule.rule);
+
+    JsonArray matched_selector_indexes;
+    matched_selector_indexes.must_append(rule.selector_index);
+
+    JsonObject serialized_rule;
+    serialized_rule.set("type"sv, to_underlying(rule.rule->type()));
+    serialized_rule.set("className"sv, rule.rule->type() == CSSRule::Type::Style ? "CSSStyleRule"sv : "CSSNestedDeclarations"sv);
+    serialized_rule.set("selectors"sv, serialize_devtools_selectors(rule));
+    serialized_rule.set("selectorsSpecificity"sv, serialize_devtools_selector_specificities(rule));
+    serialized_rule.set("matchedSelectorIndexes"sv, move(matched_selector_indexes));
+    serialized_rule.set("cssText"sv, rule.rule->css_text());
+    if (authored_text.has_value()) {
+        serialized_rule.set("authoredText"sv, *authored_text);
+        serialized_rule.set("declarations"sv, serialize_devtools_style_declarations(document, parse_devtools_style_declarations(document, authored_text->bytes_as_string_view())));
+    } else {
+        serialized_rule.set("authoredText"sv, declaration.serialized());
+        serialized_rule.set("declarations"sv, serialize_devtools_style_declarations(document, declaration));
+    }
+    serialized_rule.set("styleSheetIndex"sv, rule.style_sheet_index);
+    serialized_rule.set("ruleIndex"sv, rule.rule_index);
+    serialized_rule.set("isSystem"sv, rule.cascade_origin == CascadeOrigin::UserAgent);
+
+    if (auto const& source_location = rule.rule->source_location(); source_location.has_value()) {
+        // Our positions are 0-based, but DevTools expects them to be 1-based.
+        serialized_rule.set("line"sv, source_location->line + 1);
+        serialized_rule.set("column"sv, source_location->column + 1);
+    }
+
+    if (auto identifier = devtools_style_sheet_identifier_for_matching_rule(rule); identifier.has_value())
+        serialized_rule.set("styleSheet"sv, serialize_devtools_style_sheet_identifier(identifier.release_value()));
+
+    return serialized_rule;
+}
+
+static JsonObject serialize_devtools_inline_style(DOM::Document const& document, DOM::AbstractElement abstract_element, CSSStyleProperties const& declaration)
+{
+    auto authored_text = abstract_element.element().get_attribute(HTML::AttributeNames::style);
+
+    JsonObject serialized_rule;
+    serialized_rule.set("type"sv, 100);
+    serialized_rule.set("className"sv, 100);
+    serialized_rule.set("cssText"sv, declaration.serialized());
+    if (authored_text.has_value()) {
+        serialized_rule.set("authoredText"sv, *authored_text);
+        serialized_rule.set("declarations"sv, serialize_devtools_style_declarations(document, parse_devtools_style_declarations(document, authored_text->bytes_as_string_view())));
+    } else {
+        serialized_rule.set("authoredText"sv, declaration.serialized());
+        serialized_rule.set("declarations"sv, serialize_devtools_style_declarations(document, declaration));
+    }
+    serialized_rule.set("isSystem"sv, false);
+    serialized_rule.set("nodeId"sv, abstract_element.element().unique_id().value());
+    return serialized_rule;
+}
+
+static void append_devtools_applied_style_entry(JsonArray& entries, JsonObject rule, Optional<UniqueNodeID> inherited_node_id = {})
+{
+    JsonObject entry;
+
+    JsonValue matched_selector_indexes { JsonArray {} };
+    if (auto value = rule.get("matchedSelectorIndexes"sv); value.has_value())
+        matched_selector_indexes = *value;
+    rule.remove("matchedSelectorIndexes"sv);
+    auto is_system = rule.get_bool("isSystem"sv).value_or(false);
+
+    entry.set("rule"sv, move(rule));
+    entry.set("isSystem"sv, is_system);
+    entry.set("matchedSelectorIndexes"sv, move(matched_selector_indexes));
+    if (inherited_node_id.has_value())
+        entry.set("inheritedNodeId"sv, inherited_node_id->value());
+    else
+        entry.set("inherited"sv, JsonValue {});
+
+    entries.must_append(move(entry));
+}
+
+static void append_devtools_rules_for_element(DOM::Document const& document, JsonArray& entries, auto const& matching_rule_set, bool include_user_agent_styles, Optional<UniqueNodeID> inherited_node_id = {})
+{
+    auto should_include_rule = [&](MatchingRule const& rule) {
+        return !inherited_node_id.has_value() || has_inherited_declaration(document, rule.declaration());
+    };
+
+    auto append_rules = [&](auto const& matching_rules) {
+        for (auto const& matching_rule : matching_rules.in_reverse()) {
+            auto const& rule = *matching_rule.rule;
+            if (!should_include_rule(rule))
+                continue;
+            append_devtools_applied_style_entry(entries, serialize_devtools_matching_rule(document, rule), inherited_node_id);
+        }
+    };
+
+    for (auto const& context : matching_rule_set.author_contexts.in_reverse()) {
+        for (auto const& layer : context.author_rules.in_reverse())
+            append_rules(layer.rules);
+    }
+    append_rules(matching_rule_set.user_rules);
+    if (include_user_agent_styles)
+        append_rules(matching_rule_set.user_agent_rules);
+}
+
+JsonArray StyleComputer::collect_devtools_applied_style_rules(DOM::AbstractElement abstract_element, bool include_inherited, bool include_user_agent_styles)
+{
+    JsonArray entries;
+
+    auto append_rules_for_abstract_element = [&](DOM::AbstractElement current_element, Optional<UniqueNodeID> inherited_node_id) {
+        if (auto inline_style = current_element.inline_style()) {
+            if (!inherited_node_id.has_value() || has_inherited_declaration(m_document, *inline_style))
+                append_devtools_applied_style_entry(entries, serialize_devtools_inline_style(m_document, current_element, *inline_style), inherited_node_id);
+        }
+
+        auto const first_ancestor = [&] -> GC::Ptr<DOM::Element const> {
+            if (current_element.pseudo_element().has_value())
+                return &current_element.element();
+            return current_element.element().parent_or_shadow_host_element();
+        }();
+
+        for (auto ancestor = first_ancestor; ancestor; ancestor = ancestor->parent_or_shadow_host_element())
+            push_ancestor(*ancestor);
+
+        ScopeGuard pop_ancestors = [&] {
+            for (auto ancestor = first_ancestor; ancestor; ancestor = ancestor->parent_or_shadow_host_element())
+                pop_ancestor(*ancestor);
+        };
+
+        bool did_match_any_pseudo_element_rules = false;
+        auto matching_rule_set = build_matching_rule_set(current_element, did_match_any_pseudo_element_rules, ComputeStyleMode::Normal);
+        append_devtools_rules_for_element(m_document, entries, matching_rule_set, include_user_agent_styles, inherited_node_id);
+    };
+
+    append_rules_for_abstract_element(abstract_element, {});
+
+    if (!include_inherited)
+        return entries;
+
+    for (auto current_element = abstract_element.element_to_inherit_style_from(); current_element.has_value(); current_element = current_element->element_to_inherit_style_from())
+        append_rules_for_abstract_element(*current_element, current_element->element().unique_id());
+
+    return entries;
+}
+
 // https://www.w3.org/TR/css-cascade/#cascading
 // https://drafts.csswg.org/css-cascade-5/#layering
 GC::Ref<CascadedProperties> StyleComputer::compute_cascaded_values(DOM::AbstractElement abstract_element, bool did_match_any_pseudo_element_rules, ComputeStyleMode mode, MatchingRuleSet const& matching_rule_set) const
@@ -2197,9 +2636,9 @@ GC::Ptr<ComputedProperties> StyleComputer::compute_style_impl(DOM::AbstractEleme
     if (did_change_custom_properties.has_value()) {
         auto new_custom_property_data = abstract_element.custom_property_data();
         if (old_custom_property_data.ptr() != new_custom_property_data.ptr()) {
-            static OrderedHashMap<FlyString, StyleProperty> const empty_own_values;
-            auto const& old_own = old_custom_property_data ? old_custom_property_data->own_values() : empty_own_values;
-            auto const& new_own = new_custom_property_data ? new_custom_property_data->own_values() : empty_own_values;
+            static NeverDestroyed<OrderedHashMap<FlyString, StyleProperty>> empty_own_values;
+            auto const& old_own = old_custom_property_data ? old_custom_property_data->own_values() : *empty_own_values;
+            auto const& new_own = new_custom_property_data ? new_custom_property_data->own_values() : *empty_own_values;
             if (old_own != new_own)
                 *did_change_custom_properties = true;
         }
@@ -2235,8 +2674,8 @@ RefPtr<StyleValue const> StyleComputer::recascade_font_size_if_needed(DOM::Abstr
 
     // FIXME: This should be configurable.
     constexpr CSSPixels default_monospace_font_size_in_px = 13;
-    static auto monospace_font_family_name = Platform::FontPlugin::the().generic_font_name(Platform::GenericFont::Monospace, 400, 0);
-    static auto monospace_font = Gfx::FontDatabase::the().get(monospace_font_family_name, default_monospace_font_size_in_px * 0.75f, 400, Gfx::FontWidth::Normal, 0);
+    static auto const& monospace_font_family_name = *new String(Platform::FontPlugin::the().generic_font_name(Platform::GenericFont::Monospace, 400, 0));
+    static auto const& monospace_font = Gfx::FontDatabase::the().get(monospace_font_family_name, default_monospace_font_size_in_px * 0.75f, 400, Gfx::FontWidth::Normal, 0).release_nonnull().leak_ref();
 
     // Reconstruct the line of ancestor elements we need to inherit style from, and then do the cascade again
     // but only for the font-size property.
@@ -2305,7 +2744,7 @@ RefPtr<StyleValue const> StyleComputer::recascade_font_size_if_needed(DOM::Abstr
         bool did_resolve_viewport_relative_length = false;
         Length::ResolutionContext resolution_context {
             .viewport_rect = viewport_rect(),
-            .font_metrics = { current_size_in_px, monospace_font->with_size(current_size_in_px * 0.75f)->pixel_metrics(), inherited_line_height },
+            .font_metrics = { current_size_in_px, monospace_font.with_size(current_size_in_px * 0.75f)->pixel_metrics(), inherited_line_height },
             .root_font_metrics = m_root_element_font_metrics,
             .font_metrics_depend_on_viewport_metrics = current_size_depends_on_viewport_metrics || inherited_font_metrics_depend_on_viewport_metrics,
             .root_font_metrics_depend_on_viewport_metrics = m_root_element_font_metrics_depend_on_viewport_metrics,
@@ -2864,7 +3303,7 @@ NonnullRefPtr<StyleValue const> StyleComputer::compute_corner_shape(NonnullRefPt
     case Keyword::Round:
         // The corner shape is a quarter of a convex ellipse. Equivalent to superellipse(1).
         // NB: We cache this value since 'round' is the initial value of the `corner-*-*-shape` properties
-        static NonnullRefPtr<StyleValue const> const cached_round_value = SuperellipseStyleValue::create(NumberStyleValue::create(1));
+        static auto const& cached_round_value = SuperellipseStyleValue::create(NumberStyleValue::create(1)).leak_ref();
         return cached_round_value;
     case Keyword::Squircle:
         // The corner shape is a quarter of a "squircle", a convex curve between round and square. Equivalent to superellipse(2).

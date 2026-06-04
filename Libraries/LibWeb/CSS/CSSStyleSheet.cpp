@@ -482,6 +482,15 @@ SelectorInsights const& CSSStyleSheet::selector_insights() const
             return;
         }
 
+        if (rule.type() == CSSRule::Type::Import) {
+            auto const& import_rule = as<CSSImportRule>(rule);
+            if (import_rule.has_scope()) {
+                collect_optional_selector_list(import_rule.scope_start_selectors_for_matching());
+                collect_optional_selector_list(import_rule.scope_end_selectors_for_matching());
+            }
+            return;
+        }
+
         if (rule.type() == CSSRule::Type::Style) {
             collect_selector_list(static_cast<CSSStyleRule const&>(rule).absolutized_selectors());
             return;
@@ -632,16 +641,6 @@ void CSSStyleSheet::recalculate_rule_caches()
             return;
         }
     }
-}
-
-void CSSStyleSheet::set_source_text(String source)
-{
-    m_source_text = move(source);
-}
-
-Optional<String> CSSStyleSheet::source_text(Badge<DOM::Document>) const
-{
-    return m_source_text;
 }
 
 void CSSStyleSheet::add_critical_subresource(Subresource& subresource)

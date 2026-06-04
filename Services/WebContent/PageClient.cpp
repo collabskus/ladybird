@@ -10,6 +10,7 @@
 #include <AK/JsonObjectSerializer.h>
 #include <AK/JsonValue.h>
 #include <AK/Math.h>
+#include <LibCore/Process.h>
 #include <LibCore/Timer.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/ShareableBitmap.h>
@@ -19,6 +20,8 @@
 #include <LibJS/Runtime/ConsoleObject.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/CSS/CSSImportRule.h>
+#include <LibWeb/CSS/StyleScope.h>
+#include <LibWeb/CSS/StyleSheetIdentifier.h>
 #include <LibWeb/CSS/StyleSheetList.h>
 #include <LibWeb/DOM/CharacterData.h>
 #include <LibWeb/DOM/Document.h>
@@ -27,7 +30,6 @@
 #include <LibWeb/DOM/NodeList.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
-#include <LibWeb/HTML/HTMLLinkElement.h>
 #include <LibWeb/HTML/Navigable.h>
 #include <LibWeb/HTML/Scripting/ClassicScript.h>
 #include <LibWeb/HTML/TraversableNavigable.h>
@@ -605,7 +607,7 @@ HTTP::Cookie::VersionedCookie PageClient::page_did_request_cookie(URL::URL const
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestCookie>(m_id, url, source);
     if (!response) {
         dbgln("WebContent client disconnected during DidRequestCookie. Exiting peacefully.");
-        exit(0);
+        Core::Process::terminate_immediately(0);
     }
     return response->take_cookie();
 }
@@ -615,7 +617,7 @@ void PageClient::page_did_set_cookie(URL::URL const& url, HTTP::Cookie::ParsedCo
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidSetCookie>(url, cookie, source);
     if (!response) {
         dbgln("WebContent client disconnected during DidSetCookie. Exiting peacefully.");
-        exit(0);
+        Core::Process::terminate_immediately(0);
     }
 }
 
@@ -647,7 +649,7 @@ bool PageClient::page_did_is_known_hsts_host(String const& domain)
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidIsKnownHstsHost>(domain);
     if (!response) {
         dbgln("WebContent client disconnected during DidIsKnownHstsHost. Exiting peacefully.");
-        exit(0);
+        Core::Process::terminate_immediately(0);
     }
     return response->result();
 }
@@ -657,7 +659,7 @@ Optional<String> PageClient::page_did_request_storage_item(Web::StorageAPI::Stor
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestStorageItem>(storage_endpoint, storage_key, bottle_key);
     if (!response) {
         dbgln("WebContent client disconnected during DidRequestStorageItem. Exiting peacefully.");
-        exit(0);
+        Core::Process::terminate_immediately(0);
     }
     return response->take_value();
 }
@@ -667,7 +669,7 @@ WebView::StorageSetResult PageClient::page_did_set_storage_item(Web::StorageAPI:
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidSetStorageItem>(storage_endpoint, storage_key, bottle_key, value);
     if (!response) {
         dbgln("WebContent client disconnected during DidSetStorageItem. Exiting peacefully.");
-        exit(0);
+        Core::Process::terminate_immediately(0);
     }
     return response->result();
 }
@@ -677,7 +679,7 @@ void PageClient::page_did_remove_storage_item(Web::StorageAPI::StorageEndpointTy
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRemoveStorageItem>(storage_endpoint, storage_key, bottle_key);
     if (!response) {
         dbgln("WebContent client disconnected during DidRemoveStorageItem. Exiting peacefully.");
-        exit(0);
+        Core::Process::terminate_immediately(0);
     }
 }
 
@@ -686,7 +688,7 @@ Vector<String> PageClient::page_did_request_storage_keys(Web::StorageAPI::Storag
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestStorageKeys>(storage_endpoint, storage_key);
     if (!response) {
         dbgln("WebContent client disconnected during DidRequestStorageKeys. Exiting peacefully.");
-        exit(0);
+        Core::Process::terminate_immediately(0);
     }
     return response->take_keys();
 }
@@ -696,7 +698,7 @@ void PageClient::page_did_clear_storage(Web::StorageAPI::StorageEndpointType sto
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidClearStorage>(storage_endpoint, storage_key);
     if (!response) {
         dbgln("WebContent client disconnected during DidClearStorage. Exiting peacefully.");
-        exit(0);
+        Core::Process::terminate_immediately(0);
     }
 }
 
@@ -720,7 +722,7 @@ PageClient::NewWebViewResult PageClient::page_did_request_new_web_view(Web::HTML
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::DidRequestNewWebView>(m_id, activate_tab, hints);
     if (!response) {
         dbgln("WebContent client disconnected during DidRequestNewWebView. Exiting peacefully.");
-        exit(0);
+        Core::Process::terminate_immediately(0);
     }
 
     auto& new_client = m_owner.create_page(response->new_page_id());
@@ -819,7 +821,7 @@ Web::HTML::WorkerAgentId PageClient::start_worker_agent(Web::HTML::WorkerAgentSt
     auto response = client().send_sync_but_allow_failure<Messages::WebContentClient::StartWorkerAgent>(m_id, move(request));
     if (!response) {
         dbgln("WebContent client disconnected during StartWorkerAgent. Exiting peacefully.");
-        exit(0);
+        Core::Process::terminate_immediately(0);
     }
 
     return response->agent_id();
@@ -1042,34 +1044,8 @@ void PageClient::console_peer_did_misbehave(char const* reason)
 
 static void gather_style_sheets(Vector<Web::CSS::StyleSheetIdentifier>& results, Web::CSS::CSSStyleSheet& sheet)
 {
-    Web::CSS::StyleSheetIdentifier identifier {};
-
-    bool valid = true;
-
-    if (sheet.owner_rule()) {
-        identifier.type = Web::CSS::StyleSheetIdentifier::Type::ImportRule;
-    } else if (auto* node = sheet.owner_node()) {
-        if (node->is_html_style_element() || node->is_svg_style_element()) {
-            identifier.type = Web::CSS::StyleSheetIdentifier::Type::StyleElement;
-        } else if (is<Web::HTML::HTMLLinkElement>(node)) {
-            identifier.type = Web::CSS::StyleSheetIdentifier::Type::LinkElement;
-        } else {
-            dbgln("Can't identify where style sheet came from; owner node is {}", node->debug_description());
-            identifier.type = Web::CSS::StyleSheetIdentifier::Type::StyleElement;
-        }
-        identifier.dom_element_unique_id = node->unique_id();
-    } else {
-        dbgln("Style sheet has no owner rule or owner node; skipping");
-        valid = false;
-    }
-
-    if (valid) {
-        if (auto sheet_url = sheet.href(); sheet_url.has_value())
-            identifier.url = sheet_url.release_value();
-
-        identifier.rule_count = sheet.rules().length();
-        results.append(move(identifier));
-    }
+    if (auto identifier = Web::CSS::style_sheet_identifier_for(sheet); identifier.has_value())
+        results.append(identifier.release_value());
 
     for (auto& import_rule : sheet.import_rules()) {
         if (import_rule->loaded_style_sheet()) {
@@ -1102,24 +1078,8 @@ Vector<Web::CSS::StyleSheetIdentifier> PageClient::list_style_sheets() const
         });
     }
 
-    // User-agent
-    results.append({
-        .type = Web::CSS::StyleSheetIdentifier::Type::UserAgent,
-        .url = "CSS/Default.css"_string,
-    });
-    if (document && document->in_quirks_mode()) {
-        results.append({
-            .type = Web::CSS::StyleSheetIdentifier::Type::UserAgent,
-            .url = "CSS/QuirksMode.css"_string,
-        });
-    }
-    results.append({
-        .type = Web::CSS::StyleSheetIdentifier::Type::UserAgent,
-        .url = "MathML/Default.css"_string,
-    });
-    results.append({
-        .type = Web::CSS::StyleSheetIdentifier::Type::UserAgent,
-        .url = "SVG/Default.css"_string,
+    Web::CSS::StyleScope::for_each_user_agent_stylesheet(document && document->in_quirks_mode(), [&](auto&, auto const& identifier) {
+        results.append(identifier);
     });
 
     return results;

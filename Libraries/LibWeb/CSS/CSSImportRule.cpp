@@ -14,6 +14,7 @@
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/CSS/CSSImportRule.h>
 #include <LibWeb/CSS/CSSLayerBlockRule.h>
+#include <LibWeb/CSS/CSSScopeRule.h>
 #include <LibWeb/CSS/Fetch.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/StyleComputer.h>
@@ -28,16 +29,17 @@ namespace Web::CSS {
 
 GC_DEFINE_ALLOCATOR(CSSImportRule);
 
-GC::Ref<CSSImportRule> CSSImportRule::create(JS::Realm& realm, URL url, GC::Ptr<DOM::Document> document, Optional<FlyString> layer, RefPtr<Supports> supports, GC::Ref<MediaList> media)
+GC::Ref<CSSImportRule> CSSImportRule::create(JS::Realm& realm, URL url, GC::Ptr<DOM::Document> document, Optional<FlyString> layer, Optional<ImportScope>&& scope, RefPtr<Supports> supports, GC::Ref<MediaList> media)
 {
-    return realm.create<CSSImportRule>(realm, move(url), document, move(layer), move(supports), move(media));
+    return realm.create<CSSImportRule>(realm, move(url), document, move(layer), move(scope), move(supports), move(media));
 }
 
-CSSImportRule::CSSImportRule(JS::Realm& realm, URL url, GC::Ptr<DOM::Document> document, Optional<FlyString> layer, RefPtr<Supports> supports, GC::Ref<MediaList> media)
+CSSImportRule::CSSImportRule(JS::Realm& realm, URL url, GC::Ptr<DOM::Document> document, Optional<FlyString> layer, Optional<ImportScope>&& scope, RefPtr<Supports> supports, GC::Ref<MediaList> media)
     : CSSRule(realm, Type::Import)
     , m_url(move(url))
     , m_document(document)
     , m_layer(move(layer))
+    , m_scope(move(scope))
     , m_supports(move(supports))
     , m_media(move(media))
 {
@@ -105,6 +107,26 @@ String CSSImportRule::serialized() const
             builder.append(" layer"sv);
         } else {
             builder.appendff(" layer({})", m_layer);
+        }
+    }
+
+    // AD-HOC: Serialize the rule's import scope if it exists.
+    if (m_scope.has_value()) {
+        builder.append(" scope"sv);
+        if (m_scope->start_selectors.has_value() || m_scope->end_selectors.has_value()) {
+            builder.append('(');
+            if (m_scope->start_selectors.has_value()) {
+                if (m_scope->end_selectors.has_value())
+                    builder.appendff("({})", serialize_a_group_of_selectors(*m_scope->start_selectors));
+                else
+                    builder.append(serialize_a_group_of_selectors(*m_scope->start_selectors));
+            }
+            if (m_scope->end_selectors.has_value()) {
+                if (m_scope->start_selectors.has_value())
+                    builder.append(' ');
+                builder.appendff("to ({})", serialize_a_group_of_selectors(*m_scope->end_selectors));
+            }
+            builder.append(')');
         }
     }
 
@@ -262,6 +284,40 @@ Optional<String> CSSImportRule::supports_text() const
     return m_supports->to_string();
 }
 
+Optional<SelectorList> const& CSSImportRule::scope_start_selectors() const
+{
+    VERIFY(m_scope.has_value());
+    return m_scope->start_selectors;
+}
+
+Optional<SelectorList> const& CSSImportRule::scope_end_selectors() const
+{
+    VERIFY(m_scope.has_value());
+    return m_scope->end_selectors;
+}
+
+Optional<SelectorList> const& CSSImportRule::scope_start_selectors_for_matching() const
+{
+    VERIFY(m_scope.has_value());
+    if (!m_scope->start_selectors.has_value())
+        return m_scope->start_selectors;
+
+    if (!m_cached_scope_start_selectors_for_matching.has_value())
+        m_cached_scope_start_selectors_for_matching = absolutize_selectors_relative_to(*m_scope->start_selectors, nullptr);
+    return m_cached_scope_start_selectors_for_matching;
+}
+
+Optional<SelectorList> const& CSSImportRule::scope_end_selectors_for_matching() const
+{
+    VERIFY(m_scope.has_value());
+    if (!m_scope->end_selectors.has_value())
+        return m_scope->end_selectors;
+
+    if (!m_cached_scope_end_selectors_for_matching.has_value())
+        m_cached_scope_end_selectors_for_matching = adapt_scope_end_selectors_for_matching(*m_scope->end_selectors);
+    return m_cached_scope_end_selectors_for_matching;
+}
+
 Optional<FlyString> CSSImportRule::internal_qualified_layer_name(Badge<StyleScope>) const
 {
     if (!m_layer.has_value())
@@ -278,6 +334,13 @@ bool CSSImportRule::matches() const
     if (m_supports && !m_supports->matches())
         return false;
     return m_media->matches();
+}
+
+void CSSImportRule::clear_caches()
+{
+    Base::clear_caches();
+    m_cached_scope_start_selectors_for_matching.clear();
+    m_cached_scope_end_selectors_for_matching.clear();
 }
 
 void CSSImportRule::dump(StringBuilder& builder, int indent_levels) const
@@ -300,6 +363,23 @@ void CSSImportRule::dump(StringBuilder& builder, int indent_levels) const
 
     if (m_supports)
         m_supports->dump(builder, indent_levels + 1);
+
+    if (m_scope.has_value()) {
+        dump_indent(builder, indent_levels + 1);
+        builder.append("Scope:\n"sv);
+
+        dump_indent(builder, indent_levels + 2);
+        if (m_scope->start_selectors.has_value())
+            builder.appendff("Start selectors: {}\n", serialize_a_group_of_selectors(*m_scope->start_selectors));
+        else
+            builder.append("Start selectors: <none>\n"sv);
+
+        dump_indent(builder, indent_levels + 2);
+        if (m_scope->end_selectors.has_value())
+            builder.appendff("End selectors: {}\n", serialize_a_group_of_selectors(*m_scope->end_selectors));
+        else
+            builder.append("End selectors: <none>\n"sv);
+    }
 
     if (m_style_sheet) {
         dump_sheet(builder, *m_style_sheet, indent_levels + 1);
