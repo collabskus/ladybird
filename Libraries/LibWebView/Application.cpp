@@ -68,11 +68,6 @@ struct ApplicationSettingsObserver final : public SettingsObserver {
         Application::the().tab_settings_changed({});
     }
 
-    virtual void show_bookmarks_bar_changed() override
-    {
-        Application::the().show_bookmarks_bar_changed({});
-    }
-
     virtual void browsing_data_settings_changed() override
     {
         auto const& browsing_data_settings = Application::settings().browsing_data_settings();
@@ -1391,6 +1386,11 @@ void Application::initialize_actions()
     });
     update_vertical_tabs_action();
 
+    m_toggle_menu_bar_action = Action::create_checkable("Show Menubar"sv, ActionID::ToggleMenuBar, [this]() {
+        m_settings.set_show_menu_bar(!m_settings.show_menu_bar());
+    });
+    m_toggle_menu_bar_action->set_checked(m_settings.show_menu_bar());
+
     m_bookmarks_menu = Menu::create("Bookmarks"sv);
     m_bookmarks_menu->add_action(Action::create("Manage Bookmarks"sv, ActionID::ManageBookmarks, [this]() {
         open_url_in_new_tab(URL::about_bookmarks(), Web::HTML::ActivateTab::Yes);
@@ -1410,11 +1410,11 @@ void Application::initialize_actions()
     m_bookmarks_menu->add_action(*m_toggle_bookmark_action);
     update_bookmark_action_for_current_web_view();
 
-    m_toggle_bookmark_bar_action = Action::create("Toggle Bookmarks Bar"sv, ActionID::ToggleBookmarksBar, [this]() {
+    m_toggle_bookmark_bar_action = Action::create_checkable("Show Bookmarks Bar"sv, ActionID::ToggleBookmarksBar, [this]() {
         m_settings.set_show_bookmarks_bar(!m_settings.show_bookmarks_bar());
     });
+    m_toggle_bookmark_bar_action->set_checked(m_settings.show_bookmarks_bar());
     m_bookmarks_menu->add_action(*m_toggle_bookmark_bar_action);
-    update_bookmarks_bar_action();
 
     m_bookmarks_menu->add_separator();
     m_bookmarks_menu_static_size = m_bookmarks_menu->size();
@@ -1646,17 +1646,6 @@ void Application::bookmarks_changed(Badge<ApplicationBookmarkStoreObserver>)
     m_bookmarks_menu->shrink(m_bookmarks_menu_static_size);
     create_bookmark_menu_items();
     rebuild_bookmarks_menu();
-}
-
-void Application::update_bookmarks_bar_action()
-{
-    m_toggle_bookmark_bar_action->set_text(m_settings.show_bookmarks_bar() ? "Hide Bookmark Bar"sv : "Show Bookmark Bar"sv);
-}
-
-void Application::show_bookmarks_bar_changed(Badge<ApplicationSettingsObserver>)
-{
-    update_bookmarks_bar_action();
-    update_bookmarks_bar_display(m_settings.show_bookmarks_bar());
 }
 
 void Application::create_bookmark_menu_items(Optional<MenuData> data)
