@@ -146,29 +146,19 @@ Optional<Color> KeywordStyleValue::to_color(ColorResolutionContext color_resolut
 
     PreferredColorScheme scheme = color_resolution_context.color_scheme.value_or(PreferredColorScheme::Light);
 
-    // Calculate accent_color_text based on contrast to accent_color
-    if (keyword() == Keyword::Accentcolortext) {
-        // min_contrast = 10.2 is a magic number which provides the best accessibility trade-off based on:
-        // 1. https://webaim.org/resources/contrastchecker/
-        // 2. Current implementation of luminosity() and contrast_ratio() methods for Color instances
-
-        // the baseline colors with the least contrast from black and white are #757575 and #767676
-        // which score over 4.5 ratio for #fff and #000 accent_color_text values correspondingly
-        auto constexpr min_contrast = 10.2;
-        auto system_accent_text = SystemColor::accent_color_text(scheme);
-
-        if (color_resolution_context.accent_color.value_or(SystemColor::accent_color(scheme)).contrast_ratio(system_accent_text) < min_contrast)
-            return system_accent_text.inverted();
-
-        return system_accent_text;
-    }
-
     // First, handle <system-color>s, since they don't strictly require a node.
     // https://www.w3.org/TR/css-color-4/#css-system-colors
     // https://www.w3.org/TR/css-color-4/#deprecated-system-colors
     switch (keyword()) {
+    // AD-HOC: The spec says that 'accentcolor' and 'accentcolortext' should be resolved based on the value of the
+    //         'accent-color' property, but this isn't implemented by any other browsers and isn't fully specified
+    //          (https://github.com/w3c/csswg-drafts/issues/10971).
     case Keyword::Accentcolor:
-        return color_resolution_context.accent_color.value_or(SystemColor::accent_color(scheme));
+        return SystemColor::accent_color(scheme);
+    case Keyword::Accentcolortext:
+        return SystemColor::accent_color_text(scheme);
+    case Keyword::Activetext:
+        return SystemColor::active_text(scheme);
     case Keyword::Buttonborder:
     case Keyword::Activeborder:
     case Keyword::Inactiveborder:
@@ -224,6 +214,11 @@ Optional<Color> KeywordStyleValue::to_color(ColorResolutionContext color_resolut
         return SystemColor::button_face(scheme).with_alpha(128);
     case Keyword::LibwebButtonfacehover:
         return SystemColor::button_face(scheme).darkened(0.8f);
+    case Keyword::LibwebLink:
+    case Keyword::Linktext:
+        return SystemColor::link_text(scheme);
+    case Keyword::Visitedtext:
+        return SystemColor::visited_text(scheme);
     default:
         break;
     }
@@ -231,18 +226,6 @@ Optional<Color> KeywordStyleValue::to_color(ColorResolutionContext color_resolut
     if (!color_resolution_context.document) {
         // FIXME: Can't resolve palette colors without a document.
         return Color::Black;
-    }
-
-    switch (keyword()) {
-    case Keyword::LibwebLink:
-    case Keyword::Linktext:
-        return color_resolution_context.document->normal_link_color().value_or(SystemColor::link_text(scheme));
-    case Keyword::Visitedtext:
-        return color_resolution_context.document->visited_link_color().value_or(SystemColor::visited_text(scheme));
-    case Keyword::Activetext:
-        return color_resolution_context.document->active_link_color().value_or(SystemColor::active_text(scheme));
-    default:
-        break;
     }
 
     auto palette = color_resolution_context.document->page().palette();
