@@ -11,6 +11,7 @@
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
 #include <AK/kmalloc.h>
+#include <LibCore/EventLoop.h>
 #include <LibGC/DeferGC.h>
 #include <LibJS/Bytecode/ClassBlueprint.h>
 #include <LibJS/Bytecode/Debug.h>
@@ -40,10 +41,9 @@ namespace JS::RustIntegration {
 
 // --- Shared helpers ---
 
-// Bytecode cache materialization rebuilds executables from disk, which is untrusted input. Materialization paths flip
-// this flag for the duration of their work so that the in-process bytecode validator runs even in release builds; the
-// normal Rust pipeline path leaves it off and keeps the existing debug/sanitizer-only behavior.
-static thread_local bool s_validate_materialized_bytecode_cache_executables = false;
+// Bytecode cache blobs are validated before rebuilding Executables. Materialization paths flip this flag for the
+// duration of their work so rust_create_executable() does not run the same validator again.
+static thread_local bool s_skip_bytecode_validation_for_prevalidated_cache = false;
 
 static Utf16View utf16_view_from_bytes(uint16_t const* data, size_t len)
 {
@@ -383,11 +383,6 @@ static void collect_builtin_function(void* ctx, void* sfd_ptr, uint16_t const*, 
 
 // --- Compile functions ---
 
-bool rust_pipeline_available()
-{
-    return true;
-}
-
 ParsedProgram* parse_program(u16 const* utf16_data, size_t length_in_code_units, ProgramType type, size_t line_number_offset)
 {
     return rust_parse_program(utf16_data, length_in_code_units, static_cast<u8>(type), line_number_offset, g_dump_ast, g_dump_ast_use_color);
@@ -429,25 +424,44 @@ ByteBuffer serialize_compiled_program_for_bytecode_cache(CompiledProgram const& 
     return bytes;
 }
 
+struct BytecodeCacheBlobOwner {
+    Core::ImmutableBytes bytes;
+    Core::EventLoop* event_loop { nullptr };
+};
+
 static void free_bytecode_cache_blob_owner(void* owner)
 {
-    delete static_cast<Core::ImmutableBytes*>(owner);
+    auto owner_ptr = adopt_own_if_nonnull(static_cast<BytecodeCacheBlobOwner*>(owner));
+    if (!owner_ptr)
+        return;
+
+    if (owner_ptr->event_loop) {
+        owner_ptr->event_loop->deferred_invoke([owner = move(owner_ptr)] { (void)owner; });
+        return;
+    }
 }
 
 static void* clone_bytecode_cache_blob_owner(void const* owner)
 {
-    return new Core::ImmutableBytes(*static_cast<Core::ImmutableBytes const*>(owner));
+    auto const& existing_owner = *static_cast<BytecodeCacheBlobOwner const*>(owner);
+    return new Core::ImmutableBytes(existing_owner.bytes);
 }
 
 DecodedBytecodeCacheBlob* decode_bytecode_cache_blob(Core::ImmutableBytes bytes, ProgramType expected_type, ReadonlyBytes source_hash)
 {
-    auto* owner = new Core::ImmutableBytes(move(bytes));
-    return rust_decode_bytecode_cache_blob_with_owner(owner->bytes().data(), owner->bytes().size(), static_cast<u8>(expected_type), source_hash.data(), source_hash.size(), owner, clone_bytecode_cache_blob_owner, free_bytecode_cache_blob_owner);
+    auto* owner = new BytecodeCacheBlobOwner { move(bytes) };
+    return rust_decode_bytecode_cache_blob_with_owner(owner->bytes.bytes().data(), owner->bytes.bytes().size(), static_cast<u8>(expected_type), source_hash.data(), source_hash.size(), owner, clone_bytecode_cache_blob_owner, free_bytecode_cache_blob_owner);
 }
 
-size_t decoded_bytecode_cache_source_length(DecodedBytecodeCacheBlob const* blob)
+DecodedBytecodeCacheBlob* decode_bytecode_cache_blob(Core::ImmutableBytes bytes, ProgramType expected_type, ReadonlyBytes source_hash, Core::EventLoop& event_loop)
 {
-    return rust_decoded_bytecode_cache_source_len(blob);
+    auto* owner = new BytecodeCacheBlobOwner { move(bytes), &event_loop };
+    return rust_decode_bytecode_cache_blob_with_owner(owner->bytes.bytes().data(), owner->bytes.bytes().size(), static_cast<u8>(expected_type), source_hash.data(), source_hash.size(), owner, clone_bytecode_cache_blob_owner, free_bytecode_cache_blob_owner);
+}
+
+bool validate_decoded_bytecode_cache_blob(DecodedBytecodeCacheBlob* blob, size_t source_length)
+{
+    return rust_validate_decoded_bytecode_cache_blob(blob, source_length);
 }
 
 void free_decoded_bytecode_cache_blob(DecodedBytecodeCacheBlob* blob)
@@ -506,7 +520,7 @@ Optional<Result<ScriptResult, Vector<ParserError>>> materialize_bytecode_cache_s
         return {};
 
     GC::DeferGC defer_gc(realm.vm().heap());
-    TemporaryChange validate_cache_executables { s_validate_materialized_bytecode_cache_executables, true };
+    TemporaryChange skip_cache_executable_validation { s_skip_bytecode_validation_for_prevalidated_cache, true };
     ScriptGdiBuilder builder;
 
     void* exec_ptr = rust_materialize_bytecode_cache_script(blob, &realm.vm(), source_code.ptr(), source_code->length_in_code_units(), &builder.shared_function_data, &builder);
@@ -683,7 +697,7 @@ Optional<Result<ModuleResult, Vector<ParserError>>> materialize_bytecode_cache_m
         return {};
 
     GC::DeferGC defer_gc(realm.vm().heap());
-    TemporaryChange validate_cache_executables { s_validate_materialized_bytecode_cache_executables, true };
+    TemporaryChange skip_cache_executable_validation { s_skip_bytecode_validation_for_prevalidated_cache, true };
     ModuleBuilder builder;
     ModuleCallbacks callbacks {
         .set_has_top_level_await = module_set_has_top_level_await,
@@ -741,7 +755,7 @@ GC::Ptr<Bytecode::Executable> try_install_bytecode_cache_script(DecodedBytecodeC
     GC::Root<Bytecode::Executable> executable;
     {
         GC::DeferGC defer_gc(realm.vm().heap());
-        TemporaryChange validate_cache_executables { s_validate_materialized_bytecode_cache_executables, true };
+        TemporaryChange skip_cache_executable_validation { s_skip_bytecode_validation_for_prevalidated_cache, true };
 
         executable = static_cast<Bytecode::Executable*>(rust_install_bytecode_cache_script(
             blob, &realm.vm(), source_code.ptr(), source_code->length_in_code_units(), &existing_executable,
@@ -771,7 +785,7 @@ Optional<ModuleBytecodeCacheInstallResult> try_install_bytecode_cache_module(Dec
         existing_shared_function_data_ptrs.unchecked_append(function);
 
     GC::DeferGC defer_gc(realm.vm().heap());
-    TemporaryChange validate_cache_executables { s_validate_materialized_bytecode_cache_executables, true };
+    TemporaryChange skip_cache_executable_validation { s_skip_bytecode_validation_for_prevalidated_cache, true };
 
     void* top_level_await_executable = nullptr;
     auto* exec = static_cast<Bytecode::Executable*>(rust_install_bytecode_cache_module(
@@ -899,7 +913,7 @@ GC::Ptr<Bytecode::Executable> compile_function(VM& vm, SharedFunctionInstanceDat
 
     if (shared_data.m_cached_bytecode_executable) {
         GC::DeferGC defer_gc(vm.heap());
-        TemporaryChange validate_cache_executables { s_validate_materialized_bytecode_cache_executables, true };
+        TemporaryChange skip_cache_executable_validation { s_skip_bytecode_validation_for_prevalidated_cache, true };
         auto* exec = static_cast<Bytecode::Executable*>(rust_materialize_bytecode_cache_function(
             shared_data.m_cached_bytecode_executable,
             &vm,
@@ -1258,16 +1272,13 @@ extern "C" void* rust_create_executable(
         delete bp;
     }
 
-    auto const is_materializing_bytecode_cache = JS::RustIntegration::s_validate_materialized_bytecode_cache_executables;
 #if !defined(NDEBUG) || defined(HAS_ADDRESS_SANITIZER)
-    auto const should_validate_bytecode = true;
+    auto const should_validate_bytecode = !JS::RustIntegration::s_skip_bytecode_validation_for_prevalidated_cache;
 #else
-    auto const should_validate_bytecode = is_materializing_bytecode_cache;
+    auto const should_validate_bytecode = false;
 #endif
     if (should_validate_bytecode) {
         if (auto validation = JS::Bytecode::validate_bytecode(*executable, basic_block_offsets.span()); validation.is_error()) {
-            if (is_materializing_bytecode_cache)
-                return nullptr;
 #if !defined(NDEBUG) || defined(HAS_ADDRESS_SANITIZER)
             VERIFY_NOT_REACHED();
 #else

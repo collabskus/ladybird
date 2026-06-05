@@ -13,6 +13,7 @@
 #include <AK/Result.h>
 #include <AK/Span.h>
 #include <AK/Utf16FlyString.h>
+#include <LibCore/Forward.h>
 #include <LibCore/ImmutableBytes.h>
 #include <LibGC/Ptr.h>
 #include <LibGC/Root.h>
@@ -91,9 +92,6 @@ struct ModuleResult {
     GC::Root<SharedFunctionInstanceData> tla_shared_data;
 };
 
-// Check if the Rust pipeline is available for off-thread parsing.
-JS_API bool rust_pipeline_available();
-
 // Parse a program (script or module) without GC interaction. Thread-safe.
 JS_API FFI::ParsedProgram* parse_program(u16 const* utf16_data, size_t length_in_code_units, ProgramType type, size_t line_number_offset = 0);
 
@@ -117,9 +115,10 @@ JS_API ByteBuffer serialize_compiled_program_for_bytecode_cache(FFI::CompiledPro
 
 // Decode an ImmutableBytes-backed bytecode cache blob into a parser-free cache handle.
 JS_API FFI::DecodedBytecodeCacheBlob* decode_bytecode_cache_blob(Core::ImmutableBytes, ProgramType, ReadonlyBytes source_hash);
+JS_API FFI::DecodedBytecodeCacheBlob* decode_bytecode_cache_blob(Core::ImmutableBytes, ProgramType, ReadonlyBytes source_hash, Core::EventLoop&);
 
-// Return the decoded source length carried by a bytecode cache blob.
-JS_API size_t decoded_bytecode_cache_source_length(FFI::DecodedBytecodeCacheBlob const*);
+// Validate a decoded bytecode cache blob before materialization. Thread-safe.
+JS_API bool validate_decoded_bytecode_cache_blob(FFI::DecodedBytecodeCacheBlob*, size_t source_length);
 
 // Free a decoded bytecode cache blob.
 JS_API void free_decoded_bytecode_cache_blob(FFI::DecodedBytecodeCacheBlob*);
