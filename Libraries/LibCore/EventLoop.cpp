@@ -42,6 +42,11 @@ EventLoop::~EventLoop()
         current_event_loop() = nullptr;
 }
 
+EventLoop& EventLoop::initialize_for_current_thread()
+{
+    return *new EventLoop;
+}
+
 bool EventLoop::is_running()
 {
     return current_event_loop() != nullptr;
@@ -49,8 +54,7 @@ bool EventLoop::is_running()
 
 EventLoop& EventLoop::current()
 {
-    if (!current_event_loop())
-        dbgln("No EventLoop is present, unable to return current one!");
+    VERIFY(current_event_loop());
     return *current_event_loop();
 }
 
@@ -87,6 +91,7 @@ void EventLoop::spin_until(Function<bool()> goal_condition)
 
 size_t EventLoop::pump(WaitMode mode)
 {
+    VERIFY(current_event_loop() == this);
     return m_impl->pump(mode == WaitMode::WaitForEvents ? EventLoopImplementation::PumpMode::WaitForEvents : EventLoopImplementation::PumpMode::DontWaitForEvents);
 }
 
