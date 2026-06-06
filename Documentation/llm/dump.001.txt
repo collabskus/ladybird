@@ -406538,6 +406538,7 @@ set(SOURCES
     Fetch/Infrastructure/NetworkPartitionKey.cpp
     Fetch/Infrastructure/NoSniffBlocking.cpp
     Fetch/Infrastructure/PortBlocking.cpp
+    Fetch/Infrastructure/PreflightCache.cpp
     Fetch/Infrastructure/Task.cpp
     Fetch/Infrastructure/URL.cpp
     Fetch/Request.cpp
@@ -534042,7 +534043,7 @@ void ImageStyleValue::paint(DisplayListRecordingContext& context, DevicePixelRec
     auto dest_int_rect = dest_rect.to_type<int>();
     auto rect = image_data->frame_rect(m_current_frame_index).value_or(dest_int_rect);
     auto scaling_mode = to_gfx_scaling_mode(image_rendering, rect.size(), dest_int_rect.size());
-    image_data->paint(context, m_current_frame_index, dest_int_rect, dest_int_rect, scaling_mode);
+    image_data->paint(context, m_current_frame_index, dest_int_rect, scaling_mode);
 }
 
 Optional<Gfx::DecodedImageFrame> ImageStyleValue::current_frame(DevicePixelRect const& dest_rect) const
@@ -593746,6 +593747,7 @@ FILE: Libraries/LibWeb/Fetch/Fetching/Fetching.cpp
 #include <LibWeb/Fetch/Infrastructure/NetworkPartitionKey.h>
 #include <LibWeb/Fetch/Infrastructure/NoSniffBlocking.h>
 #include <LibWeb/Fetch/Infrastructure/PortBlocking.h>
+#include <LibWeb/Fetch/Infrastructure/PreflightCache.h>
 #include <LibWeb/Fetch/Infrastructure/Task.h>
 #include <LibWeb/Fetch/Infrastructure/URL.h>
 #include <LibWeb/FileAPI/Blob.h>
@@ -594276,11 +594278,11 @@ GC::Ptr<PendingResponse> main_fetch(JS::Realm& realm, Infrastructure::FetchParam
 
             // 2. Let corsWithPreflightResponse be the result of running HTTP fetch given fetchParams and true.
             auto cors_with_preflight_response = http_fetch(realm, fetch_params, MakeCORSPreflight::Yes);
-            cors_with_preflight_response->when_loaded([returned_pending_response](GC::Ref<Infrastructure::Response> cors_with_preflight_response) {
+            cors_with_preflight_response->when_loaded([request, returned_pending_response](GC::Ref<Infrastructure::Response> cors_with_preflight_response) {
                 dbgln_if(WEB_FETCH_DEBUG, "Fetch: Running 'main fetch' cors_with_preflight_response load callback");
                 // 3. If corsWithPreflightResponse is a network error, then clear cache entries using request.
                 if (cors_with_preflight_response->is_network_error()) {
-                    // FIXME: Clear cache entries
+                    Infrastructure::PreflightCache::the().clear_cache_entries(request);
                 }
 
                 // 4. Return corsWithPreflightResponse.
@@ -595013,25 +595015,31 @@ GC::Ref<PendingResponse> http_fetch(JS::Realm& realm, Infrastructure::FetchParam
     // 4. If response is null, then:
     if (!response) {
         // 1. If makeCORSPreflight is true and one of these conditions is true:
-        // NOTE: This step checks the CORS-preflight cache and if there is no suitable entry it performs a
-        //       CORS-preflight fetch which, if successful, populates the cache. The purpose of the CORS-preflight
-        //       fetch is to ensure the fetched resource is familiar with the CORS protocol. The cache is there to
-        //       minimize the number of CORS-preflight fetches.
         GC::Ptr<PendingResponse> pending_preflight_response;
-        if (make_cors_preflight == MakeCORSPreflight::Yes && (
-                // - There is no method cache entry match for request’s method using request, and either request’s
-                //   method is not a CORS-safelisted method or request’s use-CORS-preflight flag is set.
-                //   FIXME: We currently have no cache, so there will always be no method cache entry.
-                (!HTTP::is_cors_safelisted_method(request->method()) || request->use_cors_preflight())
-                // - There is at least one item in the CORS-unsafe request-header names with request’s header list for
-                //   which there is no header-name cache entry match using request.
-                //   FIXME: We currently have no cache, so there will always be no header-name cache entry.
-                || !Infrastructure::get_cors_unsafe_header_names(request->header_list()).is_empty())) {
+        auto& preflight_cache = Infrastructure::PreflightCache::the();
+
+        // - There is no method cache entry match for request's method using request,
+        //   and either request's method is not a CORS-safelisted method or request's use-CORS-preflight flag is set.
+        bool method_needs_preflight = !preflight_cache.is_a_method_cache_entry_match(*request, request->method())
+            && (!HTTP::is_cors_safelisted_method(request->method()) || request->use_cors_preflight());
+
+        // - There is at least one item in the CORS-unsafe request-header names with request's header list for
+        //   which there is no header-name cache entry match using request.
+        bool headers_need_preflight = any_of(Infrastructure::get_cors_unsafe_header_names(request->header_list()),
+            [&](auto const& name) {
+                return !preflight_cache.is_a_header_name_cache_entry_match(*request, name);
+            });
+
+        if (make_cors_preflight == MakeCORSPreflight::Yes && (method_needs_preflight || headers_need_preflight)) {
             // 1. Let preflightResponse be the result of running CORS-preflight fetch given request.
             pending_preflight_response = cors_preflight_fetch(realm, request);
 
             // NOTE: Step 2 is performed in pending_preflight_response's load callback below.
         }
+        // NOTE: This step checks the CORS-preflight cache and if there is no suitable entry it performs a
+        //       CORS-preflight fetch which, if successful, populates the cache. The purpose of the CORS-preflight
+        //       fetch is to ensure the fetched resource is familiar with the CORS protocol. The cache is there to
+        //       minimize the number of CORS-preflight fetches.
 
         auto fetch_main_content = GC::create_function(realm.heap(), [request, realm = GC::Ref { realm }, fetch_params = GC::Ref { fetch_params }]() -> GC::Ref<PendingResponse> {
             // 2. If request’s redirect mode is "follow", then set request’s service-workers mode to "none".
@@ -596165,24 +596173,39 @@ GC::Ref<PendingResponse> cors_preflight_fetch(JS::Realm& realm, Infrastructure::
                 }
             }
 
-            // FIXME: 8. Let max-age be the result of extracting header list values given `Access-Control-Max-Age` and response’s header list.
-            // FIXME: 9. If max-age is failure or null, then set max-age to 5.
-            // FIXME: 10. If max-age is greater than an imposed limit on max-age, then set max-age to the imposed limit.
+            // 8. Let max-age be the result of extracting header list values given `Access-Control-Max-Age` and response's header list.
+            auto max_age_result = response->header_list()->extract_header_list_values("Access-Control-Max-Age"sv);
+            auto* maybe_max_age = max_age_result.get_pointer<Vector<ByteString>>();
+
+            // 9. If max-age is failure or null, then set max-age to 5.
+            // 10. If max-age is greater than an imposed limit on max-age, then set max-age to the imposed limit.
+            auto max_age = AK::Duration::from_seconds(5);
+            if (maybe_max_age && maybe_max_age->size() == 1) {
+                if (auto maybe_number = maybe_max_age->first().to_number<i32>(); maybe_number.has_value())
+                    max_age = min(AK::Duration::from_seconds(maybe_number.value()), Infrastructure::PreflightCache::MAX_AGE_LIMIT);
+            }
 
             // 11. If the user agent does not provide for a cache, then return response.
-            // NOTE: Since we don't currently have a cache, this is always true.
+            // NB: We do provide for a cache, so continue.
+
+            // 12. For each method in methods for which there is a method cache entry match using request, set matching entry's max-age
+            //     to max-age.
+            // 13. For each method in methods for which there is no method cache entry match using request, create a new cache entry
+            //     with request, max-age, method, and null.
+            auto& preflight_cache = Infrastructure::PreflightCache::the();
+            for (auto const& method : methods)
+                preflight_cache.cache_method(request, method, max_age);
+
+            // 14. For each headerName in headerNames for which there is a header-name cache entry match using request, set matching
+            //     entry's max-age to max-age.
+            // 15. For each headerName in headerNames for which there is no header-name cache entry match using request, create a
+            //     new cache entry with request, max-age, null, and headerName.
+            for (auto const& header_name : header_names)
+                preflight_cache.cache_header_name(request, header_name, max_age);
+
+            // 16. Return response.
             returned_pending_response->resolve(response);
             return;
-
-            // FIXME: 12. For each method in methods for which there is a method cache entry match using request, set matching entry’s max-age
-            //            to max-age.
-            // FIXME: 13. For each method in methods for which there is no method cache entry match using request, create a new cache entry
-            //            with request, max-age, method, and null.
-            // FIXME: 14. For each headerName in headerNames for which there is a header-name cache entry match using request, set matching
-            //            entry’s max-age to max-age.
-            // FIXME: 15. For each headerName in headerNames for which there is no header-name cache entry match using request, create a
-            //            new cache entry with request, max-age, null, and headerName.
-            // FIXME: 16. Return response.
         }
 
         // 8. Otherwise, return a network error.
@@ -601422,6 +601445,293 @@ namespace Web::Fetch::Infrastructure {
 
 [[nodiscard]] WEB_API RequestOrResponseBlocking block_bad_port(Request const&);
 [[nodiscard]] bool is_bad_port(u16);
+
+}
+
+FILE: Libraries/LibWeb/Fetch/Infrastructure/PreflightCache.cpp
+/*
+ * Copyright (c) 2026, Shannon Booth <shannon@serenityos.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/Debug.h>
+#include <AK/NeverDestroyed.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/CORS.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
+#include <LibWeb/Fetch/Infrastructure/PreflightCache.h>
+
+namespace Web::Fetch::Infrastructure {
+
+PreflightCache& PreflightCache::the()
+{
+    static NeverDestroyed<PreflightCache> s_cache;
+    return *s_cache;
+}
+
+// https://fetch.spec.whatwg.org/#concept-cache-create-entry
+void PreflightCache::create_a_new_cache_entry(Request const& request, AK::Duration max_age, Optional<ByteString> method, Optional<ByteString> header_name)
+{
+    // Already expired, no need to store.
+    if (max_age.is_negative() || max_age.is_zero())
+        return;
+
+    auto partition_key = determine_the_network_partition_key(request);
+    VERIFY(partition_key.has_value());
+
+    // 1. Let entry be a cache entry, initialized as follows:
+    Entry entry {
+        .stored_at = MonotonicTime::now(),
+
+        // key
+        //    The result of determining the network partition key given request
+        .key = partition_key.release_value(),
+
+        // byte-serialized origin
+        //     The result of byte-serializing a request origin with request
+        .byte_serialized_origin = request.byte_serialize_origin(),
+
+        // URL
+        //    request’s current URL
+        .url = request.current_url(),
+
+        // max-age
+        //     max-age
+        .max_age = max_age,
+
+        // credentials
+        //     True if request’s credentials mode is "include", and false otherwise
+        .credentials = request.credentials_mode() == Request::CredentialsMode::Include,
+
+        // method
+        //     method
+        .method = move(method),
+
+        // header name
+        //     headerName
+        .header_name = move(header_name),
+    };
+
+    // 2. Append entry to the user agent’s CORS-preflight cache.
+    m_entries.append(move(entry));
+}
+
+// https://fetch.spec.whatwg.org/#concept-cache-match-method
+bool PreflightCache::is_a_method_cache_entry_match(Request const& request, ByteString const& method)
+{
+    evict_expired_entries();
+
+    // There is a method cache entry match for method using request when there is a cache entry in the user agent’s
+    // CORS-preflight cache for which there is a cache entry match with request and its method is method or `*`.
+    return method_cache_entry_match(request, method) != nullptr;
+}
+
+PreflightCache::Entry* PreflightCache::method_cache_entry_match(Request const& request, ByteString const& method)
+{
+    for (auto& entry : m_entries) {
+        if (!entry.method.has_value() || (!entry.method->equals_ignoring_ascii_case(method) && entry.method != "*"sv))
+            continue;
+        if (is_cache_entry_match(entry, request))
+            return &entry;
+    }
+    return nullptr;
+}
+
+void PreflightCache::cache_method(Request const& request, ByteString const& method, AK::Duration max_age)
+{
+    evict_expired_entries();
+
+    if (auto* entry = method_cache_entry_match(request, method); entry != nullptr) {
+        entry->update_max_age(max_age);
+        return;
+    }
+
+    create_a_new_cache_entry(request, max_age, method, OptionalNone());
+}
+
+// https://fetch.spec.whatwg.org/#concept-cache-match-header
+bool PreflightCache::is_a_header_name_cache_entry_match(Request const& request, ByteString const& header_name)
+{
+    evict_expired_entries();
+
+    // There is a header-name cache entry match for headerName using request when there is a cache entry in the user
+    // agent’s CORS-preflight cache for which there is a cache entry match with request and one of:
+    //  * its header name is a byte-case-insensitive match for headerName
+    //  * its header name is `*` and headerName is not a CORS non-wildcard request-header name
+    // is true
+    return header_name_cache_entry_match(request, header_name) != nullptr;
+}
+
+PreflightCache::Entry* PreflightCache::header_name_cache_entry_match(Request const& request, ByteString const& header_name)
+{
+    for (auto& entry : m_entries) {
+        if (!entry.header_name.has_value())
+            continue;
+        if (!(entry.header_name->equals_ignoring_ascii_case(header_name) || (entry.header_name.value() == "*"sv && !is_cors_non_wildcard_request_header_name(header_name))))
+            continue;
+        if (is_cache_entry_match(entry, request))
+            return &entry;
+    }
+    return nullptr;
+}
+
+void PreflightCache::cache_header_name(Request const& request, ByteString const& header_name, AK::Duration max_age)
+{
+    evict_expired_entries();
+
+    if (auto* entry = header_name_cache_entry_match(request, header_name); entry != nullptr) {
+        entry->update_max_age(max_age);
+        return;
+    }
+
+    create_a_new_cache_entry(request, max_age, OptionalNone(), header_name);
+}
+
+// https://fetch.spec.whatwg.org/#concept-cache-match
+bool PreflightCache::is_cache_entry_match(Entry const& entry, Request const& request)
+{
+    if (entry.has_expired())
+        return false;
+
+    // There is a cache entry match for a cache entry entry with request if
+    // entry’s key is the result of determining the network partition key given request,
+    if (entry.key != determine_the_network_partition_key(request))
+        return false;
+
+    // entry’s byte-serialized origin is the result of byte-serializing a request origin with request,
+    if (entry.byte_serialized_origin != request.byte_serialize_origin())
+        return false;
+
+    // entry’s URL is request’s current URL,
+    if (entry.url != request.current_url())
+        return false;
+
+    // and one of
+    //  * entry’s credentials is true
+    //  * entry’s credentials is false and request’s credentials mode is not "include".
+    return entry.credentials || request.credentials_mode() != Request::CredentialsMode::Include;
+}
+
+void PreflightCache::evict_expired_entries()
+{
+    m_entries.remove_all_matching([](Entry const& entry) {
+        return entry.has_expired();
+    });
+}
+
+// https://fetch.spec.whatwg.org/#concept-cache-clear
+void PreflightCache::clear_cache_entries(Request const& request)
+{
+    auto request_key = determine_the_network_partition_key(request);
+
+    // To clear cache entries, given a request, remove any cache entries in the user agent’s CORS-preflight cache whose
+    m_entries.remove_all_matching([&](Entry const& entry) {
+        if (entry.has_expired())
+            return true;
+
+        // key is the result of determining the network partition key given request,
+        if (entry.key != request_key)
+            return false;
+
+        // byte-serialized origin is the result of byte-serializing a request origin with request,
+        if (entry.byte_serialized_origin != request.byte_serialize_origin())
+            return false;
+
+        // and URL is request’s current URL.
+        if (entry.url != request.current_url())
+            return false;
+
+        return true;
+    });
+}
+
+bool PreflightCache::Entry::has_expired() const
+{
+    return MonotonicTime::now() - stored_at >= max_age;
+}
+
+void PreflightCache::Entry::update_max_age(AK::Duration new_max_age)
+{
+    max_age = new_max_age;
+    stored_at = MonotonicTime::now();
+}
+
+}
+
+FILE: Libraries/LibWeb/Fetch/Infrastructure/PreflightCache.h
+/*
+ * Copyright (c) 2026, Shannon Booth <shannon@serenityos.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Time.h>
+#include <LibURL/URL.h>
+#include <LibWeb/Fetch/Infrastructure/NetworkPartitionKey.h>
+
+namespace Web::Fetch::Infrastructure {
+
+// https://fetch.spec.whatwg.org/#concept-cache
+class PreflightCache {
+public:
+    static constexpr AK::Duration MAX_AGE_LIMIT = AK::Duration::from_seconds(7200); // 2 hours.
+
+    static PreflightCache& the();
+
+    void cache_method(Request const&, ByteString const& method, AK::Duration max_age);
+    void cache_header_name(Request const&, ByteString const& header_name, AK::Duration max_age);
+
+    bool is_a_method_cache_entry_match(Request const&, ByteString const& method);
+    bool is_a_header_name_cache_entry_match(Request const&, ByteString const& header_name);
+
+    void clear_cache_entries(Request const&);
+
+    void evict_expired_entries();
+
+private:
+    // https://fetch.spec.whatwg.org/#cache-entry
+    struct Entry {
+        // "Cache entries must be removed after the seconds specified in their max-age field have passed since
+        //  storing the entry. Cache entries may be removed before that moment arrives."
+        MonotonicTime stored_at;
+
+        // A cache entry consists of:
+
+        // key (a network partition key)
+        NetworkPartitionKey key;
+
+        // byte-serialized origin (a byte sequence)
+        ByteString byte_serialized_origin;
+
+        // URL (a URL)
+        URL::URL url;
+
+        // max-age (a number of seconds)
+        AK::Duration max_age;
+
+        // credentials (a boolean)
+        bool credentials { false };
+
+        // method (null, `*`, or a method)
+        Optional<ByteString> method;
+
+        // header name (null, `*`, or a header name)
+        Optional<ByteString> header_name;
+
+        bool has_expired() const;
+        void update_max_age(AK::Duration max_age);
+    };
+
+    void create_a_new_cache_entry(Request const&, AK::Duration max_age, Optional<ByteString> method, Optional<ByteString> header_name);
+    Entry* method_cache_entry_match(Request const&, ByteString const& method);
+    Entry* header_name_cache_entry_match(Request const&, ByteString const& header_name);
+    static bool is_cache_entry_match(Entry const&, Request const&);
+
+    // A CORS-preflight cache is a list of cache entries.
+    Vector<Entry> m_entries;
+};
 
 }
 
@@ -613140,12 +613450,12 @@ Optional<Gfx::IntRect> AnimatedDecodedImageData::frame_rect(size_t) const
     return Gfx::IntRect { {}, m_size };
 }
 
-void AnimatedDecodedImageData::paint(DisplayListRecordingContext& context, size_t frame_index, Gfx::IntRect dst_rect, Gfx::IntRect clip_rect, Gfx::ScalingMode scaling_mode) const
+void AnimatedDecodedImageData::paint(DisplayListRecordingContext& context, size_t frame_index, Gfx::IntRect dst_rect, Gfx::ScalingMode scaling_mode) const
 {
     auto decoded_frame = frame(frame_index);
     if (!decoded_frame.has_value())
         return;
-    context.display_list_recorder().draw_scaled_decoded_image_frame(dst_rect, clip_rect, *decoded_frame, scaling_mode);
+    context.display_list_recorder().draw_scaled_decoded_image_frame(dst_rect, *decoded_frame, scaling_mode);
 }
 
 void AnimatedDecodedImageData::receive_frames(Vector<NonnullRefPtr<Gfx::Bitmap>> bitmaps, u32 start_frame_index)
@@ -613263,7 +613573,7 @@ public:
     virtual Optional<CSSPixelFraction> intrinsic_aspect_ratio() const override;
 
     virtual Optional<Gfx::IntRect> frame_rect(size_t frame_index) const override;
-    virtual void paint(DisplayListRecordingContext&, size_t frame_index, Gfx::IntRect dst_rect, Gfx::IntRect clip_rect, Gfx::ScalingMode) const override;
+    virtual void paint(DisplayListRecordingContext&, size_t frame_index, Gfx::IntRect dst_rect, Gfx::ScalingMode) const override;
 
     virtual size_t notify_frame_advanced(size_t caller_frame_index) override;
 
@@ -614876,9 +615186,9 @@ Optional<Gfx::IntRect> BitmapDecodedImageData::frame_rect(size_t frame_index) co
     return m_frames[frame_index].frame.rect();
 }
 
-void BitmapDecodedImageData::paint(DisplayListRecordingContext& context, size_t frame_index, Gfx::IntRect dst_rect, Gfx::IntRect clip_rect, Gfx::ScalingMode scaling_mode) const
+void BitmapDecodedImageData::paint(DisplayListRecordingContext& context, size_t frame_index, Gfx::IntRect dst_rect, Gfx::ScalingMode scaling_mode) const
 {
-    context.display_list_recorder().draw_scaled_decoded_image_frame(dst_rect, clip_rect, m_frames[frame_index].frame, scaling_mode);
+    context.display_list_recorder().draw_scaled_decoded_image_frame(dst_rect, m_frames[frame_index].frame, scaling_mode);
 }
 
 }
@@ -614923,7 +615233,7 @@ public:
     virtual Optional<CSSPixelFraction> intrinsic_aspect_ratio() const override;
 
     virtual Optional<Gfx::IntRect> frame_rect(size_t frame_index) const override;
-    virtual void paint(DisplayListRecordingContext&, size_t frame_index, Gfx::IntRect dst_rect, Gfx::IntRect clip_rect, Gfx::ScalingMode scaling_mode) const override;
+    virtual void paint(DisplayListRecordingContext&, size_t frame_index, Gfx::IntRect dst_rect, Gfx::ScalingMode scaling_mode) const override;
 
 private:
     BitmapDecodedImageData(Vector<Frame>&&, size_t loop_count, bool animated);
@@ -624559,7 +624869,7 @@ public:
     virtual ~DecodedImageData();
 
     virtual Optional<Gfx::IntRect> frame_rect([[maybe_unused]] size_t frame_index) const = 0;
-    virtual void paint([[maybe_unused]] DisplayListRecordingContext&, [[maybe_unused]] size_t frame_index, [[maybe_unused]] Gfx::IntRect dst_rect, [[maybe_unused]] Gfx::IntRect clip_rect, [[maybe_unused]] Gfx::ScalingMode scaling_mode) const = 0;
+    virtual void paint([[maybe_unused]] DisplayListRecordingContext&, [[maybe_unused]] size_t frame_index, [[maybe_unused]] Gfx::IntRect dst_rect, [[maybe_unused]] Gfx::ScalingMode scaling_mode) const = 0;
 
     virtual Optional<Gfx::DecodedImageFrame> frame(size_t frame_index, Gfx::IntSize = {}) const = 0;
     virtual int frame_duration(size_t frame_index) const = 0;
@@ -648152,206 +648462,3 @@ double HTMLInputElement::step_scale_factor() const
     VERIFY_NOT_REACHED();
 }
 
-// https://html.spec.whatwg.org/multipage/input.html#concept-input-step
-Optional<double> HTMLInputElement::allowed_value_step() const
-{
-    // 1. If the attribute does not apply, then there is no allowed value step.
-    if (!step_applies())
-        return {};
-
-    // 2. Otherwise, if the attribute is absent, then the allowed value step is the default step multiplied by the step scale factor.
-    auto maybe_step_string = get_attribute(AttributeNames::step);
-    if (!maybe_step_string.has_value())
-        return default_step() * step_scale_factor();
-    auto step_string = *maybe_step_string;
-
-    // 3. Otherwise, if the attribute's value is an ASCII case-insensitive match for the string "any", then there is no allowed value step.
-    if (step_string.equals_ignoring_ascii_case("any"sv))
-        return {};
-
-    // 4. Otherwise, if the rules for parsing floating-point number values, when they are applied to the attribute's value, return an error,
-    // zero, or a number less than zero, then the allowed value step is the default step multiplied by the step scale factor.
-    auto maybe_step = parse_floating_point_number(step_string);
-    if (!maybe_step.has_value() || *maybe_step == 0 || *maybe_step < 0)
-        return default_step() * step_scale_factor();
-
-    // 5. Otherwise, the allowed value step is the number returned by the rules for parsing floating-point number values when they are applied
-    // to the attribute's value, multiplied by the step scale factor.
-    return *maybe_step * step_scale_factor();
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#concept-input-min-zero
-double HTMLInputElement::step_base() const
-{
-    // 1. If the element has a min content attribute, and the result of applying the algorithm to convert a string to a number to the value of
-    // the min content attribute is not an error, then return that result.
-    if (auto min = this->min(); min.has_value())
-        return *min;
-
-    // 2. If the element has a value content attribute, and the result of applying the algorithm to convert a string to a number to the value of
-    // the value content attribute is not an error, then return that result.
-    if (auto value = get_attribute(HTML::AttributeNames::value); value.has_value()) {
-        if (auto value_as_number = convert_string_to_number(value.value()); value_as_number.has_value())
-            return value_as_number.value();
-    }
-
-    // 3. If a default step base is defined for this element given its type attribute's state, then return it.
-    if (type_state() == TypeAttributeState::Week) {
-        // The default step base is −259,200,000 (the start of week 1970-W01).
-        return -259'200'000;
-    }
-
-    // 4. Return zero.
-    return 0;
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#dom-input-valueasdate
-JS::Object* HTMLInputElement::value_as_date() const
-{
-    // On getting, if the valueAsDate attribute does not apply, as defined for the input element's type attribute's current state, then return null.
-    if (!value_as_date_applies())
-        return nullptr;
-
-    // Otherwise, run the algorithm to convert a string to a Date object defined for that state to the element's value;
-    // if the algorithm returned a Date object, then return it, otherwise, return null.
-    auto maybe_date = convert_string_to_date(value());
-    if (!maybe_date.is_exception())
-        return maybe_date.value().ptr();
-    return nullptr;
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#dom-input-valueasdate
-WebIDL::ExceptionOr<void> HTMLInputElement::set_value_as_date(GC::Ptr<JS::Object> value)
-{
-    // On setting, if the valueAsDate attribute does not apply, as defined for the input element's type attribute's current state, then throw an "InvalidStateError" DOMException;
-    if (!value_as_date_applies())
-        return WebIDL::InvalidStateError::create(realm(), "valueAsDate: Invalid input type used"_utf16);
-
-    // otherwise, if the new value is not null and not a Date object throw a TypeError exception;
-    if (value && !is<JS::Date>(*value))
-        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "valueAsDate: input is not a Date"sv };
-
-    // otherwise if the new value is null or a Date object representing the NaN time value, then set the value of the element to the empty string;
-    if (!value) {
-        TRY(set_value({}));
-        return {};
-    }
-    auto& date = static_cast<JS::Date&>(*value);
-    if (!isfinite(date.date_value())) {
-        TRY(set_value({}));
-        return {};
-    }
-
-    // otherwise, run the algorithm to convert a Date object to a string, as defined for that state, on the new value, and set the value of the element to the resulting string.
-    TRY(set_value(convert_date_to_string(date)));
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#dom-input-valueasnumber
-double HTMLInputElement::value_as_number() const
-{
-    // On getting, if the valueAsNumber attribute does not apply, as defined for the input element's type attribute's current state, then return a Not-a-Number (NaN) value.
-    if (!value_as_number_applies())
-        return NAN;
-
-    // Otherwise, run the algorithm to convert a string to a number defined for that state to the element's value;
-    // if the algorithm returned a number, then return it, otherwise, return a Not-a-Number (NaN) value.
-    return convert_string_to_number(value()).value_or(NAN);
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#dom-input-valueasnumber
-WebIDL::ExceptionOr<void> HTMLInputElement::set_value_as_number(double value)
-{
-    // On setting, if the new value is infinite, then throw a TypeError exception.
-    if (!isfinite(value))
-        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "valueAsNumber: Value is infinite"sv };
-
-    // Otherwise, if the valueAsNumber attribute does not apply, as defined for the input element's type attribute's current state, then throw an "InvalidStateError" DOMException.
-    if (!value_as_number_applies())
-        return WebIDL::InvalidStateError::create(realm(), "valueAsNumber: Invalid input type used"_utf16);
-
-    // Otherwise, if the new value is a Not-a-Number (NaN) value, then set the value of the element to the empty string.
-    if (value == NAN) {
-        TRY(set_value({}));
-        return {};
-    }
-
-    // Otherwise, run the algorithm to convert a number to a string, as defined for that state, on the new value, and set the value of the element to the resulting string.
-    TRY(set_value(convert_number_to_string(value)));
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#dom-input-stepup
-WebIDL::ExceptionOr<void> HTMLInputElement::step_up(WebIDL::Long n)
-{
-    return step_up_or_down(false, n);
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#dom-input-stepdown
-WebIDL::ExceptionOr<void> HTMLInputElement::step_down(WebIDL::Long n)
-{
-    return step_up_or_down(true, n);
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#dom-input-stepup
-WebIDL::ExceptionOr<void> HTMLInputElement::step_up_or_down(bool is_down, WebIDL::Long n)
-{
-    // 1. If the stepDown() and stepUp() methods do not apply, as defined for the input element's type attribute's current state, then throw an "InvalidStateError" DOMException.
-    if (!step_up_or_down_applies())
-        return WebIDL::InvalidStateError::create(realm(), Utf16String::formatted("{}: Invalid input type used", is_down ? "stepDown()" : "stepUp()"));
-
-    // 2. If the element has no allowed value step, then throw an "InvalidStateError" DOMException.
-    auto maybe_allowed_value_step = allowed_value_step();
-    if (!maybe_allowed_value_step.has_value())
-        return WebIDL::InvalidStateError::create(realm(), "element has no allowed value step"_utf16);
-    double allowed_value_step = *maybe_allowed_value_step;
-
-    // 3. If the element has a minimum and a maximum and the minimum is greater than the maximum, then return.
-    auto maybe_minimum = min();
-    auto maybe_maximum = max();
-    if (maybe_minimum.has_value() && maybe_maximum.has_value() && *maybe_minimum > *maybe_maximum)
-        return {};
-
-    // 4. If the element has a minimum and a maximum and there is no value greater than or equal to the element's minimum and less than
-    // or equal to the element's maximum that, when subtracted from the step base, is an integral multiple of the allowed value step, then return.
-    if (maybe_minimum.has_value() && maybe_maximum.has_value() && ceil((*maybe_minimum - step_base()) / allowed_value_step) > floor((*maybe_maximum - step_base()) / allowed_value_step))
-        return {};
-
-    // 5. If applying the algorithm to convert a string to a number to the string given by the element's value does not result in an error,
-    // then let value be the result of that algorithm. Otherwise, let value be zero.
-    double value = convert_string_to_number(this->value()).value_or(0);
-
-    // 6. Let valueBeforeStepping be value.
-    double value_before_stepping = value;
-
-    // 7. If value subtracted from the step base is not an integral multiple of the allowed value step, then set value to the nearest value that,
-    // when subtracted from the step base, is an integral multiple of the allowed value step, and that is less than value if the method invoked was the stepDown() method, and more than value otherwise.
-    if (!is_integral_multiple(step_base() - value, allowed_value_step)) {
-        if (is_down) {
-            value = step_base() + floor((value - step_base()) / allowed_value_step) * allowed_value_step;
-        } else {
-            value = step_base() + ceil((value - step_base()) / allowed_value_step) * allowed_value_step;
-        }
-    }
-    // Otherwise (value subtracted from the step base is an integral multiple of the allowed value step):
-    else {
-        // 1. Let n be the argument.
-        // 2. Let delta be the allowed value step multiplied by n.
-        double delta = allowed_value_step * n;
-
-        // 3. If the method invoked was the stepDown() method, negate delta.
-        if (is_down)
-            delta = -delta;
-
-        // 4. Let value be the result of adding delta to value.
-        value += delta;
-    }
-
-    // 8. If the element has a minimum, and value is less than that minimum, then set value to the smallest value that,
-    //    when subtracted from the step base, is an integral multiple of the allowed value step, and that is more than
-    //    or equal to that minimum.
-    if (maybe_minimum.has_value() && value < *maybe_minimum) {
-        value = step_base() + ceil((*maybe_minimum - step_base()) / allowed_value_step) * allowed_value_step;
-    }
-
-    // 9. If the element has a maximum, and value is greater than that maximum, then set value to the largest value that,
