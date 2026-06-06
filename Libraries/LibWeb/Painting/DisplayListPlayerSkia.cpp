@@ -276,12 +276,11 @@ void DisplayListPlayerSkia::draw_scaled_decoded_image_frame(DrawScaledDecodedIma
         return;
 
     auto dst_rect = to_skia_rect(command.dst_rect);
-    auto clip_rect = to_skia_rect(command.clip_rect);
     auto& canvas = surface().canvas();
     SkPaint paint;
     paint.setAntiAlias(true);
     canvas.save();
-    canvas.clipRect(clip_rect, true);
+    canvas.clipRect(dst_rect, true);
     canvas.drawImageRect(image.get(), dst_rect, to_skia_sampling_options(command.scaling_mode), &paint);
     canvas.restore();
 }
@@ -858,11 +857,16 @@ void DisplayListPlayerSkia::add_rounded_rect_clip(AddRoundedRectClip const& comm
 void DisplayListPlayerSkia::paint_nested_display_list(PaintNestedDisplayList const& command)
 {
     auto& canvas = surface().canvas();
+    canvas.save();
     canvas.translate(command.rect.x(), command.rect.y());
     ScrollStateSnapshot scroll_state_snapshot;
-    auto command_bytes = inline_data(command.command_bytes);
     auto const& nested_display_list = resource_storage().display_list_resource(command.display_list_id);
-    execute_nested_display_list(*nested_display_list.display_list, nested_display_list.visual_context_tree, scroll_state_snapshot, command_bytes);
+    execute_nested_display_list(
+        *nested_display_list.display_list,
+        nested_display_list.visual_context_tree,
+        scroll_state_snapshot,
+        nested_display_list.display_list->command_bytes());
+    canvas.restore();
 }
 
 void DisplayListPlayerSkia::compositor_scroll_node(CompositorScrollNode const&)

@@ -305,15 +305,10 @@ void DisplayListRecorder::replay_cached_commands(ReadonlyBytes command_bytes)
 void DisplayListRecorder::paint_nested_display_list(DisplayListResource const& display_list, Gfx::IntRect rect)
 {
     auto display_list_id = resource_storage().add_display_list(display_list.display_list, display_list.visual_context_tree);
-    CommandPayloadBuilder<PaintNestedDisplayList> payload_builder(m_display_list);
-    auto command_bytes = payload_builder.append_data(display_list.display_list->command_bytes(), alignof(DisplayListCommandHeader));
-    append_command(
-        PaintNestedDisplayList {
-            display_list_id,
-            command_bytes,
-            rect,
-        },
-        payload_builder.inline_data());
+    append_command(PaintNestedDisplayList {
+        display_list_id,
+        rect,
+    });
 }
 
 void DisplayListRecorder::add_rounded_rect_clip(Gfx::CornerRadii corner_radii, Gfx::IntRect border_rect, Gfx::CornerClip corner_clip)
@@ -539,13 +534,12 @@ void DisplayListRecorder::draw_video_frame(Gfx::IntRect const& dst_rect, VideoFr
     });
 }
 
-void DisplayListRecorder::draw_scaled_decoded_image_frame(Gfx::IntRect const& dst_rect, Gfx::IntRect const& clip_rect, Gfx::DecodedImageFrame frame, Gfx::ScalingMode scaling_mode)
+void DisplayListRecorder::draw_scaled_decoded_image_frame(Gfx::IntRect const& dst_rect, Gfx::DecodedImageFrame frame, Gfx::ScalingMode scaling_mode)
 {
     if (dst_rect.is_empty())
         return;
     append_command(DrawScaledDecodedImageFrame {
         .dst_rect = dst_rect,
-        .clip_rect = clip_rect,
         .frame_id = resource_storage().add_image_frame(frame),
         .scaling_mode = scaling_mode,
     });
