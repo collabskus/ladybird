@@ -6,15 +6,13 @@
 
 #pragma once
 
-#include <AK/Atomic.h>
-#include <AK/HashMap.h>
 #include <AK/NonnullRefPtr.h>
+#include <AK/OwnPtr.h>
 #include <AK/RefPtr.h>
-#include <LibMedia/Audio/Forward.h>
 #include <LibMedia/Audio/SampleSpecification.h>
+#include <LibMedia/Audio/TimeStretcher.h>
 #include <LibMedia/AudioBlock.h>
 #include <LibMedia/Export.h>
-#include <LibMedia/Forward.h>
 #include <LibMedia/PipelineStatus.h>
 #include <LibMedia/Processors/AudioProcessor.h>
 #include <LibMedia/Producers/AudioProducer.h>
@@ -22,53 +20,48 @@
 
 namespace Media {
 
-class MEDIA_API AudioMixer final : public AudioProcessor {
+class MEDIA_API AudioTimeStretchProcessor final : public AudioProcessor {
 public:
-    static ErrorOr<NonnullRefPtr<AudioMixer>> try_create();
-    AudioMixer();
-    virtual ~AudioMixer() override;
+    static ErrorOr<NonnullRefPtr<AudioTimeStretchProcessor>> try_create();
+    AudioTimeStretchProcessor();
+    virtual ~AudioTimeStretchProcessor() override;
 
     virtual ErrorOr<void> connect_input(NonnullRefPtr<AudioProducer> const&) override;
     virtual void disconnect_input(NonnullRefPtr<AudioProducer> const&) override;
 
-    virtual void seek(AK::Duration timestamp) override;
-
-    virtual void set_playback_rate(float) override;
-
+    virtual void seek(AK::Duration) override;
     virtual ErrorOr<void> set_output_sample_specification(Audio::SampleSpecification) override;
-    Audio::SampleSpecification sample_specification() const;
-
     virtual void start() override;
 
     virtual PipelineStatus status() const override;
-    virtual void pull(AudioBlock& into) override;
-
+    virtual void pull(AudioBlock&) override;
     virtual void set_wake_handler(PipelineWakeHandler) override;
+    virtual void set_playback_rate(float) override;
 
 private:
-    struct InputMixingData {
-        AudioBlock current_block;
-        i64 next_frame { 0 };
-        PipelineStatus last_status { PipelineStatus::Pending };
-    };
-
-    PipelineStatus combined_input_status() const;
+    void ensure_stretcher_while_locked() const;
+    void maybe_recover_from_stale_upstream_eos_while_locked() const;
+    PipelineStatus produce_block_while_locked(AudioBlock&) const;
     void dispatch_wake();
-    AK::Duration mix_head_timestamp() const;
-
-    void disconnect_input_while_locked(NonnullRefPtr<AudioProducer> const&);
 
     mutable Sync::Mutex m_mutex;
     Audio::SampleSpecification m_sample_specification;
-    mutable HashMap<NonnullRefPtr<AudioProducer>, InputMixingData> m_inputs;
-    i64 m_next_frame_to_write { 0 };
+    RefPtr<AudioProducer> m_input;
+
     float m_playback_rate { 1.0f };
+    mutable OwnPtr<Audio::TimeStretcher> m_stretcher;
     bool m_started { false };
+
+    mutable i64 m_next_output_frame { 0 };
+    mutable AK::Duration m_next_emit_media_time;
+    mutable bool m_stretcher_reached_eos { false };
+
+    mutable AudioBlock m_input_block;
+    mutable AudioBlock m_pending_block;
+    mutable bool m_downstream_needs_wake { true };
     bool m_moved_position_pending { false };
 
     PipelineWakeHandler m_wake_handler;
-    mutable PipelineStatus m_status { PipelineStatus::Pending };
-    mutable PipelineStatus m_last_returned_status { PipelineStatus::Pending };
 };
 
 }
