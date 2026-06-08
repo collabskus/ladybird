@@ -5744,7 +5744,10 @@ void Document::unload_a_document_and_its_descendants(GC::Ptr<Document> new_docum
                 auto increment_unloaded = GC::create_function(heap, [unload_state] { unload_state->did_process_child(); });
 
                 // 2. Unload a document and its descendants given childNavigable's active document, null, and incrementUnloaded.
-                child_navigable->active_document()->unload_a_document_and_its_descendants({}, increment_unloaded);
+                if (auto active_document = child_navigable->active_document())
+                    active_document->unload_a_document_and_its_descendants({}, increment_unloaded);
+                else
+                    increment_unloaded->function()();
             }));
     }
 
@@ -7931,6 +7934,17 @@ Vector<GC::Root<Range>> Document::find_matching_text(String const& query, CaseSe
             VERIFY(end_dom_node);
             auto end_position = match_index.value() + utf16_query.length_in_code_units() - match_end_position->start_offset + match_end_position->dom_offset_within_node;
 
+            if (&start_dom_node->root() != &end_dom_node->root()
+                || !start_dom_node->is_connected()
+                || !end_dom_node->is_connected()
+                || start_position > start_dom_node->length()
+                || end_position > end_dom_node->length()) {
+                offset = match_index.value() + utf16_query.length_in_code_units() + 1;
+                if (offset >= text_view.length_in_code_units())
+                    break;
+                continue;
+            }
+
             matches.append(Range::create(*start_dom_node, start_position, *end_dom_node, end_position));
             match_start_position = match_end_position;
             offset = match_index.value() + utf16_query.length_in_code_units() + 1;
@@ -8368,6 +8382,63 @@ GC::Ptr<DOM::Position> Document::cursor_position() const
         return m_selection->cursor_position();
 
     return nullptr;
+}
+
+Optional<CSSPixelRect> Document::current_caret_rect()
+{
+    // Returns the bounds of the current text caret in viewport-relative CSS pixels. Used to position platform overlays
+    // such as the IME candidate window. Returns nothing when no editable element is focused or when layout isn't ready.
+    auto position = cursor_position();
+    if (!position)
+        return {};
+    auto& dom_node = *position->node();
+
+    update_layout(UpdateLayoutReason::InputCaretRect);
+
+    auto* layout_node = dom_node.layout_node();
+    if (!layout_node)
+        return {};
+
+    // The caret rects computed here are document-relative (absolute). Platform IME overlays are positioned relative to
+    // the viewport — so translate by scroll offset and map through any containing navigables to the top-level viewport.
+    auto to_viewport_rect = [this](CSSPixelRect rect) -> CSSPixelRect {
+        auto navigable = this->navigable();
+        if (!navigable)
+            return rect;
+        auto scroll = navigable->viewport_scroll_offset();
+        CSSPixelRect viewport_rect { rect.x() - scroll.x(), rect.y() - scroll.y(), rect.width(), rect.height() };
+        return navigable->to_top_level_rect(viewport_rect);
+    };
+
+    // Walk up to the nearest PaintableWithLines, which is where text fragments live.
+    Painting::PaintableWithLines const* paintable_with_lines = nullptr;
+    for (auto paintable = layout_node->first_paintable(); paintable; paintable = paintable->parent()) {
+        if (auto const* with_lines = as_if<Painting::PaintableWithLines>(*paintable)) {
+            paintable_with_lines = with_lines;
+            break;
+        }
+    }
+
+    if (paintable_with_lines) {
+        for (auto const& fragment : paintable_with_lines->fragments()) {
+            if (fragment.layout_node().dom_node() != &dom_node)
+                continue;
+            auto const offset = position->offset();
+            if (offset < fragment.dom_start_offset_in_node() || offset > fragment.dom_end_offset_in_node())
+                continue;
+            return to_viewport_rect(fragment.range_rect(Painting::Paintable::SelectionState::StartAndEnd, offset, offset));
+        }
+    }
+
+    // Empty editable elements have no fragments; fall back to the padding-box corner.
+    if (auto* node_with_style = as_if<Layout::NodeWithStyleAndBoxModelMetrics>(*layout_node)) {
+        auto paintable = node_with_style->first_paintable();
+        if (auto const* box = as_if<Painting::PaintableBox>(paintable.ptr())) {
+            auto content_box = box->absolute_padding_box_rect();
+            return to_viewport_rect(CSSPixelRect { content_box.x(), content_box.y(), 1, node_with_style->computed_values().line_height() });
+        }
+    }
+    return {};
 }
 
 void Document::reset_cursor_blink_cycle()
