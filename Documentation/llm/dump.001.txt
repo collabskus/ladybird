@@ -57122,6 +57122,178 @@ The `.cpp`, `.h`, and `.idl` files for a given interface should all be in the sa
 the implementation is hand-written when it cannot be generated from IDL. In those cases, no IDL file
 is present and code should be placed in `Bindings/`.
 
+FILE: Documentation/MediaPipelineDesign.md
+# Media Pipeline
+
+## Overview
+
+LibMedia turns demuxed media data into decoded audio and video, then feeds it to sinks that are
+driven by playback time. The pipeline is pull-based: downstream nodes ask upstream nodes whether
+data is available, then pull data when the reported status allows it.
+
+The current pipeline is made of three categories of nodes:
+
+- Producers materialize raw audio/video data.
+- Sinks consume that raw audio/video data.
+- Processors are both producers and sinks, pulling data from an input producer to transform it
+  before a downstream sink makes use of it.
+
+Audio and video use separate producer interfaces because the data they carry is different, but their
+control flow is intentionally similar.
+
+## Producer Interface
+
+Producers expose three core operations:
+
+- `status()` reports what a subsequent `pull()` would observe.
+- `pull(...)` consumes the status previously observed and writes data into the provided output
+  object if that status indicates that it should.
+- `set_wake_handler(...)` is used by the downstream node to wake itself when a previously-queried
+  status would result in it going to sleep.
+
+Downstream nodes call `status()` when they need new data, before deciding whether to pull or sleep.
+This allows producers to provide in-band signals without forcing their downstream nodes to
+potentially hold data that they have no room for.
+
+## PipelineStatus
+
+`PipelineStatus` is the shared status language between nodes:
+
+- `Pending`: Data is not available yet, but may become available later.
+- `HaveData`: The next pull will produce data.
+- `MovedPosition`: The upstream position moved and downstream cached data may no longer be monotonic
+  with future output.
+- `Blocked`: Data is not available yet, i.e. we have run out of buffered data from over the network.
+- `EndOfStream`: We have reached the end of the input data.
+- `Error`: The upstream node encountered an error and cannot continue without a seek.
+
+`HaveData` can carry data. All other statuses require handling by downstream code.
+
+`Pending`, `MovedPosition`, `Blocked`, `EndOfStream` and `Error` are waiting statuses. A downstream
+node that normally polls for upstream input seeing these should sleep until its wake handler fires.
+
+`MovedPosition` signals that downstream nodes should invalidate their queued data in order to begin
+playback of fresh data. This is mainly important for backwards seeks, since data with a lower
+timestamp will not be output otherwise.
+
+`EndOfStream` and `Error` are terminal statuses. They resolve seeks even though they are still
+"waiting" statuses for helper APIs, because no more data is required to decide the seek has
+completed.
+
+## Wake Handlers
+
+Wake handlers do not carry state. A wake means the downstream node should query `status()` again.
+
+Nodes should dispatch a wake when the downstream node may be waiting, and the status has changed to
+one that resolves a seek: `HaveData`, `EndOfStream`, or `Error`.
+
+Some nodes (i.e. AudioMixer) may also wake when moving away from a previously dispatched
+`EndOfStream`, so stale EOS state can be recovered after a seek or after new input becomes
+available.
+
+## Seeking
+
+Seeking is initiated downstream and forwarded upstream. For downstream nodes, a seek completes when
+the upstream node reports a status that resolves the new position. Usually that means `HaveData`,
+but `EndOfStream` or `Error` can also complete the wait.
+
+Sinks report pipeline status changes to their users. A user such as the playback manager can
+interpret a seek-resolving status as seek completion.
+
+`MovedPosition` is separate from seek completion. It tells downstream nodes that the upstream
+position moved and cached data may no longer be monotonic with future output. It often precedes the
+new data for a seek, but data may still be pending afterward. A pull that consumes `MovedPosition`
+must not also produce decoded data. The downstream caller should clear cached data that could now be
+out of order, then query status and wait or pull again.
+
+Internal seeks used by a producer to resume decoding may also produce `MovedPosition`. This is safe
+as long as downstream nodes consume the signal before accepting resumed output, clearing any cached
+data that could otherwise be out of order.
+
+## Decoded Data Producers
+
+Decoded data producers run demux and decode video/audio data into queues in order to absorb variance
+in processing for each individual coded frame.
+
+When a downstream pull consumes an item from the queue, the producer wakes its decoder thread so it
+can refill the queue. When the queue is full and no downstream activity occurs for the idle timeout,
+the producer may auto-suspend: it drops decoder state, remembers where decoding should resume, and
+waits for new demand.
+
+Both `status()` and `pull()` count as downstream activity for a suspended producer. This matters
+because downstream nodes often sleep after observing `Pending`; if only `pull()` woke a suspended
+producer, the pipeline could become stuck with downstream waiting for a wake while upstream waits
+for a pull.
+
+## Playback Manager
+
+`PlaybackManager` creates, modifies and drives the end-to-end playback pipeline. When media data is
+received, it will spawn a thread to determine what tracks are present, and connect the necessary
+nodes for playback to begin.
+
+Behavior is defined through state handlers derived from `PlaybackStateHandler`, with each overriding
+methods for various functions and signals to determine when to transition to another state. Upon
+entering or exiting, a state handler will drive changes to the pipeline, like pausing/resuming or
+seeking.
+
+The media time is derived from the audio sink when audio is used, otherwise `GenericTimeProvider`
+calculates time from the monotonic clock.
+
+## Audio Pipeline
+
+The usual audio path is:
+
+```text
+DecodedAudioProducer
+    -> AudioMixer
+    -> AudioTimeStretchProcessor
+    -> AudioPlaybackSink
+    -> PlaybackStream
+```
+
+`AudioPlaybackSink` owns a small queue of `AudioBlock`s pulled from upstream, which it fills on a
+separate thread to avoid blocking the `PlaybackStream` data callback. When its input reaches
+`EndOfStream`, it continues producing silence to allow the time to advance in case there is video
+data still available.
+
+`AudioMixer` sequences/mixes audio from multiple inputs into a single output. It emits silence for
+gaps, and pauses output when any input indicates data is not ready yet. When all inputs are at
+`EndOfStream`, the output becomes `EndOfStream` as well.
+
+`AudioTimeStretchProcessor` stretches audio without affecting pitch.
+
+## Video Pipeline
+
+The usual video path is:
+
+```text
+DecodedVideoProducer -> DisplayingVideoSink
+```
+
+`DisplayingVideoSink` keeps the current frame and the next frame. It advances when playback time
+passes the current frame's display interval.
+
+Video seeks are comparatively expensive, so the sink can satisfy some seeks locally when the
+requested timestamp is already covered by the current or next frame interval. This avoids
+unnecessary upstream seeks during scrubbing. The same optimization is less important for audio
+because it decodes exponentially faster.
+
+## Threading
+
+The media pipeline crosses several threads:
+
+- The main thread coordinates playback state and serializes cross-thread communication through its
+  event loop
+- Decoded data producers manage decoding threads to amortize the cost to decode each frame
+- The audio sink runs a processing thread to amortize the cost of mixing/stretching each audio block
+- The playback stream data callback is invoked from an (often system-managed) thread
+
+Avoid synchronous callback dispatch while holding locks unless the callee is known not to reenter
+the same pipeline. Deferred dispatch is often used to keep lock ordering simple.
+
+Wake handlers must be removed before disconnecting or destroying a node. An upstream node must never
+invoke a handler after downstream has cleared it.
+
 FILE: Documentation/Patterns.md
 # Coding Patterns
 
@@ -57592,6 +57764,7 @@ If you have any questions that are not answered here or in the [FAQ](FAQ.md), yo
 * [How to Add an IDL File](AddNewIDLFile.md)
 * [LibWeb Code Style & Patterns](LibWebPatterns.md)
 * [CSS Generated Files](CSSGeneratedFiles.md)
+* [Media Pipeline Design](MediaPipelineDesign.md)
 
 FILE: Documentation/RequestServerWireLogging.md
 # RequestServer wire-activity logging
@@ -58898,6 +59071,7 @@ add_subdirectory(LibJS)
 add_subdirectory(LibMain)
 add_subdirectory(LibRegex)
 add_subdirectory(LibRequests)
+add_subdirectory(LibSandbox)
 add_subdirectory(LibSync)
 add_subdirectory(LibSyntax)
 add_subdirectory(LibTLS)
@@ -102740,6 +102914,52 @@ Array<char, 4> format_to_8bit_compatible(u8 value)
 
 }
 
+// https://w3c.github.io/wcag/guidelines/22/#dfn-relative-luminance
+double Color::relative_luminance() const
+{
+    // the relative brightness of any point in a colorspace, normalized to 0 for darkest black and 1 for lightest
+    // white.
+
+    // Note 1:
+    // For the sRGB colorspace, the relative luminance of a color is defined as L = 0.2126 * R + 0.7152 * G +
+    // 0.0722 * B where R, G and B are defined as:
+    //   * if RsRGB <= 0.04045 then R = RsRGB/12.92 else R = ((RsRGB+0.055)/1.055) ^ 2.4
+    //   * if GsRGB <= 0.04045 then G = GsRGB/12.92 else G = ((GsRGB+0.055)/1.055) ^ 2.4
+    //   * if BsRGB <= 0.04045 then B = BsRGB/12.92 else B = ((BsRGB+0.055)/1.055) ^ 2.4
+    // and RsRGB, GsRGB, and BsRGB are defined as:
+    //   * RsRGB = R8bit/255
+    //   * GsRGB = G8bit/255
+    //   * BsRGB = B8bit/255
+    // The "^" character is the exponentiation operator. (Formula taken from [SRGB].)
+    auto linearized_srgb_component = [](u8 component) {
+        auto srgb_component = component / 255.0;
+        if (srgb_component <= 0.04045)
+            return srgb_component / 12.92;
+        return AK::pow((srgb_component + 0.055) / 1.055, 2.4);
+    };
+    return 0.2126 * linearized_srgb_component(red())
+        + 0.7152 * linearized_srgb_component(green())
+        + 0.0722 * linearized_srgb_component(blue());
+}
+
+// https://w3c.github.io/wcag/guidelines/22/#dfn-contrast-ratio
+double Color::contrast_ratio(Color const other) const
+{
+    // (L1 + 0.05) / (L2 + 0.05), where
+    //   * L1 is the relative luminance of the lighter of the colors, and
+    //   * L2 is the relative luminance of the darker of the colors.
+    auto l1 = relative_luminance();
+    auto l2 = other.relative_luminance();
+    auto darkest = min(l1, l2);
+    auto brightest = max(l1, l2);
+    return (brightest + 0.05) / (darkest + 0.05);
+}
+
+Color Color::suggested_foreground_color() const
+{
+    return contrast_ratio(Black) >= contrast_ratio(White) ? Black : White;
+}
+
 // https://www.w3.org/TR/css-color-4/#serializing-sRGB-values
 void Color::serialize_a_srgb_value(StringBuilder& builder) const
 {
@@ -103556,25 +103776,8 @@ public:
         return delta_alpha * delta_alpha / (2.0f * 255 * 255) + rgb_distance * alpha() * other.alpha() / (255 * 255);
     }
 
-    constexpr u8 luminosity() const
-    {
-        return round_to<u8>(red() * 0.2126f + green() * 0.7152f + blue() * 0.0722f);
-    }
-
-    constexpr float contrast_ratio(Color other)
-    {
-        auto l1 = luminosity();
-        auto l2 = other.luminosity();
-        auto darkest = min(l1, l2) / 255.;
-        auto brightest = max(l1, l2) / 255.;
-        return (brightest + 0.05) / (darkest + 0.05);
-    }
-
-    constexpr Color to_grayscale() const
-    {
-        auto gray = luminosity();
-        return Color(gray, gray, gray, alpha());
-    }
+    double relative_luminance() const;
+    double contrast_ratio(Color other) const;
 
     constexpr Color sepia(float amount = 1.0f) const
     {
@@ -103695,10 +103898,7 @@ public:
         return Color(out_r, out_g, out_b);
     }
 
-    constexpr Color suggested_foreground_color() const
-    {
-        return luminosity() < 128 ? Color::White : Color::Black;
-    }
+    Color suggested_foreground_color() const;
 
 private:
     constexpr explicit Color(BGRA8888 argb)
@@ -106859,23 +107059,13 @@ SkFont Font::skia_font(float scale) const
     return sk_font;
 }
 
-Font::ShapingCache::~ShapingCache()
-{
-    clear();
-}
+Font::ShapingCache::~ShapingCache() = default;
 
 void Font::ShapingCache::clear()
 {
-    for (auto& it : map) {
-        hb_buffer_destroy(it.value);
-    }
     map.clear();
-    for (auto& buffer : single_ascii_character_map) {
-        if (buffer) {
-            hb_buffer_destroy(buffer);
-            buffer = nullptr;
-        }
-    }
+    for (auto& slot : single_ascii_character_map)
+        slot = nullptr;
 }
 
 static bool hb_face_has_table(hb_face_t* face, hb_tag_t tag)
@@ -106938,6 +107128,8 @@ FILE: Libraries/LibGfx/Font/Font.h
 
 #include <AK/AtomicRefCounted.h>
 #include <AK/FlyString.h>
+#include <AK/HashMap.h>
+#include <AK/OwnPtr.h>
 #include <AK/RefPtr.h>
 #include <AK/Utf16String.h>
 #include <LibGfx/Font/Font.h>
@@ -106949,6 +107141,16 @@ struct hb_font_t;
 struct hb_buffer_t;
 
 namespace Gfx {
+
+struct ShapedGlyphs;
+
+struct ShapingCacheKey {
+    Utf16String text;
+    u8 text_type { 0 };
+    u32 letter_spacing_bit_pattern { 0 };
+
+    bool operator==(ShapingCacheKey const&) const = default;
+};
 
 struct FontPixelMetrics {
     float x_height { 0 };
@@ -107006,8 +107208,8 @@ public:
     ShapeFeatures const& features() const { return m_shape_features; }
 
     struct ShapingCache {
-        HashMap<Utf16String, hb_buffer_t*> map;
-        hb_buffer_t* single_ascii_character_map[128] { nullptr };
+        HashMap<ShapingCacheKey, OwnPtr<ShapedGlyphs>> map;
+        OwnPtr<ShapedGlyphs> single_ascii_character_map[128];
 
         ~ShapingCache();
         void clear();
@@ -107034,6 +107236,18 @@ private:
     FontPixelMetrics m_pixel_metrics;
 
     float m_pixel_size { 0.0f };
+};
+
+}
+
+namespace AK {
+
+template<>
+struct Traits<Gfx::ShapingCacheKey> : public DefaultTraits<Gfx::ShapingCacheKey> {
+    static unsigned hash(Gfx::ShapingCacheKey const& key)
+    {
+        return pair_int_hash(key.text.hash(), pair_int_hash(key.text_type, key.letter_spacing_bit_pattern));
+    }
 };
 
 }
@@ -123674,6 +123888,8 @@ FILE: Libraries/LibGfx/TextLayout.cpp
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/BitCast.h>
+#include <AK/HashFunctions.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
 #include <LibGfx/Font/Font.h>
@@ -123862,41 +124078,18 @@ static hb_buffer_t* setup_text_shaping(Utf16View const& string, Font const& font
     return buffer;
 }
 
-NonnullRefPtr<GlyphRun> shape_text(FloatPoint baseline_start, float letter_spacing, Utf16View const& string, Font const& font, GlyphRun::TextType text_type)
+static NonnullOwnPtr<ShapedGlyphs> build_origin_relative_shape(Utf16View const& string, Font const& font, GlyphRun::TextType text_type, float letter_spacing)
 {
     auto const& metrics = font.pixel_metrics();
-    auto& shaping_cache = font.shaping_cache();
+    auto* buffer = setup_text_shaping(string, font, text_type);
 
-    // FIXME: The cache currently grows unbounded. We should have some limit and LRU mechanism.
-    auto get_or_create_buffer = [&] -> hb_buffer_t* {
-        if (string.length_in_code_units() == 1) {
-            auto code_unit = string.code_unit_at(0);
-            if (code_unit < 128) {
-                auto*& cache_slot = shaping_cache.single_ascii_character_map[code_unit];
-                if (!cache_slot) {
-                    cache_slot = setup_text_shaping(string, font, text_type);
-                }
-                return cache_slot;
-            }
-        }
-        if (auto it = shaping_cache.map.find(
-                string.hash(), [&](auto& candidate) { return candidate.key == string; });
-            it != shaping_cache.map.end()) {
-            return it->value;
-        }
-        auto* buffer = setup_text_shaping(string, font, text_type);
-        shaping_cache.map.set(Utf16String::from_utf16(string), buffer);
-        return buffer;
-    };
-
-    hb_buffer_t* buffer = get_or_create_buffer();
     u32 glyph_count;
     auto const* glyph_info = hb_buffer_get_glyph_infos(buffer, &glyph_count);
     auto const* positions = hb_buffer_get_glyph_positions(buffer, &glyph_count);
 
-    Vector<DrawGlyph> glyph_run;
-    glyph_run.ensure_capacity(glyph_count);
-    FloatPoint point = baseline_start;
+    Vector<DrawGlyph> glyphs;
+    glyphs.ensure_capacity(glyph_count);
+    FloatPoint point;
 
     // We track the code unit length rather than just the code unit offset because LibWeb may later collapse glyph runs.
     // Updating the offset of each glyph gets tricky when handling text direction (LTR/RTL). So rather than doing that,
@@ -123920,7 +124113,7 @@ NonnullRefPtr<GlyphRun> shape_text(FloatPoint baseline_start, float letter_spaci
             - FloatPoint { 0, metrics.ascent }
             + FloatPoint { positions[i].x_offset, positions[i].y_offset } / text_shaping_resolution;
 
-        glyph_run.unchecked_append({
+        glyphs.unchecked_append({
             .position = position,
             .length_in_code_units = glyph_length_in_code_units(i),
             .glyph_width = positions[i].x_advance / text_shaping_resolution + letter_spacing,
@@ -123934,7 +124127,52 @@ NonnullRefPtr<GlyphRun> shape_text(FloatPoint baseline_start, float letter_spaci
         point.translate_by(letter_spacing, 0);
     }
 
-    return adopt_ref(*new GlyphRun(move(glyph_run), font, text_type, point.x() - baseline_start.x()));
+    hb_buffer_destroy(buffer);
+
+    return make<ShapedGlyphs>(move(glyphs), point.x());
+}
+
+NonnullRefPtr<GlyphRun> shape_text(FloatPoint baseline_start, float letter_spacing, Utf16View const& string, Font const& font, GlyphRun::TextType text_type)
+{
+    auto& shaping_cache = font.shaping_cache();
+
+    auto build_glyph_run = [&](ShapedGlyphs const& shape) -> NonnullRefPtr<GlyphRun> {
+        Vector<DrawGlyph> glyphs = shape.glyphs;
+        if (!baseline_start.is_zero()) {
+            for (auto& glyph : glyphs)
+                glyph.position.translate_by(baseline_start);
+        }
+        return adopt_ref(*new GlyphRun(move(glyphs), font, text_type, shape.width));
+    };
+
+    // FIXME: The cache currently grows unbounded. We should have some limit and LRU mechanism.
+    if (string.length_in_code_units() == 1 && letter_spacing == 0.f && text_type == GlyphRun::TextType::Common) {
+        auto code_unit = string.code_unit_at(0);
+        if (code_unit < 128) {
+            auto& cache_slot = shaping_cache.single_ascii_character_map[code_unit];
+            if (!cache_slot)
+                cache_slot = build_origin_relative_shape(string, font, text_type, letter_spacing);
+            return build_glyph_run(*cache_slot);
+        }
+    }
+
+    auto text_type_bits = static_cast<u8>(to_underlying(text_type));
+    auto letter_spacing_bit_pattern = bit_cast<u32>(letter_spacing);
+    auto key_hash = pair_int_hash(string.hash(), pair_int_hash(text_type_bits, letter_spacing_bit_pattern));
+
+    if (auto it = shaping_cache.map.find(key_hash, [&](auto const& candidate) {
+            return candidate.key.text_type == text_type_bits
+                && candidate.key.letter_spacing_bit_pattern == letter_spacing_bit_pattern
+                && candidate.key.text == string;
+        });
+        it != shaping_cache.map.end()) {
+        return build_glyph_run(*it->value);
+    }
+
+    auto shape = build_origin_relative_shape(string, font, text_type, letter_spacing);
+    auto run = build_glyph_run(*shape);
+    shaping_cache.map.set({ Utf16String::from_utf16(string), text_type_bits, letter_spacing_bit_pattern }, move(shape));
+    return run;
 }
 
 float measure_text_width(Utf16View const& string, Font const& font, float letter_spacing)
@@ -123985,6 +124223,11 @@ struct DrawGlyph {
     size_t length_in_code_units { 0 };
     float glyph_width { 0.0 };
     u32 glyph_id { 0 };
+};
+
+struct ShapedGlyphs {
+    Vector<DrawGlyph> glyphs;
+    float width { 0 };
 };
 
 class GlyphRun : public AtomicRefCounted<GlyphRun> {
@@ -154889,8 +155132,11 @@ static bool shape_has_enumerable_string_property(Shape const& shape)
 {
     bool has_enumerable_string_property = false;
     shape.for_each_property_in_insertion_order([&](auto const& property_key, auto const& metadata) {
-        if (property_key.is_string() && metadata.attributes.is_enumerable())
+        if (property_key.is_string() && metadata.attributes.is_enumerable()) {
             has_enumerable_string_property = true;
+            return IterationDecision::Break;
+        }
+        return IterationDecision::Continue;
     });
     return has_enumerable_string_property;
 }
@@ -183078,17 +183324,6 @@ void DescriptorArray::remove(PropertyKey const& property_key, u32 descriptor_cou
     }
 }
 
-void DescriptorArray::for_each_in_insertion_order(Function<void(PropertyKey const&, PropertyMetadata const&)> const& callback, u32 descriptor_count) const
-{
-    VERIFY(descriptor_count <= m_entry_indices_by_enum_index.size());
-    for (u32 enum_index = 0; enum_index < descriptor_count; ++enum_index) {
-        auto const& entry = m_entries[m_entry_indices_by_enum_index[enum_index]];
-        VERIFY(entry.enum_index == enum_index);
-        auto metadata = entry.metadata();
-        callback(entry.property_key, metadata);
-    }
-}
-
 void DescriptorArray::visit_edges(Visitor& visitor)
 {
     Base::visit_edges(visitor);
@@ -183157,7 +183392,7 @@ FILE: Libraries/LibJS/Runtime/DescriptorArray.h
 
 #pragma once
 
-#include <AK/Function.h>
+#include <AK/IterationDecision.h>
 #include <AK/NumericLimits.h>
 #include <AK/Vector.h>
 #include <LibJS/Export.h>
@@ -183202,7 +183437,22 @@ public:
     void set_attributes(PropertyKey const&, PropertyAttributes, u32 descriptor_count);
     void remove(PropertyKey const&, u32 descriptor_count);
 
-    void for_each_in_insertion_order(Function<void(PropertyKey const&, PropertyMetadata const&)> const&, u32 descriptor_count) const;
+    template<typename Callback>
+    void for_each_in_insertion_order(Callback&& callback, u32 descriptor_count) const
+    {
+        VERIFY(descriptor_count <= m_entry_indices_by_enum_index.size());
+        for (u32 enum_index = 0; enum_index < descriptor_count; ++enum_index) {
+            auto const& entry = m_entries[m_entry_indices_by_enum_index[enum_index]];
+            VERIFY(entry.enum_index == enum_index);
+            auto metadata = entry.metadata();
+            if constexpr (IsSame<IterationDecision, decltype(callback(entry.property_key, metadata))>) {
+                if (callback(entry.property_key, metadata) == IterationDecision::Break)
+                    return;
+            } else {
+                callback(entry.property_key, metadata);
+            }
+        }
+    }
 
 private:
     virtual void visit_edges(Visitor&) override;
@@ -210195,6 +210445,42 @@ ThrowCompletionOr<void> Object::copy_data_properties(VM& vm, Value source, HashT
     // 2. Let from be ! ToObject(source).
     auto from = MUST(source.to_object(vm));
 
+    // OPTIMIZATION: For ordinary objects we can iterate the shape directly and read values by storage
+    //               offset, avoiding repeated property lookups through DescriptorArray::find.
+    if (from->eligible_for_own_property_enumeration_fast_path()
+        && !from->has_intrinsic_accessors()
+        && !from->may_interfere_with_indexed_property_access()
+        && excluded_values.is_empty()
+        && from->indexed_storage_kind() <= IndexedStorageKind::Packed) {
+
+        bool has_accessors = false;
+        from->shape().for_each_property_in_insertion_order([&](auto const&, auto const& metadata) {
+            if (metadata.attributes.is_enumerable() && from->get_direct(metadata.offset).is_accessor()) {
+                has_accessors = true;
+                return IterationDecision::Break;
+            }
+            return IterationDecision::Continue;
+        });
+
+        if (!has_accessors) {
+            for (u32 i = 0; i < from->indexed_array_like_size(); ++i) {
+                if (!excluded_keys.is_empty() && excluded_keys.contains(PropertyKey(i)))
+                    continue;
+                MUST(create_data_property_or_throw(PropertyKey(i), from->m_indexed_elements[i]));
+            }
+
+            from->shape().for_each_property_in_insertion_order([&](auto const& property_key, auto const& metadata) {
+                if (!metadata.attributes.is_enumerable())
+                    return;
+                if (!excluded_keys.is_empty() && excluded_keys.contains(property_key))
+                    return;
+                MUST(create_data_property_or_throw(property_key, from->get_direct(metadata.offset)));
+            });
+
+            return {};
+        }
+    }
+
     // 3. Let keys be ? from.[[OwnPropertyKeys]]().
     auto keys = TRY(from->internal_own_property_keys());
 
@@ -224417,18 +224703,6 @@ Optional<PropertyMetadata> Shape::lookup(PropertyKey const& property_key) const
     return descriptors()->lookup(property_key, m_property_count);
 }
 
-void Shape::for_each_property_in_insertion_order(Function<void(PropertyKey const&, PropertyMetadata const&)> const& callback) const
-{
-    if (m_dictionary) {
-        for (auto const& [property_key, metadata] : property_table())
-            callback(property_key, metadata);
-        return;
-    }
-    if (!descriptors())
-        return;
-    descriptors()->for_each_in_insertion_order(callback, m_property_count);
-}
-
 void Shape::ensure_descriptor_array()
 {
     VERIFY(!m_dictionary);
@@ -224635,6 +224909,7 @@ FILE: Libraries/LibJS/Runtime/Shape.h
 #pragma once
 
 #include <AK/HashMap.h>
+#include <AK/IterationDecision.h>
 #include <AK/OwnPtr.h>
 #include <AK/StringView.h>
 #include <AK/Vector.h>
@@ -224718,7 +224993,24 @@ public:
     Object const* prototype() const { return m_prototype; }
 
     Optional<PropertyMetadata> lookup(PropertyKey const&) const;
-    void for_each_property_in_insertion_order(Function<void(PropertyKey const&, PropertyMetadata const&)> const&) const;
+    template<typename Callback>
+    void for_each_property_in_insertion_order(Callback&& callback) const
+    {
+        if (m_dictionary) {
+            for (auto const& [property_key, metadata] : property_table()) {
+                if constexpr (IsSame<IterationDecision, decltype(callback(property_key, metadata))>) {
+                    if (callback(property_key, metadata) == IterationDecision::Break)
+                        return;
+                } else {
+                    callback(property_key, metadata);
+                }
+            }
+            return;
+        }
+        if (!descriptors())
+            return;
+        descriptors()->for_each_in_insertion_order(forward<Callback>(callback), m_property_count);
+    }
     u32 property_count() const { return m_property_count; }
 
     void set_prototype_without_transition(Object* new_prototype);
@@ -328986,6 +329278,1454 @@ private:
 
 }
 
+FILE: Libraries/LibSandbox/CMakeLists.txt
+set(SOURCES
+    Sandbox.cpp
+)
+
+if (LINUX)
+    list(APPEND SOURCES
+        Seccomp.cpp
+    )
+endif()
+
+ladybird_lib(LibSandbox sandbox)
+
+FILE: Libraries/LibSandbox/Sandbox.cpp
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <LibSandbox/Sandbox.h>
+
+#if defined(AK_OS_LINUX)
+#    include <AK/LexicalPath.h>
+#    include <AK/ScopeGuard.h>
+#    include <AK/Vector.h>
+#    include <errno.h>
+#    include <fcntl.h>
+#    include <linux/landlock.h>
+#    include <sys/prctl.h>
+#    include <sys/stat.h>
+#    include <sys/syscall.h>
+#    include <unistd.h>
+#endif
+
+#if defined(__GLIBC__)
+#    include <malloc.h>
+#endif
+
+namespace Sandbox {
+
+ErrorOr<void> install_no_new_privileges()
+{
+#if defined(AK_OS_LINUX)
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
+        return Error::from_syscall("prctl(PR_SET_NO_NEW_PRIVS)"sv, errno);
+#endif
+    return {};
+}
+
+ErrorOr<void> configure_runtime()
+{
+#if defined(AK_OS_LINUX) && defined(__GLIBC__) && defined(M_ARENA_MAX) && !defined(HAS_ADDRESS_SANITIZER)
+    if (mallopt(M_ARENA_MAX, 4) == 0)
+        return Error::from_string_literal("mallopt(M_ARENA_MAX) failed");
+#endif
+    return {};
+}
+
+ErrorOr<void> add_landlock_path_if_exists(Vector<LandlockPath>& paths, StringView path, LandlockPath::Access access)
+{
+#if defined(AK_OS_LINUX)
+    auto path_bytes = path.to_byte_string();
+
+    struct stat statbuf;
+    if (stat(path_bytes.characters(), &statbuf) < 0) {
+        if (errno == ENOENT)
+            return {};
+        return Error::from_syscall("stat"sv, errno);
+    }
+
+    if (!S_ISDIR(statbuf.st_mode))
+        path_bytes = LexicalPath::dirname(path_bytes);
+
+    for (auto const& existing_path : paths) {
+        if (existing_path.access == access && existing_path.path == path_bytes)
+            return {};
+    }
+
+    TRY(paths.try_append({ move(path_bytes), access }));
+#else
+    (void)paths;
+    (void)path;
+    (void)access;
+#endif
+    return {};
+}
+
+ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath> paths)
+{
+#if defined(AK_OS_LINUX) && defined(__NR_landlock_create_ruleset) && defined(__NR_landlock_add_rule) && defined(__NR_landlock_restrict_self)
+    auto landlock_abi = syscall(__NR_landlock_create_ruleset, nullptr, 0, LANDLOCK_CREATE_RULESET_VERSION);
+    if (landlock_abi < 0) {
+        if (errno == ENOSYS || errno == EOPNOTSUPP || errno == EINVAL)
+            return {};
+        return Error::from_syscall("landlock_create_ruleset(LANDLOCK_CREATE_RULESET_VERSION)"sv, errno);
+    }
+    if (landlock_abi == 0)
+        return {};
+
+    landlock_ruleset_attr ruleset_attributes {};
+    ruleset_attributes.handled_access_fs = LANDLOCK_ACCESS_FS_EXECUTE
+        | LANDLOCK_ACCESS_FS_WRITE_FILE
+        | LANDLOCK_ACCESS_FS_READ_FILE
+        | LANDLOCK_ACCESS_FS_READ_DIR
+        | LANDLOCK_ACCESS_FS_REMOVE_DIR
+        | LANDLOCK_ACCESS_FS_REMOVE_FILE
+        | LANDLOCK_ACCESS_FS_MAKE_CHAR
+        | LANDLOCK_ACCESS_FS_MAKE_DIR
+        | LANDLOCK_ACCESS_FS_MAKE_REG
+        | LANDLOCK_ACCESS_FS_MAKE_SOCK
+        | LANDLOCK_ACCESS_FS_MAKE_FIFO
+        | LANDLOCK_ACCESS_FS_MAKE_BLOCK
+        | LANDLOCK_ACCESS_FS_MAKE_SYM;
+
+#    ifdef LANDLOCK_ACCESS_FS_REFER
+    if (landlock_abi >= 2)
+        ruleset_attributes.handled_access_fs |= LANDLOCK_ACCESS_FS_REFER;
+#    endif
+#    ifdef LANDLOCK_ACCESS_FS_TRUNCATE
+    if (landlock_abi >= 3)
+        ruleset_attributes.handled_access_fs |= LANDLOCK_ACCESS_FS_TRUNCATE;
+#    endif
+#    if defined(LANDLOCK_ACCESS_NET_BIND_TCP) && defined(LANDLOCK_ACCESS_NET_CONNECT_TCP)
+    auto ruleset_attributes_size = offsetof(landlock_ruleset_attr, handled_access_net);
+#    else
+    auto ruleset_attributes_size = sizeof(ruleset_attributes);
+#    endif
+    auto ruleset_fd = syscall(__NR_landlock_create_ruleset, &ruleset_attributes, ruleset_attributes_size, 0);
+    if (ruleset_fd < 0)
+        return Error::from_syscall("landlock_create_ruleset"sv, errno);
+
+    ArmedScopeGuard close_ruleset_fd = [&] {
+        close(static_cast<int>(ruleset_fd));
+    };
+
+    for (auto const& landlock_path : paths) {
+        auto path_fd = open(landlock_path.path.characters(), O_PATH | O_CLOEXEC);
+        if (path_fd < 0)
+            return Error::from_syscall("open(O_PATH)"sv, errno);
+
+        ArmedScopeGuard close_path_fd = [&] {
+            close(path_fd);
+        };
+
+        landlock_path_beneath_attr path_beneath {};
+        path_beneath.allowed_access = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
+        if (landlock_path.access == LandlockPath::Access::ReadAndExecute)
+            path_beneath.allowed_access |= LANDLOCK_ACCESS_FS_EXECUTE;
+        if (landlock_path.access == LandlockPath::Access::ReadWrite) {
+            path_beneath.allowed_access |= LANDLOCK_ACCESS_FS_WRITE_FILE
+                | LANDLOCK_ACCESS_FS_REMOVE_DIR
+                | LANDLOCK_ACCESS_FS_REMOVE_FILE
+                | LANDLOCK_ACCESS_FS_MAKE_DIR
+                | LANDLOCK_ACCESS_FS_MAKE_REG
+                | LANDLOCK_ACCESS_FS_MAKE_SOCK
+                | LANDLOCK_ACCESS_FS_MAKE_FIFO;
+#    ifdef LANDLOCK_ACCESS_FS_REFER
+            if (landlock_abi >= 2)
+                path_beneath.allowed_access |= LANDLOCK_ACCESS_FS_REFER;
+#    endif
+#    ifdef LANDLOCK_ACCESS_FS_TRUNCATE
+            if (landlock_abi >= 3)
+                path_beneath.allowed_access |= LANDLOCK_ACCESS_FS_TRUNCATE;
+#    endif
+        }
+        path_beneath.parent_fd = path_fd;
+        if (syscall(__NR_landlock_add_rule, ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &path_beneath, 0) < 0)
+            return Error::from_syscall("landlock_add_rule"sv, errno);
+    }
+
+    if (syscall(__NR_landlock_restrict_self, ruleset_fd, 0) < 0)
+        return Error::from_syscall("landlock_restrict_self"sv, errno);
+#else
+    (void)paths;
+#endif
+
+    return {};
+}
+
+ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<StringView> readable_paths)
+{
+    Vector<LandlockPath> paths;
+    for (auto readable_path : readable_paths)
+        TRY(paths.try_append({ readable_path.to_byte_string(), LandlockPath::Access::ReadOnly }));
+    return restrict_filesystem_with_landlock(paths.span());
+}
+
+}
+
+FILE: Libraries/LibSandbox/Sandbox.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/ByteString.h>
+#include <AK/Error.h>
+#include <AK/Span.h>
+#include <AK/StringView.h>
+#include <AK/Vector.h>
+
+namespace Sandbox {
+
+struct LandlockPath {
+    enum class Access {
+        ReadOnly,
+        ReadAndExecute,
+        ReadWrite,
+    };
+
+    ByteString path;
+    Access access { Access::ReadOnly };
+};
+
+[[nodiscard]] ErrorOr<void> install_no_new_privileges();
+[[nodiscard]] ErrorOr<void> configure_runtime();
+[[nodiscard]] ErrorOr<void> add_landlock_path_if_exists(Vector<LandlockPath>& paths, StringView path, LandlockPath::Access);
+[[nodiscard]] ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath>);
+[[nodiscard]] ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<StringView> readable_paths = {});
+
+}
+
+FILE: Libraries/LibSandbox/Seccomp.cpp
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <LibSandbox/Seccomp.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/audit.h>
+#include <linux/sched.h>
+#include <linux/seccomp.h>
+#include <signal.h>
+#include <stddef.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
+#include <sys/ucontext.h>
+#include <unistd.h>
+
+namespace Sandbox {
+
+namespace {
+
+#if defined(__x86_64__)
+static constexpr u32 audit_architecture = AUDIT_ARCH_X86_64;
+#elif defined(__aarch64__)
+static constexpr u32 audit_architecture = AUDIT_ARCH_AARCH64;
+#elif defined(__riscv) && __riscv_xlen == 64
+static constexpr u32 audit_architecture = AUDIT_ARCH_RISCV64;
+#else
+#    error "Add 64-bit seccomp audit architecture for this Linux architecture"
+#endif
+
+static constexpr u32 thread_clone_required_flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+static constexpr u32 thread_clone_allowed_flags = thread_clone_required_flags
+    | CLONE_SYSVSEM
+    | CLONE_SETTLS
+    | CLONE_PARENT_SETTID
+    | CLONE_CHILD_CLEARTID
+    | CLONE_DETACHED
+    | CLONE_CHILD_SETTID;
+static constexpr u32 vfork_clone_flags = CLONE_VM | CLONE_VFORK | SIGCHLD;
+
+#ifdef O_LARGEFILE
+static constexpr unsigned read_only_open_flags = O_CLOEXEC | O_LARGEFILE;
+#else
+static constexpr unsigned read_only_open_flags = O_CLOEXEC;
+#endif
+
+#define SECCOMP_LOAD_SYSCALL_NR BPF_STMT(BPF_LD | BPF_W | BPF_ABS, static_cast<unsigned int>(offsetof(seccomp_data, nr)))
+#define SECCOMP_LOAD_ARCHITECTURE BPF_STMT(BPF_LD | BPF_W | BPF_ABS, static_cast<unsigned int>(offsetof(seccomp_data, arch)))
+#define SECCOMP_LOAD_ARGUMENT(index) BPF_STMT(BPF_LD | BPF_W | BPF_ABS, static_cast<unsigned int>(offsetof(seccomp_data, args[(index)])))
+#define SECCOMP_ALLOW BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)
+#define SECCOMP_TRAP BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP)
+#define SECCOMP_ERRNO(error) BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ((error) & SECCOMP_RET_DATA))
+#define SECCOMP_ALLOW_NOTHING BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0)
+#define SECCOMP_APPEND_ALLOW_SYSCALL(policy, name)                               \
+    do {                                                                         \
+        (policy).append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_##name, 0, 1)); \
+        (policy).append(SECCOMP_ALLOW);                                          \
+    } while (0)
+#define SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(policy, name) \
+    IF_DEFINED_##name(SECCOMP_APPEND_ALLOW_SYSCALL(policy, name), (policy).append(SECCOMP_ALLOW_NOTHING))
+
+#define IF_DEFINED_accept(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_accept4(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_access(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_bind(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_brk(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_clock_getres(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_clock_gettime(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_clock_nanosleep(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_clone(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_clone3(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_close(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_connect(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_dup(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_dup3(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_epoll_create1(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_epoll_ctl(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_epoll_pwait(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_epoll_wait(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_eventfd2(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_execve(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_execveat(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_exit(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_exit_group(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_fcntl(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_fcntl64(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_fdatasync(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_flock(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_fstat(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_fsync(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_ftruncate(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_futex(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_futex_time64(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_getdents64(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_getcpu(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_getegid(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_geteuid(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_getgid(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_getpeername(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_getpid(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_getrandom(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_getrlimit(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_getrusage(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_getsockname(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_getsockopt(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_gettid(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_gettimeofday(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_getuid(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_ioctl(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_link(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_linkat(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_listen(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_lseek(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_madvise(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_membarrier(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_memfd_create(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_mkdir(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_mkdirat(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_mmap(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_mmap2(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_mprotect(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_mremap(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_munmap(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_nanosleep(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_newfstatat(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_open(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_openat(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_pipe2(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_poll(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_pread64(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_ppoll(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_prctl(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_prlimit64(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_pselect6(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_pwrite64(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_read(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_readlink(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_readlinkat(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_rename(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_renameat(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_renameat2(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_recvfrom(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_recvmmsg(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_recvmsg(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_restart_syscall(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_rmdir(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_rseq(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_rt_sigaction(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_rt_sigprocmask(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_rt_sigreturn(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_sched_getaffinity(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_sched_yield(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_sendfile(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_sendmmsg(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_sendmsg(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_sendto(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_set_robust_list(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_set_tid_address(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_setsockopt(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_sigaltstack(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_shutdown(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_socket(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_socketpair(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_statx(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_sysinfo(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_tgkill(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_unlink(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_unlinkat(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_umask(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_uname(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_wait4(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_waitid(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_write(if_defined, if_not_defined) if_defined
+
+#ifndef __NR_accept
+#    undef IF_DEFINED_accept
+#    define IF_DEFINED_accept(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_accept4
+#    undef IF_DEFINED_accept4
+#    define IF_DEFINED_accept4(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_access
+#    undef IF_DEFINED_access
+#    define IF_DEFINED_access(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_bind
+#    undef IF_DEFINED_bind
+#    define IF_DEFINED_bind(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_connect
+#    undef IF_DEFINED_connect
+#    define IF_DEFINED_connect(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_clock_getres
+#    undef IF_DEFINED_clock_getres
+#    define IF_DEFINED_clock_getres(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_clock_gettime
+#    undef IF_DEFINED_clock_gettime
+#    define IF_DEFINED_clock_gettime(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_clock_nanosleep
+#    undef IF_DEFINED_clock_nanosleep
+#    define IF_DEFINED_clock_nanosleep(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_clone3
+#    undef IF_DEFINED_clone3
+#    define IF_DEFINED_clone3(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_dup3
+#    undef IF_DEFINED_dup3
+#    define IF_DEFINED_dup3(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_epoll_create1
+#    undef IF_DEFINED_epoll_create1
+#    define IF_DEFINED_epoll_create1(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_epoll_ctl
+#    undef IF_DEFINED_epoll_ctl
+#    define IF_DEFINED_epoll_ctl(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_epoll_pwait
+#    undef IF_DEFINED_epoll_pwait
+#    define IF_DEFINED_epoll_pwait(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_epoll_wait
+#    undef IF_DEFINED_epoll_wait
+#    define IF_DEFINED_epoll_wait(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_eventfd2
+#    undef IF_DEFINED_eventfd2
+#    define IF_DEFINED_eventfd2(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_execve
+#    undef IF_DEFINED_execve
+#    define IF_DEFINED_execve(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_execveat
+#    undef IF_DEFINED_execveat
+#    define IF_DEFINED_execveat(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_fcntl64
+#    undef IF_DEFINED_fcntl64
+#    define IF_DEFINED_fcntl64(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_fdatasync
+#    undef IF_DEFINED_fdatasync
+#    define IF_DEFINED_fdatasync(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_flock
+#    undef IF_DEFINED_flock
+#    define IF_DEFINED_flock(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_fstat
+#    undef IF_DEFINED_fstat
+#    define IF_DEFINED_fstat(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_fsync
+#    undef IF_DEFINED_fsync
+#    define IF_DEFINED_fsync(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_futex_time64
+#    undef IF_DEFINED_futex_time64
+#    define IF_DEFINED_futex_time64(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_getdents64
+#    undef IF_DEFINED_getdents64
+#    define IF_DEFINED_getdents64(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_link
+#    undef IF_DEFINED_link
+#    define IF_DEFINED_link(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_linkat
+#    undef IF_DEFINED_linkat
+#    define IF_DEFINED_linkat(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_listen
+#    undef IF_DEFINED_listen
+#    define IF_DEFINED_listen(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_getcpu
+#    undef IF_DEFINED_getcpu
+#    define IF_DEFINED_getcpu(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_getrandom
+#    undef IF_DEFINED_getrandom
+#    define IF_DEFINED_getrandom(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_membarrier
+#    undef IF_DEFINED_membarrier
+#    define IF_DEFINED_membarrier(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_memfd_create
+#    undef IF_DEFINED_memfd_create
+#    define IF_DEFINED_memfd_create(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_mkdir
+#    undef IF_DEFINED_mkdir
+#    define IF_DEFINED_mkdir(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_mkdirat
+#    undef IF_DEFINED_mkdirat
+#    define IF_DEFINED_mkdirat(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_mmap2
+#    undef IF_DEFINED_mmap2
+#    define IF_DEFINED_mmap2(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_pipe2
+#    undef IF_DEFINED_pipe2
+#    define IF_DEFINED_pipe2(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_newfstatat
+#    undef IF_DEFINED_newfstatat
+#    define IF_DEFINED_newfstatat(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_open
+#    undef IF_DEFINED_open
+#    define IF_DEFINED_open(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_openat
+#    undef IF_DEFINED_openat
+#    define IF_DEFINED_openat(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_poll
+#    undef IF_DEFINED_poll
+#    define IF_DEFINED_poll(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_pread64
+#    undef IF_DEFINED_pread64
+#    define IF_DEFINED_pread64(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_readlink
+#    undef IF_DEFINED_readlink
+#    define IF_DEFINED_readlink(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_readlinkat
+#    undef IF_DEFINED_readlinkat
+#    define IF_DEFINED_readlinkat(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_rename
+#    undef IF_DEFINED_rename
+#    define IF_DEFINED_rename(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_renameat
+#    undef IF_DEFINED_renameat
+#    define IF_DEFINED_renameat(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_renameat2
+#    undef IF_DEFINED_renameat2
+#    define IF_DEFINED_renameat2(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_rmdir
+#    undef IF_DEFINED_rmdir
+#    define IF_DEFINED_rmdir(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_ppoll
+#    undef IF_DEFINED_ppoll
+#    define IF_DEFINED_ppoll(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_prlimit64
+#    undef IF_DEFINED_prlimit64
+#    define IF_DEFINED_prlimit64(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_pselect6
+#    undef IF_DEFINED_pselect6
+#    define IF_DEFINED_pselect6(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_pwrite64
+#    undef IF_DEFINED_pwrite64
+#    define IF_DEFINED_pwrite64(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_recvmmsg
+#    undef IF_DEFINED_recvmmsg
+#    define IF_DEFINED_recvmmsg(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_restart_syscall
+#    undef IF_DEFINED_restart_syscall
+#    define IF_DEFINED_restart_syscall(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_rseq
+#    undef IF_DEFINED_rseq
+#    define IF_DEFINED_rseq(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_sendmmsg
+#    undef IF_DEFINED_sendmmsg
+#    define IF_DEFINED_sendmmsg(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_sendfile
+#    undef IF_DEFINED_sendfile
+#    define IF_DEFINED_sendfile(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_sigaltstack
+#    undef IF_DEFINED_sigaltstack
+#    define IF_DEFINED_sigaltstack(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_socket
+#    undef IF_DEFINED_socket
+#    define IF_DEFINED_socket(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_shutdown
+#    undef IF_DEFINED_shutdown
+#    define IF_DEFINED_shutdown(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_statx
+#    undef IF_DEFINED_statx
+#    define IF_DEFINED_statx(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_unlink
+#    undef IF_DEFINED_unlink
+#    define IF_DEFINED_unlink(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_unlinkat
+#    undef IF_DEFINED_unlinkat
+#    define IF_DEFINED_unlinkat(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_sysinfo
+#    undef IF_DEFINED_sysinfo
+#    define IF_DEFINED_sysinfo(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_umask
+#    undef IF_DEFINED_umask
+#    define IF_DEFINED_umask(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_wait4
+#    undef IF_DEFINED_wait4
+#    define IF_DEFINED_wait4(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_waitid
+#    undef IF_DEFINED_waitid
+#    define IF_DEFINED_waitid(if_defined, if_not_defined) if_not_defined
+#endif
+
+static size_t safe_string_length(char const* string)
+{
+    size_t length = 0;
+    while (string[length] != '\0')
+        ++length;
+    return length;
+}
+
+static void write_bytes(char const* string, size_t length)
+{
+    while (length > 0) {
+        auto written = write(STDERR_FILENO, string, length);
+        if (written <= 0)
+            return;
+        string += written;
+        length -= static_cast<size_t>(written);
+    }
+}
+
+static void write_string(char const* string)
+{
+    write_bytes(string, safe_string_length(string));
+}
+
+static void write_unsigned(u64 value)
+{
+    char buffer[20];
+    size_t index = sizeof(buffer);
+    do {
+        buffer[--index] = static_cast<char>('0' + (value % 10));
+        value /= 10;
+    } while (value > 0);
+    write_bytes(buffer + index, sizeof(buffer) - index);
+}
+
+static void write_hex(u64 value)
+{
+    constexpr char const* digits = "0123456789abcdef";
+    char buffer[16];
+    size_t index = sizeof(buffer);
+    do {
+        buffer[--index] = digits[value & 0xf];
+        value >>= 4;
+    } while (value > 0);
+    write_string("0x");
+    write_bytes(buffer + index, sizeof(buffer) - index);
+}
+
+#define CASE_SYSCALL_NAME(name) \
+    case __NR_##name:           \
+        return #name
+
+static char const* syscall_name(long syscall_number)
+{
+    switch (syscall_number) {
+#ifdef __NR_accept
+        CASE_SYSCALL_NAME(accept);
+#endif
+#ifdef __NR_accept4
+        CASE_SYSCALL_NAME(accept4);
+#endif
+#ifdef __NR_access
+        CASE_SYSCALL_NAME(access);
+#endif
+#ifdef __NR_bind
+        CASE_SYSCALL_NAME(bind);
+#endif
+#ifdef __NR_clone
+        CASE_SYSCALL_NAME(clone);
+#endif
+#ifdef __NR_clone3
+        CASE_SYSCALL_NAME(clone3);
+#endif
+#ifdef __NR_connect
+        CASE_SYSCALL_NAME(connect);
+#endif
+#ifdef __NR_execve
+        CASE_SYSCALL_NAME(execve);
+#endif
+#ifdef __NR_execveat
+        CASE_SYSCALL_NAME(execveat);
+#endif
+#ifdef __NR_fcntl
+        CASE_SYSCALL_NAME(fcntl);
+#endif
+#ifdef __NR_fcntl64
+        CASE_SYSCALL_NAME(fcntl64);
+#endif
+#ifdef __NR_fstat
+        CASE_SYSCALL_NAME(fstat);
+#endif
+#ifdef __NR_futex
+        CASE_SYSCALL_NAME(futex);
+#endif
+#ifdef __NR_getdents64
+        CASE_SYSCALL_NAME(getdents64);
+#endif
+#ifdef __NR_ioctl
+        CASE_SYSCALL_NAME(ioctl);
+#endif
+#ifdef __NR_link
+        CASE_SYSCALL_NAME(link);
+#endif
+#ifdef __NR_linkat
+        CASE_SYSCALL_NAME(linkat);
+#endif
+#ifdef __NR_memfd_create
+        CASE_SYSCALL_NAME(memfd_create);
+#endif
+#ifdef __NR_mkdir
+        CASE_SYSCALL_NAME(mkdir);
+#endif
+#ifdef __NR_mkdirat
+        CASE_SYSCALL_NAME(mkdirat);
+#endif
+#ifdef __NR_mmap
+        CASE_SYSCALL_NAME(mmap);
+#endif
+#ifdef __NR_mmap2
+        CASE_SYSCALL_NAME(mmap2);
+#endif
+#ifdef __NR_mprotect
+        CASE_SYSCALL_NAME(mprotect);
+#endif
+#ifdef __NR_newfstatat
+        CASE_SYSCALL_NAME(newfstatat);
+#endif
+#ifdef __NR_open
+        CASE_SYSCALL_NAME(open);
+#endif
+#ifdef __NR_openat
+        CASE_SYSCALL_NAME(openat);
+#endif
+#ifdef __NR_prctl
+        CASE_SYSCALL_NAME(prctl);
+#endif
+#ifdef __NR_readlink
+        CASE_SYSCALL_NAME(readlink);
+#endif
+#ifdef __NR_readlinkat
+        CASE_SYSCALL_NAME(readlinkat);
+#endif
+#ifdef __NR_rename
+        CASE_SYSCALL_NAME(rename);
+#endif
+#ifdef __NR_renameat
+        CASE_SYSCALL_NAME(renameat);
+#endif
+#ifdef __NR_renameat2
+        CASE_SYSCALL_NAME(renameat2);
+#endif
+#ifdef __NR_rmdir
+        CASE_SYSCALL_NAME(rmdir);
+#endif
+#ifdef __NR_sched_setaffinity
+        CASE_SYSCALL_NAME(sched_setaffinity);
+#endif
+#ifdef __NR_sched_setparam
+        CASE_SYSCALL_NAME(sched_setparam);
+#endif
+#ifdef __NR_sched_setscheduler
+        CASE_SYSCALL_NAME(sched_setscheduler);
+#endif
+#ifdef __NR_seccomp
+        CASE_SYSCALL_NAME(seccomp);
+#endif
+#ifdef __NR_socket
+        CASE_SYSCALL_NAME(socket);
+#endif
+#ifdef __NR_statx
+        CASE_SYSCALL_NAME(statx);
+#endif
+#ifdef __NR_unlink
+        CASE_SYSCALL_NAME(unlink);
+#endif
+#ifdef __NR_unlinkat
+        CASE_SYSCALL_NAME(unlinkat);
+#endif
+    default:
+        return "unknown";
+    }
+}
+
+#undef CASE_SYSCALL_NAME
+
+static void handle_sigsys(int, siginfo_t* info, void* context)
+{
+    write_string("Sandbox violation: disallowed syscall ");
+    write_string(syscall_name(info->si_syscall));
+    write_string(" (");
+    write_unsigned(static_cast<u64>(info->si_syscall));
+    write_string("), architecture ");
+    write_hex(info->si_arch);
+    write_string(", instruction pointer ");
+    write_hex(reinterpret_cast<FlatPtr>(info->si_call_addr));
+
+#if defined(__x86_64__)
+    auto* machine_context = &static_cast<ucontext_t*>(context)->uc_mcontext;
+    write_string(", args [");
+    write_hex(static_cast<u64>(machine_context->gregs[REG_RDI]));
+    write_string(", ");
+    write_hex(static_cast<u64>(machine_context->gregs[REG_RSI]));
+    write_string(", ");
+    write_hex(static_cast<u64>(machine_context->gregs[REG_RDX]));
+    write_string(", ");
+    write_hex(static_cast<u64>(machine_context->gregs[REG_R10]));
+    write_string(", ");
+    write_hex(static_cast<u64>(machine_context->gregs[REG_R8]));
+    write_string(", ");
+    write_hex(static_cast<u64>(machine_context->gregs[REG_R9]));
+    write_string("]");
+#elif defined(__aarch64__)
+    auto* machine_context = &static_cast<ucontext_t*>(context)->uc_mcontext;
+    write_string(", args [");
+    for (size_t i = 0; i < 6; ++i) {
+        if (i != 0)
+            write_string(", ");
+        write_hex(static_cast<u64>(machine_context->regs[i]));
+    }
+    write_string("]");
+#endif
+
+    write_string("\n");
+
+    struct sigaction action {};
+    action.sa_handler = SIG_DFL;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGSYS, &action, nullptr);
+    raise(SIGSYS);
+    _exit(128 + SIGSYS);
+}
+
+static ErrorOr<void> install_sigsys_handler()
+{
+    struct sigaction action {};
+    action.sa_sigaction = handle_sigsys;
+    action.sa_flags = SA_SIGINFO;
+    if (sigemptyset(&action.sa_mask) < 0)
+        return Error::from_syscall("sigemptyset"sv, errno);
+    if (sigaction(SIGSYS, &action, nullptr) < 0)
+        return Error::from_syscall("sigaction(SIGSYS)"sv, errno);
+    return {};
+}
+
+}
+
+SeccompPolicy::SeccompPolicy()
+{
+    append_architecture_check();
+    append_load_syscall_number();
+}
+
+void SeccompPolicy::append(sock_filter filter)
+{
+    MUST(m_filter.try_append(filter));
+}
+
+void SeccompPolicy::append_architecture_check()
+{
+    append(SECCOMP_LOAD_ARCHITECTURE);
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, audit_architecture, 1, 0));
+    append(SECCOMP_TRAP);
+}
+
+void SeccompPolicy::append_load_syscall_number()
+{
+    append(SECCOMP_LOAD_SYSCALL_NR);
+}
+
+void SeccompPolicy::append_kill()
+{
+    append(SECCOMP_TRAP);
+}
+
+void SeccompPolicy::deny_readonly_filesystem_probes()
+{
+#ifdef __NR_open
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_open, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, ~read_only_open_flags));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1));
+    append(SECCOMP_ERRNO(EACCES));
+    append(SECCOMP_LOAD_SYSCALL_NR);
+#endif
+#ifdef __NR_openat
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(2));
+    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, ~read_only_open_flags));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1));
+    append(SECCOMP_ERRNO(EACCES));
+    append(SECCOMP_LOAD_SYSCALL_NR);
+#endif
+}
+
+void SeccompPolicy::allow_readonly_file_opens()
+{
+#ifdef __NR_open
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_open, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, ~read_only_open_flags));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+#endif
+#ifdef __NR_openat
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(2));
+    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, ~read_only_open_flags));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+#endif
+}
+
+void SeccompPolicy::allow_filesystem_metadata_queries()
+{
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, access);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getdents64);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, newfstatat);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, readlink);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, readlinkat);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, statx);
+}
+
+void SeccompPolicy::allow_filesystem_writes()
+{
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, open);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, openat);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, unlink);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, unlinkat);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, link);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, linkat);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, rename);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, renameat);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, renameat2);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, mkdir);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, mkdirat);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, rmdir);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, fsync);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, fdatasync);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, flock);
+
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fcntl, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, F_GETLK, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+    append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
+
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fcntl, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, F_SETLK, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+    append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
+
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fcntl, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, F_SETLKW, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+    append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
+}
+
+void SeccompPolicy::allow_file_descriptor_operations()
+{
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, read);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, write);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, close);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, fstat);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, dup);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, dup3);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, pipe2);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, ftruncate);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, lseek);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, pread64);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, pwrite64);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, sendfile);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, memfd_create);
+
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fcntl, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, F_GETFD, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+    append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
+
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fcntl, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, F_SETFD, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+    append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
+
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fcntl, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, F_GETFL, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+    append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
+
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fcntl, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, F_SETFL, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+    append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
+
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fcntl, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, F_DUPFD_CLOEXEC, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+    append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
+
+#ifdef F_ADD_SEALS
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fcntl, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, F_ADD_SEALS, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+    append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
+#endif
+
+#ifdef F_GET_SEALS
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fcntl, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, F_GET_SEALS, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+    append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
+#endif
+
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_ioctl, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, FIONBIO, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+    append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
+
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_ioctl, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, FIONREAD, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+    append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
+
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_ioctl, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, TCGETS, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+    append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
+}
+
+void SeccompPolicy::allow_process_creation()
+{
+#ifdef __NR_clone
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(0));
+    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, ~vfork_clone_flags));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+#endif
+
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, execve);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, execveat);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, wait4);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, waitid);
+}
+
+void SeccompPolicy::allow_ipc()
+{
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, eventfd2);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, poll);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, ppoll);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, pselect6);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, recvmsg);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, recvfrom);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, recvmmsg);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, sendmsg);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, sendto);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, sendmmsg);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, socketpair);
+#ifdef __NR_socket
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_socket, 0, 3));
+    append(SECCOMP_LOAD_ARGUMENT(0));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_UNIX, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+#endif
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, connect);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getsockopt);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, setsockopt);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getsockname);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getpeername);
+}
+
+void SeccompPolicy::allow_network()
+{
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, socket);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, connect);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, bind);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, listen);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, accept);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, accept4);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, shutdown);
+}
+
+void SeccompPolicy::allow_memory_without_executable_mappings()
+{
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_mmap, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(2));
+    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, PROT_EXEC));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+
+#ifdef __NR_mmap2
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_mmap2, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(2));
+    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, PROT_EXEC));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+#endif
+
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_mprotect, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(2));
+    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, PROT_EXEC));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, mremap);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, munmap);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, madvise);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, brk);
+}
+
+void SeccompPolicy::allow_executable_memory_mappings()
+{
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_mmap, 0, 8));
+    append(SECCOMP_LOAD_ARGUMENT(2));
+    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, PROT_EXEC));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 4, 0));
+    append(SECCOMP_LOAD_ARGUMENT(2));
+    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, PROT_WRITE));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+
+#ifdef __NR_mmap2
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_mmap2, 0, 8));
+    append(SECCOMP_LOAD_ARGUMENT(2));
+    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, PROT_EXEC));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 4, 0));
+    append(SECCOMP_LOAD_ARGUMENT(2));
+    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, PROT_WRITE));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+#endif
+
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_mprotect, 0, 8));
+    append(SECCOMP_LOAD_ARGUMENT(2));
+    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, PROT_EXEC));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 4, 0));
+    append(SECCOMP_LOAD_ARGUMENT(2));
+    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, PROT_WRITE));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+}
+
+void SeccompPolicy::allow_threads()
+{
+#ifdef __NR_clone
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone, 0, 8));
+    append(SECCOMP_LOAD_ARGUMENT(0));
+    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, thread_clone_required_flags));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, thread_clone_required_flags, 0, 4));
+    append(SECCOMP_LOAD_ARGUMENT(0));
+    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, ~thread_clone_allowed_flags));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+#endif
+#ifdef __NR_clone3
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone3, 0, 1));
+    append(SECCOMP_ERRNO(ENOSYS));
+#endif
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, futex);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, futex_time64);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, set_tid_address);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, set_robust_list);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, rseq);
+}
+
+void SeccompPolicy::allow_signals()
+{
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, rt_sigaction);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, rt_sigprocmask);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, rt_sigreturn);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, sigaltstack);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, tgkill);
+}
+
+void SeccompPolicy::allow_clocks()
+{
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, clock_gettime);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, clock_getres);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, clock_nanosleep);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, nanosleep);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, restart_syscall);
+}
+
+void SeccompPolicy::allow_gpu_device_operations()
+{
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, ioctl);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, eventfd2);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, epoll_create1);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, epoll_ctl);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, epoll_wait);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, epoll_pwait);
+}
+
+void SeccompPolicy::allow_process_metadata()
+{
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getpid);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, gettid);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getuid);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, geteuid);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getgid);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getegid);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getrandom);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, gettimeofday);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getrlimit);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, prlimit64);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getrusage);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, sched_getaffinity);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, sched_yield);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getcpu);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, membarrier);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, sysinfo);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, uname);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, umask);
+
+#ifdef __NR_sched_getscheduler
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_sched_getscheduler, 0, 1));
+    append(SECCOMP_ALLOW);
+#endif
+#ifdef __NR_sched_get_priority_max
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_sched_get_priority_max, 0, 1));
+    append(SECCOMP_ALLOW);
+#endif
+#ifdef __NR_sched_get_priority_min
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_sched_get_priority_min, 0, 1));
+    append(SECCOMP_ALLOW);
+#endif
+#ifdef __NR_getpriority
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_getpriority, 0, 1));
+    append(SECCOMP_ALLOW);
+#endif
+#ifdef __NR_setpriority
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_setpriority, 0, 1));
+    append(SECCOMP_ERRNO(EPERM));
+#endif
+#ifdef __NR_sched_setscheduler
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_sched_setscheduler, 0, 1));
+    append(SECCOMP_ERRNO(EPERM));
+#endif
+#ifdef __NR_sched_setparam
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_sched_setparam, 0, 1));
+    append(SECCOMP_ERRNO(EPERM));
+#endif
+#ifdef __NR_sched_setaffinity
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_sched_setaffinity, 0, 1));
+    append(SECCOMP_ERRNO(EPERM));
+#endif
+}
+
+void SeccompPolicy::allow_common_runtime()
+{
+    allow_memory_without_executable_mappings();
+    allow_threads();
+    allow_signals();
+    allow_clocks();
+    allow_process_metadata();
+    allow_prctl();
+    allow_exit();
+}
+
+void SeccompPolicy::allow_prctl()
+{
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, prctl);
+}
+
+void SeccompPolicy::allow_exit()
+{
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, exit);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, exit_group);
+}
+
+ErrorOr<void> SeccompPolicy::install()
+{
+    TRY(install_sigsys_handler());
+
+    append_kill();
+
+    sock_fprog program {
+        .len = static_cast<unsigned short>(m_filter.size()),
+        .filter = m_filter.data(),
+    };
+
+#ifdef __NR_seccomp
+    if (syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &program) < 0)
+        return Error::from_syscall("seccomp(SECCOMP_SET_MODE_FILTER)"sv, errno);
+#else
+    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program) < 0)
+        return Error::from_syscall("prctl(PR_SET_SECCOMP)"sv, errno);
+#endif
+
+    return {};
+}
+
+}
+
+FILE: Libraries/LibSandbox/Seccomp.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Error.h>
+#include <AK/Vector.h>
+#include <linux/filter.h>
+
+namespace Sandbox {
+
+class SeccompPolicy {
+public:
+    SeccompPolicy();
+
+    void deny_readonly_filesystem_probes();
+    void allow_readonly_file_opens();
+    void allow_filesystem_metadata_queries();
+    void allow_filesystem_writes();
+    void allow_file_descriptor_operations();
+    void allow_process_creation();
+    void allow_ipc();
+    void allow_network();
+    void allow_memory_without_executable_mappings();
+    void allow_executable_memory_mappings();
+    void allow_threads();
+    void allow_signals();
+    void allow_clocks();
+    void allow_gpu_device_operations();
+    void allow_process_metadata();
+    void allow_common_runtime();
+    void allow_prctl();
+    void allow_exit();
+
+    [[nodiscard]] ErrorOr<void> install();
+
+private:
+    void append(sock_filter);
+    void append_architecture_check();
+    void append_load_syscall_number();
+    void append_kill();
+
+    Vector<sock_filter> m_filter;
+};
+
+}
+
 FILE: Libraries/LibSync/CMakeLists.txt
 if (WIN32)
     set(SOURCES MutexWindows.cpp ConditionVariableWindows.cpp RWLockWindows.cpp)
@@ -404607,6 +406347,7 @@ set(SOURCES
     CSS/StyleValues/ColorStyleValue.cpp
     CSS/StyleValues/ConicGradientStyleValue.cpp
     CSS/StyleValues/ContentStyleValue.cpp
+    CSS/StyleValues/ContrastColorStyleValue.cpp
     CSS/StyleValues/CounterDefinitionsStyleValue.cpp
     CSS/StyleValues/CounterStyleSystemStyleValue.cpp
     CSS/StyleValues/CounterStyleValue.cpp
@@ -482445,6 +484186,7 @@ private:
     RefPtr<StyleValue const> parse_color_function(TokenStream<ComponentValue>&);
     RefPtr<StyleValue const> parse_color_mix_function(TokenStream<ComponentValue>&);
     RefPtr<StyleValue const> parse_light_dark_color_value(TokenStream<ComponentValue>&);
+    RefPtr<StyleValue const> parse_contrast_color_value(TokenStream<ComponentValue>&);
     RefPtr<StyleValue const> parse_color_value(TokenStream<ComponentValue>&);
     RefPtr<StyleValue const> parse_color_scheme_value(TokenStream<ComponentValue>&);
     RefPtr<StyleValue const> parse_corner_shape_value(TokenStream<ComponentValue>&);
@@ -496034,6 +497776,7 @@ FILE: Libraries/LibWeb/CSS/Parser/ValueParsing.cpp
 #include <LibWeb/CSS/StyleValues/ColorMixStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ConicGradientStyleValue.h>
+#include <LibWeb/CSS/StyleValues/ContrastColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/CounterDefinitionsStyleValue.h>
 #include <LibWeb/CSS/StyleValues/CounterStyleStyleValue.h>
 #include <LibWeb/CSS/StyleValues/CounterStyleValue.h>
@@ -498183,6 +499926,31 @@ RefPtr<StyleValue const> Parser::parse_light_dark_color_value(TokenStream<Compon
     return LightDarkStyleValue::create(light.release_nonnull(), dark.release_nonnull());
 }
 
+// https://drafts.csswg.org/css-color-5/#contrast-color
+RefPtr<StyleValue const> Parser::parse_contrast_color_value(TokenStream<ComponentValue>& outer_tokens)
+{
+    auto transaction = outer_tokens.begin_transaction();
+
+    outer_tokens.discard_whitespace();
+    auto const& function_token = outer_tokens.consume_a_token();
+    if (!function_token.is_function("contrast-color"sv))
+        return {};
+
+    auto inner_tokens = TokenStream { function_token.function().value };
+
+    inner_tokens.discard_whitespace();
+    auto color = parse_color_value(inner_tokens);
+    if (!color)
+        return {};
+
+    inner_tokens.discard_whitespace();
+    if (inner_tokens.has_next_token())
+        return {};
+
+    transaction.commit();
+    return ContrastColorStyleValue::create(color.release_nonnull());
+}
+
 // https://www.w3.org/TR/css-color-4/#color-syntax
 RefPtr<StyleValue const> Parser::parse_color_value(TokenStream<ComponentValue>& tokens)
 {
@@ -498219,6 +499987,8 @@ RefPtr<StyleValue const> Parser::parse_color_value(TokenStream<ComponentValue>& 
         return oklch;
     if (auto light_dark = parse_light_dark_color_value(tokens))
         return light_dark;
+    if (auto contrast_color = parse_contrast_color_value(tokens))
+        return contrast_color;
 
     auto transaction = tokens.begin_transaction();
     tokens.discard_whitespace();
@@ -518049,6 +519819,11 @@ WebIDL::ExceptionOr<void> StylePropertyMap::set(Utf16FlyString property_name, Re
     if ((property->is_custom_property() || property_is_single_valued(property->id())) && values.size() > 1)
         return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, MUST(String::formatted("Property '{}' only accepts a single value", property_name)) };
 
+    // FIXME: The spec doesn't say how to handle empty `values`, but other browsers throw a TypeError so let's do that
+    //        too - see https://github.com/w3c/css-houdini-drafts/issues/1176
+    if (values.is_empty())
+        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, MUST(String::formatted("Property '{}' requires at least one value", property_name)) };
+
     // 4. If any of the items in values have a non-null [[associatedProperty]] internal slot, and that slot’s value is
     //    anything other than property, throw a TypeError.
     if (any_have_non_matching_associated_property(property->name(), values))
@@ -518066,10 +519841,6 @@ WebIDL::ExceptionOr<void> StylePropertyMap::set(Utf16FlyString property_name, Re
     // 6. Let props be the value of this’s [[declarations]] internal slot.
     auto& props = declarations();
 
-    // 7. If props[property] exists, remove it.
-    // FIXME: Avoid converting to string and back.
-    TRY(props.remove_property(property->name()));
-
     // 8. Let values to set be an empty list.
     StyleValueVector values_to_set;
 
@@ -518085,6 +519856,12 @@ WebIDL::ExceptionOr<void> StylePropertyMap::set(Utf16FlyString property_name, Re
 
         values_to_set.append(move(internal_representation));
     }
+
+    // 7. If props[property] exists, remove it.
+    // FIXME: Avoid converting to string and back.
+    // FIXME: We handle this after creating the internal representations (step 9) so that we maintain the original
+    //        value in the case that fails - see https://github.com/w3c/css-houdini-drafts/issues/1175
+    TRY(props.remove_property(property->name()));
 
     // AD-HOC: To match the behavior of our parser we should store values of list-valued longhands as lists even if
     //         there is only one value, except in some rare circumstances.
@@ -529330,6 +531107,104 @@ private:
 
 }
 
+FILE: Libraries/LibWeb/CSS/StyleValues/ContrastColorStyleValue.cpp
+/*
+ * Copyright (c) 2026, Ladybird contributors
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <LibWeb/CSS/StyleValues/ContrastColorStyleValue.h>
+
+namespace Web::CSS {
+
+Optional<Color> ContrastColorStyleValue::to_color(ColorResolutionContext color_resolution_context) const
+{
+    auto color = m_color->to_color(color_resolution_context);
+    if (!color.has_value())
+        return {};
+    return color->suggested_foreground_color();
+}
+
+ValueComparingNonnullRefPtr<StyleValue const> ContrastColorStyleValue::absolutized(ComputationContext const& context) const
+{
+    ColorResolutionContext color_resolution_context {
+        .color_scheme = context.color_scheme,
+        .current_color = {},
+        .calculation_resolution_context = CalculationResolutionContext::from_computation_context(context),
+    };
+
+    if (auto color = to_color(color_resolution_context); color.has_value())
+        return create_from_color(*color, ColorSyntax::Modern);
+
+    auto absolutized_color = m_color->absolutized(context);
+    if (absolutized_color == m_color)
+        return *this;
+    return create(move(absolutized_color));
+}
+
+bool ContrastColorStyleValue::equals(StyleValue const& other) const
+{
+    auto const* other_contrast_color = as_if<ContrastColorStyleValue>(other);
+    if (!other_contrast_color)
+        return false;
+    return m_color == other_contrast_color->m_color;
+}
+
+void ContrastColorStyleValue::serialize(StringBuilder& builder, SerializationMode mode) const
+{
+    builder.append("contrast-color("sv);
+    m_color->serialize(builder, mode);
+    builder.append(')');
+}
+
+}
+
+FILE: Libraries/LibWeb/CSS/StyleValues/ContrastColorStyleValue.h
+/*
+ * Copyright (c) 2026, Ladybird contributors
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
+
+namespace Web::CSS {
+
+// https://drafts.csswg.org/css-color-5/#contrast-color
+class ContrastColorStyleValue final : public ColorStyleValue {
+public:
+    virtual ~ContrastColorStyleValue() override = default;
+
+    static ValueComparingNonnullRefPtr<ContrastColorStyleValue const> create(ValueComparingNonnullRefPtr<StyleValue const> color)
+    {
+        return adopt_ref(*new (nothrow) ContrastColorStyleValue(move(color)));
+    }
+
+    virtual bool equals(StyleValue const&) const override;
+    virtual Optional<Color> to_color(ColorResolutionContext) const override;
+    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
+    virtual void serialize(StringBuilder&, SerializationMode) const override;
+
+    virtual bool is_computationally_independent() const override
+    {
+        return m_color->is_computationally_independent();
+    }
+
+private:
+    explicit ContrastColorStyleValue(ValueComparingNonnullRefPtr<StyleValue const> color)
+        : ColorStyleValue({}, ColorSyntax::Modern)
+        , m_color(move(color))
+    {
+    }
+
+    ValueComparingNonnullRefPtr<StyleValue const> m_color;
+};
+
+}
+
 FILE: Libraries/LibWeb/CSS/StyleValues/CounterDefinitionsStyleValue.cpp
 /*
  * Copyright (c) 2024, Sam Atkins <atkinssj@serenityos.org>
@@ -536815,6 +538690,7 @@ FILE: Libraries/LibWeb/CSS/StyleValues/StyleValue.cpp
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ConicGradientStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ContentStyleValue.h>
+#include <LibWeb/CSS/StyleValues/ContrastColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/CounterDefinitionsStyleValue.h>
 #include <LibWeb/CSS/StyleValues/CounterStyleStyleValue.h>
 #include <LibWeb/CSS/StyleValues/CounterStyleSystemStyleValue.h>
@@ -537073,6 +538949,7 @@ namespace Web::CSS {
     __ENUMERATE_CSS_STYLE_VALUE_TYPE(Color, color, ColorStyleValue)                                                            \
     __ENUMERATE_CSS_STYLE_VALUE_TYPE(ConicGradient, conic_gradient, ConicGradientStyleValue)                                   \
     __ENUMERATE_CSS_STYLE_VALUE_TYPE(Content, content, ContentStyleValue)                                                      \
+    __ENUMERATE_CSS_STYLE_VALUE_TYPE(ContrastColor, contrast_color, ContrastColorStyleValue)                                   \
     __ENUMERATE_CSS_STYLE_VALUE_TYPE(Counter, counter, CounterStyleValue)                                                      \
     __ENUMERATE_CSS_STYLE_VALUE_TYPE(CounterStyle, counter_style, CounterStyleStyleValue)                                      \
     __ENUMERATE_CSS_STYLE_VALUE_TYPE(CounterDefinitions, counter_definitions, CounterDefinitionsStyleValue)                    \
@@ -604127,6 +606004,7 @@ class ComputedProperties;
 class ConicGradientStyleValue;
 class ContainerQuery;
 class ContentStyleValue;
+class ContrastColorStyleValue;
 class CounterDefinitionsStyleValue;
 class CounterStyle;
 class CounterStyleStyleValue;
@@ -646454,1538 +648332,3 @@ void HTMLInputElement::apply_presentational_hints(Vector<CSS::StyleProperty>& pr
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#the-input-element%3Aconcept-node-clone-ext
-WebIDL::ExceptionOr<void> HTMLInputElement::cloned(DOM::Node& copy, bool subtree) const
-{
-    TRY(Base::cloned(copy, subtree));
-
-    // The cloning steps for input elements given node, copy, and subtree are to propagate the value, dirty value flag, checkedness, and dirty checkedness flag from node to copy.
-    auto& input_clone = as<HTMLInputElement>(copy);
-    input_clone.m_value = m_value;
-    input_clone.m_dirty_value = m_dirty_value;
-    input_clone.m_checked = m_checked;
-    input_clone.m_dirty_checkedness = m_dirty_checkedness;
-
-    // AD-HOC: The spec doesn't mention propagating this state, but there is a WPT test that expects cloned nodes to preserve it.
-    input_clone.m_indeterminate = m_indeterminate;
-
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#radio-button-group
-static bool is_in_same_radio_button_group(HTML::HTMLInputElement const& a, HTML::HTMLInputElement const& b)
-{
-    auto non_empty_equals = [](auto const& value_a, auto const& value_b) {
-        return !value_a.is_empty() && value_a == value_b;
-    };
-    // The radio button group that contains an input element a also contains all the
-    // other input elements b that fulfill all of the following conditions:
-    return (
-        // - Both a and b are in the same tree.
-        &a.root() == &b.root()
-        // - The input element b's type attribute is in the Radio Button state.
-        && a.type_state() == b.type_state()
-        && b.type_state() == HTMLInputElement::TypeAttributeState::RadioButton
-        // - Either a and b have the same form owner, or they both have no form owner.
-        && a.form() == b.form()
-        // - They both have a name attribute, their name attributes are not empty, and the
-        // value of a's name attribute equals the value of b's name attribute.
-        && a.name().has_value()
-        && b.name().has_value()
-        && non_empty_equals(a.name().value(), b.name().value()));
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type=radio)
-void HTMLInputElement::set_checked_within_group()
-{
-    if (checked())
-        return;
-
-    set_checked(true);
-
-    // No point iterating the tree if we have an empty name.
-    if (!name().has_value() || name()->is_empty())
-        return;
-
-    root().for_each_in_inclusive_subtree_of_type<HTML::HTMLInputElement>([&](auto& element) {
-        if (element.checked() && &element != this && is_in_same_radio_button_group(*this, element))
-            element.set_checked(false);
-        return TraversalDecision::Continue;
-    });
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-input-element:legacy-pre-activation-behavior
-void HTMLInputElement::legacy_pre_activation_behavior()
-{
-    m_before_legacy_pre_activation_behavior_checked = checked();
-    m_before_legacy_pre_activation_behavior_indeterminate = indeterminate();
-
-    // 1. If this element's type attribute is in the Checkbox state, then set
-    // this element's checkedness to its opposite value (i.e. true if it is
-    // false, false if it is true) and set this element's indeterminate IDL
-    // attribute to false.
-    if (type_state() == TypeAttributeState::Checkbox) {
-        set_checked(!checked());
-        set_indeterminate(false);
-    }
-
-    // 2. If this element's type attribute is in the Radio Button state, then
-    // get a reference to the element in this element's radio button group that
-    // has its checkedness set to true, if any, and then set this element's
-    // checkedness to true.
-    if (type_state() == TypeAttributeState::RadioButton) {
-        root().for_each_in_inclusive_subtree_of_type<HTML::HTMLInputElement>([&](auto& element) {
-            if (element.checked() && is_in_same_radio_button_group(*this, element)) {
-                m_legacy_pre_activation_behavior_checked_element_in_group = &element;
-                return TraversalDecision::Break;
-            }
-            return TraversalDecision::Continue;
-        });
-
-        set_checked_within_group();
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-input-element:legacy-canceled-activation-behavior
-void HTMLInputElement::legacy_cancelled_activation_behavior()
-{
-    // 1. If the element's type attribute is in the Checkbox state, then set the
-    // element's checkedness and the element's indeterminate IDL attribute back
-    // to the values they had before the legacy-pre-activation behavior was run.
-    if (type_state() == TypeAttributeState::Checkbox) {
-        set_checked(m_before_legacy_pre_activation_behavior_checked);
-        set_indeterminate(m_before_legacy_pre_activation_behavior_indeterminate);
-    }
-
-    // 2. If this element's type attribute is in the Radio Button state, then
-    // if the element to which a reference was obtained in the
-    // legacy-pre-activation behavior, if any, is still in what is now this
-    // element' s radio button group, if it still has one, and if so, set
-    // that element 's checkedness to true; or else, if there was no such
-    // element, or that element is no longer in this element' s radio button
-    // group, or if this element no longer has a radio button group, set
-    // this element's checkedness to false.
-    if (type_state() == TypeAttributeState::RadioButton) {
-        bool did_reselect_previous_element = false;
-        if (m_legacy_pre_activation_behavior_checked_element_in_group) {
-            auto& element_in_group = *m_legacy_pre_activation_behavior_checked_element_in_group;
-            if (is_in_same_radio_button_group(*this, element_in_group)) {
-                element_in_group.set_checked_within_group();
-                did_reselect_previous_element = true;
-            }
-
-            m_legacy_pre_activation_behavior_checked_element_in_group = nullptr;
-        }
-
-        if (!did_reselect_previous_element)
-            set_checked(false);
-    }
-}
-
-void HTMLInputElement::legacy_cancelled_activation_behavior_was_not_called()
-{
-    m_legacy_pre_activation_behavior_checked_element_in_group = nullptr;
-}
-
-GC::Ptr<DecodedImageData> HTMLInputElement::image_data() const
-{
-    if (m_resource_request)
-        return m_resource_request->image_data();
-    return nullptr;
-}
-
-bool HTMLInputElement::is_image_available() const
-{
-    return image_data() != nullptr;
-}
-
-Optional<CSSPixels> HTMLInputElement::intrinsic_width() const
-{
-    if (auto image_data = this->image_data())
-        return image_data->intrinsic_width();
-    return {};
-}
-
-Optional<CSSPixels> HTMLInputElement::intrinsic_height() const
-{
-    if (auto image_data = this->image_data())
-        return image_data->intrinsic_height();
-    return {};
-}
-
-Optional<CSSPixelFraction> HTMLInputElement::intrinsic_aspect_ratio() const
-{
-    if (auto image_data = this->image_data())
-        return image_data->intrinsic_aspect_ratio();
-    return {};
-}
-
-Optional<Gfx::DecodedImageFrame> HTMLInputElement::current_image_frame_sized(Gfx::IntSize size) const
-{
-    if (auto image_data = this->image_data())
-        return image_data->frame(0, size);
-    return {};
-}
-
-void HTMLInputElement::set_visible_in_viewport(bool)
-{
-    // FIXME: Loosen grip on image data when it's not visible, e.g via volatile memory.
-}
-
-// https://html.spec.whatwg.org/multipage/interaction.html#dom-tabindex
-i32 HTMLInputElement::default_tab_index_value() const
-{
-    // See the base function for the spec comments.
-    return 0;
-}
-
-//  https://html.spec.whatwg.org/multipage/input.html#dom-input-maxlength
-WebIDL::Long HTMLInputElement::max_length() const
-{
-    // The maxLength IDL attribute must reflect the maxlength content attribute, limited to only non-negative numbers.
-    if (auto maxlength_string = get_attribute(HTML::AttributeNames::maxlength); maxlength_string.has_value()) {
-        if (auto maxlength = parse_non_negative_integer(*maxlength_string); maxlength.has_value() && *maxlength <= 2147483647)
-            return *maxlength;
-    }
-    return -1;
-}
-
-WebIDL::ExceptionOr<void> HTMLInputElement::set_max_length(WebIDL::Long value)
-{
-    // The maxLength IDL attribute must reflect the maxlength content attribute, limited to only non-negative numbers.
-    set_attribute_value(HTML::AttributeNames::maxlength, TRY(convert_non_negative_integer_to_string(realm(), value)));
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#dom-input-minlength
-WebIDL::Long HTMLInputElement::min_length() const
-{
-    // The minLength IDL attribute must reflect the minlength content attribute, limited to only non-negative numbers.
-    if (auto minlength_string = get_attribute(HTML::AttributeNames::minlength); minlength_string.has_value()) {
-        if (auto minlength = parse_non_negative_integer(*minlength_string); minlength.has_value() && *minlength <= 2147483647)
-            return *minlength;
-    }
-    return -1;
-}
-
-WebIDL::ExceptionOr<void> HTMLInputElement::set_min_length(WebIDL::Long value)
-{
-    // The minLength IDL attribute must reflect the minlength content attribute, limited to only non-negative numbers.
-    set_attribute_value(HTML::AttributeNames::minlength, TRY(convert_non_negative_integer_to_string(realm(), value)));
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-size-attribute
-WebIDL::UnsignedLong HTMLInputElement::size() const
-{
-    // The size attribute, if specified, must have a value that is a valid non-negative integer greater than zero.
-    // The size IDL attribute is limited to only positive numbers and has a default value of 20.
-    if (auto size_string = get_attribute(HTML::AttributeNames::size); size_string.has_value()) {
-        if (auto size = parse_non_negative_integer(*size_string); size.has_value() && *size != 0 && *size <= 2147483647)
-            return *size;
-    }
-    return 20;
-}
-
-WebIDL::ExceptionOr<void> HTMLInputElement::set_size(WebIDL::UnsignedLong value)
-{
-    if (value == 0)
-        return WebIDL::IndexSizeError::create(realm(), "Size must be greater than zero"_utf16);
-    if (value > 2147483647)
-        value = 20;
-    set_attribute_value(HTML::AttributeNames::size, String::number(value));
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#dom-input-height
-WebIDL::UnsignedLong HTMLInputElement::height() const
-{
-    const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLInputElementHeight);
-
-    // When the input element's type attribute is not in the Image Button state, then no image is available.
-    if (type_state() != TypeAttributeState::ImageButton)
-        return 0;
-
-    // Return the rendered height of the image, in CSS pixels, if the image is being rendered.
-    if (auto paintable_box = this->paintable_box())
-        return paintable_box->content_height().to_int();
-
-    // On setting [the width or height IDL attribute], they must act as if they reflected the respective content attributes of the same name.
-    if (auto height_string = get_attribute(HTML::AttributeNames::height); height_string.has_value()) {
-        if (auto height = parse_non_negative_integer(*height_string); height.has_value() && *height <= 2147483647)
-            return *height;
-    }
-
-    // ...or else the natural height and height of the image, in CSS pixels, if an image is available but not being rendered
-    if (auto bitmap = current_image_frame(); bitmap.has_value())
-        return bitmap->height();
-
-    // ...or else 0, if the image is not available or does not have intrinsic dimensions.
-    return 0;
-}
-
-void HTMLInputElement::set_height(WebIDL::UnsignedLong value)
-{
-    if (value > 2147483647)
-        value = 0;
-
-    set_attribute_value(HTML::AttributeNames::height, String::number(value));
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#dom-input-width
-WebIDL::UnsignedLong HTMLInputElement::width() const
-{
-    const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLInputElementWidth);
-
-    // When the input element's type attribute is not in the Image Button state, then no image is available.
-    if (type_state() != TypeAttributeState::ImageButton)
-        return 0;
-
-    // Return the rendered width of the image, in CSS pixels, if the image is being rendered.
-    if (auto paintable_box = this->paintable_box())
-        return paintable_box->content_width().to_int();
-
-    // On setting [the width or height IDL attribute], they must act as if they reflected the respective content attributes of the same name.
-    if (auto width_string = get_attribute(HTML::AttributeNames::width); width_string.has_value()) {
-        if (auto width = parse_non_negative_integer(*width_string); width.has_value() && *width <= 2147483647)
-            return *width;
-    }
-
-    // ...or else the natural width and height of the image, in CSS pixels, if an image is available but not being rendered
-    if (auto bitmap = current_image_frame(); bitmap.has_value())
-        return bitmap->width();
-
-    // ...or else 0, if the image is not available or does not have intrinsic dimensions.
-    return 0;
-}
-
-void HTMLInputElement::set_width(WebIDL::UnsignedLong value)
-{
-    if (value > 2147483647)
-        value = 0;
-
-    set_attribute_value(HTML::AttributeNames::width, String::number(value));
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#month-state-(type=month):concept-input-value-string-number
-static Optional<double> convert_month_string_to_number(StringView input)
-{
-    // The algorithm to convert a string to a number, given a string input, is as follows: If parsing a month from input
-    // results in an error, then return an error; otherwise, return the number of months between January 1970 and the
-    // parsed month.
-    auto maybe_year_and_month = parse_a_month_string(input);
-    if (!maybe_year_and_month.has_value())
-        return {};
-    return number_of_months_since_unix_epoch(maybe_year_and_month.value());
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#week-state-(type=week):concept-input-value-string-number
-static Optional<double> convert_week_string_to_number(StringView input)
-{
-    // The algorithm to convert a string to a number, given a string input, is as follows: If parsing a week
-    // string from input results in an error, then return an error; otherwise, return the number of
-    // milliseconds elapsed from midnight UTC on the morning of 1970-01-01 (the time represented by the value
-    // "1970-01-01T00:00:00.0Z") to midnight UTC on the morning of the Monday of the parsed week, ignoring
-    // leap seconds.
-    auto parsed_week = parse_a_week_string(input);
-    if (!parsed_week.has_value())
-        return {};
-    return UnixDateTime::from_iso8601_week(parsed_week->week_year, parsed_week->week).milliseconds_since_epoch();
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#date-state-(type=date):concept-input-value-number-string
-static Optional<double> convert_date_string_to_number(StringView input)
-{
-    // The algorithm to convert a string to a number, given a string input, is as follows: If parsing a date
-    // from input results in an error, then return an error; otherwise, return the number of milliseconds
-    // elapsed from midnight UTC on the morning of 1970-01-01 (the time represented by the value
-    // "1970-01-01T00:00:00.0Z") to midnight UTC on the morning of the parsed date, ignoring leap seconds.
-    auto maybe_date = parse_a_date_string(input);
-    if (!maybe_date.has_value())
-        return {};
-    auto date = maybe_date.value();
-
-    auto date_time = UnixDateTime::from_unix_time_parts(date.year, date.month, date.day, 0, 0, 0, 0);
-    return date_time.milliseconds_since_epoch();
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#local-date-and-time-state-(type=datetime-local):parse-a-local-date-and-time-string-2
-static Optional<double> convert_local_date_and_time_string_to_number(StringView input)
-{
-    // The algorithm to convert a string to a number, given a string input, is as follows: If parsing a date and time
-    // from input results in an error, then return an error; otherwise, return the number of milliseconds elapsed from
-    // midnight on the morning of 1970-01-01 (the time represented by the value "1970-01-01T00:00:00.0") to the parsed
-    // local date and time, ignoring leap seconds.
-    auto maybe_date_and_time = parse_a_local_date_and_time_string(input);
-    if (!maybe_date_and_time.has_value())
-        return {};
-    auto date_and_time = maybe_date_and_time.value();
-    auto date = date_and_time.date;
-    auto time = date_and_time.time;
-
-    auto date_time = UnixDateTime::from_unix_time_parts(date.year, date.month, date.day, time.hour, time.minute, time.second, static_cast<i32>(time.second * 1000) % 1000);
-    return date_time.milliseconds_since_epoch();
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#time-state-(type=time):concept-input-value-string-number
-Optional<double> HTMLInputElement::convert_time_string_to_number(StringView input) const
-{
-    // The algorithm to convert a string to a number, given a string input, is as follows: If parsing a time from input
-    // results in an error, then return an error; otherwise, return the number of milliseconds elapsed from midnight to
-    // the parsed time on a day with no time changes.
-    auto maybe_time = parse_time_string(realm(), input);
-    if (maybe_time.is_exception())
-        return {};
-    return maybe_time.value()->date_value();
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#concept-input-value-string-number
-Optional<double> HTMLInputElement::convert_string_to_number(StringView input) const
-{
-    // https://html.spec.whatwg.org/multipage/input.html#number-state-(type=number):concept-input-value-string-number
-    if (type_state() == TypeAttributeState::Number)
-        return parse_floating_point_number(input);
-
-    // https://html.spec.whatwg.org/multipage/input.html#range-state-(type=range):concept-input-value-string-number
-    if (type_state() == TypeAttributeState::Range)
-        return parse_floating_point_number(input);
-
-    if (type_state() == TypeAttributeState::Month)
-        return convert_month_string_to_number(input);
-
-    if (type_state() == TypeAttributeState::Week)
-        return convert_week_string_to_number(input);
-
-    if (type_state() == TypeAttributeState::Date)
-        return convert_date_string_to_number(input);
-
-    if (type_state() == TypeAttributeState::Time)
-        return convert_time_string_to_number(input);
-
-    if (type_state() == TypeAttributeState::LocalDateAndTime)
-        return convert_local_date_and_time_string_to_number(input);
-
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#concept-input-value-string-number
-Optional<double> HTMLInputElement::convert_string_to_number(Utf16String const& input) const
-{
-    // FIXME: Implement a UTF-16 GenericLexer.
-    if (!input.has_ascii_storage())
-        return {};
-    return convert_string_to_number(input.ascii_view());
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#month-state-(type=month):concept-input-value-number-string
-static Utf16String convert_number_to_month_string(double input)
-{
-    // The algorithm to convert a number to a string, given a number input, is as follows: Return a valid month
-    // string that represents the month that has input months between it and January 1970.
-    auto months = JS::modulo(input, 12);
-    auto year = 1970 + (input - months) / 12;
-
-    return Utf16String::formatted("{:04d}-{:02d}", static_cast<int>(year), static_cast<int>(months) + 1);
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#month-state-(type=month):concept-input-value-date-string
-static Utf16String convert_date_to_month_string(double input)
-{
-    // The algorithm to convert a number to a string, given a number input, is as follows: Return a valid month
-    // string that represents the month that has input months between it and January 1970.
-    auto date = AK::UnixDateTime::from_milliseconds_since_epoch(input);
-    return date.to_utf16_string("%Y-%m"sv, AK::UnixDateTime::LocalTime::No);
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#concept-input-value-number-string
-static Utf16String convert_number_to_week_string(double input)
-{
-    // The algorithm to convert a number to a string, given a number input, is as follows: Return a valid week string
-    // that represents the week that, in UTC, is current input milliseconds after midnight UTC on the morning of
-    // 1970-01-01 (the time represented by the value "1970-01-01T00:00:00.0Z").
-
-    // AD-HOC: Values outside the valid ECMSScript time value range cannot produce valid date strings.
-    if (!isfinite(input) || fabs(input) > JS::max_time_value)
-        return {};
-
-    auto year = JS::year_from_time(input);
-    auto month = JS::month_from_time(input) + 1; // Adjust for zero-based month
-    auto day = JS::date_from_time(input);
-
-    constexpr Array normalYearDays = { 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
-    constexpr Array leapYearDays = { 0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335 };
-
-    auto ordinal_day = (is_leap_year(year) ? leapYearDays[month - 1] : normalYearDays[month - 1]) + day;
-
-    unsigned week = (10 + ordinal_day - 1) / 7; // -1 because the day of the week is always monday
-    if (week > iso8061_weeks_in_year(year)) {
-        ++year;
-        week = 1;
-    }
-    return Utf16String::formatted("{:04d}-W{:02d}", year, week);
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#date-state-(type=date):concept-input-value-number-string
-static Utf16String convert_number_to_date_string(double input)
-{
-    // The algorithm to convert a number to a string, given a number input, is as follows: Return a valid
-    // date string that represents the date that, in UTC, is current input milliseconds after midnight UTC
-    // on the morning of 1970-01-01 (the time represented by the value "1970-01-01T00:00:00.0Z").
-    auto date = AK::UnixDateTime::from_milliseconds_since_epoch(input);
-    return date.to_utf16_string("%Y-%m-%d"sv, AK::UnixDateTime::LocalTime::No);
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#time-state-(type=time):concept-input-value-number-string
-static Utf16String convert_number_to_time_string(double input)
-{
-    // The algorithm to convert a number to a string, given a number input, is as follows: Return a valid time
-    // string that represents the time that is input milliseconds after midnight on a day with no time changes.
-
-    // NB: We don't use JS::*_from_time helpers here because they lose sub-day precision when |input| is much larger
-    //     than 2^53.
-    auto time_of_day = fmod(input, JS::ms_per_day);
-    if (time_of_day < 0)
-        time_of_day += JS::ms_per_day;
-
-    auto hours = static_cast<u32>(time_of_day / JS::ms_per_hour);
-    auto minutes = static_cast<u32>(fmod(time_of_day, JS::ms_per_hour) / JS::ms_per_minute);
-    auto seconds = static_cast<u32>(fmod(time_of_day, JS::ms_per_minute) / JS::ms_per_second);
-    auto milliseconds = static_cast<u32>(fmod(time_of_day, JS::ms_per_second));
-
-    if (milliseconds > 0)
-        return Utf16String::formatted("{:02d}:{:02d}:{:02d}.{:03d}", hours, minutes, seconds, milliseconds);
-    if (seconds > 0)
-        return Utf16String::formatted("{:02d}:{:02d}:{:02d}", hours, minutes, seconds);
-    return Utf16String::formatted("{:02d}:{:02d}", hours, minutes);
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#local-date-and-time-state-(type=datetime-local):concept-input-value-number-string
-static Utf16String convert_number_to_local_date_and_time_string(double input)
-{
-    // The algorithm to convert a number to a string, given a number input, is as follows: Return a valid
-    // normalized local date and time string that represents the date and time that is input milliseconds
-    // after midnight on the morning of 1970-01-01 (the time represented by the value "1970-01-01T00:00:00.0").
-
-    // AD-HOC: Values outside the valid ECMSScript time value range cannot produce valid date strings.
-    if (!isfinite(input) || fabs(input) > JS::max_time_value)
-        return {};
-
-    auto year = JS::year_from_time(input);
-    auto month = JS::month_from_time(input) + 1; // Adjust for zero-based month
-    auto day = JS::date_from_time(input);
-    auto hour = JS::hour_from_time(input);
-    auto minutes = JS::min_from_time(input);
-    auto seconds = JS::sec_from_time(input);
-    auto milliseconds = JS::ms_from_time(input);
-
-    if (milliseconds > 0)
-        return Utf16String::formatted("{:04d}-{:02d}-{:02d}T{:02d}:{:02d}:{:02d}.{:03d}", year, month, day, hour, minutes, seconds, milliseconds).trim("0"sv, TrimMode::Right);
-    if (seconds > 0)
-        return Utf16String::formatted("{:04d}-{:02d}-{:02d}T{:02d}:{:02d}:{:02d}", year, month, day, hour, minutes, seconds);
-    return Utf16String::formatted("{:04d}-{:02d}-{:02d}T{:02d}:{:02d}", year, month, day, hour, minutes);
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#concept-input-value-string-number
-Utf16String HTMLInputElement::convert_number_to_string(double input) const
-{
-    // https://html.spec.whatwg.org/multipage/input.html#number-state-(type=number):concept-input-value-number-string
-    if (type_state() == TypeAttributeState::Number)
-        return Utf16String::number(input);
-
-    // https://html.spec.whatwg.org/multipage/input.html#range-state-(type=range):concept-input-value-number-string
-    if (type_state() == TypeAttributeState::Range)
-        return Utf16String::number(input);
-
-    if (type_state() == TypeAttributeState::Month)
-        return convert_number_to_month_string(input);
-
-    if (type_state() == TypeAttributeState::Week)
-        return convert_number_to_week_string(input);
-
-    if (type_state() == TypeAttributeState::Date)
-        return convert_number_to_date_string(input);
-
-    if (type_state() == TypeAttributeState::Time)
-        return convert_number_to_time_string(input);
-
-    if (type_state() == TypeAttributeState::LocalDateAndTime)
-        return convert_number_to_local_date_and_time_string(input);
-
-    dbgln("HTMLInputElement::convert_number_to_string() not implemented for input type {}", type());
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#concept-input-value-string-date
-WebIDL::ExceptionOr<GC::Ptr<JS::Date>> HTMLInputElement::convert_string_to_date(StringView input) const
-{
-    // https://html.spec.whatwg.org/multipage/input.html#date-state-(type=date):concept-input-value-string-date
-    if (type_state() == TypeAttributeState::Date) {
-        // If parsing a date from input results in an error, then return an error;
-        auto maybe_date = parse_a_date_string(input);
-        if (!maybe_date.has_value())
-            return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Can't parse date string"sv };
-        auto date = maybe_date.value();
-
-        // otherwise, return a new Date object representing midnight UTC on the morning of the parsed date.
-        return JS::Date::create(realm(), JS::make_date(JS::make_day(date.year, date.month - 1, date.day), 0));
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#month-state-(type=month):concept-input-value-string-date
-    if (type_state() == TypeAttributeState::Month) {
-        // If parsing a month from input results in an error, then return an error;
-        auto maybe_year_and_month = parse_a_month_string(input);
-        if (!maybe_year_and_month.has_value())
-            return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Can't parse month string"sv };
-        auto year_and_month = maybe_year_and_month.value();
-
-        // otherwise, return a new Date object representing midnight UTC on the morning of the first day of the parsed month.
-        return JS::Date::create(realm(), JS::make_date(JS::make_day(year_and_month.year, year_and_month.month - 1, 1), 0));
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#week-state-(type=week):concept-input-value-string-date
-    if (type_state() == TypeAttributeState::Week) {
-        // If parsing a week from input results in an error, then return an error;
-        auto maybe_week = parse_a_week_string(input);
-        if (!maybe_week.has_value())
-            return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Can't parse week string"sv };
-        auto week = maybe_week.value();
-
-        // otherwise, return a new Date object representing midnight UTC on the morning of the Monday of the parsed week.
-        auto datetime = UnixDateTime::from_iso8601_week(week.week_year, week.week);
-        return JS::Date::create(realm(), datetime.milliseconds_since_epoch());
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#time-state-(type=time):concept-input-value-string-date
-    if (type_state() == TypeAttributeState::Time) {
-        // If parsing a time from input results in an error, then return an error;
-        auto maybe_time = parse_time_string(realm(), input);
-        if (maybe_time.is_exception())
-            return maybe_time.exception();
-
-        // otherwise, return a new Date object representing the parsed time in UTC on 1970-01-01.
-        return maybe_time.value();
-    }
-
-    dbgln("HTMLInputElement::convert_string_to_date() not implemented for input type {}", type());
-    return nullptr;
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#concept-input-value-string-date
-WebIDL::ExceptionOr<GC::Ptr<JS::Date>> HTMLInputElement::convert_string_to_date(Utf16String const& input) const
-{
-    // FIXME: Implement a UTF-16 GenericLexer.
-    if (!input.has_ascii_storage())
-        return nullptr;
-    return convert_string_to_date(input.ascii_view());
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#concept-input-value-date-string
-Utf16String HTMLInputElement::convert_date_to_string(GC::Ref<JS::Date> input) const
-{
-    // https://html.spec.whatwg.org/multipage/input.html#date-state-(type=date):concept-input-value-date-string
-    if (type_state() == TypeAttributeState::Date) {
-        // Return a valid date string that represents the date current at the time represented by input in the UTC time zone.
-        // https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#valid-date-string
-        return convert_number_to_date_string(input->date_value());
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#month-state-(type=month):concept-input-value-date-string
-    if (type_state() == TypeAttributeState::Month) {
-        // Return a valid month string that represents the month current at the time represented by input in the UTC time zone.
-        // https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#valid-month-string
-        return convert_date_to_month_string(input->date_value());
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#week-state-(type=week):concept-input-value-date-string
-    if (type_state() == TypeAttributeState::Week) {
-        // Return a valid week string that represents the week current at the time represented by input in the UTC time zone.
-        // https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#valid-week-string
-        return convert_number_to_week_string(input->date_value());
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#time-state-(type=time):concept-input-value-string-date
-    if (type_state() == TypeAttributeState::Time) {
-        // Return a valid time string that represents the UTC time component that is represented by input.
-        // https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#valid-time-string
-        return convert_number_to_time_string(input->date_value());
-    }
-
-    dbgln("HTMLInputElement::convert_date_to_string() not implemented for input type {}", type());
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#attr-input-min
-Optional<double> HTMLInputElement::min() const
-{
-    // If the element has a min attribute, and the result of applying the algorithm to convert a string to a number to
-    // the value of the min attribute is a number, then that number is the element's minimum; otherwise, if the type
-    // attribute's current state defines a default minimum, then that is the minimum; otherwise, the element has no minimum.
-    if (auto min_string = get_attribute(HTML::AttributeNames::min); min_string.has_value()) {
-        if (auto min = convert_string_to_number(*min_string); min.has_value())
-            return *min;
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#range-state-(type=range):concept-input-min-default
-    if (type_state() == TypeAttributeState::Range)
-        return 0;
-
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#attr-input-max
-Optional<double> HTMLInputElement::max() const
-{
-    // If the element has a max attribute, and the result of applying the algorithm to convert a string to a number to the
-    // value of the max attribute is a number, then that number is the element's maximum; otherwise, if the type attribute's
-    // current state defines a default maximum, then that is the maximum; otherwise, the element has no maximum.
-    if (auto max_string = get_attribute(HTML::AttributeNames::max); max_string.has_value()) {
-        if (auto max = convert_string_to_number(*max_string); max.has_value())
-            return *max;
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#range-state-(type=range):concept-input-max-default
-    if (type_state() == TypeAttributeState::Range)
-        return 100;
-
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#concept-input-step-default
-double HTMLInputElement::default_step() const
-{
-    // https://html.spec.whatwg.org/multipage/input.html#number-state-(type=number):concept-input-step-default
-    if (type_state() == TypeAttributeState::Number)
-        return 1;
-
-    // https://html.spec.whatwg.org/multipage/input.html#range-state-(type=range):concept-input-step-default
-    if (type_state() == TypeAttributeState::Range)
-        return 1;
-
-    // https://html.spec.whatwg.org/multipage/input.html#time-state-(type=time):concept-input-step-default
-    if (type_state() == TypeAttributeState::Time)
-        return 60;
-
-    // https://html.spec.whatwg.org/multipage/input.html#date-state-(type=date):concept-input-step-default
-    if (type_state() == TypeAttributeState::Date)
-        return 1;
-
-    // https://html.spec.whatwg.org/multipage/input.html#month-state-(type=month):concept-input-step-default
-    if (type_state() == TypeAttributeState::Month)
-        return 1;
-
-    // https://html.spec.whatwg.org/multipage/input.html#week-state-(type=week):concept-input-step-default
-    if (type_state() == TypeAttributeState::Week)
-        return 1;
-
-    // https://html.spec.whatwg.org/multipage/input.html#local-date-and-time-state-(type=datetime-local):concept-input-step-default
-    if (type_state() == TypeAttributeState::LocalDateAndTime)
-        return 60;
-
-    VERIFY_NOT_REACHED();
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#concept-input-step-scale
-double HTMLInputElement::step_scale_factor() const
-{
-    // https://html.spec.whatwg.org/multipage/input.html#number-state-(type=number):concept-input-step-scale
-    if (type_state() == TypeAttributeState::Number)
-        return 1;
-
-    // https://html.spec.whatwg.org/multipage/input.html#range-state-(type=range):concept-input-step-scale
-    if (type_state() == TypeAttributeState::Range)
-        return 1;
-
-    // https://html.spec.whatwg.org/multipage/input.html#time-state-(type=time):concept-input-step-scale
-    if (type_state() == TypeAttributeState::Time)
-        return 1000;
-
-    // https://html.spec.whatwg.org/multipage/input.html#date-state-(type=date):concept-input-step-scale
-    if (type_state() == TypeAttributeState::Date)
-        return 86400000;
-
-    // https://html.spec.whatwg.org/multipage/input.html#month-state-(type=month):concept-input-step-scale
-    if (type_state() == TypeAttributeState::Month)
-        return 1;
-
-    // https://html.spec.whatwg.org/multipage/input.html#week-state-(type=week):concept-input-step-scale
-    if (type_state() == TypeAttributeState::Week)
-        return 604800000;
-
-    // https://html.spec.whatwg.org/multipage/input.html#local-date-and-time-state-(type=datetime-local):concept-input-step-scale
-    if (type_state() == TypeAttributeState::LocalDateAndTime)
-        return 1000;
-
-    VERIFY_NOT_REACHED();
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#concept-input-step
-Optional<double> HTMLInputElement::allowed_value_step() const
-{
-    // 1. If the attribute does not apply, then there is no allowed value step.
-    if (!step_applies())
-        return {};
-
-    // 2. Otherwise, if the attribute is absent, then the allowed value step is the default step multiplied by the step scale factor.
-    auto maybe_step_string = get_attribute(AttributeNames::step);
-    if (!maybe_step_string.has_value())
-        return default_step() * step_scale_factor();
-    auto step_string = *maybe_step_string;
-
-    // 3. Otherwise, if the attribute's value is an ASCII case-insensitive match for the string "any", then there is no allowed value step.
-    if (step_string.equals_ignoring_ascii_case("any"sv))
-        return {};
-
-    // 4. Otherwise, if the rules for parsing floating-point number values, when they are applied to the attribute's value, return an error,
-    // zero, or a number less than zero, then the allowed value step is the default step multiplied by the step scale factor.
-    auto maybe_step = parse_floating_point_number(step_string);
-    if (!maybe_step.has_value() || *maybe_step == 0 || *maybe_step < 0)
-        return default_step() * step_scale_factor();
-
-    // 5. Otherwise, the allowed value step is the number returned by the rules for parsing floating-point number values when they are applied
-    // to the attribute's value, multiplied by the step scale factor.
-    return *maybe_step * step_scale_factor();
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#concept-input-min-zero
-double HTMLInputElement::step_base() const
-{
-    // 1. If the element has a min content attribute, and the result of applying the algorithm to convert a string to a number to the value of
-    // the min content attribute is not an error, then return that result.
-    if (auto min = this->min(); min.has_value())
-        return *min;
-
-    // 2. If the element has a value content attribute, and the result of applying the algorithm to convert a string to a number to the value of
-    // the value content attribute is not an error, then return that result.
-    if (auto value = get_attribute(HTML::AttributeNames::value); value.has_value()) {
-        if (auto value_as_number = convert_string_to_number(value.value()); value_as_number.has_value())
-            return value_as_number.value();
-    }
-
-    // 3. If a default step base is defined for this element given its type attribute's state, then return it.
-    if (type_state() == TypeAttributeState::Week) {
-        // The default step base is −259,200,000 (the start of week 1970-W01).
-        return -259'200'000;
-    }
-
-    // 4. Return zero.
-    return 0;
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#dom-input-valueasdate
-JS::Object* HTMLInputElement::value_as_date() const
-{
-    // On getting, if the valueAsDate attribute does not apply, as defined for the input element's type attribute's current state, then return null.
-    if (!value_as_date_applies())
-        return nullptr;
-
-    // Otherwise, run the algorithm to convert a string to a Date object defined for that state to the element's value;
-    // if the algorithm returned a Date object, then return it, otherwise, return null.
-    auto maybe_date = convert_string_to_date(value());
-    if (!maybe_date.is_exception())
-        return maybe_date.value().ptr();
-    return nullptr;
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#dom-input-valueasdate
-WebIDL::ExceptionOr<void> HTMLInputElement::set_value_as_date(GC::Ptr<JS::Object> value)
-{
-    // On setting, if the valueAsDate attribute does not apply, as defined for the input element's type attribute's current state, then throw an "InvalidStateError" DOMException;
-    if (!value_as_date_applies())
-        return WebIDL::InvalidStateError::create(realm(), "valueAsDate: Invalid input type used"_utf16);
-
-    // otherwise, if the new value is not null and not a Date object throw a TypeError exception;
-    if (value && !is<JS::Date>(*value))
-        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "valueAsDate: input is not a Date"sv };
-
-    // otherwise if the new value is null or a Date object representing the NaN time value, then set the value of the element to the empty string;
-    if (!value) {
-        TRY(set_value({}));
-        return {};
-    }
-    auto& date = static_cast<JS::Date&>(*value);
-    if (!isfinite(date.date_value())) {
-        TRY(set_value({}));
-        return {};
-    }
-
-    // otherwise, run the algorithm to convert a Date object to a string, as defined for that state, on the new value, and set the value of the element to the resulting string.
-    TRY(set_value(convert_date_to_string(date)));
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#dom-input-valueasnumber
-double HTMLInputElement::value_as_number() const
-{
-    // On getting, if the valueAsNumber attribute does not apply, as defined for the input element's type attribute's current state, then return a Not-a-Number (NaN) value.
-    if (!value_as_number_applies())
-        return NAN;
-
-    // Otherwise, run the algorithm to convert a string to a number defined for that state to the element's value;
-    // if the algorithm returned a number, then return it, otherwise, return a Not-a-Number (NaN) value.
-    return convert_string_to_number(value()).value_or(NAN);
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#dom-input-valueasnumber
-WebIDL::ExceptionOr<void> HTMLInputElement::set_value_as_number(double value)
-{
-    // On setting, if the new value is infinite, then throw a TypeError exception.
-    if (!isfinite(value))
-        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "valueAsNumber: Value is infinite"sv };
-
-    // Otherwise, if the valueAsNumber attribute does not apply, as defined for the input element's type attribute's current state, then throw an "InvalidStateError" DOMException.
-    if (!value_as_number_applies())
-        return WebIDL::InvalidStateError::create(realm(), "valueAsNumber: Invalid input type used"_utf16);
-
-    // Otherwise, if the new value is a Not-a-Number (NaN) value, then set the value of the element to the empty string.
-    if (value == NAN) {
-        TRY(set_value({}));
-        return {};
-    }
-
-    // Otherwise, run the algorithm to convert a number to a string, as defined for that state, on the new value, and set the value of the element to the resulting string.
-    TRY(set_value(convert_number_to_string(value)));
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#dom-input-stepup
-WebIDL::ExceptionOr<void> HTMLInputElement::step_up(WebIDL::Long n)
-{
-    return step_up_or_down(false, n);
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#dom-input-stepdown
-WebIDL::ExceptionOr<void> HTMLInputElement::step_down(WebIDL::Long n)
-{
-    return step_up_or_down(true, n);
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#dom-input-stepup
-WebIDL::ExceptionOr<void> HTMLInputElement::step_up_or_down(bool is_down, WebIDL::Long n)
-{
-    // 1. If the stepDown() and stepUp() methods do not apply, as defined for the input element's type attribute's current state, then throw an "InvalidStateError" DOMException.
-    if (!step_up_or_down_applies())
-        return WebIDL::InvalidStateError::create(realm(), Utf16String::formatted("{}: Invalid input type used", is_down ? "stepDown()" : "stepUp()"));
-
-    // 2. If the element has no allowed value step, then throw an "InvalidStateError" DOMException.
-    auto maybe_allowed_value_step = allowed_value_step();
-    if (!maybe_allowed_value_step.has_value())
-        return WebIDL::InvalidStateError::create(realm(), "element has no allowed value step"_utf16);
-    double allowed_value_step = *maybe_allowed_value_step;
-
-    // 3. If the element has a minimum and a maximum and the minimum is greater than the maximum, then return.
-    auto maybe_minimum = min();
-    auto maybe_maximum = max();
-    if (maybe_minimum.has_value() && maybe_maximum.has_value() && *maybe_minimum > *maybe_maximum)
-        return {};
-
-    // 4. If the element has a minimum and a maximum and there is no value greater than or equal to the element's minimum and less than
-    // or equal to the element's maximum that, when subtracted from the step base, is an integral multiple of the allowed value step, then return.
-    if (maybe_minimum.has_value() && maybe_maximum.has_value() && ceil((*maybe_minimum - step_base()) / allowed_value_step) > floor((*maybe_maximum - step_base()) / allowed_value_step))
-        return {};
-
-    // 5. If applying the algorithm to convert a string to a number to the string given by the element's value does not result in an error,
-    // then let value be the result of that algorithm. Otherwise, let value be zero.
-    double value = convert_string_to_number(this->value()).value_or(0);
-
-    // 6. Let valueBeforeStepping be value.
-    double value_before_stepping = value;
-
-    // 7. If value subtracted from the step base is not an integral multiple of the allowed value step, then set value to the nearest value that,
-    // when subtracted from the step base, is an integral multiple of the allowed value step, and that is less than value if the method invoked was the stepDown() method, and more than value otherwise.
-    if (!is_integral_multiple(step_base() - value, allowed_value_step)) {
-        if (is_down) {
-            value = step_base() + floor((value - step_base()) / allowed_value_step) * allowed_value_step;
-        } else {
-            value = step_base() + ceil((value - step_base()) / allowed_value_step) * allowed_value_step;
-        }
-    }
-    // Otherwise (value subtracted from the step base is an integral multiple of the allowed value step):
-    else {
-        // 1. Let n be the argument.
-        // 2. Let delta be the allowed value step multiplied by n.
-        double delta = allowed_value_step * n;
-
-        // 3. If the method invoked was the stepDown() method, negate delta.
-        if (is_down)
-            delta = -delta;
-
-        // 4. Let value be the result of adding delta to value.
-        value += delta;
-    }
-
-    // 8. If the element has a minimum, and value is less than that minimum, then set value to the smallest value that,
-    //    when subtracted from the step base, is an integral multiple of the allowed value step, and that is more than
-    //    or equal to that minimum.
-    if (maybe_minimum.has_value() && value < *maybe_minimum) {
-        value = step_base() + ceil((*maybe_minimum - step_base()) / allowed_value_step) * allowed_value_step;
-    }
-
-    // 9. If the element has a maximum, and value is greater than that maximum, then set value to the largest value that,
-    //    when subtracted from the step base, is an integral multiple of the allowed value step, and that is less than
-    //    or equal to that maximum.
-    if (maybe_maximum.has_value() && value > *maybe_maximum) {
-        value = step_base() + floor((*maybe_maximum - step_base()) / allowed_value_step) * allowed_value_step;
-    }
-
-    // 10. If either the method invoked was the stepDown() method and value is greater than valueBeforeStepping,
-    // or the method invoked was the stepUp() method and value is less than valueBeforeStepping, then return.
-    if (is_down) {
-        if (value > value_before_stepping)
-            return {};
-    } else {
-        if (value < value_before_stepping)
-            return {};
-    }
-
-    // 11. Let value as string be the result of running the algorithm to convert a number to a string,
-    // as defined for the input element's type attribute's current state, on value.
-    auto value_as_string = convert_number_to_string(value);
-
-    // 12. Set the value of the element to value as string.
-    TRY(set_value(value_as_string));
-    return {};
-}
-
-Optional<ARIA::Role> HTMLInputElement::default_role() const
-{
-    // http://wpt.live/html-aam/roles-dynamic-switch.tentative.window.html "Disconnected <input type=checkbox switch>"
-    if (!is_connected())
-        return {};
-    // https://www.w3.org/TR/html-aria/#el-input-button
-    if (type_state() == TypeAttributeState::Button)
-        return ARIA::Role::button;
-    // https://www.w3.org/TR/html-aria/#el-input-checkbox
-    if (type_state() == TypeAttributeState::Checkbox) {
-        // https://github.com/w3c/html-aam/issues/496
-        if (has_attribute(HTML::AttributeNames::switch_))
-            return ARIA::Role::switch_;
-        return ARIA::Role::checkbox;
-    }
-    // https://www.w3.org/TR/html-aria/#el-input-email
-    if (type_state() == TypeAttributeState::Email && !has_attribute(AttributeNames::list))
-        return ARIA::Role::textbox;
-    // https://www.w3.org/TR/html-aria/#el-input-image
-    if (type_state() == TypeAttributeState::ImageButton)
-        return ARIA::Role::button;
-    // https://www.w3.org/TR/html-aria/#el-input-number
-    if (type_state() == TypeAttributeState::Number)
-        return ARIA::Role::spinbutton;
-    // https://www.w3.org/TR/html-aria/#el-input-radio
-    if (type_state() == TypeAttributeState::RadioButton)
-        return ARIA::Role::radio;
-    // https://www.w3.org/TR/html-aria/#el-input-range
-    if (type_state() == TypeAttributeState::Range)
-        return ARIA::Role::slider;
-    // https://www.w3.org/TR/html-aria/#el-input-reset
-    if (type_state() == TypeAttributeState::ResetButton)
-        return ARIA::Role::button;
-    // https://www.w3.org/TR/html-aria/#el-input-text-list
-    if ((type_state() == TypeAttributeState::Text
-            || type_state() == TypeAttributeState::Search
-            || type_state() == TypeAttributeState::Telephone
-            || type_state() == TypeAttributeState::URL
-            || type_state() == TypeAttributeState::Email)
-        && has_attribute(AttributeNames::list))
-        return ARIA::Role::combobox;
-    // https://www.w3.org/TR/html-aria/#el-input-search
-    if (type_state() == TypeAttributeState::Search && !has_attribute(AttributeNames::list))
-        return ARIA::Role::searchbox;
-    // https://www.w3.org/TR/html-aria/#el-input-submit
-    if (type_state() == TypeAttributeState::SubmitButton)
-        return ARIA::Role::button;
-    // https://www.w3.org/TR/html-aria/#el-input-tel
-    if (type_state() == TypeAttributeState::Telephone)
-        return ARIA::Role::textbox;
-    // https://www.w3.org/TR/html-aria/#el-input-text
-    if (type_state() == TypeAttributeState::Text && !has_attribute(AttributeNames::list))
-        return ARIA::Role::textbox;
-    // https://www.w3.org/TR/html-aria/#el-input-url
-    if (type_state() == TypeAttributeState::URL && !has_attribute(AttributeNames::list))
-        return ARIA::Role::textbox;
-
-    // https://www.w3.org/TR/html-aria/#el-input-color
-    // https://www.w3.org/TR/html-aria/#el-input-date
-    // https://www.w3.org/TR/html-aria/#el-input-datetime-local
-    // https://www.w3.org/TR/html-aria/#el-input-file
-    // https://www.w3.org/TR/html-aria/#el-input-hidden
-    // https://www.w3.org/TR/html-aria/#el-input-month
-    // https://www.w3.org/TR/html-aria/#el-input-password
-    // https://www.w3.org/TR/html-aria/#el-input-time
-    // https://www.w3.org/TR/html-aria/#el-input-week
-    return {};
-}
-
-bool HTMLInputElement::is_button() const
-{
-    // https://html.spec.whatwg.org/multipage/input.html#submit-button-state-(type=submit):concept-button
-    // https://html.spec.whatwg.org/multipage/input.html#image-button-state-(type=image):concept-button
-    // https://html.spec.whatwg.org/multipage/input.html#reset-button-state-(type=reset):concept-button
-    // https://html.spec.whatwg.org/multipage/input.html#button-state-(type=button):concept-button
-    return type_state() == TypeAttributeState::SubmitButton
-        || type_state() == TypeAttributeState::ImageButton
-        || type_state() == TypeAttributeState::ResetButton
-        || type_state() == TypeAttributeState::Button;
-}
-
-bool HTMLInputElement::is_submit_button() const
-{
-    // https://html.spec.whatwg.org/multipage/input.html#submit-button-state-(type=submit):concept-submit-button
-    // https://html.spec.whatwg.org/multipage/input.html#image-button-state-(type=image):concept-submit-button
-    return type_state() == TypeAttributeState::SubmitButton
-        || type_state() == TypeAttributeState::ImageButton;
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#text-(type=text)-state-and-search-state-(type=search)
-// https://html.spec.whatwg.org/multipage/input.html#password-state-(type=password)
-// "one line plain text edit control"
-bool HTMLInputElement::is_single_line() const
-{
-    // NOTE: For web compatibility reasons, we consider other types
-    //       in addition to Text, Search, and Password as single line inputs.
-    return type_state() == TypeAttributeState::Text
-        || type_state() == TypeAttributeState::Search
-        || type_state() == TypeAttributeState::Password
-        || type_state() == TypeAttributeState::Email
-        || type_state() == TypeAttributeState::Telephone
-        || type_state() == TypeAttributeState::Number;
-}
-
-bool HTMLInputElement::has_activation_behavior() const
-{
-    return true;
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-input-element:activation-behaviour
-void HTMLInputElement::activation_behavior(DOM::Event const& event)
-{
-    // The activation behavior for input elements are these steps:
-
-    // 1. If element is not mutable, and element's type attribute is neither in the Checkbox nor in the Radio state, then return.
-    if (!is_mutable() && !first_is_one_of(m_type, TypeAttributeState::Checkbox, TypeAttributeState::RadioButton))
-        return;
-
-    // 2. Run element's input activation behavior, if any, and do nothing otherwise.
-    run_input_activation_behavior(event).release_value_but_fixme_should_propagate_errors();
-
-    // 3. If element has a form owner and element's type attribute is not in the Button state, then return.
-    if (form() != nullptr && type_state() != TypeAttributeState::Button)
-        return;
-
-    // 4. Run the popover target attribute activation behavior given element and event's target.
-    if (event.target() && event.target()->is_dom_node())
-        PopoverTargetAttributes::popover_target_activation_behaviour(*this, as<DOM::Node>(*event.target()));
-}
-
-bool HTMLInputElement::has_input_activation_behavior() const
-{
-    switch (type_state()) {
-    case TypeAttributeState::Checkbox:
-    case TypeAttributeState::Color:
-    case TypeAttributeState::FileUpload:
-    case TypeAttributeState::ImageButton:
-    case TypeAttributeState::RadioButton:
-    case TypeAttributeState::ResetButton:
-    case TypeAttributeState::SubmitButton:
-        return true;
-    default:
-        return false;
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#do-not-apply
-bool HTMLInputElement::select_applies() const
-{
-    switch (type_state()) {
-    case TypeAttributeState::Button:
-    case TypeAttributeState::Checkbox:
-    case TypeAttributeState::Hidden:
-    case TypeAttributeState::ImageButton:
-    case TypeAttributeState::RadioButton:
-    case TypeAttributeState::Range:
-    case TypeAttributeState::ResetButton:
-    case TypeAttributeState::SubmitButton:
-        return false;
-    default:
-        return true;
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#do-not-apply
-bool HTMLInputElement::selection_or_range_applies() const
-{
-    return selection_or_range_applies_for_type_state(type_state());
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#do-not-apply
-bool HTMLInputElement::selection_direction_applies() const
-{
-    switch (type_state()) {
-    case TypeAttributeState::Text:
-    case TypeAttributeState::Search:
-    case TypeAttributeState::Telephone:
-    case TypeAttributeState::URL:
-    case TypeAttributeState::Password:
-        return true;
-    default:
-        return false;
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#do-not-apply
-bool HTMLInputElement::pattern_applies() const
-{
-    switch (type_state()) {
-    case TypeAttributeState::Text:
-    case TypeAttributeState::Search:
-    case TypeAttributeState::Telephone:
-    case TypeAttributeState::URL:
-    case TypeAttributeState::Email:
-    case TypeAttributeState::Password:
-        return true;
-    default:
-        return false;
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#do-not-apply
-bool HTMLInputElement::multiple_applies() const
-{
-    switch (type_state()) {
-    case TypeAttributeState::Email:
-    case TypeAttributeState::FileUpload:
-        return true;
-    default:
-        return false;
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#do-not-apply
-bool HTMLInputElement::required_applies() const
-{
-    switch (type_state()) {
-    case TypeAttributeState::Text:
-    case TypeAttributeState::Search:
-    case TypeAttributeState::Telephone:
-    case TypeAttributeState::URL:
-    case TypeAttributeState::Email:
-    case TypeAttributeState::Password:
-    case TypeAttributeState::Date:
-    case TypeAttributeState::Month:
-    case TypeAttributeState::Week:
-    case TypeAttributeState::Time:
-    case TypeAttributeState::LocalDateAndTime:
-    case TypeAttributeState::Number:
-    case TypeAttributeState::Checkbox:
-    case TypeAttributeState::RadioButton:
-    case TypeAttributeState::FileUpload:
-        return true;
-    default:
-        return false;
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#do-not-apply
-bool HTMLInputElement::checked_applies(TypeAttributeState type_state)
-{
-    switch (type_state) {
-    case TypeAttributeState::Checkbox:
-    case TypeAttributeState::RadioButton:
-        return true;
-    default:
-        return false;
-    }
-}
-
-bool HTMLInputElement::checked_applies() const
-{
-    return checked_applies(type_state());
-}
-
-bool HTMLInputElement::has_selectable_text() const
-{
-    // Potential FIXME: Date, Month, Week, Time and LocalDateAndTime are rendered as a basic text input for now,
-    // thus they have selectable text, this need to change when we will have a visual date/time selector.
-
-    switch (type_state()) {
-    case TypeAttributeState::Text:
-    case TypeAttributeState::Search:
-    case TypeAttributeState::Telephone:
-    case TypeAttributeState::URL:
-    case TypeAttributeState::Password:
-    case TypeAttributeState::Date:
-    case TypeAttributeState::Month:
-    case TypeAttributeState::Week:
-    case TypeAttributeState::Time:
-    case TypeAttributeState::LocalDateAndTime:
-    case TypeAttributeState::Number:
-    case TypeAttributeState::Email:
-        return true;
-    default:
-        return false;
-    }
-}
-
-bool HTMLInputElement::selection_or_range_applies_for_type_state(TypeAttributeState type_state)
-{
-    switch (type_state) {
-    case TypeAttributeState::Text:
-    case TypeAttributeState::Search:
-    case TypeAttributeState::Telephone:
-    case TypeAttributeState::URL:
-    case TypeAttributeState::Password:
-        return true;
-    default:
-        return false;
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-input-element:event-change-2
-bool HTMLInputElement::change_event_applies() const
-{
-    switch (type_state()) {
-    case TypeAttributeState::Checkbox:
-    case TypeAttributeState::Color:
-    case TypeAttributeState::Date:
-    case TypeAttributeState::Email:
-    case TypeAttributeState::FileUpload:
-    case TypeAttributeState::LocalDateAndTime:
-    case TypeAttributeState::Month:
-    case TypeAttributeState::Number:
-    case TypeAttributeState::Password:
-    case TypeAttributeState::RadioButton:
-    case TypeAttributeState::Range:
-    case TypeAttributeState::Search:
-    case TypeAttributeState::Telephone:
-    case TypeAttributeState::Text:
-    case TypeAttributeState::Time:
-    case TypeAttributeState::URL:
-    case TypeAttributeState::Week:
-        return true;
-    default:
-        return false;
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-input-element:dom-input-valueasdate-3
-bool HTMLInputElement::value_as_date_applies() const
-{
-    switch (type_state()) {
-    case TypeAttributeState::Date:
-    case TypeAttributeState::Month:
-    case TypeAttributeState::Week:
-    case TypeAttributeState::Time:
-        return true;
-    default:
-        return false;
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-input-element:dom-input-valueasnumber-3
-bool HTMLInputElement::value_as_number_applies() const
-{
-    switch (type_state()) {
-    case TypeAttributeState::Date:
-    case TypeAttributeState::Month:
-    case TypeAttributeState::Week:
-    case TypeAttributeState::Time:
-    case TypeAttributeState::LocalDateAndTime:
-    case TypeAttributeState::Number:
-    case TypeAttributeState::Range:
-        return true;
-    default:
-        return false;
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-input-element:attr-input-step-3
-bool HTMLInputElement::step_applies() const
-{
-    return value_as_number_applies();
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-input-element:dom-input-stepup-3
-bool HTMLInputElement::step_up_or_down_applies() const
-{
-    return value_as_number_applies();
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-input-element:dom-input-value-2
-HTMLInputElement::ValueAttributeMode HTMLInputElement::value_attribute_mode_for_type_state(TypeAttributeState type_state)
-{
-    switch (type_state) {
-    case TypeAttributeState::Text:
-    case TypeAttributeState::Search:
-    case TypeAttributeState::Telephone:
-    case TypeAttributeState::URL:
-    case TypeAttributeState::Email:
-    case TypeAttributeState::Password:
-    case TypeAttributeState::Date:
-    case TypeAttributeState::Month:
-    case TypeAttributeState::Week:
-    case TypeAttributeState::Time:
-    case TypeAttributeState::LocalDateAndTime:
-    case TypeAttributeState::Number:
-    case TypeAttributeState::Range:
-    case TypeAttributeState::Color:
-        return ValueAttributeMode::Value;
-
-    case TypeAttributeState::Hidden:
-    case TypeAttributeState::SubmitButton:
-    case TypeAttributeState::ImageButton:
-    case TypeAttributeState::ResetButton:
-    case TypeAttributeState::Button:
-        return ValueAttributeMode::Default;
-
-    case TypeAttributeState::Checkbox:
-    case TypeAttributeState::RadioButton:
-        return ValueAttributeMode::DefaultOn;
-
-    case TypeAttributeState::FileUpload:
-        return ValueAttributeMode::Filename;
-    }
-
-    VERIFY_NOT_REACHED();
-}
-
-HTMLInputElement::ValueAttributeMode HTMLInputElement::value_attribute_mode() const
-{
-    return value_attribute_mode_for_type_state(type_state());
-}
-
-bool HTMLInputElement::is_focusable() const
-{
-    return m_type != TypeAttributeState::Hidden
-        && enabled()
-        && meets_focusable_area_rendering_requirements();
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#has-a-reversed-range
-bool HTMLInputElement::has_reversed_range() const
-{
-    auto minimum = min();
-    if (!minimum.has_value())
-        return false;
-    auto maximum = max();
-    if (!maximum.has_value())
-        return false;
-    // An element has a reversed range if it has a periodic domain and its maximum is less than its minimum.
-    return has_periodic_domain() && maximum.value() < minimum.value();
-}
-
-// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#suffering-from-being-missing
-bool HTMLInputElement::suffering_from_being_missing() const
-{
-    bool has_checkedness_false_for_all_elements_in_group = true;
-    bool has_required_element_in_group = false;
-    switch (type_state()) {
-    case TypeAttributeState::Checkbox:
-        // https://html.spec.whatwg.org/multipage/input.html#checkbox-state-(type%3Dcheckbox)%3Asuffering-from-being-missing
-        // If the element is required and its checkedness is false, then the element is suffering from being missing.
-        if (has_attribute(HTML::AttributeNames::required) && !checked())
-            return true;
-        break;
-    case TypeAttributeState::RadioButton:
-        // https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type%3Dradio)%3Asuffering-from-being-missing
-        // If an element in the radio button group is required, and all of the input elements in the radio button group
-        // have a checkedness that is false, then the element is suffering from being missing.
-        root().for_each_in_inclusive_subtree_of_type<HTML::HTMLInputElement>([&](auto& element) {
-            if (is_in_same_radio_button_group(*this, element)) {
-                if (element.checked())
-                    has_checkedness_false_for_all_elements_in_group = false;
-                if (element.has_attribute(HTML::AttributeNames::required))
-                    has_required_element_in_group = true;
-            }
-            return TraversalDecision::Continue;
-        });
-        if (has_checkedness_false_for_all_elements_in_group && has_required_element_in_group)
-            return true;
-        break;
-    case TypeAttributeState::FileUpload:
-        // https://html.spec.whatwg.org/multipage/input.html#file-upload-state-(type%3Dfile)%3Asuffering-from-being-missing
-        // If the element is required and the list of selected files is empty, then the element is suffering from being missing.
-        if (has_attribute(HTML::AttributeNames::required) && const_cast<HTMLInputElement&>(*this).files()->length() == 0)
-            return true;
-        break;
-    default:
-        break;
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#the-required-attribute%3Asuffering-from-being-missing
-    // If the element is required, and its value IDL attribute applies and is in the mode value, and the element is mutable, and the element's value is the empty
-    // string, then the element is suffering from being missing.
-    if (has_attribute(HTML::AttributeNames::required) && value_attribute_mode() == ValueAttributeMode::Value && is_mutable() && m_value.is_empty())
-        return true;
-
-    return false;
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#valid-e-mail-address
-static regex::ECMAScriptRegex& valid_email_address_regex()
-{
-    static NeverDestroyed<regex::ECMAScriptRegex> regex { MUST(regex::ECMAScriptRegex::compile(
-        "^[a-zA-Z0-9.!#$%&'*+\\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$"sv,
-        regex::ECMAScriptCompileFlags {})) };
-    return *regex;
-}
-
-// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#suffering-from-a-type-mismatch
-bool HTMLInputElement::suffering_from_a_type_mismatch() const
-{
-    auto input = value();
-    switch (type_state()) {
-    // https://html.spec.whatwg.org/multipage/input.html#url-state-(type%3Durl)%3Asuffering-from-a-type-mismatch
-    case TypeAttributeState::URL:
-        // While the value of the element is neither the empty string nor a valid absolute URL, the element is suffering from a type mismatch.
-        // AD-HOC: https://github.com/whatwg/html/issues/11083 and https://github.com/web-platform-tests/wpt/pull/51011
-        //         We intentionally don't check if the value is a "valid absolute URL", because that's not what other
-        //         engines actually do. So we instead just implement what matches the behavior in existing engines.
-        return !input.is_empty() && !URL::Parser::basic_parse(input.to_utf8_but_should_be_ported_to_utf16()).has_value();
-
-    // https://html.spec.whatwg.org/multipage/input.html#email-state-(type%3Demail)%3Asuffering-from-a-type-mismatch
-    case TypeAttributeState::Email: {
-        // When the multiple attribute is not specified on the element: While the value of the element is neither the
-        // empty string nor a single valid email address, the element is suffering from a type mismatch.
-        if (!has_attribute(HTML::AttributeNames::multiple))
-            return !input.is_empty() && valid_email_address_regex().exec(input.utf16_view(), 0) != regex::MatchResult::Match;
-
-        // When the multiple attribute is specified on the element: While the value of the element is not a valid email
-        // address list, the element is suffering from a type mismatch.
-        // https://html.spec.whatwg.org/multipage/input.html#valid-e-mail-address-list
-        // A valid email address list is a set of comma-separated tokens, where each token is itself a valid email
-        // address. To obtain the list of tokens from a valid email address list, an implementation must split the
-        // string on commas.
-        bool valid = true;
-
-        input.for_each_split_view(',', SplitBehavior::Nothing, [&](auto const& address) {
-            if (valid_email_address_regex().exec(address, 0) == regex::MatchResult::Match)
-                return IterationDecision::Continue;
-
-            valid = false;
-            return IterationDecision::Break;
-        });
-
-        return !valid;
-    }
-
-    default:
-        break;
-    }
-
-    return false;
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-pattern-attribute%3Asuffering-from-a-pattern-mismatch
-bool HTMLInputElement::suffering_from_a_pattern_mismatch() const
-{
-    // If the element's value is not the empty string, and either the element's multiple attribute is not specified or
-    // it does not apply to the input element given its type attribute's current state, and the element has a compiled
-    // pattern regular expression but that regular expression does not match the element's value, then the element is
-    // suffering from a pattern mismatch.
-
-    // If the element's value is not the empty string, and the element's multiple attribute is specified and applies to
-    // the input element, and the element has a compiled pattern regular expression but that regular expression does not
-    // match each of the element's values, then the element is suffering from a pattern mismatch.
-
-    if (!pattern_applies())
-        return false;
-
-    auto value = this->value();
