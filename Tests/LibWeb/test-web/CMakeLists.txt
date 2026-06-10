@@ -1,12 +1,14 @@
 set(SOURCES
     Application.cpp
     CaptureFile.cpp
+    Collection.cpp
     Debug.cpp
     Display.cpp
     Fixture.cpp
     Fuzzy.cpp
     TestRunCapture.cpp
     TestWebView.cpp
+    Variants.cpp
     main.cpp
 )
 
