@@ -23,6 +23,7 @@
 #include <LibFileSystem/FileSystem.h>
 #include <LibImageDecoderClient/Client.h>
 #include <LibURL/InternalURLs.h>
+#include <LibURL/Parser.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/Loader/UserAgent.h>
 #include <LibWeb/Page/InputEvent.h>
@@ -1817,6 +1818,52 @@ void Application::traverse_the_history_by_delta(DevTools::TabDescription const& 
 {
     if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
         view->traverse_the_history_by_delta(delta);
+}
+
+Vector<HTTP::Cookie::Cookie> Application::cookies(DevTools::TabDescription const& description) const
+{
+    if (!ViewImplementation::find_view_by_id(description.id).has_value())
+        return {};
+
+    return Application::cookie_jar().get_all_cookies();
+}
+
+ErrorOr<void> Application::set_cookie(DevTools::TabDescription const& description, Optional<HTTP::Cookie::Cookie> old_cookie, HTTP::Cookie::Cookie cookie) const
+{
+    if (!ViewImplementation::find_view_by_id(description.id).has_value())
+        return Error::from_string_literal("Unable to locate tab");
+
+    auto url = URL::Parser::basic_parse(description.url);
+    if (!url.has_value())
+        return Error::from_string_literal("Unable to parse tab URL");
+
+    Optional<CookieStorageKey> old_key;
+    if (old_cookie.has_value())
+        old_key = CookieStorageKey { old_cookie->name, old_cookie->domain, old_cookie->path };
+
+    TRY(Application::cookie_jar().set_cookie_from_devtools(*url, move(old_key), move(cookie)));
+    return {};
+}
+
+void Application::delete_cookies(DevTools::TabDescription const& description, Vector<HTTP::Cookie::Cookie> cookies) const
+{
+    if (!ViewImplementation::find_view_by_id(description.id).has_value())
+        return;
+
+    for (auto const& cookie : cookies)
+        Application::cookie_jar().delete_cookie({ cookie.name, cookie.domain, cookie.path });
+}
+
+void Application::listen_for_host_cookie_changes(DevTools::TabDescription const& description, OnHostCookieChange on_host_cookie_change) const
+{
+    if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
+        view->listen_for_host_cookie_changes(move(on_host_cookie_change));
+}
+
+void Application::stop_listening_for_host_cookie_changes(DevTools::TabDescription const& description) const
+{
+    if (auto view = ViewImplementation::find_view_by_id(description.id); view.has_value())
+        view->stop_listening_for_host_cookie_changes();
 }
 
 void Application::inspect_tab(DevTools::TabDescription const& description, OnTabInspectionComplete on_complete) const
