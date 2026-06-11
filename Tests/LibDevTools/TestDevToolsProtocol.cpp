@@ -547,7 +547,7 @@ class TestDevToolsDelegate final : public DevTools::DevToolsDelegate {
 public:
     virtual Vector<DevTools::TabDescription> tab_list() const override
     {
-        return { { .id = 1, .title = "Fixture page"_string, .url = "https://example.test/"_string } };
+        return { { .id = 1, .title = "Fixture page"_string, .url = tab_url } };
     }
 
     virtual Vector<DevTools::CSSProperty> css_property_list() const override
@@ -651,6 +651,84 @@ public:
     {
         ++stop_listening_for_cookie_changes_call_count;
         on_host_cookie_change = nullptr;
+    }
+
+    virtual void inspect_storage(DevTools::TabDescription const&, Web::StorageAPI::StorageEndpointType storage_endpoint, OnStorageItemsReceived callback) const override
+    {
+        ++inspect_storage_call_count;
+        callback(storage_items_for_endpoint(storage_endpoint));
+    }
+
+    virtual ErrorOr<Optional<String>> set_storage_item(DevTools::TabDescription const&, Web::StorageAPI::StorageEndpointType storage_endpoint, String const& storage_key, String const& key, String const& value) const override
+    {
+        ++set_storage_item_call_count;
+        if (fail_set_storage_item)
+            return Error::from_string_literal("Unable to set storage item");
+
+        auto& storage_items = storage_items_for_endpoint(storage_endpoint);
+        for (auto& item : storage_items) {
+            if (item.name != key)
+                continue;
+
+            auto old_value = item.value;
+            item.value = value;
+            if (old_value != value)
+                emit_storage_change({ storage_endpoint, storage_key, DevTools::DevToolsDelegate::StorageChange::Type::Changed, key });
+            return old_value;
+        }
+
+        storage_items.append({ key, value });
+        emit_storage_change({ storage_endpoint, storage_key, DevTools::DevToolsDelegate::StorageChange::Type::Added, key });
+        return Optional<String> {};
+    }
+
+    virtual ErrorOr<Optional<String>> remove_storage_item(DevTools::TabDescription const&, Web::StorageAPI::StorageEndpointType storage_endpoint, String const& storage_key, String const& key) const override
+    {
+        ++remove_storage_item_call_count;
+        if (fail_remove_storage_item)
+            return Error::from_string_literal("Unable to remove storage item");
+
+        auto& storage_items = storage_items_for_endpoint(storage_endpoint);
+        for (auto i = 0uz; i < storage_items.size(); ++i) {
+            if (storage_items[i].name != key)
+                continue;
+
+            auto old_value = storage_items[i].value;
+            storage_items.remove(i);
+            emit_storage_change({ storage_endpoint, storage_key, DevTools::DevToolsDelegate::StorageChange::Type::Deleted, key });
+            return old_value;
+        }
+
+        return Optional<String> {};
+    }
+
+    virtual ErrorOr<void> clear_storage(DevTools::TabDescription const&, Web::StorageAPI::StorageEndpointType storage_endpoint, String const& storage_key) const override
+    {
+        ++clear_storage_call_count;
+        if (fail_clear_storage)
+            return Error::from_string_literal("Unable to clear storage");
+
+        auto& storage_items = storage_items_for_endpoint(storage_endpoint);
+        if (storage_items.is_empty())
+            return {};
+
+        storage_items.clear();
+        emit_storage_change({ storage_endpoint, storage_key, DevTools::DevToolsDelegate::StorageChange::Type::Cleared, {} });
+        return {};
+    }
+
+    virtual u64 add_storage_change_listener(DevTools::TabDescription const&, OnStorageChange callback) const override
+    {
+        auto listener_id = next_storage_change_listener_id++;
+        storage_change_listeners.set(listener_id, move(callback));
+        ++add_storage_change_listener_call_count;
+        return listener_id;
+    }
+
+    virtual void remove_storage_change_listener(DevTools::TabDescription const&, u64 listener_id) const override
+    {
+        storage_change_listeners.remove(listener_id);
+        ++remove_storage_change_listener_call_count;
     }
 
     virtual void inspect_tab(DevTools::TabDescription const&, OnTabInspectionComplete callback) const override
@@ -1052,6 +1130,21 @@ public:
         on_host_cookie_change(move(cookies));
     }
 
+    void emit_storage_change(DevToolsDelegate::StorageChange change) const
+    {
+        for (auto& listener : storage_change_listeners)
+            listener.value(change);
+    }
+
+    Vector<DevTools::DevToolsDelegate::StorageItem>& storage_items_for_endpoint(Web::StorageAPI::StorageEndpointType storage_endpoint) const
+    {
+        if (storage_endpoint == Web::StorageAPI::StorageEndpointType::LocalStorage)
+            return fixture_local_storage_items;
+
+        VERIFY(storage_endpoint == Web::StorageAPI::StorageEndpointType::SessionStorage);
+        return fixture_session_storage_items;
+    }
+
     mutable Function<void(WebView::DOMNodeProperties)> on_dom_node_properties;
     mutable Function<void(WebView::Mutation)> on_dom_mutation;
     mutable Function<void(Web::CSS::StyleSheetIdentifier const&, String)> on_style_sheet_source;
@@ -1062,6 +1155,8 @@ public:
     mutable Function<void(DevToolsDelegate::NetworkRequestCompleteData)> on_network_request_finished;
     mutable Function<void(DevToolsDelegate::NodePickerEvent)> on_node_picker_event;
     mutable Function<void(Vector<HTTP::Cookie::Cookie>)> on_host_cookie_change;
+    mutable HashMap<u64, Function<void(DevToolsDelegate::StorageChange)>> storage_change_listeners;
+    String tab_url { "https://example.test/"_string };
 
     struct NavigationListener {
         Function<void(String)> on_navigation_started;
@@ -1071,6 +1166,8 @@ public:
 
     mutable bool use_navigation_dom_tree { false };
     mutable Vector<HTTP::Cookie::Cookie> fixture_cookies;
+    mutable Vector<DevTools::DevToolsDelegate::StorageItem> fixture_local_storage_items;
+    mutable Vector<DevTools::DevToolsDelegate::StorageItem> fixture_session_storage_items;
 
     mutable size_t inspect_tab_call_count { 0 };
     mutable size_t cookies_call_count { 0 };
@@ -1078,6 +1175,16 @@ public:
     mutable size_t delete_cookies_call_count { 0 };
     mutable size_t listen_for_cookie_changes_call_count { 0 };
     mutable size_t stop_listening_for_cookie_changes_call_count { 0 };
+    mutable size_t inspect_storage_call_count { 0 };
+    mutable size_t set_storage_item_call_count { 0 };
+    mutable size_t remove_storage_item_call_count { 0 };
+    mutable size_t clear_storage_call_count { 0 };
+    mutable size_t add_storage_change_listener_call_count { 0 };
+    mutable size_t remove_storage_change_listener_call_count { 0 };
+    mutable u64 next_storage_change_listener_id { 1 };
+    mutable bool fail_set_storage_item { false };
+    mutable bool fail_remove_storage_item { false };
+    mutable bool fail_clear_storage { false };
     mutable size_t inspect_accessibility_tree_call_count { 0 };
     mutable size_t listen_for_dom_properties_call_count { 0 };
     mutable size_t stop_listening_for_dom_properties_call_count { 0 };
@@ -1220,6 +1327,7 @@ private:
             || *type == "pickerNodePicked"sv
             || *type == "pickerNodePreviewed"sv
             || *type == "tabListChanged"sv
+            || *type == "storesCleared"sv
             || *type == "storesUpdate"sv
             || *type == "target-available-form"sv
             || *type == "target-destroyed-form"sv;
@@ -1287,9 +1395,10 @@ struct TestSession {
     OwnPtr<ProtocolClient> client;
 };
 
-static NonnullOwnPtr<TestSession> create_session()
+static NonnullOwnPtr<TestSession> create_session(StringView tab_url = "https://example.test/"sv)
 {
     auto session = make<TestSession>();
+    session->delegate.tab_url = MUST(String::from_utf8(tab_url));
     session->server = MUST(DevTools::DevToolsServer::create(session->delegate, 0));
     session->client = ProtocolClient::connect(session->loop, *session->server);
     return session;
@@ -1412,6 +1521,36 @@ static JsonObject get_cookie_store_objects(ProtocolClient& client, StringView co
     return client.request(move(get_store_objects));
 }
 
+static String get_storage_actor(ProtocolClient& client, StringView resource_type)
+{
+    auto tab_actor = actor_from(get_tab(client), "actor"sv);
+    auto watcher_actor = actor_from(client.request(tab_actor, "getWatcher"sv), "actor"sv);
+
+    JsonObject watch_resources;
+    watch_resources.set("to"sv, watcher_actor);
+    watch_resources.set("type"sv, "watchResources"sv);
+    JsonArray resource_types;
+    resource_types.must_append(resource_type);
+    watch_resources.set("resourceTypes"sv, move(resource_types));
+    EXPECT_EQ(client.request(move(watch_resources)).get_string("from"sv).value(), watcher_actor);
+
+    return actor_from(read_resource(client, resource_type), "actor"sv);
+}
+
+static JsonObject get_storage_store_objects(ProtocolClient& client, StringView storage_actor, StringView host = "https://example.test"sv, Optional<JsonArray> names = {})
+{
+    JsonObject get_store_objects;
+    get_store_objects.set("to"sv, storage_actor);
+    get_store_objects.set("type"sv, "getStoreObjects"sv);
+    get_store_objects.set("host"sv, host);
+    if (names.has_value())
+        get_store_objects.set("names"sv, names.release_value());
+    else
+        get_store_objects.set("names"sv, JsonValue {});
+    get_store_objects.set("options"sv, JsonObject {});
+    return client.request(move(get_store_objects));
+}
+
 static JsonArray get_cookie_update_keys(JsonObject const& stores_update, StringView update_type, StringView host = "https://example.test"sv)
 {
     return stores_update.get_object("data"sv)
@@ -1419,6 +1558,67 @@ static JsonArray get_cookie_update_keys(JsonObject const& stores_update, StringV
         ->get_object("cookies"sv)
         ->get_array(host)
         .release_value();
+}
+
+static JsonArray get_storage_update_keys(JsonObject const& stores_update, StringView update_type, StringView resource_key, StringView host = "https://example.test"sv)
+{
+    return stores_update.get_object("data"sv)
+        ->get_object(update_type)
+        ->get_object(resource_key)
+        ->get_array(host)
+        .release_value();
+}
+
+static JsonObject make_storage_edit_items(StringView name, StringView value)
+{
+    JsonObject items;
+    items.set("name"sv, name);
+    items.set("value"sv, value);
+    return items;
+}
+
+static JsonObject edit_storage_item(ProtocolClient& client, StringView storage_actor, StringView field, JsonValue old_value, StringView name, StringView value)
+{
+    JsonObject data;
+    data.set("host"sv, "https://example.test"sv);
+    data.set("field"sv, field);
+    data.set("oldValue"sv, move(old_value));
+    data.set("items"sv, make_storage_edit_items(name, value));
+
+    JsonObject request;
+    request.set("to"sv, storage_actor);
+    request.set("type"sv, "editItem"sv);
+    request.set("data"sv, move(data));
+    return client.request(move(request));
+}
+
+static JsonObject add_storage_item(ProtocolClient& client, StringView storage_actor, StringView name)
+{
+    JsonObject request;
+    request.set("to"sv, storage_actor);
+    request.set("type"sv, "addItem"sv);
+    request.set("guid"sv, name);
+    request.set("host"sv, "https://example.test"sv);
+    return client.request(move(request));
+}
+
+static JsonObject remove_storage_item(ProtocolClient& client, StringView storage_actor, StringView name)
+{
+    JsonObject request;
+    request.set("to"sv, storage_actor);
+    request.set("type"sv, "removeItem"sv);
+    request.set("host"sv, "https://example.test"sv);
+    request.set("name"sv, name);
+    return client.request(move(request));
+}
+
+static JsonObject remove_all_storage_items(ProtocolClient& client, StringView storage_actor)
+{
+    JsonObject request;
+    request.set("to"sv, storage_actor);
+    request.set("type"sv, "removeAll"sv);
+    request.set("host"sv, "https://example.test"sv);
+    return client.request(move(request));
 }
 
 static JsonObject make_cookie_edit_items(HTTP::Cookie::Cookie const& cookie)
@@ -1700,6 +1900,326 @@ TEST_CASE(storage_cookie_resource)
     EXPECT_EQ(objects.get_integer<size_t>("offset"sv).value(), 0u);
     EXPECT_EQ(objects.get_integer<size_t>("total"sv).value(), 0u);
     EXPECT(objects.get_array("data"sv)->is_empty());
+}
+
+TEST_CASE(storage_web_storage_resources)
+{
+    auto session = create_session();
+    auto& client = *session->client;
+    (void)client.read_message();
+
+    auto tab_actor = actor_from(get_tab(client), "actor"sv);
+    auto watcher_response = client.request(tab_actor, "getWatcher"sv);
+    auto watcher_actor = actor_from(watcher_response, "actor"sv);
+    auto resources = watcher_response.get_object("traits"sv)->get_object("resources"sv).release_value();
+    EXPECT(resources.get_bool("local-storage"sv).value());
+    EXPECT(resources.get_bool("session-storage"sv).value());
+
+    JsonObject watch_resources;
+    watch_resources.set("to"sv, watcher_actor);
+    watch_resources.set("type"sv, "watchResources"sv);
+    JsonArray resource_types;
+    resource_types.must_append("local-storage"sv);
+    resource_types.must_append("session-storage"sv);
+    watch_resources.set("resourceTypes"sv, move(resource_types));
+    EXPECT_EQ(client.request(move(watch_resources)).get_string("from"sv).value(), watcher_actor);
+
+    auto local_storage_resource = read_resource(client, "local-storage"sv);
+    EXPECT_EQ(local_storage_resource.get_string("resourceKey"sv).value(), "localStorage"sv);
+    EXPECT_EQ(local_storage_resource.get_integer<u64>("browsingContextID"sv).value(), 1u);
+    EXPECT_EQ(local_storage_resource.get_integer<u64>("innerWindowId"sv).value(), 1u);
+    EXPECT_EQ(local_storage_resource.get_string("resourceId"sv).value(), "localStorage-1"sv);
+    EXPECT(local_storage_resource.get_object("hosts"sv)->has_array("https://example.test"sv));
+    auto local_traits = local_storage_resource.get_object("traits"sv).release_value();
+    EXPECT(local_traits.get_bool("supportsAddItem"sv).value());
+    EXPECT(local_traits.get_bool("supportsRemoveAll"sv).value());
+    EXPECT(!local_traits.get_bool("supportsRemoveAllSessionCookies"sv).value());
+    EXPECT(local_traits.get_bool("supportsRemoveItem"sv).value());
+
+    auto local_storage_actor = actor_from(local_storage_resource, "actor"sv);
+    auto fields = client.request(local_storage_actor, "getFields"sv).get_array("value"sv).release_value();
+    EXPECT_EQ(fields.size(), 2u);
+    EXPECT_EQ(fields.at(0).as_object().get_string("name"sv).value(), "name"sv);
+    EXPECT(fields.at(0).as_object().get_bool("editable"sv).value());
+    EXPECT_EQ(fields.at(1).as_object().get_string("name"sv).value(), "value"sv);
+    EXPECT(fields.at(1).as_object().get_bool("editable"sv).value());
+
+    auto session_storage_resource = read_resource(client, "session-storage"sv);
+    EXPECT_EQ(session_storage_resource.get_string("resourceKey"sv).value(), "sessionStorage"sv);
+    EXPECT_EQ(session_storage_resource.get_string("resourceId"sv).value(), "sessionStorage-1"sv);
+    EXPECT(session_storage_resource.get_object("hosts"sv)->has_array("https://example.test"sv));
+}
+
+TEST_CASE(storage_web_storage_store_objects)
+{
+    auto session = create_session();
+    auto& client = *session->client;
+    (void)client.read_message();
+
+    session->delegate.fixture_local_storage_items.append({ "beta"_string, "two"_string });
+    session->delegate.fixture_local_storage_items.append({ "alpha"_string, "one"_string });
+    session->delegate.fixture_session_storage_items.append({ "session-key"_string, "session-value"_string });
+
+    auto local_storage_actor = get_storage_actor(client, "local-storage"sv);
+    auto objects = get_storage_store_objects(client, local_storage_actor);
+    EXPECT_EQ(session->delegate.inspect_storage_call_count, 1u);
+    EXPECT_EQ(objects.get_integer<size_t>("offset"sv).value(), 0u);
+    EXPECT_EQ(objects.get_integer<size_t>("total"sv).value(), 2u);
+
+    auto data = objects.get_array("data"sv).release_value();
+    EXPECT_EQ(data.size(), 2u);
+    EXPECT_EQ(data.at(0).as_object().get_string("name"sv).value(), "alpha"sv);
+    EXPECT_EQ(data.at(0).as_object().get_string("value"sv).value(), "one"sv);
+    EXPECT_EQ(data.at(1).as_object().get_string("name"sv).value(), "beta"sv);
+    EXPECT_EQ(data.at(1).as_object().get_string("value"sv).value(), "two"sv);
+
+    JsonArray names;
+    names.must_append("beta"sv);
+    auto filtered_objects = get_storage_store_objects(client, local_storage_actor, "https://example.test"sv, move(names));
+    EXPECT_EQ(filtered_objects.get_integer<size_t>("total"sv).value(), 1u);
+    auto filtered_data = filtered_objects.get_array("data"sv).release_value();
+    EXPECT_EQ(filtered_data.size(), 1u);
+    EXPECT_EQ(filtered_data.at(0).as_object().get_string("name"sv).value(), "beta"sv);
+
+    JsonObject paginated_request;
+    paginated_request.set("to"sv, local_storage_actor);
+    paginated_request.set("type"sv, "getStoreObjects"sv);
+    paginated_request.set("host"sv, "https://example.test"sv);
+    paginated_request.set("names"sv, JsonValue {});
+    JsonObject options;
+    options.set("offset"sv, 1);
+    options.set("size"sv, 1);
+    paginated_request.set("options"sv, move(options));
+    auto paginated_objects = client.request(move(paginated_request));
+    EXPECT_EQ(paginated_objects.get_integer<size_t>("offset"sv).value(), 1u);
+    EXPECT_EQ(paginated_objects.get_integer<size_t>("total"sv).value(), 2u);
+    auto paginated_data = paginated_objects.get_array("data"sv).release_value();
+    EXPECT_EQ(paginated_data.size(), 1u);
+    EXPECT_EQ(paginated_data.at(0).as_object().get_string("name"sv).value(), "beta"sv);
+
+    auto session_storage_actor = get_storage_actor(client, "session-storage"sv);
+    objects = get_storage_store_objects(client, session_storage_actor);
+    EXPECT_EQ(objects.get_integer<size_t>("total"sv).value(), 1u);
+    data = objects.get_array("data"sv).release_value();
+    EXPECT_EQ(data.at(0).as_object().get_string("name"sv).value(), "session-key"sv);
+    EXPECT_EQ(data.at(0).as_object().get_string("value"sv).value(), "session-value"sv);
+
+    objects = get_storage_store_objects(client, session_storage_actor, "https://other.test"sv);
+    EXPECT_EQ(objects.get_integer<size_t>("total"sv).value(), 0u);
+    EXPECT(objects.get_array("data"sv)->is_empty());
+}
+
+TEST_CASE(storage_web_storage_change_events)
+{
+    auto session = create_session();
+    auto& client = *session->client;
+    (void)client.read_message();
+
+    auto local_storage_actor = get_storage_actor(client, "local-storage"sv);
+    EXPECT_EQ(session->delegate.add_storage_change_listener_call_count, 1u);
+
+    session->delegate.emit_storage_change({
+        .storage_endpoint = Web::StorageAPI::StorageEndpointType::LocalStorage,
+        .host = "https://example.test"_string,
+        .type = DevTools::DevToolsDelegate::StorageChange::Type::Added,
+        .key = "alpha"_string,
+    });
+    auto stores_update = read_packet_with_type(client, "storesUpdate"sv);
+    EXPECT_EQ(stores_update.get_string("from"sv).value(), local_storage_actor);
+    auto added_keys = get_storage_update_keys(stores_update, "added"sv, "localStorage"sv);
+    EXPECT_EQ(added_keys.size(), 1u);
+    EXPECT_EQ(added_keys.at(0).as_string(), "alpha"sv);
+
+    session->delegate.emit_storage_change({
+        .storage_endpoint = Web::StorageAPI::StorageEndpointType::LocalStorage,
+        .host = "https://example.test"_string,
+        .type = DevTools::DevToolsDelegate::StorageChange::Type::Changed,
+        .key = "alpha"_string,
+    });
+    stores_update = read_packet_with_type(client, "storesUpdate"sv);
+    auto changed_keys = get_storage_update_keys(stores_update, "changed"sv, "localStorage"sv);
+    EXPECT_EQ(changed_keys.size(), 1u);
+    EXPECT_EQ(changed_keys.at(0).as_string(), "alpha"sv);
+
+    session->delegate.emit_storage_change({
+        .storage_endpoint = Web::StorageAPI::StorageEndpointType::LocalStorage,
+        .host = "https://example.test"_string,
+        .type = DevTools::DevToolsDelegate::StorageChange::Type::Deleted,
+        .key = "alpha"_string,
+    });
+    stores_update = read_packet_with_type(client, "storesUpdate"sv);
+    auto deleted_keys = get_storage_update_keys(stores_update, "deleted"sv, "localStorage"sv);
+    EXPECT_EQ(deleted_keys.size(), 1u);
+    EXPECT_EQ(deleted_keys.at(0).as_string(), "alpha"sv);
+
+    session->delegate.emit_storage_change({
+        .storage_endpoint = Web::StorageAPI::StorageEndpointType::LocalStorage,
+        .host = "https://example.test"_string,
+        .type = DevTools::DevToolsDelegate::StorageChange::Type::Cleared,
+        .key = {},
+    });
+    auto stores_cleared = read_packet_with_type(client, "storesCleared"sv);
+    EXPECT_EQ(stores_cleared.get_string("from"sv).value(), local_storage_actor);
+    auto cleared_hosts = stores_cleared.get_object("data"sv)->get_array("clearedHostsOrPaths"sv).release_value();
+    EXPECT_EQ(cleared_hosts.size(), 1u);
+    EXPECT_EQ(cleared_hosts.at(0).as_string(), "https://example.test"sv);
+
+    auto session_storage_actor = get_storage_actor(client, "session-storage"sv);
+    EXPECT_EQ(session->delegate.add_storage_change_listener_call_count, 2u);
+    session->delegate.emit_storage_change({
+        .storage_endpoint = Web::StorageAPI::StorageEndpointType::SessionStorage,
+        .host = "https://example.test"_string,
+        .type = DevTools::DevToolsDelegate::StorageChange::Type::Added,
+        .key = "session-key"_string,
+    });
+    stores_update = read_packet_with_type(client, "storesUpdate"sv);
+    EXPECT_EQ(stores_update.get_string("from"sv).value(), session_storage_actor);
+    added_keys = get_storage_update_keys(stores_update, "added"sv, "sessionStorage"sv);
+    EXPECT_EQ(added_keys.size(), 1u);
+    EXPECT_EQ(added_keys.at(0).as_string(), "session-key"sv);
+}
+
+TEST_CASE(storage_web_storage_change_events_for_file_urls)
+{
+    auto session = create_session("file:///tmp/devtools-storage.html"sv);
+    auto& client = *session->client;
+    (void)client.read_message();
+
+    auto local_storage_actor = get_storage_actor(client, "local-storage"sv);
+
+    session->delegate.emit_storage_change({
+        .storage_endpoint = Web::StorageAPI::StorageEndpointType::LocalStorage,
+        .host = "file:///tmp/other.html"_string,
+        .type = DevTools::DevToolsDelegate::StorageChange::Type::Added,
+        .key = "other"_string,
+    });
+    session->delegate.emit_storage_change({
+        .storage_endpoint = Web::StorageAPI::StorageEndpointType::LocalStorage,
+        .host = "file:///tmp/devtools-storage.html"_string,
+        .type = DevTools::DevToolsDelegate::StorageChange::Type::Added,
+        .key = "alpha"_string,
+    });
+
+    auto stores_update = read_packet_with_type(client, "storesUpdate"sv);
+    EXPECT_EQ(stores_update.get_string("from"sv).value(), local_storage_actor);
+    auto added_keys = get_storage_update_keys(stores_update, "added"sv, "localStorage"sv, "file:///tmp/devtools-storage.html"sv);
+    EXPECT_EQ(added_keys.size(), 1u);
+    EXPECT_EQ(added_keys.at(0).as_string(), "alpha"sv);
+}
+
+TEST_CASE(storage_web_storage_add_edit_and_remove_items)
+{
+    auto session = create_session();
+    auto& client = *session->client;
+    (void)client.read_message();
+
+    auto local_storage_actor = get_storage_actor(client, "local-storage"sv);
+
+    auto response = add_storage_item(client, local_storage_actor, "devtools-key"sv);
+    EXPECT(response.get("errorString"sv).value().is_null());
+    EXPECT_EQ(session->delegate.set_storage_item_call_count, 1u);
+    EXPECT_EQ(session->delegate.fixture_local_storage_items.size(), 1u);
+    EXPECT_EQ(session->delegate.fixture_local_storage_items[0].name, "devtools-key"sv);
+    EXPECT_EQ(session->delegate.fixture_local_storage_items[0].value, "value"sv);
+
+    auto stores_update = read_packet_with_type(client, "storesUpdate"sv);
+    auto added_keys = get_storage_update_keys(stores_update, "added"sv, "localStorage"sv);
+    EXPECT_EQ(added_keys.size(), 1u);
+    EXPECT_EQ(added_keys.at(0).as_string(), "devtools-key"sv);
+
+    response = edit_storage_item(client, local_storage_actor, "value"sv, "value"_string, "devtools-key"sv, "updated-value"sv);
+    EXPECT(response.get("errorString"sv).value().is_null());
+    EXPECT_EQ(session->delegate.set_storage_item_call_count, 2u);
+    EXPECT_EQ(session->delegate.fixture_local_storage_items.size(), 1u);
+    EXPECT_EQ(session->delegate.fixture_local_storage_items[0].name, "devtools-key"sv);
+    EXPECT_EQ(session->delegate.fixture_local_storage_items[0].value, "updated-value"sv);
+
+    stores_update = read_packet_with_type(client, "storesUpdate"sv);
+    auto changed_keys = get_storage_update_keys(stores_update, "changed"sv, "localStorage"sv);
+    EXPECT_EQ(changed_keys.size(), 1u);
+    EXPECT_EQ(changed_keys.at(0).as_string(), "devtools-key"sv);
+
+    response = edit_storage_item(client, local_storage_actor, "name"sv, "devtools-key"_string, "renamed-key"sv, "updated-value"sv);
+    EXPECT(response.get("errorString"sv).value().is_null());
+    EXPECT_EQ(session->delegate.remove_storage_item_call_count, 1u);
+    EXPECT_EQ(session->delegate.set_storage_item_call_count, 3u);
+    EXPECT_EQ(session->delegate.fixture_local_storage_items.size(), 1u);
+    EXPECT_EQ(session->delegate.fixture_local_storage_items[0].name, "renamed-key"sv);
+    EXPECT_EQ(session->delegate.fixture_local_storage_items[0].value, "updated-value"sv);
+
+    stores_update = read_packet_with_type(client, "storesUpdate"sv);
+    auto deleted_keys = get_storage_update_keys(stores_update, "deleted"sv, "localStorage"sv);
+    EXPECT_EQ(deleted_keys.size(), 1u);
+    EXPECT_EQ(deleted_keys.at(0).as_string(), "devtools-key"sv);
+    stores_update = read_packet_with_type(client, "storesUpdate"sv);
+    added_keys = get_storage_update_keys(stores_update, "added"sv, "localStorage"sv);
+    EXPECT_EQ(added_keys.size(), 1u);
+    EXPECT_EQ(added_keys.at(0).as_string(), "renamed-key"sv);
+
+    response = remove_storage_item(client, local_storage_actor, "renamed-key"sv);
+    EXPECT_EQ(response.get_string("from"sv).value(), local_storage_actor);
+    EXPECT_EQ(session->delegate.remove_storage_item_call_count, 2u);
+    EXPECT(session->delegate.fixture_local_storage_items.is_empty());
+
+    stores_update = read_packet_with_type(client, "storesUpdate"sv);
+    deleted_keys = get_storage_update_keys(stores_update, "deleted"sv, "localStorage"sv);
+    EXPECT_EQ(deleted_keys.size(), 1u);
+    EXPECT_EQ(deleted_keys.at(0).as_string(), "renamed-key"sv);
+
+    session->delegate.fixture_local_storage_items.append({ "first"_string, "one"_string });
+    session->delegate.fixture_local_storage_items.append({ "second"_string, "two"_string });
+    response = remove_all_storage_items(client, local_storage_actor);
+    EXPECT_EQ(response.get_string("from"sv).value(), local_storage_actor);
+    EXPECT_EQ(session->delegate.clear_storage_call_count, 1u);
+    EXPECT(session->delegate.fixture_local_storage_items.is_empty());
+
+    auto stores_cleared = read_packet_with_type(client, "storesCleared"sv);
+    EXPECT_EQ(stores_cleared.get_string("from"sv).value(), local_storage_actor);
+    auto cleared_hosts = stores_cleared.get_object("data"sv)->get_array("clearedHostsOrPaths"sv).release_value();
+    EXPECT_EQ(cleared_hosts.size(), 1u);
+    EXPECT_EQ(cleared_hosts.at(0).as_string(), "https://example.test"sv);
+
+    auto session_storage_actor = get_storage_actor(client, "session-storage"sv);
+    response = add_storage_item(client, session_storage_actor, "session-key"sv);
+    EXPECT(response.get("errorString"sv).value().is_null());
+    EXPECT_EQ(session->delegate.fixture_session_storage_items.size(), 1u);
+    EXPECT_EQ(session->delegate.fixture_session_storage_items[0].name, "session-key"sv);
+    EXPECT_EQ(session->delegate.fixture_session_storage_items[0].value, "value"sv);
+
+    stores_update = read_packet_with_type(client, "storesUpdate"sv);
+    added_keys = get_storage_update_keys(stores_update, "added"sv, "sessionStorage"sv);
+    EXPECT_EQ(added_keys.size(), 1u);
+    EXPECT_EQ(added_keys.at(0).as_string(), "session-key"sv);
+}
+
+TEST_CASE(storage_web_storage_mutation_errors)
+{
+    auto session = create_session();
+    auto& client = *session->client;
+    (void)client.read_message();
+
+    auto local_storage_actor = get_storage_actor(client, "local-storage"sv);
+    session->delegate.fixture_local_storage_items.append({ "devtools-key"_string, "value"_string });
+
+    session->delegate.fail_remove_storage_item = true;
+    auto response = edit_storage_item(client, local_storage_actor, "name"sv, "devtools-key"_string, "renamed-key"sv, "value"sv);
+    EXPECT_EQ(response.get_string("errorString"sv).value(), "Unable to remove storage item"sv);
+    EXPECT_EQ(session->delegate.remove_storage_item_call_count, 1u);
+    EXPECT_EQ(session->delegate.set_storage_item_call_count, 0u);
+    EXPECT_EQ(session->delegate.fixture_local_storage_items.size(), 1u);
+    EXPECT_EQ(session->delegate.fixture_local_storage_items[0].name, "devtools-key"sv);
+
+    response = remove_storage_item(client, local_storage_actor, "devtools-key"sv);
+    EXPECT_EQ(response.get_string("errorString"sv).value(), "Unable to remove storage item"sv);
+    EXPECT_EQ(session->delegate.remove_storage_item_call_count, 2u);
+    EXPECT_EQ(session->delegate.fixture_local_storage_items.size(), 1u);
+
+    session->delegate.fail_remove_storage_item = false;
+    session->delegate.fail_clear_storage = true;
+    response = remove_all_storage_items(client, local_storage_actor);
+    EXPECT_EQ(response.get_string("errorString"sv).value(), "Unable to clear storage"sv);
+    EXPECT_EQ(session->delegate.clear_storage_call_count, 1u);
+    EXPECT_EQ(session->delegate.fixture_local_storage_items.size(), 1u);
 }
 
 TEST_CASE(storage_cookie_store_objects)
