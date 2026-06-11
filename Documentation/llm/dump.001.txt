@@ -46914,6 +46914,18 @@ FILE: Base/res/ladybird/about-pages/history.html
         <link rel="stylesheet" type="text/css" href="resource://ladybird/ladybird.css" />
         <link rel="stylesheet" type="text/css" href="resource://ladybird/about-pages/webui.css" />
         <style>
+            @media (prefers-color-scheme: light) {
+                :root {
+                    --history-entry-hover-color: #e8e8e8;
+                }
+            }
+
+            @media (prefers-color-scheme: dark) {
+                :root {
+                    --history-entry-hover-color: #2d2d2d;
+                }
+            }
+
             .history-status {
                 color: var(--secondary-text-color);
                 font-size: 13px;
@@ -46969,7 +46981,7 @@ FILE: Base/res/ladybird/about-pages/history.html
             }
 
             .history-entry:hover {
-                background-color: var(--item-hover-color);
+                background-color: var(--history-entry-hover-color);
             }
 
             .history-entry + .history-entry {
@@ -47011,12 +47023,19 @@ FILE: Base/res/ladybird/about-pages/history.html
             .entry-text {
                 display: flex;
                 flex-direction: column;
+                flex: 1;
                 gap: 4px;
                 min-width: 0;
+                width: 100%;
             }
 
             .entry-title {
                 color: inherit;
+                display: block;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+
                 font-size: 14px;
                 font-weight: 600;
                 text-decoration: none;
@@ -47079,11 +47098,6 @@ FILE: Base/res/ladybird/about-pages/history.html
 
                 .entry-meta {
                     text-align: left;
-                }
-
-                .entry-actions {
-                    width: 100%;
-                    justify-content: flex-end;
                 }
             }
         </style>
@@ -47323,6 +47337,7 @@ FILE: Base/res/ladybird/about-pages/history.html
                                 className: "entry-title",
                                 href: entry.url,
                                 textContent: title,
+                                title,
                             }),
                             createElement("div", {
                                 className: "entry-url",
@@ -85609,6 +85624,795 @@ private:
 
 }
 
+FILE: Libraries/LibDevTools/Actors/CookiesActor.cpp
+/*
+ * Copyright (c) 2026, Ladybird contributors
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/JsonArray.h>
+#include <AK/JsonObject.h>
+#include <AK/QuickSort.h>
+#include <AK/Time.h>
+#include <LibDevTools/Actors/CookiesActor.h>
+#include <LibDevTools/Actors/TabActor.h>
+#include <LibDevTools/DevToolsDelegate.h>
+#include <LibDevTools/DevToolsServer.h>
+#include <LibDevTools/StorageHelpers.h>
+#include <LibHTTP/Cookie/Cookie.h>
+#include <LibHTTP/Cookie/ParsedCookie.h>
+#include <LibURL/Parser.h>
+#include <LibURL/URL.h>
+
+namespace DevTools {
+
+static constexpr auto cookie_unique_key_separator = "{9d414cc5-8319-0a04-0586-c0a6ae01670a}"sv;
+static constexpr auto max_store_object_count = 50uz;
+static constexpr auto session_cookie_label = "Session"sv;
+static constexpr auto default_cookie_value = "value"sv;
+
+static bool cookie_matches_storage_host(HTTP::Cookie::Cookie const& cookie, String const& storage_host)
+{
+    auto host_name = storage_host_name(storage_host);
+    if (!host_name.has_value())
+        return false;
+
+    if (cookie.host_only)
+        return cookie.domain == *host_name;
+
+    return HTTP::Cookie::domain_matches(*host_name, cookie.domain);
+}
+
+static String cookie_unique_key(HTTP::Cookie::Cookie const& cookie)
+{
+    return MUST(String::formatted("{}{}{}{}{}{}",
+        cookie.name,
+        cookie_unique_key_separator,
+        cookie.domain,
+        cookie_unique_key_separator,
+        cookie.path,
+        cookie_unique_key_separator));
+}
+
+struct ParsedCookieUniqueKey {
+    String name;
+    String domain;
+    String path;
+};
+
+static Optional<ParsedCookieUniqueKey> parse_cookie_unique_key(StringView unique_key)
+{
+    auto parts = unique_key.split_view(cookie_unique_key_separator, SplitBehavior::KeepEmpty);
+    if (parts.size() < 3)
+        return {};
+
+    return ParsedCookieUniqueKey {
+        MUST(String::from_utf8(parts[0])),
+        MUST(String::from_utf8(parts[1])),
+        MUST(String::from_utf8(parts[2])),
+    };
+}
+
+static bool cookie_matches_unique_key(HTTP::Cookie::Cookie const& cookie, ParsedCookieUniqueKey const& unique_key)
+{
+    return cookie.name == unique_key.name
+        && cookie.domain == unique_key.domain
+        && cookie.path == unique_key.path;
+}
+
+static bool cookie_matches_requested_domain(HTTP::Cookie::Cookie const& cookie, Optional<String> const& domain)
+{
+    if (!domain.has_value())
+        return true;
+    return cookie.domain == *domain;
+}
+
+static JsonObject cookie_operation_result(Optional<String> error_string)
+{
+    JsonObject response;
+    if (error_string.has_value())
+        response.set("errorString"sv, *error_string);
+    else
+        response.set("errorString"sv, JsonValue {});
+    return response;
+}
+
+static JsonObject cookie_operation_result(ErrorOr<void> result)
+{
+    JsonObject response;
+    if (result.is_error())
+        response.set("errorString"sv, result.error().string_literal());
+    else
+        response.set("errorString"sv, JsonValue {});
+    return response;
+}
+
+static String same_site_for_devtools(HTTP::Cookie::SameSite same_site)
+{
+    if (same_site == HTTP::Cookie::SameSite::Default)
+        return {};
+    return MUST(String::from_utf8(HTTP::Cookie::same_site_to_string(same_site)));
+}
+
+static JsonObject serialize_cookie(HTTP::Cookie::Cookie const& cookie)
+{
+    JsonObject object;
+    object.set("uniqueKey"sv, cookie_unique_key(cookie));
+    object.set("name"sv, cookie.name);
+    object.set("value"sv, cookie.value);
+    object.set("host"sv, cookie.domain);
+    object.set("path"sv, cookie.path);
+    object.set("expires"sv, cookie.persistent ? cookie.expiry_time.milliseconds_since_epoch() : 0);
+    object.set("size"sv, cookie.name.bytes().size() + cookie.value.bytes().size());
+    object.set("isHttpOnly"sv, cookie.http_only);
+    object.set("isSecure"sv, cookie.secure);
+    object.set("sameSite"sv, same_site_for_devtools(cookie.same_site));
+    object.set("lastAccessed"sv, cookie.last_access_time.milliseconds_since_epoch());
+    object.set("creationTime"sv, cookie.creation_time.milliseconds_since_epoch());
+    object.set("updateTime"sv, cookie.creation_time.milliseconds_since_epoch());
+    object.set("hostOnly"sv, cookie.host_only);
+    object.set("partitionKey"sv, ""sv);
+    return object;
+}
+
+static Optional<String> string_from_devtools_value(JsonValue const& value)
+{
+    if (value.is_string())
+        return value.as_string();
+    if (value.is_bool())
+        return value.as_bool() ? "true"_string : "false"_string;
+    if (value.is_number())
+        return MUST(String::formatted("{}", value.get_number_with_precision_loss<double>().release_value()));
+    if (value.is_null())
+        return {};
+    return value.serialized();
+}
+
+static Optional<bool> bool_from_devtools_value(JsonValue const& value)
+{
+    if (value.is_bool())
+        return value.as_bool();
+    if (!value.is_string())
+        return {};
+
+    auto string = value.as_string().bytes_as_string_view();
+    if (string.equals_ignoring_ascii_case("true"sv))
+        return true;
+    if (string.equals_ignoring_ascii_case("false"sv))
+        return false;
+    return {};
+}
+
+static void set_session_cookie_expiry(HTTP::Cookie::Cookie& cookie)
+{
+    cookie.persistent = false;
+    cookie.expiry_time = UnixDateTime::from_unix_time_parts(3000, 1, 1, 0, 0, 0, 0);
+}
+
+static Optional<String> set_cookie_expiry_from_devtools(HTTP::Cookie::Cookie& cookie, JsonValue const& json_value, StringView value)
+{
+    if (value.is_empty() || value == session_cookie_label) {
+        set_session_cookie_expiry(cookie);
+        return {};
+    }
+
+    if (json_value.is_number()) {
+        cookie.persistent = true;
+        cookie.expiry_time = UnixDateTime::from_milliseconds_since_epoch(json_value.get_number_with_precision_loss<i64>().release_value());
+        return {};
+    }
+
+    if (auto milliseconds_since_epoch = value.to_number<i64>(); milliseconds_since_epoch.has_value()) {
+        cookie.persistent = true;
+        cookie.expiry_time = UnixDateTime::from_milliseconds_since_epoch(*milliseconds_since_epoch);
+        return {};
+    }
+
+    auto expiry_time = HTTP::Cookie::parse_cookie_date(value);
+    if (!expiry_time.has_value())
+        return "Cookie expiry date is invalid"_string;
+
+    cookie.persistent = true;
+    cookie.expiry_time = *expiry_time;
+    return {};
+}
+
+NonnullRefPtr<CookiesActor> CookiesActor::create(DevToolsServer& devtools, String name, WeakPtr<TabActor> tab)
+{
+    return adopt_ref(*new CookiesActor(devtools, move(name), move(tab)));
+}
+
+CookiesActor::CookiesActor(DevToolsServer& devtools, String name, WeakPtr<TabActor> tab)
+    : Actor(devtools, move(name))
+    , m_tab(move(tab))
+{
+    if (auto tab = m_tab.strong_ref()) {
+        devtools.delegate().listen_for_host_cookie_changes(
+            tab->description(),
+            weak_callback(*this, [](auto& self, Vector<HTTP::Cookie::Cookie> cookies) {
+                self.on_cookies_changed(move(cookies));
+            }));
+    }
+}
+
+CookiesActor::~CookiesActor()
+{
+    if (auto tab = m_tab.strong_ref())
+        devtools().delegate().stop_listening_for_host_cookie_changes(tab->description());
+}
+
+Optional<String> CookiesActor::host() const
+{
+    auto tab = m_tab.strong_ref();
+    if (!tab)
+        return {};
+    return storage_host_for_url(tab->description().url);
+}
+
+JsonObject CookiesActor::serialize_storage() const
+{
+    JsonObject hosts;
+    if (auto storage_host = host(); storage_host.has_value())
+        hosts.set(*storage_host, JsonArray {});
+
+    JsonObject traits;
+    traits.set("supportsAddItem"sv, true);
+    traits.set("supportsRemoveAll"sv, true);
+    traits.set("supportsRemoveAllSessionCookies"sv, true);
+    traits.set("supportsRemoveItem"sv, true);
+
+    JsonObject storage;
+    storage.set("actor"sv, name());
+    if (auto tab = m_tab.strong_ref()) {
+        storage.set("browsingContextID"sv, tab->description().id);
+        storage.set("innerWindowId"sv, tab->inner_window_id());
+        storage.set("resourceId"sv, MUST(String::formatted("cookies-{}", tab->inner_window_id())));
+    }
+    storage.set("hosts"sv, move(hosts));
+    storage.set("resourceKey"sv, "cookies"sv);
+    storage.set("traits"sv, move(traits));
+    return storage;
+}
+
+void CookiesActor::handle_message(Message const& message)
+{
+    if (message.type == "getFields"sv) {
+        get_fields(message);
+        return;
+    }
+
+    if (message.type == "getStoreObjects"sv) {
+        get_store_objects(message);
+        return;
+    }
+
+    if (message.type == "editItem"sv) {
+        edit_item(message);
+        return;
+    }
+
+    if (message.type == "addItem"sv) {
+        add_item(message);
+        return;
+    }
+
+    if (message.type == "removeItem"sv) {
+        remove_item(message);
+        return;
+    }
+
+    if (message.type == "removeAll"sv) {
+        remove_all(message);
+        return;
+    }
+
+    if (message.type == "removeAllSessionCookies"sv) {
+        remove_all_session_cookies(message);
+        return;
+    }
+
+    send_unrecognized_packet_type_error(message);
+}
+
+void CookiesActor::get_fields(Message const& message)
+{
+    enum class FieldState : u8 {
+        Immutable,
+        Editable,
+        Hidden,
+        Private,
+    };
+    auto make_field = [](StringView name, FieldState state) {
+        JsonObject field;
+        field.set("name"sv, name);
+        field.set("editable"sv, state == FieldState::Editable);
+        field.set("hidden"sv, state == FieldState::Hidden);
+        field.set("private"sv, state == FieldState::Private);
+        return field;
+    };
+
+    JsonArray fields;
+    fields.must_append(make_field("uniqueKey"sv, FieldState::Private));
+    fields.must_append(make_field("name"sv, FieldState::Editable));
+    fields.must_append(make_field("value"sv, FieldState::Editable));
+    fields.must_append(make_field("host"sv, FieldState::Editable));
+    fields.must_append(make_field("path"sv, FieldState::Editable));
+    fields.must_append(make_field("expires"sv, FieldState::Editable));
+    fields.must_append(make_field("size"sv, FieldState::Immutable));
+    fields.must_append(make_field("isHttpOnly"sv, FieldState::Editable));
+    fields.must_append(make_field("isSecure"sv, FieldState::Editable));
+    fields.must_append(make_field("sameSite"sv, FieldState::Immutable));
+    fields.must_append(make_field("lastAccessed"sv, FieldState::Immutable));
+    fields.must_append(make_field("creationTime"sv, FieldState::Hidden));
+    fields.must_append(make_field("updateTime"sv, FieldState::Hidden));
+    fields.must_append(make_field("hostOnly"sv, FieldState::Hidden));
+    fields.must_append(make_field("partitionKey"sv, FieldState::Immutable));
+
+    JsonObject response;
+    response.set("value"sv, move(fields));
+    send_response(message, move(response));
+}
+
+void CookiesActor::get_store_objects(Message const& message)
+{
+    auto host = get_required_parameter<String>(message, "host"sv);
+    if (!host.has_value())
+        return;
+
+    auto tab = m_tab.strong_ref();
+    if (!tab)
+        return;
+
+    auto requested_names = message.data.get_array("names"sv);
+
+    Vector<HTTP::Cookie::Cookie> cookies;
+    for (auto& cookie : devtools().delegate().cookies(tab->description())) {
+        if (!cookie_matches_storage_host(cookie, *host))
+            continue;
+
+        if (requested_names.has_value()) {
+            auto unique_key = cookie_unique_key(cookie);
+            auto was_requested = any_of(requested_names->values(), [&](auto const& name) {
+                return name.is_string() && name.as_string() == unique_key;
+            });
+            if (!was_requested)
+                continue;
+        }
+
+        cookies.append(move(cookie));
+    }
+
+    if (!requested_names.has_value()) {
+        HashTable<String> visible_keys;
+        for (auto const& cookie : cookies)
+            visible_keys.set(cookie_unique_key(cookie));
+        m_visible_cookie_unique_keys.set(*host, move(visible_keys));
+    }
+
+    quick_sort(cookies, [](auto const& left, auto const& right) {
+        if (left.name != right.name)
+            return left.name < right.name;
+        if (left.domain != right.domain)
+            return left.domain < right.domain;
+        if (left.path.bytes().size() != right.path.bytes().size())
+            return left.path.bytes().size() < right.path.bytes().size();
+        return cookie_unique_key(left) < cookie_unique_key(right);
+    });
+
+    size_t offset = 0;
+    size_t size = max_store_object_count;
+    if (auto options = message.data.get_object("options"sv); options.has_value()) {
+        offset = options->get_integer<size_t>("offset"sv).value_or(0);
+        size = min(options->get_integer<size_t>("size"sv).value_or(max_store_object_count), max_store_object_count);
+    }
+
+    JsonArray data;
+    if (offset < cookies.size()) {
+        auto end = min(cookies.size(), offset + size);
+        for (size_t i = offset; i < end; ++i)
+            data.must_append(serialize_cookie(cookies[i]));
+    } else {
+        offset = cookies.size();
+    }
+
+    JsonObject response;
+    response.set("offset"sv, offset);
+    response.set("total"sv, cookies.size());
+    response.set("data"sv, move(data));
+    send_response(message, move(response));
+}
+
+void CookiesActor::edit_item(Message const& message)
+{
+    auto data = get_required_parameter<JsonObject>(message, "data"sv);
+    if (!data.has_value())
+        return;
+
+    auto tab = m_tab.strong_ref();
+    if (!tab)
+        return;
+
+    auto field = data->get_string("field"sv);
+    if (!field.has_value()) {
+        send_missing_parameter_error(message, "field"sv);
+        return;
+    }
+
+    auto new_value_json = data->get("newValue"sv);
+    if (!new_value_json.has_value()) {
+        send_missing_parameter_error(message, "newValue"sv);
+        return;
+    }
+
+    auto new_value = string_from_devtools_value(*new_value_json);
+    if (!new_value.has_value()) {
+        send_response(message, cookie_operation_result("Missing cookie value"_string));
+        return;
+    }
+
+    auto cookies = devtools().delegate().cookies(tab->description());
+    auto find_cookie = [&](auto const& predicate) -> Optional<HTTP::Cookie::Cookie> {
+        auto cookie = cookies.first_matching(predicate);
+        if (!cookie.has_value())
+            return {};
+        return *cookie;
+    };
+
+    Optional<HTTP::Cookie::Cookie> old_cookie;
+    auto items = data->get_object("items"sv);
+    if (items.has_value()) {
+        if (auto unique_key_string = items->get_string("uniqueKey"sv); unique_key_string.has_value()) {
+            if (auto unique_key = parse_cookie_unique_key(unique_key_string->bytes_as_string_view()); unique_key.has_value())
+                old_cookie = find_cookie([&](auto const& cookie) { return cookie_matches_unique_key(cookie, *unique_key); });
+        }
+
+        if (!old_cookie.has_value()) {
+            Optional<String> old_value;
+            if (auto old_value_json = data->get("oldValue"sv); old_value_json.has_value())
+                old_value = string_from_devtools_value(*old_value_json);
+
+            Optional<String> name;
+            if (*field == "name"sv) {
+                name = old_value;
+            } else if (auto item_name = items->get_string("name"sv); item_name.has_value()) {
+                name = *item_name;
+            }
+
+            Optional<String> domain;
+            if (*field == "host"sv) {
+                domain = old_value;
+            } else if (auto item_host = items->get_string("host"sv); item_host.has_value()) {
+                domain = *item_host;
+            }
+
+            Optional<String> path;
+            if (*field == "path"sv) {
+                path = old_value;
+            } else if (auto item_path = items->get_string("path"sv); item_path.has_value()) {
+                path = *item_path;
+            }
+
+            if (name.has_value() && domain.has_value() && path.has_value()) {
+                old_cookie = find_cookie([&](auto const& cookie) {
+                    return cookie.name == *name
+                        && cookie.domain == *domain
+                        && cookie.path == *path;
+                });
+            }
+        }
+    }
+
+    if (!old_cookie.has_value()) {
+        send_response(message, cookie_operation_result(Optional<String> {}));
+        return;
+    }
+
+    auto edited_cookie = *old_cookie;
+
+    if (*field == "name"sv) {
+        edited_cookie.name = new_value.release_value();
+    } else if (*field == "value"sv) {
+        edited_cookie.value = new_value.release_value();
+    } else if (*field == "host"sv) {
+        edited_cookie.domain = new_value.release_value();
+    } else if (*field == "path"sv) {
+        edited_cookie.path = new_value.release_value();
+    } else if (*field == "expires"sv) {
+        if (auto error_string = set_cookie_expiry_from_devtools(edited_cookie, *new_value_json, new_value->bytes_as_string_view()); error_string.has_value()) {
+            send_response(message, cookie_operation_result(move(error_string)));
+            return;
+        }
+    } else if (*field == "isSecure"sv) {
+        auto value = bool_from_devtools_value(*new_value_json);
+        if (!value.has_value()) {
+            send_response(message, cookie_operation_result("Cookie secure flag must be true or false"_string));
+            return;
+        }
+        edited_cookie.secure = *value;
+    } else if (*field == "isHttpOnly"sv) {
+        auto value = bool_from_devtools_value(*new_value_json);
+        if (!value.has_value()) {
+            send_response(message, cookie_operation_result("Cookie HTTP-only flag must be true or false"_string));
+            return;
+        }
+        edited_cookie.http_only = *value;
+    } else if (*field == "sameSite"sv) {
+        edited_cookie.same_site = HTTP::Cookie::same_site_from_string(new_value->bytes_as_string_view());
+    } else {
+        send_response(message, cookie_operation_result(Optional<String> {}));
+        return;
+    }
+
+    auto result = devtools().delegate().set_cookie(tab->description(), old_cookie, move(edited_cookie));
+    send_response(message, cookie_operation_result(move(result)));
+}
+
+void CookiesActor::add_item(Message const& message)
+{
+    auto guid = get_required_parameter<String>(message, "guid"sv);
+    if (!guid.has_value())
+        return;
+
+    auto storage_host = message.data.get_string("host"sv)
+                            .value_or_lazy_evaluated_optional([this] { return host(); });
+    if (!storage_host.has_value()) {
+        send_response(message, cookie_operation_result("No storage host is available for this page"_string));
+        return;
+    }
+
+    auto storage_url = URL::Parser::basic_parse(*storage_host);
+    auto host_name = storage_host_name(*storage_host);
+    if (!storage_url.has_value() || !host_name.has_value()) {
+        send_response(message, cookie_operation_result("Cannot add a cookie for this storage host"_string));
+        return;
+    }
+
+    auto tab = m_tab.strong_ref();
+    if (!tab)
+        return;
+
+    auto now = UnixDateTime::now();
+
+    HTTP::Cookie::Cookie cookie;
+    cookie.name = move(*guid);
+    cookie.value = MUST(String::from_utf8(default_cookie_value));
+    cookie.same_site = HTTP::Cookie::SameSite::Lax;
+    cookie.creation_time = now;
+    cookie.last_access_time = now;
+    set_session_cookie_expiry(cookie);
+    cookie.domain = move(*host_name);
+    cookie.path = "/"_string;
+    cookie.secure = storage_url->scheme() == "https"sv;
+    cookie.host_only = true;
+
+    auto result = devtools().delegate().set_cookie(tab->description(), {}, move(cookie));
+    send_response(message, cookie_operation_result(move(result)));
+}
+
+void CookiesActor::remove_item(Message const& message)
+{
+    auto host = get_required_parameter<String>(message, "host"sv);
+    if (!host.has_value())
+        return;
+
+    auto name = get_required_parameter<String>(message, "name"sv);
+    if (!name.has_value())
+        return;
+
+    auto unique_key = parse_cookie_unique_key(name->bytes_as_string_view());
+    if (!unique_key.has_value()) {
+        send_response(message, {});
+        return;
+    }
+
+    auto tab = m_tab.strong_ref();
+    if (!tab)
+        return;
+
+    Vector<HTTP::Cookie::Cookie> cookies_to_delete;
+    for (auto& cookie : devtools().delegate().cookies(tab->description())) {
+        if (!cookie_matches_storage_host(cookie, *host))
+            continue;
+        if (!cookie_matches_unique_key(cookie, *unique_key))
+            continue;
+        cookies_to_delete.append(move(cookie));
+    }
+
+    devtools().delegate().delete_cookies(tab->description(), move(cookies_to_delete));
+    send_response(message, {});
+}
+
+void CookiesActor::remove_all(Message const& message)
+{
+    auto host = get_required_parameter<String>(message, "host"sv);
+    if (!host.has_value())
+        return;
+
+    Optional<String> domain;
+    if (auto requested_domain = message.data.get_string("domain"sv); requested_domain.has_value())
+        domain = *requested_domain;
+
+    auto tab = m_tab.strong_ref();
+    if (!tab)
+        return;
+
+    Vector<HTTP::Cookie::Cookie> cookies_to_delete;
+    for (auto& cookie : devtools().delegate().cookies(tab->description())) {
+        if (!cookie_matches_storage_host(cookie, *host))
+            continue;
+        if (!cookie_matches_requested_domain(cookie, domain))
+            continue;
+        cookies_to_delete.append(move(cookie));
+    }
+
+    devtools().delegate().delete_cookies(tab->description(), move(cookies_to_delete));
+    send_response(message, {});
+}
+
+void CookiesActor::remove_all_session_cookies(Message const& message)
+{
+    auto host = get_required_parameter<String>(message, "host"sv);
+    if (!host.has_value())
+        return;
+
+    Optional<String> domain;
+    if (auto requested_domain = message.data.get_string("domain"sv); requested_domain.has_value())
+        domain = *requested_domain;
+
+    auto tab = m_tab.strong_ref();
+    if (!tab)
+        return;
+
+    Vector<HTTP::Cookie::Cookie> cookies_to_delete;
+    for (auto& cookie : devtools().delegate().cookies(tab->description())) {
+        if (!cookie_matches_storage_host(cookie, *host))
+            continue;
+        if (!cookie_matches_requested_domain(cookie, domain))
+            continue;
+        if (cookie.persistent)
+            continue;
+        cookies_to_delete.append(move(cookie));
+    }
+
+    devtools().delegate().delete_cookies(tab->description(), move(cookies_to_delete));
+    send_response(message, {});
+}
+
+HashTable<String> CookiesActor::visible_cookie_unique_keys(String const& host) const
+{
+    HashTable<String> visible_keys;
+    auto tab = m_tab.strong_ref();
+    if (!tab)
+        return visible_keys;
+
+    for (auto& cookie : devtools().delegate().cookies(tab->description())) {
+        if (cookie_matches_storage_host(cookie, host))
+            visible_keys.set(cookie_unique_key(cookie));
+    }
+    return visible_keys;
+}
+
+void CookiesActor::send_cookie_store_update(String const& host, JsonArray added, JsonArray changed, JsonArray deleted)
+{
+    JsonObject update;
+
+    auto append_update = [&](StringView update_type, JsonArray keys) {
+        if (keys.is_empty())
+            return;
+
+        JsonObject hosts;
+        hosts.set(host, move(keys));
+
+        JsonObject cookies;
+        cookies.set("cookies"sv, move(hosts));
+
+        update.set(update_type, move(cookies));
+    };
+
+    append_update("added"sv, move(added));
+    append_update("changed"sv, move(changed));
+    append_update("deleted"sv, move(deleted));
+
+    JsonObject message;
+    message.set("type"sv, "storesUpdate"sv);
+    message.set("data"sv, move(update));
+    send_message(move(message));
+}
+
+void CookiesActor::on_cookies_changed(Vector<HTTP::Cookie::Cookie> changed_cookies)
+{
+    auto storage_host = host();
+    if (!storage_host.has_value())
+        return;
+
+    HashTable<String> old_visible_keys;
+    if (auto it = m_visible_cookie_unique_keys.find(*storage_host); it != m_visible_cookie_unique_keys.end())
+        old_visible_keys = it->value;
+
+    auto current_visible_keys = visible_cookie_unique_keys(*storage_host);
+
+    JsonArray added;
+    JsonArray changed;
+    JsonArray deleted;
+
+    for (auto const& cookie : changed_cookies) {
+        if (!cookie_matches_storage_host(cookie, *storage_host))
+            continue;
+
+        auto unique_key = cookie_unique_key(cookie);
+        auto was_visible = old_visible_keys.contains(unique_key);
+        auto is_visible = current_visible_keys.contains(unique_key);
+
+        if (is_visible && was_visible)
+            changed.must_append(unique_key);
+        else if (is_visible)
+            added.must_append(unique_key);
+        else if (was_visible)
+            deleted.must_append(unique_key);
+    }
+
+    m_visible_cookie_unique_keys.set(*storage_host, move(current_visible_keys));
+
+    if (added.is_empty() && changed.is_empty() && deleted.is_empty())
+        return;
+
+    send_cookie_store_update(*storage_host, move(added), move(changed), move(deleted));
+}
+
+}
+
+FILE: Libraries/LibDevTools/Actors/CookiesActor.h
+/*
+ * Copyright (c) 2026, Ladybird contributors
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/HashMap.h>
+#include <AK/HashTable.h>
+#include <AK/JsonArray.h>
+#include <AK/NonnullRefPtr.h>
+#include <LibDevTools/Actor.h>
+#include <LibDevTools/Forward.h>
+#include <LibHTTP/Forward.h>
+
+namespace DevTools {
+
+class DEVTOOLS_API CookiesActor final : public Actor {
+public:
+    static constexpr auto base_name = "cookies"sv;
+
+    static NonnullRefPtr<CookiesActor> create(DevToolsServer&, String name, WeakPtr<TabActor>);
+    virtual ~CookiesActor() override;
+
+    Optional<String> host() const;
+    JsonObject serialize_storage() const;
+    void on_cookies_changed(Vector<HTTP::Cookie::Cookie>);
+
+private:
+    CookiesActor(DevToolsServer&, String name, WeakPtr<TabActor>);
+
+    virtual void handle_message(Message const&) override;
+
+    void get_fields(Message const&);
+    void get_store_objects(Message const&);
+    void edit_item(Message const&);
+    void add_item(Message const&);
+    void remove_item(Message const&);
+    void remove_all(Message const&);
+    void remove_all_session_cookies(Message const&);
+    HashTable<String> visible_cookie_unique_keys(String const& host) const;
+    void send_cookie_store_update(String const& host, JsonArray added, JsonArray changed, JsonArray deleted);
+
+    WeakPtr<TabActor> m_tab;
+    HashMap<String, HashTable<String>> m_visible_cookie_unique_keys;
+};
+
+}
+
 FILE: Libraries/LibDevTools/Actors/CSSPropertiesActor.cpp
 /*
  * Copyright (c) 2025, Tim Flynn <trflynn89@ladybird.org>
@@ -90808,6 +91612,7 @@ FILE: Libraries/LibDevTools/Actors/WatcherActor.cpp
 #include <LibDevTools/Actors/AccessibilityActor.h>
 #include <LibDevTools/Actors/CSSPropertiesActor.h>
 #include <LibDevTools/Actors/ConsoleActor.h>
+#include <LibDevTools/Actors/CookiesActor.h>
 #include <LibDevTools/Actors/FrameActor.h>
 #include <LibDevTools/Actors/InspectorActor.h>
 #include <LibDevTools/Actors/NetworkParentActor.h>
@@ -90887,16 +91692,27 @@ void WatcherActor::handle_message(Message const& message)
         if (!resource_types.has_value())
             return;
 
+        bool should_send_cookie_resources = false;
         if constexpr (DEVTOOLS_DEBUG) {
             for (auto const& resource_type : resource_types->values()) {
                 if (!resource_type.is_string())
                     continue;
-                if (resource_type.as_string() != "console-message"sv)
+                if (resource_type.as_string() != "console-message"sv && resource_type.as_string() != "cookies"sv)
                     dbgln("Unrecognized `watchResources` resource type: '{}'", resource_type.as_string());
+            }
+        }
+        for (auto const& resource_type : resource_types->values()) {
+            if (!resource_type.is_string())
+                continue;
+            if (resource_type.as_string() == "cookies"sv) {
+                m_is_watching_cookie_resources = true;
+                should_send_cookie_resources = true;
             }
         }
 
         send_response(message, move(response));
+        if (should_send_cookie_resources)
+            send_cookies_resource_available_message();
         return;
     }
 
@@ -90930,7 +91746,7 @@ JsonObject WatcherActor::serialize_description() const
     JsonObject resources;
     resources.set("Cache"sv, false);
     resources.set("console-message"sv, true);
-    resources.set("cookies"sv, false);
+    resources.set("cookies"sv, true);
     resources.set("css-change"sv, false);
     resources.set("css-message"sv, false);
     resources.set("css-registered-properties"sv, false);
@@ -90998,6 +91814,8 @@ void WatcherActor::switch_frame_target(FrameActor& previous_target, String const
     send_frame_target_available_message(target);
     target.send_frame_update_message();
     target.set_pending_navigation_document_events_after_target_switch(url, title);
+    if (m_is_watching_cookie_resources)
+        send_cookies_resource_available_message();
 }
 
 void WatcherActor::send_frame_target_available_message(FrameActor& target)
@@ -91018,6 +91836,33 @@ void WatcherActor::send_frame_target_destroyed_message(FrameActor& target)
     message.set("type"sv, "target-destroyed-form"sv);
     message.set("target"sv, target.serialize_target());
     message.set("options"sv, move(options));
+    send_message(move(message));
+}
+
+CookiesActor& WatcherActor::cookies_actor()
+{
+    if (auto cookies = m_cookies.strong_ref())
+        return *cookies;
+
+    m_cookies = devtools().register_actor<CookiesActor>(m_tab);
+    return *m_cookies.strong_ref();
+}
+
+void WatcherActor::send_cookies_resource_available_message()
+{
+    JsonArray cookies;
+    cookies.must_append(cookies_actor().serialize_storage());
+
+    JsonArray cookie_resources;
+    cookie_resources.must_append("cookies"sv);
+    cookie_resources.must_append(move(cookies));
+
+    JsonArray array;
+    array.must_append(move(cookie_resources));
+
+    JsonObject message;
+    message.set("type"sv, "resources-available-array"sv);
+    message.set("array"sv, move(array));
     send_message(move(message));
 }
 
@@ -91057,13 +91902,17 @@ private:
     FrameActor& create_frame_target();
     void send_frame_target_available_message(FrameActor&);
     void send_frame_target_destroyed_message(FrameActor&);
+    CookiesActor& cookies_actor();
+    void send_cookies_resource_available_message();
 
     WeakPtr<TabActor> m_tab;
     WeakPtr<FrameActor> m_target;
+    WeakPtr<CookiesActor> m_cookies;
     WeakPtr<TargetConfigurationActor> m_target_configuration;
     WeakPtr<ThreadConfigurationActor> m_thread_configuration;
     WeakPtr<NetworkParentActor> m_network_parent;
     bool m_is_watching_frame_targets { false };
+    bool m_is_watching_cookie_resources { false };
 };
 
 }
@@ -91075,6 +91924,7 @@ set(SOURCES
     Actors/AccessibilityNodeActor.cpp
     Actors/AccessibilityWalkerActor.cpp
     Actors/ConsoleActor.cpp
+    Actors/CookiesActor.cpp
     Actors/CSSPropertiesActor.cpp
     Actors/DeviceActor.cpp
     Actors/FrameActor.cpp
@@ -91099,10 +91949,11 @@ set(SOURCES
     Actors/WatcherActor.cpp
     Connection.cpp
     DevToolsServer.cpp
+    StorageHelpers.cpp
 )
 
 ladybird_lib(LibDevTools devtools EXPLICIT_SYMBOL_EXPORT)
-target_link_libraries(LibDevTools PRIVATE LibCore LibWeb)
+target_link_libraries(LibDevTools PRIVATE LibCore LibHTTP LibWeb LibURL)
 
 FILE: Libraries/LibDevTools/Connection.cpp
 /*
@@ -91279,6 +92130,7 @@ FILE: Libraries/LibDevTools/DevToolsDelegate.h
 #include <LibDevTools/Actors/PageStyleActor.h>
 #include <LibDevTools/Actors/TabActor.h>
 #include <LibDevTools/Forward.h>
+#include <LibHTTP/Cookie/Cookie.h>
 #include <LibHTTP/Header.h>
 #include <LibRequests/NetworkError.h>
 #include <LibRequests/RequestTimingInfo.h>
@@ -91299,6 +92151,12 @@ public:
     virtual void navigate_tab(TabDescription const&, String const&) const { }
     virtual void reload_tab(TabDescription const&, bool bypass_cache) const { (void)bypass_cache; }
     virtual void traverse_the_history_by_delta(TabDescription const&, int) const { }
+    virtual Vector<HTTP::Cookie::Cookie> cookies(TabDescription const&) const { return {}; }
+    virtual ErrorOr<void> set_cookie(TabDescription const&, Optional<HTTP::Cookie::Cookie>, HTTP::Cookie::Cookie) const { return {}; }
+    virtual void delete_cookies(TabDescription const&, Vector<HTTP::Cookie::Cookie>) const { }
+    using OnHostCookieChange = Function<void(Vector<HTTP::Cookie::Cookie>)>;
+    virtual void listen_for_host_cookie_changes(TabDescription const&, OnHostCookieChange) const { }
+    virtual void stop_listening_for_host_cookie_changes(TabDescription const&) const { }
 
     using OnTabInspectionComplete = Function<void(ErrorOr<JsonValue>)>;
     virtual void inspect_tab(TabDescription const&, OnTabInspectionComplete) const { }
@@ -91674,6 +92532,7 @@ class AccessibilityNodeActor;
 class AccessibilityWalkerActor;
 class Connection;
 class ConsoleActor;
+class CookiesActor;
 class CSSPropertiesActor;
 class DeviceActor;
 class DevToolsDelegate;
@@ -91752,6 +92611,72 @@ static constexpr Web::DOM::NodeType parse_dom_node_type(StringView type)
         return Web::DOM::NodeType::COMMENT_NODE;
     return Web::DOM::NodeType::INVALID;
 }
+
+}
+
+FILE: Libraries/LibDevTools/StorageHelpers.cpp
+/*
+ * Copyright (c) 2026, Ladybird contributors
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/StringBuilder.h>
+#include <LibDevTools/StorageHelpers.h>
+#include <LibURL/Parser.h>
+#include <LibURL/URL.h>
+
+namespace DevTools {
+
+Optional<String> storage_host_for_url(String const& url_string)
+{
+    auto url = URL::Parser::basic_parse(url_string);
+    if (!url.has_value())
+        return {};
+
+    auto const& scheme = url->scheme();
+    if (scheme == "http"sv || scheme == "https"sv) {
+        StringBuilder builder;
+        builder.append(scheme);
+        builder.append("://"sv);
+        builder.append(url->serialized_host());
+        if (auto port = url->port(); port.has_value())
+            builder.appendff(":{}", *port);
+        return builder.to_string_without_validation();
+    }
+
+    if (scheme == "about"sv || scheme == "file"sv || scheme == "javascript"sv || scheme == "resource"sv)
+        return url->serialize();
+
+    return {};
+}
+
+Optional<String> storage_host_name(String const& storage_host)
+{
+    auto url = URL::Parser::basic_parse(storage_host);
+    if (!url.has_value() || !url->host().has_value())
+        return {};
+    return url->serialized_host();
+}
+
+}
+
+FILE: Libraries/LibDevTools/StorageHelpers.h
+/*
+ * Copyright (c) 2026, Ladybird contributors
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Optional.h>
+#include <AK/String.h>
+
+namespace DevTools {
+
+Optional<String> storage_host_for_url(String const&);
+Optional<String> storage_host_name(String const&);
 
 }
 
@@ -130658,7 +131583,6 @@ static void on_path_attribute(URL::URL const&, ParsedCookie& parsed_cookie, Stri
 static void on_secure_attribute(ParsedCookie& parsed_cookie);
 static void on_http_only_attribute(ParsedCookie& parsed_cookie);
 static void on_same_site_attribute(ParsedCookie& parsed_cookie, StringView attribute_value);
-static Optional<UnixDateTime> parse_date_time(StringView date_string);
 
 bool cookie_contains_invalid_control_character(StringView cookie_string)
 {
@@ -130822,7 +131746,7 @@ ErrorOr<void> process_attribute(URL::URL const& url, ParsedCookie& parsed_cookie
 void on_expires_attribute(ParsedCookie& parsed_cookie, StringView attribute_value)
 {
     // 1. Let the expiry-time be the result of parsing the attribute-value as cookie-date (see Section 5.1.1).
-    auto expiry_time = parse_date_time(attribute_value);
+    auto expiry_time = parse_cookie_date(attribute_value);
 
     // 2. If the attribute-value failed to parse as a cookie date, ignore the cookie-av.
     if (!expiry_time.has_value())
@@ -130963,7 +131887,7 @@ void on_same_site_attribute(ParsedCookie& parsed_cookie, StringView attribute_va
 }
 
 // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-22#section-5.1.1
-Optional<UnixDateTime> parse_date_time(StringView date_string)
+Optional<UnixDateTime> parse_cookie_date(StringView date_string)
 {
     // https://tools.ietf.org/html/rfc6265#section-5.1.1
     unsigned hour = 0;
@@ -131171,6 +132095,7 @@ struct ParsedCookie {
 
 Optional<ParsedCookie> parse_cookie(URL::URL const&, StringView cookie_string);
 bool cookie_contains_invalid_control_character(StringView);
+Optional<UnixDateTime> parse_cookie_date(StringView);
 
 constexpr inline auto MAXIMUM_COOKIE_AGE = AK::Duration::from_seconds(400LL * 24 * 60 * 60);
 
@@ -304819,6 +305744,8 @@ set(SOURCES
     GenericTimeProvider.cpp
     IncrementallyPopulatedStream.cpp
     PlaybackManager.cpp
+    PlaybackStates/BufferingStateHandler.cpp
+    PlaybackStates/PlayingStateHandler.cpp
     PlaybackStates/StartingStateHandler.cpp
     PlaybackStates/PausedStateHandler.cpp
     PlaybackStates/PlaybackStateHandler.cpp
@@ -313391,12 +314318,12 @@ constexpr PipelineStatus select_combined_pipeline_status(PipelineStatus a, Pipel
         return PipelineStatus::Error;
     if (a == PipelineStatus::Blocked || b == PipelineStatus::Blocked)
         return PipelineStatus::Blocked;
+    if (a == PipelineStatus::Pending || b == PipelineStatus::Pending)
+        return PipelineStatus::Pending;
     if (a == PipelineStatus::HaveData || b == PipelineStatus::HaveData)
         return PipelineStatus::HaveData;
     if (a == PipelineStatus::MovedPosition || b == PipelineStatus::MovedPosition)
         return PipelineStatus::MovedPosition;
-    if (a == PipelineStatus::Pending || b == PipelineStatus::Pending)
-        return PipelineStatus::Pending;
     return PipelineStatus::EndOfStream;
 }
 
@@ -313682,35 +314609,54 @@ void PlaybackManager::set_up_producers()
     }
 }
 
+AK::Duration PlaybackManager::current_time() const
+{
+    auto time = m_handler->current_time();
+    return min(time, duration());
+}
+
 void PlaybackManager::on_audio_sink_state_changed(PipelineStatus status)
 {
-    m_audio_buffering = status == PipelineStatus::Blocked;
-    update_buffering_state();
-    m_handler->on_audio_sink_state_changed(status);
+    m_audio_sink_status = status;
+    update_pipeline_state();
 }
 
 void PlaybackManager::on_video_sink_state_changed(Track const& track, PipelineStatus status)
 {
-    if (status == PipelineStatus::Blocked) {
-        if (m_video_tracks_buffering.set(track) == HashSetResult::InsertedNewEntry)
-            update_buffering_state();
-    } else {
-        if (m_video_tracks_buffering.remove(track))
-            update_buffering_state();
-    }
-    m_handler->on_video_sink_state_changed(track, status);
+    auto& track_data = get_video_data_for_track(track);
+    track_data.sink_status = status;
+    update_pipeline_state();
 }
 
-void PlaybackManager::update_buffering_state()
+PipelineStatus PlaybackManager::combined_pipeline_status() const
 {
-    auto is_buffering = m_audio_buffering || !m_video_tracks_buffering.is_empty();
-    if (is_buffering == m_was_buffering)
-        return;
-    m_was_buffering = is_buffering;
-    if (is_buffering)
-        m_handler->enter_buffering();
-    else
-        m_handler->exit_buffering();
+    auto status = PipelineStatus::EndOfStream;
+
+    if (m_audio_sink != nullptr)
+        status = select_combined_pipeline_status(status, m_audio_sink_status);
+
+    for (auto const& track_data : m_video_track_datas) {
+        if (track_data.display == nullptr)
+            continue;
+        status = select_combined_pipeline_status(status, track_data.sink_status);
+    }
+
+    return status;
+}
+
+void PlaybackManager::update_pipeline_state()
+{
+    m_handler->on_pipeline_status_changed(combined_pipeline_status());
+}
+
+void PlaybackManager::reset_pipeline_state()
+{
+    for (auto& track_data : m_video_track_datas) {
+        if (track_data.display == nullptr)
+            continue;
+        track_data.sink_status = PipelineStatus::Pending;
+    }
+    m_audio_sink_status = m_audio_sink != nullptr ? PipelineStatus::Pending : PipelineStatus::HaveData;
 }
 
 void PlaybackManager::check_for_duration_change(AK::Duration duration)
@@ -313750,7 +314696,6 @@ void PlaybackManager::set_time_provider(NonnullRefPtr<MediaTimeProvider> const& 
 
 void PlaybackManager::disable_audio()
 {
-    m_audio_buffering = false;
     m_audio_mixer = nullptr;
     m_audio_time_stretch_processor = nullptr;
     m_audio_sink = nullptr;
@@ -313762,6 +314707,7 @@ NonnullRefPtr<DisplayingVideoSink> PlaybackManager::get_or_create_the_displaying
 {
     auto& track_data = get_video_data_for_track(track);
     if (track_data.display == nullptr) {
+        track_data.sink_status = PipelineStatus::HaveData;
         auto display = MUST(Media::DisplayingVideoSink::try_create(m_time_provider,
             [self = weak(), track](PipelineStatus status) {
                 if (!self)
@@ -313770,6 +314716,7 @@ NonnullRefPtr<DisplayingVideoSink> PlaybackManager::get_or_create_the_displaying
             }));
         MUST(display->connect_input(track_data.producer));
         track_data.display = move(display);
+        update_pipeline_state();
     }
     return *track_data.display;
 }
@@ -313780,29 +314727,34 @@ void PlaybackManager::remove_the_displaying_video_sink_for_track(Track const& tr
     VERIFY(track_data.display);
     track_data.display->disconnect_input(track_data.producer);
     track_data.display = nullptr;
-    on_video_sink_state_changed(track, PipelineStatus::EndOfStream);
+    track_data.sink_status = PipelineStatus::HaveData;
+    update_pipeline_state();
 }
 
 void PlaybackManager::enable_an_audio_track(Track const& track)
 {
     auto& track_data = get_audio_data_for_track(track);
     VERIFY(!track_data.enabled);
+    m_audio_sink_status = PipelineStatus::HaveData;
     if (m_audio_mixer) {
         m_audio_mixer->seek(current_time());
         MUST(m_audio_mixer->connect_input(track_data.producer));
     }
     track_data.enabled = true;
+    update_pipeline_state();
 }
 
 void PlaybackManager::disable_an_audio_track(Track const& track)
 {
     auto& track_data = get_audio_data_for_track(track);
     VERIFY(track_data.enabled);
+    m_audio_sink_status = PipelineStatus::HaveData;
     if (m_audio_mixer) {
         m_audio_mixer->seek(current_time());
         m_audio_mixer->disconnect_input(track_data.producer);
     }
     track_data.enabled = false;
+    update_pipeline_state();
 }
 
 bool PlaybackManager::track_is_enabled(Track const& track) const
@@ -313834,10 +314786,10 @@ void PlaybackManager::pause()
 
 void PlaybackManager::seek(AK::Duration timestamp, SeekMode mode)
 {
-    if (!m_is_in_error_state && current_time() == timestamp)
-        return;
+    reset_pipeline_state();
     m_handler->seek(timestamp, mode);
     m_is_in_error_state = false;
+    update_pipeline_state();
 }
 
 bool PlaybackManager::is_playing()
@@ -313946,7 +314898,7 @@ public:
 
     AK::Duration duration() const { return m_duration; }
     void set_duration(AK::Duration duration) { m_duration = duration; }
-    AK::Duration current_time() const { return min(m_time_provider->current_time(), duration()); }
+    AK::Duration current_time() const;
 
     Optional<AK::UnixDateTime> start_time_realtime() const { return m_start_time_realtime; }
 
@@ -313997,6 +314949,7 @@ private:
         Track track;
         NonnullRefPtr<DecodedVideoProducer> producer;
         RefPtr<DisplayingVideoSink> display;
+        PipelineStatus sink_status { PipelineStatus::HaveData };
     };
     using VideoTrackDatas = Vector<VideoTrackData, EXPECTED_VIDEO_TRACK_COUNT>;
 
@@ -314017,7 +314970,9 @@ private:
     void set_up_producers();
     void on_audio_sink_state_changed(PipelineStatus);
     void on_video_sink_state_changed(Track const&, PipelineStatus);
-    void update_buffering_state();
+    void update_pipeline_state();
+    void reset_pipeline_state();
+    PipelineStatus combined_pipeline_status() const;
     void check_for_duration_change(AK::Duration);
     void dispatch_error(DecoderError&&);
 
@@ -314073,9 +315028,7 @@ private:
     AK::Duration m_duration;
     Optional<AK::UnixDateTime> m_start_time_realtime;
 
-    bool m_audio_buffering { false };
-    HashTable<Track> m_video_tracks_buffering;
-    bool m_was_buffering { false };
+    PipelineStatus m_audio_sink_status { PipelineStatus::HaveData };
 
     bool m_is_in_error_state { false };
 };
@@ -314187,6 +315140,33 @@ enum class AvailableData : u8 {
 
 }
 
+FILE: Libraries/LibMedia/PlaybackStates/BufferingStateHandler.cpp
+/*
+ * Copyright (c) 2025-2026, Gregory Bertilson <gregory@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include "BufferingStateHandler.h"
+
+#include <LibMedia/PlaybackManager.h>
+#include <LibMedia/PlaybackStates/EndedStateHandler.h>
+
+namespace Media {
+
+void BufferingStateHandler::on_pipeline_status_changed(PipelineStatus status)
+{
+    if (status == PipelineStatus::EndOfStream) {
+        manager().replace_state_handler<EndedStateHandler>();
+        return;
+    }
+
+    if (status != PipelineStatus::Blocked)
+        resume();
+}
+
+}
+
 FILE: Libraries/LibMedia/PlaybackStates/BufferingStateHandler.h
 /*
  * Copyright (c) 2025, Gregory Bertilson <zaggy1024@gmail.com>
@@ -314220,14 +315200,60 @@ public:
         return AvailableData::Current;
     }
 
-    virtual void enter_buffering() override
+    virtual void on_pipeline_status_changed(PipelineStatus) override;
+};
+
+}
+
+FILE: Libraries/LibMedia/PlaybackStates/EndedStateHandler.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <LibMedia/PlaybackManager.h>
+
+namespace Media {
+
+class EndedStateHandler final : public PlaybackStateHandler {
+public:
+    EndedStateHandler(PlaybackManager& manager)
+        : PlaybackStateHandler(manager)
     {
+    }
+    virtual ~EndedStateHandler() override = default;
+
+    virtual void on_enter() override
+    {
+        manager().m_time_provider->pause();
+    }
+    virtual void on_exit() override { }
+
+    virtual AK::Duration current_time() const override
+    {
+        return manager().duration();
     }
 
-    virtual void exit_buffering() override
+    virtual void play() override { }
+    virtual void pause() override { }
+
+    virtual bool is_playing() override
     {
-        resume();
+        return false;
     }
+    virtual PlaybackState state() override
+    {
+        return PlaybackState::Ended;
+    }
+    virtual AvailableData available_data() override
+    {
+        return AvailableData::Current;
+    }
+
+    virtual void on_pipeline_status_changed(PipelineStatus) override { }
 };
 
 }
@@ -314250,7 +315276,8 @@ FILE: Libraries/LibMedia/PlaybackStates/Forward.h
     X(PlayingStateHandler)                   \
     X(PausedStateHandler)                    \
     X(ResumingStateHandler)                  \
-    X(SeekingStateHandler)
+    X(SeekingStateHandler)                   \
+    X(EndedStateHandler)
 
 namespace Media {
 
@@ -314321,9 +315348,6 @@ public:
     {
         return AvailableData::Future;
     }
-
-    virtual void enter_buffering() override { }
-    virtual void exit_buffering() override { }
 };
 
 }
@@ -314348,6 +315372,7 @@ enum class PlaybackState : u8 {
     Playing,
     Paused,
     Seeking,
+    Ended,
 };
 
 constexpr StringView playback_state_to_string(PlaybackState state)
@@ -314363,6 +315388,8 @@ constexpr StringView playback_state_to_string(PlaybackState state)
         return "Paused"sv;
     case PlaybackState::Seeking:
         return "Seeking"sv;
+    case PlaybackState::Ended:
+        return "Ended"sv;
     }
     return "Invalid"sv;
 }
@@ -314389,15 +315416,27 @@ FILE: Libraries/LibMedia/PlaybackStates/PlaybackStateHandler.cpp
  */
 
 #include <LibMedia/PlaybackManager.h>
+#include <LibMedia/PlaybackStates/EndedStateHandler.h>
 #include <LibMedia/PlaybackStates/SeekingStateHandler.h>
 
 #include "PlaybackStateHandler.h"
 
 namespace Media {
 
+AK::Duration PlaybackStateHandler::current_time() const
+{
+    return manager().m_time_provider->current_time();
+}
+
 void PlaybackStateHandler::seek(AK::Duration timestamp, SeekMode mode)
 {
     manager().replace_state_handler<SeekingStateHandler>(manager().is_playing(), timestamp, mode);
+}
+
+void PlaybackStateHandler::on_pipeline_status_changed(PipelineStatus status)
+{
+    if (status == PipelineStatus::EndOfStream)
+        manager().replace_state_handler<EndedStateHandler>();
 }
 
 }
@@ -314431,6 +315470,8 @@ public:
     virtual void on_enter() = 0;
     virtual void on_exit() = 0;
 
+    virtual AK::Duration current_time() const;
+
     virtual void start() { }
     virtual void play() = 0;
     virtual void pause() = 0;
@@ -314440,11 +315481,7 @@ public:
     virtual PlaybackState state() = 0;
     virtual AvailableData available_data() = 0;
 
-    virtual void enter_buffering() = 0;
-    virtual void exit_buffering() = 0;
-
-    virtual void on_audio_sink_state_changed(PipelineStatus) { }
-    virtual void on_video_sink_state_changed(Track const&, PipelineStatus) { }
+    virtual void on_pipeline_status_changed(PipelineStatus);
 
 protected:
     PlaybackManager& manager() const { return m_manager; }
@@ -314452,6 +315489,40 @@ protected:
 private:
     PlaybackManager& m_manager;
 };
+
+}
+
+FILE: Libraries/LibMedia/PlaybackStates/PlayingStateHandler.cpp
+/*
+ * Copyright (c) 2025-2026, Gregory Bertilson <gregory@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include "PlayingStateHandler.h"
+
+#include <LibMedia/PlaybackManager.h>
+#include <LibMedia/PlaybackStates/BufferingStateHandler.h>
+#include <LibMedia/PlaybackStates/EndedStateHandler.h>
+#include <LibMedia/PlaybackStates/PausedStateHandler.h>
+
+namespace Media {
+
+void PlayingStateHandler::pause()
+{
+    manager().replace_state_handler<PausedStateHandler>();
+}
+
+void PlayingStateHandler::on_pipeline_status_changed(PipelineStatus status)
+{
+    if (status == PipelineStatus::Blocked) {
+        manager().replace_state_handler<BufferingStateHandler>(true);
+        return;
+    }
+
+    if (status == PipelineStatus::EndOfStream)
+        manager().replace_state_handler<EndedStateHandler>();
+}
 
 }
 
@@ -314465,9 +315536,7 @@ FILE: Libraries/LibMedia/PlaybackStates/PlayingStateHandler.h
 #pragma once
 
 #include <LibMedia/PlaybackManager.h>
-#include <LibMedia/PlaybackStates/BufferingStateHandler.h>
 #include <LibMedia/PlaybackStates/Forward.h>
-#include <LibMedia/PlaybackStates/PausedStateHandler.h>
 
 namespace Media {
 
@@ -314489,10 +315558,7 @@ public:
     }
 
     virtual void play() override { }
-    virtual void pause() override
-    {
-        manager().replace_state_handler<PausedStateHandler>();
-    }
+    virtual void pause() override;
 
     virtual bool is_playing() override
     {
@@ -314507,11 +315573,7 @@ public:
         return AvailableData::Future;
     }
 
-    virtual void enter_buffering() override
-    {
-        manager().replace_state_handler<BufferingStateHandler>(true);
-    }
-    virtual void exit_buffering() override { }
+    virtual void on_pipeline_status_changed(PipelineStatus) override;
 };
 
 }
@@ -314598,7 +315660,6 @@ FILE: Libraries/LibMedia/PlaybackStates/SeekingStateHandler.h
 
 #pragma once
 
-#include <AK/HashTable.h>
 #include <AK/Time.h>
 #include <LibMedia/PipelineStatus.h>
 #include <LibMedia/PlaybackManager.h>
@@ -314628,11 +315689,9 @@ public:
         begin_seek();
     }
 
-    virtual void on_exit() override
-    {
-        VERIFY(m_video_seeks_pending.is_empty());
-        VERIFY(!m_audio_seek_pending);
-    }
+    virtual void on_exit() override { }
+
+    virtual AK::Duration current_time() const override { return m_chosen_timestamp; }
 
     virtual void seek(AK::Duration timestamp, SeekMode mode) override
     {
@@ -314650,23 +315709,17 @@ public:
         return AvailableData::Current;
     }
 
-    virtual void enter_buffering() override { }
-    virtual void exit_buffering() override { }
-
-    virtual void on_audio_sink_state_changed(PipelineStatus status) override
+    virtual void on_pipeline_status_changed(PipelineStatus status) override
     {
         if (!resolves_seek(status))
             return;
-        m_audio_seek_pending = false;
-        possibly_complete_seek();
-    }
 
-    virtual void on_video_sink_state_changed(Track const& track, PipelineStatus status) override
-    {
-        if (!resolves_seek(status))
+        if (status == PipelineStatus::EndOfStream) {
+            PlaybackStateHandler::on_pipeline_status_changed(status);
             return;
-        m_video_seeks_pending.remove(track);
-        possibly_complete_seek();
+        }
+
+        resume();
     }
 
 private:
@@ -314688,40 +315741,22 @@ private:
     void begin_seek()
     {
         m_chosen_timestamp = choose_timestamp();
-        m_video_seeks_pending.clear();
-        m_audio_seek_pending = false;
 
         for (auto& video_track_data : manager().m_video_track_datas) {
             if (video_track_data.display == nullptr)
                 continue;
-            m_video_seeks_pending.set(video_track_data.track);
             video_track_data.display->seek(m_chosen_timestamp);
         }
 
-        if (manager().m_audio_sink) {
-            m_audio_seek_pending = true;
+        if (manager().m_audio_sink)
             manager().m_audio_sink->seek(m_chosen_timestamp);
-        } else {
+        else
             manager().m_time_provider->seek(m_chosen_timestamp);
-        }
-
-        possibly_complete_seek();
-    }
-
-    void possibly_complete_seek()
-    {
-        if (m_audio_seek_pending)
-            return;
-        if (!m_video_seeks_pending.is_empty())
-            return;
-        resume();
     }
 
     AK::Duration m_target_timestamp;
     SeekMode m_mode { SeekMode::Accurate };
     AK::Duration m_chosen_timestamp { AK::Duration::zero() };
-    HashTable<Track> m_video_seeks_pending;
-    bool m_audio_seek_pending { false };
 };
 
 }
@@ -314736,7 +315771,6 @@ FILE: Libraries/LibMedia/PlaybackStates/StartingStateHandler.cpp
 #include "StartingStateHandler.h"
 
 #include <LibMedia/PlaybackManager.h>
-#include <LibMedia/PlaybackStates/BufferingStateHandler.h>
 
 namespace Media {
 
@@ -314744,13 +315778,15 @@ void StartingStateHandler::start()
 {
     m_started = true;
 
-    if (!manager().m_audio_buffering && manager().m_video_tracks_buffering.is_empty())
+    if (!m_pipeline_blocked)
         resume();
 }
 
-void StartingStateHandler::exit_buffering()
+void StartingStateHandler::on_pipeline_status_changed(PipelineStatus status)
 {
-    if (m_started)
+    m_pipeline_blocked = status == PipelineStatus::Blocked;
+
+    if (m_started && !m_pipeline_blocked)
         resume();
 }
 
@@ -314788,11 +315824,11 @@ public:
         return AvailableData::None;
     }
 
-    virtual void enter_buffering() override { }
-    virtual void exit_buffering() override;
+    virtual void on_pipeline_status_changed(PipelineStatus) override;
 
 private:
     bool m_started { false };
+    bool m_pipeline_blocked { false };
 };
 
 }
@@ -315936,7 +316972,6 @@ void DecodedAudioProducer::ThreadData::seek(AK::Duration timestamp)
     note_consumer_activity_while_locked();
     m_seek_id++;
     m_seek_timestamp = timestamp;
-    m_current_halting_status = PipelineStatus::Pending;
     m_downstream_needs_wake = true;
     m_demuxer->set_blocking_reads_aborted_for_track(m_track);
     wake();
@@ -316074,8 +317109,8 @@ DecoderErrorOr<void> DecodedAudioProducer::ThreadData::retrieve_next_block(Audio
 void DecodedAudioProducer::ThreadData::resolve_seek(u32 seek_id, bool moved_position)
 {
     m_last_processed_seek_id = seek_id;
-    VERIFY(m_current_halting_status != PipelineStatus::HaveData);
     if (moved_position) {
+        m_current_halting_status = PipelineStatus::Pending;
         m_moved_position_pending = true;
         m_queue.clear();
     }
@@ -316089,15 +317124,19 @@ bool DecodedAudioProducer::ThreadData::handle_seek()
     if (m_last_processed_seek_id == seek_id)
         return false;
 
+    AK::Duration timestamp;
+    bool moved_position = false;
+
     auto handle_error = [&](DecoderError&& error) {
         auto locker = take_lock();
         m_queue.clear();
+        if (moved_position) {
+            m_current_halting_status = PipelineStatus::Pending;
+            m_moved_position_pending = true;
+        }
         enter_halting_state(PipelineStatus::Error, move(error));
         m_last_processed_seek_id = seek_id;
     };
-
-    AK::Duration timestamp;
-    bool moved_position = false;
 
     while (true) {
         {
@@ -316186,28 +317225,24 @@ void DecodedAudioProducer::ThreadData::push_data_and_decode_a_block()
     VERIFY(m_decoder);
 
     auto set_halting_status_and_wait_for_seek = [this](PipelineStatus status, Optional<DecoderError> error) {
-        {
-            auto locker = take_lock();
-            enter_halting_state(status, move(error));
-        }
+        auto locker = take_lock();
+        enter_halting_state(status, move(error));
 
         dbgln_if(PLAYBACK_MANAGER_DEBUG, "Decoded Audio Producer: Reached a halting pull status, waiting for a seek to start decoding again...");
         while (true) {
-            {
-                auto locker = take_lock();
-                if (m_current_halting_status == PipelineStatus::Pending)
-                    return;
-            }
-            if (handle_seek())
-                break;
-            {
-                auto locker = take_lock();
-                m_wait_condition.wait();
-                if (should_thread_exit_while_locked())
-                    return;
-            }
+            if (m_seek_id != m_last_processed_seek_id)
+                return;
+            m_wait_condition.wait();
+            if (should_thread_exit_while_locked())
+                return;
         }
     };
+
+    // If a prior seek encountered a decoding error, stop here to ensure that the pipeline state stays Error.
+    if (m_current_halting_status != PipelineStatus::Pending) {
+        set_halting_status_and_wait_for_seek(m_current_halting_status, {});
+        return;
+    }
 
     auto sample_result = m_demuxer->get_next_sample_for_track(m_track);
     if (sample_result.is_error()) {
@@ -316695,7 +317730,6 @@ void DecodedVideoProducer::ThreadData::seek(AK::Duration timestamp)
 {
     auto locker = take_lock();
     note_consumer_activity_while_locked();
-    m_current_halting_status = PipelineStatus::Pending;
     m_downstream_needs_wake = true;
 
     if (timestamp >= m_earliest_available_timestamp && timestamp < m_latest_available_timestamp) {
@@ -316828,8 +317862,8 @@ void DecodedVideoProducer::ThreadData::dispatch_error(DecoderError&& error)
 void DecodedVideoProducer::ThreadData::resolve_seek(u32 seek_id, bool moved_position)
 {
     m_last_processed_seek_id = seek_id;
-    VERIFY(m_current_halting_status != PipelineStatus::HaveData);
     if (moved_position) {
+        m_current_halting_status = PipelineStatus::Pending;
         m_moved_position_pending = true;
         m_queue.clear();
     }
@@ -316843,15 +317877,19 @@ bool DecodedVideoProducer::ThreadData::handle_seek()
     if (m_last_processed_seek_id == seek_id)
         return false;
 
+    AK::Duration timestamp;
+    bool moved_position = false;
+
     auto handle_error = [&](DecoderError&& error) {
         auto locker = take_lock();
         m_queue.clear();
+        if (moved_position) {
+            m_current_halting_status = PipelineStatus::Pending;
+            m_moved_position_pending = true;
+        }
         enter_halting_state(PipelineStatus::Error, move(error));
         m_last_processed_seek_id = seek_id;
     };
-
-    AK::Duration timestamp;
-    bool moved_position = false;
 
     while (true) {
         {
@@ -316948,28 +317986,24 @@ void DecodedVideoProducer::ThreadData::push_data_and_decode_some_frames()
     //        before this functionality can exist.
 
     auto set_halting_status_and_wait_for_seek = [this](PipelineStatus status, Optional<DecoderError> error) {
-        {
-            auto locker = take_lock();
-            enter_halting_state(status, move(error));
-        }
+        auto locker = take_lock();
+        enter_halting_state(status, move(error));
 
         dbgln_if(PLAYBACK_MANAGER_DEBUG, "Decoded Video Producer: Reached a halting pull status, waiting for a seek to start decoding again...");
         while (true) {
-            {
-                auto locker = take_lock();
-                if (m_current_halting_status == PipelineStatus::Pending)
-                    return;
-            }
-            if (handle_seek())
-                break;
-            {
-                auto locker = take_lock();
-                m_wait_condition.wait();
-                if (should_thread_exit_while_locked())
-                    return;
-            }
+            if (m_seek_id != m_last_processed_seek_id)
+                return;
+            m_wait_condition.wait();
+            if (should_thread_exit_while_locked())
+                return;
         }
     };
+
+    // If a prior seek encountered a decoding error, stop here to ensure that the pipeline state stays Error.
+    if (m_current_halting_status != PipelineStatus::Pending) {
+        set_halting_status_and_wait_for_seek(m_current_halting_status, {});
+        return;
+    }
 
     auto sample_result = m_demuxer->get_next_sample_for_track(m_track);
     if (sample_result.is_error()) {
@@ -317743,7 +318777,6 @@ void AudioPlaybackSink::OutputThreadData::dispatch_state_if_changed(PipelineStat
         return;
     m_last_dispatched_status = status;
     m_main_thread_event_loop.deferred_invoke([self = NonnullRefPtr(*this), status, seek_id] {
-        Sync::MutexLocker locker { self->m_output_mutex };
         if (self->m_seek_id != seek_id)
             return;
         if (self->m_on_state_changed)
@@ -318098,6 +319131,8 @@ ErrorOr<void> DisplayingVideoSink::connect_input(NonnullRefPtr<VideoProducer> co
         consume_moved_position_signals(status);
         if (!resolves_seek(status))
             return;
+        if (m_current_frame != nullptr && m_seek_status == SeekStatus::None)
+            status = PipelineStatus::HaveData;
         dispatch_state_if_changed(status);
     });
     input->seek(m_time_provider->current_time());
@@ -318194,9 +319229,21 @@ DisplayingVideoSinkUpdateResult DisplayingVideoSink::update()
         result = DisplayingVideoSinkUpdateResult::NewFrameAvailable;
     }
 
+    if (m_current_frame != nullptr && m_seek_status == SeekStatus::None) {
+        AK::Duration current_frame_end;
+        if (is_terminal(last_status))
+            current_frame_end = m_current_frame->timestamp() + m_current_frame->duration();
+        else
+            current_frame_end = conservative_frame_end(*m_current_frame);
+        if (current_time <= current_frame_end)
+            last_status = PipelineStatus::HaveData;
+    }
+
     // Dispatch the new state with a deferred invoke to avoid reentrancy. This prevents a seek from resolving while
     // an update is being processed.
-    Core::deferred_invoke([self = NonnullRefPtr(*this), last_status] {
+    Core::deferred_invoke([self = NonnullRefPtr(*this), last_status, seek_id = m_seek_id] {
+        if (seek_id != self->m_seek_id)
+            return;
         self->dispatch_state_if_changed(last_status);
     });
 
@@ -547218,6 +548265,7 @@ FILE: Libraries/LibWeb/DOM/Document.cpp
 #include <LibWeb/HTML/CustomElements/CustomElementDefinition.h>
 #include <LibWeb/HTML/CustomElements/CustomElementReactionNames.h>
 #include <LibWeb/HTML/CustomElements/CustomElementRegistry.h>
+#include <LibWeb/HTML/DOMStringList.h>
 #include <LibWeb/HTML/DecodedImageData.h>
 #include <LibWeb/HTML/DocumentState.h>
 #include <LibWeb/HTML/DragEvent.h>
@@ -547305,6 +548353,7 @@ FILE: Libraries/LibWeb/DOM/Document.cpp
 #include <LibWeb/SVG/SVGScriptElement.h>
 #include <LibWeb/SVG/SVGStyleElement.h>
 #include <LibWeb/SVG/SVGTitleElement.h>
+#include <LibWeb/SVG/SVGUseElement.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/TrustedTypes/RequireTrustedTypesForDirective.h>
 #include <LibWeb/TrustedTypes/TrustedTypePolicy.h>
@@ -547570,10 +548619,18 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
     // 10. Set window's associated Document to document.
     window->set_associated_document(*document);
 
-    // 11. Run CSP initialization for a Document given document.
+    // 11. Set document's internal ancestor origin objects list to the result of running the internal ancestor origin
+    //     objects list creation steps given document and navigationParams's iframe element referrer policy.
+    document->set_internal_ancestor_origin_objects_list(document->internal_ancestor_origin_objects_list_creation_steps(navigation_params.iframe_element_referrer_policy));
+
+    // 12. Set document's ancestor origins list to the result of running the ancestor origins list creation steps given
+    //     document.
+    document->set_ancestor_origins_list(document->ancestor_origins_list_creation_steps());
+
+    // 13. Run CSP initialization for a Document given document.
     document->run_csp_initialization();
 
-    // 12. If navigationParams's request is non-null, then:
+    // 14. If navigationParams's request is non-null, then:
     if (navigation_params.request) {
         // 1. Set document's referrer to the empty string.
         document->m_referrer = String {};
@@ -547587,12 +548644,13 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
         }
     }
 
-    // FIXME: 13: If navigationParams's fetch controller is not null, then:
+    // FIXME: 15: If navigationParams's fetch controller is not null, then:
 
-    // FIXME: 14. Create the navigation timing entry for document, with navigationParams's response's timing info, redirectCount, navigationParams's navigation timing type, and
-    //            navigationParams's response's service worker timing info.
+    // FIXME: 16. Create the navigation timing entry for document, with navigationParams's response's timing info,
+    //        redirectCount, navigationParams's navigation timing type, and navigationParams's response's service
+    //        worker timing info.
 
-    // 15. If navigationParams's response has a `Refresh` header, then:
+    // 17. If navigationParams's response has a `Refresh` header, then:
     if (auto maybe_refresh = navigation_params.response->header_list()->get("Refresh"sv); maybe_refresh.has_value()) {
         // 1. Let value be the isomorphic decoding of the value of the header.
         auto value = TextCodec::isomorphic_decode(maybe_refresh.value());
@@ -547601,13 +548659,17 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
         document->shared_declarative_refresh_steps(value, nullptr);
     }
 
-    // FIXME: 16. If navigationParams's commit early hints is not null, then call navigationParams's commit early hints with document.
+    // FIXME: 18. If navigationParams's commit early hints is not null, then call navigationParams's commit early hints
+    //        with document.
 
-    // FIXME: 17. Process link headers given document, navigationParams's response, and "pre-media".
+    // FIXME: 19. Process link headers given document, navigationParams's response, and "pre-media".
 
-    // FIXME: 18. Potentially free deferred fetch quota for document.
+    // FIXME: 20. If navigationParams's navigable is a top-level traversable, then process the `Speculation-Rules`
+    //        header given document and navigationParams's response .
 
-    // 19. Return document.
+    // FIXME: 21. Potentially free deferred fetch quota for document.
+
+    // 22. Return document.
     return document;
 }
 
@@ -547876,6 +548938,7 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_style_invalidator);
     visitor.visit(m_deferred_parser_start);
     visitor.visit(m_custom_element_registry);
+    visitor.visit(m_ancestor_origins_list);
 }
 
 String const& Document::content_blocker_style_sheet()
@@ -551972,6 +553035,16 @@ void Document::unregister_document_observer(Badge<DocumentObserver>, DocumentObs
 {
     bool was_removed = m_document_observers.remove(document_observer);
     VERIFY(was_removed);
+}
+
+void Document::register_svg_use_element(Badge<SVG::SVGUseElement>, SVG::SVGUseElement& use_element)
+{
+    m_svg_use_elements.append(use_element);
+}
+
+void Document::unregister_svg_use_element(Badge<SVG::SVGUseElement>, SVG::SVGUseElement& use_element)
+{
+    m_svg_use_elements.remove(use_element);
 }
 
 void Document::increment_number_of_things_delaying_the_load_event(Badge<DocumentLoadEventDelayer>)
@@ -556400,6 +557473,87 @@ void Document::ensure_cookie_version_index(URL::URL const& new_url, URL::URL con
     m_cookie_version_index = {};
 }
 
+// https://html.spec.whatwg.org/multipage/dom.html#internal-ancestor-origin-objects-list-creation-steps
+Vector<URL::Origin> Document::internal_ancestor_origin_objects_list_creation_steps(ReferrerPolicy::ReferrerPolicy referrer_policy) const
+{
+    // 1. Let output be « ».
+    Vector<URL::Origin> output;
+
+    // 2. Let parentDoc be document's container document.
+    auto parent_doc = container_document();
+
+    // 3. If parentDoc is null, then return output.
+    if (!parent_doc)
+        return output;
+
+    // 4. Assert: parentDoc is fully active.
+    VERIFY(parent_doc->is_fully_active());
+
+    // 5. Let ancestorOrigins be parentDoc's internal ancestor origin objects list.
+    auto ancestor_origins = parent_doc->internal_ancestor_origin_objects_list();
+
+    // 6. Let container be document's node navigable's container.
+    // AD-HOC: This isn't used, see https://github.com/whatwg/html/issues/12566
+    // auto container = navigable()->container();
+
+    // 7. Let masked be false.
+    auto masked = false;
+
+    // 8. If referrerPolicy is "no-referrer", then set masked to true.
+    if (referrer_policy == ReferrerPolicy::ReferrerPolicy::NoReferrer)
+        masked = true;
+
+    // 9. Otherwise, if referrerPolicy is "same-origin" and parentDoc's origin is not same origin with document's origin, then set masked to true.
+    else if (referrer_policy == ReferrerPolicy::ReferrerPolicy::SameOrigin && parent_doc->origin().is_same_origin(origin()))
+        masked = true;
+
+    // 10. If masked is true, then append a new opaque origin to output.
+    if (masked)
+        output.append(URL::Origin::create_opaque());
+
+    // 11. Otherwise, append parentDoc's origin to output.
+    else
+        output.append(parent_doc->origin());
+
+    // 12. For each ancestorOrigin of ancestorOrigins:
+    for (auto const& ancestor_origin : ancestor_origins.value()) {
+        // 1. If masked is true and ancestorOrigin is same origin with parentDoc's origin, then append a new opaque origin to output and continue.
+        if (masked && ancestor_origin.is_same_origin(parent_doc->origin())) {
+            output.append(URL::Origin::create_opaque());
+            continue;
+        }
+
+        // 2. Append ancestorOrigin to output and set masked to false.
+        output.append(ancestor_origin);
+        masked = false;
+    }
+
+    // 13. Return output.
+    return output;
+}
+
+// https://html.spec.whatwg.org/multipage/dom.html#ancestor-origins-list-creation-steps
+GC::Ref<HTML::DOMStringList> Document::ancestor_origins_list_creation_steps() const
+{
+    // 1. Let ancestorOrigins be document's internal ancestor origin objects list.
+    auto& ancestor_origins = m_internal_ancestor_origin_objects_list;
+
+    // 2. Assert: ancestorOrigins is not null.
+    VERIFY(ancestor_origins.has_value());
+
+    // 3. Let output be « ».
+    Vector<String> output;
+
+    // 4. For each origin of ancestorOrigins:
+    for (auto const& origin : ancestor_origins.value()) {
+        // 1. Append the serialization of origin to output.
+        output.append(origin.serialize());
+    }
+
+    // 5. Return a new DOMStringList object whose associated list is output.
+    return HTML::DOMStringList::create(realm(), move(output));
+}
+
 StringView to_string(SetNeedsLayoutReason reason)
 {
     switch (reason) {
@@ -556567,6 +557721,7 @@ FILE: Libraries/LibWeb/DOM/Document.h
 #include <LibWeb/Painting/GridInspectorOverlay.h>
 #include <LibWeb/Painting/HitTestResult.h>
 #include <LibWeb/ResizeObserver/ResizeObserver.h>
+#include <LibWeb/SVG/SVGUseElement.h>
 #include <LibWeb/TrustedTypes/InjectionSink.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
@@ -557174,6 +558329,10 @@ public:
     void register_document_observer(Badge<DocumentObserver>, DocumentObserver&);
     void unregister_document_observer(Badge<DocumentObserver>, DocumentObserver&);
 
+    void register_svg_use_element(Badge<SVG::SVGUseElement>, SVG::SVGUseElement&);
+    void unregister_svg_use_element(Badge<SVG::SVGUseElement>, SVG::SVGUseElement&);
+    SVG::SVGUseElement::DocumentUseElementList& svg_use_elements() { return m_svg_use_elements; }
+
     template<typename Callback>
     void for_each_node_iterator(Callback callback)
     {
@@ -557658,6 +558817,14 @@ public:
 
     void upgrade_particular_elements(GC::Ref<HTML::CustomElementRegistry>, GC::Ref<HTML::CustomElementDefinition>, String local_name, Optional<String> name = {});
 
+    Vector<URL::Origin> internal_ancestor_origin_objects_list_creation_steps(ReferrerPolicy::ReferrerPolicy) const;
+    Optional<Vector<URL::Origin>>& internal_ancestor_origin_objects_list() { return m_internal_ancestor_origin_objects_list; }
+    void set_internal_ancestor_origin_objects_list(Optional<Vector<URL::Origin>>&& list) { m_internal_ancestor_origin_objects_list = move(list); }
+
+    GC::Ref<HTML::DOMStringList> ancestor_origins_list_creation_steps() const;
+    GC::Ptr<HTML::DOMStringList> ancestor_origins_list() { return m_ancestor_origins_list; }
+    void set_ancestor_origins_list(GC::Ptr<HTML::DOMStringList> list) { m_ancestor_origins_list = move(list); }
+
 protected:
     virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Cell::Visitor&) override;
@@ -557887,6 +559054,11 @@ private:
     // It's responsibility of object that requires DocumentObserver to keep it alive.
     HashTable<GC::RawRef<DocumentObserver>> m_document_observers;
     Vector<GC::Ref<DocumentObserver>> m_document_observers_being_notified;
+
+    // Every SVG use element connected to this document's node tree, maintained by SVGUseElement on insertion and
+    // removal. This lets SVG elements notify interested use elements about mutations without traversing the entire
+    // document. Not visited: registered elements are connected and thus kept alive by the tree.
+    SVG::SVGUseElement::DocumentUseElementList m_svg_use_elements;
 
     // https://html.spec.whatwg.org/multipage/dom.html#is-initial-about:blank
     bool m_is_initial_about_blank { false };
@@ -558137,6 +559309,12 @@ private:
 
     // https://dom.spec.whatwg.org/#document-custom-element-registry
     GC::Ptr<HTML::CustomElementRegistry> m_custom_element_registry;
+
+    // https://html.spec.whatwg.org/multipage/dom.html#concept-document-internal-ancestor-origin-objects-list
+    Optional<Vector<URL::Origin>> m_internal_ancestor_origin_objects_list;
+
+    // https://html.spec.whatwg.org/multipage/dom.html#concept-document-ancestor-origins-list
+    GC::Ptr<HTML::DOMStringList> m_ancestor_origins_list;
 };
 
 template<>
@@ -559115,6 +560293,7 @@ GC::Ref<DOM::Document> create_document_for_inline_content(GC::Ptr<HTML::Navigabl
     //    reserved environment: null
     //    policy container: a new policy container
     //    final sandboxing flag set: an empty set
+    //    iframe element referrer policy: the empty string
     //    opener policy: coop
     //    FIXME: navigation timing type: navTimingType
     //    about base URL: null
@@ -559133,6 +560312,7 @@ GC::Ref<DOM::Document> create_document_for_inline_content(GC::Ptr<HTML::Navigabl
         move(origin),
         vm.heap().allocate<HTML::PolicyContainer>(vm.heap()),
         HTML::SandboxingFlagSet {},
+        ReferrerPolicy::ReferrerPolicy::EmptyString,
         move(coop),
         OptionalNone {},
         user_involvement);
@@ -576534,6 +577714,10 @@ GC::Ptr<Element> ParentNode::get_element_by_id(FlyString const& id) const
             auto const& shadow_root = static_cast<ShadowRoot const&>(*this);
             return shadow_root.element_by_id().get(id, shadow_root);
         }
+        // The document element's inclusive subtree contains every element in the document, so the document's cache
+        // gives the same answer as walking our subtree.
+        if (auto const& document = this->document(); document.document_element() == this)
+            return document.element_by_id().get(id, document);
     }
 
     GC::Ptr<Element> found_element;
@@ -616270,7 +617454,7 @@ void AudioTrack::set_enabled(bool enabled)
     // Whenever an audio track in an AudioTrackList that was disabled is enabled, and whenever one that was enabled
     // is disabled, the user agent must queue a media element task given the media element to fire an event named
     // change at the AudioTrackList object.
-    media_element().queue_a_media_element_task([audio_track_list = m_audio_track_list]() {
+    media_element().queue_a_media_element_task([audio_track_list = m_audio_track_list](HTMLMediaElement&) {
         audio_track_list->dispatch_event(DOM::Event::create(audio_track_list->realm(), HTML::EventNames::change));
     });
 
@@ -617958,7 +619142,17 @@ BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_browsi
     // custom element registry: A new CustomElementRegistry object.
     document->set_custom_element_registry(realm.create<CustomElementRegistry>(realm));
 
-    // 16. If creator is non-null, then:
+    // 16. Let iframeReferrerPolicy be the result of determining the iframe element referrer policy given embedder.
+    auto iframe_referrer_policy = determine_iframe_element_referrer_policy(embedder);
+
+    // 17. Set document's internal ancestor origin objects list to the result of running the internal ancestor origin
+    //     objects list creation steps given document and iframeReferrerPolicy.
+    document->set_internal_ancestor_origin_objects_list(document->internal_ancestor_origin_objects_list_creation_steps(iframe_referrer_policy));
+
+    // 18. Set document's ancestor origins list to the result of running the ancestor origins list creation steps given document.
+    document->set_ancestor_origins_list(document->ancestor_origins_list_creation_steps());
+
+    // 19. If creator is non-null:
     if (creator) {
         // 1. Set document's referrer to the serialization of creator's URL.
         document->set_referrer(creator->url().serialize());
@@ -617975,25 +619169,25 @@ BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_browsi
         }
     }
 
-    // 17. Assert: document's URL and document's relevant settings object's creation URL are about:blank.
+    // 20. Assert: document's URL and document's relevant settings object's creation URL are about:blank.
     VERIFY(document->url() == URL::about_blank());
     VERIFY(document->relevant_settings_object().creation_url == URL::about_blank());
 
-    // 18. Mark document as ready for post-load tasks.
+    // 21. Mark document as ready for post-load tasks.
     document->set_ready_for_post_load_tasks(true);
 
-    // 19. Populate with html/head/body given document.
+    // 22. Populate with html/head/body given document.
     populate_with_html_head_body(*document);
     if (!embedder)
         document->set_supported_color_schemes({ "light"_string, "dark"_string });
 
-    // 20. Make active document.
+    // 23. Make active document.
     document->make_active();
 
-    // 21. Completely finish loading document.
+    // 24. Completely finish loading document.
     document->completely_finish_loading();
 
-    // 22. Return browsingContext and document.
+    // 25. Return browsingContext and document.
     return BrowsingContext::BrowsingContextAndDocument { browsing_context, document };
 }
 
@@ -645707,6 +646901,19 @@ WebIDL::ExceptionOr<void> HTMLIFrameElement::set_srcdoc(TrustedTypes::TrustedHTM
     return {};
 }
 
+// https://html.spec.whatwg.org/multipage/browsers.html#determining-the-iframe-element-referrer-policy
+ReferrerPolicy::ReferrerPolicy determine_iframe_element_referrer_policy(GC::Ptr<DOM::Element> embedder)
+{
+    // 1. If embedder is an iframe element, then return embedder's referrerpolicy attribute's state's corresponding
+    //    keyword.
+    if (auto* iframe = as_if<HTMLIFrameElement>(embedder.ptr())) {
+        return ReferrerPolicy::from_string(iframe->get_attribute_value(HTML::AttributeNames::referrerpolicy)).value_or(ReferrerPolicy::ReferrerPolicy::EmptyString);
+    }
+
+    // 2. Return the empty string.
+    return ReferrerPolicy::ReferrerPolicy::EmptyString;
+}
+
 }
 
 FILE: Libraries/LibWeb/HTML/HTMLIFrameElement.h
@@ -645799,6 +647006,8 @@ private:
 };
 
 void run_iframe_load_event_steps(HTML::HTMLIFrameElement&);
+
+ReferrerPolicy::ReferrerPolicy determine_iframe_element_referrer_policy(GC::Ptr<DOM::Element> embedder);
 
 }
 
@@ -647942,952 +649151,4 @@ FileFilter HTMLInputElement::parse_accept_attribute() const
         //     Indicates that image files are accepted.
         else if (value.equals_ignoring_ascii_case("image/*"sv))
             filter.add_filter(FileFilter::FileType::Image);
-
-        // A valid MIME type string with no parameters
-        //     Indicates that files of the specified type are accepted.
-        else if (auto mime_type = MimeSniff::MimeType::parse(value); mime_type.has_value() && mime_type->parameters().is_empty())
-            filter.add_filter(FileFilter::MimeType { mime_type->essence() });
-
-        // A string whose first character is a U+002E FULL STOP character (.)
-        //     Indicates that files with the specified file extension are accepted.
-        else if (value.starts_with('.'))
-            filter.add_filter(FileFilter::Extension { MUST(String::from_utf8(value.substring_view(1))) });
-    });
-
-    return filter;
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#update-the-file-selection
-void HTMLInputElement::update_the_file_selection(GC::Ref<FileAPI::FileList> files)
-{
-    // 1. Queue an element task on the user interaction task source given element and the following steps:
-    queue_an_element_task(Task::Source::UserInteraction, [this, files] {
-        // 1. Update element's selected files so that it represents the user's selection.
-        this->set_files(files.ptr());
-
-        // 2. Fire an event named input at the input element, with the bubbles and composed attributes initialized to true.
-        auto input_event = DOM::Event::create(this->realm(), EventNames::input, { .bubbles = true, .composed = true });
-        this->dispatch_event(input_event);
-
-        // 3. Fire an event named change at the input element, with the bubbles attribute initialized to true.
-        auto change_event = DOM::Event::create(this->realm(), EventNames::change, { .bubbles = true });
-        this->dispatch_event(change_event);
-    });
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#show-the-picker,-if-applicable
-static void show_the_picker_if_applicable(HTMLInputElement& element)
-{
-    // To show the picker, if applicable for an input element element:
-
-    // 1. If element's relevant global object does not have transient activation, then return.
-    auto& global_object = relevant_global_object(element);
-    if (!is<HTML::Window>(global_object))
-        return;
-    auto& relevant_global_object = static_cast<HTML::Window&>(global_object);
-    if (!relevant_global_object.has_transient_activation())
-        return;
-
-    // 2. If element is not mutable, then return.
-    if (!element.is_mutable())
-        return;
-
-    // 3. Consume user activation given element's relevant global object.
-    relevant_global_object.consume_user_activation();
-
-    // 4. If element does not support a picker, then return.
-    if (!element.supports_a_picker())
-        return;
-
-    // 5. If element is an input element and element's type attribute is in the File Upload state, then run these steps in parallel:
-    if (element.type_state() == HTMLInputElement::TypeAttributeState::FileUpload) {
-        // NOTE: These steps cannot be fully implemented here, and must be done in the PageClient when the response comes back from the PageHost
-        //       See: ViewImplementation::on_request_file_picker, Page::did_request_file_picker(), Page::file_picker_closed()
-
-        // 1. Optionally, wait until any prior execution of this algorithm has terminated.
-        // FIXME: 2. Let dismissed be the result of WebDriver BiDi file dialog opened with element.
-        bool dismissed = false;
-        // 3. If dismissed is false:
-        if (!dismissed) {
-            // 1. Display a prompt to the user requesting that the user specify some files.
-            //    If the multiple attribute is not set on element, there must be no more than one file selected;
-            //    otherwise, any number may be selected.
-            //    Files can be from the filesystem or created on the fly, e.g., a picture taken from a camera connected
-            //    to the user's device.
-            // 2. Wait for the user to have made their selection.
-            auto accepted_file_types = element.parse_accept_attribute();
-            auto allow_multiple_files = element.has_attribute(HTML::AttributeNames::multiple) ? AllowMultipleFiles::Yes : AllowMultipleFiles::No;
-            auto weak_element = GC::Weak<HTMLInputElement> { element };
-
-            element.set_is_open(true);
-            element.document().browsing_context()->top_level_browsing_context()->page().did_request_file_picker(weak_element, accepted_file_types, allow_multiple_files);
-        }
-        // 4. If dismissed is true or if the user dismissed the prompt without changing their selection,
-        //    then queue an element task on the user interaction task source given element to fire an event named cancel at element,
-        //    with the bubbles attribute initialized to true.
-        else {
-            // FIXME: Handle the "dismissed is true" case here.
-        }
-        // 5. Otherwise, update the file selection for element.
-    }
-
-    // 6. Otherwise, the user agent should show the relevant user interface for selecting a value for element, in the
-    //    way it normally would when the user interacts with the control.
-    //    When showing such a user interface, it must respect the requirements stated in the relevant parts of the
-    //    specification for how element behaves given its type attribute state. (For example, various sections describe
-    //    restrictions on the resulting value string.)
-    //    This step can have side effects, such as closing other pickers that were previously shown by this algorithm.
-    //    (If this closes a file selection picker, then per the above that will lead to firing either input and change
-    //    events, or a cancel event.)
-    else {
-        if (element.type_state() == HTMLInputElement::TypeAttributeState::Color) {
-            auto weak_element = GC::Weak<HTMLInputElement> { element };
-            element.set_is_open(true);
-            element.document().browsing_context()->top_level_browsing_context()->page().did_request_color_picker(weak_element, Color::from_utf16_string(element.value()).value_or(Color(0, 0, 0)));
-        }
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#dom-input-showpicker
-WebIDL::ExceptionOr<void> HTMLInputElement::show_picker()
-{
-    // The showPicker() method steps are:
-
-    // 1. If this is not mutable, then throw an "InvalidStateError" DOMException.
-    if (!is_mutable())
-        return WebIDL::InvalidStateError::create(realm(), "Element is not mutable"_utf16);
-
-    // 2. If this's relevant settings object's origin is not same origin with this's relevant settings object's top-level origin,
-    // and this's type attribute is not in the File Upload state or Color state, then throw a "SecurityError" DOMException.
-    // NOTE: File and Color inputs are exempted from this check for historical reason: their input activation behavior also shows their pickers,
-    //       and has never been guarded by an origin check.
-    if (!relevant_settings_object(*this).origin().is_same_origin(relevant_settings_object(*this).top_level_origin.value())
-        && m_type != TypeAttributeState::FileUpload && m_type != TypeAttributeState::Color) {
-        return WebIDL::SecurityError::create(realm(), "Cross origin pickers are not allowed"_utf16);
-    }
-
-    // 3. If this's relevant global object does not have transient activation, then throw a "NotAllowedError" DOMException.
-    // FIXME: The global object we get here should probably not need casted to Window to check for transient activation
-    auto& global_object = relevant_global_object(*this);
-    if (!is<HTML::Window>(global_object) || !static_cast<HTML::Window&>(global_object).has_transient_activation()) {
-        return WebIDL::NotAllowedError::create(realm(), "Too long since user activation to show picker"_utf16);
-    }
-
-    // 4. Show the picker, if applicable, for this.
-    show_the_picker_if_applicable(*this);
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#input-activation-behavior
-WebIDL::ExceptionOr<void> HTMLInputElement::run_input_activation_behavior(DOM::Event const& event)
-{
-    if (type_state() == TypeAttributeState::Checkbox || type_state() == TypeAttributeState::RadioButton) {
-        // 1. If the element is not connected, then return.
-        if (!is_connected())
-            return {};
-
-        // 2. Fire an event named input at the element with the bubbles and composed attributes initialized to true.
-        auto input_event = DOM::Event::create(realm(), HTML::EventNames::input);
-        input_event->set_bubbles(true);
-        input_event->set_composed(true);
-        dispatch_event(input_event);
-
-        // 3. Fire an event named change at the element with the bubbles attribute initialized to true.
-        auto change_event = DOM::Event::create(realm(), HTML::EventNames::change);
-        change_event->set_bubbles(true);
-        dispatch_event(*change_event);
-    }
-    // https://html.spec.whatwg.org/multipage/input.html#submit-button-state-(type=submit)
-    else if (type_state() == TypeAttributeState::SubmitButton) {
-        GC::Ptr<HTMLFormElement> form;
-
-        // The input element represents a button that, when activated, submits the form.
-        if (is_actually_disabled())
-            return {};
-
-        // 1. If the element does not have a form owner, then return.
-        if (!(form = this->form()))
-            return {};
-
-        // 2. If the element's node document is not fully active, then return.
-        if (!document().is_fully_active())
-            return {};
-
-        // 3. Submit the element's form owner from the element with userInvolvement set to event's user navigation involvement.
-        TRY(form->submit_form(*this, { .user_involvement = user_navigation_involvement(event) }));
-    } else if (type_state() == TypeAttributeState::FileUpload || type_state() == TypeAttributeState::Color) {
-        show_the_picker_if_applicable(*this);
-    }
-    // https://html.spec.whatwg.org/multipage/input.html#image-button-state-(type=image):input-activation-behavior
-    else if (type_state() == TypeAttributeState::ImageButton) {
-        // 1. If the element does not have a form owner, then return.
-        auto* form = this->form();
-        if (!form)
-            return {};
-
-        // 2. If the element's node document is not fully active, then return.
-        if (!document().is_fully_active())
-            return {};
-
-        // 3. If the user activated the control while explicitly selecting a coordinate, then set the element's selected
-        //    coordinate to that coordinate.
-        if (auto* mouse_event = as_if<UIEvents::MouseEvent>(event); mouse_event && event.is_trusted()) {
-            CSSPixels x { mouse_event->offset_x() };
-            CSSPixels y { mouse_event->offset_y() };
-
-            m_selected_coordinate = { x.to_int(), y.to_int() };
-        }
-
-        // 4. Submit the element's form owner from the element with userInvolvement set to event's user navigation involvement.
-        TRY(form->submit_form(*this, { .user_involvement = user_navigation_involvement(event) }));
-    }
-    // https://html.spec.whatwg.org/multipage/input.html#reset-button-state-(type=reset)
-    else if (type_state() == TypeAttributeState::ResetButton) {
-        // The input element represents a button that, when activated, resets the form.
-        if (is_actually_disabled())
-            return {};
-
-        // 1. If the element does not have a form owner, then return.
-        auto* form = this->form();
-        if (!form)
-            return {};
-
-        // 2. If the element's node document is not fully active, then return.
-        if (!document().is_fully_active())
-            return {};
-
-        // 3. Reset the form owner from the element.
-        form->reset_form();
-    }
-
-    return {};
-}
-
-void HTMLInputElement::did_edit_text_node(FlyString const& input_type, Optional<Utf16String> const& data)
-{
-    m_dirty_value = true;
-    m_has_uncommitted_changes = true;
-
-    CSS::Invalidation::invalidate_style_after_validity_change(*this);
-
-    user_interaction_did_change_input_value(input_type, data);
-}
-
-void HTMLInputElement::did_pick_color(Optional<Color> picked_color, ColorPickerUpdateState state)
-{
-    if (type_state() == TypeAttributeState::Color && picked_color.has_value()) {
-        // then when the user changes the element's value
-        m_value = value_sanitization_algorithm(picked_color->to_utf16_string_without_alpha());
-        m_dirty_value = true;
-
-        update_color_well_element();
-
-        // the user agent must queue an element task on the user interaction task source
-        user_interaction_did_change_input_value();
-
-        if (state == ColorPickerUpdateState::Closed) {
-            set_is_open(false);
-
-            // https://html.spec.whatwg.org/multipage/input.html#common-input-element-events
-            // [...] any time the user commits the change, the user agent must queue an element task on the user interaction task source given the input element to
-            queue_an_element_task(HTML::Task::Source::UserInteraction, [this] {
-                // set its user validity to true
-                m_user_validity = true;
-
-                // AD-HOC: Setting the user validity changes which of the :user-valid and :user-invalid pseudo-classes match.
-                CSS::Invalidation::invalidate_style_after_validity_change(*this);
-
-                // and fire an event named change at the input element, with the bubbles attribute initialized to true.
-                auto change_event = DOM::Event::create(realm(), HTML::EventNames::change);
-                change_event->set_bubbles(true);
-                dispatch_event(*change_event);
-            });
-        }
-    }
-}
-
-void HTMLInputElement::did_select_files(Span<SelectedFile> selected_files, MultipleHandling multiple_handling)
-{
-    set_is_open(false);
-
-    // https://html.spec.whatwg.org/multipage/input.html#show-the-picker,-if-applicable
-    // 4. If the user dismissed the prompt without changing their selection, then queue an element task on the user
-    //    interaction task source given element to fire an event named cancel at element, with the bubbles attribute
-    //    initialized to true.
-    if (selected_files.is_empty()) {
-        queue_an_element_task(HTML::Task::Source::UserInteraction, [this]() {
-            dispatch_event(DOM::Event::create(realm(), HTML::EventNames::cancel, { .bubbles = true }));
-        });
-
-        return;
-    }
-
-    auto files = FileAPI::FileList::create(realm());
-
-    for (auto& selected_file : selected_files) {
-        auto contents = selected_file.take_contents();
-
-        auto mime_type = MimeSniff::Resource::sniff(contents);
-        auto blob = FileAPI::Blob::create(realm(), move(contents), mime_type.essence());
-
-        // FIXME: The FileAPI should use ByteString for file names.
-        auto file_name = MUST(String::from_byte_string(selected_file.name()));
-
-        // FIXME: Fill in other fields (e.g. last_modified).
-        Bindings::FilePropertyBag options {};
-        options.type = mime_type.essence();
-
-        auto file = MUST(FileAPI::File::create(realm(), { { blob } }, file_name, move(options)));
-        files->add_file(file);
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#update-the-file-selection
-    // 1. Queue an element task on the user interaction task source given element and the following steps:
-    queue_an_element_task(HTML::Task::Source::UserInteraction, [this, files, multiple_handling]() mutable {
-        auto multiple = has_attribute(HTML::AttributeNames::multiple);
-
-        // 1. Update element's selected files so that it represents the user's selection.
-        if (m_selected_files && multiple && multiple_handling == MultipleHandling::Append) {
-            for (size_t i = 0; i < files->length(); ++i)
-                m_selected_files->add_file(*files->item(i));
-        } else {
-            m_selected_files = files;
-        }
-
-        update_file_input_shadow_tree();
-
-        // 2. Fire an event named input at the input element, with the bubbles and composed attributes initialized to true.
-        dispatch_event(DOM::Event::create(realm(), HTML::EventNames::input, { .bubbles = true, .composed = true }));
-
-        // 3. Fire an event named change at the input element, with the bubbles attribute initialized to true.
-        dispatch_event(DOM::Event::create(realm(), HTML::EventNames::change, { .bubbles = true }));
-    });
-}
-
-Utf16String HTMLInputElement::value() const
-{
-    switch (value_attribute_mode()) {
-    // https://html.spec.whatwg.org/multipage/input.html#dom-input-value-value
-    case ValueAttributeMode::Value:
-        // Return the current value of the element.
-        return m_value;
-
-    // https://html.spec.whatwg.org/multipage/input.html#dom-input-value-default
-    case ValueAttributeMode::Default:
-        // On getting, if the element has a value content attribute, return that attribute's value; otherwise, return
-        // the empty string.
-        return Utf16String::from_utf8(get_attribute_value(AttributeNames::value));
-
-    // https://html.spec.whatwg.org/multipage/input.html#dom-input-value-default-on
-    case ValueAttributeMode::DefaultOn:
-        // On getting, if the element has a value content attribute, return that attribute's value; otherwise, return
-        // the string "on".
-        if (auto value = get_attribute(AttributeNames::value); value.has_value())
-            return Utf16String::from_utf8(*value);
-        return "on"_utf16;
-
-    // https://html.spec.whatwg.org/multipage/input.html#dom-input-value-filename
-    case ValueAttributeMode::Filename:
-        // On getting, return the string "C:\fakepath\" followed by the name of the first file in the list of selected
-        // files, if any, or the empty string if the list is empty.
-        if (m_selected_files && m_selected_files->item(0))
-            return Utf16String::formatted("C:\\fakepath\\{}", m_selected_files->item(0)->name());
-        return {};
-    }
-
-    VERIFY_NOT_REACHED();
-}
-
-Optional<String> HTMLInputElement::optional_value() const
-{
-    switch (m_type) {
-    // https://html.spec.whatwg.org/multipage/input.html#submit-button-state-(type=submit):concept-fe-optional-value
-    case TypeAttributeState::SubmitButton:
-        // The element's optional value is the value of the element's value attribute, if there is one; otherwise null.
-        return get_attribute(AttributeNames::value);
-    default:
-        VERIFY_NOT_REACHED();
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-textarea/input-relevant-value
-Utf16String HTMLInputElement::relevant_value() const
-{
-    // AD-HOC: If a text node is present, use that as the raw text buffer, so that it can differ from the sanitized
-    //         or canonicalized value.
-    if (m_text_node)
-        return m_text_node->data();
-    return value();
-}
-
-WebIDL::ExceptionOr<void> HTMLInputElement::set_relevant_value(Utf16String const& value)
-{
-    if (m_text_node)
-        m_text_node->set_data(value);
-
-    // https://html.spec.whatwg.org/multipage/input.html#number-state-(type=number)
-    // If the user agent provides a user interface for selecting a number, then the value must be set to the best
-    // representation of the number representing the user's selection as a floating-point number.
-    if (type_state() == TypeAttributeState::Number) {
-        m_value = {};
-        if (auto parsed = parse_floating_point_number(value); parsed.has_value() && isfinite(*parsed))
-            m_value = convert_number_to_string(*parsed);
-    } else {
-        m_value = value_sanitization_algorithm(value);
-    }
-
-    update_placeholder_visibility();
-    return {};
-}
-
-WebIDL::ExceptionOr<void> HTMLInputElement::set_value(Utf16String const& value)
-{
-    auto& realm = this->realm();
-
-    switch (value_attribute_mode()) {
-    // https://html.spec.whatwg.org/multipage/input.html#dom-input-value-value
-    case ValueAttributeMode::Value: {
-        // 1. Let oldValue be the element's value.
-        auto old_value = move(m_value);
-
-        // 2. Set the element's value to the new value.
-        // NOTE: For the TextNode this is done as part of step 4 below.
-
-        // 3. Set the element's dirty value flag to true.
-        m_dirty_value = true;
-
-        // 4. Invoke the value sanitization algorithm, if the element's type attribute's current state defines one.
-        m_value = value_sanitization_algorithm(value);
-
-        // 5. If the element's value (after applying the value sanitization algorithm) is different from oldValue,
-        //    and the element has a text entry cursor position, move the text entry cursor position to the end of the
-        //    text control, unselecting any selected text and resetting the selection direction to "none".
-        if (m_value != old_value) {
-            relevant_value_was_changed();
-
-            // AD-HOC: Changing the value may change which validity pseudo-classes match.
-            CSS::Invalidation::invalidate_style_after_validity_change(*this);
-
-            if (m_text_node) {
-                m_text_node->set_data(m_value);
-                update_placeholder_visibility();
-
-                set_the_selection_range(m_text_node->length(), m_text_node->length());
-            }
-
-            update_shadow_tree();
-        }
-
-        break;
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#dom-input-value-default
-    // https://html.spec.whatwg.org/multipage/input.html#dom-input-value-default-on
-    case ValueAttributeMode::Default:
-    case ValueAttributeMode::DefaultOn:
-        // On setting, set the value of the element's value content attribute to the new value.
-        set_attribute_value(HTML::AttributeNames::value, value.to_utf8_but_should_be_ported_to_utf16());
-        break;
-
-    // https://html.spec.whatwg.org/multipage/input.html#dom-input-value-filename
-    case ValueAttributeMode::Filename:
-        // On setting, if the new value is the empty string, empty the list of selected files; otherwise, throw an "InvalidStateError" DOMException.
-        if (!value.is_empty())
-            return WebIDL::InvalidStateError::create(realm, "Setting value of input type file to non-empty string"_utf16);
-
-        m_selected_files = nullptr;
-        break;
-    }
-
-    return {};
-}
-
-void HTMLInputElement::commit_pending_changes()
-{
-    // The change event fires when the value is committed, if that makes sense for the control,
-    // or else when the control loses focus
-    switch (type_state()) {
-    case TypeAttributeState::Email:
-    case TypeAttributeState::Password:
-    case TypeAttributeState::Search:
-    case TypeAttributeState::Telephone:
-    case TypeAttributeState::Text:
-    case TypeAttributeState::URL:
-    case TypeAttributeState::Checkbox:
-    case TypeAttributeState::RadioButton:
-        if (!m_has_uncommitted_changes)
-            return;
-        break;
-
-    default:
-        break;
-    }
-
-    m_has_uncommitted_changes = false;
-
-    auto change_event = DOM::Event::create(realm(), HTML::EventNames::change, { .bubbles = true });
-    dispatch_event(change_event);
-}
-
-// https://www.w3.org/TR/css-ui-4/#input-rules
-static GC::Ref<CSS::CSSStyleProperties> inner_text_style_when_visible()
-{
-    static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
-    if (!style) {
-        style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
-        style->set_declarations_from_text(R"~~~(
-                width: 100%;
-                height: 1lh;
-                align-items: center;
-                overflow: auto;
-                scrollbar-width: none;
-                text-overflow: clip;
-                white-space: nowrap;
-            )~~~"sv);
-    }
-    return *style;
-}
-
-static GC::Ref<CSS::CSSStyleProperties> inner_text_style_when_hidden()
-{
-    static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
-    if (!style) {
-        style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
-        style->set_declarations_from_text(R"~~~(
-                width: 0;
-                display: inline;
-            )~~~"sv);
-    }
-    return *style;
-}
-
-static GC::Ref<CSS::CSSStyleProperties> stepper_button_style_when_visible()
-{
-    static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
-    if (!style) {
-        style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
-        style->set_declarations_from_text(R"~~~(
-                padding: 0;
-                cursor: default;
-            )~~~"sv);
-    }
-    return *style;
-}
-
-static GC::Ref<CSS::CSSStyleProperties> stepper_button_style_when_hidden()
-{
-    static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
-    if (!style) {
-        style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
-        style->set_declarations_from_text(R"~~~(
-                display: none;
-            )~~~"sv);
-    }
-    return *style;
-}
-
-static GC::Ref<CSS::CSSStyleProperties> placeholder_style_when_visible()
-{
-    static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
-    if (!style) {
-        style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
-        style->set_declarations_from_text(R"~~~(
-                width: 100%;
-                height: 1lh;
-                align-items: center;
-                overflow: hidden;
-                scrollbar-width: none;
-                text-overflow: clip;
-                white-space: nowrap;
-            )~~~"sv);
-    }
-    return *style;
-}
-
-static GC::Ref<CSS::CSSStyleProperties> placeholder_style_when_hidden()
-{
-    static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
-    if (!style) {
-        style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
-        style->set_declarations_from_text("display: none;"sv);
-    }
-    return *style;
-}
-
-void HTMLInputElement::update_placeholder_visibility()
-{
-    if (!m_placeholder_element)
-        return;
-    if (this->placeholder_value().has_value()) {
-        m_inner_text_element->set_inline_style(inner_text_style_when_hidden());
-        m_placeholder_element->set_inline_style(placeholder_style_when_visible());
-    } else {
-        m_inner_text_element->set_inline_style(inner_text_style_when_visible());
-        m_placeholder_element->set_inline_style(placeholder_style_when_hidden());
-    }
-}
-
-Utf16String HTMLInputElement::button_label() const
-{
-    auto label = get_attribute(HTML::AttributeNames::value).map([](auto const& label) { return Utf16String::from_utf8(label); });
-
-    if (!label.has_value()) {
-        if (type_state() == TypeAttributeState::ResetButton) {
-            // https://html.spec.whatwg.org/multipage/input.html#reset-button-state-(type=reset)
-            // If the element has a value attribute, the button's label must be the value of that attribute;
-            // otherwise, it must be an implementation-defined string that means "Reset" or some such.
-            label = "Reset"_utf16;
-        } else if (type_state() == TypeAttributeState::SubmitButton) {
-            // https://html.spec.whatwg.org/multipage/input.html#submit-button-state-(type=submit)
-            // If the element has a value attribute, the button's label must be the value of that attribute;
-            // otherwise, it must be an implementation-defined string that means "Submit" or some such.
-            label = "Submit"_utf16;
-        } else {
-            // https://html.spec.whatwg.org/multipage/input.html#button-state-(type=button)
-            // If the element has a value attribute, the button's label must be the value of that attribute;
-            // otherwise, it must be the empty string.
-            label = value();
-        }
-    }
-
-    return label.release_value();
-}
-
-void HTMLInputElement::update_button_input_shadow_tree()
-{
-    if (m_text_node) {
-        m_text_node->set_data(button_label());
-        update_placeholder_visibility();
-    }
-}
-
-void HTMLInputElement::update_text_input_shadow_tree()
-{
-    update_placeholder_visibility();
-
-    if (m_type == TypeAttributeState::Number) {
-        // The `textfield` appearance is used to hide the stepper buttons.
-        if (auto style = computed_properties(); style && style->appearance() == CSS::Appearance::Textfield) {
-            m_up_button_element->set_inline_style(stepper_button_style_when_hidden());
-            m_down_button_element->set_inline_style(stepper_button_style_when_hidden());
-        } else {
-            m_up_button_element->set_inline_style(stepper_button_style_when_visible());
-            m_down_button_element->set_inline_style(stepper_button_style_when_visible());
-        }
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-input-element:attr-input-readonly-3
-bool HTMLInputElement::is_allowed_to_be_readonly() const
-{
-    switch (m_type) {
-    case HTML::HTMLInputElement::TypeAttributeState::Text:
-    case HTML::HTMLInputElement::TypeAttributeState::Search:
-    case HTML::HTMLInputElement::TypeAttributeState::Telephone:
-    case HTML::HTMLInputElement::TypeAttributeState::URL:
-    case HTML::HTMLInputElement::TypeAttributeState::Email:
-    case HTML::HTMLInputElement::TypeAttributeState::Password:
-    case HTML::HTMLInputElement::TypeAttributeState::Date:
-    case HTML::HTMLInputElement::TypeAttributeState::Month:
-    case HTML::HTMLInputElement::TypeAttributeState::Week:
-    case HTML::HTMLInputElement::TypeAttributeState::Time:
-    case HTML::HTMLInputElement::TypeAttributeState::LocalDateAndTime:
-    case HTML::HTMLInputElement::TypeAttributeState::Number:
-        return true;
-    default:
-        return false;
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-input-element:attr-input-maxlength-3
-static bool is_applicable_for_maxlength_attribute(HTML::HTMLInputElement::TypeAttributeState state)
-{
-    switch (state) {
-    case HTML::HTMLInputElement::TypeAttributeState::Text:
-    case HTML::HTMLInputElement::TypeAttributeState::Search:
-    case HTML::HTMLInputElement::TypeAttributeState::Telephone:
-    case HTML::HTMLInputElement::TypeAttributeState::URL:
-    case HTML::HTMLInputElement::TypeAttributeState::Email:
-    case HTML::HTMLInputElement::TypeAttributeState::Password:
-        return true;
-    default:
-        return false;
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#attr-input-maxlength
-void HTMLInputElement::handle_maxlength_attribute()
-{
-    // The maxlength attribute, when it applies, is a form control maxlength attribute.
-    if (m_text_node && is_applicable_for_maxlength_attribute(type_state())) {
-        auto max_length = this->max_length();
-        if (max_length >= 0) {
-            m_text_node->set_max_length(max_length);
-        } else {
-            m_text_node->set_max_length({});
-        }
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-input-element:attr-input-placeholder-3
-static bool is_allowed_to_have_placeholder(HTML::HTMLInputElement::TypeAttributeState state)
-{
-    switch (state) {
-    case HTML::HTMLInputElement::TypeAttributeState::Text:
-    case HTML::HTMLInputElement::TypeAttributeState::Search:
-    case HTML::HTMLInputElement::TypeAttributeState::URL:
-    case HTML::HTMLInputElement::TypeAttributeState::Telephone:
-    case HTML::HTMLInputElement::TypeAttributeState::Email:
-    case HTML::HTMLInputElement::TypeAttributeState::Password:
-    case HTML::HTMLInputElement::TypeAttributeState::Number:
-        return true;
-    default:
-        return false;
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#attr-input-placeholder
-String HTMLInputElement::placeholder() const
-{
-    auto maybe_placeholder = get_attribute(HTML::AttributeNames::placeholder);
-    if (!maybe_placeholder.has_value())
-        return String {};
-    auto placeholder = *maybe_placeholder;
-
-    // The attribute, if specified, must have a value that contains no U+000A LINE FEED (LF) or U+000D CARRIAGE RETURN (CR) characters.
-    StringBuilder builder;
-    for (auto c : placeholder.bytes_as_string_view()) {
-        if (c != '\r' && c != '\n')
-            builder.append(c);
-    }
-    return MUST(builder.to_string());
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#attr-input-placeholder
-Optional<String> HTMLInputElement::placeholder_value() const
-{
-    if (!m_text_node || !m_text_node->data().is_empty())
-        return {};
-    if (!is_allowed_to_have_placeholder(type_state()))
-        return {};
-    if (!has_attribute(HTML::AttributeNames::placeholder))
-        return {};
-    return placeholder();
-}
-
-void HTMLInputElement::create_shadow_tree_if_needed()
-{
-    if (shadow_root())
-        return;
-
-    switch (type_state()) {
-    case TypeAttributeState::Hidden:
-    case TypeAttributeState::RadioButton:
-    case TypeAttributeState::Checkbox:
-        break;
-    case TypeAttributeState::Button:
-    case TypeAttributeState::SubmitButton:
-    case TypeAttributeState::ResetButton:
-        create_button_input_shadow_tree();
-        break;
-    case TypeAttributeState::ImageButton:
-        break;
-    case TypeAttributeState::Color:
-        create_color_input_shadow_tree();
-        break;
-    case TypeAttributeState::FileUpload:
-        create_file_input_shadow_tree();
-        break;
-    case TypeAttributeState::Range:
-        create_range_input_shadow_tree();
-        break;
-    // FIXME: This could be better factored. Everything except the above types becomes a text input.
-    default:
-        create_text_input_shadow_tree();
-        break;
-    }
-}
-
-void HTMLInputElement::update_shadow_tree()
-{
-    switch (type_state()) {
-    case TypeAttributeState::Color:
-        update_color_well_element();
-        break;
-    case TypeAttributeState::FileUpload:
-        update_file_input_shadow_tree();
-        break;
-    case TypeAttributeState::Range:
-        update_slider_shadow_tree_elements();
-        break;
-    case TypeAttributeState::Button:
-    case TypeAttributeState::ResetButton:
-    case TypeAttributeState::SubmitButton:
-        update_button_input_shadow_tree();
-        break;
-    default:
-        update_text_input_shadow_tree();
-        break;
-    }
-}
-
-void HTMLInputElement::create_button_input_shadow_tree()
-{
-    auto shadow_root = realm().create<DOM::ShadowRoot>(document(), *this, Bindings::ShadowRootMode::Closed);
-    shadow_root->set_user_agent_internal(true);
-    set_shadow_root(shadow_root);
-    auto text_container = MUST(DOM::create_element(document(), HTML::TagNames::span, Namespace::HTML));
-    text_container->set_attribute_value(HTML::AttributeNames::style, "display: inline-block; pointer-events: none;"_string);
-
-    m_text_node = realm().create<DOM::Text>(document(), button_label());
-    MUST(text_container->append_child(*m_text_node));
-    MUST(shadow_root->append_child(*text_container));
-}
-
-void HTMLInputElement::create_text_input_shadow_tree()
-{
-    auto shadow_root = realm().create<DOM::ShadowRoot>(document(), *this, Bindings::ShadowRootMode::Closed);
-    shadow_root->set_user_agent_internal(true);
-    set_shadow_root(shadow_root);
-
-    auto element = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
-    {
-        static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
-        if (!style) {
-            style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
-            style->set_declarations_from_text(R"~~~(
-                display: flex;
-                height: 100%;
-                align-items: center;
-                white-space: pre;
-                border: none;
-                padding: 1px 2px;
-            )~~~"sv);
-        }
-        element->set_inline_style(*style);
-    }
-    MUST(shadow_root->append_child(element));
-
-    // https://www.w3.org/TR/css-ui-4/#input-rules
-    m_inner_text_element = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
-    {
-        static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
-        if (!style) {
-            style = CSS::CSSStyleProperties::create(internal_css_realm(), {}, {});
-            style->set_declarations_from_text(R"~~~(
-                width: 100%;
-                height: 1lh;
-                align-items: center;
-                overflow: auto;
-                scrollbar-width: none;
-                text-overflow: clip;
-                white-space: nowrap;
-            )~~~"sv);
-        }
-        m_inner_text_element->set_inline_style(*style);
-    }
-    MUST(element->append_child(*m_inner_text_element));
-
-    m_text_node = realm().create<DOM::Text>(document(), m_value);
-    if (type_state() == TypeAttributeState::Password)
-        m_text_node->set_is_password_input({}, true);
-    handle_maxlength_attribute();
-    MUST(m_inner_text_element->append_child(*m_text_node));
-
-    m_placeholder_element = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
-    MUST(element->append_child(*m_placeholder_element));
-    m_placeholder_element->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::Placeholder);
-
-    m_placeholder_text_node = realm().create<DOM::Text>(document(), Utf16String::from_utf8(placeholder()));
-    MUST(m_placeholder_element->append_child(*m_placeholder_text_node));
-
-    if (type_state() == TypeAttributeState::Number) {
-        // Up button
-        m_up_button_element = MUST(DOM::create_element(document(), HTML::TagNames::button, Namespace::HTML));
-
-        auto up_button_svg = MUST(DOM::create_element(document(), SVG::TagNames::svg, Namespace::SVG));
-        up_button_svg->set_attribute_value(HTML::AttributeNames::style, "width: 1em; height: 1em;"_string);
-        up_button_svg->set_attribute_value(SVG::AttributeNames::xmlns, Namespace::SVG.to_string());
-        up_button_svg->set_attribute_value(SVG::AttributeNames::viewBox, "0 0 24 24"_string);
-        MUST(m_up_button_element->append_child(up_button_svg));
-
-        auto up_button_svg_path = MUST(DOM::create_element(document(), SVG::TagNames::path, Namespace::SVG));
-        up_button_svg_path->set_attribute_value(SVG::AttributeNames::fill, "currentColor"_string);
-        up_button_svg_path->set_attribute_value(SVG::AttributeNames::d, "M7.41,15.41L12,10.83L16.59,15.41L18,14L12,8L6,14L7.41,15.41Z"_string);
-        MUST(up_button_svg->append_child(up_button_svg_path));
-
-        MUST(element->append_child(*m_up_button_element));
-
-        auto mouseup_callback_function = JS::NativeFunction::create(
-            realm(), [this](JS::VM&) {
-                commit_pending_changes();
-                return JS::js_undefined();
-            },
-            0, Utf16FlyString {}, &realm());
-        auto mouseup_callback = realm().heap().allocate<WebIDL::CallbackType>(*mouseup_callback_function, realm());
-        Bindings::AddEventListenerOptions mouseup_listener_options;
-        mouseup_listener_options.once = true;
-
-        auto up_callback_function = JS::NativeFunction::create(
-            realm(), [this](JS::VM&) {
-                if (type_state() == TypeAttributeState::Number && is_mutable() && allowed_value_step().has_value()) {
-                    MUST(step_up());
-                    user_interaction_did_change_input_value();
-                }
-                return JS::js_undefined();
-            },
-            0, Utf16FlyString {}, &realm());
-        auto step_up_callback = realm().heap().allocate<WebIDL::CallbackType>(*up_callback_function, realm());
-        m_up_button_element->add_event_listener_without_options(UIEvents::EventNames::mousedown, DOM::IDLEventListener::create(realm(), step_up_callback));
-        m_up_button_element->add_event_listener_without_options(UIEvents::EventNames::mouseup, DOM::IDLEventListener::create(realm(), mouseup_callback));
-
-        // Down button
-        m_down_button_element = MUST(DOM::create_element(document(), HTML::TagNames::button, Namespace::HTML));
-
-        auto down_button_svg = MUST(DOM::create_element(document(), SVG::TagNames::svg, Namespace::SVG));
-        down_button_svg->set_attribute_value(HTML::AttributeNames::style, "width: 1em; height: 1em;"_string);
-        down_button_svg->set_attribute_value(SVG::AttributeNames::xmlns, Namespace::SVG.to_string());
-        down_button_svg->set_attribute_value(SVG::AttributeNames::viewBox, "0 0 24 24"_string);
-        MUST(m_down_button_element->append_child(down_button_svg));
-
-        auto down_button_svg_path = MUST(DOM::create_element(document(), SVG::TagNames::path, Namespace::SVG));
-        down_button_svg_path->set_attribute_value(SVG::AttributeNames::fill, "currentColor"_string);
-        down_button_svg_path->set_attribute_value(SVG::AttributeNames::d, "M7.41,8.58L12,13.17L16.59,8.58L18,10L12,16L6,10L7.41,8.58Z"_string);
-        MUST(down_button_svg->append_child(down_button_svg_path));
-
-        MUST(element->append_child(*m_down_button_element));
-
-        auto down_callback_function = JS::NativeFunction::create(
-            realm(), [this](JS::VM&) {
-                if (type_state() == TypeAttributeState::Number && is_mutable() && allowed_value_step().has_value()) {
-                    MUST(step_down());
-                    user_interaction_did_change_input_value();
-                }
-                return JS::js_undefined();
-            },
-            0, Utf16FlyString {}, &realm());
-        auto step_down_callback = realm().heap().allocate<WebIDL::CallbackType>(*down_callback_function, realm());
-        m_down_button_element->add_event_listener_without_options(UIEvents::EventNames::mousedown, DOM::IDLEventListener::create(realm(), step_down_callback));
-        m_down_button_element->add_event_listener_without_options(UIEvents::EventNames::mouseup, DOM::IDLEventListener::create(realm(), mouseup_callback));
-    }
-
-    update_text_input_shadow_tree();
-}
-
-void HTMLInputElement::create_color_input_shadow_tree()
-{
-    auto shadow_root = realm().create<DOM::ShadowRoot>(document(), *this, Bindings::ShadowRootMode::Closed);
-    shadow_root->set_user_agent_internal(true);
-    set_shadow_root(shadow_root);
-
-    auto color = value_sanitization_algorithm(m_value);
-
-    auto border = DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML).release_value_but_fixme_should_propagate_errors();
-    border->set_attribute_value(HTML::AttributeNames::style, R"~~~(
-        width: fit-content;
-        height: fit-content;
-        padding: 4px;
-        border: 1px solid ButtonBorder;
-        background-color: ButtonFace;
-)~~~"_string);
 
