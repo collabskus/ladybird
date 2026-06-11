@@ -85708,26 +85708,6 @@ static bool cookie_matches_requested_domain(HTTP::Cookie::Cookie const& cookie, 
     return cookie.domain == *domain;
 }
 
-static JsonObject cookie_operation_result(Optional<String> error_string)
-{
-    JsonObject response;
-    if (error_string.has_value())
-        response.set("errorString"sv, *error_string);
-    else
-        response.set("errorString"sv, JsonValue {});
-    return response;
-}
-
-static JsonObject cookie_operation_result(ErrorOr<void> result)
-{
-    JsonObject response;
-    if (result.is_error())
-        response.set("errorString"sv, result.error().string_literal());
-    else
-        response.set("errorString"sv, JsonValue {});
-    return response;
-}
-
 static String same_site_for_devtools(HTTP::Cookie::SameSite same_site)
 {
     if (same_site == HTTP::Cookie::SameSite::Default)
@@ -86047,7 +86027,7 @@ void CookiesActor::edit_item(Message const& message)
 
     auto new_value = string_from_devtools_value(*new_value_json);
     if (!new_value.has_value()) {
-        send_response(message, cookie_operation_result("Missing cookie value"_string));
+        send_response(message, to_storage_operation_result("Missing cookie value"_string));
         return;
     }
 
@@ -86104,7 +86084,7 @@ void CookiesActor::edit_item(Message const& message)
     }
 
     if (!old_cookie.has_value()) {
-        send_response(message, cookie_operation_result(Optional<String> {}));
+        send_response(message, to_storage_operation_result(Optional<String> {}));
         return;
     }
 
@@ -86120,32 +86100,32 @@ void CookiesActor::edit_item(Message const& message)
         edited_cookie.path = new_value.release_value();
     } else if (*field == "expires"sv) {
         if (auto error_string = set_cookie_expiry_from_devtools(edited_cookie, *new_value_json, new_value->bytes_as_string_view()); error_string.has_value()) {
-            send_response(message, cookie_operation_result(move(error_string)));
+            send_response(message, to_storage_operation_result(move(error_string)));
             return;
         }
     } else if (*field == "isSecure"sv) {
         auto value = bool_from_devtools_value(*new_value_json);
         if (!value.has_value()) {
-            send_response(message, cookie_operation_result("Cookie secure flag must be true or false"_string));
+            send_response(message, to_storage_operation_result("Cookie secure flag must be true or false"_string));
             return;
         }
         edited_cookie.secure = *value;
     } else if (*field == "isHttpOnly"sv) {
         auto value = bool_from_devtools_value(*new_value_json);
         if (!value.has_value()) {
-            send_response(message, cookie_operation_result("Cookie HTTP-only flag must be true or false"_string));
+            send_response(message, to_storage_operation_result("Cookie HTTP-only flag must be true or false"_string));
             return;
         }
         edited_cookie.http_only = *value;
     } else if (*field == "sameSite"sv) {
         edited_cookie.same_site = HTTP::Cookie::same_site_from_string(new_value->bytes_as_string_view());
     } else {
-        send_response(message, cookie_operation_result(Optional<String> {}));
+        send_response(message, to_storage_operation_result(Optional<String> {}));
         return;
     }
 
     auto result = devtools().delegate().set_cookie(tab->description(), old_cookie, move(edited_cookie));
-    send_response(message, cookie_operation_result(move(result)));
+    send_response(message, to_storage_operation_result(move(result)));
 }
 
 void CookiesActor::add_item(Message const& message)
@@ -86157,14 +86137,14 @@ void CookiesActor::add_item(Message const& message)
     auto storage_host = message.data.get_string("host"sv)
                             .value_or_lazy_evaluated_optional([this] { return host(); });
     if (!storage_host.has_value()) {
-        send_response(message, cookie_operation_result("No storage host is available for this page"_string));
+        send_response(message, to_storage_operation_result("No storage host is available for this page"_string));
         return;
     }
 
     auto storage_url = URL::Parser::basic_parse(*storage_host);
     auto host_name = storage_host_name(*storage_host);
     if (!storage_url.has_value() || !host_name.has_value()) {
-        send_response(message, cookie_operation_result("Cannot add a cookie for this storage host"_string));
+        send_response(message, to_storage_operation_result("Cannot add a cookie for this storage host"_string));
         return;
     }
 
@@ -86187,7 +86167,7 @@ void CookiesActor::add_item(Message const& message)
     cookie.host_only = true;
 
     auto result = devtools().delegate().set_cookie(tab->description(), {}, move(cookie));
-    send_response(message, cookie_operation_result(move(result)));
+    send_response(message, to_storage_operation_result(result));
 }
 
 void CookiesActor::remove_item(Message const& message)
@@ -89733,6 +89713,537 @@ private:
 
 }
 
+FILE: Libraries/LibDevTools/Actors/StorageActor.cpp
+/*
+ * Copyright (c) 2026, Ladybird contributors
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/JsonArray.h>
+#include <AK/JsonObject.h>
+#include <AK/QuickSort.h>
+#include <LibDevTools/Actors/StorageActor.h>
+#include <LibDevTools/Actors/TabActor.h>
+#include <LibDevTools/DevToolsDelegate.h>
+#include <LibDevTools/DevToolsServer.h>
+#include <LibDevTools/StorageHelpers.h>
+
+namespace DevTools {
+
+static constexpr auto max_store_object_count = 50uz;
+
+static JsonObject storage_field(StringView name)
+{
+    JsonObject field;
+    field.set("name"sv, name);
+    field.set("editable"sv, true);
+    return field;
+}
+
+static JsonObject serialize_storage_item(DevToolsDelegate::StorageItem const& item)
+{
+    JsonObject object;
+    object.set("name"sv, item.name);
+    object.set("value"sv, item.value);
+    return object;
+}
+
+static Optional<String> string_from_devtools_value(JsonValue const& value)
+{
+    if (value.is_string())
+        return value.as_string();
+    if (value.is_bool())
+        return value.as_bool() ? "true"_string : "false"_string;
+    if (value.is_number())
+        return MUST(String::formatted("{}", value.get_number_with_precision_loss<double>().release_value()));
+    if (value.is_null())
+        return {};
+    return value.serialized();
+}
+
+NonnullRefPtr<StorageActor> StorageActor::create(DevToolsServer& devtools, String name, WeakPtr<TabActor> tab, Web::StorageAPI::StorageEndpointType storage_endpoint)
+{
+    return adopt_ref(*new StorageActor(devtools, move(name), move(tab), storage_endpoint));
+}
+
+StorageActor::StorageActor(DevToolsServer& devtools, String name, WeakPtr<TabActor> tab, Web::StorageAPI::StorageEndpointType storage_endpoint)
+    : Actor(devtools, move(name))
+    , m_tab(move(tab))
+    , m_storage_endpoint(storage_endpoint)
+{
+    if (auto tab = m_tab.strong_ref()) {
+        m_storage_change_listener_id = devtools.delegate().add_storage_change_listener(
+            tab->description(),
+            weak_callback(*this, [](auto& self, DevToolsDelegate::StorageChange change) {
+                self.on_storage_changed(move(change));
+            }));
+    }
+}
+
+StorageActor::~StorageActor()
+{
+    if (m_storage_change_listener_id == 0)
+        return;
+
+    if (auto tab = m_tab.strong_ref())
+        devtools().delegate().remove_storage_change_listener(tab->description(), m_storage_change_listener_id);
+}
+
+StringView StorageActor::resource_type() const
+{
+    if (m_storage_endpoint == Web::StorageAPI::StorageEndpointType::LocalStorage)
+        return "local-storage"sv;
+    VERIFY(m_storage_endpoint == Web::StorageAPI::StorageEndpointType::SessionStorage);
+    return "session-storage"sv;
+}
+
+StringView StorageActor::resource_key() const
+{
+    if (m_storage_endpoint == Web::StorageAPI::StorageEndpointType::LocalStorage)
+        return "localStorage"sv;
+    VERIFY(m_storage_endpoint == Web::StorageAPI::StorageEndpointType::SessionStorage);
+    return "sessionStorage"sv;
+}
+
+Optional<String> StorageActor::host() const
+{
+    auto tab = m_tab.strong_ref();
+    if (!tab)
+        return {};
+    return storage_host_for_url(tab->description().url);
+}
+
+JsonObject StorageActor::serialize_storage() const
+{
+    JsonObject hosts;
+    if (auto storage_host = host(); storage_host.has_value())
+        hosts.set(*storage_host, JsonArray {});
+
+    JsonObject traits;
+    traits.set("supportsAddItem"sv, true);
+    traits.set("supportsRemoveAll"sv, true);
+    traits.set("supportsRemoveAllSessionCookies"sv, false);
+    traits.set("supportsRemoveItem"sv, true);
+
+    JsonObject storage;
+    storage.set("actor"sv, name());
+    if (auto tab = m_tab.strong_ref()) {
+        storage.set("browsingContextID"sv, tab->description().id);
+        storage.set("innerWindowId"sv, tab->inner_window_id());
+        storage.set("resourceId"sv, MUST(String::formatted("{}-{}", resource_key(), tab->inner_window_id())));
+    }
+    storage.set("hosts"sv, move(hosts));
+    storage.set("resourceKey"sv, resource_key());
+    storage.set("traits"sv, move(traits));
+    return storage;
+}
+
+void StorageActor::handle_message(Message const& message)
+{
+    if (message.type == "getFields"sv) {
+        get_fields(message);
+        return;
+    }
+
+    if (message.type == "getStoreObjects"sv) {
+        get_store_objects(message);
+        return;
+    }
+
+    if (message.type == "editItem"sv) {
+        edit_item(message);
+        return;
+    }
+
+    if (message.type == "addItem"sv) {
+        add_item(message);
+        return;
+    }
+
+    if (message.type == "removeItem"sv) {
+        remove_item(message);
+        return;
+    }
+
+    if (message.type == "removeAll"sv) {
+        remove_all(message);
+        return;
+    }
+
+    send_unrecognized_packet_type_error(message);
+}
+
+void StorageActor::get_fields(Message const& message)
+{
+    JsonArray fields;
+    fields.must_append(storage_field("name"sv));
+    fields.must_append(storage_field("value"sv));
+
+    JsonObject response;
+    response.set("value"sv, move(fields));
+    send_response(message, move(response));
+}
+
+void StorageActor::get_store_objects(Message const& message)
+{
+    auto requested_host_ref = get_required_parameter<String>(message, "host"sv);
+    if (!requested_host_ref.has_value())
+        return;
+    String requested_host = *requested_host_ref;
+
+    auto names_value = message.data.get("names"sv);
+    Optional<JsonArray> requested_names;
+    if (names_value.has_value() && names_value->is_array())
+        requested_names = names_value->as_array();
+
+    JsonObject options;
+    auto options_value = message.data.get("options"sv);
+    if (options_value.has_value() && options_value->is_object())
+        options = options_value->as_object();
+
+    auto tab = m_tab.strong_ref();
+    if (!tab) {
+        send_store_objects(message, requested_host, move(requested_names), move(options), Vector<DevToolsDelegate::StorageItem> {});
+        return;
+    }
+
+    devtools().delegate().inspect_storage(
+        tab->description(),
+        m_storage_endpoint,
+        weak_callback(*this, [message, requested_host, requested_names, options](auto& self, ErrorOr<Vector<DevToolsDelegate::StorageItem>> storage_items) {
+            self.send_store_objects(message, requested_host, requested_names, options, move(storage_items));
+        }));
+}
+
+void StorageActor::send_store_objects(Message const& message, Optional<String> requested_host, Optional<JsonArray> requested_names, JsonObject options, ErrorOr<Vector<DevToolsDelegate::StorageItem>> storage_items_or_error)
+{
+    if (storage_items_or_error.is_error()) {
+        JsonObject response;
+        response.set("error"sv, "storageError"sv);
+        response.set("message"sv, storage_items_or_error.error().string_literal());
+        send_response(message, move(response));
+        return;
+    }
+
+    Vector<DevToolsDelegate::StorageItem> storage_items = storage_items_or_error.release_value();
+    if (!host().has_value() || !requested_host.has_value() || *host() != *requested_host)
+        storage_items.clear();
+
+    if (requested_names.has_value()) {
+        storage_items.remove_all_matching([&](auto const& item) {
+            return !requested_names->values().contains([&](auto const& value) {
+                return value.is_string() && value.as_string() == item.name;
+            });
+        });
+    }
+
+    quick_sort(storage_items, [](auto const& a, auto const& b) {
+        return a.name < b.name;
+    });
+
+    auto total = storage_items.size();
+    auto offset = options.get_integer<size_t>("offset"sv).value_or(0);
+    auto size = options.get_integer<size_t>("size"sv).value_or(max_store_object_count);
+    if (size > max_store_object_count)
+        size = max_store_object_count;
+
+    JsonArray data;
+    if (offset > total) {
+        offset = total;
+    } else {
+        auto end = min(total, offset + size);
+        for (auto i = offset; i < end; ++i)
+            data.must_append(serialize_storage_item(storage_items[i]));
+    }
+
+    JsonObject response;
+    response.set("offset"sv, offset);
+    response.set("total"sv, total);
+    response.set("data"sv, move(data));
+    send_response(message, move(response));
+}
+
+void StorageActor::edit_item(Message const& message)
+{
+    auto data = get_required_parameter<JsonObject>(message, "data"sv);
+    if (!data.has_value())
+        return;
+
+    auto requested_host = data->get_string("host"sv);
+    if (!requested_host.has_value()) {
+        send_missing_parameter_error(message, "host"sv);
+        return;
+    }
+
+    if (!host().has_value() || *host() != *requested_host) {
+        send_response(message, to_storage_operation_result(Error::from_string_literal("Storage host is not available")));
+        return;
+    }
+
+    auto field = data->get_string("field"sv);
+    if (!field.has_value()) {
+        send_missing_parameter_error(message, "field"sv);
+        return;
+    }
+
+    auto items = data->get_object("items"sv);
+    if (!items.has_value()) {
+        send_missing_parameter_error(message, "items"sv);
+        return;
+    }
+
+    auto key = items->get_string("name"sv);
+    if (!key.has_value()) {
+        send_missing_parameter_error(message, "items.name"sv);
+        return;
+    }
+
+    auto value_json = items->get("value"sv);
+    if (!value_json.has_value()) {
+        send_missing_parameter_error(message, "items.value"sv);
+        return;
+    }
+
+    auto value = string_from_devtools_value(*value_json);
+    if (!value.has_value()) {
+        send_response(message, to_storage_operation_result(Error::from_string_literal("Missing storage value")));
+        return;
+    }
+
+    auto tab = m_tab.strong_ref();
+    if (!tab)
+        return;
+
+    if (*field == "name"sv) {
+        auto old_value_json = data->get("oldValue"sv);
+        if (!old_value_json.has_value()) {
+            send_missing_parameter_error(message, "oldValue"sv);
+            return;
+        }
+
+        auto old_key = string_from_devtools_value(*old_value_json);
+        if (!old_key.has_value()) {
+            send_response(message, to_storage_operation_result(Error::from_string_literal("Missing old storage key")));
+            return;
+        }
+
+        if (*old_key != *key) {
+            auto remove_result = devtools().delegate().remove_storage_item(tab->description(), m_storage_endpoint, *requested_host, *old_key);
+            if (remove_result.is_error()) {
+                send_response(message, to_storage_operation_result(remove_result.release_error()));
+                return;
+            }
+        }
+    }
+
+    auto result = devtools().delegate().set_storage_item(tab->description(), m_storage_endpoint, *requested_host, *key, *value);
+    if (result.is_error())
+        send_response(message, to_storage_operation_result(result.release_error()));
+    else
+        send_response(message, to_storage_operation_result(ErrorOr<void> {}));
+}
+
+void StorageActor::add_item(Message const& message)
+{
+    auto guid = get_required_parameter<String>(message, "guid"sv);
+    if (!guid.has_value())
+        return;
+
+    auto requested_host = message.data.get_string("host"sv)
+                              .value_or_lazy_evaluated_optional([this] { return host(); });
+    if (!requested_host.has_value()) {
+        send_response(message, to_storage_operation_result(Error::from_string_literal("No storage host is available for this page")));
+        return;
+    }
+
+    if (!host().has_value() || *host() != *requested_host) {
+        send_response(message, to_storage_operation_result(Error::from_string_literal("Storage host is not available")));
+        return;
+    }
+
+    auto tab = m_tab.strong_ref();
+    if (!tab)
+        return;
+
+    auto result = devtools().delegate().set_storage_item(tab->description(), m_storage_endpoint, *requested_host, *guid, "value"_string);
+    if (result.is_error())
+        send_response(message, to_storage_operation_result(result.release_error()));
+    else
+        send_response(message, to_storage_operation_result(ErrorOr<void> {}));
+}
+
+void StorageActor::remove_item(Message const& message)
+{
+    auto requested_host = get_required_parameter<String>(message, "host"sv);
+    if (!requested_host.has_value())
+        return;
+
+    auto name = get_required_parameter<String>(message, "name"sv);
+    if (!name.has_value())
+        return;
+
+    if (!host().has_value() || *host() != *requested_host) {
+        send_response(message, {});
+        return;
+    }
+
+    auto tab = m_tab.strong_ref();
+    if (!tab)
+        return;
+
+    auto result = devtools().delegate().remove_storage_item(tab->description(), m_storage_endpoint, *requested_host, *name);
+    if (result.is_error())
+        send_response(message, to_storage_operation_result(result.release_error()));
+    else
+        send_response(message, {});
+}
+
+void StorageActor::remove_all(Message const& message)
+{
+    auto requested_host = get_required_parameter<String>(message, "host"sv);
+    if (!requested_host.has_value())
+        return;
+
+    if (!host().has_value() || *host() != *requested_host) {
+        send_response(message, {});
+        return;
+    }
+
+    auto tab = m_tab.strong_ref();
+    if (!tab)
+        return;
+
+    auto result = devtools().delegate().clear_storage(tab->description(), m_storage_endpoint, *requested_host);
+    if (result.is_error())
+        send_response(message, to_storage_operation_result(result.release_error()));
+    else
+        send_response(message, {});
+}
+
+void StorageActor::on_storage_changed(DevToolsDelegate::StorageChange change)
+{
+    if (change.storage_endpoint != m_storage_endpoint)
+        return;
+
+    auto storage_host = host();
+    if (!storage_host.has_value() || *storage_host != change.host)
+        return;
+
+    if (change.type == DevToolsDelegate::StorageChange::Type::Cleared) {
+        send_store_cleared(change);
+        return;
+    }
+
+    if (!change.key.has_value())
+        return;
+
+    send_store_update(change);
+}
+
+void StorageActor::send_store_update(DevToolsDelegate::StorageChange const& change)
+{
+    StringView update_type;
+    switch (change.type) {
+    case DevToolsDelegate::StorageChange::Type::Added:
+        update_type = "added"sv;
+        break;
+    case DevToolsDelegate::StorageChange::Type::Changed:
+        update_type = "changed"sv;
+        break;
+    case DevToolsDelegate::StorageChange::Type::Deleted:
+        update_type = "deleted"sv;
+        break;
+    case DevToolsDelegate::StorageChange::Type::Cleared:
+        VERIFY_NOT_REACHED();
+    }
+
+    JsonArray keys;
+    keys.must_append(*change.key);
+
+    JsonObject hosts;
+    hosts.set(change.host, move(keys));
+
+    JsonObject storage_updates;
+    storage_updates.set(resource_key(), move(hosts));
+
+    JsonObject data;
+    data.set(update_type, move(storage_updates));
+
+    JsonObject message;
+    message.set("type"sv, "storesUpdate"sv);
+    message.set("data"sv, move(data));
+    send_message(move(message));
+}
+
+void StorageActor::send_store_cleared(DevToolsDelegate::StorageChange const& change)
+{
+    JsonArray hosts;
+    hosts.must_append(change.host);
+
+    JsonObject data;
+    data.set("clearedHostsOrPaths"sv, move(hosts));
+
+    JsonObject message;
+    message.set("type"sv, "storesCleared"sv);
+    message.set("data"sv, move(data));
+    send_message(move(message));
+}
+
+}
+
+FILE: Libraries/LibDevTools/Actors/StorageActor.h
+/*
+ * Copyright (c) 2026, Ladybird contributors
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/JsonArray.h>
+#include <LibDevTools/Actor.h>
+#include <LibDevTools/DevToolsDelegate.h>
+#include <LibDevTools/Forward.h>
+#include <LibWeb/StorageAPI/StorageEndpoint.h>
+
+namespace DevTools {
+
+class DEVTOOLS_API StorageActor final : public Actor {
+public:
+    static constexpr auto base_name = "storage"sv;
+
+    static NonnullRefPtr<StorageActor> create(DevToolsServer&, String name, WeakPtr<TabActor>, Web::StorageAPI::StorageEndpointType);
+    virtual ~StorageActor() override;
+
+    StringView resource_type() const;
+    StringView resource_key() const;
+    Optional<String> host() const;
+    JsonObject serialize_storage() const;
+    void on_storage_changed(DevToolsDelegate::StorageChange);
+
+private:
+    StorageActor(DevToolsServer&, String name, WeakPtr<TabActor>, Web::StorageAPI::StorageEndpointType);
+
+    virtual void handle_message(Message const&) override;
+
+    void get_fields(Message const&);
+    void get_store_objects(Message const&);
+    void edit_item(Message const&);
+    void add_item(Message const&);
+    void remove_item(Message const&);
+    void remove_all(Message const&);
+    void send_store_objects(Message const&, Optional<String> requested_host, Optional<JsonArray> requested_names, JsonObject options, ErrorOr<Vector<DevToolsDelegate::StorageItem>>);
+    void send_store_update(DevToolsDelegate::StorageChange const&);
+    void send_store_cleared(DevToolsDelegate::StorageChange const&);
+
+    WeakPtr<TabActor> m_tab;
+    Web::StorageAPI::StorageEndpointType m_storage_endpoint;
+    u64 m_storage_change_listener_id { 0 };
+};
+
+}
+
 FILE: Libraries/LibDevTools/Actors/StyleRuleActor.cpp
 /*
  * Copyright (c) 2026, Sam Atkins <sam@ladybird.org>
@@ -91616,6 +92127,7 @@ FILE: Libraries/LibDevTools/Actors/WatcherActor.cpp
 #include <LibDevTools/Actors/FrameActor.h>
 #include <LibDevTools/Actors/InspectorActor.h>
 #include <LibDevTools/Actors/NetworkParentActor.h>
+#include <LibDevTools/Actors/StorageActor.h>
 #include <LibDevTools/Actors/StyleSheetsActor.h>
 #include <LibDevTools/Actors/TabActor.h>
 #include <LibDevTools/Actors/TargetConfigurationActor.h>
@@ -91693,11 +92205,13 @@ void WatcherActor::handle_message(Message const& message)
             return;
 
         bool should_send_cookie_resources = false;
+        bool should_send_local_storage_resources = false;
+        bool should_send_session_storage_resources = false;
         if constexpr (DEVTOOLS_DEBUG) {
             for (auto const& resource_type : resource_types->values()) {
                 if (!resource_type.is_string())
                     continue;
-                if (resource_type.as_string() != "console-message"sv && resource_type.as_string() != "cookies"sv)
+                if (!first_is_one_of(resource_type.as_string(), "console-message"sv, "cookies"sv, "local-storage"sv, "session-storage"sv))
                     dbgln("Unrecognized `watchResources` resource type: '{}'", resource_type.as_string());
             }
         }
@@ -91707,12 +92221,22 @@ void WatcherActor::handle_message(Message const& message)
             if (resource_type.as_string() == "cookies"sv) {
                 m_is_watching_cookie_resources = true;
                 should_send_cookie_resources = true;
+            } else if (resource_type.as_string() == "local-storage"sv) {
+                m_is_watching_local_storage_resources = true;
+                should_send_local_storage_resources = true;
+            } else if (resource_type.as_string() == "session-storage"sv) {
+                m_is_watching_session_storage_resources = true;
+                should_send_session_storage_resources = true;
             }
         }
 
         send_response(message, move(response));
         if (should_send_cookie_resources)
             send_cookies_resource_available_message();
+        if (should_send_local_storage_resources)
+            send_storage_resource_available_message(local_storage_actor());
+        if (should_send_session_storage_resources)
+            send_storage_resource_available_message(session_storage_actor());
         return;
     }
 
@@ -91757,13 +92281,13 @@ JsonObject WatcherActor::serialize_description() const
     resources.set("jstracer-state"sv, false);
     resources.set("jstracer-trace"sv, false);
     resources.set("last-private-context-exit"sv, false);
-    resources.set("local-storage"sv, false);
+    resources.set("local-storage"sv, true);
     resources.set("network-event"sv, true);
     resources.set("network-event-stacktrace"sv, false);
     resources.set("platform-message"sv, false);
     resources.set("reflow"sv, false);
     resources.set("server-sent-event"sv, false);
-    resources.set("session-storage"sv, false);
+    resources.set("session-storage"sv, true);
     resources.set("source"sv, false);
     resources.set("stylesheet"sv, false);
     resources.set("thread-state"sv, false);
@@ -91816,6 +92340,10 @@ void WatcherActor::switch_frame_target(FrameActor& previous_target, String const
     target.set_pending_navigation_document_events_after_target_switch(url, title);
     if (m_is_watching_cookie_resources)
         send_cookies_resource_available_message();
+    if (m_is_watching_local_storage_resources)
+        send_storage_resource_available_message(local_storage_actor());
+    if (m_is_watching_session_storage_resources)
+        send_storage_resource_available_message(session_storage_actor());
 }
 
 void WatcherActor::send_frame_target_available_message(FrameActor& target)
@@ -91866,6 +92394,42 @@ void WatcherActor::send_cookies_resource_available_message()
     send_message(move(message));
 }
 
+StorageActor& WatcherActor::local_storage_actor()
+{
+    if (auto storage = m_local_storage.strong_ref())
+        return *storage;
+
+    m_local_storage = devtools().register_actor<StorageActor>(m_tab, Web::StorageAPI::StorageEndpointType::LocalStorage);
+    return *m_local_storage.strong_ref();
+}
+
+StorageActor& WatcherActor::session_storage_actor()
+{
+    if (auto storage = m_session_storage.strong_ref())
+        return *storage;
+
+    m_session_storage = devtools().register_actor<StorageActor>(m_tab, Web::StorageAPI::StorageEndpointType::SessionStorage);
+    return *m_session_storage.strong_ref();
+}
+
+void WatcherActor::send_storage_resource_available_message(StorageActor& storage)
+{
+    JsonArray resources;
+    resources.must_append(storage.serialize_storage());
+
+    JsonArray typed_resources;
+    typed_resources.must_append(storage.resource_type());
+    typed_resources.must_append(move(resources));
+
+    JsonArray array;
+    array.must_append(move(typed_resources));
+
+    JsonObject message;
+    message.set("type"sv, "resources-available-array"sv);
+    message.set("array"sv, move(array));
+    send_message(move(message));
+}
+
 }
 
 FILE: Libraries/LibDevTools/Actors/WatcherActor.h
@@ -91904,15 +92468,22 @@ private:
     void send_frame_target_destroyed_message(FrameActor&);
     CookiesActor& cookies_actor();
     void send_cookies_resource_available_message();
+    StorageActor& local_storage_actor();
+    StorageActor& session_storage_actor();
+    void send_storage_resource_available_message(StorageActor&);
 
     WeakPtr<TabActor> m_tab;
     WeakPtr<FrameActor> m_target;
     WeakPtr<CookiesActor> m_cookies;
+    WeakPtr<StorageActor> m_local_storage;
+    WeakPtr<StorageActor> m_session_storage;
     WeakPtr<TargetConfigurationActor> m_target_configuration;
     WeakPtr<ThreadConfigurationActor> m_thread_configuration;
     WeakPtr<NetworkParentActor> m_network_parent;
     bool m_is_watching_frame_targets { false };
     bool m_is_watching_cookie_resources { false };
+    bool m_is_watching_local_storage_resources { false };
+    bool m_is_watching_session_storage_resources { false };
 };
 
 }
@@ -91941,6 +92512,7 @@ set(SOURCES
     Actors/RootActor.cpp
     Actors/StyleRuleActor.cpp
     Actors/StyleSheetsActor.cpp
+    Actors/StorageActor.cpp
     Actors/TabActor.cpp
     Actors/TargetConfigurationActor.cpp
     Actors/ThreadActor.cpp
@@ -92137,6 +92709,7 @@ FILE: Libraries/LibDevTools/DevToolsDelegate.h
 #include <LibWeb/CSS/Selector.h>
 #include <LibWeb/CSS/StyleSheetIdentifier.h>
 #include <LibWeb/Forward.h>
+#include <LibWeb/StorageAPI/StorageEndpoint.h>
 #include <LibWebView/DOMNodeProperties.h>
 #include <LibWebView/Forward.h>
 
@@ -92157,6 +92730,35 @@ public:
     using OnHostCookieChange = Function<void(Vector<HTTP::Cookie::Cookie>)>;
     virtual void listen_for_host_cookie_changes(TabDescription const&, OnHostCookieChange) const { }
     virtual void stop_listening_for_host_cookie_changes(TabDescription const&) const { }
+
+    struct StorageItem {
+        String name;
+        String value;
+    };
+
+    using OnStorageItemsReceived = Function<void(ErrorOr<Vector<StorageItem>>)>;
+    virtual void inspect_storage(TabDescription const&, Web::StorageAPI::StorageEndpointType, OnStorageItemsReceived) const { }
+    virtual ErrorOr<Optional<String>> set_storage_item(TabDescription const&, Web::StorageAPI::StorageEndpointType, String const&, String const&, String const&) const { return Optional<String> {}; }
+    virtual ErrorOr<Optional<String>> remove_storage_item(TabDescription const&, Web::StorageAPI::StorageEndpointType, String const&, String const&) const { return Optional<String> {}; }
+    virtual ErrorOr<void> clear_storage(TabDescription const&, Web::StorageAPI::StorageEndpointType, String const&) const { return {}; }
+
+    struct StorageChange {
+        enum class Type : u8 {
+            Added,
+            Changed,
+            Deleted,
+            Cleared,
+        };
+
+        Web::StorageAPI::StorageEndpointType storage_endpoint;
+        String host;
+        Type type;
+        Optional<String> key;
+    };
+
+    using OnStorageChange = Function<void(StorageChange)>;
+    virtual u64 add_storage_change_listener(TabDescription const&, OnStorageChange) const { return 0; }
+    virtual void remove_storage_change_listener(TabDescription const&, u64) const { }
 
     using OnTabInspectionComplete = Function<void(ErrorOr<JsonValue>)>;
     virtual void inspect_tab(TabDescription const&, OnTabInspectionComplete) const { }
@@ -92551,6 +93153,7 @@ class ProcessActor;
 class RootActor;
 class StyleRuleActor;
 class StyleSheetsActor;
+class StorageActor;
 class TabActor;
 class TargetConfigurationActor;
 class ThreadActor;
@@ -92659,6 +93262,26 @@ Optional<String> storage_host_name(String const& storage_host)
     return url->serialized_host();
 }
 
+JsonObject to_storage_operation_result(Optional<String> const& error_string)
+{
+    JsonObject response;
+    if (error_string.has_value())
+        response.set("errorString"sv, *error_string);
+    else
+        response.set("errorString"sv, JsonValue {});
+    return response;
+}
+
+JsonObject to_storage_operation_result(ErrorOr<void> const& result)
+{
+    JsonObject response;
+    if (result.is_error())
+        response.set("errorString"sv, result.error().string_literal());
+    else
+        response.set("errorString"sv, JsonValue {});
+    return response;
+}
+
 }
 
 FILE: Libraries/LibDevTools/StorageHelpers.h
@@ -92670,13 +93293,19 @@ FILE: Libraries/LibDevTools/StorageHelpers.h
 
 #pragma once
 
+#include <AK/Error.h>
+#include <AK/JsonObject.h>
 #include <AK/Optional.h>
 #include <AK/String.h>
+#include <LibDevTools/Forward.h>
 
 namespace DevTools {
 
-Optional<String> storage_host_for_url(String const&);
-Optional<String> storage_host_name(String const&);
+DEVTOOLS_API Optional<String> storage_host_for_url(String const&);
+DEVTOOLS_API Optional<String> storage_host_name(String const&);
+
+JsonObject to_storage_operation_result(Optional<String> const& error_string);
+JsonObject to_storage_operation_result(ErrorOr<void> const& result);
 
 }
 
@@ -564237,13 +564866,19 @@ bool Element::is_actually_disabled() const
         return !form_associated_element.enabled();
     }
 
-    // - an optgroup element that has a disabled attribute
-    if (is<HTML::HTMLOptGroupElement>(this))
-        return has_attribute(HTML::AttributeNames::disabled);
+    auto nearest_ancestor_select_is_disabled = [this] {
+        if (auto select = HTML::get_nearest_ancestor_select(*this))
+            return select->has_attribute(HTML::AttributeNames::disabled);
+        return false;
+    };
 
-    // - an option element that is disabled
-    if (is<HTML::HTMLOptionElement>(this))
-        return static_cast<HTML::HTMLOptionElement const&>(*this).disabled();
+    // - an optgroup element that has a disabled attribute or whose nearest ancestor select is disabled
+    if (is<HTML::HTMLOptGroupElement>(this))
+        return has_attribute(HTML::AttributeNames::disabled) || nearest_ancestor_select_is_disabled();
+
+    // - an option element that is disabled or whose nearest ancestor select is disabled
+    if (auto* option = as_if<HTML::HTMLOptionElement>(this))
+        return option->disabled() || nearest_ancestor_select_is_disabled();
 
     // - a fieldset element that is a disabled fieldset
     if (is<HTML::HTMLFieldSetElement>(this))
@@ -622314,6 +622949,7 @@ FILE: Libraries/LibWeb/HTML/CanvasRenderingContext2D.cpp
 #include <LibWeb/CSS/StyleValues/FilterValueListStyleValue.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/CanvasRenderingContext2D.h>
+#include <LibWeb/HTML/DecodedImageData.h>
 #include <LibWeb/HTML/HTMLCanvasElement.h>
 #include <LibWeb/HTML/HTMLImageElement.h>
 #include <LibWeb/HTML/HTMLMediaElement.h>
@@ -623253,9 +623889,9 @@ bool image_is_not_origin_clean(CanvasImageSource const& image)
     // An object image is not origin-clean if, switching on image's type:
     return image.visit(
         // HTMLOrSVGImageElement
-        [](GC::Ref<HTMLImageElement>) {
-            // FIXME: image's current request's image data is CORS-cross-origin.
-            return false;
+        [](GC::Ref<HTMLImageElement> image) {
+            // image's current request's image data is CORS-cross-origin.
+            return image->current_request().image_data()->is_cors_cross_origin();
         },
         [](GC::Ref<SVG::SVGImageElement>) {
             // FIXME: image's current request's image data is CORS-cross-origin.
@@ -628089,6 +628725,9 @@ class DecodedImageData : public JS::Cell {
 public:
     virtual ~DecodedImageData();
 
+    [[nodiscard]] bool is_cors_cross_origin() const { return m_is_cors_cross_origin; }
+    void set_is_cors_cross_origin(bool value) { m_is_cors_cross_origin = value; }
+
     virtual Optional<Gfx::IntRect> frame_rect([[maybe_unused]] size_t frame_index) const = 0;
     virtual void paint([[maybe_unused]] DisplayListRecordingContext&, [[maybe_unused]] size_t frame_index, [[maybe_unused]] Gfx::IntRect dst_rect, [[maybe_unused]] Gfx::ScalingMode scaling_mode) const = 0;
 
@@ -628107,6 +628746,9 @@ public:
 
 protected:
     DecodedImageData();
+
+private:
+    bool m_is_cors_cross_origin { false };
 };
 
 }
@@ -637565,7 +638207,7 @@ void HTMLButtonElement::activation_behavior(DOM::Event const& event)
         // 8. Otherwise, if command is in the Toggle Popover state:
         else if (command == "toggle-popover") {
             // 1. If the result of running check popover validity given target, false, false, and null is true,
-            //    then run the show popover algorithm given target, false, and this.
+            //    then run the show popover algorithm given target, false, and element.
             if (MUST(target_element->check_popover_validity(ExpectedToBeShowing::No, ThrowExceptions::No, nullptr, IgnoreDomState::No))) {
                 MUST(target_element->show_popover(ThrowExceptions::No, this));
             }
@@ -637580,7 +638222,7 @@ void HTMLButtonElement::activation_behavior(DOM::Event const& event)
         // 9. Otherwise, if command is in the Show Popover state:
         else if (command == "show-popover") {
             // 1. If the result of running check popover validity given target, false, false, and null is true,
-            //    then run the show popover algorithm given target, false, and this.
+            //    then run the show popover algorithm given target, false, and element.
             if (MUST(target_element->check_popover_validity(ExpectedToBeShowing::No, ThrowExceptions::No, nullptr, IgnoreDomState::No))) {
                 MUST(target_element->show_popover(ThrowExceptions::No, this));
             }
@@ -646579,7 +647221,7 @@ interface mixin HTMLHyperlinkElementUtils {
 FILE: Libraries/LibWeb/HTML/HTMLIFrameElement.cpp
 /*
  * Copyright (c) 2020-2021, Andreas Kling <andreas@ladybird.org>
- * Copyright (c) 2023-2025, Sam Atkins <sam@ladybird.org>
+ * Copyright (c) 2023-2026, Sam Atkins <sam@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -646599,6 +647241,7 @@ FILE: Libraries/LibWeb/HTML/HTMLIFrameElement.cpp
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/TraversableNavigable.h>
 #include <LibWeb/Layout/NavigableContainerViewport.h>
+#include <LibWeb/ResourceTiming/PerformanceResourceTiming.h>
 #include <LibWeb/TrustedTypes/RequireTrustedTypesForDirective.h>
 #include <LibWeb/TrustedTypes/TrustedTypePolicy.h>
 
@@ -646792,7 +647435,7 @@ void HTMLIFrameElement::removed_from(IsSubtreeRoot is_subtree_root, DOM::Node* o
 }
 
 // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#iframe-load-event-steps
-void run_iframe_load_event_steps(HTML::HTMLIFrameElement& element)
+void run_iframe_load_event_steps(HTMLIFrameElement& element)
 {
     // FIXME: 1. Assert: element's content navigable is not null.
     if (!element.content_navigable()) {
@@ -646806,12 +647449,45 @@ void run_iframe_load_event_steps(HTML::HTMLIFrameElement& element)
 
     // FIXME: 3. If childDocument has its mute iframe load flag set, then return.
 
-    // FIXME: 4. Set childDocument's iframe load in progress flag.
+    // 4. If element's pending resource-timing start time is not null:
+    if (element.pending_resource_start_time().has_value()) {
+        // 1. Assert: element's pending resource-timing URL is not null.
+        VERIFY(element.pending_resource_timing_url().has_value());
 
-    // 5. Fire an event named load at element.
+        // 2. Let global be element's node document's relevant global object.
+        auto& global = relevant_global_object(element.document());
+
+        // 3. Let fallbackTimingInfo be a new fetch timing info whose start time is element's pending resource-timing
+        //    start time and whose response end time is the current high resolution time given global.
+        auto fallback_timing_info = Fetch::Infrastructure::FetchTimingInfo::create(element.vm());
+        fallback_timing_info->set_start_time(element.pending_resource_start_time().value());
+        fallback_timing_info->set_end_time(HighResolutionTime::current_high_resolution_time(global));
+
+        // 4. Mark resource timing given fallbackTimingInfo, the result of parsing element's pending resource-timing
+        //    URL, "iframe", global, the empty string, a new response body info, and 0.
+        // FIXME: Our URL is already parsed, how are we supposed to parse it?
+        ResourceTiming::PerformanceResourceTiming::mark_resource_timing(
+            fallback_timing_info,
+            element.pending_resource_timing_url()->to_string(),
+            "iframe"_fly_string,
+            global,
+            Optional<Fetch::Infrastructure::Response::CacheState> {},
+            Fetch::Infrastructure::Response::BodyInfo {},
+            0);
+
+        // 5. Set element's pending resource-timing start time to null.
+        element.set_pending_resource_start_time({});
+
+        // 6. Set element's pending resource-timing URL to null.
+        element.set_pending_resource_timing_url({});
+    }
+
+    // FIXME: 5. Set childDocument's iframe load in progress flag.
+
+    // 6. Fire an event named load at element.
     element.dispatch_event(DOM::Event::create(element.realm(), HTML::EventNames::load));
 
-    // FIXME: 6. Unset childDocument's iframe load in progress flag.
+    // FIXME: 7. Unset childDocument's iframe load in progress flag.
 }
 
 // https://html.spec.whatwg.org/multipage/interaction.html#dom-tabindex
@@ -646956,6 +647632,9 @@ public:
     Optional<HighResolutionTime::DOMHighResTimeStamp> const& pending_resource_start_time() const { return m_pending_resource_start_time; }
     void set_pending_resource_start_time(Optional<HighResolutionTime::DOMHighResTimeStamp> time) { m_pending_resource_start_time = time; }
 
+    Optional<URL::URL> const& pending_resource_timing_url() const { return m_pending_resource_timing_url; }
+    void set_pending_resource_timing_url(Optional<URL::URL> url) { m_pending_resource_timing_url = url; }
+
     GC::Ref<DOM::DOMTokenList> sandbox();
 
     SandboxingFlagSet iframe_sandboxing_flag_set() const { return m_iframe_sandboxing_flag_set; }
@@ -646998,6 +647677,9 @@ private:
 
     // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#iframe-pending-resource-timing-start-time
     Optional<HighResolutionTime::DOMHighResTimeStamp> m_pending_resource_start_time = {};
+
+    // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#iframe-pending-resource-timing-url
+    Optional<URL::URL> m_pending_resource_timing_url {};
 
     GC::Ptr<DOM::DOMTokenList> m_sandbox;
 
@@ -647473,25 +648155,27 @@ void HTMLImageElement::set_height(WebIDL::UnsignedLong height)
 // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-naturalwidth
 unsigned HTMLImageElement::natural_width() const
 {
-    // Return the density-corrected intrinsic width of the image, in CSS pixels,
-    // if the image has intrinsic dimensions and is available.
-    if (auto bitmap = current_image_frame(); bitmap.has_value())
-        return bitmap->width();
+    // 1. If the image is not available, then return 0.
+    auto bitmap = current_image_frame();
+    if (!bitmap.has_value())
+        return 0;
 
-    // ...or else 0.
-    return 0;
+    // 2. Return the respective component of the image's density-corrected natural width and height, in CSS pixels. [CSS]
+    // FIXME: Implement density-corrected algorithm.
+    return bitmap->width();
 }
 
 // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-naturalheight
 unsigned HTMLImageElement::natural_height() const
 {
-    // Return the density-corrected intrinsic height of the image, in CSS pixels,
-    // if the image has intrinsic dimensions and is available.
-    if (auto bitmap = current_image_frame(); bitmap.has_value())
-        return bitmap->height();
+    // 1. If the image is not available, then return 0.
+    auto bitmap = current_image_frame();
+    if (!bitmap.has_value())
+        return 0;
 
-    // ...or else 0.
-    return 0;
+    // 2. Return the respective component of the image's density-corrected natural width and height, in CSS pixels. [CSS]
+    // FIXME: Implement density-corrected algorithm.
+    return bitmap->height();
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-htmlimageelement-x
@@ -647931,17 +648615,21 @@ after_step_7:
         if (m_pending_request && url_string == m_pending_request->current_url())
             return;
 
-        // 15. If urlString is the same as the current request's current URL and the current request's state is partially available,
-        //     then abort the image request for the pending request,
-        //     queue an element task on the DOM manipulation task source given the img element
-        //     to restart the animation if restart animation is set, and return.
+        // 15. If urlString is the same as the current request's current URL and the current request's state is
+        //     partially available:
         if (url_string == m_current_request->current_url() && m_current_request->state() == ImageRequest::State::PartiallyAvailable) {
+            // 1. Abort the image request for the pending request.
             abort_the_image_request(realm(), m_pending_request);
+
+            // 2. If restart animation is set, then queue an element task on the DOM manipulation task source given the
+            //    img element to restart the animation.
             if (restart_animations) {
                 queue_an_element_task(HTML::Task::Source::DOMManipulation, [this] {
                     restart_the_animation();
                 });
             }
+
+            // 3. Return.
             return;
         }
 
@@ -648581,574 +649269,3 @@ namespace Web::HTML {
 
 class HTMLImageElement final
     : public HTMLElement
-    , public LazyLoadingElement<HTMLImageElement>
-    , public Layout::ImageProvider
-    , public DOM::ViewportClient {
-    WEB_PLATFORM_OBJECT(HTMLImageElement, HTMLElement);
-    GC_DECLARE_ALLOCATOR(HTMLImageElement);
-    LAZY_LOADING_ELEMENT(HTMLImageElement);
-
-public:
-    static constexpr bool OVERRIDES_FINALIZE = true;
-
-    virtual ~HTMLImageElement() override;
-
-    // ^FormAssociatedElement
-    virtual bool is_form_associated_element() const override { return true; }
-
-    virtual void form_associated_element_attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
-
-    Optional<String> alternative_text() const override
-    {
-        if (auto alt = get_attribute(HTML::AttributeNames::alt); alt.has_value())
-            return alt.release_value();
-        return {};
-    }
-
-    String alt() const { return get_attribute_value(HTML::AttributeNames::alt); }
-
-    virtual Optional<Gfx::DecodedImageFrame> default_image_frame_sized(Gfx::IntSize) const override;
-
-    WebIDL::UnsignedLong width() const;
-    void set_width(WebIDL::UnsignedLong);
-
-    WebIDL::UnsignedLong height() const;
-    void set_height(WebIDL::UnsignedLong);
-
-    unsigned natural_width() const;
-    unsigned natural_height() const;
-
-    int x() const;
-    int y() const;
-
-    // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete
-    bool complete() const;
-
-    // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-currentsrc
-    String current_src() const;
-
-    // https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-decode
-    [[nodiscard]] WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> decode() const;
-
-    virtual Optional<ARIA::Role> default_role() const override;
-
-    // https://html.spec.whatwg.org/multipage/images.html#img-environment-changes
-    void react_to_changes_in_the_environment();
-
-    // https://html.spec.whatwg.org/multipage/images.html#update-the-image-data
-    void update_the_image_data(bool restart_the_animations = false, bool maybe_omit_events = false);
-
-    // https://html.spec.whatwg.org/multipage/images.html#use-srcset-or-picture
-    [[nodiscard]] bool uses_srcset_or_picture() const;
-
-    // https://html.spec.whatwg.org/multipage/rendering.html#restart-the-animation
-    void restart_the_animation();
-
-    // https://html.spec.whatwg.org/multipage/images.html#select-an-image-source
-    [[nodiscard]] Optional<ImageSourceAndPixelDensity> select_an_image_source();
-
-    void set_source_set(SourceSet);
-
-    // https://html.spec.whatwg.org/multipage/embedded-content.html#the-img-element:dimension-attribute-source
-    DOM::Element const& dimension_attribute_source() const;
-    void set_dimension_attribute_source(DOM::Element const*);
-
-    ImageRequest& current_request() { return *m_current_request; }
-    ImageRequest const& current_request() const { return *m_current_request; }
-
-    virtual size_t current_frame_index() const override { return m_current_frame_index; }
-
-    // https://html.spec.whatwg.org/multipage/images.html#upgrade-the-pending-request-to-the-current-request
-    void upgrade_pending_request_to_current_request();
-
-    // https://html.spec.whatwg.org/multipage/embedded-content.html#allows-auto-sizes
-    bool allows_auto_sizes() const;
-
-    // ^Layout::ImageProvider
-    virtual bool is_image_available() const override;
-    virtual Optional<CSSPixels> intrinsic_width() const override;
-    virtual Optional<CSSPixels> intrinsic_height() const override;
-    virtual Optional<CSSPixelFraction> intrinsic_aspect_ratio() const override;
-    virtual Optional<Gfx::DecodedImageFrame> current_image_frame_sized(Gfx::IntSize) const override;
-    virtual void set_visible_in_viewport(bool) override;
-    virtual GC::Ptr<DOM::Element const> to_html_element() const override { return *this; }
-    virtual GC::Ptr<DecodedImageData> decoded_image_data() const override;
-
-    virtual void visit_edges(Cell::Visitor&) override;
-
-private:
-    HTMLImageElement(DOM::Document&, DOM::QualifiedName);
-
-    void update_the_image_data_impl(bool restart_the_animations, bool maybe_omit_events, u64 update_the_image_data_count);
-
-    virtual bool is_html_image_element() const override { return true; }
-
-    virtual void initialize(JS::Realm&) override;
-    virtual void finalize() override;
-
-    virtual void adopted_from(DOM::Document&) override;
-
-    virtual bool is_presentational_hint(FlyString const&) const override;
-    virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
-
-    // https://html.spec.whatwg.org/multipage/embedded-content.html#the-img-element:dimension-attributes
-    virtual bool supports_dimension_attributes() const override { return true; }
-
-    virtual RefPtr<Layout::Node> create_layout_node(CSS::ComputedProperties const&) override;
-    virtual void adjust_computed_style(CSS::ComputedProperties&) override;
-
-    virtual void did_set_viewport_rect(CSSPixelRect const&) override;
-
-    void handle_successful_fetch(URL::URL const&, StringView mime_type, ImageRequest&, ByteBuffer, bool maybe_omit_events, URL::URL const& previous_url);
-    void handle_failed_fetch();
-    void add_callbacks_to_image_request(GC::Ref<ImageRequest>, bool maybe_omit_events, String const& url_string, String const& previous_url, u64 update_the_image_data_count);
-
-    bool current_request_has_running_animation() const;
-    void start_animation_timer_if_visible();
-    void animate();
-
-    RefPtr<Core::Timer> m_animation_timer;
-    size_t m_current_frame_index { 0 };
-    size_t m_loops_completed { 0 };
-    bool m_animation_paused_by_visibility { false };
-
-    Optional<DOM::DocumentLoadEventDelayer> m_load_event_delayer;
-
-    GC::Ptr<DOM::DocumentObserver> m_document_observer;
-
-    CORSSettingAttribute m_cors_setting { CORSSettingAttribute::NoCORS };
-
-    // https://html.spec.whatwg.org/multipage/images.html#last-selected-source
-    // Each img element has a last selected source, which must initially be null.
-    Optional<String> m_last_selected_source;
-
-    // https://html.spec.whatwg.org/multipage/images.html#current-request
-    GC::Ptr<ImageRequest> m_current_request;
-
-    // https://html.spec.whatwg.org/multipage/images.html#pending-request
-    GC::Ptr<ImageRequest> m_pending_request;
-
-    SourceSet m_source_set;
-
-    CSSPixelSize m_last_seen_viewport_size;
-
-    // https://html.spec.whatwg.org/multipage/embedded-content.html#the-img-element:dimension-attribute-source
-    // Each img element has a dimension attribute source, which must initially be the img element itself.
-    GC::Ptr<DOM::Element const> m_dimension_attribute_source;
-
-    u64 m_update_the_image_data_count { 0 };
-};
-
-}
-
-namespace Web::DOM {
-
-template<>
-inline bool Node::fast_is<HTML::HTMLImageElement>() const { return is_html_image_element(); }
-
-}
-
-FILE: Libraries/LibWeb/HTML/HTMLImageElement.idl
-// https://html.spec.whatwg.org/multipage/images.html#image-decoding-hint
-[MissingValueDefault=auto, InvalidValueDefault=auto]
-enum Decoding {
-    "sync",
-    "async",
-    "auto"
-};
-
-// https://html.spec.whatwg.org/multipage/embedded-content.html#htmlimageelement
-[Exposed=Window, LegacyFactoryFunction=Image(optional unsigned long width, optional unsigned long height)]
-interface HTMLImageElement : HTMLElement {
-
-    [HTMLConstructor] constructor();
-
-    [CEReactions, Reflect] attribute DOMString alt;
-    [CEReactions, Reflect, URL] attribute USVString src;
-    [CEReactions, Reflect] attribute DOMString srcset;
-    [CEReactions, Reflect] attribute DOMString sizes;
-    [CEReactions, Enumerated=CORSSettingsAttribute, Reflect=crossorigin] attribute DOMString? crossOrigin;
-    [CEReactions, Reflect=usemap] attribute DOMString useMap;
-    [CEReactions, Reflect=ismap] attribute boolean isMap;
-    [CEReactions] attribute unsigned long width;
-    [CEReactions] attribute unsigned long height;
-    readonly attribute unsigned long naturalWidth;
-    readonly attribute unsigned long naturalHeight;
-    readonly attribute boolean complete;
-    readonly attribute USVString currentSrc;
-    [CEReactions, Reflect=referrerpolicy, Enumerated=ReferrerPolicy] attribute DOMString referrerPolicy;
-    [CEReactions, Enumerated=Decoding, Reflect] attribute DOMString decoding;
-    [CEReactions, Enumerated=LazyLoadingAttribute, Reflect] attribute DOMString loading;
-    [CEReactions, Enumerated=FetchPriorityAttribute, Reflect=fetchpriority] attribute DOMString fetchPriority;
-
-    Promise<undefined> decode();
-
-    // Obsolete
-    [CEReactions, Reflect] attribute DOMString name;
-    [CEReactions, Reflect, URL] attribute USVString lowsrc;
-    [CEReactions, Reflect] attribute DOMString align;
-    [CEReactions, Reflect] attribute unsigned long hspace;
-    [CEReactions, Reflect] attribute unsigned long vspace;
-    [CEReactions, Reflect=longdesc, URL] attribute USVString longDesc;
-
-    [CEReactions, LegacyNullToEmptyString, Reflect] attribute DOMString border;
-
-    // https://drafts.csswg.org/cssom-view/#extensions-to-the-htmlimageelement-interface
-    readonly attribute long x;
-    readonly attribute long y;
-
-};
-
-FILE: Libraries/LibWeb/HTML/HTMLInputElement.cpp
-/*
- * Copyright (c) 2018-2025, Andreas Kling <andreas@ladybird.org>
- * Copyright (c) 2022, Adam Hodgen <ant1441@gmail.com>
- * Copyright (c) 2022, Andrew Kaster <akaster@serenityos.org>
- * Copyright (c) 2023-2026, Shannon Booth <shannon@serenityos.org>
- * Copyright (c) 2023, Bastiaan van der Plaat <bastiaan.v.d.plaat@gmail.com>
- * Copyright (c) 2024-2026, Jelle Raaijmakers <jelle@ladybird.org>
- * Copyright (c) 2024, Fernando Kiotheka <fer@k6a.dev>
- * Copyright (c) 2025, Felipe Muñoz Mazur <felipe.munoz.mazur@protonmail.com>
- * Copyright (c) 2025, Glenn Skrzypczak <glenn.skrzypczak@gmail.com>
- * Copyright (c) 2026, Michiel Nijenhuis <michielmitsjol@gmail.com>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <AK/NeverDestroyed.h>
-#include <LibGfx/DecodedImageFrame.h>
-#include <LibJS/Runtime/Date.h>
-#include <LibJS/Runtime/NativeFunction.h>
-#include <LibJS/Runtime/RegExpObject.h>
-#include <LibURL/Parser.h>
-#include <LibWeb/Bindings/HTMLInputElement.h>
-#include <LibWeb/Bindings/InputEvent.h>
-#include <LibWeb/Bindings/PrincipalHostDefined.h>
-#include <LibWeb/CSS/CSSStyleProperties.h>
-#include <LibWeb/CSS/ComputedProperties.h>
-#include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
-#include <LibWeb/CSS/Invalidation/FormControlInvalidator.h>
-#include <LibWeb/CSS/Parser/Parser.h>
-#include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
-#include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
-#include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
-#include <LibWeb/DOM/Document.h>
-#include <LibWeb/DOM/ElementFactory.h>
-#include <LibWeb/DOM/Event.h>
-#include <LibWeb/DOM/IDLEventListener.h>
-#include <LibWeb/DOM/ShadowRoot.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
-#include <LibWeb/HTML/BrowsingContext.h>
-#include <LibWeb/HTML/Dates.h>
-#include <LibWeb/HTML/DecodedImageData.h>
-#include <LibWeb/HTML/EventNames.h>
-#include <LibWeb/HTML/HTMLDataListElement.h>
-#include <LibWeb/HTML/HTMLFormElement.h>
-#include <LibWeb/HTML/HTMLInputElement.h>
-#include <LibWeb/HTML/Numbers.h>
-#include <LibWeb/HTML/Parser/HTMLParser.h>
-#include <LibWeb/HTML/Scripting/Environments.h>
-#include <LibWeb/HTML/SelectedFile.h>
-#include <LibWeb/HTML/SharedResourceRequest.h>
-#include <LibWeb/HTML/Window.h>
-#include <LibWeb/Infra/CharacterTypes.h>
-#include <LibWeb/Layout/BlockContainer.h>
-#include <LibWeb/Layout/CheckBox.h>
-#include <LibWeb/Layout/ImageBox.h>
-#include <LibWeb/Layout/RadioButton.h>
-#include <LibWeb/Layout/RangeInputBox.h>
-#include <LibWeb/Layout/TextInputBox.h>
-#include <LibWeb/MimeSniff/MimeType.h>
-#include <LibWeb/MimeSniff/Resource.h>
-#include <LibWeb/Namespace.h>
-#include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/PaintableBox.h>
-#include <LibWeb/Selection/Selection.h>
-#include <LibWeb/UIEvents/EventNames.h>
-#include <LibWeb/UIEvents/InputEvent.h>
-#include <LibWeb/UIEvents/MouseEvent.h>
-#include <LibWeb/WebIDL/DOMException.h>
-#include <LibWeb/WebIDL/ExceptionOr.h>
-
-namespace {
-
-bool is_integral_multiple(double value, double step)
-{
-    VERIFY(step > 0);
-
-    // The step is so small, that the integral multiple closest to the value cannot be accurately expressed as a double
-    if (fabs(value) / ldexp(1.0, NumericLimits<double>::digits()) > step)
-        return true;
-
-    auto division_remainder = fabs(remainder(value, step));
-    // NOTE: There is no spec for the integral multiple. However, chromium uses tolerance so we comply here.
-    //       https://github.com/chromium/chromium/blob/18aeefb6d0fe94e267c08e1aaeaf2632937f4ce2/third_party/blink/renderer/core/html/forms/step_range.cc#L67
-    double acceptable_error = round(step) == step ? 0 : step / static_cast<double>(1 << NumericLimits<float>::digits());
-    return division_remainder <= acceptable_error || division_remainder >= (step - acceptable_error);
-}
-
-}
-
-namespace Web::HTML {
-
-GC_DEFINE_ALLOCATOR(HTMLInputElement);
-
-HTMLInputElement::HTMLInputElement(DOM::Document& document, DOM::QualifiedName qualified_name)
-    : HTMLElement(document, move(qualified_name))
-{
-}
-
-HTMLInputElement::~HTMLInputElement() = default;
-
-void HTMLInputElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLInputElement);
-    Base::initialize(realm);
-}
-
-void HTMLInputElement::visit_edges(Cell::Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-    visitor.visit(m_inner_text_element);
-    visitor.visit(m_text_node);
-    visitor.visit(m_placeholder_element);
-    visitor.visit(m_placeholder_text_node);
-    visitor.visit(m_up_button_element);
-    visitor.visit(m_down_button_element);
-    visitor.visit(m_color_well_element);
-    visitor.visit(m_file_button);
-    visitor.visit(m_file_label);
-    visitor.visit(m_legacy_pre_activation_behavior_checked_element_in_group);
-    visitor.visit(m_selected_files);
-    visitor.visit(m_slider_runnable_track);
-    visitor.visit(m_slider_progress_element);
-    visitor.visit(m_slider_thumb);
-    visitor.visit(m_resource_request);
-}
-
-void HTMLInputElement::adopted_from(DOM::Document& old_document)
-{
-    Base::adopted_from(old_document);
-
-    if (m_load_event_delayer.has_value())
-        m_load_event_delayer.emplace(document());
-}
-
-void HTMLInputElement::set_being_activated(bool activated)
-{
-    Base::set_being_activated(activated);
-    if (first_is_one_of(type_state(), TypeAttributeState::Checkbox, TypeAttributeState::RadioButton))
-        set_needs_repaint();
-}
-
-RefPtr<Layout::Node> HTMLInputElement::create_layout_node(CSS::ComputedProperties const& style)
-{
-    if (type_state() == TypeAttributeState::Hidden)
-        return nullptr;
-
-    // NOTE: Image inputs are `appearance: none` per the default UA style,
-    //       but we still need to create an ImageBox for them, or no image will get loaded.
-    if (type_state() == TypeAttributeState::ImageButton) {
-        return make_ref_counted<Layout::ImageBox>(document(), *this, style, *this);
-    }
-
-    // https://drafts.csswg.org/css-ui/#appearance-switching
-    // This specification introduces the appearance property to provide some control over this behavior.
-    // In particular, using appearance: none allows authors to suppress the native appearance of widgets,
-    // giving them a primitive appearance where CSS can be used to restyle them.
-    if (style.appearance() == CSS::Appearance::None) {
-        return Element::create_layout_node_for_display_type(document(), style.display(), style, this);
-    }
-
-    switch (type_state()) {
-
-    case TypeAttributeState::SubmitButton:
-    case TypeAttributeState::Button:
-    case TypeAttributeState::ResetButton:
-        return make_ref_counted<Layout::BlockContainer>(document(), this, style);
-    case TypeAttributeState::Checkbox:
-        return make_ref_counted<Layout::CheckBox>(document(), *this, style);
-    case TypeAttributeState::RadioButton:
-        return make_ref_counted<Layout::RadioButton>(document(), *this, style);
-    case TypeAttributeState::Range:
-        return make_ref_counted<Layout::RangeInputBox>(document(), *this, style);
-    case TypeAttributeState::Color:
-    case TypeAttributeState::FileUpload:
-        return Element::create_layout_node_for_display_type(document(), style.display(), style, this);
-    default:
-        return make_ref_counted<Layout::TextInputBox>(document(), *this, style);
-    }
-}
-
-void HTMLInputElement::adjust_computed_style(CSS::ComputedProperties& style)
-{
-    if (type_state() == TypeAttributeState::Hidden || type_state() == TypeAttributeState::SubmitButton || type_state() == TypeAttributeState::Button || type_state() == TypeAttributeState::ResetButton || type_state() == TypeAttributeState::ImageButton || type_state() == TypeAttributeState::Checkbox || type_state() == TypeAttributeState::RadioButton)
-        return;
-
-    // https://drafts.csswg.org/css-display-3/#unbox
-    if (style.display().is_contents())
-        style.set_property(CSS::PropertyID::Display, CSS::DisplayStyleValue::create(CSS::Display::from_short(CSS::Display::Short::None)));
-
-    // AD-HOC: We rewrite `display: inline` to `display: inline-block`.
-    //         This is required for the internal shadow tree to work correctly in layout.
-    if (style.display().is_inline_outside() && style.display().is_flow_inside())
-        style.set_property(CSS::PropertyID::Display, CSS::DisplayStyleValue::create(CSS::Display::from_short(CSS::Display::Short::InlineBlock)));
-
-    // NOTE: Other browsers apply a minimum height of a single line's line-height to single-line input elements.
-    if (is_single_line() && style.property(CSS::PropertyID::Height).has_auto()) {
-        auto current_line_height = style.line_height().to_double();
-        auto minimum_line_height = style.first_available_computed_font(document().font_computer())->pixel_size() * CSS::ComputedProperties::normal_line_height_scale;
-
-        // FIXME: Instead of overriding line-height, we should set height here instead.
-        if (current_line_height < minimum_line_height)
-            style.set_property(CSS::PropertyID::LineHeight, CSS::KeywordStyleValue::create(CSS::Keyword::Normal));
-    }
-}
-
-void HTMLInputElement::set_checked(bool checked)
-{
-    // The dirty checkedness flag must be initially set to false when the element is created,
-    // and must be set to true whenever the user interacts with the control in a way that changes the checkedness.
-    m_dirty_checkedness = true;
-    if (m_checked == checked)
-        return;
-
-    m_checked = checked;
-
-    CSS::Invalidation::invalidate_style_after_checked_state_change(*this, DOM::StyleInvalidationReason::HTMLInputElementSetChecked);
-
-    set_needs_repaint();
-}
-
-void HTMLInputElement::set_checked_binding(bool checked)
-{
-    if (type_state() == TypeAttributeState::RadioButton) {
-        if (checked)
-            set_checked_within_group();
-        else
-            set_checked(false);
-    } else {
-        set_checked(checked);
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#dom-input-indeterminate
-void HTMLInputElement::set_indeterminate(bool value)
-{
-    // On setting, it must be set to the new value. It has no effect except for changing the appearance of checkbox controls.
-    m_indeterminate = value;
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#dom-input-list
-GC::Ptr<HTMLDataListElement const> HTMLInputElement::list() const
-{
-    // The list IDL attribute must return the current suggestions source element, if any, or null otherwise.
-    if (auto data_list_element = suggestions_source_element(); data_list_element.has_value())
-        return *data_list_element;
-
-    return nullptr;
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#concept-input-list
-Optional<GC::Ref<HTMLDataListElement const>> HTMLInputElement::suggestions_source_element() const
-{
-    // The suggestions source element is the first element in the tree in tree order to have an ID equal to the value of the list attribute,
-    // if that element is a datalist element. If there is no list attribute, or if there is no element with that ID,
-    // or if the first element with that ID is not a datalist element, then there is no suggestions source element.
-    Optional<GC::Ref<HTMLDataListElement const>> result;
-    if (auto list_attribute_value = get_attribute(HTML::AttributeNames::list); list_attribute_value.has_value()) {
-        root().for_each_in_inclusive_subtree_of_type<DOM::Element>([&](auto& element) {
-            if (element.id() == *list_attribute_value) {
-                if (auto data_list_element = as_if<HTMLDataListElement>(element))
-                    result = *data_list_element;
-
-                return TraversalDecision::Break;
-            }
-
-            return TraversalDecision::Continue;
-        });
-    }
-
-    return result;
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#compiled-pattern-regular-expression
-Optional<regex::ECMAScriptRegex> HTMLInputElement::compiled_pattern_regular_expression() const
-{
-    // 1. If the element does not have a pattern attribute specified, then return nothing. The element has no compiled pattern regular expression.
-    auto maybe_pattern = get_attribute(HTML::AttributeNames::pattern);
-    if (!maybe_pattern.has_value())
-        return {};
-
-    // 2. Let pattern be the value of the pattern attribute of the element.
-    auto pattern = maybe_pattern.release_value();
-
-    // 3. Let regexpCompletion be RegExpCreate(pattern, "v").
-    regex::ECMAScriptCompileFlags compile_flags {};
-    compile_flags.unicode_sets = true;
-    auto regexp_completion = regex::ECMAScriptRegex::compile(pattern.bytes_as_string_view(), compile_flags);
-
-    // 4. If regexpCompletion is an abrupt completion, then return nothing. The element has no compiled pattern regular expression.
-    if (regexp_completion.is_error())
-        return {};
-
-    // 5. Let anchoredPattern be the string "^(?:", followed by pattern, followed by ")$".
-    auto anchored_pattern = MUST(String::formatted("^(?:{})$", pattern));
-
-    // 6. Return ! RegExpCreate(anchoredPattern, "v").
-    auto anchored = regex::ECMAScriptRegex::compile(anchored_pattern.bytes_as_string_view(), compile_flags);
-    if (anchored.is_error())
-        return {};
-    return anchored.release_value();
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#dom-input-files
-GC::Ptr<FileAPI::FileList> HTMLInputElement::files()
-{
-    // On getting, if the IDL attribute applies, it must return a FileList object that represents the current selected files.
-    //  The same object must be returned until the list of selected files changes.
-    // If the IDL attribute does not apply, then it must instead return null.
-    if (m_type != TypeAttributeState::FileUpload)
-        return nullptr;
-
-    if (!m_selected_files)
-        m_selected_files = FileAPI::FileList::create(realm());
-    return m_selected_files;
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#dom-input-files
-void HTMLInputElement::set_files(GC::Ptr<FileAPI::FileList> files)
-{
-    // 1. If the IDL attribute does not apply or the given value is null, then return.
-    if (m_type != TypeAttributeState::FileUpload || files == nullptr)
-        return;
-
-    // 2. Replace the element's selected files with the given value.
-    m_selected_files = files;
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#attr-input-accept
-FileFilter HTMLInputElement::parse_accept_attribute() const
-{
-    FileFilter filter;
-
-    // If specified, the attribute must consist of a set of comma-separated tokens, each of which must be an ASCII
-    // case-insensitive match for one of the following:
-    auto accept = get_attribute_value(HTML::AttributeNames::accept);
-
-    accept.bytes_as_string_view().for_each_split_view(',', SplitBehavior::Nothing, [&](StringView value) {
-        // The string "audio/*"
-        //     Indicates that sound files are accepted.
-        if (value.equals_ignoring_ascii_case("audio/*"sv))
-            filter.add_filter(FileFilter::FileType::Audio);
-
-        // The string "video/*"
-        //     Indicates that video files are accepted.
-        else if (value.equals_ignoring_ascii_case("video/*"sv))
-            filter.add_filter(FileFilter::FileType::Video);
-
-        // The string "image/*"
-        //     Indicates that image files are accepted.
-        else if (value.equals_ignoring_ascii_case("image/*"sv))
-            filter.add_filter(FileFilter::FileType::Image);
-
