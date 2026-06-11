@@ -8620,7 +8620,7 @@ ByteStringImpl::~ByteStringImpl() = default;
 NonnullRefPtr<ByteStringImpl const> ByteStringImpl::create_uninitialized(size_t length, char*& buffer)
 {
     VERIFY(length);
-    void* slot = kmalloc(allocation_size_for_stringimpl(length));
+    void* slot = kmalloc(HeapPartition::String, allocation_size_for_stringimpl(length));
     VERIFY(slot);
     auto new_stringimpl = adopt_ref(*new (slot) ByteStringImpl(ConstructWithInlineBuffer, length));
     buffer = const_cast<char*>(new_stringimpl->characters());
@@ -22354,6 +22354,9 @@ static mi_heap_t* heap_for_partition(HeapPartition partition)
     case HeapPartition::JSObjectStorage:
         static mi_heap_t* js_object_storage_heap = mi_heap_new();
         return js_object_storage_heap;
+    case HeapPartition::String:
+        static thread_local mi_heap_t* string_heap = mi_heap_new();
+        return string_heap;
     }
     VERIFY_NOT_REACHED();
 }
@@ -22436,6 +22439,7 @@ enum class HeapPartition {
     General,
     ArrayBuffer,
     JSObjectStorage,
+    String,
 };
 
 [[nodiscard]] void* ak_kcalloc(size_t count, size_t size);
@@ -33971,10 +33975,240 @@ FILE: AK/StringBuilder.cpp
 #include <AK/Utf16String.h>
 #include <AK/Utf16StringData.h>
 #include <AK/Utf16View.h>
+#include <AK/kmalloc.h>
 
 #include <simdutf.h>
 
 namespace AK {
+
+StringBuilder::Buffer::Buffer(Buffer const& other)
+{
+    MUST(try_resize(other.size()));
+    if (other.size() != 0)
+        __builtin_memcpy(data(), other.data(), other.size());
+}
+
+StringBuilder::Buffer::Buffer(Buffer&& other)
+{
+    move_from(move(other));
+}
+
+StringBuilder::Buffer::~Buffer()
+{
+    clear();
+}
+
+auto StringBuilder::Buffer::operator=(Buffer const& other) -> Buffer&
+{
+    if (this != &other) {
+        if (m_size > other.size())
+            trim(other.size(), true);
+        else
+            MUST(try_resize(other.size()));
+
+        if (other.size() != 0)
+            __builtin_memcpy(data(), other.data(), other.size());
+    }
+
+    return *this;
+}
+
+auto StringBuilder::Buffer::operator=(Buffer&& other) -> Buffer&
+{
+    if (this != &other) {
+        clear();
+        move_from(move(other));
+    }
+
+    return *this;
+}
+
+u8* StringBuilder::Buffer::data()
+{
+    return m_inline ? m_inline_buffer : m_outline_buffer;
+}
+
+u8 const* StringBuilder::Buffer::data() const
+{
+    return m_inline ? m_inline_buffer : m_outline_buffer;
+}
+
+Bytes StringBuilder::Buffer::span()
+{
+    return { data(), size() };
+}
+
+ReadonlyBytes StringBuilder::Buffer::span() const
+{
+    return { data(), size() };
+}
+
+void* StringBuilder::Buffer::end_pointer()
+{
+    return data() + m_size;
+}
+
+void StringBuilder::Buffer::clear()
+{
+    if (!m_inline) {
+        kfree(m_outline_buffer);
+        m_inline = true;
+    }
+    m_size = 0;
+}
+
+void StringBuilder::Buffer::resize(size_t new_size)
+{
+    MUST(try_resize(new_size));
+}
+
+void StringBuilder::Buffer::set_size(size_t new_size)
+{
+    ASSERT(new_size <= capacity());
+    m_size = new_size;
+}
+
+void StringBuilder::Buffer::ensure_capacity(size_t new_capacity)
+{
+    MUST(try_ensure_capacity(new_capacity));
+}
+
+ErrorOr<void> StringBuilder::Buffer::try_resize(size_t new_size)
+{
+    if (new_size <= m_size) {
+        trim(new_size, false);
+        return {};
+    }
+
+    TRY(try_ensure_capacity(new_size));
+    set_size(new_size);
+    return {};
+}
+
+ErrorOr<void> StringBuilder::Buffer::try_ensure_capacity(size_t new_capacity)
+{
+    if (new_capacity <= capacity())
+        return {};
+    return try_ensure_capacity_slowpath(new_capacity);
+}
+
+ErrorOr<void> StringBuilder::Buffer::try_append(char byte)
+{
+    auto old_size = size();
+    Checked<size_t> new_size = old_size;
+    new_size += 1;
+    VERIFY(!new_size.has_overflow());
+
+    TRY(try_resize(new_size.value()));
+    data()[old_size] = static_cast<u8>(byte);
+    return {};
+}
+
+ErrorOr<void> StringBuilder::Buffer::try_append(ReadonlyBytes bytes)
+{
+    return try_append(bytes.data(), bytes.size());
+}
+
+ErrorOr<void> StringBuilder::Buffer::try_append(void const* data, size_t data_size)
+{
+    if (data_size == 0)
+        return {};
+    VERIFY(data != nullptr);
+
+    auto old_size = size();
+    Checked<size_t> new_size = old_size;
+    new_size += data_size;
+    VERIFY(!new_size.has_overflow());
+
+    TRY(try_resize(new_size.value()));
+    __builtin_memcpy(this->data() + old_size, data, data_size);
+    return {};
+}
+
+void StringBuilder::Buffer::append(char byte)
+{
+    MUST(try_append(byte));
+}
+
+void StringBuilder::Buffer::append(void const* data, size_t data_size)
+{
+    MUST(try_append(data, data_size));
+}
+
+auto StringBuilder::Buffer::leak_outline_buffer() -> Optional<OutlineBuffer>
+{
+    if (m_inline)
+        return {};
+
+    auto* outline_buffer = m_outline_buffer;
+    auto size = m_size;
+    auto outline_capacity = m_outline_capacity;
+
+    m_inline = true;
+    m_size = 0;
+
+    return OutlineBuffer { Bytes { outline_buffer, size }, outline_capacity };
+}
+
+void StringBuilder::Buffer::move_from(Buffer&& other)
+{
+    m_size = other.m_size;
+    m_inline = other.m_inline;
+
+    if (other.m_inline) {
+        VERIFY(other.m_size <= inline_capacity);
+        if (other.m_size != 0)
+            __builtin_memcpy(m_inline_buffer, other.m_inline_buffer, other.m_size);
+    } else {
+        m_outline_buffer = other.m_outline_buffer;
+        m_outline_capacity = other.m_outline_capacity;
+    }
+
+    other.m_size = 0;
+    other.m_inline = true;
+}
+
+void StringBuilder::Buffer::trim(size_t size, bool may_discard_existing_data)
+{
+    VERIFY(size <= m_size);
+    if (!m_inline && size <= inline_capacity)
+        shrink_into_inline_buffer(size, may_discard_existing_data);
+    m_size = size;
+}
+
+void StringBuilder::Buffer::shrink_into_inline_buffer(size_t size, bool may_discard_existing_data)
+{
+    auto* outline_buffer = m_outline_buffer;
+    if (!may_discard_existing_data)
+        __builtin_memcpy(m_inline_buffer, outline_buffer, size);
+    kfree(outline_buffer);
+    m_inline = true;
+}
+
+ErrorOr<void> StringBuilder::Buffer::try_ensure_capacity_slowpath(size_t new_capacity)
+{
+    new_capacity = max(new_capacity, (capacity() * 3) / 2);
+    new_capacity = kmalloc_good_size(new_capacity);
+
+    if (m_inline) {
+        auto* new_buffer = static_cast<u8*>(kmalloc(HeapPartition::String, new_capacity));
+        if (!new_buffer)
+            return Error::from_errno(ENOMEM);
+
+        __builtin_memcpy(new_buffer, data(), m_size);
+        m_outline_buffer = new_buffer;
+    } else {
+        auto* new_buffer = static_cast<u8*>(krealloc(HeapPartition::String, m_outline_buffer, new_capacity));
+        if (!new_buffer)
+            return Error::from_errno(ENOMEM);
+
+        m_outline_buffer = new_buffer;
+    }
+
+    m_outline_capacity = new_capacity;
+    m_inline = false;
+    return {};
+}
 
 static constexpr size_t string_builder_prefix_size(StringBuilder::Mode mode)
 {
@@ -34499,7 +34733,7 @@ ErrorOr<void> StringBuilder::try_append_escaped_for_json(StringView string)
 
 auto StringBuilder::leak_buffer_for_string_construction() -> Optional<Buffer::OutlineBuffer>
 {
-    if (auto buffer = m_buffer.leak_outline_buffer({}); buffer.has_value()) {
+    if (auto buffer = m_buffer.leak_outline_buffer(); buffer.has_value()) {
         clear();
         return buffer;
     }
@@ -34536,7 +34770,64 @@ public:
     static constexpr auto DEFAULT_MODE = Mode::UTF8;
     static constexpr size_t inline_capacity = 256;
 
-    using Buffer = Detail::ByteBuffer<inline_capacity>;
+    class Buffer {
+    public:
+        Buffer() = default;
+        Buffer(Buffer const&);
+        Buffer(Buffer&&);
+        ~Buffer();
+
+        Buffer& operator=(Buffer const&);
+        Buffer& operator=(Buffer&&);
+
+        [[nodiscard]] u8* data();
+        [[nodiscard]] u8 const* data() const;
+
+        [[nodiscard]] Bytes span() LIFETIME_BOUND;
+        [[nodiscard]] ReadonlyBytes span() const LIFETIME_BOUND;
+
+        [[nodiscard]] void* end_pointer();
+
+        [[nodiscard]] size_t size() const { return m_size; }
+        [[nodiscard]] size_t capacity() const { return m_inline ? inline_capacity : m_outline_capacity; }
+        [[nodiscard]] bool is_inline() const { return m_inline; }
+
+        void clear();
+        void resize(size_t);
+        void set_size(size_t);
+        void ensure_capacity(size_t);
+
+        ErrorOr<void> try_resize(size_t);
+        ErrorOr<void> try_ensure_capacity(size_t);
+        ErrorOr<void> try_append(char);
+        ErrorOr<void> try_append(ReadonlyBytes);
+        ErrorOr<void> try_append(void const*, size_t);
+
+        void append(char);
+        void append(void const*, size_t);
+
+        struct OutlineBuffer {
+            Bytes buffer;
+            size_t capacity { 0 };
+        };
+        Optional<OutlineBuffer> leak_outline_buffer();
+
+    private:
+        void move_from(Buffer&&);
+        void trim(size_t, bool may_discard_existing_data);
+        void shrink_into_inline_buffer(size_t, bool may_discard_existing_data);
+        ErrorOr<void> try_ensure_capacity_slowpath(size_t);
+
+        union {
+            u8 m_inline_buffer[inline_capacity];
+            struct {
+                u8* m_outline_buffer;
+                size_t m_outline_capacity;
+            };
+        };
+        size_t m_size { 0 };
+        bool m_inline { true };
+    };
 
     StringBuilder();
     explicit StringBuilder(size_t initial_capacity);
@@ -34908,7 +35199,7 @@ public:
         VERIFY(byte_count);
 
         auto capacity = allocation_size_for_string_data(byte_count);
-        void* slot = kmalloc(capacity);
+        void* slot = kmalloc(HeapPartition::String, capacity);
         if (!slot)
             return Error::from_errno(ENOMEM);
 
@@ -34934,7 +35225,7 @@ public:
         VERIFY(byte_count > MAX_SHORT_STRING_BYTE_COUNT);
 
         auto capacity = sizeof(StringData) + sizeof(StringData::SubstringData);
-        void* slot = kmalloc(capacity);
+        void* slot = kmalloc(HeapPartition::String, capacity);
         if (!slot)
             return Error::from_errno(ENOMEM);
 
@@ -41640,7 +41931,7 @@ NonnullRefPtr<Utf16StringData> Utf16StringData::create_uninitialized(StorageType
 {
     auto allocation_size = allocation_size_for_string_data(storage_type == Utf16StringData::StorageType::ASCII, code_unit_length);
 
-    void* slot = kmalloc(allocation_size);
+    void* slot = kmalloc(HeapPartition::String, allocation_size);
     VERIFY(slot);
 
     return adopt_ref(*new (slot) Utf16StringData(storage_type, code_unit_length));
@@ -329782,6 +330073,22 @@ FILE: Libraries/LibSandbox/Sandbox.cpp
 #    include <unistd.h>
 #endif
 
+#if defined(AK_OS_MACOS)
+#    include <AK/LexicalPath.h>
+#    include <AK/StringBuilder.h>
+#    include <errno.h>
+#    include <limits.h>
+#    include <sandbox.h>
+#    include <signal.h>
+#    include <stdlib.h>
+#    include <sys/stat.h>
+#    include <unistd.h>
+
+extern "C" {
+int sandbox_init_with_parameters(char const* profile, u64 flags, char const* const parameters[], char** errorbuf);
+}
+#endif
+
 #if defined(__GLIBC__)
 #    include <malloc.h>
 #endif
@@ -329806,9 +330113,9 @@ ErrorOr<void> configure_runtime()
     return {};
 }
 
+#if defined(AK_OS_LINUX)
 ErrorOr<void> add_landlock_path_if_exists(Vector<LandlockPath>& paths, StringView path, LandlockPath::Access access)
 {
-#if defined(AK_OS_LINUX)
     auto path_bytes = path.to_byte_string();
 
     struct stat statbuf;
@@ -329827,17 +330134,342 @@ ErrorOr<void> add_landlock_path_if_exists(Vector<LandlockPath>& paths, StringVie
     }
 
     TRY(paths.try_append({ move(path_bytes), access }));
-#else
-    (void)paths;
-    (void)path;
-    (void)access;
+    return {};
+}
 #endif
+
+#if defined(AK_OS_MACOS)
+ErrorOr<void> add_seatbelt_path_if_exists(Vector<SeatbeltPath>& paths, StringView path, SeatbeltPath::Access access)
+{
+    auto path_bytes = path.to_byte_string();
+
+    struct stat statbuf;
+    if (stat(path_bytes.characters(), &statbuf) < 0) {
+        if (errno == ENOENT)
+            return {};
+        return Error::from_syscall("stat"sv, errno);
+    }
+
+    char resolved_path[PATH_MAX];
+    if (realpath(path_bytes.characters(), resolved_path) == nullptr)
+        return Error::from_syscall("realpath"sv, errno);
+    path_bytes = resolved_path;
+
+    auto is_directory = S_ISDIR(statbuf.st_mode);
+
+    for (auto const& existing_path : paths) {
+        if (existing_path.access == access && existing_path.path == path_bytes)
+            return {};
+    }
+
+    TRY(paths.try_append({ move(path_bytes), access, is_directory }));
     return {};
 }
 
+static void append_sandbox_string_literal(StringBuilder& builder, StringView string)
+{
+    builder.append('"');
+    for (auto ch : string.bytes()) {
+        if (ch == '"' || ch == '\\')
+            builder.append('\\');
+        builder.append(static_cast<char>(ch));
+    }
+    builder.append('"');
+}
+
+static void append_sandbox_path_filter(StringBuilder& builder, SeatbeltPath const& path)
+{
+    builder.append(path.is_directory ? "(subpath "sv : "(literal "sv);
+    append_sandbox_string_literal(builder, path.path);
+    builder.append(')');
+}
+
+static bool seatbelt_path_allows_access(SeatbeltPath::Access path_access, SeatbeltPath::Access requested_access)
+{
+    if (requested_access == SeatbeltPath::Access::ReadOnly)
+        return true;
+    return path_access == requested_access;
+}
+
+static ErrorOr<void> append_allowed_paths(StringBuilder& builder, StringView operation, ReadonlySpan<SeatbeltPath> paths, SeatbeltPath::Access access)
+{
+    bool emitted_header = false;
+    for (auto const& path : paths) {
+        if (!seatbelt_path_allows_access(path.access, access))
+            continue;
+
+        if (!emitted_header) {
+            builder.append("(allow "sv);
+            builder.append(operation);
+            emitted_header = true;
+        }
+        builder.append(' ');
+        append_sandbox_path_filter(builder, path);
+    }
+
+    if (emitted_header)
+        builder.append(")\n"sv);
+
+    return {};
+}
+
+static ErrorOr<void> append_allowed_path_extensions(StringBuilder& builder, ReadonlySpan<SeatbeltPath> paths, SeatbeltPath::Access access)
+{
+    auto extension_class = access == SeatbeltPath::Access::ReadWrite ? "com.apple.app-sandbox.read-write"sv : "com.apple.app-sandbox.read"sv;
+
+    bool emitted_header = false;
+    for (auto const& path : paths) {
+        if (!seatbelt_path_allows_access(path.access, access))
+            continue;
+
+        if (!emitted_header) {
+            builder.append("(allow file-issue-extension"sv);
+            emitted_header = true;
+        }
+        builder.append(" (require-all (extension-class "sv);
+        append_sandbox_string_literal(builder, extension_class);
+        builder.append(") "sv);
+        append_sandbox_path_filter(builder, path);
+        builder.append(')');
+    }
+
+    if (emitted_header)
+        builder.append(")\n"sv);
+
+    return {};
+}
+
+static ErrorOr<void> append_allowed_executables(StringBuilder& builder, ReadonlySpan<ByteString> executable_paths)
+{
+    if (executable_paths.is_empty())
+        return {};
+
+    builder.append("(allow process-exec"sv);
+    for (auto const& path : executable_paths) {
+        builder.append(" (literal "sv);
+        append_sandbox_string_literal(builder, path);
+        builder.append(')');
+    }
+    builder.append(")\n"sv);
+
+    return {};
+}
+
+static void sandbox_violation_signal_handler(int)
+{
+    char const message[] = "Sandbox violation: terminating process\n";
+    [[maybe_unused]] auto nwritten = write(STDERR_FILENO, message, sizeof(message) - 1);
+    _exit(128 + SIGSYS);
+}
+
+static ErrorOr<void> install_sandbox_violation_signal_handler()
+{
+    struct sigaction action {};
+    action.sa_handler = sandbox_violation_signal_handler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESETHAND;
+    if (sigaction(SIGSYS, &action, nullptr) < 0)
+        return Error::from_syscall("sigaction(SIGSYS)"sv, errno);
+    return {};
+}
+
+ErrorOr<void> apply_macos_sandbox(ReadonlySpan<SeatbeltPath> paths, NetworkAccess network_access, ReadonlySpan<ByteString> executable_paths)
+{
+    TRY(install_sandbox_violation_signal_handler());
+
+    StringBuilder profile;
+    TRY(profile.try_append(R"~~~(
+(version 1)
+(deny default
+    (with send-signal SIGSYS)
+    (with message "Ladybird macOS sandbox default deny"))
+
+(allow process-info*)
+(allow signal (target self))
+(allow sysctl-read)
+(allow system*)
+(allow ipc*)
+(allow mach*)
+(allow iokit-open-user-client
+    (iokit-user-client-class "IOSurfaceRootUserClient"))
+(allow user-preference-read
+    (preference-domain "kCFPreferencesAnyApplication")
+    (preference-domain "org.ladybird.ladybird"))
+
+(allow network-outbound
+    (literal "/private/var/run/syslog"))
+
+(deny syscall-unix
+    (with send-signal SIGKILL)
+    (with message "Ladybird macOS sandbox syscall deny"))
+
+(allow syscall-unix
+    (syscall-group-bsdthread)
+    (syscall-group-close)
+    (syscall-group-fcntl)
+    (syscall-group-getfsstat)
+    (syscall-group-kevent)
+    (syscall-group-kqueue)
+    (syscall-group-mkdir)
+    (syscall-group-open)
+    (syscall-group-open-dprotected)
+    (syscall-group-pthread)
+    (syscall-group-pthread-cv)
+    (syscall-group-pthread-locks)
+    (syscall-group-read)
+    (syscall-group-recv)
+    (syscall-group-rlimit)
+    (syscall-group-select)
+    (syscall-group-send)
+    (syscall-group-signal)
+    (syscall-group-sockopt)
+    (syscall-group-stat)
+    (syscall-group-statfs)
+    (syscall-group-ulock)
+    (syscall-group-write)
+    (syscall-number
+        SYS___disable_threadsignal
+        SYS___channel_open
+        SYS___mac_syscall
+        SYS___semwait_signal
+        SYS___semwait_signal_nocancel
+        SYS_abort_with_payload
+        SYS_access
+        SYS_change_fdguard_np
+        SYS_connect
+        SYS_crossarch_trap
+        SYS_csops_audittoken
+        SYS_csrctl
+        SYS_dup
+        SYS_exit
+        SYS_faccessat
+        SYS_fileport_makefd
+        SYS_fileport_makeport
+        SYS_fgetattrlist
+        SYS_fgetxattr
+        SYS_flock
+        SYS_fsgetpath
+        SYS_fsync
+        SYS_ftruncate
+        SYS_getaudit_addr
+        SYS_getattrlist
+        SYS_getattrlistbulk
+        SYS_getdirentries64
+        SYS_getentropy
+        SYS_getegid
+        SYS_geteuid
+        SYS_getgid
+        SYS_gethostuuid
+        SYS_getpeername
+        SYS_getpid
+        SYS_getrusage
+        SYS_getsockname
+        SYS_gettid
+        SYS_gettimeofday
+        SYS_getuid
+        SYS_getxattr
+        SYS_ioctl
+        SYS_issetugid
+        SYS_kdebug_trace
+        SYS_kdebug_trace64
+        SYS_kdebug_trace_string
+        SYS_kdebug_typefilter
+        SYS_listxattr
+        SYS_lseek
+        SYS_madvise
+        SYS_mlock
+        SYS_mmap
+        SYS_mprotect
+        SYS_mremap_encrypted
+        SYS_msync
+        SYS_munlock
+        SYS_munmap
+        SYS_necp_client_action
+        SYS_necp_open
+        SYS_open
+        SYS_open_nocancel
+        SYS_openat
+        SYS_os_fault_with_payload
+        SYS_pathconf
+        SYS_pipe
+        SYS_poll
+        SYS_posix_spawn
+        SYS_proc_info
+        SYS_readlink
+        SYS_rename
+        SYS_rmdir
+        SYS_sendfile
+        SYS_shm_open
+        SYS_shared_region_check_np
+        SYS_shared_region_map_and_slide_2_np
+        SYS_socket
+        SYS_socketpair
+        SYS_sysctl
+        SYS_sysctlbyname
+        SYS_thread_selfid
+        SYS_umask
+        SYS_wait4
+        SYS_work_interval_ctl
+        SYS_workq_kernreturn
+        SYS_workq_open))
+
+(allow file-read-metadata)
+(allow file-read*
+    (literal "/")
+    (literal "/dev/dtracehelper")
+    (literal "/dev/null")
+    (literal "/dev/random")
+    (literal "/dev/urandom")
+    (literal "/private/etc/localtime")
+    (subpath "/private/etc/ssl")
+    (subpath "/System")
+    (subpath "/Library/Preferences/Logging")
+    (subpath "/private/var/db/timezone")
+    (subpath "/usr/lib")
+    (subpath "/usr/share"))
+
+(allow file-map-executable
+    (subpath "/System")
+    (subpath "/usr/lib"))
+
+(allow file-write-data file-ioctl
+    (literal "/dev/dtracehelper"))
+)~~~"sv));
+
+    if (network_access == NetworkAccess::Allowed)
+        TRY(profile.try_append("(allow network*)\n"sv));
+
+    TRY(append_allowed_paths(profile, "file-read*"sv, paths, SeatbeltPath::Access::ReadOnly));
+    TRY(append_allowed_paths(profile, "file-map-executable"sv, paths, SeatbeltPath::Access::ReadAndExecute));
+    TRY(append_allowed_paths(profile, "file-write*"sv, paths, SeatbeltPath::Access::ReadWrite));
+    TRY(append_allowed_path_extensions(profile, paths, SeatbeltPath::Access::ReadOnly));
+    TRY(append_allowed_path_extensions(profile, paths, SeatbeltPath::Access::ReadWrite));
+    TRY(append_allowed_executables(profile, executable_paths));
+
+    auto profile_string = profile.to_byte_string();
+
+    char* errorbuf = nullptr;
+#    pragma clang diagnostic push
+#    pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    auto result = sandbox_init_with_parameters(profile_string.characters(), 0, nullptr, &errorbuf);
+#    pragma clang diagnostic pop
+    if (result < 0) {
+        if (errorbuf) {
+#    pragma clang diagnostic push
+#    pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            sandbox_free_error(errorbuf);
+#    pragma clang diagnostic pop
+        }
+        return Error::from_string_literal("sandbox_init_with_parameters failed");
+    }
+    return {};
+}
+#endif
+
+#if defined(AK_OS_LINUX)
 ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath> paths)
 {
-#if defined(AK_OS_LINUX) && defined(__NR_landlock_create_ruleset) && defined(__NR_landlock_add_rule) && defined(__NR_landlock_restrict_self)
+#    if defined(__NR_landlock_create_ruleset) && defined(__NR_landlock_add_rule) && defined(__NR_landlock_restrict_self)
     auto landlock_abi = syscall(__NR_landlock_create_ruleset, nullptr, 0, LANDLOCK_CREATE_RULESET_VERSION);
     if (landlock_abi < 0) {
         if (errno == ENOSYS || errno == EOPNOTSUPP || errno == EINVAL)
@@ -329862,19 +330494,19 @@ ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath> paths
         | LANDLOCK_ACCESS_FS_MAKE_BLOCK
         | LANDLOCK_ACCESS_FS_MAKE_SYM;
 
-#    ifdef LANDLOCK_ACCESS_FS_REFER
+#        ifdef LANDLOCK_ACCESS_FS_REFER
     if (landlock_abi >= 2)
         ruleset_attributes.handled_access_fs |= LANDLOCK_ACCESS_FS_REFER;
-#    endif
-#    ifdef LANDLOCK_ACCESS_FS_TRUNCATE
+#        endif
+#        ifdef LANDLOCK_ACCESS_FS_TRUNCATE
     if (landlock_abi >= 3)
         ruleset_attributes.handled_access_fs |= LANDLOCK_ACCESS_FS_TRUNCATE;
-#    endif
-#    if defined(LANDLOCK_ACCESS_NET_BIND_TCP) && defined(LANDLOCK_ACCESS_NET_CONNECT_TCP)
+#        endif
+#        if defined(LANDLOCK_ACCESS_NET_BIND_TCP) && defined(LANDLOCK_ACCESS_NET_CONNECT_TCP)
     auto ruleset_attributes_size = offsetof(landlock_ruleset_attr, handled_access_net);
-#    else
+#        else
     auto ruleset_attributes_size = sizeof(ruleset_attributes);
-#    endif
+#        endif
     auto ruleset_fd = syscall(__NR_landlock_create_ruleset, &ruleset_attributes, ruleset_attributes_size, 0);
     if (ruleset_fd < 0)
         return Error::from_syscall("landlock_create_ruleset"sv, errno);
@@ -329904,14 +330536,14 @@ ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath> paths
                 | LANDLOCK_ACCESS_FS_MAKE_REG
                 | LANDLOCK_ACCESS_FS_MAKE_SOCK
                 | LANDLOCK_ACCESS_FS_MAKE_FIFO;
-#    ifdef LANDLOCK_ACCESS_FS_REFER
+#        ifdef LANDLOCK_ACCESS_FS_REFER
             if (landlock_abi >= 2)
                 path_beneath.allowed_access |= LANDLOCK_ACCESS_FS_REFER;
-#    endif
-#    ifdef LANDLOCK_ACCESS_FS_TRUNCATE
+#        endif
+#        ifdef LANDLOCK_ACCESS_FS_TRUNCATE
             if (landlock_abi >= 3)
                 path_beneath.allowed_access |= LANDLOCK_ACCESS_FS_TRUNCATE;
-#    endif
+#        endif
         }
         path_beneath.parent_fd = path_fd;
         if (syscall(__NR_landlock_add_rule, ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &path_beneath, 0) < 0)
@@ -329920,9 +330552,9 @@ ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath> paths
 
     if (syscall(__NR_landlock_restrict_self, ruleset_fd, 0) < 0)
         return Error::from_syscall("landlock_restrict_self"sv, errno);
-#else
+#    else
     (void)paths;
-#endif
+#    endif
 
     return {};
 }
@@ -329934,6 +330566,7 @@ ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<StringView> readabl
         TRY(paths.try_append({ readable_path.to_byte_string(), LandlockPath::Access::ReadOnly }));
     return restrict_filesystem_with_landlock(paths.span());
 }
+#endif
 
 }
 
@@ -329948,12 +330581,14 @@ FILE: Libraries/LibSandbox/Sandbox.h
 
 #include <AK/ByteString.h>
 #include <AK/Error.h>
+#include <AK/Platform.h>
 #include <AK/Span.h>
 #include <AK/StringView.h>
 #include <AK/Vector.h>
 
 namespace Sandbox {
 
+#if defined(AK_OS_LINUX)
 struct LandlockPath {
     enum class Access {
         ReadOnly,
@@ -329964,12 +330599,40 @@ struct LandlockPath {
     ByteString path;
     Access access { Access::ReadOnly };
 };
+#endif
+
+#if defined(AK_OS_MACOS)
+struct SeatbeltPath {
+    enum class Access {
+        ReadOnly,
+        ReadAndExecute,
+        ReadWrite,
+    };
+
+    ByteString path;
+    Access access { Access::ReadOnly };
+    bool is_directory { false };
+};
+
+enum class NetworkAccess {
+    Denied,
+    Allowed,
+};
+#endif
 
 [[nodiscard]] ErrorOr<void> install_no_new_privileges();
 [[nodiscard]] ErrorOr<void> configure_runtime();
+
+#if defined(AK_OS_LINUX)
 [[nodiscard]] ErrorOr<void> add_landlock_path_if_exists(Vector<LandlockPath>& paths, StringView path, LandlockPath::Access);
 [[nodiscard]] ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<LandlockPath>);
 [[nodiscard]] ErrorOr<void> restrict_filesystem_with_landlock(ReadonlySpan<StringView> readable_paths = {});
+#endif
+
+#if defined(AK_OS_MACOS)
+[[nodiscard]] ErrorOr<void> add_seatbelt_path_if_exists(Vector<SeatbeltPath>& paths, StringView path, SeatbeltPath::Access);
+[[nodiscard]] ErrorOr<void> apply_macos_sandbox(ReadonlySpan<SeatbeltPath>, NetworkAccess, ReadonlySpan<ByteString> executable_paths = {});
+#endif
 
 }
 
@@ -648227,352 +648890,3 @@ void HTMLInputElement::create_file_input_shadow_tree()
 {
     auto& realm = this->realm();
 
-    auto shadow_root = realm.create<DOM::ShadowRoot>(document(), *this, Bindings::ShadowRootMode::Closed);
-    shadow_root->set_user_agent_internal(true);
-    set_shadow_root(shadow_root);
-
-    m_file_button = DOM::create_element(document(), HTML::TagNames::button, Namespace::HTML).release_value_but_fixme_should_propagate_errors();
-    MUST(shadow_root->append_child(*m_file_button));
-    m_file_button->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::FileSelectorButton);
-
-    m_file_label = DOM::create_element(document(), HTML::TagNames::label, Namespace::HTML).release_value_but_fixme_should_propagate_errors();
-    m_file_label->set_attribute_value(HTML::AttributeNames::style, "padding-left: 4px;"_string);
-
-    auto on_button_click = [this](JS::VM&) {
-        show_the_picker_if_applicable(*this);
-        return JS::js_undefined();
-    };
-
-    auto on_button_click_function = JS::NativeFunction::create(realm, move(on_button_click), 0, Utf16FlyString {}, &realm);
-    auto on_button_click_callback = realm.heap().allocate<WebIDL::CallbackType>(on_button_click_function, realm);
-    m_file_button->add_event_listener_without_options(UIEvents::EventNames::click, DOM::IDLEventListener::create(realm, on_button_click_callback));
-
-    update_file_input_shadow_tree();
-
-    MUST(shadow_root->append_child(*m_file_label));
-}
-
-void HTMLInputElement::update_file_input_shadow_tree()
-{
-    if (!m_file_button || !m_file_label)
-        return;
-
-    auto files_label = has_attribute(HTML::AttributeNames::multiple) ? "files"sv : "file"sv;
-    m_file_button->string_replace_all(Utf16String::formatted("Select {}...", files_label));
-
-    if (m_selected_files && m_selected_files->length() > 0) {
-        if (m_selected_files->length() == 1)
-            m_file_label->string_replace_all(Utf16String::from_utf8(m_selected_files->item(0)->name()));
-        else
-            m_file_label->string_replace_all(Utf16String::formatted("{} files selected.", m_selected_files->length()));
-    } else {
-        m_file_label->string_replace_all(Utf16String::formatted("No {} selected.", files_label));
-    }
-}
-
-void HTMLInputElement::create_range_input_shadow_tree()
-{
-    auto shadow_root = realm().create<DOM::ShadowRoot>(document(), *this, Bindings::ShadowRootMode::Closed);
-    shadow_root->set_user_agent_internal(true);
-    set_shadow_root(shadow_root);
-
-    m_slider_runnable_track = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
-    MUST(shadow_root->append_child(*m_slider_runnable_track));
-    m_slider_runnable_track->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::SliderTrack);
-
-    m_slider_progress_element = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
-    MUST(m_slider_runnable_track->append_child(*m_slider_progress_element));
-    m_slider_progress_element->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::SliderFill);
-
-    m_slider_thumb = MUST(DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML));
-    MUST(m_slider_runnable_track->append_child(*m_slider_thumb));
-    m_slider_thumb->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::SliderThumb);
-
-    update_slider_shadow_tree_elements();
-
-    auto keydown_callback_function = JS::NativeFunction::create(
-        realm(), [this](JS::VM& vm) {
-            if (type_state() != TypeAttributeState::Range)
-                return JS::js_undefined();
-            if (!allowed_value_step().has_value())
-                return JS::js_undefined();
-            auto key_value = MUST(vm.argument(0).get(vm, "key"_utf16_fly_string));
-            if (!key_value.is_string())
-                return JS::js_undefined();
-            auto key = key_value.as_string().utf8_string();
-
-            if (key == "ArrowLeft" || key == "ArrowDown")
-                MUST(step_down());
-            if (key == "PageDown")
-                MUST(step_down(10));
-
-            if (key == "ArrowRight" || key == "ArrowUp")
-                MUST(step_up());
-            if (key == "PageUp")
-                MUST(step_up(10));
-
-            user_interaction_did_change_input_value();
-            return JS::js_undefined();
-        },
-        0, Utf16FlyString {}, &realm());
-    auto keydown_callback = realm().heap().allocate<WebIDL::CallbackType>(*keydown_callback_function, realm());
-    add_event_listener_without_options(UIEvents::EventNames::keydown, DOM::IDLEventListener::create(realm(), keydown_callback));
-
-    auto wheel_callback_function = JS::NativeFunction::create(
-        realm(), [this](JS::VM& vm) {
-            if (type_state() != TypeAttributeState::Range)
-                return JS::js_undefined();
-            if (!allowed_value_step().has_value())
-                return JS::js_undefined();
-            auto delta_y_value = MUST(vm.argument(0).get(vm, "deltaY"_utf16_fly_string));
-            if (!delta_y_value.is_finite_number())
-                return JS::js_undefined();
-            if (delta_y_value.as_double() > 0) {
-                MUST(step_down());
-            } else {
-                MUST(step_up());
-            }
-            user_interaction_did_change_input_value();
-            return JS::js_undefined();
-        },
-        0, Utf16FlyString {}, &realm());
-    auto wheel_callback = realm().heap().allocate<WebIDL::CallbackType>(*wheel_callback_function, realm());
-    add_event_listener_without_options(UIEvents::EventNames::wheel, DOM::IDLEventListener::create(realm(), wheel_callback));
-
-    auto update_slider_by_mouse = [this](JS::VM& vm) {
-        if (type_state() != TypeAttributeState::Range)
-            return;
-        auto event = vm.argument(0).as_if<UIEvents::MouseEvent>();
-        if (!event)
-            return;
-        auto client_x = event->client_x();
-        if (!isfinite(client_x))
-            return;
-        auto rect = get_bounding_client_rect().to_type<double>();
-        if (rect.width() <= 0)
-            return;
-        double minimum = *min();
-        double maximum = *max();
-        if (minimum > maximum)
-            return;
-        auto relative_x = client_x - rect.left();
-        MUST(set_value_as_number(mix(minimum, maximum, relative_x / rect.width())));
-        user_interaction_did_change_input_value();
-    };
-
-    auto mousedown_callback_function = JS::NativeFunction::create(
-        realm(), [this, update_slider_by_mouse](JS::VM& vm) {
-            update_slider_by_mouse(vm);
-
-            auto mousemove_callback_function = JS::NativeFunction::create(
-                realm(), [update_slider_by_mouse](JS::VM& vm) {
-                    update_slider_by_mouse(vm);
-                    return JS::js_undefined();
-                },
-                0, Utf16FlyString {}, &realm());
-            auto mousemove_callback = realm().heap().allocate<WebIDL::CallbackType>(*mousemove_callback_function, realm());
-            auto mousemove_listener = DOM::IDLEventListener::create(realm(), mousemove_callback);
-            auto& window = static_cast<HTML::Window&>(relevant_global_object(*this));
-            window.add_event_listener_without_options(UIEvents::EventNames::mousemove, mousemove_listener);
-
-            auto mouseup_callback_function = JS::NativeFunction::create(
-                realm(), [this, mousemove_listener](JS::VM&) {
-                    auto& window = static_cast<HTML::Window&>(relevant_global_object(*this));
-                    window.remove_event_listener_without_options(UIEvents::EventNames::mousemove, mousemove_listener);
-                    return JS::js_undefined();
-                },
-                0, Utf16FlyString {}, &realm());
-            auto mouseup_callback = realm().heap().allocate<WebIDL::CallbackType>(*mouseup_callback_function, realm());
-            Bindings::AddEventListenerOptions mouseup_listener_options;
-            mouseup_listener_options.once = true;
-            window.add_event_listener(UIEvents::EventNames::mouseup, DOM::IDLEventListener::create(realm(), mouseup_callback), mouseup_listener_options);
-
-            return JS::js_undefined();
-        },
-        0, Utf16FlyString {}, &realm());
-    auto mousedown_callback = realm().heap().allocate<WebIDL::CallbackType>(*mousedown_callback_function, realm());
-    add_event_listener_without_options(UIEvents::EventNames::mousedown, DOM::IDLEventListener::create(realm(), mousedown_callback));
-}
-
-void HTMLInputElement::user_interaction_did_change_input_value(FlyString const& input_type, Optional<Utf16String> const& data)
-{
-    // https://html.spec.whatwg.org/multipage/input.html#common-input-element-events
-    // For input elements without a defined input activation behavior, but to which these events apply,
-    // and for which the user interface involves both interactive manipulation and an explicit commit action,
-    // then when the user changes the element's value, the user agent must queue an element task on the user interaction task source
-    // given the input element to fire an event named input at the input element, with the bubbles and composed attributes initialized to true
-    queue_an_element_task(HTML::Task::Source::UserInteraction, [this, input_type, data] {
-        // https://w3c.github.io/uievents/#event-type-input
-        Bindings::InputEventInit input_event_init;
-        input_event_init.bubbles = true;
-        input_event_init.composed = true;
-        input_event_init.input_type = input_type.to_string();
-        input_event_init.data = data;
-        auto input_event = UIEvents::InputEvent::create_from_platform_event(realm(), HTML::EventNames::input, input_event_init);
-        dispatch_event(*input_event);
-    });
-    // and any time the user commits the change, the user agent must queue an element task on the user interaction task source given the input
-    // element to set its user validity to true and fire an event named change at the input element, with the bubbles attribute initialized to true.
-    // NOTE: This is done manually as needed
-}
-
-void HTMLInputElement::update_slider_shadow_tree_elements()
-{
-    double value = convert_string_to_number(value_sanitization_algorithm(m_value)).value_or(0);
-    double minimum = *min();
-    double maximum = *max();
-    double position = (value - minimum) / (maximum - minimum) * 100;
-
-    if (m_slider_progress_element)
-        MUST(m_slider_progress_element->style_for_bindings()->set_property(CSS::PropertyID::Width, MUST(String::formatted("{}%", position))));
-
-    if (m_slider_thumb)
-        MUST(m_slider_thumb->style_for_bindings()->set_property(CSS::PropertyID::MarginLeft, MUST(String::formatted("{}%", position))));
-}
-
-void HTMLInputElement::did_receive_focus()
-{
-    if (!m_text_node)
-        return;
-    m_text_node->set_needs_repaint();
-
-    if (m_placeholder_text_node)
-        m_placeholder_text_node->set_needs_repaint();
-
-    if (has_selectable_text()) {
-        if (document().last_focus_trigger() == FocusTrigger::Key)
-            MUST(select());
-        else
-            document().get_selection()->remove_all_ranges();
-    }
-}
-
-void HTMLInputElement::did_lose_focus()
-{
-    if (m_text_node)
-        m_text_node->set_needs_repaint();
-
-    if (m_placeholder_text_node)
-        m_placeholder_text_node->set_needs_repaint();
-
-    commit_pending_changes();
-}
-
-void HTMLInputElement::form_associated_element_attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_)
-{
-    PopoverTargetAttributes::associated_attribute_changed(name, value, namespace_);
-
-    if (name == HTML::AttributeNames::checked) {
-        // https://html.spec.whatwg.org/multipage/input.html#the-input-element:concept-input-checked-dirty-2
-        // When the checked content attribute is added, if the control does not have dirty checkedness, the user agent must set the checkedness of the element to true;
-        // when the checked content attribute is removed, if the control does not have dirty checkedness, the user agent must set the checkedness of the element to false.
-        if (!m_dirty_checkedness) {
-            set_checked(value.has_value());
-            // set_checked() sets the dirty checkedness flag. We reset it here sinceit shouldn't be set when updating the attribute value
-            m_dirty_checkedness = false;
-        }
-    } else if (name == HTML::AttributeNames::type) {
-        auto new_type_attribute_state = parse_type_attribute(value.value_or(String {}));
-        type_attribute_changed(m_type, new_type_attribute_state);
-
-        // https://html.spec.whatwg.org/multipage/input.html#image-button-state-(type=image):the-input-element-4
-        // the input element's type attribute is changed back to the Image Button state, and the src attribute is present,
-        // and its value has changed since the last time the type attribute was in the Image Button state
-        if (type_state() == TypeAttributeState::ImageButton) {
-            if (auto src = attribute(AttributeNames::src); src.has_value() && src != m_last_src_value)
-                handle_src_attribute(*src).release_value_but_fixme_should_propagate_errors();
-        }
-
-    } else if (name == HTML::AttributeNames::value) {
-        if (!m_dirty_value) {
-            auto old_value = move(m_value);
-
-            if (value.has_value())
-                m_value = value_sanitization_algorithm(Utf16String::from_utf8(*value));
-            else
-                m_value = {};
-
-            if (m_value != old_value)
-                relevant_value_was_changed();
-
-            if (m_text_node)
-                m_text_node->set_data(m_value);
-
-            update_shadow_tree();
-        }
-    } else if (name == HTML::AttributeNames::placeholder) {
-        if (m_placeholder_text_node) {
-            m_placeholder_text_node->set_data(Utf16String::from_utf8(placeholder()));
-            update_placeholder_visibility();
-        }
-    } else if (name == HTML::AttributeNames::src) {
-        handle_src_attribute(value.value_or({})).release_value_but_fixme_should_propagate_errors();
-    } else if (name == HTML::AttributeNames::alt) {
-        if (unsafe_layout_node() && type_state() == TypeAttributeState::ImageButton)
-            did_update_alt_text(as<Layout::ImageBox>(*unsafe_layout_node()));
-    } else if (name == HTML::AttributeNames::maxlength) {
-        handle_maxlength_attribute();
-    } else if (name == HTML::AttributeNames::multiple) {
-        if (type_state() == TypeAttributeState::Email && old_value.has_value() != value.has_value()) {
-            m_value = value_sanitization_algorithm(m_value);
-        }
-        update_shadow_tree();
-    } else if (name == HTML::AttributeNames::min || name == HTML::AttributeNames::max || name == HTML::AttributeNames::step) {
-        if (type_state() == TypeAttributeState::Range) {
-            m_value = value_sanitization_algorithm(m_value);
-            update_shadow_tree();
-        }
-    }
-
-    // AD-HOC: A change to any of these attributes can change whether the element satisfies its constraints, and
-    //         therefore which validity pseudo-classes match.
-    if (first_is_one_of(name, HTML::AttributeNames::type, HTML::AttributeNames::value, HTML::AttributeNames::required, HTML::AttributeNames::pattern, HTML::AttributeNames::min, HTML::AttributeNames::max, HTML::AttributeNames::step, HTML::AttributeNames::maxlength, HTML::AttributeNames::minlength, HTML::AttributeNames::multiple))
-        CSS::Invalidation::invalidate_style_after_validity_change(*this);
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#input-type-change
-void HTMLInputElement::type_attribute_changed(TypeAttributeState old_state, TypeAttributeState new_state)
-{
-    auto new_value_attribute_mode = value_attribute_mode_for_type_state(new_state);
-    auto old_value_attribute_mode = value_attribute_mode_for_type_state(old_state);
-
-    if (checked_applies(old_state) != checked_applies(new_state)) {
-        CSS::Invalidation::invalidate_style_after_checked_state_change(*this, DOM::StyleInvalidationReason::HTMLInputElementSetType);
-    }
-
-    // 1. If the previous state of the element's type attribute put the value IDL attribute in the value mode, and the element's
-    //    value is not the empty string, and the new state of the element's type attribute puts the value IDL attribute in either
-    //    the default mode or the default/on mode, then set the element's value content attribute to the element's value.
-    if (old_value_attribute_mode == ValueAttributeMode::Value && !m_value.is_empty() && (first_is_one_of(new_value_attribute_mode, ValueAttributeMode::Default, ValueAttributeMode::DefaultOn))) {
-        set_attribute_value(HTML::AttributeNames::value, m_value.to_utf8_but_should_be_ported_to_utf16());
-    }
-
-    // 2. Otherwise, if the previous state of the element's type attribute put the value IDL attribute in any mode other
-    //    than the value mode, and the new state of the element's type attribute puts the value IDL attribute in the value mode,
-    //    then set the value of the element to the value of the value content attribute, if there is one, or the empty string
-    //    otherwise, and then set the control's dirty value flag to false.
-    else if (old_value_attribute_mode != ValueAttributeMode::Value && new_value_attribute_mode == ValueAttributeMode::Value) {
-        m_value = Utf16String::from_utf8(attribute(HTML::AttributeNames::value).value_or({}));
-        m_dirty_value = false;
-    }
-
-    // 3. Otherwise, if the previous state of the element's type attribute put the value IDL attribute in any mode other
-    //    than the filename mode, and the new state of the element's type attribute puts the value IDL attribute in the filename mode,
-    //    then set the value of the element to the empty string.
-    else if (old_value_attribute_mode != ValueAttributeMode::Filename && new_value_attribute_mode == ValueAttributeMode::Filename) {
-        m_value = {};
-    }
-
-    // 4. Update the element's rendering and behavior to the new state's.
-    m_type = new_state;
-    clear_element_reference_pseudo_elements();
-    set_shadow_root(nullptr);
-    create_shadow_tree_if_needed();
-
-    // 5. Signal a type change for the element. (The Radio Button state uses this, in particular.)
-    signal_a_type_change();
-
-    // 6. Invoke the value sanitization algorithm, if one is defined for the type attribute's new state.
-    m_value = value_sanitization_algorithm(m_value);
-
-    // 7. Let previouslySelectable be true if setRangeText() previously applied to the element, and false otherwise.
