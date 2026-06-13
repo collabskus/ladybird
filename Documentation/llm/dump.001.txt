@@ -133860,6 +133860,7 @@ set(SOURCES
     Encoder.cpp
     File.cpp
     Message.cpp
+    ReceivedMessageBytes.cpp
     TransportHandle.cpp
 )
 
@@ -134055,10 +134056,11 @@ ConnectionBase::PeerEOF ConnectionBase::drain_messages_from_peer()
 {
     bool parse_error = false;
     auto schedule_shutdown = m_transport->read_as_many_messages_as_possible_without_blocking([&](auto&& raw_message) {
-        if (auto message = try_parse_message(raw_message.bytes, raw_message.attachments)) {
+        auto bytes = raw_message.bytes.bytes();
+        if (auto message = try_parse_message(bytes, raw_message.attachments)) {
             m_unprocessed_messages.append(message.release_nonnull());
         } else {
-            dbgln("Failed to parse IPC message {:hex-dump}", raw_message.bytes);
+            dbgln("Failed to parse IPC message {:hex-dump}", bytes);
             parse_error = true;
         }
     });
@@ -135747,7 +135749,7 @@ ErrorOr<void> MessageBuffer::transfer_message(Transport& transport)
     VERIFY(m_data.size() <= MAX_MESSAGE_PAYLOAD_SIZE);
     VERIFY(m_attachments.size() <= MAX_MESSAGE_FD_COUNT);
 
-    transport.post_message(m_data, m_attachments);
+    transport.post_message(take_data(), m_attachments);
     return {};
 }
 
@@ -135821,6 +135823,151 @@ public:
 
 protected:
     Message() = default;
+};
+
+}
+
+FILE: Libraries/LibIPC/ReceivedMessageBytes.cpp
+/*
+ * Copyright (c) 2026, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/RefCounted.h>
+#include <LibIPC/ReceivedMessageBytes.h>
+
+#if defined(AK_OS_MACOS)
+#    include <mach/mach.h>
+#endif
+
+namespace IPC {
+
+class ReceivedMessageBytes::Impl final : public RefCounted<ReceivedMessageBytes::Impl> {
+public:
+    explicit Impl(Vector<u8> bytes)
+        : m_storage_type(StorageType::Vector)
+        , m_vector(move(bytes))
+    {
+    }
+
+#if defined(AK_OS_MACOS)
+    Impl(void* vm_region_address, size_t vm_region_size)
+        : m_storage_type(StorageType::VMRegion)
+        , m_vm_region_address(vm_region_address)
+        , m_vm_region_size(vm_region_size)
+    {
+    }
+#endif
+
+    ~Impl()
+    {
+#if defined(AK_OS_MACOS)
+        if (m_storage_type == StorageType::VMRegion && m_vm_region_size > 0)
+            vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(m_vm_region_address), m_vm_region_size);
+#endif
+    }
+
+    ReadonlyBytes bytes() const
+    {
+        switch (m_storage_type) {
+        case StorageType::Vector:
+            return m_vector;
+        case StorageType::VMRegion:
+            return { static_cast<u8 const*>(m_vm_region_address), m_vm_region_size };
+        }
+        VERIFY_NOT_REACHED();
+    }
+
+private:
+    enum class StorageType {
+        Vector,
+        VMRegion,
+    };
+
+    StorageType m_storage_type { StorageType::Vector };
+    Vector<u8> m_vector;
+    void* m_vm_region_address { nullptr };
+    size_t m_vm_region_size { 0 };
+};
+
+ReceivedMessageBytes::ReceivedMessageBytes() = default;
+ReceivedMessageBytes::ReceivedMessageBytes(ReceivedMessageBytes const&) = default;
+ReceivedMessageBytes::ReceivedMessageBytes(ReceivedMessageBytes&&) = default;
+ReceivedMessageBytes::~ReceivedMessageBytes() = default;
+
+ReceivedMessageBytes& ReceivedMessageBytes::operator=(ReceivedMessageBytes const&) = default;
+ReceivedMessageBytes& ReceivedMessageBytes::operator=(ReceivedMessageBytes&&) = default;
+
+ReceivedMessageBytes::ReceivedMessageBytes(NonnullRefPtr<Impl> impl)
+    : m_impl(move(impl))
+{
+}
+
+ReceivedMessageBytes ReceivedMessageBytes::from_vector(Vector<u8> bytes)
+{
+    if (bytes.is_empty())
+        return {};
+    return ReceivedMessageBytes { adopt_ref(*new Impl(move(bytes))) };
+}
+
+#if defined(AK_OS_MACOS)
+ReceivedMessageBytes ReceivedMessageBytes::adopt_vm_region(void* address, size_t size)
+{
+    if (size == 0)
+        return {};
+    return ReceivedMessageBytes { adopt_ref(*new Impl(address, size)) };
+}
+#endif
+
+ReadonlyBytes ReceivedMessageBytes::bytes() const
+{
+    if (!m_impl)
+        return {};
+    return m_impl->bytes();
+}
+
+}
+
+FILE: Libraries/LibIPC/ReceivedMessageBytes.h
+/*
+ * Copyright (c) 2026, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Platform.h>
+#include <AK/RefPtr.h>
+#include <AK/Vector.h>
+
+namespace IPC {
+
+class ReceivedMessageBytes {
+public:
+    ReceivedMessageBytes();
+    ReceivedMessageBytes(ReceivedMessageBytes const&);
+    ReceivedMessageBytes(ReceivedMessageBytes&&);
+    ~ReceivedMessageBytes();
+
+    ReceivedMessageBytes& operator=(ReceivedMessageBytes const&);
+    ReceivedMessageBytes& operator=(ReceivedMessageBytes&&);
+
+    static ReceivedMessageBytes from_vector(Vector<u8>);
+#if defined(AK_OS_MACOS)
+    static ReceivedMessageBytes adopt_vm_region(void*, size_t);
+#endif
+
+    ReadonlyBytes bytes() const;
+    bool is_empty() const { return bytes().is_empty(); }
+
+private:
+    class Impl;
+
+    explicit ReceivedMessageBytes(NonnullRefPtr<Impl>);
+
+    RefPtr<Impl> m_impl;
 };
 
 }
@@ -136560,27 +136707,22 @@ void TransportMachPort::process_received_message(u8* buffer)
     auto* descriptors = reinterpret_cast<mach_msg_port_descriptor_t*>(body + 1);
     auto const* payload = reinterpret_cast<mach_msg_ool_descriptor_t const*>(&descriptors[attachment_count]);
 
+    VERIFY(payload->type == MACH_MSG_OOL_DESCRIPTOR);
+    auto payload_bytes = ReceivedMessageBytes::adopt_vm_region(payload->address, payload->size);
+
     auto message = make<Message>();
     for (unsigned int i = 0; i < attachment_count; ++i) {
         auto attachment = attachment_from_descriptor(descriptors[i]);
         if (attachment.is_error()) {
             dbgln("TransportMachPort: dropping message with invalid port descriptor {} of {}: {} (name={:x}, disposition={}, type={})",
                 i + 1, attachment_count, attachment.error(), descriptors[i].name, descriptors[i].disposition, descriptors[i].type);
-            if (payload->type == MACH_MSG_OOL_DESCRIPTOR && payload->size > 0)
-                vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(payload->address), payload->size);
             mark_peer_eof();
             return;
         }
         message->attachments.enqueue(attachment.release_value());
     }
 
-    VERIFY(payload->type == MACH_MSG_OOL_DESCRIPTOR);
-    if (payload->size > 0) {
-        message->bytes.append(static_cast<u8 const*>(payload->address), payload->size);
-        // The out-of-line payload arrives as a temporary mapping in this task. After copying it into our queue,
-        // unmap that region so each receive does not leak virtual memory.
-        vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(payload->address), payload->size);
-    }
+    message->bytes = move(payload_bytes);
 
     if (message->bytes.is_empty() && message->attachments.is_empty())
         return;
@@ -136635,11 +136777,11 @@ void TransportMachPort::wait_until_readable()
         m_incoming_cv.wait();
 }
 
-void TransportMachPort::post_message(Vector<u8> const& bytes, Vector<Attachment>& attachments)
+void TransportMachPort::post_message(MessageDataType bytes, Vector<Attachment>& attachments)
 {
     {
         Sync::MutexLocker locker(m_send_mutex);
-        m_pending_send_messages.append(PendingMessage { bytes, move(attachments) });
+        m_pending_send_messages.append(PendingMessage { move(bytes), move(attachments) });
     }
     wake_io_thread();
 }
@@ -136713,6 +136855,8 @@ FILE: Libraries/LibIPC/TransportMachPort.h
 #include <LibCore/Notifier.h>
 #include <LibIPC/Attachment.h>
 #include <LibIPC/AutoCloseFileDescriptor.h>
+#include <LibIPC/Forward.h>
+#include <LibIPC/ReceivedMessageBytes.h>
 #include <LibIPC/TransportHandle.h>
 #include <LibSync/ConditionVariable.h>
 #include <LibSync/Mutex.h>
@@ -136742,14 +136886,14 @@ public:
 
     void wait_until_readable();
 
-    void post_message(Vector<u8> const&, Vector<Attachment>& attachments);
+    void post_message(MessageDataType, Vector<Attachment>& attachments);
 
     enum class ShouldShutdown {
         No,
         Yes,
     };
     struct Message {
-        Vector<u8> bytes;
+        ReceivedMessageBytes bytes;
         Queue<Attachment> attachments;
     };
     ShouldShutdown read_as_many_messages_as_possible_without_blocking(Function<void(Message&&)>&&);
@@ -136761,7 +136905,7 @@ private:
     static constexpr unsigned int IPC_WAKEUP_MESSAGE_ID = 0x4950C003;
 
     struct PendingMessage {
-        Vector<u8> bytes;
+        MessageDataType bytes;
         Vector<Attachment> attachments;
     };
 
@@ -136862,11 +137006,11 @@ ErrorOr<TransportSocket::Paired> TransportSocket::create_paired()
     };
 }
 
-void SendQueue::enqueue_message(ReadonlyBytes header, ReadonlyBytes payload, Vector<int>&& fds)
+void SendQueue::enqueue_message(SocketMessageHeader header, MessageDataType payload, Vector<int>&& fds)
 {
     Sync::MutexLocker locker(m_mutex);
-    VERIFY(MUST(m_stream.write_some(header)) == header.size());
-    VERIFY(MUST(m_stream.write_some(payload)) == payload.size());
+    m_queued_byte_count += sizeof(SocketMessageHeader) + payload.size();
+    m_queued_messages.append(QueuedMessage { header, move(payload) });
     m_fds.append(fds.data(), fds.size());
 }
 
@@ -136874,9 +137018,28 @@ SendQueue::BytesAndFds SendQueue::peek(size_t max_bytes)
 {
     Sync::MutexLocker locker(m_mutex);
     BytesAndFds result;
-    auto bytes_to_send = min(max_bytes, m_stream.used_buffer_size());
+    auto bytes_to_send = min(max_bytes, m_queued_byte_count);
     result.bytes.resize(bytes_to_send);
-    m_stream.peek_some(result.bytes);
+    size_t copied_bytes = 0;
+    for (auto const& queued_message : m_queued_messages) {
+        if (copied_bytes == bytes_to_send)
+            break;
+
+        auto start_offset = queued_message.start_offset;
+        if (start_offset < sizeof(SocketMessageHeader)) {
+            ReadonlyBytes header { reinterpret_cast<u8 const*>(&queued_message.header), sizeof(SocketMessageHeader) };
+            copied_bytes += header.slice(start_offset).copy_trimmed_to(result.bytes.span().slice(copied_bytes));
+            if (copied_bytes == bytes_to_send)
+                break;
+            start_offset = sizeof(SocketMessageHeader);
+        }
+
+        auto payload_offset = start_offset - sizeof(SocketMessageHeader);
+        if (payload_offset < queued_message.payload.size()) {
+            ReadonlyBytes payload { queued_message.payload.data() + payload_offset, queued_message.payload.size() - payload_offset };
+            copied_bytes += payload.copy_trimmed_to(result.bytes.span().slice(copied_bytes));
+        }
+    }
 
     if (m_fds.size() > 0) {
         auto fds_to_send = min(m_fds.size(), Core::LocalSocket::MAX_TRANSFER_FDS);
@@ -136889,7 +137052,17 @@ SendQueue::BytesAndFds SendQueue::peek(size_t max_bytes)
 void SendQueue::discard(size_t bytes_count, size_t fds_count)
 {
     Sync::MutexLocker locker(m_mutex);
-    MUST(m_stream.discard(bytes_count));
+    VERIFY(bytes_count <= m_queued_byte_count);
+    m_queued_byte_count -= bytes_count;
+    while (bytes_count > 0) {
+        auto& queued_message = m_queued_messages.first();
+        auto available_bytes = queued_message.size() - queued_message.start_offset;
+        auto consumed_bytes = min(available_bytes, bytes_count);
+        queued_message.start_offset += consumed_bytes;
+        bytes_count -= consumed_bytes;
+        if (queued_message.start_offset == queued_message.size())
+            (void)m_queued_messages.remove(m_queued_messages.begin());
+    }
     m_fds.remove(0, fds_count);
 }
 
@@ -137075,22 +137248,12 @@ static constexpr size_t MAX_UNPROCESSED_BUFFER_SIZE = 128 * MiB;
 // Maximum number of accumulated unprocessed file descriptors before we disconnect the peer
 static constexpr size_t MAX_UNPROCESSED_FDS = 512;
 
-struct MessageHeader {
-    enum class Type : u8 {
-        Payload = 0,
-        FileDescriptorAcknowledgement = 1,
-    };
-    Type type { Type::Payload };
-    u32 payload_size { 0 };
-    u32 fd_count { 0 };
-};
-
-void TransportSocket::post_message(Vector<u8> const& bytes_to_write, Vector<Attachment>& attachments)
+void TransportSocket::post_message(MessageDataType bytes_to_write, Vector<Attachment>& attachments)
 {
     auto num_fds_to_transfer = attachments.size();
 
-    MessageHeader header {
-        .type = MessageHeader::Type::Payload,
+    SocketMessageHeader header {
+        .type = SocketMessageHeader::Type::Payload,
         .payload_size = static_cast<u32>(bytes_to_write.size()),
         .fd_count = static_cast<u32>(num_fds_to_transfer),
     };
@@ -137107,7 +137270,7 @@ void TransportSocket::post_message(Vector<u8> const& bytes_to_write, Vector<Atta
         }
     }
 
-    m_send_queue->enqueue_message({ reinterpret_cast<u8 const*>(&header), sizeof(header) }, bytes_to_write, move(raw_fds));
+    m_send_queue->enqueue_message(header, move(bytes_to_write), move(raw_fds));
     wake_io_thread();
 }
 
@@ -137213,10 +137376,10 @@ void TransportSocket::read_incoming_messages()
     Checked<u32> received_fd_count = 0;
     Checked<u32> acknowledged_fd_count = 0;
     size_t index = 0;
-    while (index + sizeof(MessageHeader) <= m_unprocessed_bytes.size()) {
-        MessageHeader header;
-        memcpy(&header, m_unprocessed_bytes.data() + index, sizeof(MessageHeader));
-        if (header.type == MessageHeader::Type::Payload) {
+    while (index + sizeof(SocketMessageHeader) <= m_unprocessed_bytes.size()) {
+        SocketMessageHeader header;
+        memcpy(&header, m_unprocessed_bytes.data() + index, sizeof(SocketMessageHeader));
+        if (header.type == SocketMessageHeader::Type::Payload) {
             if (header.payload_size > MAX_MESSAGE_PAYLOAD_SIZE) {
                 dbgln("TransportSocket: Rejecting message with payload_size {} exceeding limit {}", header.payload_size, MAX_MESSAGE_PAYLOAD_SIZE);
                 m_peer_eof = true;
@@ -137228,7 +137391,7 @@ void TransportSocket::read_incoming_messages()
                 break;
             }
             Checked<size_t> message_size = header.payload_size;
-            message_size += sizeof(MessageHeader);
+            message_size += sizeof(SocketMessageHeader);
             if (message_size.has_overflow() || message_size.value() > m_unprocessed_bytes.size() - index)
                 break;
             if (header.fd_count > m_unprocessed_attachments.size())
@@ -137242,13 +137405,15 @@ void TransportSocket::read_incoming_messages()
             }
             for (size_t i = 0; i < header.fd_count; ++i)
                 message->attachments.enqueue(m_unprocessed_attachments.dequeue());
-            if (message->bytes.try_append(m_unprocessed_bytes.data() + index + sizeof(MessageHeader), header.payload_size).is_error()) {
+            Vector<u8> payload_bytes;
+            if (payload_bytes.try_append(m_unprocessed_bytes.data() + index + sizeof(SocketMessageHeader), header.payload_size).is_error()) {
                 dbgln("TransportSocket: Failed to allocate message buffer for payload_size {}", header.payload_size);
                 m_peer_eof = true;
                 break;
             }
+            message->bytes = ReceivedMessageBytes::from_vector(move(payload_bytes));
             batch.append(move(message));
-        } else if (header.type == MessageHeader::Type::FileDescriptorAcknowledgement) {
+        } else if (header.type == SocketMessageHeader::Type::FileDescriptorAcknowledgement) {
             if (header.payload_size != 0) {
                 dbgln("TransportSocket: FileDescriptorAcknowledgement with non-zero payload_size {}", header.payload_size);
                 m_peer_eof = true;
@@ -137267,7 +137432,7 @@ void TransportSocket::read_incoming_messages()
         }
         Checked<size_t> new_index = index;
         new_index += header.payload_size;
-        new_index += sizeof(MessageHeader);
+        new_index += sizeof(SocketMessageHeader);
         if (new_index.has_overflow()) {
             dbgln("TransportSocket: index would overflow");
             m_peer_eof = true;
@@ -137290,12 +137455,12 @@ void TransportSocket::read_incoming_messages()
     }
 
     if (received_fd_count > 0u) {
-        MessageHeader header {
-            .type = MessageHeader::Type::FileDescriptorAcknowledgement,
+        SocketMessageHeader header {
+            .type = SocketMessageHeader::Type::FileDescriptorAcknowledgement,
             .payload_size = 0,
             .fd_count = received_fd_count.value(),
         };
-        m_send_queue->enqueue_message({ reinterpret_cast<u8 const*>(&header), sizeof(header) }, {}, {});
+        m_send_queue->enqueue_message(header, {}, {});
         wake_io_thread();
     }
 
@@ -137352,11 +137517,14 @@ FILE: Libraries/LibIPC/TransportSocket.h
 
 #pragma once
 
-#include <AK/MemoryStream.h>
 #include <AK/Queue.h>
+#include <AK/SinglyLinkedList.h>
+#include <AK/SinglyLinkedListSizePolicy.h>
 #include <LibCore/Socket.h>
 #include <LibIPC/Attachment.h>
 #include <LibIPC/AutoCloseFileDescriptor.h>
+#include <LibIPC/Forward.h>
+#include <LibIPC/ReceivedMessageBytes.h>
 #include <LibIPC/TransportHandle.h>
 #include <LibSync/ConditionVariable.h>
 #include <LibSync/Mutex.h>
@@ -137364,9 +137532,19 @@ FILE: Libraries/LibIPC/TransportSocket.h
 
 namespace IPC {
 
+struct SocketMessageHeader {
+    enum class Type : u8 {
+        Payload = 0,
+        FileDescriptorAcknowledgement = 1,
+    };
+    Type type { Type::Payload };
+    u32 payload_size { 0 };
+    u32 fd_count { 0 };
+};
+
 class SendQueue : public AtomicRefCounted<SendQueue> {
 public:
-    void enqueue_message(ReadonlyBytes header, ReadonlyBytes payload, Vector<int>&& fds);
+    void enqueue_message(SocketMessageHeader, MessageDataType payload, Vector<int>&& fds);
     struct BytesAndFds {
         Vector<u8> bytes;
         Vector<int> fds;
@@ -137375,7 +137553,16 @@ public:
     void discard(size_t bytes_count, size_t fds_count);
 
 private:
-    AllocatingMemoryStream m_stream;
+    struct QueuedMessage {
+        SocketMessageHeader header;
+        MessageDataType payload;
+        size_t start_offset { 0 };
+
+        size_t size() const { return sizeof(SocketMessageHeader) + payload.size(); }
+    };
+
+    SinglyLinkedList<QueuedMessage, AK::DefaultSizeCalculationPolicy> m_queued_messages;
+    size_t m_queued_byte_count { 0 };
     Vector<int> m_fds;
     Sync::Mutex m_mutex;
 };
@@ -137405,14 +137592,14 @@ public:
 
     void wait_until_readable();
 
-    void post_message(Vector<u8> const&, Vector<Attachment>& attachments);
+    void post_message(MessageDataType, Vector<Attachment>& attachments);
 
     enum class ShouldShutdown {
         No,
         Yes,
     };
     struct Message {
-        Vector<u8> bytes;
+        ReceivedMessageBytes bytes;
         Queue<Attachment> attachments;
     };
     ShouldShutdown read_as_many_messages_as_possible_without_blocking(Function<void(Message&&)>&&);
@@ -137647,7 +137834,7 @@ Attachment TransportSocketWindows::deserialize_attachment(ReadonlyBytes& seriali
     VERIFY_NOT_REACHED();
 }
 
-void TransportSocketWindows::post_message(Vector<u8> const& bytes, Vector<Attachment>& attachments)
+void TransportSocketWindows::post_message(MessageDataType bytes, Vector<Attachment>& attachments)
 {
     VERIFY(bytes.size() <= MAX_MESSAGE_PAYLOAD_SIZE);
     VERIFY(attachments.size() <= MAX_MESSAGE_FD_COUNT);
@@ -137768,11 +137955,13 @@ TransportSocketWindows::ShouldShutdown TransportSocketWindows::read_as_many_mess
         VERIFY(attachment_bytes.is_empty());
 
         auto const* payload = m_unprocessed_bytes.data() + index + sizeof(MessageHeader) + header.attachment_data_size;
-        if (message.bytes.try_append(payload, header.payload_size).is_error()) {
+        Vector<u8> payload_bytes;
+        if (payload_bytes.try_append(payload, header.payload_size).is_error()) {
             dbgln("TransportSocketWindows: Failed to allocate message buffer for payload_size {}", header.payload_size);
             should_shutdown = ShouldShutdown::Yes;
             break;
         }
+        message.bytes = ReceivedMessageBytes::from_vector(move(payload_bytes));
         callback(move(message));
         Checked<size_t> new_index = index;
         new_index += header.payload_size;
@@ -137822,6 +138011,8 @@ FILE: Libraries/LibIPC/TransportSocketWindows.h
 #include <AK/Queue.h>
 #include <LibCore/Socket.h>
 #include <LibIPC/Attachment.h>
+#include <LibIPC/Forward.h>
+#include <LibIPC/ReceivedMessageBytes.h>
 #include <LibIPC/TransportHandle.h>
 
 namespace IPC {
@@ -137848,14 +138039,14 @@ public:
 
     void wait_until_readable();
 
-    void post_message(Vector<u8> const&, Vector<Attachment>& attachments);
+    void post_message(MessageDataType, Vector<Attachment>& attachments);
 
     enum class ShouldShutdown {
         No,
         Yes,
     };
     struct Message {
-        Vector<u8> bytes;
+        ReceivedMessageBytes bytes;
         Queue<Attachment> attachments;
     };
     ShouldShutdown read_as_many_messages_as_possible_without_blocking(Function<void(Message&&)>&&);
@@ -409171,6 +409362,8 @@ generate_css_implementation()
 
 generate_html_implementation()
 
+generate_webgl_implementation()
+
 set(GENERATED_SOURCES
     ARIA/AriaRoles.cpp
     CSS/DefaultStyleSheetSource.cpp
@@ -409197,6 +409390,7 @@ set(GENERATED_SOURCES
     Worker/WebWorkerServerEndpoint.h
     HTML/MediaControlsDOM.cpp
     HTML/Parser/NamedCharacterReferences.cpp
+    WebGL/GLFunctions.cpp
 )
 
 ladybird_lib(LibWeb web EXPLICIT_SYMBOL_EXPORT)
@@ -648940,132 +649134,3 @@ void HTMLInputElement::did_select_files(Span<SelectedFile> selected_files, Multi
         auto contents = selected_file.take_contents();
 
         auto mime_type = MimeSniff::Resource::sniff(contents);
-        auto blob = FileAPI::Blob::create(realm(), move(contents), mime_type.essence());
-
-        // FIXME: The FileAPI should use ByteString for file names.
-        auto file_name = MUST(String::from_byte_string(selected_file.name()));
-
-        // FIXME: Fill in other fields (e.g. last_modified).
-        Bindings::FilePropertyBag options {};
-        options.type = mime_type.essence();
-
-        auto file = MUST(FileAPI::File::create(realm(), { { blob } }, file_name, move(options)));
-        files->add_file(file);
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#update-the-file-selection
-    // 1. Queue an element task on the user interaction task source given element and the following steps:
-    queue_an_element_task(HTML::Task::Source::UserInteraction, [this, files, multiple_handling]() mutable {
-        auto multiple = has_attribute(HTML::AttributeNames::multiple);
-
-        // 1. Update element's selected files so that it represents the user's selection.
-        if (m_selected_files && multiple && multiple_handling == MultipleHandling::Append) {
-            for (size_t i = 0; i < files->length(); ++i)
-                m_selected_files->add_file(*files->item(i));
-        } else {
-            m_selected_files = files;
-        }
-
-        update_file_input_shadow_tree();
-
-        // 2. Fire an event named input at the input element, with the bubbles and composed attributes initialized to true.
-        dispatch_event(DOM::Event::create(realm(), HTML::EventNames::input, { .bubbles = true, .composed = true }));
-
-        // 3. Fire an event named change at the input element, with the bubbles attribute initialized to true.
-        dispatch_event(DOM::Event::create(realm(), HTML::EventNames::change, { .bubbles = true }));
-    });
-}
-
-Utf16String HTMLInputElement::value() const
-{
-    switch (value_attribute_mode()) {
-    // https://html.spec.whatwg.org/multipage/input.html#dom-input-value-value
-    case ValueAttributeMode::Value:
-        // Return the current value of the element.
-        return m_value;
-
-    // https://html.spec.whatwg.org/multipage/input.html#dom-input-value-default
-    case ValueAttributeMode::Default:
-        // On getting, if the element has a value content attribute, return that attribute's value; otherwise, return
-        // the empty string.
-        return Utf16String::from_utf8(get_attribute_value(AttributeNames::value));
-
-    // https://html.spec.whatwg.org/multipage/input.html#dom-input-value-default-on
-    case ValueAttributeMode::DefaultOn:
-        // On getting, if the element has a value content attribute, return that attribute's value; otherwise, return
-        // the string "on".
-        if (auto value = get_attribute(AttributeNames::value); value.has_value())
-            return Utf16String::from_utf8(*value);
-        return "on"_utf16;
-
-    // https://html.spec.whatwg.org/multipage/input.html#dom-input-value-filename
-    case ValueAttributeMode::Filename:
-        // On getting, return the string "C:\fakepath\" followed by the name of the first file in the list of selected
-        // files, if any, or the empty string if the list is empty.
-        if (m_selected_files && m_selected_files->item(0))
-            return Utf16String::formatted("C:\\fakepath\\{}", m_selected_files->item(0)->name());
-        return {};
-    }
-
-    VERIFY_NOT_REACHED();
-}
-
-Optional<String> HTMLInputElement::optional_value() const
-{
-    switch (m_type) {
-    // https://html.spec.whatwg.org/multipage/input.html#submit-button-state-(type=submit):concept-fe-optional-value
-    case TypeAttributeState::SubmitButton:
-        // The element's optional value is the value of the element's value attribute, if there is one; otherwise null.
-        return get_attribute(AttributeNames::value);
-    default:
-        VERIFY_NOT_REACHED();
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-textarea/input-relevant-value
-Utf16String HTMLInputElement::relevant_value() const
-{
-    // AD-HOC: If a text node is present, use that as the raw text buffer, so that it can differ from the sanitized
-    //         or canonicalized value.
-    if (m_text_node)
-        return m_text_node->data();
-    return value();
-}
-
-WebIDL::ExceptionOr<void> HTMLInputElement::set_relevant_value(Utf16String const& value)
-{
-    if (m_text_node)
-        m_text_node->set_data(value);
-
-    // https://html.spec.whatwg.org/multipage/input.html#number-state-(type=number)
-    // If the user agent provides a user interface for selecting a number, then the value must be set to the best
-    // representation of the number representing the user's selection as a floating-point number.
-    if (type_state() == TypeAttributeState::Number) {
-        m_value = {};
-        if (auto parsed = parse_floating_point_number(value); parsed.has_value() && isfinite(*parsed))
-            m_value = convert_number_to_string(*parsed);
-    } else {
-        m_value = value_sanitization_algorithm(value);
-    }
-
-    update_placeholder_visibility();
-    return {};
-}
-
-WebIDL::ExceptionOr<void> HTMLInputElement::set_value(Utf16String const& value)
-{
-    auto& realm = this->realm();
-
-    switch (value_attribute_mode()) {
-    // https://html.spec.whatwg.org/multipage/input.html#dom-input-value-value
-    case ValueAttributeMode::Value: {
-        // 1. Let oldValue be the element's value.
-        auto old_value = move(m_value);
-
-        // 2. Set the element's value to the new value.
-        // NOTE: For the TextNode this is done as part of step 4 below.
-
-        // 3. Set the element's dirty value flag to true.
-        m_dirty_value = true;
-
-        // 4. Invoke the value sanitization algorithm, if the element's type attribute's current state defines one.
