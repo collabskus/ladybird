@@ -1,4 +1,200 @@
-﻿            # It doesn't make sense to wait for a close frame if the reason is
+﻿            if code is None and reason is not None and len(reason) > 0:
+                self._logger.warning(
+                    'Handler specified reason despite code being None')
+                reason = ''
+            if reason is None:
+                reason = ''
+        self._send_closing_handshake(code, reason)
+        self._logger.debug(
+            'Acknowledged closing handshake initiated by the peer '
+            '(code=%r, reason=%r)', code, reason)
+
+    def _process_ping_message(self, message):
+        """Processes ping message.
+
+        Args:
+            message: ping message.
+        """
+
+        try:
+            handler = self._request.on_ping_handler
+            if handler:
+                handler(self._request, message)
+                return
+        except AttributeError:
+            pass
+        self._send_pong(message)
+
+    def _process_pong_message(self, message):
+        """Processes pong message.
+
+        Args:
+            message: pong message.
+        """
+
+        # TODO(tyoshino): Add ping timeout handling.
+
+        inflight_pings = deque()
+
+        while True:
+            try:
+                expected_body = self._ping_queue.popleft()
+                if expected_body == message:
+                    # inflight_pings contains pings ignored by the
+                    # other peer. Just forget them.
+                    self._logger.debug(
+                        'Ping %r is acked (%d pings were ignored)',
+                        expected_body, len(inflight_pings))
+                    break
+                else:
+                    inflight_pings.append(expected_body)
+            except IndexError:
+                # The received pong was unsolicited pong. Keep the
+                # ping queue as is.
+                self._ping_queue = inflight_pings
+                self._logger.debug('Received a unsolicited pong')
+                break
+
+        try:
+            handler = self._request.on_pong_handler
+            if handler:
+                handler(self._request, message)
+        except AttributeError:
+            pass
+
+    def receive_message(self):
+        """Receive a WebSocket frame and return its payload as a text in
+        unicode or a binary in str.
+
+        Returns:
+            payload data of the frame
+            - as unicode instance if received text frame
+            - as str instance if received binary frame
+            or None iff received closing handshake.
+        Raises:
+            BadOperationException: when called on a client-terminated
+                connection.
+            ConnectionTerminatedException: when read returns empty
+                string.
+            InvalidFrameException: when the frame contains invalid
+                data.
+            UnsupportedFrameException: when the received frame has
+                flags, opcode we cannot handle. You can ignore this
+                exception and continue receiving the next frame.
+        """
+
+        if self._request.client_terminated:
+            raise BadOperationException(
+                'Requested receive_message after receiving a closing '
+                'handshake')
+
+        while True:
+            # mp_conn.read will block if no bytes are available.
+
+            frame = self._receive_frame_as_frame_object()
+
+            # Check the constraint on the payload size for control frames
+            # before extension processes the frame.
+            # See also http://tools.ietf.org/html/rfc6455#section-5.5
+            if (common.is_control_opcode(frame.opcode)
+                    and len(frame.payload) > 125):
+                raise InvalidFrameException(
+                    'Payload data size of control frames must be 125 bytes or '
+                    'less')
+
+            for frame_filter in self._options.incoming_frame_filters:
+                frame_filter.filter(frame)
+
+            if frame.rsv1 or frame.rsv2 or frame.rsv3:
+                raise UnsupportedFrameException(
+                    'Unsupported flag is set (rsv = %d%d%d)' %
+                    (frame.rsv1, frame.rsv2, frame.rsv3))
+
+            message = self._get_message_from_frame(frame)
+            if message is None:
+                continue
+
+            for message_filter in self._options.incoming_message_filters:
+                message = message_filter.filter(message)
+
+            if self._original_opcode == common.OPCODE_TEXT:
+                # The WebSocket protocol section 4.4 specifies that invalid
+                # characters must be replaced with U+fffd REPLACEMENT
+                # CHARACTER.
+                try:
+                    return message.decode('utf-8')
+                except UnicodeDecodeError as e:
+                    raise InvalidUTF8Exception(e)
+            elif self._original_opcode == common.OPCODE_BINARY:
+                return message
+            elif self._original_opcode == common.OPCODE_CLOSE:
+                self._process_close_message(message)
+                return None
+            elif self._original_opcode == common.OPCODE_PING:
+                self._process_ping_message(message)
+            elif self._original_opcode == common.OPCODE_PONG:
+                self._process_pong_message(message)
+            else:
+                raise UnsupportedFrameException('Opcode %d is not supported' %
+                                                self._original_opcode)
+
+    def _send_closing_handshake(self, code, reason):
+        body = create_closing_handshake_body(code, reason)
+        frame = create_close_frame(
+            body,
+            mask=self._options.mask_send,
+            frame_filters=self._options.outgoing_frame_filters)
+
+        self._request.server_terminated = True
+
+        self._write(frame)
+
+    def close_connection(self,
+                         code=common.STATUS_NORMAL_CLOSURE,
+                         reason='',
+                         wait_response=True):
+        """Closes a WebSocket connection. Note that this method blocks until
+        it receives acknowledgement to the closing handshake.
+
+        Args:
+            code: Status code for close frame. If code is None, a close
+                frame with empty body will be sent.
+            reason: string representing close reason.
+            wait_response: True when caller want to wait the response.
+        Raises:
+            BadOperationException: when reason is specified with code None
+                or reason is not an instance of both str and unicode.
+        """
+
+        if self._request.server_terminated:
+            self._logger.debug(
+                'Requested close_connection but server is already terminated')
+            return
+
+        # When we receive a close frame, we call _process_close_message().
+        # _process_close_message() immediately acknowledges to the
+        # server-initiated closing handshake and sets server_terminated to
+        # True. So, here we can assume that we haven't received any close
+        # frame. We're initiating a closing handshake.
+
+        if code is None:
+            if reason is not None and len(reason) > 0:
+                raise BadOperationException(
+                    'close reason must not be specified if code is None')
+            reason = ''
+        else:
+            if not isinstance(reason, bytes) and not isinstance(
+                    reason, six.text_type):
+                raise BadOperationException(
+                    'close reason must be an instance of bytes or unicode')
+
+        self._send_closing_handshake(code, reason)
+        self._logger.debug('Initiated closing handshake (code=%r, reason=%r)',
+                           code, reason)
+
+        if (code == common.STATUS_GOING_AWAY
+                or code == common.STATUS_PROTOCOL_ERROR) or not wait_response:
+            # It doesn't make sense to wait for a close frame if the reason is
             # protocol error or that the server is going away. For some of
             # other reasons, it might not make sense to wait for a close frame,
             # but it's not clear, yet.
@@ -12410,6 +12606,794 @@ Content-Security-Policy: script-src 'strict-dynamic' 'nonce-dummy'
 
 FILE: Tests/LibWeb/Text/input/wpt-import/content-security-policy/script-src/simpleSourcedScript.js
 window.postMessage(document.currentScript.id, "*");
+
+FILE: Tests/LibWeb/Text/input/wpt-import/cookies/__init__.py
+
+FILE: Tests/LibWeb/Text/input/wpt-import/cookies/attributes/domain.sub.html
+<!doctype html>
+<html>
+  <head>
+    <meta charset=utf-8>
+    <title>Test cookie domain attribute parsing</title>
+    <meta name=help href="https://tools.ietf.org/html/rfc6265#section-5.2.3">
+    <meta name="timeout" content="long">
+    <script src="/resources/testharness.js"></script>
+    <script src="/resources/testharnessreport.js"></script>
+    <script src="/resources/testdriver.js"></script>
+    <script src="/resources/testdriver-vendor.js"></script>
+  </head>
+  <body>
+    <script>
+      const port    = "{{ports[http][0]}}";
+      const wwwHost = "{{domains[www]}}";
+
+      test(t => {
+        const win = window.open(`http://${wwwHost}:${port}/cookies/attributes/resources/domain-child.sub.html`);
+        fetch_tests_from_window(win);
+      });
+    </script>
+  </body>
+</html>
+
+FILE: Tests/LibWeb/Text/input/wpt-import/cookies/attributes/resources/domain-child.sub.html
+<!doctype html>
+<html>
+  <head>
+    <meta charset=utf-8>
+    <title>Test cookie domain attribute parsing</title>
+    <meta name=help href="https://tools.ietf.org/html/rfc6265#section-5.2.3">
+    <meta name="timeout" content="long">
+    <script src="../../../resources/testharness.js"></script>
+    <script src="../../../resources/testdriver.js"></script>
+    <script src="../../../resources/testdriver-vendor.js"></script>
+    <script src="../../../cookies/resources/cookie-test.js"></script>
+  </head>
+  <body>
+    <script>
+      const path        = "path=/cookies/attributes"
+      const port        = "{{ports[http][0]}}";
+      const host        = "{{host}}";              // example.org
+      const wwwHost     = "{{domains[www]}}";      // home.example.org
+      const www1Host    = "{{domains[www1]}}";     // sibling.example.org
+      const www2wwwHost = "{{domains[www2.www]}}"; // subdomain.home.example.org
+
+      // naive helper method to return the TLD for a given domain
+      const getTLD = domain => {
+        let match = /\.[a-z]+$/.exec(domain);
+        if (match) {
+          return match[0];
+        } else {
+          throw 'Domain is malformed!';
+        }
+      }
+
+      // helper to take a domain like "www.example.org"
+      // and return a string like "www.eXaMpLe.org"
+      const makeBizarre = domain => {
+        let bizarre = "";
+        let domainArray = domain.split(".");
+        let secondLevel = domainArray[domainArray.length - 2];
+        for (let i in secondLevel) {
+          if (i % 2 == 1) {
+            bizarre += secondLevel[i].toUpperCase();
+          } else {
+            bizarre += secondLevel[i];
+          }
+        }
+        domainArray[domainArray.length - 2] = bizarre;
+        return domainArray.join(".");
+      }
+
+      // helper to change the current TLD to a TLD that doesn't exist, and is
+      // unlikely to exist in the future. (the main point is that the TLD
+      // *changes*, so there is no domain match, but we cant' predict how WPT
+      // servers may be set up in the wild so picking any valid TLD has the risk
+      // of future (unintentional) domain matching.
+      const changeTLD = domain => {
+        let domainArray = domain.split(".");
+        domainArray[domainArray.length - 1] += "zzz";
+        return domainArray.join(".");
+      }
+
+      const domainTests = [
+        {
+          cookie: `test=1; domain=${wwwHost}`,
+          expected: "test=1",
+          name: "Return cookie for a domain match",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=2; domain=${wwwHost}`,
+          expected: "",
+          name: "No cookie returned for domain mismatch (subdomains differ post-redirect)",
+          location: `http://${www1Host}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=3; domain=.${wwwHost}`,
+          expected: "test=3",
+          name: "Return cookie for a domain match with leading '.'",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=4; domain=${wwwHost}`,
+          expected: "test=4",
+          name: "Return cookie for domain match (domain attribute is suffix of the host name and first level subdomain)",
+          location: `http://${www2wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=5; domain=.${wwwHost}`,
+          expected: "test=5",
+          name: "Return cookie for domain match (domain attribute is suffix of the host name and first level subdomain, with leading '.')",
+          location: `http://${www2wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=6; domain=.${wwwHost}`,
+          expected: "",
+          name: "No cookie returned for domain mismatch (subdomains differ, with leading '.')",
+          location: `http://${www1Host}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=7; domain=${www1Host}`,
+          expected: "",
+          name: "No cookie returned for domain mismatch when cookie was created (which would match after the redirect, with one subdomain level)",
+          location: `http://${www1Host}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=8; domain=.${host}`,
+          expected: "test=8",
+          name: "Return cookie for domain match (domain attribute is suffix of the host name, with leading '.')",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=9; domain=${host}`,
+          expected: "test=9",
+          name: "Return cookie for domain match (domain attribute is suffix of the host name)",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=10; domain=..${wwwHost}`,
+          expected: "",
+          name: "No cookie returned for domain attribute with double leading '.'",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=11; domain=www..${host}`,
+          expected: "",
+          name: "No cookie returned for domain attribute with subdomain followed by ..",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=12; domain=  .${wwwHost}`,
+          expected: "test=12",
+          name: "Return cookie for a domain match with leading whitespace and '.'",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=13; domain=  .  ${wwwHost}`,
+          expected: "",
+          name: "No cookie returned for domain attribute with whitespace that surrounds a leading '.'",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=14; domain=${wwwHost}.`,
+          expected: "",
+          name: "No cookie returned for domain attribute with trailing '.'",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=15; domain=${wwwHost}..`,
+          expected: "",
+          name: "No cookie returned for domain attribute with trailing '..'",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=16; domain=${wwwHost} .`,
+          expected: "",
+          name: "No cookie returned for domain attribute with trailing whitespace and '.'",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=17; domain=${getTLD(host)}`,
+          expected: "",
+          name: "No cookie returned for domain attribute with TLD as value",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=18; domain=.${getTLD(host)}`,
+          expected: "",
+          name: "No cookie returned for domain attribute with TLD as value, with leading '.'",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=18b; domain=.${getTLD(host)}.`,
+          expected: "",
+          name: "No cookie returned for domain attribute with TLD as value, with leading and trailing '.'",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: [`testA=19; domain=${wwwHost}`, `testB=19; domain=.${wwwHost}`],
+          expected: "testA=19; testB=19",
+          name: "Return multiple cookies that match on domain (without and with leading '.')",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: [`testB=20; domain=.${wwwHost}`, `testA=20; domain=${wwwHost}`],
+          expected: "testB=20; testA=20",
+          name: "Return multiple cookies that match on domain (with and without leading '.')",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=21; domain="${wwwHost}"`,
+          expected: "",
+          name: "No cookie returned for domain attribute value between quotes",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: [`testA=22; domain=${wwwHost}`, `testB=22; domain=.${host}`],
+          expected: "testA=22; testB=22",
+          name: "Return multiple cookies that match on subdomain and domain (without and with leading '.')",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: [`testB=23; domain=.${host}`, `testA=23; domain=${wwwHost}`],
+          expected: "testB=23; testA=23",
+          name: "Return multiple cookies that match on domain and subdomain (with and without leading '.')",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=24; domain=.${host}; domain=${wwwHost}`,
+          expected: "",
+          name: "No cookie returned when domain attribute does not domain-match (and first does)",
+          location: `http://${www1Host}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=25; domain=${wwwHost}; domain=.${host}`,
+          expected: "test=25",
+          name: "Return cookie for domain attribute match (first does not, but second does)",
+          location: `http://${www1Host}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=26; domain=${makeBizarre(wwwHost)}`,
+          expected: "test=26",
+          name: "Return cookie for domain match (with bizarre capitalization for domain attribute value)",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=27; domain="${wwwHost}:${port}"`,
+          expected: "",
+          name: "No cookie returned for domain attribute value with port",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=28; domain=${www2wwwHost}`,
+          expected: "",
+          name: "No cookie returned for domain mismatch when cookie was created (which would match after the redirect, with two subdomain levels)",
+          location: `http://${www2wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=29`,
+          expected: "",
+          name: "No cookie returned for cookie set on different domain (with no domain attribute)",
+          location: `http://${www2wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: "test=30; domain=",
+          expected: "test=30",
+          name: "Return cookie set with bare domain= attribute",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=31; domain=${wwwHost}`,
+          expected: "test=31",
+          name: "Return cookie that domain-matches with bizarre-cased URL",
+          location: `http://${makeBizarre(wwwHost)}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=32; domain=${wwwHost}; domain=${changeTLD(wwwHost)}`,
+          expected: "",
+          name: "No cookie returned for domain attribute mismatch (first attribute matches, but second does not)",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=33; domain=${changeTLD(wwwHost)}; domain=${wwwHost}`,
+          expected: "test=33",
+          name: "Return cookie for domain match (first attribute doesn't, but second does)",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=34; domain=${wwwHost}; domain=${changeTLD(wwwHost)}; domain=${wwwHost}`,
+          expected: "test=34",
+          name: "Return cookie for domain match (first attribute matches, second doesn't, third does)",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=35; domain=${changeTLD(wwwHost)}; domain=${wwwHost}; domain=${changeTLD(wwwHost)}`,
+          expected: "",
+          name: "No cookie returned for domain attribute mismatch (first attribute doesn't, second does, third doesn't)",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=36; domain=${wwwHost}; domain=${wwwHost}`,
+          expected: "test=36",
+          name: "Return cookie for domain match (with two identical domain attributes)",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=37; domain=${wwwHost}; domain=${host}`,
+          expected: "test=37",
+          name: "Return cookie for domain match (with first domain attribute a match for host name and second as suffix of host name)",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=38; domain=${host}; domain=${wwwHost}`,
+          expected: "test=38",
+          name: "Return cookie for domain match (with first domain attribute as suffix of host name and second a match for host name)",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=39; domain=.${www1Host}`,
+          expected: "",
+          name: "No cookie set on domain mismatch before a (domain matching) redirect",
+          location: `http://${www1Host}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=40; domain=.${www2wwwHost}`,
+          expected: "",
+          name: "No cookie set on domain mismatch before a (domain matching) redirect (for second level subdomain)",
+          location: `http://${www2wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=41; domain=${host}; domain=`,
+          expected: "test=41",
+          name: "Return cookie for domain match (with first domain attribute as suffix of host name and second a bare attribute)",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=42; domain=${www1Host}; domain=`,
+          expected: "test=42",
+          name: "Cookie returned for bare domain attribute following mismatched domain attribute (after redirect to same-origin page).",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=43; domain=${www1Host}; domain=`,
+          expected: "",
+          name: "No cookie returned for domain mismatch (first attribute is a different subdomain and second is bare)",
+          location: `http://${www2wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: [`test=not44; domain=${wwwHost}`, `test=44; domain=.${wwwHost}`],
+          expected: "test=44",
+          name: "Cookies with same name, path, and domain (differing only in leading '.') overwrite each other ('.' second)",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: [`test=not45; domain=.${wwwHost}`, `test=45; domain=${wwwHost}`],
+          expected: "test=45",
+          name: "Cookies with same name, path, and domain (differing only in leading '.') overwrite each other ('.' first)",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=46; domain=.`,
+          expected: "",
+          name: "No cookie returned for domain with single dot ('.') value.",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: `test=46b; domain=.; domain=${host}`,
+          expected: "test=46b",
+          name: "Return cookie with valid domain after domain with single dot ('.') value.",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: ["test=47", `test=47b; domain=${host}`,`test=47b; domain=${www1Host}; domain=`],
+          expected: "test=47b; test=47b",
+          name: "Empty domain treated as host cookie 1",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: ["test=48", `test=48b; domain=${host}`,`test=48b; domain=${host}; domain=`],
+          expected: "test=48b; test=48b",
+          name: "Empty domain treated as host cookie 2",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: ["test=49", `test=49b; domain=${host}`,`test=49b; domain=`],
+          expected: "test=49b; test=49b",
+          name: "Empty domain treated as host cookie 3",
+          location: `http://${wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: ["test=50", `test=50b; domain=${host}`,`test=50b; domain=${www1Host}; domain=`],
+          expected: "test=50b",
+          name: "No host cookies returned for host cookies after non-host redirect 1",
+          location: `http://${www2wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: ["test=51", `test=51b; domain=${host}`,`test=51b; domain=${host}; domain=`],
+          expected: "test=51b",
+          name: "No host cookies returned for host cookies after non-host redirect 2",
+          location: `http://${www2wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+        {
+          cookie: ["test=52", `test=52b; domain=${host}`,`test=52b; domain=`],
+          expected: "test=52b",
+          name: "No host cookies returned for host cookies after non-host redirect 3",
+          location: `http://${www2wwwHost}:${port}/cookies/attributes/resources/path.html`,
+        },
+      ];
+
+      for (const test of domainTests) {
+        if (Array.isArray(test.cookie)) {
+          for (let i in test.cookie) {
+            test.cookie[i] += `; ${path}`;
+          }
+        } else {
+          test.cookie += `; ${path}`;
+        }
+
+        httpRedirectCookieTest(test.cookie, test.expected, test.name,
+                               test.location);
+      }
+    </script>
+  </body>
+</html>
+
+FILE: Tests/LibWeb/Text/input/wpt-import/cookies/attributes/resources/path-redirect-shared.js
+// Note: this function has a dependency on testdriver.js. Any test files calling
+// it should include testdriver.js and testdriver-vendor.js
+window.addEventListener("message", (e) => {
+  setTestContextUsingRootWindow();
+  if (e.data == "getAndExpireCookiesForRedirectTest") {
+    const cookies = document.cookie;
+    test_driver.delete_all_cookies().then(() => {
+      e.source.postMessage({"cookies": cookies}, '*');
+    });
+  }
+});
+
+FILE: Tests/LibWeb/Text/input/wpt-import/cookies/attributes/resources/path.html
+<!doctype html>
+<html>
+<head>
+  <meta charset=utf-8>
+  <title>helper iframe for matching cookie path redirect tests</title>
+  <meta name=help href="http://tools.ietf.org/html/rfc6265#section-5.1.4">
+</head>
+<body>
+  <script src="../../../resources/testdriver.js"></script>
+  <script src="../../../resources/testdriver-vendor.js"></script>
+  <script src="../../../cookies/resources/cookie-test.js"></script>
+  <script src="../../../cookies/attributes/resources/path-redirect-shared.js"></script>
+</body>
+</html>
+FILE: Tests/LibWeb/Text/input/wpt-import/cookies/attributes/resources/path.html.headers
+Access-Control-Allow-Origin: *
+FILE: Tests/LibWeb/Text/input/wpt-import/cookies/resources/__init__.py
+
+FILE: Tests/LibWeb/Text/input/wpt-import/cookies/resources/cookie-test.js
+// getAndExpireCookiesForDefaultPathTest is a helper method to get and delete
+// cookies using echo-cookie.html.
+async function getAndExpireCookiesForDefaultPathTest() {
+  return new Promise((resolve, reject) => {
+    try {
+      const iframe = document.createElement('iframe');
+      iframe.style = 'display: none';
+      iframe.addEventListener('load', (e) => {
+        const win = e.target.contentWindow;
+        const iframeCookies = win.getCookies();
+        win.expireCookies().then(() => {
+          document.documentElement.removeChild(iframe);
+          resolve(iframeCookies);
+        });
+      }, {once: true});
+      iframe.src = '/cookies/resources/echo-cookie.html';
+      document.documentElement.appendChild(iframe);
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
+// getAndExpireCookiesForRedirectTest is a helper method to get and delete
+// cookies that were set from a Location header redirect.
+async function getAndExpireCookiesForRedirectTest(location) {
+  return new Promise((resolve, reject) => {
+    try {
+      const iframe = document.createElement('iframe');
+      iframe.style = 'display: none';
+      const listener = (e) => {
+        if (typeof e.data == 'object' && 'cookies' in e.data) {
+          window.removeEventListener('message', listener);
+          document.documentElement.removeChild(iframe);
+          resolve(e.data.cookies);
+        }
+      };
+      window.addEventListener('message', listener);
+      iframe.addEventListener('load', (e) => {
+        e.target.contentWindow.postMessage('getAndExpireCookiesForRedirectTest', '*');
+      }, {once: true});
+      iframe.src = location;
+      document.documentElement.appendChild(iframe);
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
+// httpCookieTest sets a `cookie` (via HTTP), then asserts it was or was not set
+// via `expectedValue` (via the DOM). Then cleans it up (via test driver). Most
+// tests do not set a Path attribute, so `defaultPath` defaults to true. If the
+// cookie values are expected to cause the HTTP request or response to fail, the
+// test can be made to pass when this happens via `allowFetchFailure`, which
+// defaults to false.
+//
+// `cookie` may be a single cookie string, or an array of cookie strings, where
+// the order of the array items represents the order of the Set-Cookie headers
+// sent by the server.
+//
+// Note: this function has a dependency on testdriver.js. Any test files calling
+// it should include testdriver.js and testdriver-vendor.js
+function httpCookieTest(cookie, expectedValue, name, defaultPath = true,
+                        allowFetchFailure = false) {
+  return promise_test((t) => {
+    var skipAssertions = false;
+    return new Promise(async (resolve, reject) => {
+      // The result is ignored as we're expiring cookies for cleaning here.
+      await getAndExpireCookiesForDefaultPathTest();
+      await test_driver.delete_all_cookies();
+      t.add_cleanup(test_driver.delete_all_cookies);
+
+      let encodedCookie = encodeURIComponent(JSON.stringify(cookie));
+      try {
+        await fetch(`/cookies/resources/cookie.py?set=${encodedCookie}`);
+      } catch {
+        if (allowFetchFailure) {
+          skipAssertions = true;
+        } else {
+          reject('Failed to fetch /cookies/resources/cookie.py');
+        }
+      }
+      let cookies = document.cookie;
+      if (defaultPath) {
+        // for the tests where a Path is set from the request-uri
+        // path, we need to go look for cookies in an iframe at that
+        // default path.
+        cookies = await getAndExpireCookiesForDefaultPathTest();
+      }
+      resolve(cookies);
+    }).then((cookies) => {
+      if (skipAssertions) {
+        return;
+      }
+      if (Boolean(expectedValue)) {
+        assert_equals(cookies, expectedValue, 'The cookie was set as expected.');
+      } else {
+        assert_equals(cookies, expectedValue, 'The cookie was rejected.');
+      }
+    });
+  }, name);
+}
+
+// This is a variation on httpCookieTest, where a redirect happens via
+// the Location header and we check to see if cookies are sent via
+// getRedirectedCookies
+//
+// Note: the locations targeted by this function have a dependency on
+// path-redirect-shared.js and should be sure to include it.
+function httpRedirectCookieTest(cookie, expectedValue, name, location) {
+  return promise_test(async (t) => {
+    // The result is ignored as we're expiring cookies for cleaning here.
+    await getAndExpireCookiesForRedirectTest(location);
+
+    const encodedCookie = encodeURIComponent(JSON.stringify(cookie));
+    const encodedLocation = encodeURIComponent(location);
+    const setParams = `?set=${encodedCookie}&location=${encodedLocation}`;
+    await fetch(`/cookies/resources/cookie.py${setParams}`);
+    // for the tests where a redirect happens, we need to head
+    // to that URI to get the cookies (and then delete them there)
+    const cookies = await getAndExpireCookiesForRedirectTest(location);
+    if (Boolean(expectedValue)) {
+      assert_equals(cookies, expectedValue, 'The cookie was set as expected.');
+    } else {
+      assert_equals(cookies, expectedValue, 'The cookie was rejected.');
+    }
+  }, name);
+}
+
+// Sets a `cookie` via the DOM, checks it against `expectedValue` via the DOM,
+// then cleans it up via the DOM. This is needed in cases where going through
+// HTTP headers may modify the cookie line (e.g. by stripping control
+// characters).
+//
+// Note: this function has a dependency on testdriver.js. Any test files calling
+// it should include testdriver.js and testdriver-vendor.js
+function domCookieTest(cookie, expectedValue, name) {
+  return promise_test(async (t) => {
+    await test_driver.delete_all_cookies();
+    t.add_cleanup(test_driver.delete_all_cookies);
+
+    if (typeof cookie === "string") {
+      document.cookie = cookie;
+    } else if (Array.isArray(cookie)) {
+      for (const singlecookie of cookie) {
+        document.cookie = singlecookie;
+      }
+    } else {
+      throw new Error('Unexpected type passed into domCookieTest as cookie: ' + typeof cookie);
+    }
+    let cookies = document.cookie;
+    assert_equals(cookies, expectedValue, Boolean(expectedValue) ?
+                                          'The cookie was set as expected.' :
+                                          'The cookie was rejected.');
+  }, name);
+}
+
+// Returns an array of control characters along with their ASCII codes. Control
+// characters are defined by RFC 5234 to be %x00-1F / %x7F.
+function getCtlCharacters() {
+  const ctlCodes = [...Array(0x20).keys()]
+                       .concat([0x7F]);
+  return ctlCodes.map(i => ({ code: i, chr: String.fromCharCode(i) }))
+}
+
+// Returns a cookie string with name set to "t" * nameLength and value
+// set to "1" * valueLength. Passing in 0 for either allows for creating
+// a name- or value-less cookie.
+//
+// Note: Cookie length checking should ignore the "=".
+function cookieStringWithNameAndValueLengths(nameLength, valueLength) {
+  return `${"t".repeat(nameLength)}=${"1".repeat(valueLength)}`;
+}
+
+// Finds the root window.top.opener and directs test_driver commands to it.
+//
+// If you see a message like: "Error: Tried to run in a non-testharness window
+// without a call to set_test_context." then you probably need to call this.
+function setTestContextUsingRootWindow() {
+  let test_window = window.top;
+  while (test_window.opener && !test_window.opener.closed) {
+    test_window = test_window.opener.top;
+  }
+  test_driver.set_test_context(test_window);
+}
+
+FILE: Tests/LibWeb/Text/input/wpt-import/cookies/resources/cookie.py
+import json
+
+from cookies.resources.helpers import setNoCacheAndCORSHeaders
+from wptserve.utils import isomorphic_decode
+from wptserve.utils import isomorphic_encode
+
+def set_cookie(headers, cookie_string):
+    """Helper method to add a Set-Cookie header"""
+    headers.append((b'Set-Cookie', isomorphic_encode(cookie_string)))
+
+def main(request, response):
+    """Set a cookie via GET params.
+
+    Usage: `/cookie.py?set={cookie}`
+
+    The passed-in cookie string should be stringified via JSON.stringify() (in
+    the case of multiple cookie headers sent in an array) and encoded via
+    encodeURIComponent, otherwise `parse_qsl` will split on any semicolons
+    (used by the Request.GET property getter). Note that values returned by
+    Request.GET will decode any percent-encoded sequences sent in a GET param
+    (which may or may not be surprising depending on what you're doing).
+
+    Note: here we don't use Response.delete_cookie() or similar other methods
+    in this resources directory because there are edge cases that are impossible
+    to express via those APIs, namely a bare (`Path`) or empty Path (`Path=`)
+    attribute. Instead, we pipe through the entire cookie and append `max-age=0`
+    to it.
+    """
+    headers = setNoCacheAndCORSHeaders(request, response)
+
+    if b'set' in request.GET:
+        cookie = isomorphic_decode(request.GET[b'set'])
+        cookie = json.loads(cookie)
+        cookies = cookie if isinstance(cookie, list) else [cookie]
+        for c in cookies:
+            set_cookie(headers, c)
+
+    if b'location' in request.GET:
+        headers.append((b'Location', request.GET[b'location']))
+        return 302, headers, b'{"redirect": true}'
+
+    return headers, b'{"success": true}'
+
+FILE: Tests/LibWeb/Text/input/wpt-import/cookies/resources/echo-cookie.html
+<!doctype html>
+<html>
+<head>
+  <meta charset=utf-8>
+  <title>helper iframe for matching cookie path tests</title>
+  <meta name=help href="http://tools.ietf.org/html/rfc6265#section-5.1.4">
+  <script src="/resources/testdriver.js"></script>
+  <script src="/resources/testdriver-vendor.js"></script>
+  <script src="/cookies/resources/cookie-test.js"></script>
+</head>
+<body>
+<script>
+window.setCookie = function (name, path) {
+  document.cookie = name + '=1; Path=' + path + ';';
+};
+window.fetchCookieThen = function (name, path) {
+  return fetch("/cookies/resources/set-cookie.py?name=" + encodeURIComponent(name) + "&path=" + encodeURIComponent(path), {'credentials': 'include'});
+};
+window.isCookieSet = function (name, path) {
+  return document.cookie.match(name + '=1');
+};
+// Note: this function has a dependency on testdriver.js. Any test files calling
+// it should include testdriver.js and testdriver-vendor.js
+window.expireCookies = async () => {
+  setTestContextUsingRootWindow();
+  await test_driver.delete_all_cookies();
+};
+window.getCookies = () => document.cookie;
+</script>
+</body>
+</html>
+
+FILE: Tests/LibWeb/Text/input/wpt-import/cookies/resources/helpers.py
+from urllib.parse import parse_qs
+
+from wptserve.utils import isomorphic_encode
+
+def setNoCacheAndCORSHeaders(request, response):
+    """Set Cache-Control, CORS and Content-Type headers appropriate for the cookie tests."""
+    headers = [(b"Content-Type", b"application/json"),
+               (b"Access-Control-Allow-Credentials", b"true")]
+
+    origin = b"*"
+    if b"origin" in request.headers:
+        origin = request.headers[b"origin"]
+
+    headers.append((b"Access-Control-Allow-Origin", origin))
+    #headers.append(("Access-Control-Allow-Credentials", "true"))
+    headers.append((b"Cache-Control", b"no-cache"))
+    headers.append((b"Expires", b"Fri, 01 Jan 1990 00:00:00 GMT"))
+
+    return headers
+
+def makeCookieHeader(name, value, otherAttrs):
+    """Make a Set-Cookie header for a cookie with the name, value and attributes provided."""
+    def makeAV(a, v):
+        if None == v or b"" == v:
+            return a
+        if isinstance(v, int):
+            return b"%s=%i" % (a, v)
+        else:
+            return b"%s=%s" % (a, v)
+
+    # ensure cookie name is always first
+    attrs = [b"%s=%s" % (name, value)]
+    attrs.extend(makeAV(a, v) for (a, v) in otherAttrs.items())
+    return (b"Set-Cookie", b"; ".join((attrs)))
+
+def makeDropCookie(name, secure):
+    attrs = {b"max-age": 0, b"path": b"/"}
+    if secure:
+        attrs[b"secure"] = b""
+    return makeCookieHeader(name, b"", attrs)
+
+def readParameter(request, paramName, requireValue):
+    """Read a parameter from the request. Raise if requireValue is set and the
+    parameter has an empty value or is not present."""
+    params = parse_qs(request.url_parts.query)
+    param = params[paramName][0].strip()
+    if len(param) == 0:
+        raise Exception(u"Empty or missing name parameter.")
+    return isomorphic_encode(param)
+
+def readCookies(request):
+    """Read the cookies from the client present in the request."""
+    cookies = {}
+    for key in request.cookies:
+        for cookie in request.cookies.get_list(key):
+            # do we care we'll clobber cookies here? If so, do we
+            # need to modify the test to take cookie names and value lists?
+            cookies[key] = cookie.value
+    return cookies
 
 FILE: Tests/LibWeb/Text/input/wpt-import/cors/image-tainting-in-cross-origin-iframe.sub.html
 <!DOCTYPE html>
@@ -319187,6 +320171,10 @@ window.test_driver_internal.get_computed_label = async function(element) {
 
 window.test_driver_internal.get_computed_role = async function(element) {
     return await window.internals.getComputedRole(element);
+};
+
+window.test_driver_internal.delete_all_cookies = function(context) {
+    return window.internals.deleteAllCookies();
 };
 
 window.test_driver_internal.action_sequence = function(actions, context) {
