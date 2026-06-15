@@ -25165,6 +25165,35 @@ HashTable<GC::RawRef<Navigable>>& all_navigables()
     return *set;
 }
 
+// https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-session-history-entries
+static Vector<NonnullRefPtr<SessionHistoryEntry>>* get_session_history_entries_if_present(TraversableNavigable& traversable, Navigable const& navigable)
+{
+    // 4. Let docStates be an empty ordered set of document states.
+    Vector<RefPtr<DocumentState>> doc_states;
+
+    // 5. For each entry of traversable's session history entries, append entry's document state to docStates.
+    for (auto& entry : traversable.session_history_entries())
+        doc_states.append(entry->document_state());
+
+    // 6. For each docState of docStates:
+    for (size_t i = 0; i < doc_states.size(); ++i) {
+        auto doc_state = doc_states[i];
+
+        // 1. For each nestedHistory of docState's nested histories:
+        for (auto& nested_history : doc_state->nested_histories()) {
+            // 1. If nestedHistory's id equals navigable's id, return nestedHistory's entries.
+            if (nested_history.id == navigable.id())
+                return &nested_history.entries;
+
+            // 2. For each entry of nestedHistory's entries, append entry's document state to docStates.
+            for (auto& entry : nested_history.entries)
+                doc_states.append(entry->document_state());
+        }
+    }
+
+    return nullptr;
+}
+
 // https://html.spec.whatwg.org/multipage/document-sequences.html#child-navigable
 Vector<GC::Root<Navigable>> Navigable::child_navigables() const
 {
@@ -25847,28 +25876,8 @@ Vector<NonnullRefPtr<SessionHistoryEntry>>& Navigable::get_session_history_entri
     if (this == traversable)
         return traversable->session_history_entries();
 
-    // 4. Let docStates be an empty ordered set of document states.
-    Vector<RefPtr<DocumentState>> doc_states;
-
-    // 5. For each entry of traversable's session history entries, append entry's document state to docStates.
-    for (auto& entry : traversable->session_history_entries())
-        doc_states.append(entry->document_state());
-
-    // 6. For each docState of docStates:
-    for (size_t i = 0; i < doc_states.size(); ++i) {
-        auto doc_state = doc_states[i];
-
-        // 1. For each nestedHistory of docState's nested histories:
-        for (auto& nested_history : doc_state->nested_histories()) {
-            // 1. If nestedHistory's id equals navigable's id, return nestedHistory's entries.
-            if (nested_history.id == id())
-                return nested_history.entries;
-
-            // 2. For each entry of nestedHistory's entries, append entry's document state to docStates.
-            for (auto& entry : nested_history.entries)
-                doc_states.append(entry->document_state());
-        }
-    }
+    if (auto* entries = get_session_history_entries_if_present(*traversable, *this))
+        return *entries;
 
     VERIFY_NOT_REACHED();
 }
@@ -27766,7 +27775,23 @@ void finalize_a_cross_document_navigation(GC::Ref<Navigable> navigable, HistoryH
     int target_step;
 
     // 8. Let targetEntries be the result of getting session history entries for navigable.
-    auto& target_entries = navigable->get_session_history_entries();
+    Vector<NonnullRefPtr<SessionHistoryEntry>>* target_entries_pointer = nullptr;
+    if (navigable.ptr() == traversable.ptr()) {
+        target_entries_pointer = &traversable->session_history_entries();
+    } else {
+        target_entries_pointer = get_session_history_entries_if_present(*traversable, navigable);
+        // https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-session-history-entries
+        // AD-HOC: The spec asserts that a nested history list is found. A queued child-frame commit can run
+        //         after the iframe has been removed, when there is no remaining list to update. Chromium,
+        //         WebKit, and Gecko bind child-frame commits to the live frame, so a removed frame's late
+        //         commit has no observable session history effect.
+        if (!target_entries_pointer) {
+            navigable->clear_navigation_load_event_guard();
+            on_complete->function()(HistoryStepResult::Applied);
+            return;
+        }
+    }
+    auto& target_entries = *target_entries_pointer;
 
     // 9. If entryToReplace is null, then:
     if (entry_to_replace == nullptr) {
@@ -27783,10 +27808,45 @@ void finalize_a_cross_document_navigation(GC::Ref<Navigable> navigable, HistoryH
         target_entries.append(history_entry);
     } else {
         // 1. Replace entryToReplace with historyEntry in targetEntries.
-        *(target_entries.find(*entry_to_replace)) = history_entry;
+        auto entry_to_replace_iterator = target_entries.find(*entry_to_replace);
+        if (entry_to_replace_iterator == target_entries.end()) {
+            if (!navigable->active_document()->is_initial_about_blank()) {
+                // AD-HOC: A non-initial document whose entryToReplace is no longer in targetEntries is the same
+                //         stale child-frame commit case as above.
+                navigable->clear_navigation_load_event_guard();
+                on_complete->function()(HistoryStepResult::Applied);
+                return;
+            }
 
-        // 2. Set historyEntry's step to entryToReplace's step.
-        history_entry->set_step(entry_to_replace->step());
+            // https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-child-navigable
+            // https://html.spec.whatwg.org/multipage/browsing-the-web.html#finalize-a-cross-document-navigation
+            // AD-HOC: Initial about:blank's first real navigation is a replacement. If a synchronous
+            //         same-document history update swapped out the original entry object before the queued
+            //         cross-document commit runs, replace the remaining initial child entry instead.
+            Optional<size_t> entry_to_replace_index;
+            for (size_t i = 0; i < target_entries.size(); ++i) {
+                if (target_entries[i]->step() == entry_to_replace->step()) {
+                    entry_to_replace_index = i;
+                    break;
+                }
+            }
+            if (!entry_to_replace_index.has_value() && target_entries.size() == 1)
+                entry_to_replace_index = 0;
+            if (!entry_to_replace_index.has_value()) {
+                navigable->clear_navigation_load_event_guard();
+                on_complete->function()(HistoryStepResult::Applied);
+                return;
+            }
+
+            auto replacement_entry = target_entries[*entry_to_replace_index];
+            target_entries[*entry_to_replace_index] = history_entry;
+            history_entry->set_step(replacement_entry->step());
+        } else {
+            *entry_to_replace_iterator = history_entry;
+
+            // 2. Set historyEntry's step to entryToReplace's step.
+            history_entry->set_step(entry_to_replace->step());
+        }
 
         // 3. If historyEntry's document state's origin is same origin with entryToReplace's document state's origin,
         //    then set historyEntry's navigation API key to entryToReplace's navigation API key.
@@ -67071,32 +67131,23 @@ void ApplyHistoryStepState::start()
     // 8. For each navigable of changingNavigables:
     auto changing_navigables = m_traversable->get_all_navigables_whose_current_session_history_entry_will_change_or_reload(m_target_step);
     for (auto& navigable : changing_navigables) {
-        // AD-HOC: For a synchronous (same-document) application of a history step, skip a navigable that has just
-        //         been claimed by a fresh ongoing navigation. Apply the history step would otherwise transition the
-        //         navigable's ongoing navigation through "traversal" and back to null, which informs the navigation
-        //         API about aborting (cancelling the in-flight navigation's navigate event) and then trips the
-        //         "ongoing navigation is no longer navigationId" bail-out in navigate's deferred steps, leaving the
-        //         in-flight navigation stranded.
-        //
-        //         The race shows up when a click capture handler calls history.replaceState and the link's
-        //         cross-document activation behavior runs in the same task: the replaceState's queued sync step
-        //         finalizes after the link nav has already entered begin_navigation, and wipes its id. Real-world
-        //         example: Shopify storefronts running hCaptcha (which hooks click and replaceStates to the current
-        //         URL for analytics). The page silently never moves.
-        //
-        //         No major engine reproduces this. Chromium runs sync same-document nav entirely in-task and never
-        //         enters a parallel traversal queue, WebKit doesn't track navigation IDs at all, and Gecko routes
-        //         sync replaceState directly through history without entering SetOngoingNavigation. The strictly
-        //         correct long-term fix is to bypass the traversal queue for sync same-document navigations to
-        //         match Chromium; until then, skipping the transient when the navigable is already mid-navigation
-        //         matches the observable behavior of all three.
-        //
-        //         Cross-document and traversal applications still process every changing navigable: the "traversal"
-        //         transition there is not transient. It precedes an actual document switch that takes ownership.
+        // https://html.spec.whatwg.org/multipage/browsing-the-web.html#finalize-a-same-document-navigation
+        // AD-HOC: The spec queues same-document history updates because they happen synchronously, outside the
+        //         traversal queue, and must later resolve races with the current history step. If another navigation
+        //         has already claimed the navigable by the time this queued reconciliation runs, leave that navigation
+        //         ID alone. This matches the observable behavior of Chromium, WebKit, and Gecko: a same-document
+        //         history update does not cancel a later cross-document navigation from the same task.
         if (m_synchronous_navigation == TraversableNavigable::SynchronousNavigation::Yes
             && navigable->ongoing_navigation().has<String>()) {
             continue;
         }
+
+        // https://html.spec.whatwg.org/multipage/document-sequences.html#creating-a-new-child-navigable
+        // NB: The creation/destruction update is the bookkeeping step after the child's nested history has been
+        //     attached to its parent document state. If the container's requested navigation has already started, it
+        //     owns the ongoing navigation ID and eventual document activation.
+        if (!m_navigation_type.has_value() && navigable->ongoing_navigation().has<String>())
+            continue;
 
         // 1. Let targetEntry be the result of getting the target history entry given navigable and targetStep.
         auto target_entry = navigable->get_the_target_history_entry(m_target_step);
@@ -67389,7 +67440,7 @@ void ApplyHistoryStepState::process_continuations()
             continue;
         }
 
-        VERIFY(m_target_step == m_traversable->get_the_used_step(m_step));
+        m_target_step = m_traversable->get_the_used_step(m_step);
 
         // 7. Let (scriptHistoryLength, scriptHistoryIndex) be the result of getting the history object length and index given traversable and targetStep.
         auto history_object_length_and_index = m_traversable->get_the_history_object_length_and_index(m_target_step);
@@ -67503,7 +67554,7 @@ void ApplyHistoryStepState::process_continuations()
 
 void ApplyHistoryStepState::enter_waiting_for_non_changing_jobs()
 {
-    VERIFY(m_target_step == m_traversable->get_the_used_step(m_step));
+    m_target_step = m_traversable->get_the_used_step(m_step);
 
     // 17. Let (scriptHistoryLength, scriptHistoryIndex) be the result of getting the history object length and index given traversable and targetStep.
     auto length_and_index = m_traversable->get_the_history_object_length_and_index(m_target_step);
@@ -67630,11 +67681,20 @@ TraversableNavigable::SessionHistorySnapshot TraversableNavigable::create_sessio
     auto used_history_steps = get_all_used_history_steps();
     Vector<i32> used_session_history_steps;
     used_session_history_steps.ensure_capacity(used_history_steps.size());
+    auto current_session_history_step_for_snapshot = current_session_history_step();
+    if (!used_history_steps.contains_slow(current_session_history_step_for_snapshot)) {
+        // https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-the-used-step
+        // NB: The UI process snapshot needs a current item from the used-steps list. While the
+        //     creation/destruction update is reconciling removed child navigables, the traversable's current
+        //     session history step can be a hole. Use the same greatest-used-step <= current step rule here only;
+        //     traversal and back/forward decisions still use the spec's current-step-in-allSteps assertions.
+        current_session_history_step_for_snapshot = get_the_used_step(current_session_history_step_for_snapshot);
+    }
     Optional<size_t> current_used_step_index;
     for (size_t i = 0; i < used_history_steps.size(); ++i) {
         auto step = used_history_steps[i];
         used_session_history_steps.unchecked_append(static_cast<i32>(step));
-        if (step == current_session_history_step())
+        if (step == current_session_history_step_for_snapshot)
             current_used_step_index = i;
     }
     VERIFY(current_used_step_index.has_value());
@@ -67652,6 +67712,12 @@ void ApplyHistoryStepState::complete()
         return;
     m_phase = Phase::Completed;
     m_timeout->stop();
+
+    // https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-the-used-step
+    // NB: targetStep was computed before the asynchronous portions of applying the history step. If a child
+    //     navigable was removed while those steps were running, that step can stop being used. Normalize again
+    //     before storing it as the traversable's current session history step.
+    m_target_step = m_traversable->get_the_used_step(m_target_step);
 
     // 20. Set traversable's current session history step to targetStep.
     m_traversable->m_current_session_history_step = m_target_step;
@@ -103361,7 +103427,12 @@ void InlineFormattingContext::apply_justification_to_fragments(CSS::TextJustify 
 
         if (fragment.is_justifiable_whitespace()
             && fragment.inline_length() != justified_space_width) {
-            running_diff += justified_space_width - fragment.inline_length();
+            auto diff = justified_space_width - fragment.inline_length();
+            running_diff += diff;
+            for (auto& marker : line_box.static_position_markers()) {
+                if (marker.inline_offset > fragment.inline_offset())
+                    marker.inline_offset += diff;
+            }
             fragment.set_inline_length(justified_space_width);
         }
     }
@@ -103458,6 +103529,7 @@ void InlineFormattingContext::apply_text_overflow_ellipsis(Vector<LineBox>& line
                 fragments[j].set_fully_truncated(true);
 
             line_box.m_inline_length = available_width;
+            line_box.clamp_static_position_markers_to_inline_length();
             break;
         }
     }
@@ -103537,7 +103609,7 @@ void InlineFormattingContext::generate_line_boxes()
         }
         case InlineLevelIterator::Item::Type::AbsolutelyPositionedElement:
             if (auto const* box = as_if<Box>(*item.node)) {
-                // Calculation of static position for absolute boxes is delayed until trailing whitespaces are removed.
+                line_builder.append_static_position_marker(*box);
                 absolute_boxes.append(box);
             }
             break;
@@ -103603,8 +103675,6 @@ void InlineFormattingContext::generate_line_boxes()
 
     apply_text_overflow_ellipsis(line_boxes);
 
-    line_builder.remove_last_line_if_empty();
-
     auto const& containing_block = this->containing_block();
     auto text_align = containing_block.computed_values().text_align();
     auto text_justify = containing_block.computed_values().text_justify();
@@ -103627,14 +103697,35 @@ void InlineFormattingContext::generate_line_boxes()
     }
 
     line_builder.update_last_line();
-    m_containing_block_used_values.set_inline_end_static_position_rect(calculate_inline_end_static_position_rect());
 
     if (m_layout_mode == LayoutMode::Normal) {
-        for (auto* box : absolute_boxes) {
+        for (auto const* box : absolute_boxes) {
+            StaticPositionRect static_position_rect;
+            bool found_static_position_marker = false;
+            for (auto const& line_box : line_boxes) {
+                for (auto const& marker : line_box.static_position_markers()) {
+                    if (marker.box != box)
+                        continue;
+
+                    if (box->display_before_box_type_transformation().is_block_outside()) {
+                        auto block_position = line_box.fragments().is_empty() ? marker.offset().y() : line_box.bottom();
+                        static_position_rect.rect = { { 0, block_position }, { 0, 0 } };
+                    } else {
+                        static_position_rect.rect = { marker.offset(), { 0, 0 } };
+                    }
+                    found_static_position_marker = true;
+                    break;
+                }
+                if (found_static_position_marker)
+                    break;
+            }
             auto& box_state = m_state.get_mutable(*box);
-            box_state.set_static_position_rect(calculate_static_position_rect(*box));
+            box_state.set_static_position_rect(static_position_rect);
         }
     }
+
+    line_builder.remove_last_line_if_empty();
+    m_containing_block_used_values.set_inline_end_static_position_rect(calculate_inline_end_static_position_rect());
 }
 
 bool InlineFormattingContext::any_floats_intrude_at_block_offset(CSSPixels block_offset) const
@@ -103681,48 +103772,6 @@ CSSPixels InlineFormattingContext::vertical_float_clearance() const
 void InlineFormattingContext::set_vertical_float_clearance(CSSPixels vertical_float_clearance)
 {
     m_vertical_float_clearance = vertical_float_clearance;
-}
-
-StaticPositionRect InlineFormattingContext::calculate_static_position_rect(Box const& box) const
-{
-    VERIFY(box.parent());
-    VERIFY(box.parent()->children_are_inline());
-
-    CSSPixelPoint position;
-
-    // We're calculating the position for an absolutely positioned box in an IFC.
-    // Walk backwards through previous siblings to find the most recent one with a line box fragment.
-    LineBoxFragment const* last_fragment = nullptr;
-    for (auto sibling = box.previous_sibling(); sibling && !last_fragment; sibling = sibling->previous_sibling()) {
-        for (auto const& line_box : m_containing_block_used_values.line_boxes) {
-            for (auto const& fragment : line_box.fragments()) {
-                if (&fragment.layout_node() == sibling.ptr())
-                    last_fragment = &fragment;
-            }
-        }
-    }
-
-    // We need to position the box...
-    // ...below the last fragment, if the display-outside value (before box type transformation) is block.
-    // ...at the top right corner of the last fragment otherwise.
-    auto is_block_outside = box.display_before_box_type_transformation().is_block_outside();
-    if (last_fragment) {
-        if (is_block_outside) {
-            // Display-outside value is block => position below
-            position.set_x(0);
-            position.set_y(last_fragment->offset().y() + last_fragment->height());
-        } else {
-            // Display-outside value is not block => position to the right
-            position.set_x(last_fragment->offset().x() + last_fragment->width());
-            position.set_y(last_fragment->offset().y());
-        }
-    } else if (!is_block_outside) {
-        // No preceding sibling has a line box fragment (e.g. only floats and collapsed whitespace precede this box).
-        // For inline-level elements, the static position must account for float intrusion into the line box.
-        position.set_x(leftmost_inline_offset_at(0));
-    }
-
-    return { .rect = { position, { 0, 0 } } };
 }
 
 StaticPositionRect InlineFormattingContext::calculate_inline_end_static_position_rect() const
@@ -103802,7 +103851,6 @@ public:
     virtual void run(AvailableSpace const&) override;
     virtual CSSPixels automatic_content_height() const override;
     virtual CSSPixels automatic_content_width() const override;
-    StaticPositionRect calculate_static_position_rect(Box const&) const;
 
     void dimension_box_on_line(Box const&, LayoutMode);
 
@@ -106123,6 +106171,24 @@ void LineBox::add_fragment(Node const& layout_node, size_t start, size_t length,
     m_block_length = max(m_block_length, content_height + border_box_top + border_box_bottom);
 }
 
+void LineBox::add_static_position_marker(Box const& box)
+{
+    m_static_position_markers.append(StaticPositionMarker {
+        .box = &box,
+        .inline_offset = m_inline_length,
+        .block_offset = 0,
+        .writing_mode = m_writing_mode,
+    });
+}
+
+void LineBox::clamp_static_position_markers_to_inline_length()
+{
+    for (auto& marker : m_static_position_markers) {
+        if (marker.inline_offset > m_inline_length)
+            marker.inline_offset = m_inline_length;
+    }
+}
+
 CSSPixels LineBox::calculate_or_trim_trailing_whitespace(RemoveTrailingWhitespace should_remove)
 {
     auto should_trim = [](LineBoxFragment* fragment) {
@@ -106155,6 +106221,7 @@ CSSPixels LineBox::calculate_or_trim_trailing_whitespace(RemoveTrailingWhitespac
         if (should_remove == RemoveTrailingWhitespace::Yes) {
             m_inline_length -= last_fragment->inline_length();
             m_fragments.remove(fragment_index);
+            clamp_static_position_markers_to_inline_length();
         }
     }
 
@@ -106181,6 +106248,7 @@ CSSPixels LineBox::calculate_or_trim_trailing_whitespace(RemoveTrailingWhitespac
             --last_fragment->m_length_in_code_units;
             last_fragment->set_inline_length(last_fragment->inline_length() - last_character_width);
             m_inline_length -= last_character_width;
+            clamp_static_position_markers_to_inline_length();
         }
     }
 
@@ -106228,8 +106296,24 @@ FILE: Libraries/LibWeb/Layout/LineBox.h
 
 namespace Web::Layout {
 
+class Box;
+
 class LineBox {
 public:
+    struct StaticPositionMarker {
+        Box const* box { nullptr };
+        CSSPixels inline_offset { 0 };
+        CSSPixels block_offset { 0 };
+        CSS::WritingMode writing_mode { CSS::WritingMode::HorizontalTb };
+
+        CSSPixelPoint offset() const
+        {
+            if (writing_mode != CSS::WritingMode::HorizontalTb)
+                return { block_offset, inline_offset };
+            return { inline_offset, block_offset };
+        }
+    };
+
     LineBox(CSS::Direction direction, CSS::WritingMode writing_mode)
         : m_direction(direction)
         , m_writing_mode(writing_mode)
@@ -106245,12 +106329,16 @@ public:
     CSSPixels baseline() const { return m_baseline; }
 
     void add_fragment(Node const& layout_node, size_t start, size_t length, CSSPixels leading_size, CSSPixels trailing_size, CSSPixels leading_margin, CSSPixels trailing_margin, CSSPixels content_width, CSSPixels content_height, CSSPixels border_box_top, CSSPixels border_box_bottom, RefPtr<Gfx::GlyphRun> glyph_run = {});
+    void add_static_position_marker(Box const&);
 
     Vector<LineBoxFragment> const& fragments() const { return m_fragments; }
     Vector<LineBoxFragment>& fragments() { return m_fragments; }
+    Vector<StaticPositionMarker> const& static_position_markers() const { return m_static_position_markers; }
+    Vector<StaticPositionMarker>& static_position_markers() { return m_static_position_markers; }
 
     CSSPixels get_trailing_whitespace_width() const;
     void trim_trailing_whitespace();
+    void clamp_static_position_markers_to_inline_length();
 
     bool is_empty_or_ends_in_whitespace() const;
     bool is_empty() const { return m_fragments.is_empty() && !m_has_break; }
@@ -106271,6 +106359,7 @@ private:
     CSSPixels calculate_or_trim_trailing_whitespace(RemoveTrailingWhitespace);
 
     Vector<LineBoxFragment> m_fragments;
+    Vector<StaticPositionMarker> m_static_position_markers;
     CSSPixels m_inline_length { 0 };
     CSSPixels m_block_length { 0 };
     CSSPixels m_bottom { 0 };
@@ -106695,6 +106784,11 @@ void LineBuilder::append_text_chunk(TextNode const& text_node, size_t offset_in_
     m_max_height_on_current_line = max(m_max_height_on_current_line, line_box.block_length());
 }
 
+void LineBuilder::append_static_position_marker(Box const& box)
+{
+    ensure_last_line_box().add_static_position_marker(box);
+}
+
 CSSPixels LineBuilder::y_for_float_to_be_inserted_here(Box const& box)
 {
     auto const& box_state = m_layout_state.get(box);
@@ -106988,6 +107082,14 @@ void LineBuilder::update_last_line()
         lowermost_box_bottom = max(lowermost_box_bottom, bottom_of_inline_box);
     }
 
+    auto marker_inline_offset = line_box.fragments().is_empty()
+        ? max(inline_offset_top, inline_offset_bottom)
+        : inline_offset;
+    for (auto& marker : line_box.static_position_markers()) {
+        marker.inline_offset += marker_inline_offset;
+        marker.block_offset += block_offset + m_current_block_offset;
+    }
+
     // 3. The line box height is the distance between the uppermost box top and the lowermost box bottom.
     line_box.m_block_length = lowermost_box_bottom - uppermost_box_top;
     m_should_advance_to_last_line_box_bottom = should_align_strut_to_line_box_baseline;
@@ -107080,6 +107182,7 @@ public:
     void break_line(ForcedBreak, Optional<CSSPixels> next_item_width = {});
     void append_box(Box const&, CSSPixels leading_size, CSSPixels trailing_size, CSSPixels leading_margin, CSSPixels trailing_margin);
     void append_text_chunk(TextNode const&, size_t offset_in_node, size_t length_in_node, CSSPixels leading_size, CSSPixels trailing_size, CSSPixels leading_margin, CSSPixels trailing_margin, CSSPixels content_width, CSSPixels content_height, RefPtr<Gfx::GlyphRun>);
+    void append_static_position_marker(Box const&);
 
     // Returns whether a line break occurred.
     bool break_if_needed(CSSPixels next_item_width)
@@ -107489,8 +107592,12 @@ FILE: Libraries/LibWeb/Layout/Node.cpp
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/PaintableBox.h>
+#include <LibWeb/SVG/SVGClipPathElement.h>
 #include <LibWeb/SVG/SVGFilterElement.h>
 #include <LibWeb/SVG/SVGForeignObjectElement.h>
+#include <LibWeb/SVG/SVGGradientElement.h>
+#include <LibWeb/SVG/SVGPatternElement.h>
+#include <LibWeb/SVG/SVGTextContentElement.h>
 
 namespace Web::Layout {
 
@@ -107571,21 +107678,23 @@ bool Node::computed_values_establish_absolute_positioning_containing_block() con
     if (computed_values.position() != CSS::Positioning::Static || will_change_property(CSS::PropertyID::Position))
         return true;
 
-    // https://drafts.csswg.org/css-transforms-1/#propdef-transform
-    // Any computed value other than none for the transform affects containing block and stacking context
-    if (!computed_values.transformations().is_empty() || will_change_property(CSS::PropertyID::Transform))
-        return true;
-    if (computed_values.translate() || will_change_property(CSS::PropertyID::Translate))
-        return true;
-    if (computed_values.rotate() || will_change_property(CSS::PropertyID::Rotate))
-        return true;
-    if (computed_values.scale() || will_change_property(CSS::PropertyID::Scale))
-        return true;
+    if (is_transformable()) {
+        // https://drafts.csswg.org/css-transforms-1/#propdef-transform
+        // Any computed value other than none for the transform affects containing block and stacking context.
+        if (!computed_values.transformations().is_empty() || will_change_property(CSS::PropertyID::Transform))
+            return true;
+        if (computed_values.translate() || will_change_property(CSS::PropertyID::Translate))
+            return true;
+        if (computed_values.rotate() || will_change_property(CSS::PropertyID::Rotate))
+            return true;
+        if (computed_values.scale() || will_change_property(CSS::PropertyID::Scale))
+            return true;
+    }
 
     // https://drafts.csswg.org/css-transforms-2/#propdef-perspective
     // The use of this property with any value other than 'none' establishes a stacking context. It also establishes
     // a containing block for all descendants, just like the 'transform' property does.
-    if (computed_values.perspective().has_value() || will_change_property(CSS::PropertyID::Perspective))
+    if (is_transformable() && (computed_values.perspective().has_value() || will_change_property(CSS::PropertyID::Perspective)))
         return true;
 
     // https://drafts.csswg.org/filter-effects-1/#FilterProperty
@@ -107613,8 +107722,7 @@ bool Node::computed_values_establish_absolute_positioning_containing_block() con
     // https://drafts.csswg.org/css-transforms-2/#transform-style-property
     // A computed value of 'preserve-3d' for 'transform-style' on a transformable element establishes both a
     // stacking context and a containing block for all descendants.
-    // FIXME: Check that the element is a transformable element.
-    if (computed_values.transform_style() == CSS::TransformStyle::Preserve3d || will_change_property(CSS::PropertyID::TransformStyle))
+    if (is_transformable() && (computed_values.transform_style() == CSS::TransformStyle::Preserve3d || will_change_property(CSS::PropertyID::TransformStyle)))
         return true;
 
     // https://drafts.csswg.org/css-view-transitions-1/#snapshot-containing-block-concept
@@ -107657,21 +107765,23 @@ bool Node::establishes_a_fixed_positioning_containing_block() const
         return computed_values.will_change().has_property(property_id);
     };
 
-    // https://drafts.csswg.org/css-transforms-1/#propdef-transform
-    // Any computed value other than none for the transform affects containing block and stacking context
-    if (!computed_values.transformations().is_empty() || will_change_property(CSS::PropertyID::Transform))
-        return true;
-    if (computed_values.translate() || will_change_property(CSS::PropertyID::Translate))
-        return true;
-    if (computed_values.rotate() || will_change_property(CSS::PropertyID::Rotate))
-        return true;
-    if (computed_values.scale() || will_change_property(CSS::PropertyID::Scale))
-        return true;
+    if (is_transformable()) {
+        // https://drafts.csswg.org/css-transforms-1/#propdef-transform
+        // Any computed value other than none for the transform affects containing block and stacking context.
+        if (!computed_values.transformations().is_empty() || will_change_property(CSS::PropertyID::Transform))
+            return true;
+        if (computed_values.translate() || will_change_property(CSS::PropertyID::Translate))
+            return true;
+        if (computed_values.rotate() || will_change_property(CSS::PropertyID::Rotate))
+            return true;
+        if (computed_values.scale() || will_change_property(CSS::PropertyID::Scale))
+            return true;
+    }
 
     // https://drafts.csswg.org/css-transforms-2/#propdef-perspective
     // The use of this property with any value other than 'none' establishes a stacking context. It also establishes
     // a containing block for all descendants, just like the 'transform' property does.
-    if (computed_values.perspective().has_value() || will_change_property(CSS::PropertyID::Perspective))
+    if (is_transformable() && (computed_values.perspective().has_value() || will_change_property(CSS::PropertyID::Perspective)))
         return true;
 
     // https://drafts.csswg.org/filter-effects-1/#FilterProperty
@@ -107699,8 +107809,7 @@ bool Node::establishes_a_fixed_positioning_containing_block() const
     // https://drafts.csswg.org/css-transforms-2/#transform-style-property
     // A computed value of 'preserve-3d' for 'transform-style' on a transformable element establishes both a
     // stacking context and a containing block for all descendants.
-    // FIXME: Check that the element is a transformable element.
-    if (computed_values.transform_style() == CSS::TransformStyle::Preserve3d || will_change_property(CSS::PropertyID::TransformStyle))
+    if (is_transformable() && (computed_values.transform_style() == CSS::TransformStyle::Preserve3d || will_change_property(CSS::PropertyID::TransformStyle)))
         return true;
 
     // https://drafts.csswg.org/css-view-transitions-1/#snapshot-containing-block-concept
@@ -107896,17 +108005,19 @@ bool Node::establishes_stacking_context() const
         return true;
     }
 
-    if (!computed_values.transformations().is_empty() || will_change_property(CSS::PropertyID::Transform))
-        return true;
+    if (is_transformable()) {
+        if (!computed_values.transformations().is_empty() || will_change_property(CSS::PropertyID::Transform))
+            return true;
 
-    if (computed_values.translate() || will_change_property(CSS::PropertyID::Translate))
-        return true;
+        if (computed_values.translate() || will_change_property(CSS::PropertyID::Translate))
+            return true;
 
-    if (computed_values.rotate() || will_change_property(CSS::PropertyID::Rotate))
-        return true;
+        if (computed_values.rotate() || will_change_property(CSS::PropertyID::Rotate))
+            return true;
 
-    if (computed_values.scale() || will_change_property(CSS::PropertyID::Scale))
-        return true;
+        if (computed_values.scale() || will_change_property(CSS::PropertyID::Scale))
+            return true;
+    }
 
     // Element that is a child of a flex container, with z-index value other than auto.
     if (parent() && parent()->display().is_flex_inside() && has_z_index)
@@ -107970,14 +108081,13 @@ bool Node::establishes_stacking_context() const
 
     // https://drafts.csswg.org/css-transforms-2/#propdef-perspective
     // The use of this property with any value other than 'none' establishes a stacking context.
-    if (computed_values.perspective().has_value() || will_change_property(CSS::PropertyID::Perspective))
+    if (is_transformable() && (computed_values.perspective().has_value() || will_change_property(CSS::PropertyID::Perspective)))
         return true;
 
     // https://drafts.csswg.org/css-transforms-2/#transform-style-property
     // A computed value of 'preserve-3d' for 'transform-style' on a transformable element establishes both a
     // stacking context and a containing block for all descendants.
-    // FIXME: Check that the element is a transformable element.
-    if (computed_values.transform_style() == CSS::TransformStyle::Preserve3d || will_change_property(CSS::PropertyID::TransformStyle))
+    if (is_transformable() && (computed_values.transform_style() == CSS::TransformStyle::Preserve3d || will_change_property(CSS::PropertyID::TransformStyle)))
         return true;
 
     return computed_values.opacity() < 1.0f || will_change_property(CSS::PropertyID::Opacity);
@@ -108649,6 +108759,47 @@ bool Node::is_atomic_inline() const
     return display.is_inline_outside() && !display.is_flow_inside();
 }
 
+// https://drafts.csswg.org/css-transforms-1/#transformable-element
+bool Node::is_transformable() const
+{
+    // A transformable element is an element in one of these categories:
+    auto const* dom_node = this->dom_node();
+    if (!dom_node)
+        return false;
+
+    // * all SVG paint server elements, the clipPath element and SVG renderable elements with the exception
+    //   of any descendant element of text content elements [SVG2].
+    if (is<SVG::SVGElement>(*dom_node)) {
+        // Paint servers and clipPath are always transformable.
+        if (is<SVG::SVGGradientElement>(*dom_node) || is<SVG::SVGPatternElement>(*dom_node) || is<SVG::SVGClipPathElement>(*dom_node))
+            return true;
+        auto const is_renderable = (is_svg_graphics_box() && !is_svg_mask_box()) || is_svg_svg_box() || is_svg_foreign_object_box();
+        if (!is_renderable)
+            return false;
+        // ...with the exception of any descendant of a text content element.
+        for (auto const* ancestor = parent(); ancestor; ancestor = ancestor->parent()) {
+            if (auto const* ancestor_dom_node = ancestor->dom_node(); ancestor_dom_node && is<SVG::SVGTextContentElement>(*ancestor_dom_node))
+                return false;
+        }
+        return true;
+    }
+
+    // * all elements whose layout is governed by the CSS box model except for non-replaced inline boxes,
+    //   table-column boxes, and table-column-group boxes [CSS2].
+    if (is<DOM::Element>(*dom_node) && is_box()) {
+        auto display = this->display();
+        if (display.is_table_column() || display.is_table_column_group())
+            return false;
+
+        if (is_inline() && !is_atomic_inline())
+            return false;
+
+        return true;
+    }
+
+    return false;
+}
+
 NonnullRefPtr<NodeWithStyle> NodeWithStyle::create_anonymous_wrapper() const
 {
     auto wrapper = adopt_ref(*new BlockContainer(const_cast<DOM::Document&>(document()), nullptr, computed_values().clone_inherited_values()));
@@ -109243,6 +109394,7 @@ public:
     bool is_inline_table() const;
 
     bool is_atomic_inline() const;
+    bool is_transformable() const;
 
     bool is_out_of_flow(FormattingContext const&) const;
 
@@ -109361,6 +109513,9 @@ public:
 
     [[nodiscard]] bool has_css_transform() const
     {
+        if (!is_transformable())
+            return false;
+
         auto const& computed_values = this->computed_values();
         return !computed_values.transformations().is_empty()
             || computed_values.rotate()
@@ -134473,6 +134628,9 @@ static Optional<TransformData> compute_transform(PaintableBox const& paintable_b
 // https://drafts.csswg.org/css-transforms-2/#perspective-matrix
 static Optional<Gfx::FloatMatrix4x4> compute_perspective_matrix(PaintableBox const& paintable_box, CSS::ComputedValues const& computed_values)
 {
+    if (!paintable_box.layout_node().is_transformable())
+        return {};
+
     auto perspective = computed_values.perspective();
     if (!perspective.has_value())
         return {};
@@ -147221,11 +147379,7 @@ public:
 
     [[nodiscard]] bool has_css_transform() const
     {
-        auto const& computed_values = this->computed_values();
-        return !computed_values.transformations().is_empty()
-            || computed_values.rotate()
-            || computed_values.translate()
-            || computed_values.scale();
+        return layout_node().has_css_transform();
     }
 
     [[nodiscard]] bool has_non_invertible_css_transform() const { return m_has_non_invertible_css_transform; }
@@ -296025,8 +296179,8 @@ class ResourceAndType:
 
 
 test_type = TestType.TEXT
-raw_reference_path = None  # As specified in the test HTML
-reference_path = None  # With parent directories
+raw_reference_paths = []  # As specified in the test HTML
+reference_paths = []  # With parent directories
 
 
 class LinkedResourceFinder(HTMLParser):
@@ -296105,27 +296259,25 @@ class LinkedResourceFinder(HTMLParser):
 
 class TestTypeIdentifier(HTMLParser):
     """Identifies what kind of test the page is, and stores it in self.test_type
-    For reference tests, the URL of the reference page is saved as self.reference_path
+    For reference tests, the URLs of the reference pages are saved as self.reference_paths
     """
 
     def __init__(self, url):
         super().__init__()
         self.url = url
         self.test_type = TestType.TEXT
-        self.reference_path = None
-        self.ref_test_link_found = False
+        self.reference_paths = []
 
     def handle_starttag(self, tag, attrs):
         if ":" in tag:
             tag = tag.split(":", 1)[-1]
         if tag == "link":
             attr_dict = dict(attrs)
-            if "rel" in attr_dict and (attr_dict["rel"] == "match" or attr_dict["rel"] == "mismatch"):
-                if self.ref_test_link_found:
-                    raise RuntimeError("Ref tests with multiple match or mismatch links are not currently supported")
+            rel_tokens = (attr_dict.get("rel") or "").split()
+            href = attr_dict.get("href")
+            if href is not None and ("match" in rel_tokens or "mismatch" in rel_tokens):
                 self.test_type = TestType.REF
-                self.reference_path = attr_dict["href"]
-                self.ref_test_link_found = True
+                self.reference_paths.append(href)
 
 
 def map_to_path(
@@ -296199,9 +296351,8 @@ def modify_sources(files, resources: list[ResourceAndType]) -> None:
                 new_src_value = parent_folder_path + resource[1::]
                 page_source = page_source.replace(resource.encode(), new_src_value.encode())
 
-        # Look for mentions of the reference page, and update their href
-        if raw_reference_path is not None:
-            assert reference_path is not None
+        # Look for mentions of reference pages, and update their hrefs
+        for raw_reference_path, reference_path in zip(raw_reference_paths, reference_paths):
             new_reference_path = parent_folder_path + "../../expected/wpt-import/" + reference_path[::]
             page_source = page_source.replace(raw_reference_path.encode(), new_reference_path.encode())
 
@@ -296332,24 +296483,24 @@ def main():
         # replacing undecodable bytes with U+FFFD is safe and avoids a UnicodeDecodeError.
         page = response.read().decode("utf-8", errors="replace")
 
-    global test_type, reference_path, raw_reference_path
+    global test_type, reference_paths, raw_reference_paths
     if is_crash_test(url_to_import):
         test_type = TestType.CRASH
     else:
         identifier = TestTypeIdentifier(url_to_import)
         identifier.feed(page)
         test_type = identifier.test_type
-        raw_reference_path = identifier.reference_path
+        raw_reference_paths = identifier.reference_paths
 
-    print(f"Identified {url_to_import} as type {test_type}, ref {raw_reference_path}")
+    print(f"Identified {url_to_import} as type {test_type}, refs {raw_reference_paths}")
 
     main_file = [ResourceAndType(resource_path, ResourceType.INPUT)]
     main_paths = map_to_path(main_file, wpt_base_url, False)
 
-    if test_type == TestType.REF and raw_reference_path is None:
+    if test_type == TestType.REF and not raw_reference_paths:
         raise RuntimeError("Failed to file reference path in ref test")
 
-    if raw_reference_path is not None:
+    for raw_reference_path in raw_reference_paths:
         if raw_reference_path.startswith("/"):
             reference_path = raw_reference_path
             main_paths.append(
@@ -296366,6 +296517,7 @@ def main():
                     Path(test_type.expected_path + "/" + reference_path).absolute(),
                 )
             )
+        reference_paths.append(reference_path)
 
     files_to_modify = download_files(main_paths, wpt_base_url, skip_existing)
     download_headers_files(main_paths, wpt_base_url, skip_existing)
@@ -303152,6 +303304,8 @@ FILE: Services/Compositor/CompositorWebContentServer.ipc
 
 endpoint CompositorWebContentServer
 {
+    init_transport(int peer_pid) => (int compositor_pid)
+
     set_presentation_mode(Web::Compositor::CompositorContextId context_id, Web::Compositor::PresentationMode presentation_mode) =|
     destroy_context(Web::Compositor::CompositorContextId context_id) =|
 
@@ -303358,6 +303512,7 @@ FILE: Services/Compositor/ConnectionFromWebContent.cpp
  */
 
 #include <Compositor/ConnectionFromWebContent.h>
+#include <LibCore/System.h>
 #include <LibWeb/Page/InputEvent.h>
 
 namespace Compositor {
@@ -303379,6 +303534,15 @@ void ConnectionFromWebContent::die()
 void ConnectionFromWebContent::notify_compositor_lost()
 {
     async_did_lose_compositor();
+}
+
+Messages::CompositorWebContentServer::InitTransportResponse ConnectionFromWebContent::init_transport([[maybe_unused]] int peer_pid)
+{
+#ifdef AK_OS_WINDOWS
+    m_transport->set_peer_pid(peer_pid);
+    return Core::System::getpid();
+#endif
+    VERIFY_NOT_REACHED();
 }
 
 void ConnectionFromWebContent::request_rendering_update()
@@ -303544,6 +303708,7 @@ private:
 
     virtual void die() override;
 
+    virtual Messages::CompositorWebContentServer::InitTransportResponse init_transport(int peer_pid) override;
     virtual void set_presentation_mode(Web::Compositor::CompositorContextId, Web::Compositor::PresentationMode) override;
     virtual void destroy_context(Web::Compositor::CompositorContextId) override;
     virtual void update_display_list(Web::Compositor::CompositorContextId, NonnullRefPtr<Web::Painting::DisplayList>, Web::Painting::AccumulatedVisualContextTree, Web::Painting::DisplayListResourceTransaction, Web::Painting::ScrollStateSnapshot) override;
@@ -310467,6 +310632,14 @@ void ConnectionFromClient::connect_to_compositor_process(IPC::TransportHandle ha
     m_compositor_connection->on_mouse_event = [this](u64 page_id, Web::MouseEvent event) {
         mouse_event(page_id, move(event));
     };
+
+#ifdef AK_OS_WINDOWS
+    // Perform Windows peer PID handshake before any other IPC
+    if constexpr (requires { m_compositor_connection->transport().set_peer_pid(0); }) {
+        auto response = m_compositor_connection->send_sync<Messages::CompositorWebContentServer::InitTransport>(Core::System::getpid());
+        m_compositor_connection->transport().set_peer_pid(response->compositor_pid());
+    }
+#endif
 }
 
 void ConnectionFromClient::compositor_process_reconnected()
@@ -495857,6 +496030,16 @@ FILE: Tests/LibWeb/Crash/HTML/iframe-document-open-during-rendering.html
 </body>
 </html>
 
+FILE: Tests/LibWeb/Crash/HTML/iframe-pushstate-before-nested-history-snapshot.html
+<!doctype html>
+<iframe id="frame"></iframe>
+<script>
+frame.onload = () => {
+    frame.contentWindow.history.pushState({}, "", "#child");
+};
+frame.srcdoc = "<!doctype html><body>child</body>";
+</script>
+
 FILE: Tests/LibWeb/Crash/HTML/image-decode-promise-after-iframe-removed.html
 <!DOCTYPE html>
 <!-- Test: Start img.decode() on an image inside an iframe, then remove the iframe.
@@ -533239,7 +533422,7 @@ SC for Viewport<#document> [0,0 800x600] [children: 1] (z-index: auto)
     SC for BlockContainer<DIV>.endOfContent [233.5,175 333x0] [children: 0] (z-index: 0), has_transform
     SC for BlockContainer<SPAN> [316.75,64.9375 121.046875x23.328125] [children: 0] (z-index: 1), has_transform
   SC for BlockContainer<DIV>.toolbar [0,0 800x32] [children: 14] (z-index: 2)
-   SC for BlockContainer(anonymous) [15,8 16x16] [children: 0] (z-index: auto), has_transform
+   SC for BlockContainer(anonymous) [15,8 16x16] [children: 0] (z-index: auto)
    SC for BlockContainer(anonymous) [75,8 16x16] [children: 0] (z-index: auto)
    SC for Box<BUTTON>#previous.toolbarButton [98,2 28x28] [children: 1] (z-index: auto)
     SC for BlockContainer(anonymous) [104,8 16x16] [children: 0] (z-index: auto)
@@ -533254,7 +533437,7 @@ SC for Viewport<#document> [0,0 800x600] [children: 1] (z-index: auto)
    SC for BlockContainer(anonymous) [678,8 16x16] [children: 0] (z-index: auto)
    SC for BlockContainer(anonymous) [713,8 16x16] [children: 0] (z-index: auto)
    SC for BlockContainer(anonymous) [742,8 16x16] [children: 0] (z-index: auto)
-   SC for BlockContainer(anonymous) [777,8 16x16] [children: 0] (z-index: auto), has_transform
+   SC for BlockContainer(anonymous) [777,8 16x16] [children: 0] (z-index: auto)
 
 FILE: Tests/LibWeb/Layout/expected/percentage-font-size.txt
 Viewport <#document> at [0,0] [0+0+0 800 0+0+0] [0+0+0 600 0+0+0] [BFC] children: not-inline
@@ -575889,6 +576072,47 @@ FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-transforms/transform-box/refe
 <p>There should be a green 200x200 rectangle below, and no red.</p>
 <div style="width: 200px; height: 200px; background-color: green"></div>
 
+FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-transforms/transform-inline-notref.html
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>CSS Reftest Reference</title>
+    <link rel="author" title="Aryeh Gregor" href="mailto:ayg@aryeh.name">
+    <link rel="stylesheet" type="text/css" href="../..../../fonts/ahem.css" />
+    <style>
+      body {
+        font: 25px/1 Ahem;
+      }
+    </style>
+  </head>
+  <body>
+    <p>This is some text<br>that is not transformed</p>
+    <p>This is some text that is transformed</p>
+  </body>
+</html>
+
+FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-transforms/transform-inline-ref.html
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>CSS Reftest Reference</title>
+    <link rel="author" title="Aryeh Gregor" href="mailto:ayg@aryeh.name">
+    <link rel="stylesheet" type="text/css" href="../..../../fonts/ahem.css" />
+    <style>
+      body {
+        font: 25px/1 Ahem;
+      }
+      p + p {
+        transform: rotate(180deg);
+      }
+    </style>
+  </head>
+  <body>
+    <p>This is some text<br>that is not transformed</p>
+    <p>This is some text that is transformed</p>
+  </body>
+</html>
+
 FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-transforms/transform-lime-square-ref.html
 <!DOCTYPE html>
 <html>
@@ -578130,6 +578354,29 @@ body {
   <div class="bfc" style="width: 75px; left: 0px; top: 50px"></div>
 </div>
 
+FILE: Tests/LibWeb/Ref/expected/wpt-import/css/CSS2/floats/floats-wrap-top-below-001l-notref.xht
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml"><head>
+<title>CSS Test: Test for wrapping around floats whose top is below the top of what must wrap around them</title>
+<link rel="author" title="L. David Baron" href="https://dbaron.org/" />
+<link rel="author" title="Mozilla Corporation" href="http://mozilla.com/" />
+<style type="text/css">
+
+body { width: 400px; border: medium solid; text-align: left; }
+div { float: left; clear: left; }
+span { display: inline-block; vertical-align: top; width: 200px; height: 50px; background: aqua; }
+
+</style>
+</head>
+<body>
+
+<div style="width: 50px; height: 50px;"></div>
+<div style="width: 50px; height: 100px;"></div>
+<span></span>
+<span></span>
+
+
+
+</body></html>
 FILE: Tests/LibWeb/Ref/expected/wpt-import/css/CSS2/floats/floats-wrap-top-below-001l-ref.xht
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml"><head>
 <title>CSS Test: Test for wrapping around floats whose top is below the top of what must wrap around them</title>
@@ -578147,6 +578394,29 @@ span { display: inline-block; vertical-align: top; width: 200px; height: 50px; b
 
 <div style="width: 50px; height: 50px;"></div>
 <div style="width: 100px; height: 100px;"></div>
+<span></span>
+<span></span>
+
+
+
+</body></html>
+FILE: Tests/LibWeb/Ref/expected/wpt-import/css/CSS2/floats/floats-wrap-top-below-001r-notref.xht
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml"><head>
+<title>CSS Test: Test for wrapping around floats whose top is below the top of what must wrap around them</title>
+<link rel="author" title="L. David Baron" href="https://dbaron.org/" />
+<link rel="author" title="Mozilla Corporation" href="http://mozilla.com/" />
+<style type="text/css">
+
+body { width: 400px; border: medium solid; text-align: right; }
+div { float: right; clear: right; }
+span { display: inline-block; vertical-align: top; width: 200px; height: 50px; background: aqua; }
+
+</style>
+</head>
+<body>
+
+<div style="width: 50px; height: 50px;"></div>
+<div style="width: 50px; height: 100px;"></div>
 <span></span>
 <span></span>
 
@@ -602689,6 +602959,36 @@ FILE: Tests/LibWeb/Ref/input/wpt-import/css/css-transforms/perspective-zero.html
 <p>Pass if there is NO red below:</p>
 <div id="cover-me"></div><div id="test"></div>
 
+FILE: Tests/LibWeb/Ref/input/wpt-import/css/css-transforms/transform-inline-001.html
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>CSS Test (Transforms): Transformed Inline</title>
+    <link rel="author" title="Aryeh Gregor" href="mailto:ayg@aryeh.name">
+    <link rel="help" href="http://www.w3.org/TR/css-transforms-1/#transform-property">
+    <meta name="assert" content='The definition of "transformable element"
+    includes atomic inline-level elements, such as images, but not regular
+    inline-level elements, such as spans.  The &apos;transform&apos; property
+    only applies to transformable elements, so it should have no effect on a
+    span.'>
+    <link rel="match" href="../../../../expected/wpt-import/css/css-transforms/transform-inline-ref.html">
+    <link rel="mismatch" href="../../../../expected/wpt-import/css/css-transforms/transform-inline-notref.html">
+    <link rel="stylesheet" type="text/css" href="../..../../fonts/ahem.css" />
+    <style>
+      body {
+        font: 25px/1 Ahem;
+      }
+      span, p + p {
+        transform: rotate(180deg);
+      }
+    </style>
+  </head>
+  <body>
+    <p>This is some <span>text<br>that is</span> not transformed</p>
+    <p>This is some text that is transformed</p>
+  </body>
+</html>
+
 FILE: Tests/LibWeb/Ref/input/wpt-import/css/css-transforms/transform-style-stacking-context.html
 <!DOCTYPE HTML>
 <title>'transform-style: preserve-3d' establishes a stacking context.</title>
@@ -608297,7 +608597,7 @@ FILE: Tests/LibWeb/Ref/input/wpt-import/css/CSS2/floats/floats-wrap-top-below-bf
 <link rel="author" title="Mozilla Corporation" href="http://mozilla.com/" />
 <link rel="help" href="http://www.w3.org/TR/CSS21/visuren.html#floats" />
 <link rel="match" href="../../../../../expected/wpt-import/css/CSS2/floats/floats-wrap-top-below-001l-ref.xht"/>
-<link rel="mismatch" href="floats-wrap-top-below-001l-notref.xht"/>
+<link rel="mismatch" href="../../../../../expected/wpt-import/css/CSS2/floats/floats-wrap-top-below-001l-notref.xht"/>
 <meta name="assert" content="The border box of a table, a block-level replaced element, or an element in the normal flow that establishes a new block formatting context (such as an element with 'overflow' other than 'visible') must not overlap any floats in the same block formatting context as the element itself." />
 <style type="text/css">
 
@@ -608324,7 +608624,7 @@ FILE: Tests/LibWeb/Ref/input/wpt-import/css/CSS2/floats/floats-wrap-top-below-bf
 <link rel="author" title="Mozilla Corporation" href="http://mozilla.com/" />
 <link rel="help" href="http://www.w3.org/TR/CSS21/visuren.html#floats" />
 <link rel="match" href="../../../../../expected/wpt-import/css/CSS2/floats/floats-wrap-top-below-001r-ref.xht"/>
-<link rel="mismatch" href="floats-wrap-top-below-001r-notref.xht"/>
+<link rel="mismatch" href="../../../../../expected/wpt-import/css/CSS2/floats/floats-wrap-top-below-001r-notref.xht"/>
 <meta name="assert" content="The border box of a table, a block-level replaced element, or an element in the normal flow that establishes a new block formatting context (such as an element with 'overflow' other than 'visible') must not overlap any floats in the same block formatting context as the element itself." />
 <style type="text/css">
 
@@ -608451,7 +608751,7 @@ FILE: Tests/LibWeb/Ref/input/wpt-import/css/CSS2/floats/floats-wrap-top-below-in
 <link rel="author" title="Mozilla Corporation" href="http://mozilla.com/" />
 <link rel="help" href="http://www.w3.org/TR/CSS21/visuren.html#floats" />
 <link rel="match" href="../../../../../expected/wpt-import/css/CSS2/floats/floats-wrap-top-below-001l-ref.xht"/>
-<link rel="mismatch" href="floats-wrap-top-below-001l-notref.xht"/>
+<link rel="mismatch" href="../../../../../expected/wpt-import/css/CSS2/floats/floats-wrap-top-below-001l-notref.xht"/>
 <meta name="assert" content="However, line boxes created next to the float are shortened to make room for the margin box of the float." />
 <style type="text/css">
 
@@ -608478,7 +608778,7 @@ FILE: Tests/LibWeb/Ref/input/wpt-import/css/CSS2/floats/floats-wrap-top-below-in
 <link rel="author" title="Mozilla Corporation" href="http://mozilla.com/" />
 <link rel="help" href="http://www.w3.org/TR/CSS21/visuren.html#floats" />
 <link rel="match" href="../../../../../expected/wpt-import/css/CSS2/floats/floats-wrap-top-below-001r-ref.xht"/>
-<link rel="mismatch" href="floats-wrap-top-below-001r-notref.xht"/>
+<link rel="mismatch" href="../../../../../expected/wpt-import/css/CSS2/floats/floats-wrap-top-below-001r-notref.xht"/>
 <meta name="assert" content="However, line boxes created next to the float are shortened to make room for the margin box of the float." />
 <style type="text/css">
 
@@ -625482,45 +625782,35 @@ static ErrorOr<void> write_screenshot_failure_results(Test& test, Gfx::Bitmap co
     return {};
 }
 
+static ErrorOr<bool> compare_current_ref_test_expectation(Test& test, URL::URL const& test_url)
+{
+    VERIFY(test.ref_test_expectation_index < test.ref_test_expectations.size());
+
+    auto const& expectation = test.ref_test_expectations[test.ref_test_expectation_index];
+    auto should_match = expectation.type == RefTestExpectationType::Match;
+    auto screenshot_matches = fuzzy_screenshot_match(test_url, expectation.url, *test.actual_screenshot,
+        *test.expectation_screenshot, test.fuzzy_matches, should_match);
+    if (should_match == screenshot_matches)
+        return true;
+
+    TRY(write_screenshot_failure_results(test, *test.actual_screenshot, *test.expectation_screenshot));
+    return false;
+}
+
 static void run_ref_test(TestWebView& view, TestRunContext& context, Test& test, URL::URL const& url)
 {
     auto test_index = test.index;
-
-    auto handle_completed_test = [&view, &context, test_index, url]() -> ErrorOr<TestResult> {
-        auto& test = context.tests[test_index];
-        switch (test.ref_test_expectation_type) {
-        case RefTestExpectationType::None:
-            return TestResult::Fail;
-        case RefTestExpectationType::Match:
-        case RefTestExpectationType::Mismatch: {
-            auto should_match = test.ref_test_expectation_type == RefTestExpectationType::Match;
-            auto screenshot_matches = fuzzy_screenshot_match(url, view.url(), *test.actual_screenshot,
-                *test.expectation_screenshot, test.fuzzy_matches, should_match);
-            if (should_match == screenshot_matches)
-                return TestResult::Pass;
-
-            TRY(write_screenshot_failure_results(test, *test.actual_screenshot, *test.expectation_screenshot));
-            return TestResult::Fail;
-        }
-        }
-
-        VERIFY_NOT_REACHED();
-    };
-
-    auto on_test_complete = [&view, test_index, handle_completed_test]() {
-        if (auto result = handle_completed_test(); result.is_error())
-            view.on_test_complete({ test_index, TestResult::Fail });
-        else
-            view.on_test_complete({ test_index, result.value() });
-    };
 
     view.on_load_finish = [&view, &context, test_index, url](auto const& loaded_url) {
         auto& test = context.tests[test_index];
 
         // We don't want subframe loads to trigger this.
-        if (test.ref_test_expectation_url.has_value()) {
+        if (!test.ref_test_expectations.is_empty()) {
+            VERIFY(test.ref_test_expectation_index < test.ref_test_expectations.size());
+
             // Match against the expectation URL.
-            if (!test.ref_test_expectation_url->equals(loaded_url, URL::ExcludeFragment::Yes))
+            auto const& expectation_url = test.ref_test_expectations[test.ref_test_expectation_index].url;
+            if (!expectation_url.equals(loaded_url, URL::ExcludeFragment::Yes))
                 return;
         } else {
             // Match against the test URL.
@@ -625534,14 +625824,30 @@ static void run_ref_test(TestWebView& view, TestRunContext& context, Test& test,
         }
     };
 
-    view.on_test_finish = [&view, &context, test_index, on_test_complete = move(on_test_complete)](auto const&) {
+    view.on_test_finish = [&view, &context, test_index, url](auto const&) {
         auto& test = context.tests[test_index];
         if (test.actual_screenshot) {
             // The reference has finished loading; take another screenshot and move on to handling the result.
-            view.take_screenshot()->when_resolved([&view, &context, test_index, on_test_complete = move(on_test_complete)](RefPtr<Gfx::Bitmap const> screenshot) {
-                context.tests[test_index].expectation_screenshot = move(screenshot);
+            view.take_screenshot()->when_resolved([&view, &context, test_index, url](RefPtr<Gfx::Bitmap const> screenshot) {
+                auto& test = context.tests[test_index];
+                test.expectation_screenshot = move(screenshot);
                 view.reset_zoom();
-                on_test_complete();
+
+                auto expectation_passed = compare_current_ref_test_expectation(test, url);
+                if (expectation_passed.is_error() || !expectation_passed.value()) {
+                    view.on_test_complete({ test_index, TestResult::Fail });
+                    return;
+                }
+
+                ++test.ref_test_expectation_index;
+                if (test.ref_test_expectation_index >= test.ref_test_expectations.size()) {
+                    view.on_test_complete({ test_index, TestResult::Pass });
+                    return;
+                }
+
+                test.expectation_screenshot.clear();
+                test.did_inject_js = false;
+                view.load(test.ref_test_expectations[test.ref_test_expectation_index].url);
             });
         } else {
             // When the test initially finishes, we take a screenshot and request the reference test metadata.
@@ -625553,7 +625859,7 @@ static void run_ref_test(TestWebView& view, TestRunContext& context, Test& test,
         }
     };
 
-    view.on_reference_test_metadata = [&view, &context, test_index, on_test_complete = move(on_test_complete)](JsonValue const& metadata) {
+    view.on_reference_test_metadata = [&view, &context, test_index](JsonValue const& metadata) {
         auto& test = context.tests[test_index];
         auto metadata_object = metadata.as_object();
 
@@ -625581,33 +625887,31 @@ static void run_ref_test(TestWebView& view, TestRunContext& context, Test& test,
             test.fuzzy_matches.append(fuzzy_match_or_error.release_value());
         }
 
-        // Read (mis)match reference tests to load.
-        // FIXME: Currently we only support single match or mismatch reference.
-        String reference_to_load;
-        if (!match_references->is_empty()) {
-            if (match_references->size() > 1)
-                dbgln("FIXME: Only a single ref test match reference is supported");
+        test.ref_test_expectations.clear_with_capacity();
+        test.ref_test_expectation_index = 0;
 
-            test.ref_test_expectation_type = RefTestExpectationType::Match;
-            reference_to_load = match_references->at(0).as_string();
-        } else if (!mismatch_references->is_empty()) {
-            if (mismatch_references->size() > 1)
-                dbgln("FIXME: Only a single ref test mismatch reference is supported");
+        auto append_references = [&](auto const& references, RefTestExpectationType type) {
+            for (size_t i = 0; i < references.size(); ++i) {
+                auto reference_url = URL::Parser::basic_parse(references.at(i).as_string());
+                if (!reference_url.has_value()) {
+                    warnln("Failed to parse ref test reference URL '{}'", references.at(i).as_string());
+                    continue;
+                }
+                test.ref_test_expectations.append({ type, reference_url.release_value() });
+            }
+        };
+        append_references(*match_references, RefTestExpectationType::Match);
+        append_references(*mismatch_references, RefTestExpectationType::Mismatch);
 
-            test.ref_test_expectation_type = RefTestExpectationType::Mismatch;
-            reference_to_load = mismatch_references->at(0).as_string();
-        }
-
-        if (test.ref_test_expectation_type == RefTestExpectationType::None) {
-            // Skip loading the expectation page entirely since none was specified
+        if (test.ref_test_expectations.is_empty()) {
             warnln("Test '{}' does not specify an expectation file (e.g. '<link rel=\"match\" href=\"...\" />' tag), test will fail.", test.input_path);
-            on_test_complete();
-        } else {
-            // Clear flag so we can inject the JS into the reference page.
-            test.ref_test_expectation_url = URL::Parser::basic_parse(reference_to_load).release_value();
-            test.did_inject_js = false;
-            view.load(test.ref_test_expectation_url.value());
+            view.on_test_complete({ test_index, TestResult::Fail });
+            return;
         }
+
+        // Clear flag so we can inject the JS into the reference page.
+        test.did_inject_js = false;
+        view.load(test.ref_test_expectations[test.ref_test_expectation_index].url);
     };
 
     view.load(url);
@@ -627858,9 +628162,13 @@ constexpr StringView test_result_to_string(TestResult result)
 }
 
 enum class RefTestExpectationType {
-    None, // Test did not specify an expection file
     Match,
     Mismatch,
+};
+
+struct RefTestExpectation {
+    RefTestExpectationType type;
+    URL::URL url;
 };
 
 struct Test {
@@ -627884,8 +628192,8 @@ struct Test {
     bool did_finish_loading { false };
     bool did_inject_js { false };
 
-    RefTestExpectationType ref_test_expectation_type {};
-    Optional<URL::URL> ref_test_expectation_url {};
+    Vector<RefTestExpectation> ref_test_expectations {};
+    size_t ref_test_expectation_index { 0 };
     Vector<FuzzyMatch> fuzzy_matches {};
 
     RefPtr<Gfx::Bitmap const> actual_screenshot {};
@@ -628443,6 +628751,14 @@ Text/input/wpt-import/workers/nested_worker_sync_xhr.worker.html
 Text/input/wpt-import/workers/nested_worker_terminate_from_document.html
 Text/input/wpt-import/encoding/legacy-mb-schinese/gb18030/gb18030-decoder.any.worker.html
 Text/input/wpt-import/WebCryptoAPI/historical.any.worker.html
+Text/input/Worker/Worker-close-after-postMessage.html
+Text/input/Worker/Worker-crypto.html
+Text/input/Worker/Worker-echo.html
+Text/input/Worker/Worker-importScripts.html
+Text/input/Worker/Worker-location.html
+Text/input/Worker/Worker-module.html
+Text/input/Worker/Worker-performance.html
+Text/input/HTML/DedicatedWorkerGlobalScope-instanceof.html
 
 ; CORS fetch failures.
 ; Fails in other browsers too when loaded from file://.
@@ -628580,11 +628896,7 @@ Text/input/wpt-import/png/cicp-chunk.html
 Text/input/wpt-import/html/canvas/element/drawing-images-to-the-canvas/2d.drawImage.animated.gif.html
 
 [Skipped]
-; Consistently hang on macOS, see #1306
-Text/input/HTML/cross-origin-window-properties.html
-Text/input/HTML/DedicatedWorkerGlobalScope-instanceof.html
-Text/input/HTML/MessagePort-MessageEvents-should-be-trusted.html
-Text/input/wpt-import/hr-time/timeOrigin.html
+; Test seems broken
 Text/input/window-scrollTo.html
 
 ; Flaky on CI
@@ -628601,17 +628913,6 @@ Crash/wpt-import/editing/crashtests/designMode-caret-change.html
 
 ; Times out on CI - https://github.com/LadybirdBrowser/ladybird/issues/7790
 Text/input/device-pixel-ratio-media-query.html
-
-; Worker tests are flaky on CI
-Text/input/Worker/Worker-blob.html
-Text/input/Worker/Worker-close-after-postMessage.html
-Text/input/Worker/Worker-crypto.html
-Text/input/Worker/Worker-echo.html
-Text/input/Worker/Worker-importScripts.html
-Text/input/Worker/Worker-location.html
-Text/input/Worker/Worker-module.html
-Text/input/Worker/Worker-performance.html
-Text/input/Worker/Worker-postMessage-transfer.html
 
 ; WPT ref-tests that currently fail
 Ref/input/wpt-import/css/CSS2/floats/float-nowrap-3.html
@@ -634880,6 +635181,12 @@ FILE: Tests/LibWeb/Text/expected/css/abspos-inline-static-position-after-wrapped
 target x: 20
 target y: 20
 
+FILE: Tests/LibWeb/Text/expected/css/abspos-inline-static-position-in-pre.txt
+one: 0,0
+two: 0,20
+three: 0,40
+right-one: 50,0
+
 FILE: Tests/LibWeb/Text/expected/css/active-state-cleared-after-link-drag.txt
 active after foo mousedown: html, body, foo
 active after releasing foo drag: (none)
@@ -639242,32 +639549,3 @@ PASS: concrete :has argument keeps featureless mutation filtered: is concrete / 
 PASS: concrete :has argument keeps featureless mutation filtered: where concrete / append plain child | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=1, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=1, hasResultCacheHits=0, hasResultCacheMisses=1
 PASS: concrete :has argument keeps featureless mutation filtered: where concrete / append plain nested subtree | styleInvalidations=3, fullStyleInvalidations=0, elementStyleRecomputations=1, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=1, hasResultCacheHits=0, hasResultCacheMisses=1
 PASS: concrete :has argument keeps featureless mutation filtered: where concrete / append text node | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=2, elementStyleNoopRecomputations=2, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: concrete :has argument keeps featureless mutation filtered: where concrete / remove plain child | styleInvalidations=0, fullStyleInvalidations=0, elementStyleRecomputations=1, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=1, hasResultCacheHits=0, hasResultCacheMisses=1
-PASS: concrete :has argument keeps featureless mutation filtered: where concrete / replace plain child | styleInvalidations=1, fullStyleInvalidations=0, elementStyleRecomputations=1, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=1, hasResultCacheHits=0, hasResultCacheMisses=1
-PASS: concrete :has argument keeps featureless mutation filtered: not still concrete / append plain child | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=3, elementStyleNoopRecomputations=2, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: concrete :has argument keeps featureless mutation filtered: not still concrete / append plain nested subtree | styleInvalidations=3, fullStyleInvalidations=0, elementStyleRecomputations=4, elementStyleNoopRecomputations=2, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: concrete :has argument keeps featureless mutation filtered: not still concrete / append text node | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=2, elementStyleNoopRecomputations=2, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: concrete :has argument keeps featureless mutation filtered: not still concrete / remove plain child | styleInvalidations=0, fullStyleInvalidations=0, elementStyleRecomputations=2, elementStyleNoopRecomputations=2, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: concrete :has argument keeps featureless mutation filtered: not still concrete / replace plain child | styleInvalidations=1, fullStyleInvalidations=0, elementStyleRecomputations=3, elementStyleNoopRecomputations=2, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: concrete :has argument keeps featureless mutation filtered: selector list concrete / append plain child | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=1, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: concrete :has argument keeps featureless mutation filtered: selector list concrete / append plain nested subtree | styleInvalidations=3, fullStyleInvalidations=0, elementStyleRecomputations=1, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: concrete :has argument keeps featureless mutation filtered: selector list concrete / append text node | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=2, elementStyleNoopRecomputations=2, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=4, hasResultCacheHits=0, hasResultCacheMisses=4
-PASS: concrete :has argument keeps featureless mutation filtered: selector list concrete / remove plain child | styleInvalidations=0, fullStyleInvalidations=0, elementStyleRecomputations=1, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: concrete :has argument keeps featureless mutation filtered: selector list concrete / replace plain child | styleInvalidations=1, fullStyleInvalidations=0, elementStyleRecomputations=1, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: featureless-sensitive structural mutation keeps :has walk: child universal insertion | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=3, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: featureless-sensitive structural mutation keeps :has walk: descendant universal insertion | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=3, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: featureless-sensitive structural mutation keeps :has walk: child :not(class) insertion | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=3, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: featureless-sensitive structural mutation keeps :has walk: adjacent :not(class) starts matching | styleInvalidations=1, fullStyleInvalidations=0, elementStyleRecomputations=2, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: featureless-sensitive structural mutation keeps :has walk: adjacent :not(class) stops matching | styleInvalidations=1, fullStyleInvalidations=0, elementStyleRecomputations=2, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: featureless-sensitive structural mutation keeps :has walk: following :not(id) starts matching | styleInvalidations=1, fullStyleInvalidations=0, elementStyleRecomputations=2, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: featureless-sensitive structural mutation keeps :has walk: following :not(attribute) stops matching | styleInvalidations=1, fullStyleInvalidations=0, elementStyleRecomputations=2, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: featureless-sensitive structural mutation keeps :has walk: child :not(tag) insertion | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=3, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: featureless-sensitive structural mutation keeps :has walk: child :is(:not(class)) insertion | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=3, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: featureless-sensitive structural mutation keeps :has walk: child :where(:not(attribute)) insertion | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=3, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: featureless-sensitive structural mutation keeps :has walk: child :not(class, id) insertion | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=3, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: featureless-sensitive structural mutation keeps :has walk: descendant :not(class) nested insertion | styleInvalidations=3, fullStyleInvalidations=0, elementStyleRecomputations=4, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=1, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: featureless-sensitive structural mutation keeps :has walk: child :empty insertion | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=3, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: featureless-sensitive structural mutation keeps :has walk: child :empty stops matching after text append | styleInvalidations=3, fullStyleInvalidations=0, elementStyleRecomputations=3, elementStyleNoopRecomputations=2, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: featureless-sensitive structural mutation keeps :has walk: child :first-child insertion | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=3, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: featureless-sensitive structural mutation keeps :has walk: child :last-child insertion | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=3, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: featureless-sensitive structural mutation keeps :has walk: child :only-child stops matching | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=4, elementStyleNoopRecomputations=2, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
