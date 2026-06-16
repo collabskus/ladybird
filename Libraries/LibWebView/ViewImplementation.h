@@ -109,10 +109,17 @@ public:
         bool will_change_top_level_entry { false };
         bool waiting_for_cancelation_check { false };
     };
+    struct SessionHistoryTraversalMenuItem {
+        int delta { 0 };
+        String title;
+        String url;
+        Optional<String> favicon_base64_png;
+    };
     [[nodiscard]] HistoryTraversalOutcome traverse_the_history_by_delta(
         int delta,
         CheckForCancelation = CheckForCancelation::Yes,
         Function<void(HistoryTraversalOutcome)> = nullptr);
+    [[nodiscard]] Vector<SessionHistoryTraversalMenuItem> session_history_traversal_menu_items(int direction) const;
 
     void zoom_in();
     void zoom_out();
@@ -572,7 +579,7 @@ protected:
     Optional<PendingSessionHistoryNavigation> m_pending_session_history_navigation;
     Optional<PendingSessionHistoryTraversal> m_pending_session_history_traversal;
     u64 m_next_traverse_history_step_cancelation_check_request_id { 0 };
-    bool m_loading_session_history_entry_from_ui_process { false };
+    Optional<URL::URL> m_session_history_entry_url_loading_from_ui_process;
     PendingWebContentSessionHistorySeed m_pending_web_content_session_history_seed;
     Optional<URL::URL> m_webdriver_pending_navigation_url;
     bool m_webdriver_pending_navigation_completes_with_session_history_update { false };
