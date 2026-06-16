@@ -1,4 +1,181 @@
-﻿        Receive a PRIORITY frame on the connection.
+﻿            # PUSH_PROMISE was in flight when we reset the parent stream.
+            # So we just reset the new stream.
+            f = RstStreamFrame(frame.promised_stream_id)
+            f.error_code = ErrorCodes.REFUSED_STREAM
+            return [f], events
+
+        new_stream = self._begin_new_stream(
+            frame.promised_stream_id, AllowedStreamIDs.EVEN
+        )
+        self.streams[frame.promised_stream_id] = new_stream
+        new_stream.remotely_pushed(pushed_headers)
+
+        return frames, events + stream_events
+
+    def _handle_data_on_closed_stream(self, events, exc, frame):
+        # This stream is already closed - and yet we received a DATA frame.
+        # The received DATA frame counts towards the connection flow window.
+        # We need to manually to acknowledge the DATA frame to update the flow
+        # window of the connection. Otherwise the whole connection stalls due
+        # the inbound flow window being 0.
+        frames = []
+        conn_manager = self._inbound_flow_control_window_manager
+        conn_increment = conn_manager.process_bytes(
+            frame.flow_controlled_length
+        )
+        if conn_increment:
+            f = WindowUpdateFrame(0)
+            f.window_increment = conn_increment
+            frames.append(f)
+            self.config.logger.debug(
+                "Received DATA frame on closed stream %d - "
+                "auto-emitted a WINDOW_UPDATE by %d",
+                frame.stream_id, conn_increment
+            )
+        f = RstStreamFrame(exc.stream_id)
+        f.error_code = exc.error_code
+        frames.append(f)
+        self.config.logger.debug(
+            "Stream %d already CLOSED or cleaned up - "
+            "auto-emitted a RST_FRAME" % frame.stream_id
+        )
+        return frames, events + exc._events
+
+    def _receive_data_frame(self, frame):
+        """
+        Receive a data frame on the connection.
+        """
+        flow_controlled_length = frame.flow_controlled_length
+
+        events = self.state_machine.process_input(
+            ConnectionInputs.RECV_DATA
+        )
+        self._inbound_flow_control_window_manager.window_consumed(
+            flow_controlled_length
+        )
+
+        try:
+            stream = self._get_stream_by_id(frame.stream_id)
+            frames, stream_events = stream.receive_data(
+                frame.data,
+                'END_STREAM' in frame.flags,
+                flow_controlled_length
+            )
+        except StreamClosedError as e:
+            # This stream is either marked as CLOSED or already gone from our
+            # internal state.
+            return self._handle_data_on_closed_stream(events, e, frame)
+
+        return frames, events + stream_events
+
+    def _receive_settings_frame(self, frame):
+        """
+        Receive a SETTINGS frame on the connection.
+        """
+        events = self.state_machine.process_input(
+            ConnectionInputs.RECV_SETTINGS
+        )
+
+        # This is an ack of the local settings.
+        if 'ACK' in frame.flags:
+            changed_settings = self._local_settings_acked()
+            ack_event = SettingsAcknowledged()
+            ack_event.changed_settings = changed_settings
+            events.append(ack_event)
+            return [], events
+
+        # Add the new settings.
+        self.remote_settings.update(frame.settings)
+        events.append(
+            RemoteSettingsChanged.from_settings(
+                self.remote_settings, frame.settings
+            )
+        )
+        frames = self._acknowledge_settings()
+
+        return frames, events
+
+    def _receive_window_update_frame(self, frame):
+        """
+        Receive a WINDOW_UPDATE frame on the connection.
+        """
+        # hyperframe will take care of validating the window_increment.
+        # If we reach in here, we can assume a valid value.
+
+        events = self.state_machine.process_input(
+            ConnectionInputs.RECV_WINDOW_UPDATE
+        )
+
+        if frame.stream_id:
+            try:
+                stream = self._get_stream_by_id(frame.stream_id)
+                frames, stream_events = stream.receive_window_update(
+                    frame.window_increment
+                )
+            except StreamClosedError:
+                return [], events
+        else:
+            # Increment our local flow control window.
+            self.outbound_flow_control_window = guard_increment_window(
+                self.outbound_flow_control_window,
+                frame.window_increment
+            )
+
+            # FIXME: Should we split this into one event per active stream?
+            window_updated_event = WindowUpdated()
+            window_updated_event.stream_id = 0
+            window_updated_event.delta = frame.window_increment
+            stream_events = [window_updated_event]
+            frames = []
+
+        return frames, events + stream_events
+
+    def _receive_ping_frame(self, frame):
+        """
+        Receive a PING frame on the connection.
+        """
+        events = self.state_machine.process_input(
+            ConnectionInputs.RECV_PING
+        )
+        flags = []
+
+        if 'ACK' in frame.flags:
+            evt = PingAckReceived()
+        else:
+            evt = PingReceived()
+
+            # automatically ACK the PING with the same 'opaque data'
+            f = PingFrame(0)
+            f.flags = {'ACK'}
+            f.opaque_data = frame.opaque_data
+            flags.append(f)
+
+        evt.ping_data = frame.opaque_data
+        events.append(evt)
+
+        return flags, events
+
+    def _receive_rst_stream_frame(self, frame):
+        """
+        Receive a RST_STREAM frame on the connection.
+        """
+        events = self.state_machine.process_input(
+            ConnectionInputs.RECV_RST_STREAM
+        )
+        try:
+            stream = self._get_stream_by_id(frame.stream_id)
+        except NoSuchStreamError:
+            # The stream is missing. That's ok, we just do nothing here.
+            stream_frames = []
+            stream_events = []
+        else:
+            stream_frames, stream_events = stream.stream_reset(frame)
+
+        return stream_frames, events + stream_events
+
+    def _receive_priority_frame(self, frame):
+        """
+        Receive a PRIORITY frame on the connection.
         """
         events = self.state_machine.process_input(
             ConnectionInputs.RECV_PRIORITY
@@ -453024,6 +453201,45 @@ def expect_ui_session_history(
     )
 
 
+def wait_for_ui_session_history(
+    webdriver_port,
+    session_id,
+    label,
+    expected_entry_urls,
+    expected_used_steps,
+    expected_current_used_step_index,
+    expected_back_enabled,
+    expected_forward_enabled,
+    log,
+    expected_web_content_known_used_steps,
+    expected_web_content_current_step,
+):
+    def matches_expected_history(snapshot):
+        ui = snapshot["ui"]
+        web_content = snapshot["webContent"]
+        return (
+            history_entry_urls(ui) == expected_entry_urls
+            and history_used_steps(ui) == expected_used_steps
+            and ui["currentUsedStepIndex"] == expected_current_used_step_index
+            and ui["backButtonEnabled"] is expected_back_enabled
+            and ui["forwardButtonEnabled"] is expected_forward_enabled
+            and ui["webContentHistoryMatchesUI"]
+            and history_step_values(ui["webContentKnownUsedSteps"]) == expected_web_content_known_used_steps
+            and ui["webContentCurrentStep"] == expected_web_content_current_step
+            and history_current_step(ui["webContentKnownUsedSteps"]) == expected_web_content_current_step
+            and not ui["waitingToSeedWebContent"]
+            and not ui["waitingForWebContentSeedAck"]
+            and not ui["ignoringWebContentUpdatesUntilSeed"]
+            and not ui["reseedAfterCurrentHistoryLoad"]
+            and ui["pendingWebContentHistoryStepAfterFallbackLoad"] is None
+            and ui["pendingSessionHistoryNavigation"] is None
+            and ui["pendingSessionHistoryTraversal"] is None
+            and comparable_history(ui) == comparable_history(web_content)
+        )
+
+    return wait_for_session_history(webdriver_port, session_id, label, matches_expected_history, log)
+
+
 def expect_beforeunload_cancels_webdriver_navigation(
     webdriver_port,
     session_id,
@@ -454353,6 +454569,19 @@ return [Math.round(rect.left + rect.width / 2), Math.round(rect.top + rect.heigh
         )
         page_server.release_blocked_process_swap_back.set()
         wait_for_event(page_server.process_swap_back_document_ran, "process-swap UI back document")
+        wait_for_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after blocked process-swap UI back converges",
+            [url_process_swap_back_blocked, url_b],
+            [0, 1],
+            0,
+            False,
+            True,
+            log,
+            expected_web_content_known_used_steps=[0, 1],
+            expected_web_content_current_step=0,
+        )
         expect_url(
             webdriver_port,
             session_id,
@@ -455180,6 +455409,19 @@ return [location.href, window.scriptBeforeUnloadCount, navigator.userActivation.
         page_server.a_document_ran.clear()
         perform_browser_history_shortcut(webdriver_port, session_id, "left", log)
         wait_for_event(page_server.a_document_ran, "A document after browser shortcut back")
+        wait_for_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after cross-site browser shortcut back to /a converges",
+            [url_a, url_b],
+            [0, 1],
+            0,
+            False,
+            True,
+            log,
+            expected_web_content_known_used_steps=[0, 1],
+            expected_web_content_current_step=0,
+        )
         expect_url(webdriver_port, session_id, "after cross-site browser shortcut back to /a", url_a, log)
         expect_ui_session_history(
             webdriver_port,
@@ -455199,6 +455441,19 @@ return [location.href, window.scriptBeforeUnloadCount, navigator.userActivation.
         page_server.b_document_ran.clear()
         perform_browser_history_shortcut(webdriver_port, session_id, "right", log)
         wait_for_event(page_server.b_document_ran, "B document after browser shortcut forward")
+        wait_for_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after cross-site browser shortcut forward to /b converges",
+            [url_a, url_b],
+            [0, 1],
+            1,
+            True,
+            False,
+            log,
+            expected_web_content_known_used_steps=[0, 1],
+            expected_web_content_current_step=1,
+        )
         expect_url(webdriver_port, session_id, "after cross-site browser shortcut forward to /b", url_b, log)
         expect_ui_session_history(
             webdriver_port,
@@ -455236,6 +455491,19 @@ return [location.href, window.scriptBeforeUnloadCount, navigator.userActivation.
         page_server.b_document_ran.clear()
         perform_browser_history_shortcut(webdriver_port, session_id, "left", log)
         wait_for_event(page_server.b_document_ran, "B document after browser shortcut back")
+        wait_for_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after browser shortcut back to /b converges",
+            [url_a, url_b, url_c],
+            [0, 1, 2],
+            1,
+            True,
+            True,
+            log,
+            expected_web_content_known_used_steps=[0, 1, 2],
+            expected_web_content_current_step=1,
+        )
         expect_url(webdriver_port, session_id, "after browser shortcut back to /b", url_b, log)
         expect_ui_session_history(
             webdriver_port,
@@ -455255,6 +455523,19 @@ return [location.href, window.scriptBeforeUnloadCount, navigator.userActivation.
         page_server.c_document_ran.clear()
         perform_browser_history_shortcut(webdriver_port, session_id, "right", log)
         wait_for_event(page_server.c_document_ran, "C document after browser shortcut forward")
+        wait_for_ui_session_history(
+            webdriver_port,
+            session_id,
+            "after browser shortcut forward to /c converges",
+            [url_a, url_b, url_c],
+            [0, 1, 2],
+            2,
+            True,
+            False,
+            log,
+            expected_web_content_known_used_steps=[0, 1, 2],
+            expected_web_content_current_step=2,
+        )
         expect_url(webdriver_port, session_id, "after browser shortcut forward to /c", url_c, log)
         expect_ui_session_history(
             webdriver_port,
@@ -482487,6 +482768,7 @@ FILE: UI/Qt/Icon.cpp
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Base64.h>
 #include <LibCore/Resource.h>
 #include <UI/Qt/ChromeStyle.h>
 #include <UI/Qt/Icon.h>
@@ -482509,6 +482791,26 @@ QIcon load_icon_from_uri(StringView uri)
     auto path = qstring_from_ak_string(resource->filesystem_path());
 
     return QIcon { path };
+}
+
+QIcon icon_from_base64_png(StringView favicon_base64_png, int logical_size)
+{
+    auto decoded = decode_base64(favicon_base64_png);
+    if (decoded.is_error())
+        return {};
+
+    QPixmap pixmap;
+    if (!pixmap.loadFromData(decoded.value().data(), static_cast<uint>(decoded.value().size()), "PNG"))
+        return {};
+
+    QIcon icon;
+    for (auto device_pixel_ratio : ICON_DEVICE_PIXEL_RATIOS) {
+        auto size = logical_size * device_pixel_ratio;
+        auto scaled_pixmap = pixmap.scaled(size, size, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+        scaled_pixmap.setDevicePixelRatio(device_pixel_ratio);
+        icon.addPixmap(scaled_pixmap);
+    }
+    return icon;
 }
 
 static QPen chrome_icon_pen(QColor const& color, qreal width)
@@ -482939,6 +483241,7 @@ enum class ChromeIcon {
 constexpr inline auto ICON_DEVICE_PIXEL_RATIOS = to_array({ 1, 2, 3 });
 
 QIcon load_icon_from_uri(StringView);
+QIcon icon_from_base64_png(StringView, int logical_size);
 QIcon create_chrome_icon(ChromeIcon, QPalette const&);
 QIcon loading_spinner_icon(QPalette const& palette, int frame);
 
@@ -484492,7 +484795,6 @@ FILE: UI/Qt/Menu.cpp
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/Base64.h>
 #include <UI/Qt/Icon.h>
 #include <UI/Qt/Menu.h>
 #include <UI/Qt/StringUtils.h>
@@ -484629,30 +484931,10 @@ static void add_properties(QObject& object, T& menu_or_action)
         object.setProperty(key.to_byte_string().characters(), qstring_from_ak_string(value));
 }
 
-static QIcon icon_from_base64_png(StringView favicon_base64_png)
+static void initialize_native_control(WebView::Action& action, QAction& qaction, QPalette const& palette, IncludeActionIcon include_action_icon)
 {
     static constexpr int const MENU_ICON_SIZE = 16;
 
-    auto decoded = decode_base64(favicon_base64_png);
-    if (decoded.is_error())
-        return {};
-
-    QPixmap pixmap;
-    if (!pixmap.loadFromData(decoded.value().data(), static_cast<uint>(decoded.value().size()), "PNG"))
-        return {};
-
-    QIcon icon;
-    for (auto device_pixel_ratio : ICON_DEVICE_PIXEL_RATIOS) {
-        auto size = MENU_ICON_SIZE * device_pixel_ratio;
-        auto scaled_pixmap = pixmap.scaled(size, size, Qt::KeepAspectRatio, Qt::SmoothTransformation);
-        scaled_pixmap.setDevicePixelRatio(device_pixel_ratio);
-        icon.addPixmap(scaled_pixmap);
-    }
-    return icon;
-}
-
-static void initialize_native_control(WebView::Action& action, QAction& qaction, QPalette const& palette, IncludeActionIcon include_action_icon)
-{
     switch (action.id()) {
     case WebView::ActionID::NavigateBack:
         if (include_action_icon == IncludeActionIcon::Yes)
@@ -484697,7 +484979,7 @@ static void initialize_native_control(WebView::Action& action, QAction& qaction,
         break;
     case WebView::ActionID::BookmarkItem:
         if (auto icon = action.base64_png_icon(); icon.has_value())
-            qaction.setIcon(icon_from_base64_png(*icon));
+            qaction.setIcon(icon_from_base64_png(*icon, MENU_ICON_SIZE));
         else
             qaction.setIcon(create_chrome_icon(ChromeIcon::Globe, palette));
         break;
@@ -485227,6 +485509,43 @@ static QToolButton* create_toolbar_button(QWidget& parent, QAction& action)
     return button;
 }
 
+static void populate_navigation_history_menu(QMenu& menu, WebContentView& view, int direction)
+{
+    static constexpr int const MENU_ICON_SIZE = 16;
+
+    menu.clear();
+
+    for (auto const& item : view.session_history_traversal_menu_items(direction)) {
+        auto* action = menu.addAction(qstring_from_ak_string(item.title));
+        action->setToolTip(qstring_from_ak_string(item.url));
+        if (item.favicon_base64_png.has_value())
+            action->setIcon(icon_from_base64_png(*item.favicon_base64_png, MENU_ICON_SIZE));
+        else
+            action->setIcon(create_chrome_icon(ChromeIcon::Globe, menu.palette()));
+        QObject::connect(action, &QAction::triggered, &view, [&view, delta = item.delta] {
+            (void)view.traverse_the_history_by_delta(delta);
+        });
+    }
+}
+
+static QToolButton* create_navigation_history_toolbar_button(QWidget& parent, QAction& action, WebContentView& view, int direction)
+{
+    auto* button = create_toolbar_button(parent, action);
+    auto* menu = new QMenu(button);
+    QObject::connect(menu, &QMenu::aboutToShow, button, [menu, &view, direction] {
+        populate_navigation_history_menu(*menu, view, direction);
+    });
+    button->setMenu(menu);
+    button->setPopupMode(QToolButton::DelayedPopup);
+    button->setContextMenuPolicy(Qt::CustomContextMenu);
+    QObject::connect(button, &QToolButton::customContextMenuRequested, button, [button, menu, &view, direction](QPoint const&) {
+        populate_navigation_history_menu(*menu, view, direction);
+        if (!menu->isEmpty())
+            button->showMenu();
+    });
+    return button;
+}
+
 static constexpr int TOOLBAR_HORIZONTAL_MARGIN = 12;
 static constexpr int TOOLBAR_VERTICAL_MARGIN = 2;
 static constexpr int TOOLBAR_MACOS_TRAFFIC_LIGHTS_CONTROL_GAP = 22;
@@ -485352,8 +485671,8 @@ Tab::Tab(BrowserWindow* window, RefPtr<WebView::WebContentClient> parent_client,
     navigation_button_layout->addWidget(create_toolbar_button(*navigation_button_cluster, *m_toggle_vertical_tabs_expanded_action));
     m_sidebar_toggle_navigation_spacer = new QSpacerItem(0, 0, QSizePolicy::Fixed, QSizePolicy::Minimum);
     navigation_button_layout->addItem(m_sidebar_toggle_navigation_spacer);
-    navigation_button_layout->addWidget(create_toolbar_button(*navigation_button_cluster, *m_navigate_back_action));
-    navigation_button_layout->addWidget(create_toolbar_button(*navigation_button_cluster, *m_navigate_forward_action));
+    navigation_button_layout->addWidget(create_navigation_history_toolbar_button(*navigation_button_cluster, *m_navigate_back_action, view(), -1));
+    navigation_button_layout->addWidget(create_navigation_history_toolbar_button(*navigation_button_cluster, *m_navigate_forward_action, view(), 1));
     navigation_button_layout->addWidget(create_toolbar_button(*navigation_button_cluster, *m_reload_action));
 
     if (use_left_traffic_light_window_controls()) {
