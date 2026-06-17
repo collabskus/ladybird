@@ -28692,7 +28692,9 @@ void finalize_a_cross_document_navigation(GC::Ref<Navigable> navigable, HistoryH
         traversable->clear_the_forward_session_history();
 
         // 2. Set targetStep to traversable's current session history step + 1.
-        target_step = traversable->current_session_history_step() + 1;
+        // AD-HOC: Claim the step instead — so a step claimed by an apply-history-step run still in flight can't be
+        //         handed out twice. See https://github.com/whatwg/html/issues/12576.
+        target_step = traversable->claim_next_session_history_step();
 
         // 3. Set historyEntry's step to targetStep.
         history_entry->set_step(target_step);
@@ -68350,7 +68352,8 @@ public:
         GC::Ptr<Navigable> expected_ongoing_navigation_navigable,
         Optional<String> expected_ongoing_navigation_id,
         GC::Ref<OnApplyHistoryStepComplete> on_complete)
-        : m_traversable(traversable)
+        : m_generation(++traversable->m_apply_history_step_generation_counter)
+        , m_traversable(traversable)
         , m_step(step)
         , m_target_step(target_step)
         , m_source_snapshot_params(source_snapshot_params)
@@ -68465,6 +68468,7 @@ private:
     void clear_ongoing_traversals_for_changing_navigables();
 
     Phase m_phase { Phase::WaitingForDocumentPopulation };
+    u64 m_generation { 0 };
     GC::Ref<TraversableNavigable> m_traversable;
     int m_step;
     int m_target_step;
@@ -68585,7 +68589,7 @@ void ApplyHistoryStepState::start()
 
             auto displayed_step = displayed_entry ? displayed_entry->step_value() : Optional<int> {};
             auto target_step = target_entry ? target_entry->step_value() : Optional<int> {};
-            if (!displayed_step.has_value() || !target_step.has_value()) {
+            if (!target_step.has_value()) {
                 // NB: Child navigables created during a busy top-level navigation can still have a pending initial
                 //     session history entry. The spec's step-based history algorithms operate on used history steps,
                 //     so a pending child entry must not block or crash the top-level apply-history step. The queued
@@ -68636,12 +68640,13 @@ void ApplyHistoryStepState::start()
                 case Bindings::NavigationType::Replace:
                     // FIXME: Add ever populated check
                     // - "replace": Assert: targetEntry's step is displayedEntry's step and targetEntry's document state's ever populated is false.
-                    VERIFY(target_entry->step() == displayed_entry->step());
+                    if (displayed_step.has_value())
+                        VERIFY(target_entry->step() == displayed_entry->step());
                     break;
                 case Bindings::NavigationType::Push:
                     // FIXME: Add ever populated check, and fix the bug where top level traversable's step is not updated when a child navigable navigates
                     // - "push": Assert: targetEntry's step is displayedEntry's step + 1 and targetEntry's document state's ever populated is false.
-                    if (*target_step <= *displayed_step) {
+                    if (displayed_step.has_value() && *target_step <= *displayed_step) {
                         // AD-HOC: A queued push can become stale if a later navigation commits before this task runs.
                         //         Browser engines let the later navigation win; do the same and avoid moving the
                         //         traversable's current step back to this push target during completion.
@@ -69065,37 +69070,48 @@ void ApplyHistoryStepState::complete()
     m_phase = Phase::Completed;
     m_timeout->stop();
 
-    // https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-the-used-step
-    // NB: targetStep was computed before the asynchronous portions of applying the history step. If a child
-    //     navigable was removed while those steps were running, that step can stop being used. Normalize again
-    //     before storing it as the traversable's current session history step.
-    m_target_step = m_traversable->get_the_used_step(m_target_step);
+    // AD-HOC: Commit the target step only if no newer apply history step has committed one. A synchronous navigation
+    //         jumping the queue while this step was paused has a newer target step; moving the current step back past
+    //         it would let the next push assign a step number that an existing entry already holds.
+    //         See https://github.com/whatwg/html/issues/12576.
+    if (m_generation > m_traversable->m_committed_apply_history_step_generation) {
+        m_traversable->m_committed_apply_history_step_generation = m_generation;
 
-    // 20. Set traversable's current session history step to targetStep.
-    m_traversable->m_current_session_history_step = m_target_step;
+        // https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-the-used-step
+        // NB: targetStep was computed before the asynchronous portions of applying the history step. If a child
+        //     navigable was removed while those steps were running, that step can stop being used. Normalize again
+        //     before storing it as the current session history step; keep it in a local so the claimed step retired
+        //     below still matches what the navigation claimed, not the re-normalized value.
+        auto const used_target_step = m_traversable->get_the_used_step(m_target_step);
 
-    // AD-HOC: Report the updated session history descriptors to the UI-process mirror.
-    if (m_traversable->page().client().should_report_session_history_updates()) {
-        auto save_active_entry_persisted_state = TraversableNavigable::SaveActiveEntryPersistedState::Yes;
-        // NB: During history traversal, the active entry can point at the target
-        //     entry before the active document's queued history-step update has
-        //     restored the target entry's persisted state. Do not overwrite that
-        //     target entry with the document's pre-restoration viewport offset.
-        if (m_navigation_type == Bindings::NavigationType::Traverse) {
-            auto document = m_traversable->active_document();
-            auto active_entry = m_traversable->active_session_history_entry();
-            if (document && active_entry && document->latest_entry() != active_entry)
-                save_active_entry_persisted_state = TraversableNavigable::SaveActiveEntryPersistedState::No;
+        // 20. Set traversable's current session history step to targetStep.
+        m_traversable->m_current_session_history_step = used_target_step;
+
+        // AD-HOC: Report the updated session history descriptors to the UI-process mirror.
+        if (m_traversable->page().client().should_report_session_history_updates()) {
+            auto save_active_entry_persisted_state = TraversableNavigable::SaveActiveEntryPersistedState::Yes;
+            // NB: During history traversal, the active entry can point at the target
+            //     entry before the active document's queued history-step update has
+            //     restored the target entry's persisted state. Do not overwrite that
+            //     target entry with the document's pre-restoration viewport offset.
+            if (m_navigation_type == Bindings::NavigationType::Traverse) {
+                auto document = m_traversable->active_document();
+                auto active_entry = m_traversable->active_session_history_entry();
+                if (document && active_entry && document->latest_entry() != active_entry)
+                    save_active_entry_persisted_state = TraversableNavigable::SaveActiveEntryPersistedState::No;
+            }
+            auto session_history_snapshot = m_traversable->create_session_history_snapshot(save_active_entry_persisted_state);
+            m_traversable->page().client().page_did_update_session_history(session_history_snapshot.top_level_session_history_entries, session_history_snapshot.used_session_history_steps, session_history_snapshot.current_used_step_index);
         }
-        auto session_history_snapshot = m_traversable->create_session_history_snapshot(save_active_entry_persisted_state);
-        m_traversable->page().client().page_did_update_session_history(session_history_snapshot.top_level_session_history_entries, session_history_snapshot.used_session_history_steps, session_history_snapshot.current_used_step_index);
+
+        VERIFY(m_traversable->m_session_history_entries.size() > 0);
+        auto back_enabled = m_traversable->can_go_back();
+        auto forward_enabled = m_traversable->can_go_forward();
+        m_traversable->page().client().page_did_update_navigation_buttons_state(back_enabled, forward_enabled);
+        m_traversable->page().client().page_did_change_url(m_traversable->current_session_history_entry()->url());
     }
 
-    VERIFY(m_traversable->m_session_history_entries.size() > 0);
-    auto back_enabled = m_traversable->can_go_back();
-    auto forward_enabled = m_traversable->can_go_forward();
-    m_traversable->page().client().page_did_update_navigation_buttons_state(back_enabled, forward_enabled);
-    m_traversable->page().client().page_did_change_url(m_traversable->current_session_history_entry()->url());
+    m_traversable->retire_claimed_session_history_step(m_target_step);
 
     // Clear state BEFORE on_complete, because on_complete may resolve a promise
     // that triggers the next session history traversal queue entry.
@@ -69115,6 +69131,7 @@ void ApplyHistoryStepState::finish_without_applying()
     m_phase = Phase::Completed;
     m_timeout->stop();
     clear_ongoing_traversals_for_changing_navigables();
+    m_traversable->retire_claimed_session_history_step(m_target_step);
     m_traversable->m_apply_history_step_state = nullptr;
     if (m_on_complete)
         m_on_complete->function()(HistoryStepResult::Applied);
@@ -69169,6 +69186,21 @@ void ApplyHistoryStepState::clear_ongoing_traversals_for_changing_navigables()
 {
     for (auto& navigable : m_changing_navigables)
         clear_ongoing_traversal_for_changing_navigable(navigable);
+}
+
+int TraversableNavigable::claim_next_session_history_step()
+{
+    int step = m_current_session_history_step;
+    for (auto claimed : m_outstanding_claimed_session_history_steps)
+        step = max(step, claimed);
+    ++step;
+    m_outstanding_claimed_session_history_steps.append(step);
+    return step;
+}
+
+void TraversableNavigable::retire_claimed_session_history_step(int step)
+{
+    m_outstanding_claimed_session_history_steps.remove_first_matching([step](int claimed) { return claimed == step; });
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#apply-the-history-step
@@ -69621,6 +69653,13 @@ void TraversableNavigable::clear_the_forward_session_history()
     // 2. Let step be the navigable's current session history step.
     auto step = current_session_history_step();
 
+    // AD-HOC: An apply-history-step run can still be in flight with a claimed step above the current step; its entry is
+    //         not forward history that traversing away abandoned — it's the entry the in-flight run is about to make
+    //         current. Removing it would leave that run applying a step with no entry.
+    //         See https://github.com/whatwg/html/issues/12576.
+    for (auto claimed : m_outstanding_claimed_session_history_steps)
+        step = max(step, claimed);
+
     // 3. Let entryLists be the ordered set « navigable's session history entries ».
     Vector<Vector<NonnullRefPtr<SessionHistoryEntry>>&> entry_lists;
     entry_lists.append(session_history_entries());
@@ -69890,7 +69929,9 @@ static Optional<int> update_session_history_entries_for_same_document_navigation
         traversable.clear_the_forward_session_history();
 
         // 2. Set targetStep to traversable's current session history step + 1.
-        target_step = traversable.current_session_history_step() + 1;
+        // AD-HOC: Claim the step instead — so a step claimed by an apply-history-step run still in flight can't be
+        //         handed out twice. See https://github.com/whatwg/html/issues/12576.
+        target_step = traversable.claim_next_session_history_step();
 
         // 3. Set targetEntry's step to targetStep.
         target_entry->set_step(*target_step);
@@ -69929,6 +69970,13 @@ bool TraversableNavigable::try_to_synchronously_commit_same_document_navigation(
 
     target_navigable->set_current_session_history_entry(target_entry);
     m_current_session_history_step = get_the_used_step(*target_step);
+
+    // AD-HOC: A synchronous commit applies its step in this same task, so it has no asynchronous window in which
+    //         another run could observe the claim. Retire it immediately. Unlike the queued apply-history-step path,
+    //         nothing else will. Leaving it outstanding would let claimed steps accumulate without bound — and push
+    //         later step numbers ever higher. (A replacement reuses the current step and claimed nothing, so retiring
+    //         it is a no-op.) See https://github.com/whatwg/html/issues/12576.
+    retire_claimed_session_history_step(*target_step);
 
     // NB: The queued apply-history-step path clears the ongoing navigation when the history step finishes. The
     //     synchronous fast path has already committed the same-document navigation and the Navigation API entry update
@@ -70238,6 +70286,13 @@ public:
     virtual bool is_top_level_traversable() const override;
 
     int current_session_history_step() const { return m_current_session_history_step; }
+
+    // Claims the step number for a new push-type session history entry. Claims are tracked separately from the current
+    // step: The current step only advances when an apply-history-step run commits — and several runs can have claimed
+    // steps in flight at once. So, computing a new step from the current step alone can hand out a step number that an
+    // existing entry already holds. A claim is retired when the run that applies it completes.
+    [[nodiscard]] int claim_next_session_history_step();
+    void retire_claimed_session_history_step(int step);
     Vector<NonnullRefPtr<SessionHistoryEntry>>& session_history_entries() { return m_session_history_entries; }
     Vector<NonnullRefPtr<SessionHistoryEntry>> const& session_history_entries() const { return m_session_history_entries; }
     struct SessionHistorySnapshot {
@@ -70385,6 +70440,30 @@ private:
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#tn-current-session-history-step
     int m_current_session_history_step { 0 };
+
+    // Concurrent apply-history-step runs share the step numbering below. Runs are serialized through the session
+    // history traversal queue — but a synchronous navigation can jump the queue while another run is paused (see the
+    // "sync navigations jump queue" in the spec). So, a nested run mutates this state while an outer run is mid-flight.
+    // The spec describes that concurrency — but not the necessary bookkeeping it ends up requiring in implementations.
+    // See https://github.com/whatwg/html/issues/12576.
+    //
+    // Four invariants keep the numbering coherent under that nesting:
+    //
+    //  - uniqueness: a new step number is claimed past every claimed-but-uncommitted step — never just current step + 1
+    //    (claim_next_session_history_step);
+    //
+    //  - ordering: a run commits its target step only if no newer run has committed first — so the current step can't
+    //    move backwards past a newer run's commit (ApplyHistoryStepState::complete);
+    //
+    //  - integrity: clearing the forward session history spares entries whose steps are claimed by runs still in flight
+    //    (clear_the_forward_session_history);
+    //
+    //  - initialization: step numbers are only compared once assigned; a pushed entry is the active session history
+    //    entry before its queued synchronous step assigns its step number (the Push assertion in
+    //    ApplyHistoryStepState::start).
+    u64 m_apply_history_step_generation_counter { 0 };
+    u64 m_committed_apply_history_step_generation { 0 };
+    Vector<int> m_outstanding_claimed_session_history_steps;
 
     // https://html.spec.whatwg.org/multipage/document-sequences.html#tn-session-history-entries
     Vector<NonnullRefPtr<SessionHistoryEntry>> m_session_history_entries;
@@ -89061,6 +89140,7 @@ FILE: Libraries/LibWeb/Internals/Internals.cpp
 
 #include <AK/JsonObject.h>
 #include <AK/NumericLimits.h>
+#include <LibCore/EventLoop.h>
 #include <LibCore/TimeZone.h>
 #include <LibGfx/Cursor.h>
 #include <LibHTTP/HSTS/ParsedHSTSPolicy.h>
@@ -89497,6 +89577,17 @@ void Internals::spoof_current_url(String const& url_string)
     window.associated_document().set_url(url.value());
     window.associated_document().set_origin(origin);
     HTML::relevant_settings_object(window.associated_document()).creation_url = url.release_value();
+}
+
+void Internals::load_url(String const& url_string)
+{
+    auto url = DOMURL::parse(url_string);
+
+    VERIFY(url.has_value());
+
+    Core::deferred_invoke([page = GC::make_root(page()), url = url.release_value()] {
+        page->load(url);
+    });
 }
 
 GC::Ref<InternalAnimationTimeline> Internals::create_internal_animation_timeline()
@@ -90127,6 +90218,7 @@ public:
     WebIDL::ExceptionOr<bool> dispatch_user_activated_event(DOM::EventTarget&, DOM::Event& event);
 
     void spoof_current_url(String const& url);
+    void load_url(String const& url);
 
     GC::Ref<InternalAnimationTimeline> create_internal_animation_timeline();
 
@@ -90274,6 +90366,10 @@ interface Internals {
 
     boolean dispatchUserActivatedEvent(EventTarget target, Event event);
     undefined spoofCurrentURL(USVString url);
+
+    // Loads a URL in the top-level traversable — deferred so it starts outside the calling task and can land between
+    // session-history traversal-queue steps, as can one requested by ConnectionFromClient::load_url in the UI process.
+    undefined loadURL(USVString url);
 
     InternalAnimationTimeline createInternalAnimationTimeline();
 
@@ -244737,7 +244833,8 @@ void Application::initialize_actions()
 
     m_history_menu = Menu::create("History"sv);
     m_history_menu->add_action(Action::create("View History"sv, ActionID::ViewHistory, [this]() {
-        open_url_in_new_tab(URL::about_history(), Web::HTML::ActivateTab::Yes);
+        if (!activate_tab_with_url(URL::about_history()))
+            open_url_in_new_tab(URL::about_history(), Web::HTML::ActivateTab::Yes);
     }));
 
     m_inspect_menu = Menu::create("Inspect"sv);
@@ -245771,6 +245868,7 @@ public:
 
     virtual Optional<ViewImplementation&> active_web_view() const { return {}; }
     virtual Optional<ViewImplementation&> open_blank_new_tab(Web::HTML::ActivateTab) const { return {}; }
+    virtual bool activate_tab_with_url(URL::URL const&) const { return false; }
     void open_url_in_new_tab(URL::URL const&, Web::HTML::ActivateTab) const;
     void open_bookmark_in_new_tab(String const& bookmark_id, Web::HTML::ActivateTab) const;
 
@@ -253884,15 +253982,48 @@ TraversableSessionHistory::UpdateResult TraversableSessionHistory::update_from_w
         });
     }
 
+    // AD-HOC: The URL-keyed anchor searches are the common case. But find_merge_anchor compares every local entry
+    //         against every incoming entry — and each URL comparison serializes both URLs. A burst of same-document
+    //         navigations (such as a pushState flood) can push the top-level entry count into the hundreds while this
+    //         runs once per history update — so, a quadratic scan with per-comparison serialization becomes a
+    //         UI-process bottleneck. Index the incoming entries by serialized URL once — keyed the same way URL
+    //         equality compares (full serialization, fragment included) — so each URL-keyed search is linear.
     if (!merge_anchor.has_value()) {
-        merge_anchor = find_merge_anchor([](Entry const& local_entry, Entry const& incoming_entry) {
-            return local_entry.url == incoming_entry.url && entries_have_matching_nonzero_document_state_id(local_entry, incoming_entry);
+        HashMap<String, Vector<size_t>> incoming_indices_by_url;
+        for (size_t incoming_index = *incoming_current_top_level_entry_index + 1; incoming_index > 0; --incoming_index) {
+            auto candidate_incoming_index = incoming_index - 1;
+            incoming_indices_by_url.ensure(entries[candidate_incoming_index].url.serialize()).append(candidate_incoming_index);
+        }
+
+        // The incoming index lists are built highest-first. So, this reproduces find_merge_anchor's choice among the
+        // local/incoming entry pairs whose URLs are equal and who satisfy the predicate: The highest local entry — and
+        // for it, the highest matching incoming entry.
+        auto find_url_merge_anchor = [&](auto predicate) -> Optional<SessionHistoryMergeAnchor> {
+            for (size_t local_index = *local_current_top_level_entry_index + 1; local_index > 0; --local_index) {
+                auto candidate_local_index = local_index - 1;
+                auto incoming_candidates = incoming_indices_by_url.find(m_entries[candidate_local_index].url.serialize());
+                if (incoming_candidates == incoming_indices_by_url.end())
+                    continue;
+                for (auto candidate_incoming_index : incoming_candidates->value) {
+                    if (!predicate(m_entries[candidate_local_index], entries[candidate_incoming_index]))
+                        continue;
+                    return SessionHistoryMergeAnchor {
+                        .local_index = candidate_local_index,
+                        .incoming_index = candidate_incoming_index,
+                    };
+                }
+            }
+            return {};
+        };
+
+        merge_anchor = find_url_merge_anchor([](Entry const& local_entry, Entry const& incoming_entry) {
+            return entries_have_matching_nonzero_document_state_id(local_entry, incoming_entry);
         });
-    }
-    if (!merge_anchor.has_value()) {
-        merge_anchor = find_merge_anchor([](Entry const& local_entry, Entry const& incoming_entry) {
-            return local_entry.url == incoming_entry.url;
-        });
+        if (!merge_anchor.has_value()) {
+            merge_anchor = find_url_merge_anchor([](Entry const&, Entry const&) {
+                return true;
+            });
+        }
     }
 
     if (!merge_anchor.has_value())
@@ -641174,44 +641305,3 @@ PASS: actual mutation root skips unrelated RHS sibling-combinator :has anchor: s
 PASS: actual mutation root keeps RHS sibling-combinator :has anchor: subsequent sibling argument | styleInvalidations=1, fullStyleInvalidations=0, elementStyleRecomputations=5, elementStyleNoopRecomputations=4, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=1, hasMatchInvocations=4, hasResultCacheHits=0, hasResultCacheMisses=4
 PASS: batched :has mutation invalidates after earlier unrelated mutation: adjacent sibling argument | styleInvalidations=1, fullStyleInvalidations=0, elementStyleRecomputations=5, elementStyleNoopRecomputations=4, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=2, hasMatchInvocations=4, hasResultCacheHits=0, hasResultCacheMisses=4
 PASS: batched :has mutation invalidates after earlier unrelated mutation: subsequent sibling argument | styleInvalidations=1, fullStyleInvalidations=0, elementStyleRecomputations=5, elementStyleNoopRecomputations=4, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=2, hasMatchInvocations=4, hasResultCacheHits=0, hasResultCacheMisses=4
-PASS: mixed-rule sibling scan preserves feature-filter skip: relative adjacent sibling argument | styleInvalidations=0, fullStyleInvalidations=0, elementStyleRecomputations=1, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=1, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2, hasAncestorWalkVisits=4, hasAncestorSiblingElementChecks=3
-PASS: mixed-rule sibling scan preserves feature-filter skip: relative subsequent sibling argument | styleInvalidations=0, fullStyleInvalidations=0, elementStyleRecomputations=1, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=1, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2, hasAncestorWalkVisits=4, hasAncestorSiblingElementChecks=3
-
-FILE: Tests/LibWeb/Text/expected/css/style-invalidation/has-sibling-combinator-non-subject.txt
-RESULT: adjacent match stops after plain element inserted between operands: initial=match expectedInitial=match, after=base expectedAfter=base
-PASS: non-subject :has sibling combinator: adjacent match stops after plain element inserted between operands | styleInvalidations=3, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-RESULT: adjacent match starts after plain middle element is removed: initial=base expectedInitial=base, after=match expectedAfter=match
-PASS: non-subject :has sibling combinator: adjacent match starts after plain middle element is removed | styleInvalidations=4, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-RESULT: adjacent match starts after plain middle element moves after right operand: initial=base expectedInitial=base, after=match expectedAfter=match
-PASS: non-subject :has sibling combinator: adjacent match starts after plain middle element moves after right operand | styleInvalidations=5, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-RESULT: adjacent match stops after trailing plain element moves between operands: initial=match expectedInitial=match, after=base expectedAfter=base
-PASS: non-subject :has sibling combinator: adjacent match stops after trailing plain element moves between operands | styleInvalidations=5, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-RESULT: adjacent attribute right operand stops after plain insertion: initial=match expectedInitial=match, after=base expectedAfter=base
-PASS: non-subject :has sibling combinator: adjacent attribute right operand stops after plain insertion | styleInvalidations=5, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-RESULT: adjacent id left operand stops after plain insertion: initial=match expectedInitial=match, after=base expectedAfter=base
-PASS: non-subject :has sibling combinator: adjacent id left operand stops after plain insertion | styleInvalidations=5, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-RESULT: adjacent tag operands stop after plain insertion: initial=match expectedInitial=match, after=base expectedAfter=base
-PASS: non-subject :has sibling combinator: adjacent tag operands stop after plain insertion | styleInvalidations=5, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-RESULT: child-scoped adjacent operands stop after plain insertion: initial=match expectedInitial=match, after=base expectedAfter=base
-PASS: non-subject :has sibling combinator: child-scoped adjacent operands stop after plain insertion | styleInvalidations=5, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-RESULT: nested target is invalidated when adjacent match stops: initial=match expectedInitial=match, after=base expectedAfter=base
-PASS: non-subject :has sibling combinator: nested target is invalidated when adjacent match stops | styleInvalidations=5, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-RESULT: direct child target is invalidated when adjacent match stops: initial=match expectedInitial=match, after=base expectedAfter=base
-PASS: non-subject :has sibling combinator: direct child target is invalidated when adjacent match stops | styleInvalidations=5, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-RESULT: is right operand stops after plain insertion: initial=match expectedInitial=match, after=base expectedAfter=base
-PASS: non-subject :has sibling combinator: is right operand stops after plain insertion | styleInvalidations=5, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-RESULT: where left operand stops after plain insertion: initial=match expectedInitial=match, after=base expectedAfter=base
-PASS: non-subject :has sibling combinator: where left operand stops after plain insertion | styleInvalidations=5, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-RESULT: selector list argument stops after plain insertion: initial=match expectedInitial=match, after=base expectedAfter=base
-PASS: non-subject :has sibling combinator: selector list argument stops after plain insertion | styleInvalidations=5, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=4, hasResultCacheHits=0, hasResultCacheMisses=4
-RESULT: descendant container adjacent argument stops after plain insertion: initial=match expectedInitial=match, after=base expectedAfter=base
-PASS: non-subject :has sibling combinator: descendant container adjacent argument stops after plain insertion | styleInvalidations=6, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-RESULT: descendant container adjacent argument starts after middle removal: initial=base expectedInitial=base, after=match expectedAfter=match
-PASS: non-subject :has sibling combinator: descendant container adjacent argument starts after middle removal | styleInvalidations=4, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-RESULT: outer id anchor with adjacent argument stops after plain insertion: initial=match expectedInitial=match, after=base expectedAfter=base
-PASS: non-subject :has sibling combinator: outer id anchor with adjacent argument stops after plain insertion | styleInvalidations=5, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-RESULT: outer class chain anchor with adjacent argument stops after plain insertion: initial=match expectedInitial=match, after=base expectedAfter=base
-PASS: non-subject :has sibling combinator: outer class chain anchor with adjacent argument stops after plain insertion | styleInvalidations=5, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-RESULT: custom element spacer stops adjacent match: initial=match expectedInitial=match, after=base expectedAfter=base
-PASS: non-subject :has sibling combinator: custom element spacer stops adjacent match | styleInvalidations=5, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-RESULT: shadow-local adjacent match stops after plain insertion: initial=match expectedInitial=match, after=base expectedAfter=base
