@@ -1,4 +1,5 @@
-﻿        if (child->has_attribute(HTML::AttributeNames::media)) {
+﻿        // 6. If child has a media attribute, and its value does not match the environment, continue to the next child.
+        if (child->has_attribute(HTML::AttributeNames::media)) {
             auto media_query = parse_media_query(CSS::Parser::ParsingParams { element.document() },
                 child->get_attribute_value(HTML::AttributeNames::media));
             if (!media_query || !media_query->evaluate(element.document())) {
@@ -25713,6 +25714,7 @@ FILE: Libraries/LibWeb/HTML/Navigable.cpp
 #include <LibWeb/HTML/History.h>
 #include <LibWeb/HTML/HistoryHandlingBehavior.h>
 #include <LibWeb/HTML/Navigable.h>
+#include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/HTML/Navigation.h>
 #include <LibWeb/HTML/NavigationObserver.h>
 #include <LibWeb/HTML/NavigationParams.h>
@@ -25956,6 +25958,49 @@ static Vector<NonnullRefPtr<SessionHistoryEntry>>* get_session_history_entries_i
     return nullptr;
 }
 
+Vector<NonnullRefPtr<SessionHistoryEntry>>* append_nested_history_for_child_navigable(
+    Navigable& parent_navigable, Navigable& child_navigable, SessionHistoryEntry& history_entry)
+{
+    VERIFY(child_navigable.parent() == &parent_navigable);
+
+    auto parent_doc_state = parent_navigable.active_session_history_entry()->document_state();
+    auto& parent_navigable_entries = parent_navigable.get_session_history_entries();
+    auto target_step_entry_iterator = parent_navigable_entries.find_if([parent_doc_state](auto& entry) {
+        return entry->document_state() == parent_doc_state;
+    });
+    if (target_step_entry_iterator == parent_navigable_entries.end())
+        return nullptr;
+
+    history_entry.set_step((*target_step_entry_iterator)->step());
+
+    DocumentState::NestedHistory nested_history {
+        .id = child_navigable.id(),
+        .entries { history_entry },
+    };
+    parent_doc_state->nested_histories().append(move(nested_history));
+    return &parent_doc_state->nested_histories().last().entries;
+}
+
+static Vector<NonnullRefPtr<SessionHistoryEntry>>*
+recreate_missing_nested_history_for_live_child_navigable(TraversableNavigable& traversable, Navigable& navigable)
+{
+    VERIFY(&navigable != &traversable);
+
+    auto parent = navigable.parent();
+    if (!parent)
+        return nullptr;
+
+    auto container = navigable.container();
+    if (!container || container->content_navigable() != &navigable)
+        return nullptr;
+
+    auto history_entry = navigable.active_session_history_entry();
+    if (!history_entry)
+        return nullptr;
+
+    return append_nested_history_for_child_navigable(*parent, navigable, *history_entry);
+}
+
 // https://html.spec.whatwg.org/multipage/document-sequences.html#child-navigable
 Vector<GC::Root<Navigable>> Navigable::child_navigables() const
 {
@@ -26153,11 +26198,9 @@ void Navigable::initialize_navigable(NonnullRefPtr<DocumentState> document_state
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-the-target-history-entry
-RefPtr<SessionHistoryEntry> Navigable::get_the_target_history_entry(int target_step) const
+static RefPtr<SessionHistoryEntry> get_the_target_history_entry_from_entries(
+    Vector<NonnullRefPtr<SessionHistoryEntry>> const& entries, int target_step)
 {
-    // 1. Let entries be the result of getting session history entries for navigable.
-    auto& entries = get_session_history_entries();
-
     // 2. Return the item in entries that has the greatest step less than or equal to step.
     RefPtr<SessionHistoryEntry> result = nullptr;
     for (auto& entry : entries) {
@@ -26172,6 +26215,32 @@ RefPtr<SessionHistoryEntry> Navigable::get_the_target_history_entry(int target_s
     }
 
     return result;
+}
+
+RefPtr<SessionHistoryEntry> Navigable::get_the_target_history_entry(int target_step) const
+{
+    // 1. Let entries be the result of getting session history entries for navigable.
+    auto& entries = get_session_history_entries();
+
+    return get_the_target_history_entry_from_entries(entries, target_step);
+}
+
+RefPtr<SessionHistoryEntry> Navigable::get_the_target_history_entry_if_present(int target_step) const
+{
+    auto traversable = traversable_navigable();
+    Vector<NonnullRefPtr<SessionHistoryEntry>>* entries = nullptr;
+    if (this == traversable.ptr())
+        entries = &traversable->session_history_entries();
+    else
+        entries = get_session_history_entries_if_present(*traversable, *this);
+
+    // AD-HOC: The spec asserts that a nested history list is found. During queued navigable creation/destruction
+    //         bookkeeping, engines can still observe a child navigable after its iframe has been removed from the
+    //         parent's nested histories. In that case, the detached child has no observable session history effect.
+    if (!entries)
+        return nullptr;
+
+    return get_the_target_history_entry_from_entries(*entries, target_step);
 }
 
 // https://html.spec.whatwg.org/multipage/browsing-the-web.html#activate-history-entry
@@ -26410,13 +26479,10 @@ void Navigable::set_ongoing_navigation(Variant<Empty, Traversal, String> ongoing
     }
 
     // AD-HOC: If we just finished a traversal and there are navigations that were deferred because the traversal was
-    //         ongoing, process them now.
-    if (was_traversal && !ongoing_navigation.has<Traversal>()) {
-        while (!m_pending_navigations.is_empty()) {
-            auto navigation_params = m_pending_navigations.take_first();
-            begin_navigation(navigation_params);
-        }
-    }
+    //         ongoing, process them now. A freshly-created child navigable can also have pending navigations while
+    //         its initial session history entry is being installed, so only drain once both gates are open.
+    if (was_traversal && !ongoing_navigation.has<Traversal>() && m_has_session_history_entry_and_ready_for_navigation)
+        process_pending_navigations();
 }
 
 void Navigable::queue_pending_navigation(NavigateParams params, PendingNavigationBehavior behavior)
@@ -26424,6 +26490,14 @@ void Navigable::queue_pending_navigation(NavigateParams params, PendingNavigatio
     if (behavior == PendingNavigationBehavior::Replace)
         m_pending_navigations.clear();
     m_pending_navigations.append(move(params));
+}
+
+void Navigable::process_pending_navigations()
+{
+    while (!m_pending_navigations.is_empty()) {
+        auto navigation_params = m_pending_navigations.take_first();
+        begin_navigation(navigation_params);
+    }
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable
@@ -28596,14 +28670,18 @@ void finalize_a_cross_document_navigation(GC::Ref<Navigable> navigable, HistoryH
     } else {
         target_entries_pointer = get_session_history_entries_if_present(*traversable, navigable);
         // https://html.spec.whatwg.org/multipage/browsing-the-web.html#getting-session-history-entries
-        // AD-HOC: The spec asserts that a nested history list is found. A queued child-frame commit can run
-        //         after the iframe has been removed, when there is no remaining list to update. Chromium,
-        //         WebKit, and Gecko bind child-frame commits to the live frame, so a removed frame's late
-        //         commit has no observable session history effect.
+        // AD-HOC: The spec asserts that targetEntries is not null. A queued child-frame commit can run after the
+        //         iframe was removed and its nested history list was pruned from the parent document state. Chromium,
+        //         WebKit, and Gecko bind child-frame commits to the live frame, so detached frames have no observable
+        //         session history effect. Conversely, if this is still the container's live content navigable,
+        //         preserve the requested navigation by recreating the missing nested history.
         if (!target_entries_pointer) {
-            navigable->clear_navigation_load_event_guard();
-            on_complete->function()(HistoryStepResult::Applied);
-            return;
+            target_entries_pointer = recreate_missing_nested_history_for_live_child_navigable(*traversable, *navigable);
+            if (!target_entries_pointer) {
+                navigable->clear_navigation_load_event_guard();
+                on_complete->function()(HistoryStepResult::Applied);
+                return;
+            }
         }
     }
     auto& target_entries = *target_entries_pointer;
@@ -29356,10 +29434,7 @@ void Navigable::stop_loading()
 void Navigable::set_has_session_history_entry_and_ready_for_navigation()
 {
     m_has_session_history_entry_and_ready_for_navigation = true;
-    while (!m_pending_navigations.is_empty()) {
-        auto navigation_params = m_pending_navigations.take_first();
-        begin_navigation(navigation_params);
-    }
+    process_pending_navigations();
 }
 
 Painting::CompositorSurfaceId Navigable::compositor_surface_id() const
@@ -29780,6 +29855,7 @@ public:
     GC::Ptr<Window> active_window();
 
     RefPtr<SessionHistoryEntry> get_the_target_history_entry(int target_step) const;
+    RefPtr<SessionHistoryEntry> get_the_target_history_entry_if_present(int target_step) const;
 
     void save_persisted_state_to_active_session_history_entry();
     void restore_persisted_state_from_session_history_entry(SessionHistoryEntry const&);
@@ -29977,6 +30053,7 @@ private:
 
     void begin_navigation(NavigateParams);
     void queue_pending_navigation(NavigateParams, PendingNavigationBehavior);
+    void process_pending_navigations();
     void navigate_to_a_fragment(URL::URL const&, HistoryHandlingBehavior, UserNavigationInvolvement, GC::Ptr<DOM::Element> source_element, Optional<SerializationRecord> navigation_api_state, String navigation_id);
     void navigate_to_a_javascript_url(URL::URL const&, HistoryHandlingBehavior, GC::Ref<SourceSnapshotParams>, URL::Origin const& initiator_origin, UserNavigationInvolvement, ContentSecurityPolicy::Directives::Directive::NavigationType csp_navigation_type, InitialInsertion, String navigation_id);
 
@@ -30086,6 +30163,8 @@ private:
 
 WEB_API HashTable<GC::RawRef<Navigable>>& all_navigables();
 
+Vector<NonnullRefPtr<SessionHistoryEntry>>* append_nested_history_for_child_navigable(
+    Navigable& parent_navigable, Navigable& child_navigable, SessionHistoryEntry& history_entry);
 bool navigation_must_be_a_replace(URL::URL const& url, DOM::Document const& document);
 void finalize_a_cross_document_navigation(GC::Ref<Navigable>, HistoryHandlingBehavior, UserNavigationInvolvement, NonnullRefPtr<SessionHistoryEntry>, GC::Ptr<DOM::Document> pending_document, Optional<String> expected_ongoing_navigation_id, GC::Ref<OnApplyHistoryStepComplete> on_complete);
 void perform_url_and_history_update_steps(DOM::Document& document, URL::URL new_url, Optional<SerializationRecord> = {}, HistoryHandlingBehavior history_handling = HistoryHandlingBehavior::Replace);
@@ -30214,28 +30293,8 @@ void NavigableContainer::create_new_child_navigable()
             return;
         }
 
-        // 1. Let parentDocState be parentNavigable's active session history entry's document state.
-        auto parent_doc_state = parent_navigable->active_session_history_entry()->document_state();
-
-        // 2. Let parentNavigableEntries be the result of getting session history entries for parentNavigable.
-        auto parent_navigable_entries = parent_navigable->get_session_history_entries();
-
-        // 3. Let targetStepSHE be the first session history entry in parentNavigableEntries whose document state equals parentDocState.
-        auto target_step_she = *parent_navigable_entries.find_if([parent_doc_state](auto& entry) {
-            return entry->document_state() == parent_doc_state;
-        });
-
-        // 4. Set historyEntry's step to targetStepSHE's step.
-        history_entry->set_step(target_step_she->step());
-
-        // 5. Let nestedHistory be a new nested history whose id is navigable's id and entries list is « historyEntry ».
-        DocumentState::NestedHistory nested_history {
-            .id = navigable->id(),
-            .entries { *history_entry },
-        };
-
-        // 6. Append nestedHistory to parentDocState's nested histories.
-        parent_doc_state->nested_histories().append(move(nested_history));
+        // 1-6. Append nestedHistory to parentDocState's nested histories.
+        VERIFY(append_nested_history_for_child_navigable(*parent_navigable, *navigable, *history_entry));
 
         // 7. Update for navigable creation/destruction given traversable
         traversable->update_for_navigable_creation_or_destruction(GC::create_function(traversable->heap(), [signal](HistoryStepResult) {
@@ -30316,15 +30375,6 @@ Optional<URL::URL> NavigableContainer::shared_attribute_processing_steps_for_ifr
     if (!m_content_navigable)
         return {};
 
-    // AD-HOC: If the content navigable already has a navigation in progress or pending,
-    //         skip the initial attribute processing. Without this, the about:blank URL update
-    //         from perform_url_and_history_update_steps creates a state machine that clobbers the
-    //         navigable's ongoing_navigation, causing the real navigation to be dropped when its
-    //         populate completion callback checks ongoing_navigation != navigation_id.
-    if (initial_insertion == InitialInsertion::Yes && (m_content_navigable->has_pending_navigations() || !m_content_navigable->ongoing_navigation().has<Empty>())) {
-        return {};
-    }
-
     // 1. Let url be the URL record about:blank.
     auto url = URL::about_blank();
 
@@ -30345,6 +30395,17 @@ Optional<URL::URL> NavigableContainer::shared_attribute_processing_steps_for_ifr
         VERIFY(navigable->active_document());
         if (navigable->active_document()->url().equals(url, URL::ExcludeFragment::Yes))
             return {};
+    }
+
+    // AD-HOC: If the content navigable already has a navigation in progress or pending, skip the initial
+    //         about:blank URL update. Without this, the URL update creates a state machine that clobbers the
+    //         navigable's ongoing_navigation, causing the real navigation to be dropped when its populate completion
+    //         callback checks ongoing_navigation != navigation_id. Non-blank src navigations must still be processed
+    //         here, and will be queued by Navigable::navigate() until the child navigable is ready for navigation.
+    if (url_matches_about_blank(url) && initial_insertion == InitialInsertion::Yes
+        && (m_content_navigable->has_pending_navigations()
+            || !m_content_navigable->ongoing_navigation().has<Empty>())) {
+        return {};
     }
 
     // 4. If url matches about:blank and initialInsertion is true, then perform the URL and history update steps given element's content navigable's active document and url.
@@ -68086,7 +68147,7 @@ Vector<GC::Root<Navigable>> TraversableNavigable::get_all_navigables_whose_curre
         auto navigable = navigables_to_check.take_first();
 
         // 1. Let targetEntry be the result of getting the target history entry given navigable and targetStep.
-        auto target_entry = navigable->get_the_target_history_entry(target_step);
+        auto target_entry = navigable->get_the_target_history_entry_if_present(target_step);
         if (!target_entry)
             continue;
 
@@ -68126,7 +68187,7 @@ Vector<GC::Root<Navigable>> TraversableNavigable::get_all_navigables_that_only_n
         auto navigable = navigables_to_check.take_first();
 
         // 1. Let targetEntry be the result of getting the target history entry given navigable and targetStep.
-        auto target_entry = navigable->get_the_target_history_entry(target_step);
+        auto target_entry = navigable->get_the_target_history_entry_if_present(target_step);
         if (!target_entry)
             continue;
 
@@ -68165,7 +68226,7 @@ Vector<GC::Root<Navigable>> TraversableNavigable::get_all_navigables_that_might_
         auto navigable = navigables_to_check.take_first();
 
         // 1. Let targetEntry be the result of getting the target history entry given navigable and targetStep.
-        auto target_entry = navigable->get_the_target_history_entry(target_step);
+        auto target_entry = navigable->get_the_target_history_entry_if_present(target_step);
         if (!target_entry)
             continue;
 
@@ -68465,7 +68526,7 @@ void ApplyHistoryStepState::start()
             continue;
 
         // 1. Let targetEntry be the result of getting the target history entry given navigable and targetStep.
-        auto target_entry = navigable->get_the_target_history_entry(m_target_step);
+        auto target_entry = navigable->get_the_target_history_entry_if_present(m_target_step);
         if (!target_entry)
             continue;
 
@@ -641154,18 +641215,3 @@ PASS: non-subject :has sibling combinator: outer class chain anchor with adjacen
 RESULT: custom element spacer stops adjacent match: initial=match expectedInitial=match, after=base expectedAfter=base
 PASS: non-subject :has sibling combinator: custom element spacer stops adjacent match | styleInvalidations=5, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
 RESULT: shadow-local adjacent match stops after plain insertion: initial=match expectedInitial=match, after=base expectedAfter=base
-PASS: non-subject :has sibling combinator: shadow-local adjacent match stops after plain insertion | styleInvalidations=5, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-RESULT: shadow-local adjacent match starts after middle removal: initial=base expectedInitial=base, after=match expectedAfter=match
-PASS: non-subject :has sibling combinator: shadow-local adjacent match starts after middle removal | styleInvalidations=4, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-RESULT: subsequent sibling with structural pseudo stops after plain insertion: initial=match expectedInitial=match, after=base expectedAfter=base
-PASS: non-subject :has sibling combinator: subsequent sibling with structural pseudo stops after plain insertion | styleInvalidations=5, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-RESULT: subsequent sibling with structural pseudo starts after middle removal: initial=base expectedInitial=base, after=match expectedAfter=match
-PASS: non-subject :has sibling combinator: subsequent sibling with structural pseudo starts after middle removal | styleInvalidations=4, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-RESULT: adjacent match survives plain insertion before operands: initial=match expectedInitial=match, after=match expectedAfter=match
-PASS: non-subject :has sibling combinator: adjacent match survives plain insertion before operands | styleInvalidations=5, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-RESULT: adjacent mismatch survives plain insertion when right operand does not match: initial=base expectedInitial=base, after=base expectedAfter=base
-PASS: non-subject :has sibling combinator: adjacent mismatch survives plain insertion when right operand does not match | styleInvalidations=5, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-RESULT: adjacent match survives removing unrelated trailing plain element: initial=match expectedInitial=match, after=match expectedAfter=match
-PASS: non-subject :has sibling combinator: adjacent match survives removing unrelated trailing plain element | styleInvalidations=4, fullStyleInvalidations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-
-FILE: Tests/LibWeb/Text/expected/css/style-invalidation/has-structural-feature-filter.txt
