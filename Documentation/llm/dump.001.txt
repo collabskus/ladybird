@@ -751,7 +751,8 @@ runs:
       if: ${{ inputs.os == 'macOS' || inputs.os == 'Android' }}
       uses: dtolnay/rust-toolchain@stable
 
-    - name: 'Install wasm-tools'
+    - name: 'Resolve wasm-tools release'
+      id: 'wasm-tools'
       if: ${{ inputs.type == 'build' }}
       shell: bash
       run: |
@@ -768,19 +769,49 @@ runs:
           EXTENSION=tar.gz
         fi
         NAME="wasm-tools-${VERSION}-${ARCH}-${LOWERCASE_OS}"
-        FILENAME="${NAME}.${EXTENSION}"
+        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+        echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+        echo "filename=${NAME}.${EXTENSION}" >> "$GITHUB_OUTPUT"
+        echo "extension=${EXTENSION}" >> "$GITHUB_OUTPUT"
 
-        curl --fail --location --write-out '%{url}' --output "${FILENAME}" \
-          "https://github.com/bytecodealliance/wasm-tools/releases/download/v${VERSION}/${FILENAME}"
+    - name: 'Cache wasm-tools'
+      id: 'wasm-tools-cache'
+      if: ${{ inputs.type == 'build' }}
+      uses: actions/cache@v4
+      with:
+        path: ${{ github.workspace }}/${{ steps.wasm-tools.outputs.name }}
+        key: ${{ steps.wasm-tools.outputs.name }}
 
-        if [ "${EXTENSION}" == 'zip' ]; then
+    - name: 'Install wasm-tools'
+      if: ${{ inputs.type == 'build' && steps.wasm-tools-cache.outputs.cache-hit != 'true' }}
+      shell: bash
+      run: |
+        FILENAME="${{ steps.wasm-tools.outputs.filename }}"
+        URL="https://github.com/bytecodealliance/wasm-tools/releases/download/v${{ steps.wasm-tools.outputs.version }}/${FILENAME}"
+
+        delays=(5 15 45)
+        attempt=1
+        until curl --fail --location --output "${FILENAME}" "${URL}"; do
+          if (( attempt > ${#delays[@]} )); then
+            echo "wasm-tools download failed after $(( ${#delays[@]} + 1 )) attempts" >&2
+            exit 1
+          fi
+          echo "wasm-tools download failed; retrying in ${delays[attempt-1]}s" >&2
+          sleep "${delays[attempt-1]}"
+          attempt=$(( attempt + 1 ))
+        done
+
+        if [ "${{ steps.wasm-tools.outputs.extension }}" == 'zip' ]; then
           unzip "${FILENAME}"
         else
           tar -xzf "${FILENAME}"
         fi
         rm "${FILENAME}"
 
-        echo "${GITHUB_WORKSPACE}/${NAME}" >> $GITHUB_PATH
+    - name: 'Add wasm-tools to PATH'
+      if: ${{ inputs.type == 'build' }}
+      shell: bash
+      run: echo "${GITHUB_WORKSPACE}/${{ steps.wasm-tools.outputs.name }}" >> "$GITHUB_PATH"
 
     - name: 'Set required environment variables'
       if: ${{ inputs.os == 'Linux' && inputs.arch == 'arm64' }}
@@ -51509,7 +51540,6 @@ ThreedShadow1=#3d3e40
 ThreedShadow2=#2e2f30
 HoverHighlight=#696969
 Selection=#14141a
-SelectionText=white
 InactiveSelection=#606060
 InactiveSelectionText=white
 RubberBandFill=#8080803c
@@ -51597,7 +51627,6 @@ ThreedShadow1=#808080
 ThreedShadow2=#404040
 HoverHighlight=#e3dfdb
 Selection=#84351a
-SelectionText=white
 InactiveSelection=#606060
 InactiveSelectionText=white
 PlaceholderText=#808080
@@ -92556,6 +92585,8 @@ NonnullRefPtr<Connection> Connection::create(NonnullOwnPtr<Core::BufferedTCPSock
 Connection::Connection(NonnullOwnPtr<Core::BufferedTCPSocket> socket)
     : m_socket(move(socket))
 {
+    (void)m_socket->set_blocking(false);
+
     m_socket->on_ready_to_read = [this]() {
         if (auto result = on_ready_to_read(); result.is_error()) {
             if (on_connection_closed)
@@ -92590,47 +92621,71 @@ void Connection::send_message(JsonValue const& message)
     }
 }
 
-// https://firefox-source-docs.mozilla.org/devtools/backend/protocol.html#packets
-ErrorOr<JsonValue> Connection::read_message()
+ErrorOr<void> Connection::read_available_data()
 {
-    ByteBuffer length_buffer;
+    auto buffer = TRY(ByteBuffer::create_uninitialized(4096));
 
-    // FIXME: `read_until(':')` would be nicer here, but that seems to return immediately without receiving any data.
-    while (true) {
-        auto byte = TRY(m_socket->read_value<u8>());
-        if (byte == ':') {
+    while (TRY(m_socket->can_read_without_blocking())) {
+        auto bytes = TRY(m_socket->read_some(buffer));
+        if (bytes.is_empty()) {
+            if (m_socket->is_eof())
+                return Error::from_string_literal("DevTools client disconnected");
             break;
         }
 
-        length_buffer.append(byte);
+        TRY(m_incoming_buffer.try_append(bytes));
     }
 
-    auto length = StringView { length_buffer }.to_number<size_t>();
+    return {};
+}
+
+// https://firefox-source-docs.mozilla.org/devtools/backend/protocol.html#packets
+ErrorOr<Optional<JsonValue>> Connection::read_message()
+{
+    auto const packet = StringView { m_incoming_buffer };
+    auto colon_offset = packet.find(':');
+    if (!colon_offset.has_value())
+        return Optional<JsonValue> {};
+
+    auto length = packet.substring_view(0, *colon_offset).to_number<size_t>();
     if (!length.has_value())
         return Error::from_string_literal("Could not read message length from DevTools client");
 
-    ByteBuffer message_buffer;
-    message_buffer.resize(*length);
+    auto const message_offset = *colon_offset + 1;
+    auto const packet_size = message_offset + *length;
+    if (m_incoming_buffer.size() < packet_size)
+        return Optional<JsonValue> {};
 
-    TRY(m_socket->read_until_filled(message_buffer));
+    auto message = TRY(JsonValue::from_string(packet.substring_view(message_offset, *length)));
 
-    auto message = TRY(JsonValue::from_string(message_buffer));
     dbgln_if(DEVTOOLS_DEBUG, "\x1b[1;33m>>\x1b[0m {}", message);
+
+    if (packet_size == m_incoming_buffer.size()) {
+        m_incoming_buffer.clear();
+    } else {
+        m_incoming_buffer = TRY(m_incoming_buffer.slice(packet_size, m_incoming_buffer.size() - packet_size));
+    }
 
     return message;
 }
 
 ErrorOr<void> Connection::on_ready_to_read()
 {
+    TRY(read_available_data());
+
     // https://firefox-source-docs.mozilla.org/devtools/backend/protocol.html#the-request-reply-pattern
     // Note that it is correct for a client to send several requests to a request/reply actor without waiting for a
     // reply to each request before sending the next; requests can be pipelined.
-    while (TRY(m_socket->can_read_without_blocking())) {
+    while (true) {
         auto message = TRY(read_message());
-        if (!message.is_object())
+        if (!message.has_value())
+            break;
+
+        auto value = message.release_value();
+        if (!value.is_object())
             continue;
 
-        Core::deferred_invoke([weak_self = make_weak_ptr<Connection>(), message = move(message)]() mutable {
+        Core::deferred_invoke([weak_self = make_weak_ptr<Connection>(), message = move(value)]() mutable {
             auto self = weak_self.strong_ref();
             if (!self)
                 return;
@@ -92654,10 +92709,12 @@ FILE: Libraries/LibDevTools/Connection.h
 
 #pragma once
 
+#include <AK/ByteBuffer.h>
 #include <AK/Error.h>
 #include <AK/Function.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/NonnullRefPtr.h>
+#include <AK/Optional.h>
 #include <AK/RefCounted.h>
 #include <AK/Weakable.h>
 #include <LibCore/Socket.h>
@@ -92681,9 +92738,11 @@ private:
     explicit Connection(NonnullOwnPtr<Core::BufferedTCPSocket>);
 
     ErrorOr<void> on_ready_to_read();
-    ErrorOr<JsonValue> read_message();
+    ErrorOr<void> read_available_data();
+    ErrorOr<Optional<JsonValue>> read_message();
 
     NonnullOwnPtr<Core::BufferedTCPSocket> m_socket;
+    ByteBuffer m_incoming_buffer;
 };
 
 }
@@ -120219,7 +120278,11 @@ FILE: Libraries/LibGfx/PaintingSurface.cpp
 #include <LibGfx/SharedImageBuffer.h>
 #include <LibGfx/SkiaUtils.h>
 
+#include <core/SkCanvas.h>
 #include <core/SkColorSpace.h>
+#include <core/SkImage.h>
+#include <core/SkPaint.h>
+#include <core/SkRect.h>
 #include <core/SkSurface.h>
 #include <gpu/ganesh/GrBackendSurface.h>
 #include <gpu/ganesh/GrDirectContext.h>
@@ -120388,6 +120451,25 @@ void PaintingSurface::write_from_bitmap(Bitmap const& bitmap)
     m_impl->surface->writePixels(pixmap, 0, 0);
 }
 
+void PaintingSurface::copy_from_surface(PaintingSurface& source)
+{
+    source.flush();
+
+    auto image = source.m_impl->surface->makeImageSnapshot();
+    if (!image)
+        return;
+
+    SkPaint paint;
+    paint.setBlendMode(SkBlendMode::kSrc);
+    canvas().drawImageRect(
+        image.get(),
+        SkRect::MakeIWH(image->width(), image->height()),
+        SkRect::MakeIWH(size().width(), size().height()),
+        SkSamplingOptions {},
+        &paint,
+        SkCanvas::kStrict_SrcRectConstraint);
+}
+
 IntSize PaintingSurface::size() const
 {
     return m_impl->size;
@@ -120493,6 +120575,7 @@ public:
 
     void read_into_bitmap(Bitmap&, IntPoint source_position = {}) const;
     void write_from_bitmap(Bitmap const&);
+    void copy_from_surface(PaintingSurface&);
 
     void notify_content_will_change();
 
@@ -120997,7 +121080,6 @@ public:
     Color window() const { return color(ColorRole::Window); }
     Color window_text() const { return color(ColorRole::WindowText); }
     Color selection() const { return color(ColorRole::Selection); }
-    Color selection_text() const { return color(ColorRole::SelectionText); }
     Color inactive_selection() const { return color(ColorRole::InactiveSelection); }
     Color inactive_selection_text() const { return color(ColorRole::InactiveSelectionText); }
     Color desktop_background() const { return color(ColorRole::DesktopBackground); }
@@ -125374,7 +125456,6 @@ namespace Gfx {
     C(RulerBorder)                 \
     C(RulerInactiveText)           \
     C(Selection)                   \
-    C(SelectionText)               \
     C(SyntaxComment)               \
     C(SyntaxControlKeyword)        \
     C(SyntaxIdentifier)            \
@@ -435979,6 +436060,43 @@ interface SubtleCrypto {
     Promise<ArrayBuffer> decapsulateBits(AlgorithmIdentifier decapsulationAlgorithm, CryptoKey decapsulationKey, BufferSource ciphertext);
 };
 
+FILE: Libraries/LibWeb/CSS/AncestorFilter.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Types.h>
+
+namespace Web::CSS {
+
+// Separate otherwise identical string hashes by selector component kind,
+// e.g. `.article` versus `<article>`.
+static constexpr u32 ancestor_filter_hash_for_tag_name(u32 hash)
+{
+    return hash * 13;
+}
+
+static constexpr u32 ancestor_filter_hash_for_id(u32 hash)
+{
+    return hash * 17;
+}
+
+static constexpr u32 ancestor_filter_hash_for_class(u32 hash)
+{
+    return hash * 19;
+}
+
+static constexpr u32 ancestor_filter_hash_for_attribute(u32 hash)
+{
+    return hash * 23;
+}
+
+}
+
 FILE: Libraries/LibWeb/CSS/Angle.cpp
 /*
  * Copyright (c) 2022-2025, Sam Atkins <sam@ladybird.org>
@@ -474612,21 +474730,29 @@ static bool has_rule_that_may_be_affected_by_mutation(StyleScope& style_scope, D
         }
     };
 
+    auto check_rule_map = [&](auto const& map) {
+        for (auto const& entry : map) {
+            check_rule_vector(entry.value);
+            if (may_be_affected)
+                return;
+        }
+    };
+
+    auto check_rule_buckets = [&](auto const& rule_buckets) {
+        check_rule_map(rule_buckets.rules_by_id);
+        check_rule_map(rule_buckets.rules_by_class);
+        check_rule_map(rule_buckets.rules_by_tag_name);
+        check_rule_map(rule_buckets.rules_by_attribute_name);
+        check_rule_vector(rule_buckets.root_rules);
+        check_rule_vector(rule_buckets.other_rules);
+    };
+
     auto const& has_rule_cache = style_scope.get_pseudo_class_rule_cache(PseudoClass::Has);
-    for (auto const& entry : has_rule_cache.rules_by_id)
-        check_rule_vector(entry.value);
-    for (auto const& entry : has_rule_cache.rules_by_class)
-        check_rule_vector(entry.value);
-    for (auto const& entry : has_rule_cache.rules_by_tag_name)
-        check_rule_vector(entry.value);
-    for (auto const& entry : has_rule_cache.rules_by_attribute_name)
-        check_rule_vector(entry.value);
+    check_rule_buckets(has_rule_cache);
     for (auto const& rules : has_rule_cache.rules_by_pseudo_element)
-        check_rule_vector(rules);
-    check_rule_vector(has_rule_cache.root_rules);
+        check_rule_buckets(rules);
     check_rule_vector(has_rule_cache.slotted_rules);
     check_rule_vector(has_rule_cache.part_rules);
-    check_rule_vector(has_rule_cache.other_rules);
 
     return !found_has_rule || may_be_affected;
 }
@@ -476391,6 +476517,193 @@ FILE: Libraries/LibWeb/CSS/InvalidationSet.cpp
 
 namespace Web::CSS {
 
+InvalidationSet::PropertySet::PropertySet()
+    : m_empty()
+{
+}
+
+InvalidationSet::PropertySet::PropertySet(PropertySet const& other)
+    : m_empty()
+{
+    copy_from(other);
+}
+
+InvalidationSet::PropertySet::PropertySet(PropertySet&& other)
+    : m_empty()
+{
+    move_from(move(other));
+}
+
+InvalidationSet::PropertySet::~PropertySet()
+{
+    destroy_storage();
+}
+
+InvalidationSet::PropertySet& InvalidationSet::PropertySet::operator=(PropertySet const& other)
+{
+    if (this != &other) {
+        destroy_storage();
+        copy_from(other);
+    }
+    return *this;
+}
+
+InvalidationSet::PropertySet& InvalidationSet::PropertySet::operator=(PropertySet&& other)
+{
+    if (this != &other) {
+        destroy_storage();
+        move_from(move(other));
+    }
+    return *this;
+}
+
+void InvalidationSet::PropertySet::destroy_storage()
+{
+    if (m_storage_type == StorageType::Single) {
+        m_property.~Property();
+        return;
+    }
+    if (m_storage_type == StorageType::HashTable)
+        m_properties.~HashTable<Property>();
+}
+
+void InvalidationSet::PropertySet::copy_from(PropertySet const& other)
+{
+    m_storage_type = other.m_storage_type;
+    if (m_storage_type == StorageType::Empty) {
+        new (&m_empty) Empty();
+        return;
+    }
+    if (m_storage_type == StorageType::Single) {
+        new (&m_property) Property(other.m_property);
+        return;
+    }
+    new (&m_properties) HashTable<Property>(other.m_properties);
+}
+
+void InvalidationSet::PropertySet::move_from(PropertySet&& other)
+{
+    m_storage_type = other.m_storage_type;
+    if (m_storage_type == StorageType::Empty) {
+        new (&m_empty) Empty();
+        return;
+    }
+    if (m_storage_type == StorageType::Single) {
+        new (&m_property) Property(move(other.m_property));
+        return;
+    }
+    new (&m_properties) HashTable<Property>(move(other.m_properties));
+}
+
+bool InvalidationSet::PropertySet::is_empty() const
+{
+    return m_storage_type == StorageType::Empty;
+}
+
+size_t InvalidationSet::PropertySet::size() const
+{
+    if (m_storage_type == StorageType::Empty)
+        return 0;
+    if (m_storage_type == StorageType::Single)
+        return 1;
+    return m_properties.size();
+}
+
+bool InvalidationSet::PropertySet::contains(Property const& property) const
+{
+    if (m_storage_type == StorageType::Empty)
+        return false;
+    if (m_storage_type == StorageType::Single)
+        return m_property == property;
+    return m_properties.contains(property);
+}
+
+bool InvalidationSet::PropertySet::set(Property property)
+{
+    if (m_storage_type == StorageType::Empty) {
+        new (&m_property) Property(move(property));
+        m_storage_type = StorageType::Single;
+        return true;
+    }
+
+    if (m_storage_type == StorageType::Single) {
+        if (m_property == property)
+            return false;
+
+        HashTable<Property> properties;
+        properties.set(m_property, AK::HashSetExistingEntryBehavior::Keep);
+        properties.set(move(property), AK::HashSetExistingEntryBehavior::Keep);
+        m_property.~Property();
+        new (&m_properties) HashTable<Property>(move(properties));
+        m_storage_type = StorageType::HashTable;
+        return true;
+    }
+
+    return m_properties.set(move(property), AK::HashSetExistingEntryBehavior::Keep) == AK::HashSetResult::InsertedNewEntry;
+}
+
+bool InvalidationSet::PropertySet::include_all_from(PropertySet const& other)
+{
+    if (other.m_storage_type == StorageType::Empty)
+        return false;
+    if (other.m_storage_type == StorageType::Single)
+        return set(other.m_property);
+
+    bool changed = false;
+    for (auto const& property : other.m_properties)
+        changed |= set(property);
+    return changed;
+}
+
+bool InvalidationSet::PropertySet::operator==(PropertySet const& other) const
+{
+    if (size() != other.size())
+        return false;
+    if (m_storage_type == StorageType::Empty)
+        return true;
+    if (m_storage_type == StorageType::Single)
+        return other.contains(m_property);
+
+    for (auto const& property : m_properties) {
+        if (!other.contains(property))
+            return false;
+    }
+    return true;
+}
+
+void InvalidationSet::PropertySet::accumulate_hash(u32& property_hash_sum, u32& property_hash_xor) const
+{
+    auto add_property_hash = [&](auto const& property) {
+        auto property_hash = AK::Traits<Property>::hash(property);
+        property_hash_sum += property_hash;
+        property_hash_xor ^= pair_int_hash(property_hash, 0x9e3779b9);
+    };
+
+    if (m_storage_type == StorageType::Empty)
+        return;
+    if (m_storage_type == StorageType::Single) {
+        add_property_hash(m_property);
+        return;
+    }
+
+    for (auto const& property : m_properties)
+        add_property_hash(property);
+}
+
+IterationDecision InvalidationSet::PropertySet::for_each(Function<IterationDecision(Property const&)> const& callback) const
+{
+    if (m_storage_type == StorageType::Empty)
+        return IterationDecision::Continue;
+    if (m_storage_type == StorageType::Single)
+        return callback(m_property);
+
+    for (auto const& property : m_properties) {
+        if (callback(property) == IterationDecision::Break)
+            return IterationDecision::Break;
+    }
+    return IterationDecision::Continue;
+}
+
 bool InvalidationSet::operator==(InvalidationSet const& other) const
 {
     if (hash() != other.hash())
@@ -476399,28 +476712,34 @@ bool InvalidationSet::operator==(InvalidationSet const& other) const
         return false;
     if (m_needs_invalidate_whole_subtree != other.m_needs_invalidate_whole_subtree)
         return false;
-    if (m_properties.size() != other.m_properties.size())
-        return false;
-
-    for (auto const& property : m_properties) {
-        if (!other.m_properties.contains(property))
-            return false;
-    }
-    return true;
+    return m_properties == other.m_properties;
 }
 
 void InvalidationSet::include_all_from(InvalidationSet const& other)
 {
-    m_needs_invalidate_self |= other.m_needs_invalidate_self;
-    m_needs_invalidate_whole_subtree |= other.m_needs_invalidate_whole_subtree;
-    for (auto const& property : other.m_properties)
-        m_properties.set(property);
-    m_hash = {};
+    bool changed = false;
+    if (other.m_needs_invalidate_self && !m_needs_invalidate_self) {
+        m_needs_invalidate_self = true;
+        changed = true;
+    }
+    if (other.m_needs_invalidate_whole_subtree && !m_needs_invalidate_whole_subtree) {
+        m_needs_invalidate_whole_subtree = true;
+        changed = true;
+    }
+    changed |= m_properties.include_all_from(other.m_properties);
+    if (changed)
+        m_hash = {};
 }
 
 bool InvalidationSet::is_empty() const
 {
     return !m_needs_invalidate_self && !m_needs_invalidate_whole_subtree && m_properties.is_empty();
+}
+
+void InvalidationSet::add_property(Property property)
+{
+    if (m_properties.set(move(property)))
+        m_hash = {};
 }
 
 void InvalidationSet::for_each_property(Function<IterationDecision(Property const&)> const& callback) const
@@ -476433,10 +476752,7 @@ void InvalidationSet::for_each_property(Function<IterationDecision(Property cons
         if (callback({ Property::Type::InvalidateWholeSubtree }) == IterationDecision::Break)
             return;
     }
-    for (auto const& property : m_properties) {
-        if (callback(property) == IterationDecision::Break)
-            return;
-    }
+    m_properties.for_each(callback);
 }
 
 u32 InvalidationSet::hash() const
@@ -476446,11 +476762,7 @@ u32 InvalidationSet::hash() const
 
     u32 property_hash_sum = 0;
     u32 property_hash_xor = 0;
-    for (auto const& property : m_properties) {
-        auto property_hash = AK::Traits<Property>::hash(property);
-        property_hash_sum += property_hash;
-        property_hash_xor ^= pair_int_hash(property_hash, 0x9e3779b9);
-    }
+    m_properties.accumulate_hash(property_hash_sum, property_hash_xor);
 
     auto hash = pair_int_hash(m_needs_invalidate_self, m_needs_invalidate_whole_subtree);
     hash = pair_int_hash(hash, m_properties.size());
@@ -476543,6 +476855,7 @@ FILE: Libraries/LibWeb/CSS/InvalidationSet.h
 #include <AK/Forward.h>
 #include <AK/HashTable.h>
 #include <AK/Traits.h>
+#include <AK/Variant.h>
 #include <LibWeb/CSS/PseudoClass.h>
 
 namespace Web::CSS {
@@ -476588,28 +476901,23 @@ public:
 
     void set_needs_invalidate_class(FlyString const& name)
     {
-        m_properties.set({ Property::Type::Class, name });
-        m_hash = {};
+        add_property({ Property::Type::Class, name });
     }
     void set_needs_invalidate_id(FlyString const& name)
     {
-        m_properties.set({ Property::Type::Id, name });
-        m_hash = {};
+        add_property({ Property::Type::Id, name });
     }
     void set_needs_invalidate_tag_name(FlyString const& name)
     {
-        m_properties.set({ Property::Type::TagName, name });
-        m_hash = {};
+        add_property({ Property::Type::TagName, name });
     }
     void set_needs_invalidate_attribute(FlyString const& name)
     {
-        m_properties.set({ Property::Type::Attribute, name });
-        m_hash = {};
+        add_property({ Property::Type::Attribute, name });
     }
     void set_needs_invalidate_pseudo_class(PseudoClass pseudo_class)
     {
-        m_properties.set({ Property::Type::PseudoClass, pseudo_class });
-        m_hash = {};
+        add_property({ Property::Type::PseudoClass, pseudo_class });
     }
 
     bool is_empty() const;
@@ -476619,9 +476927,50 @@ public:
     u32 hash() const;
 
 private:
+    class PropertySet {
+    public:
+        PropertySet();
+        PropertySet(PropertySet const&);
+        PropertySet(PropertySet&&);
+        ~PropertySet();
+
+        PropertySet& operator=(PropertySet const&);
+        PropertySet& operator=(PropertySet&&);
+
+        bool is_empty() const;
+        size_t size() const;
+        bool contains(Property const&) const;
+        bool set(Property);
+        bool include_all_from(PropertySet const&);
+        bool operator==(PropertySet const&) const;
+        void accumulate_hash(u32& property_hash_sum, u32& property_hash_xor) const;
+
+        IterationDecision for_each(Function<IterationDecision(Property const&)> const&) const;
+
+    private:
+        enum class StorageType : u8 {
+            Empty,
+            Single,
+            HashTable,
+        };
+
+        void destroy_storage();
+        void copy_from(PropertySet const&);
+        void move_from(PropertySet&&);
+
+        StorageType m_storage_type { StorageType::Empty };
+        union {
+            Empty m_empty;
+            Property m_property;
+            HashTable<Property> m_properties;
+        };
+    };
+
+    void add_property(Property);
+
     bool m_needs_invalidate_self { false };
     bool m_needs_invalidate_whole_subtree { false };
-    HashTable<Property> m_properties;
+    PropertySet m_properties;
     mutable Optional<u32> m_hash;
 };
 
@@ -513361,6 +513710,7 @@ FILE: Libraries/LibWeb/CSS/Selector.cpp
 #include "Selector.h"
 #include <AK/GenericShorthands.h>
 #include <AK/NeverDestroyed.h>
+#include <LibWeb/CSS/AncestorFilter.h>
 #include <LibWeb/CSS/CSSStyleRule.h>
 #include <LibWeb/CSS/Parser/ErrorReporter.h>
 #include <LibWeb/CSS/Serialize.h>
@@ -513507,39 +513857,204 @@ void Selector::collect_ancestor_hashes()
     }
 
     size_t next_hash_index = 0;
-    auto append_unique_hash = [&](u32 hash) -> bool {
-        if (next_hash_index >= m_ancestor_hashes.size())
-            return true;
-        for (size_t i = 0; i < next_hash_index; ++i) {
-            if (m_ancestor_hashes[i] == hash)
-                return false;
-        }
-        m_ancestor_hashes[next_hash_index++] = hash;
-        return false;
-    };
+    struct AncestorHashCollector {
+        enum class IncludeRightmostCompound : bool {
+            No,
+            Yes,
+        };
 
-    auto append_hashes_from_compound = [&](CompoundSelector const& compound_selector) {
-        for (auto const& simple_selector : compound_selector.simple_selectors) {
+        Array<u32, 8>& ancestor_hashes;
+        size_t& next_hash_index;
+
+        static bool contains_hash(Vector<u32> const& hashes, u32 hash)
+        {
+            for (auto existing_hash : hashes) {
+                if (existing_hash == hash)
+                    return true;
+            }
+            return false;
+        }
+
+        static void append_unique_hash(Vector<u32>& hashes, u32 hash)
+        {
+            if (!contains_hash(hashes, hash))
+                hashes.append(hash);
+        }
+
+        static void intersect_hashes(Vector<u32>& hashes, Vector<u32> const& other_hashes)
+        {
+            for (size_t i = 0; i < hashes.size();) {
+                if (contains_hash(other_hashes, hashes[i])) {
+                    ++i;
+                    continue;
+                }
+                hashes.remove(i);
+            }
+        }
+
+        bool append_unique_hash(u32 hash)
+        {
+            if (next_hash_index >= ancestor_hashes.size())
+                return true;
+            for (size_t i = 0; i < next_hash_index; ++i) {
+                if (ancestor_hashes[i] == hash)
+                    return false;
+            }
+            ancestor_hashes[next_hash_index++] = hash;
+            return false;
+        }
+
+        Vector<u32> hashes_from_simple_selector(SimpleSelector const& simple_selector)
+        {
+            Vector<u32> hashes;
             switch (simple_selector.type) {
             case SimpleSelector::Type::Id:
+                hashes.append(ancestor_filter_hash_for_id(simple_selector.name().hash()));
+                break;
             case SimpleSelector::Type::Class:
-                if (append_unique_hash(simple_selector.name().hash()))
-                    return true;
+                hashes.append(ancestor_filter_hash_for_class(simple_selector.name().hash()));
                 break;
             case SimpleSelector::Type::TagName:
-                if (append_unique_hash(simple_selector.qualified_name().name.lowercase_name.hash()))
-                    return true;
+                hashes.append(ancestor_filter_hash_for_tag_name(simple_selector.qualified_name().name.lowercase_name.hash()));
                 break;
             case SimpleSelector::Type::Attribute:
-                if (append_unique_hash(simple_selector.attribute().qualified_name.name.lowercase_name.hash()))
-                    return true;
+                hashes.append(ancestor_filter_hash_for_attribute(simple_selector.attribute().qualified_name.name.lowercase_name.hash()));
                 break;
+            case SimpleSelector::Type::PseudoClass: {
+                auto const& pseudo_class = simple_selector.pseudo_class();
+                if (pseudo_class.type != PseudoClass::Is && pseudo_class.type != PseudoClass::Where)
+                    break;
+
+                // The selector's ancestor hashes are all mandatory. For :is()/:where(), only
+                // hashes required by every alternative can reject the selector without running it.
+                hashes = common_hashes_from_selector_list(pseudo_class.argument_selector_list, IncludeRightmostCompound::Yes);
+                break;
+            }
             default:
                 break;
             }
+            return hashes;
         }
-        return false;
+
+        Vector<u32> hashes_from_compound(CompoundSelector const& compound_selector)
+        {
+            Vector<u32> hashes;
+            for (auto const& simple_selector : compound_selector.simple_selectors) {
+                for (auto hash : hashes_from_simple_selector(simple_selector))
+                    append_unique_hash(hashes, hash);
+            }
+            return hashes;
+        }
+
+        Vector<u32> hashes_from_subject_compound_selector_list_pseudo_classes(CompoundSelector const& compound_selector)
+        {
+            Vector<u32> hashes;
+            for (auto const& simple_selector : compound_selector.simple_selectors) {
+                if (simple_selector.type != SimpleSelector::Type::PseudoClass)
+                    continue;
+
+                auto const& pseudo_class = simple_selector.pseudo_class();
+                if (pseudo_class.type != PseudoClass::Is && pseudo_class.type != PseudoClass::Where)
+                    continue;
+
+                for (auto hash : common_hashes_from_selector_list(pseudo_class.argument_selector_list, IncludeRightmostCompound::No))
+                    append_unique_hash(hashes, hash);
+            }
+            return hashes;
+        }
+
+        Vector<u32> hashes_from_selector(Selector const& selector, IncludeRightmostCompound include_rightmost_compound)
+        {
+            Vector<u32> hashes;
+            auto const& compound_selectors = selector.compound_selectors();
+            if (compound_selectors.is_empty())
+                return hashes;
+
+            if (include_rightmost_compound == IncludeRightmostCompound::Yes) {
+                // A selector-list pseudo-class in an ancestor compound matches that ancestor.
+                // The argument selector's rightmost compound is therefore on the subject's
+                // ancestor chain.
+                for (auto hash : hashes_from_compound(compound_selectors.last()))
+                    append_unique_hash(hashes, hash);
+            } else {
+                // A selector-list pseudo-class in the subject compound can still contain
+                // ancestor requirements inside its alternatives, e.g. `:is(.foo > .bar)`.
+                for (auto hash : hashes_from_subject_compound_selector_list_pseudo_classes(compound_selectors.last()))
+                    append_unique_hash(hashes, hash);
+            }
+
+            auto combinator_to_right = compound_selectors.last().combinator;
+            for (ssize_t i = static_cast<ssize_t>(compound_selectors.size()) - 2; i >= 0; --i) {
+                auto const& compound_selector = compound_selectors[i];
+
+                switch (combinator_to_right) {
+                case Combinator::Descendant:
+                case Combinator::ImmediateChild:
+                case Combinator::PseudoElement:
+                    for (auto hash : hashes_from_compound(compound_selector))
+                        append_unique_hash(hashes, hash);
+                    break;
+                case Combinator::NextSibling:
+                case Combinator::SubsequentSibling:
+                    break;
+                case Combinator::Column:
+                default:
+                    return hashes;
+                }
+
+                combinator_to_right = compound_selector.combinator;
+            }
+
+            return hashes;
+        }
+
+        Vector<u32> common_hashes_from_selector_list(SelectorList const& selector_list, IncludeRightmostCompound include_rightmost_compound)
+        {
+            if (selector_list.is_empty())
+                return {};
+
+            Optional<Vector<u32>> common_hashes;
+            for (auto const& argument_selector : selector_list) {
+                auto hashes = hashes_from_selector(*argument_selector, include_rightmost_compound);
+                if (!common_hashes.has_value()) {
+                    common_hashes = move(hashes);
+                    continue;
+                }
+
+                intersect_hashes(common_hashes.value(), hashes);
+                if (common_hashes->is_empty())
+                    break;
+            }
+
+            return common_hashes.release_value();
+        }
+
+        bool append_hashes_from_simple_selector(SimpleSelector const& simple_selector)
+        {
+            for (auto hash : hashes_from_simple_selector(simple_selector)) {
+                if (append_unique_hash(hash))
+                    return true;
+            }
+            return false;
+        }
+
+        bool append_hashes_from_compound(CompoundSelector const& compound_selector)
+        {
+            for (auto const& simple_selector : compound_selector.simple_selectors) {
+                if (append_hashes_from_simple_selector(simple_selector))
+                    return true;
+            }
+            return false;
+        }
     };
+    AncestorHashCollector ancestor_hash_collector { m_ancestor_hashes, next_hash_index };
+
+    for (auto hash : ancestor_hash_collector.hashes_from_subject_compound_selector_list_pseudo_classes(m_compound_selectors.last())) {
+        if (ancestor_hash_collector.append_unique_hash(hash)) {
+            m_can_use_ancestor_filter = (next_hash_index > 0);
+            return;
+        }
+    }
 
     // Walk from the compound immediately to the left of the subject toward the left.
     // The combinator that connects `i` to `i+1` is stored on `i+1`.
@@ -513557,7 +514072,7 @@ void Selector::collect_ancestor_hashes()
         case Combinator::PseudoElement:
             // This compound is on the ancestor axis (directly, as the originating element for a pseudo-element,
             // or as a shared ancestor past a sibling boundary).
-            if (append_hashes_from_compound(compound_selector)) {
+            if (ancestor_hash_collector.append_hashes_from_compound(compound_selector)) {
                 m_can_use_ancestor_filter = (next_hash_index > 0);
                 return;
             }
@@ -517518,6 +518033,7 @@ FILE: Libraries/LibWeb/CSS/StyleComputer.cpp
 #include <LibWeb/Animations/AnimationEffect.h>
 #include <LibWeb/Animations/DocumentTimeline.h>
 #include <LibWeb/Bindings/PrincipalHostDefined.h>
+#include <LibWeb/CSS/AncestorFilter.h>
 #include <LibWeb/CSS/AnimationEvent.h>
 #include <LibWeb/CSS/CSSAnimation.h>
 #include <LibWeb/CSS/CSSContainerRule.h>
@@ -517874,6 +518390,42 @@ static u64 pseudo_element_style_bit(PseudoElement pseudo_element)
     return 1ull << to_underlying(pseudo_element);
 }
 
+template<typename RuleBuckets>
+static IterationDecision for_each_matching_rule_bucket(DOM::AbstractElement abstract_element, RuleBuckets const& rule_buckets, Function<IterationDecision(Vector<MatchingRule> const&)> const& callback)
+{
+    for (auto const& class_name : abstract_element.element().class_names()) {
+        if (auto it = rule_buckets.rules_by_class.find(class_name); it != rule_buckets.rules_by_class.end()) {
+            if (callback(it->value) == IterationDecision::Break)
+                return IterationDecision::Break;
+        }
+    }
+    if (auto id = abstract_element.element().id(); id.has_value()) {
+        if (auto it = rule_buckets.rules_by_id.find(id.value()); it != rule_buckets.rules_by_id.end()) {
+            if (callback(it->value) == IterationDecision::Break)
+                return IterationDecision::Break;
+        }
+    }
+    if (auto it = rule_buckets.rules_by_tag_name.find(abstract_element.element().lowercased_local_name()); it != rule_buckets.rules_by_tag_name.end()) {
+        if (callback(it->value) == IterationDecision::Break)
+            return IterationDecision::Break;
+    }
+
+    if (abstract_element.element().is_document_element()) {
+        if (callback(rule_buckets.root_rules) == IterationDecision::Break)
+            return IterationDecision::Break;
+    }
+
+    IterationDecision decision = IterationDecision::Continue;
+    abstract_element.element().for_each_attribute([&](auto& name, auto&) {
+        if (auto it = rule_buckets.rules_by_attribute_name.find(name); it != rule_buckets.rules_by_attribute_name.end())
+            decision = callback(it->value);
+    });
+    if (decision == IterationDecision::Break)
+        return IterationDecision::Break;
+
+    return callback(rule_buckets.other_rules);
+}
+
 Vector<StyleComputer::ScopedMatchingRule> StyleComputer::collect_matching_rules_from_context(DOM::AbstractElement abstract_element, CascadeOrigin cascade_origin, GC::Ptr<DOM::ShadowRoot const> context_shadow_root, Optional<FlyString const> qualified_layer_name, u64* matching_pseudo_element_styles) const
 {
     auto const& root_node = abstract_element.element().root();
@@ -517968,8 +518520,12 @@ Vector<StyleComputer::ScopedMatchingRule> StyleComputer::collect_matching_rules_
             return IterationDecision::Continue;
         });
         if (!abstract_element.pseudo_element().has_value() && matching_pseudo_element_styles) {
-            for (auto const& matching_rules : rule_cache.rules_by_pseudo_element)
-                add_rules_to_run(matching_rules, rule_root);
+            for (auto const& pseudo_element_rules : rule_cache.rules_by_pseudo_element) {
+                (void)for_each_matching_rule_bucket(abstract_element, pseudo_element_rules, [&](auto const& matching_rules) {
+                    add_rules_to_run(matching_rules, rule_root);
+                    return IterationDecision::Continue;
+                });
+            }
         }
     };
 
@@ -520500,7 +521056,39 @@ struct SimplifiedSelectorForBucketing {
     FlyString name;
 };
 
-static Optional<SimplifiedSelectorForBucketing> is_roundabout_selector_bucketable_as_something_simpler(CSS::Selector::SimpleSelector const& simple_selector)
+static Optional<SimplifiedSelectorForBucketing> bucket_for_is_or_where_selector(CSS::Selector::SimpleSelector const&);
+
+static Optional<SimplifiedSelectorForBucketing> bucket_for_compound_selector(CSS::Selector::CompoundSelector const& compound_selector)
+{
+    Optional<SimplifiedSelectorForBucketing> attribute_bucket;
+    for (auto const& simple_selector : compound_selector.simple_selectors.in_reverse()) {
+        if (simple_selector.type == CSS::Selector::SimpleSelector::Type::Class
+            || simple_selector.type == CSS::Selector::SimpleSelector::Type::Id) {
+            return SimplifiedSelectorForBucketing { simple_selector.type, simple_selector.name() };
+        }
+
+        if (simple_selector.type == CSS::Selector::SimpleSelector::Type::TagName) {
+            return SimplifiedSelectorForBucketing { simple_selector.type, simple_selector.qualified_name().name.lowercase_name };
+        }
+
+        if (simple_selector.type == CSS::Selector::SimpleSelector::Type::Attribute) {
+            if (!attribute_bucket.has_value())
+                attribute_bucket = SimplifiedSelectorForBucketing { simple_selector.type, simple_selector.attribute().qualified_name.name.lowercase_name };
+            continue;
+        }
+
+        if (auto bucket = bucket_for_is_or_where_selector(simple_selector); bucket.has_value()) {
+            if (bucket->type != CSS::Selector::SimpleSelector::Type::Attribute)
+                return bucket;
+            if (!attribute_bucket.has_value())
+                attribute_bucket = bucket.release_value();
+        }
+    }
+
+    return attribute_bucket;
+}
+
+static Optional<SimplifiedSelectorForBucketing> bucket_for_is_or_where_selector(CSS::Selector::SimpleSelector const& simple_selector)
 {
     if (simple_selector.type != CSS::Selector::SimpleSelector::Type::PseudoClass)
         return {};
@@ -520513,22 +521101,7 @@ static Optional<SimplifiedSelectorForBucketing> is_roundabout_selector_bucketabl
         return {};
 
     auto const& argument_selector = *simple_selector.pseudo_class().argument_selector_list.first();
-
-    auto const& compound_selector = argument_selector.compound_selectors().last();
-    if (compound_selector.simple_selectors.size() != 1)
-        return {};
-
-    auto const& inner_simple_selector = compound_selector.simple_selectors.first();
-    if (inner_simple_selector.type == CSS::Selector::SimpleSelector::Type::Class
-        || inner_simple_selector.type == CSS::Selector::SimpleSelector::Type::Id) {
-        return SimplifiedSelectorForBucketing { inner_simple_selector.type, inner_simple_selector.name() };
-    }
-
-    if (inner_simple_selector.type == CSS::Selector::SimpleSelector::Type::TagName) {
-        return SimplifiedSelectorForBucketing { inner_simple_selector.type, inner_simple_selector.qualified_name().name.lowercase_name };
-    }
-
-    return {};
+    return bucket_for_compound_selector(argument_selector.compound_selectors().last());
 }
 
 NonnullRefPtr<StyleValue const> StyleComputer::compute_value_of_custom_property(DOM::AbstractElement abstract_element, Utf16FlyString const& name, Optional<Parser::GuardedSubstitutionContexts&> guarded_contexts)
@@ -521223,13 +521796,13 @@ NonnullRefPtr<StyleValue const> StyleComputer::compute_math_depth(NonnullRefPtr<
 
 static void for_each_element_hash(DOM::Element const& element, auto callback)
 {
-    callback(element.local_name().ascii_case_insensitive_hash());
+    callback(ancestor_filter_hash_for_tag_name(element.local_name().ascii_case_insensitive_hash()));
     if (element.id().has_value())
-        callback(element.id().value().hash());
+        callback(ancestor_filter_hash_for_id(element.id().value().hash()));
     for (auto const& class_ : element.class_names())
-        callback(class_.hash());
+        callback(ancestor_filter_hash_for_class(class_.hash()));
     element.for_each_attribute([&](auto& attribute) {
-        callback(attribute.name().ascii_case_insensitive_hash());
+        callback(ancestor_filter_hash_for_attribute(attribute.name().ascii_case_insensitive_hash()));
     });
 }
 
@@ -521260,41 +521833,26 @@ void StyleComputer::pop_ancestor(DOM::Element const& element)
     });
 }
 
-void RuleCache::add_rule(MatchingRule const& matching_rule, Optional<PseudoElement> pseudo_element, bool contains_root_pseudo_class)
+template<typename RuleBuckets>
+static void add_rule_to_rule_buckets(RuleBuckets& rule_buckets, MatchingRule const& matching_rule, Selector::CompoundSelector const& bucket_compound_selector, bool contains_root_pseudo_class)
 {
-    if (matching_rule.slotted) {
-        slotted_rules.append(matching_rule);
-        return;
-    }
-    if (matching_rule.contains_part_pseudo_element) {
-        part_rules.append(matching_rule);
-        return;
-    }
     // NOTE: We traverse the simple selectors in reverse order to make sure that class/ID buckets are preferred over tag buckets
     //       in the common case of div.foo or div#foo selectors.
     auto add_to_id_bucket = [&](FlyString const& name) {
-        rules_by_id.ensure(name).append(matching_rule);
+        rule_buckets.rules_by_id.ensure(name).append(matching_rule);
     };
 
     auto add_to_class_bucket = [&](FlyString const& name) {
-        rules_by_class.ensure(name).append(matching_rule);
+        rule_buckets.rules_by_class.ensure(name).append(matching_rule);
     };
 
     auto add_to_tag_name_bucket = [&](FlyString const& name) {
-        rules_by_tag_name.ensure(name).append(matching_rule);
+        rule_buckets.rules_by_tag_name.ensure(name).append(matching_rule);
     };
 
-    auto const& bucket_compound_selector = [&]() -> Selector::CompoundSelector const& {
-        if (matching_rule.contains_pseudo_element && pseudo_element.has_value()) {
-            // Normalized pseudo-element selectors end with a pseudo-element compound; bucket them
-            // by the originating element compound so `.foo::before` keeps using the `.foo` bucket.
-            for (auto const& compound_selector : matching_rule.selector.compound_selectors().in_reverse()) {
-                if (compound_selector.combinator != Selector::Combinator::PseudoElement)
-                    return compound_selector;
-            }
-        }
-        return matching_rule.selector.compound_selectors().last();
-    }();
+    auto add_to_attribute_bucket = [&](FlyString const& name) {
+        rule_buckets.rules_by_attribute_name.ensure(name).append(matching_rule);
+    };
 
     for (auto const& simple_selector : bucket_compound_selector.simple_selectors.in_reverse()) {
         if (simple_selector.type == Selector::SimpleSelector::Type::Id) {
@@ -521309,8 +521867,9 @@ void RuleCache::add_rule(MatchingRule const& matching_rule, Optional<PseudoEleme
             add_to_tag_name_bucket(simple_selector.qualified_name().name.lowercase_name);
             return;
         }
-        // NOTE: Selectors like `:is/where(.foo)` and `:is/where(.foo .bar)` are bucketed as class selectors for `foo` and `bar` respectively.
-        if (auto simplified = is_roundabout_selector_bucketable_as_something_simpler(simple_selector); simplified.has_value()) {
+        // NOTE: Single-argument :is()/:where() selectors can be bucketed by a mandatory
+        //       id, class, tag, or attribute in their rightmost compound selector.
+        if (auto simplified = bucket_for_is_or_where_selector(simple_selector); simplified.has_value()) {
             if (simplified->type == Selector::SimpleSelector::Type::TagName) {
                 add_to_tag_name_bucket(simplified->name);
                 return;
@@ -521323,70 +521882,68 @@ void RuleCache::add_rule(MatchingRule const& matching_rule, Optional<PseudoEleme
                 add_to_id_bucket(simplified->name);
                 return;
             }
+            if (simplified->type == Selector::SimpleSelector::Type::Attribute) {
+                add_to_attribute_bucket(simplified->name);
+                return;
+            }
         }
+    }
+
+    if (contains_root_pseudo_class) {
+        rule_buckets.root_rules.append(matching_rule);
+    } else {
+        for (auto const& simple_selector : bucket_compound_selector.simple_selectors) {
+            if (simple_selector.type == Selector::SimpleSelector::Type::Attribute) {
+                add_to_attribute_bucket(simple_selector.attribute().qualified_name.name.lowercase_name);
+                return;
+            }
+        }
+        rule_buckets.other_rules.append(matching_rule);
+    }
+}
+
+void RuleCache::add_rule(MatchingRule const& matching_rule, Optional<PseudoElement> pseudo_element, bool contains_root_pseudo_class)
+{
+    if (matching_rule.slotted) {
+        slotted_rules.append(matching_rule);
+        return;
+    }
+    if (matching_rule.contains_part_pseudo_element) {
+        part_rules.append(matching_rule);
+        return;
     }
 
     if (matching_rule.contains_pseudo_element && pseudo_element.has_value()) {
         if (Selector::PseudoElementSelector::is_known_pseudo_element_type(pseudo_element.value())) {
-            rules_by_pseudo_element[to_underlying(pseudo_element.value())].append(matching_rule);
-        } else {
-            // NOTE: We don't cache rules for unknown pseudo-elements. They can't match anything anyway.
+            // Normalized pseudo-element selectors end with a pseudo-element compound; bucket them
+            // by the originating element compound so `.foo::before` keeps using the `.foo` bucket.
+            auto const& bucket_compound_selector = [&]() -> Selector::CompoundSelector const& {
+                for (auto const& compound_selector : matching_rule.selector.compound_selectors().in_reverse()) {
+                    if (compound_selector.combinator != Selector::Combinator::PseudoElement)
+                        return compound_selector;
+                }
+                return matching_rule.selector.compound_selectors().last();
+            }();
+            add_rule_to_rule_buckets(rules_by_pseudo_element[to_underlying(pseudo_element.value())], matching_rule, bucket_compound_selector, contains_root_pseudo_class);
         }
-    } else if (contains_root_pseudo_class) {
-        root_rules.append(matching_rule);
-    } else {
-        for (auto const& simple_selector : matching_rule.selector.compound_selectors().last().simple_selectors) {
-            if (simple_selector.type == Selector::SimpleSelector::Type::Attribute) {
-                rules_by_attribute_name.ensure(simple_selector.attribute().qualified_name.name.lowercase_name).append(matching_rule);
-                return;
-            }
-        }
-        other_rules.append(matching_rule);
+        return;
     }
+
+    add_rule_to_rule_buckets(*this, matching_rule, matching_rule.selector.compound_selectors().last(), contains_root_pseudo_class);
 }
 
 void RuleCache::for_each_matching_rules(DOM::AbstractElement abstract_element, Function<IterationDecision(Vector<MatchingRule> const&)> callback) const
 {
-    for (auto const& class_name : abstract_element.element().class_names()) {
-        if (auto it = rules_by_class.find(class_name); it != rules_by_class.end()) {
-            if (callback(it->value) == IterationDecision::Break)
-                return;
-        }
-    }
-    if (auto id = abstract_element.element().id(); id.has_value()) {
-        if (auto it = rules_by_id.find(id.value()); it != rules_by_id.end()) {
-            if (callback(it->value) == IterationDecision::Break)
-                return;
-        }
-    }
-    if (auto it = rules_by_tag_name.find(abstract_element.element().lowercased_local_name()); it != rules_by_tag_name.end()) {
-        if (callback(it->value) == IterationDecision::Break)
-            return;
-    }
     if (abstract_element.pseudo_element().has_value()) {
         if (Selector::PseudoElementSelector::is_known_pseudo_element_type(abstract_element.pseudo_element().value())) {
-            if (callback(rules_by_pseudo_element.at(to_underlying(abstract_element.pseudo_element().value()))) == IterationDecision::Break)
-                return;
+            (void)for_each_matching_rule_bucket(abstract_element, rules_by_pseudo_element.at(to_underlying(abstract_element.pseudo_element().value())), callback);
         } else {
             // NOTE: We don't cache rules for unknown pseudo-elements. They can't match anything anyway.
         }
-    }
-
-    if (abstract_element.element().is_document_element()) {
-        if (callback(root_rules) == IterationDecision::Break)
-            return;
-    }
-
-    IterationDecision decision = IterationDecision::Continue;
-    abstract_element.element().for_each_attribute([&](auto& name, auto&) {
-        if (auto it = rules_by_attribute_name.find(name); it != rules_by_attribute_name.end()) {
-            decision = callback(it->value);
-        }
-    });
-    if (decision == IterationDecision::Break)
         return;
+    }
 
-    (void)callback(other_rules);
+    (void)for_each_matching_rule_bucket(abstract_element, *this, callback);
 }
 
 void StyleComputer::ScopedMatchingRule::visit_edges(GC::Cell::Visitor& visitor)
@@ -523667,7 +524224,12 @@ void RuleCache::visit_edges(GC::Cell::Visitor& visitor)
     visit_map(rules_by_tag_name);
     visit_map(rules_by_attribute_name);
     for (auto& rules : rules_by_pseudo_element) {
-        visit_vector(rules);
+        visit_map(rules.rules_by_id);
+        visit_map(rules.rules_by_class);
+        visit_map(rules.rules_by_tag_name);
+        visit_map(rules.rules_by_attribute_name);
+        visit_vector(rules.root_rules);
+        visit_vector(rules.other_rules);
     }
     visit_vector(root_rules);
     visit_vector(slotted_rules);
@@ -524950,11 +525512,20 @@ struct RuleCache {
     HashMap<FlyString, Vector<MatchingRule>> rules_by_class;
     HashMap<FlyString, Vector<MatchingRule>> rules_by_tag_name;
     HashMap<FlyString, Vector<MatchingRule>, AK::ASCIICaseInsensitiveFlyStringTraits> rules_by_attribute_name;
-    Array<Vector<MatchingRule>, to_underlying(CSS::PseudoElement::KnownPseudoElementCount)> rules_by_pseudo_element;
     Vector<MatchingRule> root_rules;
     Vector<MatchingRule> slotted_rules;
     Vector<MatchingRule> part_rules;
     Vector<MatchingRule> other_rules;
+
+    struct PseudoElementRules {
+        HashMap<FlyString, Vector<MatchingRule>> rules_by_id;
+        HashMap<FlyString, Vector<MatchingRule>> rules_by_class;
+        HashMap<FlyString, Vector<MatchingRule>> rules_by_tag_name;
+        HashMap<FlyString, Vector<MatchingRule>, AK::ASCIICaseInsensitiveFlyStringTraits> rules_by_attribute_name;
+        Vector<MatchingRule> root_rules;
+        Vector<MatchingRule> other_rules;
+    };
+    Array<PseudoElementRules, to_underlying(CSS::PseudoElement::KnownPseudoElementCount)> rules_by_pseudo_element;
 
     HashMap<FlyString, NonnullRefPtr<Animations::KeyframeEffect::KeyFrameSet>> rules_by_animation_keyframes;
 
@@ -623014,7 +623585,7 @@ public:
     virtual bool create_context(Gfx::IntSize, bool alpha) = 0;
     virtual Optional<Painting::CanvasId> canvas_id() const = 0;
     virtual void destroy_context() = 0;
-    virtual void update_commands(Gfx::CanvasCommandList const&) = 0;
+    virtual void update_commands(Gfx::CanvasCommandList const&, bool commit) = 0;
 
     virtual RefPtr<Gfx::Bitmap> read_back_pixels(Gfx::IntRect const&) = 0;
 };
@@ -623611,7 +624182,7 @@ WebIDL::ExceptionOr<void> CanvasRenderingContext2D::draw_image_internal(CanvasIm
                     .compositing_and_blending_operator = drawing_state().current_compositing_and_blending_operator,
                 });
                 did_draw(destination_rect);
-                flush_recorded_commands();
+                flush_recorded_commands(CommitCommands::No);
 
                 // 7. If image is not origin-clean, then set the CanvasRenderingContext2D's origin-clean flag to false.
                 if (image_is_not_origin_clean(image))
@@ -623659,7 +624230,7 @@ Gfx::CanvasCommandList* CanvasRenderingContext2D::canvas_command_list()
     if (!has_backing_storage())
         return nullptr;
     if (m_commands.size() >= max_pending_canvas_commands)
-        flush_recorded_commands();
+        flush_recorded_commands(CommitCommands::No);
     return &m_commands;
 }
 
@@ -623685,20 +624256,30 @@ bool CanvasRenderingContext2D::ensure_remote_canvas_context()
     return true;
 }
 
-void CanvasRenderingContext2D::flush_recorded_commands()
+void CanvasRenderingContext2D::flush_recorded_commands(CommitCommands commit)
 {
-    if (m_commands.is_empty() || !m_transport)
+    if (!m_transport)
         return;
 
+    bool const should_commit = commit == CommitCommands::Yes;
+    if (m_commands.is_empty()) {
+        if (!should_commit || !m_has_uncommitted_remote_commands)
+            return;
+        m_transport->update_commands(m_commands, true);
+        m_has_uncommitted_remote_commands = false;
+        return;
+    }
+
     auto commands = move(m_commands);
-    m_transport->update_commands(commands);
+    m_transport->update_commands(commands, should_commit);
+    m_has_uncommitted_remote_commands = !should_commit;
 }
 
 RefPtr<Gfx::Bitmap> CanvasRenderingContext2D::read_pixels(Gfx::IntRect const& rect)
 {
     if (!has_backing_storage())
         return nullptr;
-    flush_recorded_commands();
+    flush_recorded_commands(CommitCommands::No);
     return m_transport->read_back_pixels(rect);
 }
 
@@ -623712,7 +624293,7 @@ void CanvasRenderingContext2D::set_size(Gfx::IntSize const& size)
 
 void CanvasRenderingContext2D::prepare_for_compositing()
 {
-    flush_recorded_commands();
+    flush_recorded_commands(CommitCommands::Yes);
 }
 
 Optional<Painting::CanvasId> CanvasRenderingContext2D::canvas_id() const
@@ -623783,6 +624364,7 @@ void CanvasRenderingContext2D::ensure_backing_storage()
 void CanvasRenderingContext2D::discard_backing_storage()
 {
     m_commands = {};
+    m_has_uncommitted_remote_commands = false;
     if (m_transport) {
         m_transport->destroy_context();
         m_transport = nullptr;
@@ -625055,7 +625637,11 @@ private:
     void paint_shadow_for_fill_internal(Gfx::Path const&, Gfx::WindingRule);
     void paint_shadow_for_stroke_internal(Gfx::Path const&, Gfx::Path::CapStyle, Gfx::Path::JoinStyle, Vector<float> const&);
 
-    void flush_recorded_commands();
+    enum class CommitCommands {
+        No,
+        Yes,
+    };
+    void flush_recorded_commands(CommitCommands);
 
     bool ensure_remote_canvas_context();
 
@@ -625065,6 +625651,7 @@ private:
 
     Gfx::CanvasCommandList m_commands;
     RefPtr<RemoteCanvas2DTransport> m_transport;
+    bool m_has_uncommitted_remote_commands { false };
 
     // https://html.spec.whatwg.org/multipage/canvas.html#concept-canvas-origin-clean
     bool m_origin_clean { true };
@@ -648679,429 +649266,3 @@ void HTMLImageElement::apply_presentational_hints(Vector<CSS::StyleProperty>& pr
             }
         } else if (name == HTML::AttributeNames::vspace) {
             if (auto parsed_value = parse_dimension_value(value)) {
-                properties.append({ .property_id = CSS::PropertyID::MarginTop, .value = *parsed_value });
-                properties.append({ .property_id = CSS::PropertyID::MarginBottom, .value = *parsed_value });
-            }
-        } else if (name == HTML::AttributeNames::border) {
-            if (auto parsed_value = parse_non_negative_integer(value); parsed_value.has_value()) {
-                auto width_value = CSS::LengthStyleValue::create(CSS::Length::make_px(*parsed_value));
-                properties.append({ .property_id = CSS::PropertyID::BorderTopWidth, .value = width_value });
-                properties.append({ .property_id = CSS::PropertyID::BorderRightWidth, .value = width_value });
-                properties.append({ .property_id = CSS::PropertyID::BorderBottomWidth, .value = width_value });
-                properties.append({ .property_id = CSS::PropertyID::BorderLeftWidth, .value = width_value });
-
-                auto solid_value = CSS::KeywordStyleValue::create(CSS::Keyword::Solid);
-                properties.append({ .property_id = CSS::PropertyID::BorderTopStyle, .value = solid_value });
-                properties.append({ .property_id = CSS::PropertyID::BorderRightStyle, .value = solid_value });
-                properties.append({ .property_id = CSS::PropertyID::BorderBottomStyle, .value = solid_value });
-                properties.append({ .property_id = CSS::PropertyID::BorderLeftStyle, .value = solid_value });
-            }
-        }
-    });
-}
-
-void HTMLImageElement::form_associated_element_attribute_changed(FlyString const& name, Optional<String> const&, Optional<String> const& value, Optional<FlyString> const&)
-{
-    if (name == HTML::AttributeNames::crossorigin) {
-        m_cors_setting = cors_setting_attribute_from_keyword(value);
-    }
-
-    if (name.is_one_of(HTML::AttributeNames::src, HTML::AttributeNames::srcset)) {
-        update_the_image_data(true);
-    }
-
-    if (name == HTML::AttributeNames::alt) {
-        // NB: Called from attribute change handler, layout may be stale.
-        if (unsafe_layout_node())
-            did_update_alt_text(as<Layout::ImageBox>(*unsafe_layout_node()));
-    }
-
-    if (name == HTML::AttributeNames::decoding) {
-        if (value.has_value() && value->equals_ignoring_ascii_case("sync"sv))
-            dbgln("FIXME: HTMLImageElement.decoding = 'sync' is not implemented yet");
-    }
-}
-
-RefPtr<Layout::Node> HTMLImageElement::create_layout_node(CSS::ComputedProperties const& style)
-{
-    return make_ref_counted<Layout::ImageBox>(document(), *this, style, *this);
-}
-
-void HTMLImageElement::adjust_computed_style(CSS::ComputedProperties& style)
-{
-    // https://drafts.csswg.org/css-display-3/#unbox
-    if (style.display().is_contents())
-        style.set_property(CSS::PropertyID::Display, CSS::DisplayStyleValue::create(CSS::Display::from_short(CSS::Display::Short::None)));
-}
-
-// https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-width
-WebIDL::UnsignedLong HTMLImageElement::width() const
-{
-    const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLImageElementWidth);
-
-    // Return the rendered width of the image, in CSS pixels, if the image is being rendered.
-    if (auto paintable_box = this->paintable_box())
-        return paintable_box->content_width().to_int();
-
-    // On setting [the width or height IDL attribute], they must act as if they reflected the respective content attributes of the same name.
-    if (auto width_attr = get_attribute(HTML::AttributeNames::width); width_attr.has_value()) {
-        if (auto converted = parse_non_negative_integer(*width_attr); converted.has_value() && *converted <= 2147483647)
-            return *converted;
-    }
-
-    // ...or else the density-corrected intrinsic width and height of the image, in CSS pixels,
-    // if the image has intrinsic dimensions and is available but not being rendered.
-    if (auto bitmap = current_image_frame(); bitmap.has_value())
-        return bitmap->width();
-
-    // ...or else 0, if the image is not available or does not have intrinsic dimensions.
-    return 0;
-}
-
-void HTMLImageElement::set_width(WebIDL::UnsignedLong width)
-{
-    if (width > 2147483647)
-        width = 0;
-    set_attribute_value(HTML::AttributeNames::width, String::number(width));
-}
-
-// https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-height
-WebIDL::UnsignedLong HTMLImageElement::height() const
-{
-    const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLImageElementHeight);
-
-    // Return the rendered height of the image, in CSS pixels, if the image is being rendered.
-    if (auto paintable_box = this->paintable_box())
-        return paintable_box->content_height().to_int();
-
-    // On setting [the width or height IDL attribute], they must act as if they reflected the respective content attributes of the same name.
-    if (auto height_attr = get_attribute(HTML::AttributeNames::height); height_attr.has_value()) {
-        if (auto converted = parse_non_negative_integer(*height_attr); converted.has_value() && *converted <= 2147483647)
-            return *converted;
-    }
-
-    // ...or else the density-corrected intrinsic height and height of the image, in CSS pixels,
-    // if the image has intrinsic dimensions and is available but not being rendered.
-    if (auto bitmap = current_image_frame(); bitmap.has_value())
-        return bitmap->height();
-
-    // ...or else 0, if the image is not available or does not have intrinsic dimensions.
-    return 0;
-}
-
-void HTMLImageElement::set_height(WebIDL::UnsignedLong height)
-{
-    if (height > 2147483647)
-        height = 0;
-    set_attribute_value(HTML::AttributeNames::height, String::number(height));
-}
-
-// https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-naturalwidth
-unsigned HTMLImageElement::natural_width() const
-{
-    // 1. If the image is not available, then return 0.
-    auto bitmap = current_image_frame();
-    if (!bitmap.has_value())
-        return 0;
-
-    // 2. Return the respective component of the image's density-corrected natural width and height, in CSS pixels. [CSS]
-    // FIXME: Implement density-corrected algorithm.
-    return bitmap->width();
-}
-
-// https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-naturalheight
-unsigned HTMLImageElement::natural_height() const
-{
-    // 1. If the image is not available, then return 0.
-    auto bitmap = current_image_frame();
-    if (!bitmap.has_value())
-        return 0;
-
-    // 2. Return the respective component of the image's density-corrected natural width and height, in CSS pixels. [CSS]
-    // FIXME: Implement density-corrected algorithm.
-    return bitmap->height();
-}
-
-// https://drafts.csswg.org/cssom-view/#dom-htmlimageelement-x
-int HTMLImageElement::x() const
-{
-    // The x attribute, on getting, must return the scaled x-coordinate of the left border edge of the first box
-    // associated with the element, relative to the initial containing block origin, ignoring any transforms that apply
-    // to the element and its ancestors, or zero if there is no box.
-    const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLImageElementX);
-
-    auto paintable_box = this->paintable_box();
-    if (!paintable_box)
-        return 0;
-
-    CSSPixels scroll_offset_x = 0;
-    if (auto idx = paintable_box->enclosing_scroll_frame_index(); idx.value())
-        scroll_offset_x = paintable_box->document().paintable()->scroll_state().cumulative_offset(idx).x();
-
-    return (paintable_box->absolute_border_box_rect().x() - scroll_offset_x).to_int();
-}
-
-// https://drafts.csswg.org/cssom-view/#dom-htmlimageelement-y
-int HTMLImageElement::y() const
-{
-    // The y attribute, on getting, must return the scaled y-coordinate of the top border edge of the first box
-    // associated with the element, relative to the initial containing block origin, ignoring any transforms that apply
-    // to the element and its ancestors, or zero if there is no box.
-    const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLImageElementY);
-
-    auto paintable_box = this->paintable_box();
-    if (!paintable_box)
-        return 0;
-
-    CSSPixels scroll_offset_y = 0;
-    if (auto idx = paintable_box->enclosing_scroll_frame_index(); idx.value())
-        scroll_offset_y = paintable_box->document().paintable()->scroll_state().cumulative_offset(idx).y();
-
-    return (paintable_box->absolute_border_box_rect().y() - scroll_offset_y).to_int();
-}
-
-// https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-complete
-bool HTMLImageElement::complete() const
-{
-    // The IDL attribute complete must return true if any of the following conditions is true:
-
-    // - Both the src attribute and the srcset attribute are omitted.
-    if (!has_attribute(HTML::AttributeNames::src) && !has_attribute(HTML::AttributeNames::srcset))
-        return true;
-
-    // - The srcset attribute is omitted and the src attribute's value is the empty string.
-    if (!has_attribute(HTML::AttributeNames::srcset) && attribute(HTML::AttributeNames::src).value().is_empty())
-        return true;
-
-    // - The img element's current request's state is completely available and its pending request is null.
-    if (m_current_request->state() == ImageRequest::State::CompletelyAvailable && !m_pending_request)
-        return true;
-
-    // - The img element's current request's state is broken and its pending request is null.
-    if (m_current_request->state() == ImageRequest::State::Broken && !m_pending_request)
-        return true;
-
-    return false;
-}
-
-// https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-currentsrc
-String HTMLImageElement::current_src() const
-{
-    // The currentSrc IDL attribute must return the img element's current request's current URL.
-    return m_current_request->current_url();
-}
-
-// https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-decode
-WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> HTMLImageElement::decode() const
-{
-    auto& realm = this->realm();
-
-    // 1. Let promise be a new promise.
-    auto promise = WebIDL::create_promise(realm);
-
-    // 2. Queue a microtask to perform the following steps:
-    queue_a_microtask(&document(), GC::create_function(realm.heap(), [this, promise, &realm]() mutable {
-        // 1. Let global be this's relevant global object.
-        auto& global = relevant_global_object(*this);
-
-        auto reject_promise = [promise, &realm](Utf16String const& message) {
-            auto exception = WebIDL::EncodingError::create(realm, message);
-            HTML::TemporaryExecutionContext context(realm);
-            WebIDL::reject_promise(realm, promise, exception);
-        };
-
-        auto queue_reject_task = [reject_promise, &global, &realm](Utf16String const& message) {
-            queue_global_task(Task::Source::DOMManipulation, global, GC::create_function(realm.heap(), [reject_promise, message = message] {
-                reject_promise(message);
-            }));
-        };
-
-        auto queue_resolve_task = [promise, &realm, &global] {
-            queue_global_task(Task::Source::DOMManipulation, global, GC::create_function(realm.heap(), [&realm, promise] {
-                HTML::TemporaryExecutionContext context(realm);
-                WebIDL::resolve_promise(realm, promise, JS::js_undefined());
-            }));
-        };
-
-        // 2. If any of the following are true:
-        //    - this's node document is not fully active;
-        if (!document().is_fully_active()) {
-            // then reject promise with an "EncodingError" DOMException.
-            reject_promise("Node document not fully active"_utf16);
-            return;
-        }
-
-        //    - or this's current request's state is broken,
-        auto& current_request = *m_current_request;
-        if (current_request.state() == ImageRequest::State::Broken) {
-            // then reject promise with an "EncodingError" DOMException.
-            reject_promise("Current request state is broken"_utf16);
-            return;
-        }
-
-        auto expected_request = m_current_request;
-        auto weak_this = GC::Weak<HTMLImageElement> { *this };
-
-        // 3. Otherwise, in parallel wait for one of the following cases to occur, and perform the corresponding actions:
-        if (current_request.state() == ImageRequest::State::CompletelyAvailable) {
-            queue_resolve_task();
-            return;
-        }
-
-        if (!current_request.shared_resource_request()) {
-            queue_reject_task("Current request changed or was mutated"_utf16);
-            return;
-        }
-
-        current_request.add_callbacks(
-            // AD-HOC: Enqueue on the batching dispatcher to preserve ordering relative to update_the_image_data's step
-            //         16, which also goes through the batching dispatcher. Otherwise decode() can resolve before the
-            //         current request transitions to CompletelyAvailable, leaving the image dimensions at zero when
-            //         callers inspect them.
-            [weak_this, expected_request, queue_resolve_task, queue_reject_task, &realm] {
-                batching_dispatcher().enqueue(GC::create_function(realm.heap(), [weak_this, expected_request, queue_resolve_task, queue_reject_task] {
-                    if (!weak_this) {
-                        queue_reject_task("Image element no longer available"_utf16);
-                        return;
-                    }
-                    auto& image = *weak_this;
-
-                    if (!image.document().is_fully_active()) {
-                        queue_reject_task("Node document not fully active"_utf16);
-                        return;
-                    }
-                    if (image.m_current_request != expected_request) {
-                        queue_reject_task("Current request changed or was mutated"_utf16);
-                        return;
-                    }
-                    if (image.current_request().state() == ImageRequest::State::Broken) {
-                        queue_reject_task("Current request state is broken"_utf16);
-                        return;
-                    }
-                    queue_resolve_task();
-                }));
-            },
-            [weak_this, expected_request, queue_reject_task] {
-                if (!weak_this) {
-                    queue_reject_task("Image element no longer available"_utf16);
-                    return;
-                }
-                auto& image = *weak_this;
-
-                if (!image.document().is_fully_active()) {
-                    queue_reject_task("Node document not fully active"_utf16);
-                    return;
-                }
-
-                if (image.m_current_request != expected_request) {
-                    queue_reject_task("Current request changed or was mutated"_utf16);
-                    return;
-                }
-                queue_reject_task("Current request state is broken"_utf16);
-            });
-    }));
-
-    // 3. Return promise.
-    return promise;
-}
-
-Optional<ARIA::Role> HTMLImageElement::default_role() const
-{
-    // https://www.w3.org/TR/html-aria/#el-img
-    // https://www.w3.org/TR/html-aria/#el-img-no-alt
-    // https://w3c.github.io/aria/#image
-    // NOTE: The "image" role value is a synonym for the older "img" role value; however, the el-img test in
-    //       https://wpt.fyi/results/html-aam/roles.html expects the value to be "image" (not "img").
-    if (!alt().is_empty())
-        return ARIA::Role::image;
-    // https://www.w3.org/TR/html-aria/#el-img-empty-alt
-    // NOTE: The "none" role value is a synonym for the older "presentation" role value; however, the el-img-alt-no-value
-    //       test in https://wpt.fyi/results/html-aam/roles.html expects the value to be "none" (not "presentation").
-    return ARIA::Role::none;
-}
-
-// https://html.spec.whatwg.org/multipage/images.html#use-srcset-or-picture
-bool HTMLImageElement::uses_srcset_or_picture() const
-{
-    // An img element is said to use srcset or picture if it has a srcset attribute specified
-    // or if it has a parent that is a picture element.
-    return has_attribute(HTML::AttributeNames::srcset) || (parent() && is<HTMLPictureElement>(*parent()));
-}
-
-// https://html.spec.whatwg.org/multipage/images.html#update-the-image-data
-void HTMLImageElement::update_the_image_data(bool restart_animations, bool maybe_omit_events)
-{
-    auto update_the_image_data_count = ++m_update_the_image_data_count;
-
-    // 1. If the element's node document is not fully active, then:
-    if (!document().is_fully_active()) {
-        // 1. Continue running this algorithm in parallel.
-        // 2. Wait until the element's node document is fully active.
-        // 3. If another instance of this algorithm for this img element was started after this instance
-        //    (even if it aborted and is no longer running), then return.
-        // 4. Queue a microtask to continue this algorithm.
-        m_document_observer->set_document_became_active([this, restart_animations, maybe_omit_events, update_the_image_data_count]() {
-            queue_a_microtask(&document(), GC::create_function(this->heap(), [this, restart_animations, maybe_omit_events, update_the_image_data_count]() {
-                update_the_image_data_impl(restart_animations, maybe_omit_events, update_the_image_data_count);
-            }));
-        });
-
-        return;
-    }
-
-    update_the_image_data_impl(restart_animations, maybe_omit_events, update_the_image_data_count);
-}
-
-// https://html.spec.whatwg.org/multipage/images.html#update-the-image-data
-void HTMLImageElement::update_the_image_data_impl(bool restart_animations, bool maybe_omit_events, u64 update_the_image_data_count)
-{
-    // 1. If the element's node document is not fully active, then:
-    // FIXME: This step and it's substeps is implemented by the calling `update_the_image_data` function.
-    //        By the time that we reach here, the document should be fully active. However, it is possible
-    //        that the node document is swapped out again during the queue of the microtask to run this
-    //        algorithm.
-    if (!document().is_fully_active()) {
-        dbgln("FIXME: Node document is not fully active running 'update the image data'");
-        return;
-    }
-
-    // 2. FIXME: If the user agent cannot support images, or its support for images has been disabled,
-    //           then abort the image request for the current request and the pending request,
-    //           set the current request's state to unavailable, set the pending request to null, and return.
-
-    // 3. Let previousURL be the current request's current URL.
-    auto previous_url = m_current_request->current_url();
-
-    // 4. Let selected source be null and selected pixel density be undefined.
-    Optional<String> selected_source;
-    Optional<float> selected_pixel_density;
-
-    // 5. If the element does not use srcset or picture
-    //    and it has a src attribute specified whose value is not the empty string,
-    //    then set selected source to the value of the element's src attribute
-    //    and set selected pixel density to 1.0.
-    auto maybe_src_attribute = attribute(HTML::AttributeNames::src);
-    if (!uses_srcset_or_picture() && maybe_src_attribute.has_value() && !maybe_src_attribute.value().is_empty()) {
-        selected_source = maybe_src_attribute.release_value();
-        selected_pixel_density = 1.0f;
-    }
-
-    // 6. Set the element's last selected source to selected source.
-    m_last_selected_source = selected_source;
-
-    // 7. If selected source is not null, then:
-    if (selected_source.has_value()) {
-        // 1. Let urlString be the result of encoding-parsing-and-serializing a URL given selected source, relative to the element's node document.
-        auto url_string = document().encoding_parse_and_serialize_url(selected_source.value());
-
-        // 2. If urlString is failure, then abort this inner set of steps.
-        if (!url_string.has_value())
-            goto after_step_7;
-
-        // 3. Let key be a tuple consisting of urlString, the img element's crossorigin attribute's mode,
-        //    and, if that mode is not No CORS, the node document's origin.
-        ListOfAvailableImages::Key key;
-        key.url = *url_string;
-        key.mode = m_cors_setting;
-        key.origin = document().origin();
-
