@@ -1,4 +1,631 @@
-﻿        if (name == HTML::AttributeNames::bgcolor) {
+﻿            dispatch_event(*DOM::Event::create(realm(), HTML::EventNames::load));
+        }
+    }
+    // 5. Otherwise, fire an event named error at el.
+    else {
+        dispatch_event(*DOM::Event::create(realm(), HTML::EventNames::error));
+    }
+
+    // 6. If el contributes a script-blocking style sheet, then:
+    if (contributes_a_script_blocking_style_sheet()) {
+        // 1. Assert: el's node document's script-blocking style sheet set contains el.
+        VERIFY(document().script_blocking_style_sheet_set().contains(*this));
+
+        // 2. Remove el from its node document's script-blocking style sheet set.
+        document().script_blocking_style_sheet_set().remove(*this);
+        document().schedule_html_parser_end_check();
+    }
+
+    // 7. Unblock rendering on el.
+    unblock_rendering();
+
+    if (m_loaded_style_sheet) {
+        auto style_sheet_loading_state = m_loaded_style_sheet->loading_state();
+        if (style_sheet_loading_state == CSS::CSSStyleSheet::LoadingState::Loaded || style_sheet_loading_state == CSS::CSSStyleSheet::LoadingState::Error) {
+            finished_loading_critical_style_subresources(style_sheet_loading_state == CSS::CSSStyleSheet::LoadingState::Error ? AnyFailed::Yes : AnyFailed::No);
+        }
+    } else {
+        m_document_load_event_delayer.clear();
+    }
+}
+
+static NonnullRefPtr<Core::Promise<NonnullRefPtr<Gfx::Bitmap const>>> decode_favicon(ReadonlyBytes favicon_data, URL::URL const& favicon_url, GC::Ref<DOM::Document> document)
+{
+    auto promise = Core::Promise<NonnullRefPtr<Gfx::Bitmap const>>::construct();
+
+    if (favicon_url.basename().ends_with(".svg"sv)) {
+        auto result = SVG::SVGDecodedImageData::create(document->realm(), document->page(), favicon_url, favicon_data);
+        if (result.is_error()) {
+            promise->reject(Error::from_string_view("Failed to decode SVG favicon"sv));
+            return promise;
+        }
+
+        // FIXME: Calculate size based on device pixel ratio
+        Gfx::IntSize size { 32, 32 };
+        auto decoded_frame = result.release_value()->default_frame(size);
+        if (!decoded_frame.has_value()) {
+            promise->reject(Error::from_string_view("Failed to get bitmap from SVG favicon"sv));
+            return promise;
+        }
+
+        promise->resolve(decoded_frame->bitmap_ref());
+        return promise;
+    }
+
+    auto on_failed_decode = [favicon_url, promise]([[maybe_unused]] Error& error) {
+        dbgln_if(IMAGE_DECODER_DEBUG, "Failed to decode favicon {}: {}", favicon_url, error);
+        promise->reject(move(error));
+    };
+
+    auto on_successful_decode = [document = GC::Root(document), promise](Web::Platform::DecodedImage& decoded_image) -> ErrorOr<void> {
+        auto favicon_bitmap = decoded_image.frames[0].bitmap;
+        dbgln_if(IMAGE_DECODER_DEBUG, "Decoded favicon, {}", favicon_bitmap->size());
+
+        promise->resolve(favicon_bitmap.release_nonnull());
+        return {};
+    };
+
+    (void)Platform::ImageCodecPlugin::the().decode_image(favicon_data, move(on_successful_decode), move(on_failed_decode));
+
+    return promise;
+}
+
+RefPtr<Gfx::Bitmap const> HTMLLinkElement::load_favicon_if_window_is_active()
+{
+    if (!has_loaded_icon())
+        return {};
+
+    // FIXME: Refactor the caller(s) to handle the async nature of image loading
+    auto promise = decode_favicon(m_loaded_icon->icon, m_loaded_icon->url, document());
+
+    if (auto result = promise->await(); !result.is_error())
+        return result.release_value();
+    return {};
+}
+
+// https://html.spec.whatwg.org/multipage/links.html#rel-icon:the-link-element-3
+void HTMLLinkElement::load_fallback_favicon_if_needed(GC::Ref<DOM::Document> document)
+{
+    auto& realm = document->realm();
+    auto& vm = realm.vm();
+
+    // In the absence of a link with the icon keyword, for Document objects whose URL's scheme is an HTTP(S) scheme,
+    // user agents may instead run these steps in parallel:
+    if (document->has_active_favicon())
+        return;
+    if (!document->url().scheme().is_one_of("http"sv, "https"sv))
+        return;
+    auto icon_link_elements = DOM::HTMLCollection::create(*document, DOM::HTMLCollection::Scope::Descendants, [](DOM::Element const& element) {
+        if (!is<HTMLLinkElement>(element))
+            return false;
+
+        return static_cast<HTMLLinkElement const&>(element).has_icon_keyword();
+    });
+    if (icon_link_elements->length() != 0)
+        return;
+
+    // AD-HOC: Don't load fallback favicon for auxiliary browsing contexts (popup windows).
+    // This matches the behavior observed in Chrome and Firefox, and avoids unnecessary network requests
+    // that can interfere with Content Security Policy violation reporting.
+    // See: https://github.com/whatwg/html/issues/12082
+    if (auto browsing_context = document->browsing_context(); browsing_context->is_auxiliary())
+        return;
+
+    // 1. Let request be a new request whose URL is the URL record obtained by resolving the URL "/favicon.ico" against
+    //    the Document object's URL, client is the Document object's relevant settings object, destination is "image",
+    //    synchronous flag is set, credentials mode is "include", and whose use-URL-credentials flag is set.
+    // NOTE: Fetch requests no longer have a synchronous flag, see https://github.com/whatwg/fetch/pull/1165
+    auto favicon_url = document->encoding_parse_url("/favicon.ico"sv);
+
+    // It is possible for the URL parser to fail if the document's base URL is invalid.
+    if (!favicon_url.has_value())
+        return;
+
+    auto request = Fetch::Infrastructure::Request::create(vm);
+    request->set_url(favicon_url.release_value());
+    request->set_client(&document->relevant_settings_object());
+    request->set_destination(Fetch::Infrastructure::Request::Destination::Image);
+    request->set_credentials_mode(Fetch::Infrastructure::Request::CredentialsMode::Include);
+    request->set_use_url_credentials(true);
+
+    // 2. Let response be the result of fetching request.
+    Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input {};
+    fetch_algorithms_input.process_response = [document, request](GC::Ref<Fetch::Infrastructure::Response> response) {
+        auto& realm = document->realm();
+        auto global = GC::Ref { realm.global_object() };
+
+        auto process_body = GC::create_function(realm.heap(), [document, request](ByteBuffer body) {
+            decode_favicon(body, request->url(), document)
+                ->when_resolved(GC::weak_callback(*document, [](DOM::Document& document, NonnullRefPtr<Gfx::Bitmap const>& favicon) {
+                    if (auto navigable = document.navigable(); navigable && navigable->is_traversable())
+                        navigable->traversable_navigable()->page().client().page_did_change_favicon(*favicon);
+                }));
+        });
+        auto process_body_error = GC::create_function(realm.heap(), [](JS::Value) {
+        });
+
+        // Check for failed favicon response
+        if (!Fetch::Infrastructure::is_ok_status(response->status()) || !response->body()) {
+            return;
+        }
+
+        // 3. Use response's unsafe response as an icon as if it had been declared using the icon keyword.
+        if (auto body = response->unsafe_response()->body())
+            body->fully_read(realm, process_body, process_body_error, global);
+    };
+
+    Fetch::Fetching::fetch(realm, request, Fetch::Infrastructure::FetchAlgorithms::create(vm, move(fetch_algorithms_input)));
+}
+
+bool HTMLLinkElement::should_fetch_and_process_resource_type() const
+{
+    // https://html.spec.whatwg.org/multipage/links.html#link-type-dns-prefetch:fetch-and-process-the-linked-resource
+    // https://html.spec.whatwg.org/multipage/links.html#link-type-preconnect:fetch-and-process-the-linked-resource
+    // https://html.spec.whatwg.org/multipage/links.html#link-type-preload:fetch-and-process-the-linked-resource
+    // https://html.spec.whatwg.org/multipage/links.html#link-type-stylesheet:fetch-and-process-the-linked-resource
+    if (m_relationship & (Relationship::DNSPrefetch | Relationship::Preconnect | Relationship::Preload | Relationship::Stylesheet))
+        return true;
+
+    // AD-HOC: The spec is underspecified for fetching and processing rel="icon". See:
+    //         https://github.com/whatwg/html/issues/1769
+    return m_relationship & Relationship::Icon;
+}
+
+HTMLLinkElement::LinkProcessingOptions::LinkProcessingOptions(
+    CORSSettingAttribute crossorigin,
+    ReferrerPolicy::ReferrerPolicy referrer_policy,
+    URL::URL base_url,
+    URL::Origin origin,
+    GC::Ref<HTML::EnvironmentSettingsObject> environment,
+    GC::Ref<HTML::PolicyContainer> policy_container,
+    GC::Ptr<Web::DOM::Document> document,
+    String cryptographic_nonce_metadata,
+    Fetch::Infrastructure::Request::Priority fetch_priority)
+    : cryptographic_nonce_metadata(move(cryptographic_nonce_metadata))
+    , crossorigin(crossorigin)
+    , referrer_policy(referrer_policy)
+    , base_url(move(base_url))
+    , origin(move(origin))
+    , environment(environment)
+    , policy_container(policy_container)
+    , document(document)
+    , fetch_priority(fetch_priority)
+{
+}
+
+void HTMLLinkElement::LinkProcessingOptions::visit_edges(Cell::Visitor& visitor)
+{
+    Base::visit_edges(visitor);
+    visitor.visit(environment);
+    visitor.visit(policy_container);
+    visitor.visit(document);
+    visitor.visit(on_document_ready);
+}
+
+GC_DEFINE_ALLOCATOR(HTMLLinkElement::LinkProcessingOptions);
+
+}
+
+FILE: Libraries/LibWeb/HTML/HTMLLinkElement.h
+/*
+ * Copyright (c) 2018-2025, Andreas Kling <andreas@ladybird.org>
+ * Copyright (c) 2021, the SerenityOS developers.
+ * Copyright (c) 2021, Sam Atkins <atkinssj@serenityos.org>
+ * Copyright (c) 2023, Srikavin Ramkumar <me@srikavin.me>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Function.h>
+#include <LibWeb/DOM/DocumentLoadEventDelayer.h>
+#include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
+#include <LibWeb/Forward.h>
+#include <LibWeb/HTML/CORSSettingAttribute.h>
+#include <LibWeb/HTML/HTMLElement.h>
+#include <LibWeb/HTML/PreloadEntry.h>
+
+namespace Web::HTML {
+
+class WEB_API HTMLLinkElement final : public HTMLElement {
+    WEB_PLATFORM_OBJECT(HTMLLinkElement, HTMLElement);
+    GC_DECLARE_ALLOCATOR(HTMLLinkElement);
+
+public:
+    virtual ~HTMLLinkElement() override;
+
+    virtual void inserted() override;
+    virtual void removed_from(IsSubtreeRoot, Node* old_ancestor, Node& old_root) override;
+
+    String rel() const { return get_attribute_value(HTML::AttributeNames::rel); }
+    String type() const { return get_attribute_value(HTML::AttributeNames::type); }
+    String href() const { return get_attribute_value(HTML::AttributeNames::href); }
+
+    GC::Ref<DOM::DOMTokenList> rel_list();
+    GC::Ref<DOM::DOMTokenList> sizes();
+
+    bool has_loaded_icon() const;
+    bool has_icon_keyword() const;
+    RefPtr<Gfx::Bitmap const> load_favicon_if_window_is_active();
+
+    static void load_fallback_favicon_if_needed(GC::Ref<DOM::Document>);
+
+    void set_parser_document(Badge<HTMLParser>, GC::Ref<DOM::Document> document) { m_parser_document = document; }
+    void set_was_enabled_when_created_by_parser(Badge<HTMLParser>, bool was_enabled_when_created_by_parser) { m_was_enabled_when_created_by_parser = was_enabled_when_created_by_parser; }
+
+    void set_media(String);
+    String media() const;
+
+    GC::Ptr<CSS::CSSStyleSheet> sheet() const;
+
+    enum class AnyFailed : u8 {
+        No,
+        Yes,
+    };
+    void finished_loading_critical_style_subresources(AnyFailed);
+
+private:
+    // https://html.spec.whatwg.org/multipage/semantics.html#link-processing-options
+    struct LinkProcessingOptions final : public JS::Cell {
+        GC_CELL(LinkProcessingOptions, JS::Cell);
+        GC_DECLARE_ALLOCATOR(LinkProcessingOptions);
+
+        LinkProcessingOptions(
+            CORSSettingAttribute crossorigin,
+            ReferrerPolicy::ReferrerPolicy referrer_policy,
+            URL::URL base_url,
+            URL::Origin origin,
+            GC::Ref<HTML::EnvironmentSettingsObject> environment,
+            GC::Ref<HTML::PolicyContainer> policy_container,
+            GC::Ptr<Web::DOM::Document> document,
+            String cryptographic_nonce_metadata,
+            Fetch::Infrastructure::Request::Priority fetch_priority);
+
+        virtual void visit_edges(Cell::Visitor& visitor) override;
+
+        // href (default the empty string)
+        String href;
+
+        // initiator (default "link")
+        Optional<Fetch::Infrastructure::Request::InitiatorType> initiator { Fetch::Infrastructure::Request::InitiatorType::Link };
+
+        // integrity (default the empty string)
+        String integrity;
+
+        // type (default the empty string)
+        String type;
+
+        // cryptographic nonce metadata (default the empty string)
+        //     A string
+        String cryptographic_nonce_metadata;
+
+        // destination (default the empty string)
+        //     A destination type.
+        Optional<Fetch::Infrastructure::Request::Destination> destination;
+
+        // crossorigin (default No CORS)
+        //     A CORS settings attribute state
+        CORSSettingAttribute crossorigin { CORSSettingAttribute::NoCORS };
+
+        // referrer policy (default the empty string)
+        //     A referrer policy
+        ReferrerPolicy::ReferrerPolicy referrer_policy { ReferrerPolicy::ReferrerPolicy::EmptyString };
+
+        // FIXME: source set (default null)
+        //     Null or a source set
+
+        // base URL
+        //     A URL
+        URL::URL base_url;
+
+        // origin
+        //     An origin
+        URL::Origin origin;
+
+        // environment
+        //     An environment
+        GC::Ref<HTML::EnvironmentSettingsObject> environment;
+
+        // policy container
+        //     A policy container
+        GC::Ref<HTML::PolicyContainer> policy_container;
+
+        // document (default null)
+        //     Null or a Document
+        GC::Ptr<Web::DOM::Document> document;
+
+        // on document ready (default null)
+        //     Null or an algorithm accepting a Document
+        GC::Ptr<GC::Function<void(DOM::Document&)>> on_document_ready;
+
+        // fetch priority (default Auto)
+        //     A fetch priority attribute state
+        Fetch::Infrastructure::Request::Priority fetch_priority { Fetch::Infrastructure::Request::Priority::Auto };
+    };
+
+    HTMLLinkElement(DOM::Document&, DOM::QualifiedName);
+
+    virtual void initialize(JS::Realm&) override;
+    virtual void visit_edges(Cell::Visitor&) override;
+    virtual void adopted_from(DOM::Document&) override;
+
+    // ^DOM::Node
+    virtual bool is_html_link_element() const override { return true; }
+
+    // ^HTMLElement
+    virtual void attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual bool contributes_a_script_blocking_style_sheet() const final;
+    virtual bool is_implicitly_potentially_render_blocking() const override;
+
+    GC::Ref<LinkProcessingOptions> create_link_options();
+    GC::Ptr<Fetch::Infrastructure::Request> create_link_request(LinkProcessingOptions const&);
+
+    void fetch_and_process_linked_resource();
+    void default_fetch_and_process_linked_resource(u64 fetch_generation);
+    void fetch_and_process_linked_dns_prefetch_resource();
+    void fetch_and_process_linked_preconnect_resource();
+    void fetch_and_process_linked_preload_resource();
+
+    bool linked_resource_fetch_setup_steps(Fetch::Infrastructure::Request&);
+    bool icon_linked_resource_fetch_setup_steps(Fetch::Infrastructure::Request&);
+    bool stylesheet_linked_resource_fetch_setup_steps(Fetch::Infrastructure::Request&);
+
+    void preconnect(LinkProcessingOptions const&);
+    void preload(LinkProcessingOptions&, Function<void(Fetch::Infrastructure::Response&)> process_response = {});
+
+    void process_linked_resource(bool success, Fetch::Infrastructure::Response const&, Core::ImmutableBytes const*);
+    void process_icon_resource(bool success, Fetch::Infrastructure::Response const&, ByteBuffer);
+    void process_stylesheet_resource(bool success, Fetch::Infrastructure::Response const&, ReadonlyBytes);
+
+    bool should_fetch_and_process_resource_type() const;
+
+    struct Relationship {
+        enum {
+            Alternate = 1 << 0,
+            Stylesheet = 1 << 1,
+            Preload = 1 << 2,
+            DNSPrefetch = 1 << 3,
+            Preconnect = 1 << 4,
+            Icon = 1 << 5,
+        };
+    };
+
+    GC::Ptr<Fetch::Infrastructure::FetchController> m_fetch_controller;
+    Optional<DOM::DocumentLoadEventDelayer> m_document_load_event_delayer;
+
+    struct LoadedIcon {
+        URL::URL url;
+        ByteBuffer icon;
+    };
+
+    Optional<LoadedIcon> m_loaded_icon;
+    GC::Ptr<CSS::CSSStyleSheet> m_loaded_style_sheet;
+
+    GC::Ptr<DOM::DOMTokenList> m_rel_list;
+    GC::Ptr<DOM::DOMTokenList> m_sizes;
+    unsigned m_relationship { 0 };
+    u64 m_current_fetch_generation { 0 };
+
+    // https://html.spec.whatwg.org/multipage/semantics.html#explicitly-enabled
+    bool m_explicitly_enabled { false };
+
+    bool m_was_enabled_when_created_by_parser { false };
+
+    Optional<String> m_mime_type;
+
+    GC::Weak<DOM::Document> m_parser_document;
+};
+
+}
+
+FILE: Libraries/LibWeb/HTML/HTMLLinkElement.idl
+// https://fetch.spec.whatwg.org/#concept-potential-destination
+enum PotentialDestination {
+    "",
+    "audio",
+    "audioworklet",
+    "document",
+    "embed",
+    "font",
+    "frame",
+    "iframe",
+    "image",
+    "json",
+    "manifest",
+    "object",
+    "paintworklet",
+    "report",
+    "script",
+    "serviceworker",
+    "sharedworker",
+    "style",
+    "track",
+    "video",
+    "webidentity",
+    "worker",
+    "xslt",
+    "fetch"
+};
+
+// https://html.spec.whatwg.org/multipage/semantics.html#htmllinkelement
+[Exposed=Window]
+interface HTMLLinkElement : HTMLElement {
+
+    [HTMLConstructor] constructor();
+
+    [CEReactions, Reflect, URL] attribute USVString href;
+    [CEReactions, Reflect=crossorigin, Enumerated=CORSSettingsAttribute] attribute DOMString? crossOrigin;
+    [CEReactions, Reflect] attribute DOMString rel;
+    [CEReactions, Reflect, Enumerated=PotentialDestination] attribute DOMString as;
+    [SameObject, PutForwards=value] readonly attribute DOMTokenList relList;
+    [CEReactions] attribute DOMString media;
+    [CEReactions, Reflect] attribute DOMString integrity;
+    [CEReactions, Reflect] attribute DOMString hreflang;
+    [CEReactions, Reflect] attribute DOMString type;
+    [SameObject, PutForwards=value] readonly attribute DOMTokenList sizes;
+    [CEReactions, Reflect=imagesrcset] attribute USVString imageSrcset;
+    [CEReactions, Reflect=imagesizes] attribute DOMString imageSizes;
+    [CEReactions, Reflect=referrerpolicy, Enumerated=ReferrerPolicy] attribute DOMString referrerPolicy;
+    [FIXME, SameObject, PutForwards=value] readonly attribute DOMTokenList blocking;
+    [CEReactions, Reflect] attribute boolean disabled;
+    [CEReactions, Enumerated=FetchPriorityAttribute, Reflect=fetchpriority] attribute DOMString fetchPriority;
+
+    // Obsolete
+    [CEReactions, Reflect] attribute DOMString charset;
+    [CEReactions, Reflect] attribute DOMString rev;
+    [CEReactions, Reflect] attribute DOMString target;
+
+};
+HTMLLinkElement includes LinkStyle;
+
+FILE: Libraries/LibWeb/HTML/HTMLMapElement.cpp
+/*
+ * Copyright (c) 2020, the SerenityOS developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <LibWeb/Bindings/HTMLMapElement.h>
+#include <LibWeb/Bindings/Intrinsics.h>
+#include <LibWeb/HTML/HTMLAreaElement.h>
+#include <LibWeb/HTML/HTMLMapElement.h>
+
+namespace Web::HTML {
+
+GC_DEFINE_ALLOCATOR(HTMLMapElement);
+
+HTMLMapElement::HTMLMapElement(DOM::Document& document, DOM::QualifiedName qualified_name)
+    : HTMLElement(document, move(qualified_name))
+{
+}
+
+HTMLMapElement::~HTMLMapElement() = default;
+
+void HTMLMapElement::initialize(JS::Realm& realm)
+{
+    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLMapElement);
+    Base::initialize(realm);
+}
+
+void HTMLMapElement::visit_edges(Cell::Visitor& visitor)
+{
+    Base::visit_edges(visitor);
+    visitor.visit(m_areas);
+}
+
+// https://html.spec.whatwg.org/multipage/image-maps.html#dom-map-areas
+GC::Ref<DOM::HTMLCollection> HTMLMapElement::areas()
+{
+    // The areas attribute must return an HTMLCollection rooted at the map element, whose filter matches only area elements.
+    if (!m_areas) {
+        m_areas = DOM::HTMLCollection::create(*this, DOM::HTMLCollection::Scope::Descendants, [](Element const& element) {
+            return is<HTML::HTMLAreaElement>(element);
+        });
+    }
+    return *m_areas;
+}
+
+}
+
+FILE: Libraries/LibWeb/HTML/HTMLMapElement.h
+/*
+ * Copyright (c) 2020, the SerenityOS developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <LibWeb/DOM/HTMLCollection.h>
+#include <LibWeb/HTML/HTMLElement.h>
+
+namespace Web::HTML {
+
+class HTMLMapElement final : public HTMLElement {
+    WEB_PLATFORM_OBJECT(HTMLMapElement, HTMLElement);
+    GC_DECLARE_ALLOCATOR(HTMLMapElement);
+
+public:
+    virtual ~HTMLMapElement() override;
+
+    GC::Ref<DOM::HTMLCollection> areas();
+
+private:
+    HTMLMapElement(DOM::Document&, DOM::QualifiedName);
+
+    virtual void initialize(JS::Realm&) override;
+    virtual void visit_edges(Cell::Visitor&) override;
+
+    GC::Ptr<DOM::HTMLCollection> m_areas;
+};
+
+}
+
+FILE: Libraries/LibWeb/HTML/HTMLMapElement.idl
+// https://html.spec.whatwg.org/multipage/image-maps.html#htmlmapelement
+[Exposed=Window]
+interface HTMLMapElement : HTMLElement {
+
+    [HTMLConstructor] constructor();
+
+    [CEReactions, Reflect] attribute DOMString name;
+    [SameObject] readonly attribute HTMLCollection areas;
+
+};
+
+FILE: Libraries/LibWeb/HTML/HTMLMarqueeElement.cpp
+/*
+ * Copyright (c) 2020, the SerenityOS developers.
+ * Copyright (c) 2024, Jamie Mansfield <jmansfield@cadixdev.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <LibWeb/Bindings/HTMLMarqueeElement.h>
+#include <LibWeb/Bindings/Intrinsics.h>
+#include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
+#include <LibWeb/HTML/HTMLMarqueeElement.h>
+#include <LibWeb/HTML/Numbers.h>
+#include <LibWeb/HTML/Parser/HTMLParser.h>
+
+namespace Web::HTML {
+
+GC_DEFINE_ALLOCATOR(HTMLMarqueeElement);
+
+HTMLMarqueeElement::HTMLMarqueeElement(DOM::Document& document, DOM::QualifiedName qualified_name)
+    : HTMLElement(document, move(qualified_name))
+{
+}
+
+HTMLMarqueeElement::~HTMLMarqueeElement() = default;
+
+void HTMLMarqueeElement::initialize(JS::Realm& realm)
+{
+    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLMarqueeElement);
+    Base::initialize(realm);
+}
+
+bool HTMLMarqueeElement::is_presentational_hint(FlyString const& name) const
+{
+    if (Base::is_presentational_hint(name))
+        return true;
+
+    return first_is_one_of(name,
+        HTML::AttributeNames::bgcolor,
+        HTML::AttributeNames::height,
+        HTML::AttributeNames::hspace,
+        HTML::AttributeNames::vspace,
+        HTML::AttributeNames::width);
+}
+
+void HTMLMarqueeElement::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
+{
+    HTMLElement::apply_presentational_hints(properties);
+    for_each_attribute([&](auto& name, auto& value) {
+        if (name == HTML::AttributeNames::bgcolor) {
             // https://html.spec.whatwg.org/multipage/rendering.html#the-marquee-element-2:rules-for-parsing-a-legacy-colour-value
             auto color = parse_legacy_color_value(value);
             if (color.has_value())
@@ -268,7 +895,7 @@ void HTMLMediaElement::finalize()
     document().page().unregister_media_element({}, unique_id());
 }
 
-void HTMLMediaElement::adjust_computed_style(CSS::ComputedProperties& style)
+void HTMLMediaElement::adjust_computed_style(CSS::ComputedProperties::Builder& style)
 {
     // https://drafts.csswg.org/css-display-3/#unbox
     if (style.display().is_contents())
@@ -3143,7 +3770,7 @@ public:
         return meets_focusable_area_rendering_requirements();
     }
 
-    virtual void adjust_computed_style(CSS::ComputedProperties& style) override;
+    virtual void adjust_computed_style(CSS::ComputedProperties::Builder& style) override;
 
     // NOTE: The function is wrapped in a GC::HeapFunction immediately.
     void queue_a_media_element_task(Function<void(HTMLMediaElement&)>);
@@ -4155,7 +4782,7 @@ void HTMLMeterElement::inserted()
     create_shadow_tree_if_needed();
 }
 
-void HTMLMeterElement::adjust_computed_style(CSS::ComputedProperties& style)
+void HTMLMeterElement::adjust_computed_style(CSS::ComputedProperties::Builder& style)
 {
     // https://drafts.csswg.org/css-display-3/#unbox
     if (style.display().is_contents())
@@ -4263,7 +4890,7 @@ public:
     // ^HTMLElement
     virtual void inserted() override;
 
-    virtual void adjust_computed_style(CSS::ComputedProperties&) override;
+    virtual void adjust_computed_style(CSS::ComputedProperties::Builder&) override;
 
     // https://html.spec.whatwg.org/multipage/forms.html#category-label
     virtual bool is_labelable() const override { return true; }
@@ -4618,7 +5245,7 @@ RefPtr<Layout::Node> HTMLObjectElement::create_layout_node(CSS::ComputedProperti
     return nullptr;
 }
 
-void HTMLObjectElement::adjust_computed_style(CSS::ComputedProperties& style)
+void HTMLObjectElement::adjust_computed_style(CSS::ComputedProperties::Builder& style)
 {
     // https://drafts.csswg.org/css-display-3/#unbox
     if (style.display().is_contents())
@@ -5060,7 +5687,7 @@ private:
     virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
 
     virtual RefPtr<Layout::Node> create_layout_node(CSS::ComputedProperties const&) override;
-    virtual void adjust_computed_style(CSS::ComputedProperties&) override;
+    virtual void adjust_computed_style(CSS::ComputedProperties::Builder&) override;
 
     bool has_ancestor_media_element_or_object_element_not_showing_fallback_content() const;
 
@@ -7012,7 +7639,7 @@ void HTMLProgressElement::inserted()
     create_shadow_tree_if_needed();
 }
 
-void HTMLProgressElement::adjust_computed_style(CSS::ComputedProperties& style)
+void HTMLProgressElement::adjust_computed_style(CSS::ComputedProperties::Builder& style)
 {
     // https://drafts.csswg.org/css-display-3/#unbox
     if (style.display().is_contents())
@@ -7079,7 +7706,7 @@ public:
     // ^HTMLElement
     virtual void inserted() override;
 
-    virtual void adjust_computed_style(CSS::ComputedProperties&) override;
+    virtual void adjust_computed_style(CSS::ComputedProperties::Builder&) override;
 
     // https://html.spec.whatwg.org/multipage/forms.html#category-label
     virtual bool is_labelable() const override { return true; }
@@ -8542,7 +9169,7 @@ void HTMLSelectElement::visit_edges(Cell::Visitor& visitor)
     }
 }
 
-void HTMLSelectElement::adjust_computed_style(CSS::ComputedProperties& style)
+void HTMLSelectElement::adjust_computed_style(CSS::ComputedProperties::Builder& style)
 {
     // https://drafts.csswg.org/css-display-3/#unbox
     if (style.display().is_contents())
@@ -9499,7 +10126,7 @@ public:
 
     virtual bool is_html_select_element() const final { return true; }
 
-    virtual void adjust_computed_style(CSS::ComputedProperties&) override;
+    virtual void adjust_computed_style(CSS::ComputedProperties::Builder&) override;
 
     WebIDL::UnsignedLong size() const;
     void set_size(WebIDL::UnsignedLong);
@@ -11098,6 +11725,17 @@ void HTMLTableElement::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_t_bodies);
 }
 
+void HTMLTableElement::adjust_computed_style(CSS::ComputedProperties::Builder& style)
+{
+    Base::adjust_computed_style(style);
+
+    // Tables must not inherit -libweb-* values for text-align.
+    // FIXME: Find the spec for this.
+    auto text_align = style.style().text_align();
+    if (text_align == CSS::TextAlign::LibwebLeft || text_align == CSS::TextAlign::LibwebCenter || text_align == CSS::TextAlign::LibwebRight)
+        style.set_property(CSS::PropertyID::TextAlign, CSS::KeywordStyleValue::create(CSS::Keyword::Start));
+}
+
 static unsigned parse_border(StringView value)
 {
     return value.to_number<unsigned>().value_or(0);
@@ -11621,6 +12259,7 @@ private:
     virtual bool is_presentational_hint(FlyString const&) const override;
     virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
     virtual void attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
+    virtual void adjust_computed_style(CSS::ComputedProperties::Builder&) override;
 
     GC::Ptr<DOM::HTMLCollection> mutable m_rows;
     GC::Ptr<DOM::HTMLCollection> mutable m_t_bodies;
@@ -12377,7 +13016,7 @@ HTMLTextAreaElement::HTMLTextAreaElement(DOM::Document& document, DOM::Qualified
 
 HTMLTextAreaElement::~HTMLTextAreaElement() = default;
 
-void HTMLTextAreaElement::adjust_computed_style(CSS::ComputedProperties& style)
+void HTMLTextAreaElement::adjust_computed_style(CSS::ComputedProperties::Builder& style)
 {
     // https://drafts.csswg.org/css-display-3/#unbox
     if (style.display().is_contents())
@@ -12876,7 +13515,7 @@ class WEB_API HTMLTextAreaElement final
 public:
     virtual ~HTMLTextAreaElement() override;
 
-    virtual void adjust_computed_style(CSS::ComputedProperties&) override;
+    virtual void adjust_computed_style(CSS::ComputedProperties::Builder&) override;
 
     String const& type() const
     {
@@ -103747,6 +104386,7 @@ void NodeWithStyle::apply_style(CSS::ComputedProperties const& computed_style)
     computed_values.set_font_size(computed_style.font_size());
     computed_values.set_font_weight(computed_style.font_weight());
     computed_values.set_line_height(computed_style.line_height());
+    computed_values.set_font_variant_emoji(computed_style.font_variant_emoji());
 
     // NOTE: color must be set after color-scheme to ensure currentColor can be resolved in other properties (e.g. background-color).
     // NOTE: color must be set after font_size as `CalculatedStyleValue`s can rely on it being set for resolving lengths.
@@ -110145,6 +110785,7 @@ TextNode::ChunkList const& TextNode::chunks_for_layout(bool should_wrap_lines, b
         .should_respect_linebreaks = should_respect_linebreaks,
         .white_space_collapse = computed_values.white_space_collapse(),
         .word_break = computed_values.word_break(),
+        .font_variant_emoji = computed_values.font_variant_emoji(),
         .font_cascade_list = computed_values.font_list(),
     };
 
@@ -110190,6 +110831,7 @@ TextNode::ChunkIterator::ChunkIterator(TextNode const& text_node, Utf16View cons
     , m_grapheme_segmenter(grapheme_segmenter)
     , m_line_segmenter(line_segmenter)
     , m_word_break(word_break)
+    , m_font_variant_emoji(text_node.computed_values().font_variant_emoji())
 {
     m_should_collapse_whitespace = first_is_one_of(text_node.computed_values().white_space_collapse(), CSS::WhiteSpaceCollapse::Collapse, CSS::WhiteSpaceCollapse::PreserveBreaks);
 }
@@ -110390,7 +111032,7 @@ Gfx::Font const& TextNode::ChunkIterator::font_for_space(size_t at_index, u32 sp
     for (size_t i = at_index; i < m_view.length_in_code_units();) {
         auto cp = m_view.code_point_at(i);
         if (!is_interword_space(cp) && cp != '\t' && cp != '\n') {
-            auto const& font = m_font_cascade_list.font_for_code_point(cp, Gfx::FontCascadeList::TriggerPendingLoads::Yes);
+            auto const& font = m_font_cascade_list.font_for_code_point(cp, Gfx::FontCascadeList::TriggerPendingLoads::Yes, emoji_presentation_at(i, cp));
             if (!font.is_emoji_font() && has_glyph(font))
                 return font;
             // Text is coming from an emoji face; we'll fall back to (3).
@@ -110401,6 +111043,31 @@ Gfx::Font const& TextNode::ChunkIterator::font_for_space(size_t at_index, u32 sp
 
     // 3. No text around (leading/trailing/all spaces) — pick a font with the glyph from the cascade.
     return m_font_cascade_list.font_for_code_point(space_code_point, Gfx::FontCascadeList::TriggerPendingLoads::Yes);
+}
+
+Gfx::EmojiPresentationResult TextNode::ChunkIterator::emoji_presentation_at(size_t code_unit_offset, u32 code_point) const
+{
+    auto next_offset = code_unit_offset + AK::UnicodeUtils::code_unit_length_for_code_point(code_point);
+    Optional<u32> next_code_point;
+    if (next_offset < m_view.length_in_code_units())
+        next_code_point = m_view.code_point_at(next_offset);
+
+    auto default_presentation = Gfx::emoji_presentation_for_code_point(code_point, next_code_point);
+
+    if (default_presentation.forced == Gfx::ForcedPresentation::Yes || !Unicode::code_point_has_emoji_property(code_point))
+        return default_presentation;
+
+    switch (m_font_variant_emoji) {
+    case CSS::FontVariantEmoji::Text:
+        return { Gfx::EmojiPresentation::Text, Gfx::ForcedPresentation::Yes };
+    case CSS::FontVariantEmoji::Emoji:
+        return { Gfx::EmojiPresentation::Emoji, Gfx::ForcedPresentation::Yes };
+    case CSS::FontVariantEmoji::Unicode:
+        return { default_presentation.presentation, Gfx::ForcedPresentation::Yes };
+    case CSS::FontVariantEmoji::Normal:
+        return default_presentation;
+    }
+    VERIFY_NOT_REACHED();
 }
 
 Optional<TextNode::Chunk> TextNode::ChunkIterator::next_without_peek()
@@ -110427,7 +111094,7 @@ Optional<TextNode::Chunk> TextNode::ChunkIterator::next_without_peek()
     auto const& expected_font_for = [&](u32 cp) -> Gfx::Font const& {
         return is_interword_space(cp)
             ? font_for_space(m_current_index, cp)
-            : m_font_cascade_list.font_for_code_point(cp, Gfx::FontCascadeList::TriggerPendingLoads::Yes);
+            : m_font_cascade_list.font_for_code_point(cp, Gfx::FontCascadeList::TriggerPendingLoads::Yes, emoji_presentation_at(m_current_index, cp));
     };
 
     auto const& font = expected_font_for(current_code_point());
@@ -110628,6 +111295,7 @@ public:
 
         [[nodiscard]] bool is_at_line_break_opportunity() const;
         [[nodiscard]] Gfx::Font const& font_for_space(size_t at_index, u32 space_code_point) const;
+        [[nodiscard]] Gfx::EmojiPresentationResult emoji_presentation_at(size_t code_unit_offset, u32 code_point) const;
 
         bool const m_should_wrap_lines;
         bool const m_should_respect_linebreaks;
@@ -110638,6 +111306,7 @@ public:
         Unicode::Segmenter& m_grapheme_segmenter;
         Unicode::Segmenter& m_line_segmenter;
         CSS::WordBreak m_word_break;
+        CSS::FontVariantEmoji m_font_variant_emoji;
         size_t m_current_index { 0 };
 
         Vector<Chunk> m_peek_queue;
@@ -110685,6 +111354,7 @@ private:
         bool should_respect_linebreaks { false };
         CSS::WhiteSpaceCollapse white_space_collapse { CSS::WhiteSpaceCollapse::Collapse };
         CSS::WordBreak word_break { CSS::WordBreak::Normal };
+        CSS::FontVariantEmoji font_variant_emoji { CSS::FontVariantEmoji::Normal };
         RefPtr<Gfx::FontCascadeList const> font_cascade_list;
 
         bool operator==(ChunkCacheKey const&) const = default;
@@ -111390,7 +112060,6 @@ RefPtr<NodeWithStyle> TreeBuilder::create_pseudo_element_if_needed(DOM::Element&
                 element,
                 *pseudo_element_style);
             list_box->set_marker(list_item_marker);
-            element.set_computed_properties(CSS::PseudoElement::Marker, pseudo_element_style);
             element.set_synthetic_pseudo_element_node({}, CSS::PseudoElement::Marker, list_item_marker);
             list_box->prepend_child(*list_item_marker);
             return list_item_marker;
@@ -111753,7 +112422,7 @@ void TreeBuilder::update_layout_tree(DOM::Node& dom_node, TreeBuilder::Context& 
     }
 
     auto& style_computer = document.style_computer();
-    RefPtr<CSS::ComputedProperties> style;
+    RefPtr<CSS::ComputedProperties const> style;
     CSS::Display display;
 
     if (!should_create_layout_node) {
@@ -150800,15 +151469,8 @@ FontPlugin::FontPlugin(bool is_layout_test_mode, Gfx::SystemFontProvider* font_p
     m_default_fixed_width_font = Gfx::FontDatabase::the().get(default_fixed_width_font_name, 12.0, 400, Gfx::FontWidth::Normal, 0);
     VERIFY(m_default_fixed_width_font);
 
-    if (is_layout_test_mode) {
+    if (is_layout_test_mode)
         m_symbol_font_names = { "Noto Emoji"_fly_string };
-    } else {
-#ifdef AK_OS_MACOS
-        m_symbol_font_names = { "Apple Color Emoji"_fly_string, "Apple Symbols"_fly_string };
-#else
-        m_symbol_font_names = { "Noto Color Emoji"_fly_string, "Noto Sans Symbols"_fly_string };
-#endif
-    }
 }
 
 FontPlugin::~FontPlugin() = default;
@@ -178349,7 +179011,7 @@ void SVGElement::remove_from_use_element_that_reference_this()
     }
 }
 
-void SVGElement::adjust_computed_style(CSS::ComputedProperties& computed_properties)
+void SVGElement::adjust_computed_style(CSS::ComputedProperties::Builder& computed_properties)
 {
     Base::adjust_computed_style(computed_properties);
 
@@ -178485,7 +179147,7 @@ protected:
     virtual void children_changed(ChildrenChangedMetadata const&) override;
     virtual void inserted() override;
     virtual void removed_from(IsSubtreeRoot, Node* old_ancestor, Node& old_root) override;
-    MUST_UPCALL virtual void adjust_computed_style(CSS::ComputedProperties&) override;
+    MUST_UPCALL virtual void adjust_computed_style(CSS::ComputedProperties::Builder&) override;
 
     void update_use_elements_that_reference_this();
     void remove_from_use_element_that_reference_this();
@@ -187129,7 +187791,7 @@ void SVGSymbolElement::visit_edges(Cell::Visitor& visitor)
     SVGFitToViewBox::visit_edges(visitor);
 }
 
-void SVGSymbolElement::adjust_computed_style(CSS::ComputedProperties& computed_properties)
+void SVGSymbolElement::adjust_computed_style(CSS::ComputedProperties::Builder& computed_properties)
 {
     Base::adjust_computed_style(computed_properties);
 
@@ -187190,7 +187852,7 @@ class SVGSymbolElement final : public SVGGraphicsElement
 public:
     virtual ~SVGSymbolElement() override = default;
 
-    virtual void adjust_computed_style(CSS::ComputedProperties&) override;
+    virtual void adjust_computed_style(CSS::ComputedProperties::Builder&) override;
 
 private:
     virtual bool is_svg_symbol_element() const final { return true; }
@@ -194904,6 +195566,7 @@ FILE: Libraries/LibWeb/ViewTransition/ViewTransition.cpp
 #include <LibWeb/CSS/CSSKeyframesRule.h>
 #include <LibWeb/CSS/CSSStyleRule.h>
 #include <LibWeb/CSS/CSSStyleSheet.h>
+#include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
@@ -475675,6 +476338,34 @@ test("object literal with >64 properties in a loop doesn't corrupt shared dictio
     }
 });
 
+FILE: Tests/LibJS/Runtime/regress/environment-coordinate-cache-type-confusion.js
+// https://github.com/LadybirdBrowser/ladybird/issues/3622
+// A nested function declared in an async function's "finally" block reads a parameter whose binding we used to look up
+// through a mis-typed environment coordinate cache, leading to an OOB read. The binding must resolve to the real value.
+test("binding lookup through a nested async finally function does not confuse environment types", () => {
+    async function f0(a1) {
+        try {
+            let [] = this;
+        } catch (e17) {
+            a1.h = a1;
+            try {
+            } catch (e20) {}
+        } finally {
+            function f21() {
+                a1;
+            }
+            f21();
+        }
+    }
+
+    f0().catch(() => {});
+    f0(f0).catch(() => {});
+
+    // f0(f0) takes the catch path and runs a1.h = a1 with a1 === f0. A mis-typed environment lookup would store garbage
+    // instead of f0 here (or crash).
+    expect(f0.h).toBe(f0);
+});
+
 FILE: Tests/LibJS/Runtime/regress/function-bind-arguments.js
 test("Some function.bind cases", () => {
     function collectArguments() {
@@ -475787,6 +476478,20 @@ test("Modifying prototype in dictionary mode should cause prototype-chain validi
         configurable: true,
     });
     f(obj, 123);
+});
+
+FILE: Tests/LibJS/Runtime/regress/long-prototype-chain-to-primitive.js
+// https://github.com/LadybirdBrowser/ladybird/issues/3584
+// Converting a pathologically-deep-prototype-chain object to a primitive used to recurse Object::internal_get til the
+// native stack overflowed. The code now throws a catchable "call stack size exceeded" error instead.
+test("converting an object with a very deep prototype chain to a primitive does not crash", () => {
+    // Object.create() sets the prototype at creation without a cycle check — so the chain is built in linear time.
+    let object = {};
+    for (let i = 0; i < 1_000_000; ++i) object = Object.create(object);
+
+    expect(() => {
+        Number(object);
+    }).toThrowWithMessage(InternalError, "Call stack size limit exceeded");
 });
 
 FILE: Tests/LibJS/Runtime/regress/proxied-constructor-leads-to-use-after-free.js
@@ -564944,6 +565649,8 @@ FILE: Tests/LibWeb/Ref/data/fonts/ahem.css
 
 FILE: Tests/LibWeb/Ref/data/fonts/Ahem.ttf
 FILE: Tests/LibWeb/Ref/data/fonts/COLR-palettes-test-font.ttf
+FILE: Tests/LibWeb/Ref/data/fonts/NotoColorEmoji-Regular_subset.ttf
+FILE: Tests/LibWeb/Ref/data/fonts/NotoEmoji-Regular_subset.ttf
 FILE: Tests/LibWeb/Ref/data/HTMLLLinkElement-multiple-rel-keywords.css
 div {
     background-color: green !important;
@@ -566052,6 +566759,24 @@ FILE: Tests/LibWeb/Ref/expected/css-custom-prop-fallback-ref.html
     }
 </style>
 <body></body>
+FILE: Tests/LibWeb/Ref/expected/css-font-variant-emoji-presentation-ref.html
+<!DOCTYPE html>
+<style>
+    @font-face {
+        font-family: ColorEmojiFont;
+        src: url("../data/fonts/NotoColorEmoji-Regular_subset.ttf");
+    }
+    @font-face {
+        font-family: MonoEmojiFont;
+        src: url("../data/fonts/NotoEmoji-Regular_subset.ttf");
+    }
+    div { font: 48px serif; }
+</style>
+<div style="font-family: MonoEmojiFont; font-variant-emoji: text">&#x2139;</div>
+<div style="font-family: ColorEmojiFont; font-variant-emoji: emoji">&#x2139;</div>
+<div style="font-family: ColorEmojiFont; font-variant-emoji: emoji">&#x1fae8;</div>
+<div style="font-family: MonoEmojiFont; font-variant-emoji: text">&#x1fae8;</div>
+
 FILE: Tests/LibWeb/Ref/expected/css-gradient-currentcolor-ref.html
 <!DOCTYPE html>
 <html>
@@ -584015,6 +584740,25 @@ FILE: Tests/LibWeb/Ref/input/css-custom-prop-fallback.html
     }
 </style>
 <body></body>
+FILE: Tests/LibWeb/Ref/input/css-font-variant-emoji-presentation.html
+<!DOCTYPE html>
+<link rel="match" href="../expected/css-font-variant-emoji-presentation-ref.html">
+<style>
+    @font-face {
+        font-family: ColorEmojiFont;
+        src: url("../data/fonts/NotoColorEmoji-Regular_subset.ttf");
+    }
+    @font-face {
+        font-family: MonoEmojiFont;
+        src: url("../data/fonts/NotoEmoji-Regular_subset.ttf");
+    }
+    div { font: 48px ColorEmojiFont, MonoEmojiFont; }
+</style>
+<div style="font-variant-emoji: unicode">&#x2139;</div>
+<div style="font-variant-emoji: emoji">&#x2139;</div>
+<div style="font-variant-emoji: unicode">&#x1fae8;</div>
+<div style="font-variant-emoji: text">&#x1fae8;</div>
+
 FILE: Tests/LibWeb/Ref/input/css-functional-unknown-webkit-pseudo-element.html
 <!doctype html>
 <link rel="match" href="../expected/text-div.html" />
@@ -641650,72 +642394,3 @@ PASS: related structural mutation keeps :has walk: id / append matching child | 
 PASS: related structural mutation keeps :has walk: id / append matching nested descendant | styleInvalidations=3, fullStyleInvalidations=0, elementStyleRecomputations=4, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=2, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
 PASS: related structural mutation keeps :has walk: id / append matching fragment child | styleInvalidations=3, fullStyleInvalidations=0, elementStyleRecomputations=4, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=1, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
 PASS: related structural mutation keeps :has walk: id / move matching child into anchor | styleInvalidations=1, fullStyleInvalidations=0, elementStyleRecomputations=4, elementStyleNoopRecomputations=2, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: unrelated structural mutation skips :has walk: attribute / append plain element | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: attribute / append other class | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: attribute / append other id | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: attribute / append other attribute | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: attribute / append other tag | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: attribute / append nested unrelated subtree | styleInvalidations=4, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: attribute / append document fragment with unrelated children | styleInvalidations=3, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: attribute / remove unrelated child | styleInvalidations=1, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: attribute / move unrelated sibling before unrelated root | styleInvalidations=0, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: attribute / replace unrelated child with plain element | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: attribute / insert unrelated before anchor | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=2, elementStyleNoopRecomputations=2, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=1, hasResultCacheHits=0, hasResultCacheMisses=1
-PASS: unrelated structural mutation skips :has walk: attribute / append unrelated after fixture | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=3, elementStyleNoopRecomputations=3, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=1, hasResultCacheHits=0, hasResultCacheMisses=1
-PASS: related structural mutation keeps :has walk: attribute / append matching child | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=3, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=1, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: related structural mutation keeps :has walk: attribute / append matching nested descendant | styleInvalidations=3, fullStyleInvalidations=0, elementStyleRecomputations=4, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=2, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: related structural mutation keeps :has walk: attribute / append matching fragment child | styleInvalidations=3, fullStyleInvalidations=0, elementStyleRecomputations=4, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=1, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: related structural mutation keeps :has walk: attribute / move matching child into anchor | styleInvalidations=1, fullStyleInvalidations=0, elementStyleRecomputations=4, elementStyleNoopRecomputations=2, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: unrelated structural mutation skips :has walk: tag / append plain element | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: tag / append other class | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: tag / append other id | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: tag / append other attribute | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: tag / append other tag | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: tag / append nested unrelated subtree | styleInvalidations=4, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: tag / append document fragment with unrelated children | styleInvalidations=3, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: tag / remove unrelated child | styleInvalidations=1, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: tag / move unrelated sibling before unrelated root | styleInvalidations=0, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: tag / replace unrelated child with plain element | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: tag / insert unrelated before anchor | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=2, elementStyleNoopRecomputations=2, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=1, hasResultCacheHits=0, hasResultCacheMisses=1
-PASS: unrelated structural mutation skips :has walk: tag / append unrelated after fixture | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=3, elementStyleNoopRecomputations=3, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=1, hasResultCacheHits=0, hasResultCacheMisses=1
-PASS: related structural mutation keeps :has walk: tag / append matching child | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=3, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: related structural mutation keeps :has walk: tag / append matching nested descendant | styleInvalidations=3, fullStyleInvalidations=0, elementStyleRecomputations=4, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=1, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: related structural mutation keeps :has walk: tag / append matching fragment child | styleInvalidations=3, fullStyleInvalidations=0, elementStyleRecomputations=4, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: related structural mutation keeps :has walk: tag / move matching child into anchor | styleInvalidations=1, fullStyleInvalidations=0, elementStyleRecomputations=4, elementStyleNoopRecomputations=2, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: unrelated structural mutation skips :has walk: checked pseudo / append plain element | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: checked pseudo / append other class | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: checked pseudo / append other id | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: checked pseudo / append other attribute | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: checked pseudo / append other tag | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: checked pseudo / append nested unrelated subtree | styleInvalidations=4, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: checked pseudo / append document fragment with unrelated children | styleInvalidations=3, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: checked pseudo / remove unrelated child | styleInvalidations=1, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: checked pseudo / move unrelated sibling before unrelated root | styleInvalidations=0, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: checked pseudo / replace unrelated child with plain element | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: checked pseudo / insert unrelated before anchor | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=2, elementStyleNoopRecomputations=2, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=1, hasResultCacheHits=0, hasResultCacheMisses=1
-PASS: unrelated structural mutation skips :has walk: checked pseudo / append unrelated after fixture | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=3, elementStyleNoopRecomputations=3, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=1, hasResultCacheHits=0, hasResultCacheMisses=1
-PASS: related structural mutation keeps :has walk: checked pseudo / append matching child | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=3, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=2, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: related structural mutation keeps :has walk: checked pseudo / append matching nested descendant | styleInvalidations=3, fullStyleInvalidations=0, elementStyleRecomputations=4, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=3, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: related structural mutation keeps :has walk: checked pseudo / append matching fragment child | styleInvalidations=3, fullStyleInvalidations=0, elementStyleRecomputations=4, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=2, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: related structural mutation keeps :has walk: checked pseudo / move matching child into anchor | styleInvalidations=1, fullStyleInvalidations=0, elementStyleRecomputations=4, elementStyleNoopRecomputations=2, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: unrelated structural mutation skips :has walk: disabled pseudo / append plain element | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: disabled pseudo / append other class | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: disabled pseudo / append other id | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: disabled pseudo / append other attribute | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: disabled pseudo / append other tag | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: disabled pseudo / append nested unrelated subtree | styleInvalidations=4, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: disabled pseudo / append document fragment with unrelated children | styleInvalidations=3, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: disabled pseudo / remove unrelated child | styleInvalidations=1, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: disabled pseudo / move unrelated sibling before unrelated root | styleInvalidations=0, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: disabled pseudo / replace unrelated child with plain element | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: disabled pseudo / insert unrelated before anchor | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=2, elementStyleNoopRecomputations=2, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=1, hasResultCacheHits=0, hasResultCacheMisses=1
-PASS: unrelated structural mutation skips :has walk: disabled pseudo / append unrelated after fixture | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=3, elementStyleNoopRecomputations=3, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=1, hasResultCacheHits=0, hasResultCacheMisses=1
-PASS: related structural mutation keeps :has walk: disabled pseudo / append matching child | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=3, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=1, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: related structural mutation keeps :has walk: disabled pseudo / append matching nested descendant | styleInvalidations=3, fullStyleInvalidations=0, elementStyleRecomputations=4, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=2, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: related structural mutation keeps :has walk: disabled pseudo / append matching fragment child | styleInvalidations=3, fullStyleInvalidations=0, elementStyleRecomputations=4, elementStyleNoopRecomputations=1, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=1, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: related structural mutation keeps :has walk: disabled pseudo / move matching child into anchor | styleInvalidations=1, fullStyleInvalidations=0, elementStyleRecomputations=4, elementStyleNoopRecomputations=2, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=1, hasInvalidationMetadataCandidates=0, hasMatchInvocations=2, hasResultCacheHits=0, hasResultCacheMisses=2
-PASS: unrelated structural mutation skips :has walk: required pseudo / append plain element | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: required pseudo / append other class | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: required pseudo / append other id | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: required pseudo / append other attribute | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
-PASS: unrelated structural mutation skips :has walk: required pseudo / append other tag | styleInvalidations=2, fullStyleInvalidations=0, elementStyleRecomputations=0, elementStyleNoopRecomputations=0, elementInheritedStyleRecomputations=0, elementInheritedStyleNoopRecomputations=0, hasAncestorWalkInvocations=0, hasInvalidationMetadataCandidates=0, hasMatchInvocations=0, hasResultCacheHits=0, hasResultCacheMisses=0
