@@ -306,7 +306,7 @@ static ThrowCompletionOr<Value> regexp_builtin_exec(VM& vm, RegExpObject& regexp
         // Named groups: find by linear scan (typically very few named groups).
         for (auto const& ng : named_groups) {
             if (ng.index == i) {
-                auto group_name = Utf16FlyString::from_utf8(ng.name);
+                auto const& group_name = ng.name;
                 if (matched_group_names.contains(group_name)) {
                     // Name already matched with a non-undefined value; skip.
                     break;
@@ -325,7 +325,7 @@ static ThrowCompletionOr<Value> regexp_builtin_exec(VM& vm, RegExpObject& regexp
         groups = Object::create(realm, nullptr);
 
         for (auto const& ng : named_groups) {
-            auto group_name = Utf16FlyString::from_utf8(ng.name);
+            auto const& group_name = ng.name;
             auto value = original_groups.as_object().get_without_side_effects(group_name);
             MUST(groups.as_object().create_data_property_or_throw(group_name, value));
         }
@@ -377,7 +377,7 @@ static ThrowCompletionOr<Value> regexp_builtin_exec(VM& vm, RegExpObject& regexp
         if (has_groups) {
             HashTable<Utf16FlyString> matched_index_group_names;
             for (auto const& ng : named_groups) {
-                auto group_name = Utf16FlyString::from_utf8(ng.name);
+                auto const& group_name = ng.name;
                 if (matched_index_group_names.contains(group_name))
                     continue;
                 unsigned int group_idx = ng.index;
@@ -556,7 +556,7 @@ JS_DEFINE_NATIVE_FUNCTION(RegExpPrototype::symbol_match)
     // 4. Let flags be ? ToString(? Get(rx, "flags")).
     static auto& cache = *new Bytecode::StaticPropertyLookupCache;
     auto flags_value = TRY(regexp_object->get(vm.names.flags, cache));
-    auto flags = TRY(flags_value.to_string(vm));
+    auto flags = TRY(flags_value.to_utf16_string(vm));
 
     // 5. If flags does not contain "g", then
     if (!flags.contains('g')) {
@@ -600,7 +600,7 @@ JS_DEFINE_NATIVE_FUNCTION(RegExpPrototype::symbol_match)
 
         // 1. Let matchStr be ? ToString(? Get(result, "0")).
         auto match_value = TRY(result.get(0));
-        auto match_str = TRY(match_value.to_string(vm));
+        auto match_str = TRY(match_value.to_utf16_string(vm));
 
         // 2. Perform ! CreateDataPropertyOrThrow(A, ! ToString(𝔽(n)), matchStr).
         array->indexed_put(n, PrimitiveString::create(vm, match_str));
@@ -634,7 +634,7 @@ JS_DEFINE_NATIVE_FUNCTION(RegExpPrototype::symbol_match_all)
     // 5. Let flags be ? ToString(? Get(R, "flags")).
     static auto& cache = *new Bytecode::StaticPropertyLookupCache;
     auto flags_value = TRY(regexp_object->get(vm.names.flags, cache));
-    auto flags = TRY(flags_value.to_string(vm));
+    auto flags = TRY(flags_value.to_utf16_string(vm));
 
     // Steps 9-12 are performed early so that flags can be moved.
 
@@ -906,16 +906,16 @@ ThrowCompletionOr<Value> RegExpPrototype::symbol_replace_impl(VM& vm, Object& re
     // 5. Let functionalReplace be IsCallable(replaceValue).
 
     // 6. If functionalReplace is false, then
+    Optional<Utf16String> replace_string;
     if (!replace_value.is_function()) {
         // a. Set replaceValue to ? ToString(replaceValue).
-        auto replace_string = TRY(replace_value.to_string(vm));
-        replace_value = PrimitiveString::create(vm, move(replace_string));
+        replace_string = TRY(replace_value.to_utf16_string(vm));
     }
 
     // 7. Let flags be ? ToString(? Get(rx, "flags")).
     static auto& cache = *new Bytecode::StaticPropertyLookupCache;
     auto flags_value = TRY(regexp_object.get(vm.names.flags, cache));
-    auto flags = TRY(flags_value.to_string(vm));
+    auto flags = TRY(flags_value.to_utf16_string(vm));
 
     // 8. If flags contains "g", let global be true. Otherwise, let global be false.
     bool global = flags.contains('g');
@@ -953,7 +953,7 @@ ThrowCompletionOr<Value> RegExpPrototype::symbol_replace_impl(VM& vm, Object& re
 
         // 1. Let matchStr be ? ToString(? Get(result, "0")).
         auto match_value = TRY(result.get(vm, 0));
-        auto match_str = TRY(match_value.to_string(vm));
+        auto match_str = TRY(match_value.to_utf16_string(vm));
 
         // 2. If matchStr is the empty String, then
         if (match_str.is_empty()) {
@@ -1007,7 +1007,7 @@ ThrowCompletionOr<Value> RegExpPrototype::symbol_replace_impl(VM& vm, Object& re
             // ii. If capN is not undefined, then
             if (!capture.is_undefined()) {
                 // 1. Set capN to ? ToString(capN).
-                capture = PrimitiveString::create(vm, TRY(capture.to_string(vm)));
+                capture = PrimitiveString::create(vm, TRY(capture.to_utf16_string(vm)));
             }
 
             // iii. Append capN as the last element of captures.
@@ -1053,7 +1053,8 @@ ThrowCompletionOr<Value> RegExpPrototype::symbol_replace_impl(VM& vm, Object& re
             }
 
             // ii. Let replacement be ? GetSubstitution(matched, S, position, captures, namedCaptures, replaceValue).
-            replacement = TRY(get_substitution(vm, matched->utf16_string_view(), string->utf16_string_view(), position, captures, named_captures, replace_value));
+            VERIFY(replace_string.has_value());
+            replacement = TRY(get_substitution(vm, matched->utf16_string_view(), string->utf16_string_view(), position, captures, named_captures, *replace_string));
         }
 
         // m. If position ≥ nextSourcePosition, then
@@ -1141,7 +1142,7 @@ JS_DEFINE_NATIVE_FUNCTION(RegExpPrototype::source)
     if (!is<RegExpObject>(*regexp_object)) {
         // a. If SameValue(R, %RegExp.prototype%) is true, return "(?:)".
         if (same_value(regexp_object, realm.intrinsics().regexp_prototype()))
-            return PrimitiveString::create(vm, "(?:)"_string);
+            return PrimitiveString::create(vm, "(?:)"_utf16_fly_string);
 
         // b. Otherwise, throw a TypeError exception.
         return vm.throw_completion<TypeError>(ErrorType::NotAnObjectOfType, "RegExp");
@@ -1316,7 +1317,7 @@ ThrowCompletionOr<Value> RegExpPrototype::symbol_split_impl(VM& vm, Object& rege
     // 5. Let flags be ? ToString(? Get(rx, "flags")).
     static auto& cache = *new Bytecode::StaticPropertyLookupCache;
     auto flags_value = TRY(regexp_object.get(vm.names.flags, cache));
-    auto flags = TRY(flags_value.to_string(vm));
+    auto flags = TRY(flags_value.to_utf16_string(vm));
 
     // 6. If flags contains "u" or flags contains "v", let unicodeMatching be true.
     // 7. Else, let unicodeMatching be false.
@@ -1324,7 +1325,7 @@ ThrowCompletionOr<Value> RegExpPrototype::symbol_split_impl(VM& vm, Object& rege
 
     // 8. If flags contains "y", let newFlags be flags.
     // 9. Else, let newFlags be the string-concatenation of flags and "y".
-    auto new_flags = flags.bytes_as_string_view().find('y').has_value() ? move(flags) : MUST(String::formatted("{}y", flags));
+    auto new_flags = flags.contains('y') ? move(flags) : Utf16String::formatted("{}y", flags);
 
     // 10. Let splitter be ? Construct(C, « rx, newFlags »).
     auto splitter = TRY(construct(vm, *constructor, &regexp_object, PrimitiveString::create(vm, move(new_flags))));
@@ -1544,16 +1545,16 @@ JS_DEFINE_NATIVE_FUNCTION(RegExpPrototype::to_string)
     // 3. Let pattern be ? ToString(? Get(R, "source")).
     static auto& cache = *new Bytecode::StaticPropertyLookupCache;
     auto source_attr = TRY(regexp_object->get(vm.names.source, cache));
-    auto pattern = TRY(source_attr.to_string(vm));
+    auto pattern = TRY(source_attr.to_utf16_string(vm));
 
     // 4. Let flags be ? ToString(? Get(R, "flags")).
     static auto& cache2 = *new Bytecode::StaticPropertyLookupCache;
     auto flags_attr = TRY(regexp_object->get(vm.names.flags, cache2));
-    auto flags = TRY(flags_attr.to_string(vm));
+    auto flags = TRY(flags_attr.to_utf16_string(vm));
 
     // 5. Let result be the string-concatenation of "/", pattern, "/", and flags.
     // 6. Return result.
-    return PrimitiveString::create(vm, ByteString::formatted("/{}/{}", pattern, flags));
+    return PrimitiveString::create(vm, Utf16String::formatted("/{}/{}", pattern, flags));
 }
 
 // B.2.4.1 RegExp.prototype.compile ( pattern, flags ), https://tc39.es/ecma262/#sec-regexp.prototype.compile

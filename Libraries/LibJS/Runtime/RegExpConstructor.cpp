@@ -221,11 +221,11 @@ static Utf16String encode_for_regexp_escape(u32 code_point)
 
     // 3. Let otherPunctuators be the string-concatenation of ",-=<>#&!%:;@~'`" and the code unit 0x0022 (QUOTATION MARK).
     // 4. Let toEscape be StringToCodePoints(otherPunctuators).
-    static constexpr Utf8View to_escape { ",-=<>#&!%:;@~'`\""sv };
+    static constexpr auto to_escape = ",-=<>#&!%:;@~'`\""sv;
 
     // 5. If toEscape contains c, c is matched by either WhiteSpace or LineTerminator, or c has the same numeric value
     //    as a leading surrogate or trailing surrogate, then
-    if (to_escape.contains(code_point) || is_whitespace(code_point) || is_line_terminator(code_point) || is_unicode_surrogate(code_point)) {
+    if ((is_ascii(code_point) && to_escape.contains(static_cast<char>(code_point))) || is_whitespace(code_point) || is_line_terminator(code_point) || is_unicode_surrogate(code_point)) {
         // a. Let cNum be the numeric value of c.
         // b. If cNum ≤ 0xFF, then
         if (code_point <= 0xFF) {
@@ -257,10 +257,10 @@ JS_DEFINE_NATIVE_FUNCTION(RegExpConstructor::escape)
         return vm.throw_completion<TypeError>(ErrorType::NotAString, string);
 
     // 2. Let escaped be the empty String.
+    auto code_point_list = string.as_string().utf16_string_view();
     Utf16StringBuilder escaped(string.as_string().utf16_string_view().length_in_code_units());
 
     // 3. Let cpList be StringToCodePoints(S).
-    auto code_point_list = string.as_string().utf16_string_view();
 
     // 4. For each code point c of cpList, do
     for (auto code_point : code_point_list) {

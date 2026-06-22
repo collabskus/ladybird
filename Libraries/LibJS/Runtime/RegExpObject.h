@@ -10,6 +10,7 @@
 #include <AK/EnumBits.h>
 #include <AK/Optional.h>
 #include <AK/Result.h>
+#include <AK/String.h>
 #include <LibJS/Export.h>
 #include <LibJS/Runtime/Object.h>
 #include <LibRegex/ECMAScriptRegex.h>
@@ -20,7 +21,7 @@ JS_API ThrowCompletionOr<GC::Ref<RegExpObject>> regexp_create(VM&, Value pattern
 ThrowCompletionOr<GC::Ref<RegExpObject>> regexp_alloc(VM&, FunctionObject& new_target);
 
 struct ParseRegexPatternError {
-    String error;
+    Utf16String error;
 };
 ErrorOr<Utf16String, ParseRegexPatternError> parse_regex_pattern(Utf16View const& pattern, bool unicode, bool unicode_sets);
 ThrowCompletionOr<Utf16String> parse_regex_pattern(VM& vm, Utf16View const& pattern, bool unicode, bool unicode_sets);

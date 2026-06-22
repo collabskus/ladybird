@@ -54,9 +54,9 @@ static ThrowCompletionOr<Alphabet> parse_alphabet(VM& vm, Object& options)
 
     // If alphabet is neither "base64" nor "base64url", throw a TypeError exception.
     if (alphabet.is_string()) {
-        if (alphabet.as_string().utf8_string_view() == "base64"sv)
+        if (alphabet.as_string().utf16_string_view() == "base64"sv)
             return Alphabet::Base64;
-        if (alphabet.as_string().utf8_string_view() == "base64url"sv)
+        if (alphabet.as_string().utf16_string_view() == "base64url"sv)
             return Alphabet::Base64URL;
     }
 
@@ -74,15 +74,31 @@ static ThrowCompletionOr<AK::LastChunkHandling> parse_last_chunk_handling(VM& vm
 
     // If lastChunkHandling is not one of "loose", "strict", or "stop-before-partial", throw a TypeError exception.
     if (last_chunk_handling.is_string()) {
-        if (last_chunk_handling.as_string().utf8_string_view() == "loose"sv)
+        if (last_chunk_handling.as_string().utf16_string_view() == "loose"sv)
             return AK::LastChunkHandling::Loose;
-        if (last_chunk_handling.as_string().utf8_string_view() == "strict"sv)
+        if (last_chunk_handling.as_string().utf16_string_view() == "strict"sv)
             return AK::LastChunkHandling::Strict;
-        if (last_chunk_handling.as_string().utf8_string_view() == "stop-before-partial"sv)
+        if (last_chunk_handling.as_string().utf16_string_view() == "stop-before-partial"sv)
             return AK::LastChunkHandling::StopBeforePartial;
     }
 
     return vm.throw_completion<TypeError>(ErrorType::OptionIsNotValidValue, last_chunk_handling, "lastChunkHandling"sv);
+}
+
+static Utf16String base64_decode_error_message(AK::Base64DecodeError error)
+{
+    switch (error) {
+    case AK::Base64DecodeError::ExtraBits:
+        return "Extra bits found at end of chunk"_utf16;
+    case AK::Base64DecodeError::InputRemainder:
+        return "Invalid trailing data"_utf16;
+    case AK::Base64DecodeError::InvalidCharacter:
+        return "Invalid base64 character"_utf16;
+    case AK::Base64DecodeError::InvalidData:
+        return "Invalid base64-encoded data"_utf16;
+    }
+
+    VERIFY_NOT_REACHED();
 }
 
 // 23.3.1.1 Uint8Array.fromBase64 ( string [ , options ] ), https://tc39.es/ecma262/#sec-uint8array.frombase64
@@ -116,7 +132,7 @@ JS_DEFINE_NATIVE_FUNCTION(Uint8ArrayConstructorHelpers::from_base64)
     }
 
     // 9. Let result be FromBase64(string, alphabet, lastChunkHandling).
-    auto result = JS::from_base64(vm, string_value.as_string().utf8_string_view(), alphabet, last_chunk_handling);
+    auto result = JS::from_base64(vm, string_value.as_string().utf16_string_view(), alphabet, last_chunk_handling);
 
     // 10. If result.[[Error]] is not NONE, then
     if (result.error.has_value()) {
@@ -152,7 +168,7 @@ JS_DEFINE_NATIVE_FUNCTION(Uint8ArrayConstructorHelpers::from_hex)
         return vm.throw_completion<TypeError>(ErrorType::NotAString, string_value);
 
     // 2. Let result be FromHex(string).
-    auto result = JS::from_hex(vm, string_value.as_string().utf8_string_view());
+    auto result = JS::from_hex(vm, string_value.as_string().utf16_string_view());
 
     // 3. If result.[[Error]] is not NONE, then
     if (result.error.has_value()) {
@@ -220,7 +236,7 @@ JS_DEFINE_NATIVE_FUNCTION(Uint8ArrayPrototypeHelpers::set_from_base64)
     auto byte_length = typed_array_length(typed_array_record);
 
     // 14. Let result be FromBase64(string, alphabet, lastChunkHandling, byteLength).
-    auto result = JS::from_base64(vm, string_value.as_string().utf8_string_view(), alphabet, last_chunk_handling, byte_length);
+    auto result = JS::from_base64(vm, string_value.as_string().utf16_string_view(), alphabet, last_chunk_handling, byte_length);
 
     // 15. Let bytes be result.[[Bytes]].
     auto bytes = move(result.bytes);
@@ -280,7 +296,7 @@ JS_DEFINE_NATIVE_FUNCTION(Uint8ArrayPrototypeHelpers::set_from_hex)
     auto byte_length = typed_array_length(typed_array_record);
 
     // 7. Let result be FromHex(string, byteLength).
-    auto result = JS::from_hex(vm, string_value.as_string().utf8_string_view(), byte_length);
+    auto result = JS::from_hex(vm, string_value.as_string().utf16_string_view(), byte_length);
 
     // 8. Let bytes be result.[[Bytes]].
     auto bytes = move(result.bytes);
@@ -341,16 +357,16 @@ JS_DEFINE_NATIVE_FUNCTION(Uint8ArrayPrototypeHelpers::to_base64)
     }
 
     // 8. Let toEncode be ? GetUint8ArrayBytes(O).
-    String out_ascii;
+    Utf16String out_ascii;
 
     // OPTIMIZATION: If the ArrayBuffer is not shared, we can avoid copying the bytes.
     if (!typed_array->viewed_array_buffer()->is_shared_array_buffer()
         && !typed_array->viewed_array_buffer()->is_detached()) {
         auto to_encode = TRY(get_uint8_array_bytes_view(vm, typed_array));
         if (alphabet == Alphabet::Base64) {
-            out_ascii = MUST(encode_base64(to_encode, omit_padding));
+            out_ascii = MUST(encode_base64_to_utf16(to_encode, omit_padding));
         } else {
-            out_ascii = MUST(encode_base64url(to_encode, omit_padding));
+            out_ascii = MUST(encode_base64url_to_utf16(to_encode, omit_padding));
         }
     } else {
         auto to_encode = TRY(get_uint8_array_bytes(vm, typed_array));
@@ -359,14 +375,14 @@ JS_DEFINE_NATIVE_FUNCTION(Uint8ArrayPrototypeHelpers::to_base64)
         if (alphabet == Alphabet::Base64) {
             // a. Let outAscii be the sequence of code points which results from encoding toEncode according to the base64
             //    encoding specified in section 4 of RFC 4648. Padding is included if and only if omitPadding is false.
-            out_ascii = MUST(encode_base64(to_encode, omit_padding));
+            out_ascii = MUST(encode_base64_to_utf16(to_encode, omit_padding));
         }
         // 10. Else,
         else {
             // a. Assert: alphabet is "base64url".
             // b. Let outAscii be the sequence of code points which results from encoding toEncode according to the base64url
             //    encoding specified in section 5 of RFC 4648. Padding is included if and only if omitPadding is false.
-            out_ascii = MUST(encode_base64url(to_encode, omit_padding));
+            out_ascii = MUST(encode_base64url_to_utf16(to_encode, omit_padding));
         }
     }
 
@@ -505,7 +521,7 @@ void set_uint8_array_bytes(TypedArrayBase& into, ReadonlyBytes bytes)
 }
 
 // 23.3.3.7 FromBase64 ( string, alphabet, lastChunkHandling [ , maxLength ] ), https://tc39.es/ecma262/#sec-frombase64
-DecodeResult from_base64(VM& vm, StringView string, Alphabet alphabet, AK::LastChunkHandling last_chunk_handling, Optional<size_t> max_length)
+DecodeResult from_base64(VM& vm, Utf16View string, Alphabet alphabet, AK::LastChunkHandling last_chunk_handling, Optional<size_t> max_length)
 {
     auto output = MUST(ByteBuffer::create_uninitialized(max_length.value_or_lazy_evaluated([&]() {
         return AK::size_required_to_decode_base64(string);
@@ -516,7 +532,7 @@ DecodeResult from_base64(VM& vm, StringView string, Alphabet alphabet, AK::LastC
         : AK::decode_base64url_into(string, output, last_chunk_handling);
 
     if (result.is_error()) {
-        auto error = vm.throw_completion<SyntaxError>(result.error().error.string_literal());
+        auto error = vm.throw_completion<SyntaxError>(base64_decode_error_message(result.error().decode_error));
         return { .read = result.error().valid_input_bytes, .bytes = move(output), .error = move(error) };
     }
 
@@ -524,14 +540,14 @@ DecodeResult from_base64(VM& vm, StringView string, Alphabet alphabet, AK::LastC
 }
 
 // 23.3.3.8 FromHex ( string [ , maxLength ] ), https://tc39.es/ecma262/#sec-fromhex
-DecodeResult from_hex(VM& vm, StringView string, Optional<size_t> max_length)
+DecodeResult from_hex(VM& vm, Utf16View string, Optional<size_t> max_length)
 {
     // 1. If maxLength is not present, set maxLength to 2**53 - 1.
     if (!max_length.has_value())
         max_length = MAX_ARRAY_LIKE_INDEX;
 
     // 2. Let length be the length of string.
-    auto length = string.length();
+    auto length = string.length_in_code_units();
 
     // 3. Let bytes be a new empty List.
     ByteBuffer bytes;
@@ -542,7 +558,7 @@ DecodeResult from_hex(VM& vm, StringView string, Optional<size_t> max_length)
     // 5. If length modulo 2 ≠ 0, then
     if (length % 2 != 0) {
         // a. Let error be a newly created SyntaxError object.
-        auto error = vm.throw_completion<SyntaxError>("Hex string must have an even length"sv);
+        auto error = vm.throw_completion<SyntaxError>("Hex string must have an even length"_utf16);
 
         // b. Return the Record { [[Read]]: read, [[Bytes]]: bytes, [[Error]]: error }.
         return { .read = read, .bytes = move(bytes), .error = move(error) };
@@ -561,7 +577,7 @@ DecodeResult from_hex(VM& vm, StringView string, Optional<size_t> max_length)
         // b. If hexits contains any code units which are not in "0123456789abcdefABCDEF", then
         if (!byte.has_value()) {
             // i. Let error be a newly created SyntaxError object.
-            auto error = vm.throw_completion<SyntaxError>("Hex string must only contain hex characters"sv);
+            auto error = vm.throw_completion<SyntaxError>("Hex string must only contain hex characters"_utf16);
 
             // ii. Return the Record { [[Read]]: read, [[Bytes]]: bytes, [[Error]]: error }.
             return { .read = read, .bytes = move(bytes), .error = move(error) };

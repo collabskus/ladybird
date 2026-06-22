@@ -37,12 +37,6 @@ namespace JS {
 
 GC_DEFINE_ALLOCATOR(StringPrototype);
 
-static ThrowCompletionOr<String> utf8_string_from(VM& vm)
-{
-    auto this_value = TRY(require_object_coercible(vm, vm.this_value()));
-    return TRY(this_value.to_string(vm));
-}
-
 static ThrowCompletionOr<GC::Ref<PrimitiveString>> primitive_string_from(VM& vm)
 {
     auto this_value = TRY(require_object_coercible(vm, vm.this_value()));
@@ -279,7 +273,7 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::char_at)
     // 4. Let size be the length of S.
     // 5. If position < 0 or position ≥ size, return the empty String.
     if (position < 0 || position >= string->length_in_utf16_code_units())
-        return PrimitiveString::create(vm, String {});
+        return PrimitiveString::create(vm, Utf16String {});
 
     // 6. Return the substring of S from position to position + 1.
     return PrimitiveString::create(vm, *string, position, 1);
@@ -369,7 +363,7 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::ends_with)
         return vm.throw_completion<TypeError>(ErrorType::IsNotA, "searchString", "string, but a regular expression");
 
     // 5. Let searchStr be ? ToString(searchString).
-    auto search_string = TRY(search_string_value.to_primitive_string(vm));
+    auto search_string = TRY(search_string_value.to_utf16_string(vm));
 
     // 6. Let len be the length of S.
     auto string_length = string->length_in_utf16_code_units();
@@ -384,7 +378,7 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::ends_with)
     }
 
     // 9. Let searchLength be the length of searchStr.
-    auto search_length = search_string->length_in_utf16_code_units();
+    auto search_length = search_string.length_in_code_units();
 
     // 10. If searchLength = 0, return true.
     if (search_length == 0)
@@ -402,7 +396,7 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::ends_with)
 
     // 14. If substring is searchStr, return true.
     // 15. Return false.
-    return Value(substring_view == search_string->utf16_string_view());
+    return Value(substring_view == search_string);
 }
 
 // 22.1.3.8 String.prototype.includes ( searchString [ , position ] ), https://tc39.es/ecma262/#sec-string.prototype.includes
@@ -423,7 +417,7 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::includes)
         return vm.throw_completion<TypeError>(ErrorType::IsNotA, "searchString", "string, but a regular expression");
 
     // 5. Let searchStr be ? ToString(searchString).
-    auto search_string = TRY(search_string_value.to_primitive_string(vm));
+    auto search_string = TRY(search_string_value.to_utf16_string(vm));
 
     size_t start = 0;
     if (!position.is_undefined()) {
@@ -437,7 +431,7 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::includes)
     }
 
     // 10. Let index be StringIndexOf(S, searchStr, start).
-    auto index = string_index_of(string->utf16_string_view(), search_string->utf16_string_view(), start);
+    auto index = string_index_of(string->utf16_string_view(), search_string, start);
 
     // 11. If index ≠ -1, return true.
     // 12. Return false.
@@ -452,10 +446,10 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::index_of)
     auto string = TRY(primitive_string_from(vm));
 
     // 3. Let searchStr be ? ToString(searchString).
-    auto search_string = TRY(vm.argument(0).to_primitive_string(vm));
+    auto search_string = TRY(vm.argument(0).to_utf16_string(vm));
 
     auto utf16_string_view = string->utf16_string_view();
-    auto utf16_search_view = search_string->utf16_string_view();
+    auto utf16_search_view = search_string.utf16_view();
 
     size_t start = 0;
     if (vm.argument_count() > 1) {
@@ -493,7 +487,7 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::last_index_of)
     auto string = TRY(primitive_string_from(vm));
 
     // 4. Let searchStr be ? ToString(searchString).
-    auto search_string = TRY(vm.argument(0).to_primitive_string(vm));
+    auto search_string = TRY(vm.argument(0).to_utf16_string(vm));
 
     // 5. Let numPos be ? ToNumber(position).
     // 6. Assert: If position is undefined, then numPos is NaN.
@@ -506,7 +500,7 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::last_index_of)
     auto string_length = string->length_in_utf16_code_units();
 
     // 9. Let searchLen be the length of searchStr.
-    auto search_length = search_string->length_in_utf16_code_units();
+    auto search_length = search_string.length_in_code_units();
 
     // 10. If len < searchLen, return -1𝔽.
     if (string_length < search_length)
@@ -516,7 +510,7 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::last_index_of)
     size_t start = clamp(pos, static_cast<double>(0), static_cast<double>(string_length - search_length));
 
     // 12. Let result be StringLastIndexOf(S, searchStr, start).
-    auto result = string_last_index_of(string->utf16_string_view(), search_string->utf16_string_view(), start);
+    auto result = string_last_index_of(string->utf16_string_view(), search_string, start);
 
     // 13. If result is NOT-FOUND, return -1𝔽.
     if (!result.has_value())
@@ -673,7 +667,7 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::match_all)
             auto flags_object = TRY(require_object_coercible(vm, flags));
 
             // iii. If ? ToString(flags) does not contain "g", throw a TypeError exception.
-            auto flags_string = TRY(flags_object.to_string(vm));
+            auto flags_string = TRY(flags_object.to_utf16_string(vm));
             if (!flags_string.contains('g'))
                 return vm.throw_completion<TypeError>(ErrorType::StringNonGlobalRegExp);
         }
@@ -693,7 +687,7 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::match_all)
     auto string = TRY(this_object.to_primitive_string(vm));
 
     // 4. Let rx be ? RegExpCreate(regexp, "g").
-    auto rx = TRY(regexp_create(vm, regexp, PrimitiveString::create(vm, "g"_string)));
+    auto rx = TRY(regexp_create(vm, regexp, PrimitiveString::create(vm, "g"_utf16_fly_string)));
 
     // 5. Return ? Invoke(rx, @@matchAll, « S »).
     return TRY(Value(rx).invoke(vm, vm.well_known_symbol_match_all(), string));
@@ -704,26 +698,26 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::normalize)
 {
     // 1. Let O be ? RequireObjectCoercible(this value).
     // 2. Let S be ? ToString(O).
-    auto string = TRY(utf8_string_from(vm));
+    auto string = TRY(primitive_string_from(vm));
 
-    String form;
+    Utf16String form;
 
     // 3. If form is undefined, let f be "NFC".
     if (auto form_value = vm.argument(0); form_value.is_undefined()) {
-        form = "NFC"_string;
+        form = "NFC"_utf16;
     }
     // 4. Else, let f be ? ToString(form).
     else {
-        form = TRY(form_value.to_string(vm));
+        form = TRY(form_value.to_utf16_string(vm));
     }
 
     // 5. If f is not one of "NFC", "NFD", "NFKC", or "NFKD", throw a RangeError exception.
-    if (!form.is_one_of("NFC"sv, "NFD"sv, "NFKC"sv, "NFKD"sv))
+    if (!form.utf16_view().is_one_of(u"NFC"sv, u"NFD"sv, u"NFKC"sv, u"NFKD"sv))
         return vm.throw_completion<RangeError>(ErrorType::InvalidNormalizationForm, form);
 
     // 6. Let ns be the String value that is the result of normalizing S into the normalization form named by f as specified in https://unicode.org/reports/tr15/.
-    auto unicode_form = Unicode::normalization_form_from_string(form);
-    auto ns = Unicode::normalize(string, unicode_form);
+    auto unicode_form = Unicode::normalization_form_from_string(form.utf16_view());
+    auto ns = Unicode::normalize(string->utf16_string_view(), unicode_form);
 
     // 7. Return ns.
     return PrimitiveString::create(vm, move(ns));
@@ -775,8 +769,8 @@ static ThrowCompletionOr<Value> pad_string(VM& vm, GC::Ref<PrimitiveString> stri
     // 10. If placement is start, return the string-concatenation of truncatedStringFiller and S.
     // 11. Else, return the string-concatenation of S and truncatedStringFiller.
     auto formatted = placement == PadPlacement::Start
-        ? MUST(String::formatted("{}{}", truncated_string_filler, string->utf16_string_view()))
-        : MUST(String::formatted("{}{}", string->utf16_string_view(), truncated_string_filler));
+        ? Utf16String::formatted("{}{}", truncated_string_filler, string->utf16_string_view())
+        : Utf16String::formatted("{}{}", string->utf16_string_view(), truncated_string_filler);
     return PrimitiveString::create(vm, move(formatted));
 }
 
@@ -824,11 +818,11 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::repeat)
 
     // 5. If n = 0, return the empty String.
     if (n == 0)
-        return PrimitiveString::create(vm, String {});
+        return PrimitiveString::create(vm, Utf16String {});
 
     // OPTIMIZATION: If the string is empty, the result will be empty as well.
     if (string->is_empty())
-        return PrimitiveString::create(vm, String {});
+        return PrimitiveString::create(vm, Utf16String {});
 
     if (n > static_cast<double>(NumericLimits<size_t>::max()))
         return vm.throw_completion<RangeError>(ErrorType::StringRepeatCountMustNotOverflow);
@@ -880,10 +874,10 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::replace)
 
     // 5. Let functionalReplace be IsCallable(replaceValue).
     // 6. If functionalReplace is false, then
+    Optional<Utf16String> replace_string;
     if (!replace_value.is_function()) {
         // a. Set replaceValue to ? ToString(replaceValue).
-        auto replace_string = TRY(replace_value.to_primitive_string(vm));
-        replace_value = replace_string;
+        replace_string = TRY(replace_value.to_utf16_string(vm));
     }
 
     // 7. Let searchLength be the length of searchString.
@@ -912,13 +906,13 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::replace)
     // 13. Else,
     else {
         // a. Assert: replaceValue is a String.
-        VERIFY(replace_value.is_string());
+        VERIFY(replace_string.has_value());
 
         // b. Let captures be a new empty List.
         Span<Value> captures;
 
         // c. Let replacement be ! GetSubstitution(searchString, string, position, captures, undefined, replaceValue).
-        replacement = TRY(get_substitution(vm, search_string->utf16_string_view(), string->utf16_string_view(), *position, captures, js_undefined(), replace_value));
+        replacement = TRY(get_substitution(vm, search_string->utf16_string_view(), string->utf16_string_view(), *position, captures, js_undefined(), *replace_string));
     }
 
     // 14. Return the string-concatenation of preceding, replacement, and following.
@@ -953,7 +947,7 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::replace_all)
             auto flags_object = TRY(require_object_coercible(vm, flags));
 
             // iii. If ? ToString(flags) does not contain "g", throw a TypeError exception.
-            if (!TRY(flags_object.to_string(vm)).contains('g'))
+            if (!TRY(flags_object.to_utf16_string(vm)).contains('g'))
                 return vm.throw_completion<TypeError>(ErrorType::StringNonGlobalRegExp);
         }
 
@@ -982,10 +976,10 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::replace_all)
 
     // 5. Let functionalReplace be IsCallable(replaceValue).
     // 6. If functionalReplace is false, then
+    Optional<Utf16String> replace_string;
     if (!replace_value.is_function()) {
         // a. Set replaceValue to ? ToString(replaceValue).
-        auto replace_string = TRY(replace_value.to_primitive_string(vm));
-        replace_value = replace_string;
+        replace_string = TRY(replace_value.to_utf16_string(vm));
     }
 
     // 7. Let searchLength be the length of searchString.
@@ -1029,9 +1023,10 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::replace_all)
         // c. Else,
         else {
             // i. Assert: replaceValue is a String.
+            VERIFY(replace_string.has_value());
             // ii. Let captures be a new empty List.
             // iii. Let replacement be ! GetSubstitution(searchString, string, p, captures, undefined, replaceValue).
-            replacement = TRY(get_substitution(vm, search_string->utf16_string_view(), string->utf16_string_view(), position, {}, js_undefined(), replace_value));
+            replacement = TRY(get_substitution(vm, search_string->utf16_string_view(), string->utf16_string_view(), position, {}, js_undefined(), *replace_string));
         }
 
         // d. Set result to the string-concatenation of result, preserved, and replacement.
@@ -1128,7 +1123,7 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::slice)
 
     // 12. If from ≥ to, return the empty String.
     if (int_start >= int_end)
-        return PrimitiveString::create(vm, String {});
+        return PrimitiveString::create(vm, Utf16String {});
 
     // 13. Return the substring of S from from to to.
     return PrimitiveString::create(vm, *string, int_start, int_end - int_start);
@@ -1178,7 +1173,7 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::split)
         limit = TRY(limit_argument.to_u32(vm));
 
     // 6. Let separatorStr be ? ToString(separator).
-    auto separator = TRY(separator_argument.to_primitive_string(vm));
+    auto separator = TRY(separator_argument.to_utf16_string(vm));
 
     // 7. If lim = 0, then
     if (limit == 0) {
@@ -1196,7 +1191,7 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::split)
     }
 
     // 9. Let separatorLength be the length of separatorStr.
-    auto separator_length = separator->length_in_utf16_code_units();
+    auto separator_length = separator.length_in_code_units();
 
     // 10. If separatorLength = 0, then
     if (separator_length == 0) {
@@ -1219,7 +1214,7 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::split)
     }
 
     auto string_view = string->utf16_string_view();
-    auto separator_view = separator->utf16_string_view();
+    auto separator_view = separator.utf16_view();
 
     // 13. Let searchStart be 0.
     size_t search_start = 0;
@@ -1271,7 +1266,7 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::starts_with)
         return vm.throw_completion<TypeError>(ErrorType::IsNotA, "searchString", "string, but a regular expression");
 
     // 5. Let searchStr be ? ToString(searchString).
-    auto search_string = TRY(search_string_value.to_primitive_string(vm));
+    auto search_string = TRY(search_string_value.to_utf16_string(vm));
 
     // 6. Let len be the length of S.
     auto string_length = string->length_in_utf16_code_units();
@@ -1287,7 +1282,7 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::starts_with)
     }
 
     // 9. Let searchLength be the length of searchStr.
-    auto search_length = search_string->length_in_utf16_code_units();
+    auto search_length = search_string.length_in_code_units();
 
     // 10. If searchLength = 0, return true.
     if (search_length == 0)
@@ -1305,7 +1300,7 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::starts_with)
 
     // 14. If substring is searchStr, return true.
     // 15. Return false.
-    return Value(substring_view == search_string->utf16_string_view());
+    return Value(substring_view == search_string);
 }
 
 // 22.1.3.25 String.prototype.substring ( start, end ), https://tc39.es/ecma262/#sec-string.prototype.substring
@@ -1348,12 +1343,12 @@ enum class TargetCase {
 };
 
 // 20.1.2.1 TransformCase ( S, locales, targetCase ), https://tc39.es/ecma402/#sec-transform-case
-static ThrowCompletionOr<String> transform_case(VM& vm, String const& string, Value locales, TargetCase target_case)
+static ThrowCompletionOr<Utf16String> transform_case(VM& vm, Utf16String const& string, Value locales, TargetCase target_case)
 {
     // 1. Let requestedLocales be ? CanonicalizeLocaleList(locales).
     auto requested_locales = TRY(Intl::canonicalize_locale_list(vm, locales));
 
-    String requested_locale;
+    Utf16String requested_locale;
 
     // 2. If requestedLocales is not an empty List, then
     if (!requested_locales.is_empty()) {
@@ -1363,7 +1358,7 @@ static ThrowCompletionOr<String> transform_case(VM& vm, String const& string, Va
     // 3. Else,
     else {
         // a. Let requestedLocale be ! DefaultLocale().
-        requested_locale = String::from_utf8_without_validation(Unicode::default_locale().bytes());
+        requested_locale = Utf16String::from_utf16(Unicode::default_locale());
     }
 
     // 4. Let availableLocales be an Available Locales List which includes the language tags for which the Unicode Character Database contains language-sensitive case mappings. If the implementation supports additional locale-sensitive case mappings, availableLocales should also include their corresponding language tags.
@@ -1371,23 +1366,23 @@ static ThrowCompletionOr<String> transform_case(VM& vm, String const& string, Va
     auto match = Intl::lookup_matching_locale_by_prefix({ { requested_locale } });
 
     // 6. If match is not undefined, let locale be match.[[locale]]; else let locale be "und".
-    StringView locale = match.has_value() ? match->locale : "und"sv;
+    auto locale = match.has_value() ? match->locale.utf16_view().bytes() : "und"sv;
 
     // 7. Let codePoints be StringToCodePoints(S).
 
-    String new_code_points;
+    Utf16String new_code_points;
 
     switch (target_case) {
     // 8. If targetCase is lower, then
     case TargetCase::Lower:
         // a. Let newCodePoints be a List whose elements are the result of a lowercase transformation of codePoints according to an implementation-derived algorithm using locale or the Unicode Default Case Conversion algorithm.
-        new_code_points = MUST(string.to_lowercase(locale));
+        new_code_points = string.to_lowercase(locale);
         break;
     // 9. Else,
     case TargetCase::Upper:
         // a. Assert: targetCase is upper.
         // b. Let newCodePoints be a List whose elements are the result of an uppercase transformation of codePoints according to an implementation-derived algorithm using locale or the Unicode Default Case Conversion algorithm.
-        new_code_points = MUST(string.to_uppercase(locale));
+        new_code_points = string.to_uppercase(locale);
         break;
     default:
         VERIFY_NOT_REACHED();
@@ -1405,10 +1400,10 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::to_locale_lowercase)
 
     // 1. Let O be ? RequireObjectCoercible(this value).
     // 2. Let S be ? ToString(O).
-    auto string = TRY(utf8_string_from(vm));
+    auto string = TRY(primitive_string_from(vm));
 
     // 3. Return ? TransformCase(S, locales, lower).
-    return PrimitiveString::create(vm, TRY(transform_case(vm, string, locales, TargetCase::Lower)));
+    return PrimitiveString::create(vm, TRY(transform_case(vm, string->utf16_string(), locales, TargetCase::Lower)));
 }
 
 // 22.1.3.27 String.prototype.toLocaleUpperCase ( [ reserved1 [ , reserved2 ] ] ), https://tc39.es/ecma262/#sec-string.prototype.tolocaleuppercase
@@ -1419,10 +1414,10 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::to_locale_uppercase)
 
     // 1. Let O be ? RequireObjectCoercible(this value).
     // 2. Let S be ? ToString(O).
-    auto string = TRY(utf8_string_from(vm));
+    auto string = TRY(primitive_string_from(vm));
 
     // 3. Return ? TransformCase(S, locales, upper).
-    return PrimitiveString::create(vm, TRY(transform_case(vm, string, locales, TargetCase::Upper)));
+    return PrimitiveString::create(vm, TRY(transform_case(vm, string->utf16_string(), locales, TargetCase::Upper)));
 }
 
 // 22.1.3.28 String.prototype.toLowerCase ( ), https://tc39.es/ecma262/#sec-string.prototype.tolowercase
@@ -1431,10 +1426,10 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::to_lowercase)
     // 1. Let O be ? RequireObjectCoercible(this value).
     // 2. Let S be ? ToString(O).
     // 3. Let sText be StringToCodePoints(S).
-    auto string = TRY(utf8_string_from(vm));
+    auto string = TRY(primitive_string_from(vm));
 
     // 4. Let lowerText be the result of toLowercase(sText), according to the Unicode Default Case Conversion algorithm.
-    auto lowercase = MUST(string.to_lowercase());
+    auto lowercase = string->utf16_string().to_lowercase();
 
     // 5. Let L be CodePointsToString(lowerText).
     // 6. Return L.
@@ -1453,8 +1448,8 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::to_uppercase)
 {
     // This method interprets a String value as a sequence of UTF-16 encoded code points, as described in 6.1.4.
     // It behaves in exactly the same way as String.prototype.toLowerCase, except that the String is mapped using the toUppercase algorithm of the Unicode Default Case Conversion.
-    auto string = TRY(utf8_string_from(vm));
-    auto uppercase = MUST(string.to_uppercase());
+    auto string = TRY(primitive_string_from(vm));
+    auto uppercase = string->utf16_string().to_uppercase();
     return PrimitiveString::create(vm, move(uppercase));
 }
 
@@ -1479,23 +1474,23 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::to_well_formed)
 }
 
 // 22.1.3.32.1 TrimString ( string, where ), https://tc39.es/ecma262/#sec-trimstring
-ThrowCompletionOr<String> trim_string(VM& vm, Value input_value, TrimMode where)
+ThrowCompletionOr<Utf16String> trim_string(VM& vm, Value input_value, TrimMode where)
 {
     // 1. Let str be ? RequireObjectCoercible(string).
     auto input_string = TRY(require_object_coercible(vm, input_value));
 
     // 2. Let S be ? ToString(str).
-    auto string = TRY(input_string.to_string(vm));
+    auto string = TRY(input_string.to_utf16_string(vm));
 
     // 3. If where is start, let T be the String value that is a copy of S with leading white space removed.
     // 4. Else if where is end, let T be the String value that is a copy of S with trailing white space removed.
     // 5. Else,
     // a. Assert: where is start+end.
     // b. Let T be the String value that is a copy of S with both leading and trailing white space removed.
-    auto trimmed_string = Utf8View(string).trim(whitespace_characters, where).as_string();
+    auto trimmed_string = string.trim(whitespace_characters, where);
 
     // 6. Return T.
-    return MUST(String::from_utf8(trimmed_string));
+    return trimmed_string;
 }
 
 // 22.1.3.32 String.prototype.trim ( ), https://tc39.es/ecma262/#sec-string.prototype.trim
@@ -1537,7 +1532,7 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::symbol_iterator)
     auto this_object = TRY(require_object_coercible(vm, vm.this_value()));
 
     // 2. Let s be ? ToString(O).
-    auto string = TRY(this_object.to_string(vm));
+    auto string = TRY(this_object.to_utf16_string(vm));
 
     // 3. Let closure be a new Abstract Closure with no parameters that captures s and performs the following steps when called:
     //     ...
@@ -1579,7 +1574,7 @@ JS_DEFINE_NATIVE_FUNCTION(StringPrototype::substr)
     auto int_end = min((i32)(int_start + int_length), size);
 
     if (int_start >= int_end)
-        return PrimitiveString::create(vm, String {});
+        return PrimitiveString::create(vm, Utf16String {});
 
     // 11. Return the substring of S from intStart to intEnd.
     return PrimitiveString::create(vm, *string, int_start, int_end - int_start);
@@ -1605,7 +1600,7 @@ static ThrowCompletionOr<Value> create_html(VM& vm, Value string, StringView tag
         auto value_string = TRY(value.to_utf16_string(vm));
 
         // b. Let escapedV be the String value that is the same as V except that each occurrence of the code unit 0x0022 (QUOTATION MARK) in V has been replaced with the six code unit sequence "&quot;".
-        auto escaped_value_string = value_string.replace("\""sv, "&quot;"sv, ReplaceMode::All);
+        auto escaped_value_string = value_string.replace(u'"', "&quot;"sv, ReplaceMode::All);
 
         // c. Set p1 to the string-concatenation of:
         // - p1
