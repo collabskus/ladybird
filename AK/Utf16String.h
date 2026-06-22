@@ -16,6 +16,7 @@
 #include <AK/Traits.h>
 #include <AK/UnicodeUtils.h>
 #include <AK/Utf16StringBase.h>
+#include <AK/Utf16StringBuilder.h>
 #include <AK/Utf16StringData.h>
 #include <AK/Utf16View.h>
 #include <AK/Utf8View.h>
@@ -113,12 +114,12 @@ public:
     template<typename... Parameters>
     ALWAYS_INLINE static Utf16String formatted(CheckedFormatString<Parameters...>&& format, Parameters const&... parameters)
     {
-        StringBuilder builder(StringBuilder::Mode::UTF16);
+        Utf16StringBuilder builder;
 
         VariadicFormatParams<AllowDebugOnlyFormatters::No, Parameters...> variadic_format_parameters { parameters... };
         MUST(vformat(builder, format.view(), variadic_format_parameters));
 
-        return builder.to_utf16_string();
+        return builder.to_string();
     }
 
     template<Integral T>
@@ -133,10 +134,16 @@ public:
     template<class SeparatorType, class CollectionType>
     ALWAYS_INLINE static Utf16String join(SeparatorType const& separator, CollectionType const& collection, StringView format = "{}"sv)
     {
-        StringBuilder builder(StringBuilder::Mode::UTF16);
-        builder.join(separator, collection, format);
+        Utf16StringBuilder builder;
+        bool first = true;
+        for (auto& item : collection) {
+            if (!first)
+                builder.appendff("{}", separator);
+            builder.appendff(format, item);
+            first = false;
+        }
 
-        return builder.to_utf16_string();
+        return builder.to_string();
     }
 
     static Utf16String repeated(u32 code_point, size_t count);
@@ -229,7 +236,7 @@ public:
 
     ALWAYS_INLINE Utf16String escape_html_entities() const { return utf16_view().escape_html_entities(); }
 
-    static Utf16String from_string_builder(Badge<StringBuilder>, StringBuilder& builder);
+    static Utf16String from_string_builder(Badge<Utf16StringBuilder>, Utf16StringBuilder& builder);
     static ErrorOr<Utf16String> from_ipc_stream(Stream&, size_t length_in_code_units, bool is_ascii);
 
     constexpr Utf16String(Badge<Optional<Utf16String>>, nullptr_t)
