@@ -342656,6 +342656,7 @@ FILE: Libraries/LibTextCodec/Rust/src/lib.rs
  */
 
 use encoding_rs::CoderResult;
+use encoding_rs::DecoderResult;
 use encoding_rs::EncoderResult;
 use encoding_rs::Encoding;
 use std::ffi::c_void;
@@ -342838,15 +342839,30 @@ pub unsafe extern "C" fn textcodec_rust_streaming_decoder_decode_to_utf8(
                 return false;
             };
             let decoder = &mut *decoder;
-            let Some(output_capacity) = decoder.decoder.max_utf8_buffer_length(input.len()) else {
-                return false;
-            };
-            let mut output = String::with_capacity(output_capacity);
+            let mut output = String::with_capacity(if fatal {
+                let Some(output_capacity) = decoder.decoder.max_utf8_buffer_length_without_replacement(input.len())
+                else {
+                    return false;
+                };
+                output_capacity
+            } else {
+                let Some(output_capacity) = decoder.decoder.max_utf8_buffer_length(input.len()) else {
+                    return false;
+                };
+                output_capacity
+            });
 
-            let (result, _, had_errors) = decoder.decoder.decode_to_string(input, &mut output, last);
-            if fatal && had_errors {
-                return false;
+            if fatal {
+                let (result, _) = decoder
+                    .decoder
+                    .decode_to_string_without_replacement(input, &mut output, last);
+                if !output.is_empty() {
+                    on_bytes(ctx, output.as_ptr(), output.len());
+                }
+                return matches!(result, DecoderResult::InputEmpty);
             }
+
+            let (result, _, _) = decoder.decoder.decode_to_string(input, &mut output, last);
             if !output.is_empty() {
                 on_bytes(ctx, output.as_ptr(), output.len());
             }
@@ -600530,7 +600546,10 @@ FILE: Libraries/LibWeb/Encoding/TextDecoder.cpp
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/ByteBuffer.h>
 #include <AK/FlyString.h>
+#include <AK/StringBuilder.h>
+#include <AK/Variant.h>
 #include <LibJS/Runtime/TypedArray.h>
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/Bindings/TextDecoder.h>
@@ -600565,17 +600584,13 @@ WebIDL::ExceptionOr<GC::Ref<TextDecoder>> TextDecoder::construct_impl(JS::Realm&
     // 5. Set this’s ignore BOM to options["ignoreBOM"].
     auto ignore_bom = options.ignore_bom;
 
-    // NOTE: This should happen in decode(), but we don't support streaming yet and share decoders across calls.
-    auto decoder = TextCodec::decoder_for_exact_name(encoding.value());
-    VERIFY(decoder.has_value());
-
-    return realm.create<TextDecoder>(realm, *decoder, lowercase_encoding_name, error_mode, ignore_bom);
+    return realm.create<TextDecoder>(realm, lowercase_encoding_name, error_mode, ignore_bom);
 }
 
 // https://encoding.spec.whatwg.org/#dom-textdecoder
-TextDecoder::TextDecoder(JS::Realm& realm, TextCodec::Decoder& decoder, FlyString encoding, TextCodec::ErrorMode error_mode, bool ignore_bom)
+TextDecoder::TextDecoder(JS::Realm& realm, FlyString encoding, TextCodec::ErrorMode error_mode, bool ignore_bom)
     : PlatformObject(realm)
-    , TextDecoderCommonMixin(decoder, move(encoding), error_mode, ignore_bom)
+    , TextDecoderCommonMixin(move(encoding), error_mode, ignore_bom)
 {
 }
 
@@ -600588,25 +600603,71 @@ void TextDecoder::initialize(JS::Realm& realm)
 }
 
 // https://encoding.spec.whatwg.org/#dom-textdecoder-decode
-WebIDL::ExceptionOr<String> TextDecoder::decode(Optional<WebIDL::BufferSourceVariant> input, Optional<Bindings::TextDecodeOptions> const&) const
+WebIDL::ExceptionOr<String> TextDecoder::decode(Optional<WebIDL::BufferSourceVariant> input, Bindings::TextDecodeOptions const& options)
 {
-    auto ignore_bom = m_ignore_bom ? TextCodec::IgnoreBOM::Yes : TextCodec::IgnoreBOM::No;
-    if (!input.has_value()) {
-        auto result = m_decoder.to_utf8({}, ignore_bom, m_error_mode);
-        if (result.is_error() && result.error().code() != ENOMEM)
-            return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Decoding failed"sv };
-        return TRY_OR_THROW_OOM(vm(), move(result));
+    // 1. If this’s do not flush is false, then set this’s decoder to a new instance of this’s encoding’s decoder, this’s
+    //    I/O queue to the I/O queue of bytes « end-of-queue », and this’s BOM seen to false.
+    if (!m_do_not_flush)
+        set_decoder_to_new_instance_of_encoding_decoder();
+    VERIFY(m_decoder);
+
+    // 2. Set this’s do not flush to options["stream"].
+    m_do_not_flush = options.stream;
+
+    Optional<ByteBuffer> input_copy;
+
+    // 3. If input is given, then push a copy of input to this’s I/O queue.
+    // NOTE: Implementations are strongly encouraged to use an implementation strategy that avoids this copy. When doing
+    //       so they will have to make sure that changes to input do not affect future calls to decode().
+    // WARNING: The memory exposed by SharedArrayBuffer objects does not adhere to data race freedom properties required
+    //          by the memory model of programming languages typically used for implementations. When implementing, take
+    //          care to use the appropriate facilities when accessing memory exposed by SharedArrayBuffer objects.
+    // FIXME: Safely avoid this copy.
+    if (input.has_value()) {
+        auto data_buffer_or_error = WebIDL::get_buffer_source_copy(*input);
+        if (data_buffer_or_error.is_error())
+            return WebIDL::OperationError::create(realm(), "Failed to copy bytes from ArrayBuffer"_utf16);
+        input_copy = data_buffer_or_error.release_value();
     }
 
-    // FIXME: Implement the streaming stuff.
-    auto data_buffer_or_error = WebIDL::get_buffer_source_copy(*input);
-    if (data_buffer_or_error.is_error())
-        return WebIDL::OperationError::create(realm(), "Failed to copy bytes from ArrayBuffer"_utf16);
-    auto& data_buffer = data_buffer_or_error.value();
-    auto result = m_decoder.to_utf8({ data_buffer.data(), data_buffer.size() }, ignore_bom, m_error_mode);
-    if (result.is_error() && result.error().code() != ENOMEM)
-        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Decoding failed"sv };
-    return TRY_OR_THROW_OOM(vm(), move(result));
+    // 4. Let output be the I/O queue of scalar values « end-of-queue ».
+    TextDecoderOutputQueue output;
+
+    // 5. While true:
+    bool did_read_input = false;
+    auto read_item = [&]() -> Variant<ReadonlyBytes, EndOfQueue> {
+        if (did_read_input || !input_copy.has_value())
+            return EndOfQueue {};
+        did_read_input = true;
+        return ReadonlyBytes { input_copy->data(), input_copy->size() };
+    };
+
+    while (true) {
+        // 1. Let item be the result of reading from this’s I/O queue.
+        auto item = read_item();
+
+        // 2. If item is end-of-queue and this’s do not flush is true, then return the result of running serialize I/O
+        //    queue with this and output.
+        if (item.has<EndOfQueue>() && m_do_not_flush) {
+            return serialize_io_queue(vm(), output);
+        }
+        // 3. Otherwise:
+        else {
+            //  1. Let result be the result of processing an item with item, this’s decoder, this’s I/O queue, output,
+            //      and this’s error mode.
+            auto result = item.visit([&](auto item) {
+                return process_an_item(vm(), item, output);
+            });
+
+            // 2. If result is finished, then return the result of running serialize I/O queue with this and output.
+            if (!result.is_error() && item.has<EndOfQueue>())
+                return serialize_io_queue(vm(), output);
+
+            // 3. If result is error, throw a TypeError.
+            if (result.is_error())
+                return result.release_error();
+        }
+    }
 }
 
 }
@@ -600645,12 +600706,16 @@ public:
 
     virtual ~TextDecoder() override;
 
-    WebIDL::ExceptionOr<String> decode(Optional<WebIDL::BufferSourceVariant>, Optional<Bindings::TextDecodeOptions> const& options = {}) const;
+    WebIDL::ExceptionOr<String> decode(Optional<WebIDL::BufferSourceVariant>, Bindings::TextDecodeOptions const&);
 
 private:
-    TextDecoder(JS::Realm&, TextCodec::Decoder&, FlyString encoding, TextCodec::ErrorMode error_mode, bool ignore_bom);
+    TextDecoder(JS::Realm&, FlyString encoding, TextCodec::ErrorMode error_mode, bool ignore_bom);
 
     virtual void initialize(JS::Realm&) override;
+
+    // https://encoding.spec.whatwg.org/#textdecoder-do-not-flush-flag
+    // A TextDecoder object has an associated do not flush, which is a boolean, initially false.
+    bool m_do_not_flush { false };
 };
 
 }
@@ -600684,19 +600749,77 @@ FILE: Libraries/LibWeb/Encoding/TextDecoderCommon.cpp
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibWeb/Bindings/ExceptionOrUtils.h>
 #include <LibWeb/Encoding/TextDecoderCommon.h>
 
 namespace Web::Encoding {
 
-TextDecoderCommonMixin::TextDecoderCommonMixin(TextCodec::Decoder& decoder, FlyString encoding, TextCodec::ErrorMode error_mode, bool ignore_bom)
-    : m_decoder(decoder)
-    , m_encoding(move(encoding))
+ErrorOr<void> TextDecoderOutputQueue::push(String output)
+{
+    if (output.is_empty())
+        return {};
+
+    if (m_has_builder)
+        return m_builder.try_append(output.bytes_as_string_view());
+
+    if (!m_single_output.has_value()) {
+        m_single_output = move(output);
+        return {};
+    }
+
+    m_has_builder = true;
+    TRY(m_builder.try_append(m_single_output->bytes_as_string_view()));
+    m_single_output.clear();
+    return m_builder.try_append(output.bytes_as_string_view());
+}
+
+ErrorOr<String> TextDecoderOutputQueue::serialize()
+{
+    if (m_has_builder)
+        return m_builder.to_string();
+    if (m_single_output.has_value())
+        return m_single_output.release_value();
+    return String {};
+}
+
+TextDecoderCommonMixin::TextDecoderCommonMixin(FlyString encoding, TextCodec::ErrorMode error_mode, bool ignore_bom)
+    : m_encoding(move(encoding))
     , m_error_mode(error_mode)
     , m_ignore_bom(ignore_bom)
 {
 }
 
-TextDecoderCommonMixin::~TextDecoderCommonMixin() = default;
+void TextDecoderCommonMixin::set_decoder_to_new_instance_of_encoding_decoder()
+{
+    m_decoder = make<TextCodec::StreamingDecoder>(m_encoding, m_ignore_bom ? TextCodec::IgnoreBOM::Yes : TextCodec::IgnoreBOM::No, m_error_mode);
+}
+
+static WebIDL::ExceptionOr<void> append_decoded_output(JS::VM& vm, TextDecoderOutputQueue& output, ErrorOr<String> decoded_or_error)
+{
+    if (decoded_or_error.is_error() && decoded_or_error.error().code() != ENOMEM)
+        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Decoding failed"sv };
+
+    auto decoded = TRY_OR_THROW_OOM(vm, move(decoded_or_error));
+    TRY_OR_THROW_OOM(vm, output.push(move(decoded)));
+    return {};
+}
+
+WebIDL::ExceptionOr<void> TextDecoderCommonMixin::process_an_item(JS::VM& vm, ReadonlyBytes item, TextDecoderOutputQueue& output)
+{
+    VERIFY(m_decoder);
+    return append_decoded_output(vm, output, m_decoder->to_utf8(item));
+}
+
+WebIDL::ExceptionOr<void> TextDecoderCommonMixin::process_an_item(JS::VM& vm, EndOfQueue, TextDecoderOutputQueue& output)
+{
+    VERIFY(m_decoder);
+    return append_decoded_output(vm, output, m_decoder->finish());
+}
+
+WebIDL::ExceptionOr<String> TextDecoderCommonMixin::serialize_io_queue(JS::VM& vm, TextDecoderOutputQueue& output)
+{
+    return TRY_OR_THROW_OOM(vm, output.serialize());
+}
 
 }
 
@@ -600710,15 +600833,30 @@ FILE: Libraries/LibWeb/Encoding/TextDecoderCommon.h
 #pragma once
 
 #include <AK/FlyString.h>
+#include <AK/OwnPtr.h>
+#include <LibJS/Forward.h>
 #include <LibTextCodec/Decoder.h>
+#include <LibWeb/WebIDL/ExceptionOr.h>
 
 namespace Web::Encoding {
+
+struct EndOfQueue {
+};
+
+class TextDecoderOutputQueue {
+public:
+    ErrorOr<void> push(String);
+    ErrorOr<String> serialize();
+
+private:
+    Optional<String> m_single_output;
+    StringBuilder m_builder;
+    bool m_has_builder { false };
+};
 
 // https://encoding.spec.whatwg.org/#textdecodercommon
 class TextDecoderCommonMixin {
 public:
-    virtual ~TextDecoderCommonMixin();
-
     // https://encoding.spec.whatwg.org/#dom-textdecoder-encoding
     FlyString const& encoding() const { return m_encoding; }
 
@@ -600729,10 +600867,15 @@ public:
     bool ignore_bom() const { return m_ignore_bom; }
 
 protected:
-    TextDecoderCommonMixin(TextCodec::Decoder& decoder, FlyString encoding, TextCodec::ErrorMode error_mode, bool ignore_bom);
+    TextDecoderCommonMixin(FlyString encoding, TextCodec::ErrorMode error_mode, bool ignore_bom);
+
+    void set_decoder_to_new_instance_of_encoding_decoder();
+    WebIDL::ExceptionOr<void> process_an_item(JS::VM&, ReadonlyBytes item, TextDecoderOutputQueue& output);
+    WebIDL::ExceptionOr<void> process_an_item(JS::VM&, EndOfQueue, TextDecoderOutputQueue& output);
+    WebIDL::ExceptionOr<String> serialize_io_queue(JS::VM&, TextDecoderOutputQueue& output);
 
     // https://encoding.spec.whatwg.org/#textdecodercommon-decoder
-    TextCodec::Decoder& m_decoder;
+    OwnPtr<TextCodec::StreamingDecoder> m_decoder;
 
     // https://encoding.spec.whatwg.org/#textdecoder-encoding
     FlyString m_encoding;
@@ -600761,6 +600904,7 @@ FILE: Libraries/LibWeb/Encoding/TextDecoderStream.cpp
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Variant.h>
 #include <LibJS/Runtime/ArrayBuffer.h>
 #include <LibJS/Runtime/DataView.h>
 #include <LibJS/Runtime/PrimitiveString.h>
@@ -600801,17 +600945,14 @@ WebIDL::ExceptionOr<GC::Ref<TextDecoderStream>> TextDecoderStream::construct_imp
     // 5. Set this’s ignore BOM to options["ignoreBOM"].
     auto ignore_bom = options.ignore_bom;
 
-    // 6. Set this’s decoder to a new instance of this’s encoding’s decoder, and set this’s I/O queue to a new I/O queue.
-    auto decoder = TextCodec::decoder_for_exact_name(encoding.value());
-    VERIFY(decoder.has_value());
-
     // NB: Steps 7-11 — we create the TransformStream and the TextDecoderStream first so that we can refer to the
     //     stream from the transform/flush algorithms.
 
     // 9. Let transformStream be a new TransformStream.
     auto transform_stream = realm.create<Streams::TransformStream>(realm);
 
-    auto stream = realm.create<TextDecoderStream>(realm, transform_stream, *decoder, lowercase_encoding_name, error_mode, ignore_bom);
+    // 6. Set this’s decoder to a new instance of this’s encoding’s decoder, and set this’s I/O queue to a new I/O queue.
+    auto stream = realm.create<TextDecoderStream>(realm, transform_stream, lowercase_encoding_name, error_mode, ignore_bom);
 
     // 7. Let transformAlgorithm be an algorithm which takes a chunk argument and runs the decode and enqueue a chunk
     //    algorithm with this and chunk.
@@ -600841,15 +600982,12 @@ WebIDL::ExceptionOr<GC::Ref<TextDecoderStream>> TextDecoderStream::construct_imp
     return stream;
 }
 
-TextDecoderStream::TextDecoderStream(JS::Realm& realm, GC::Ref<Streams::TransformStream> transform, TextCodec::Decoder& decoder, FlyString encoding, TextCodec::ErrorMode error_mode, bool ignore_bom)
+TextDecoderStream::TextDecoderStream(JS::Realm& realm, GC::Ref<Streams::TransformStream> transform, FlyString encoding, TextCodec::ErrorMode error_mode, bool ignore_bom)
     : Bindings::PlatformObject(realm)
     , Streams::GenericTransformStreamMixin(transform)
-    , TextDecoderCommonMixin(decoder, move(encoding), error_mode, ignore_bom)
-    , m_streaming_decoder(make<TextCodec::StreamingDecoder>(
-          m_encoding,
-          m_ignore_bom ? TextCodec::IgnoreBOM::Yes : TextCodec::IgnoreBOM::No,
-          m_error_mode))
+    , TextDecoderCommonMixin(move(encoding), error_mode, ignore_bom)
 {
+    set_decoder_to_new_instance_of_encoding_decoder();
 }
 
 TextDecoderStream::~TextDecoderStream() = default;
@@ -600877,30 +601015,80 @@ WebIDL::ExceptionOr<void> TextDecoderStream::decode_and_enqueue_chunk(JS::Value 
         return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Chunk is not a BufferSource"sv };
 
     // 2. Push a copy of bufferSource to decoder's I/O queue.
+    // WARNING: See the warning for SharedArrayBuffer objects above.
     auto buffer_or_error = WebIDL::get_buffer_source_copy(chunk.as_object());
     if (buffer_or_error.is_error())
         return WebIDL::OperationError::create(realm, "Failed to copy bytes from BufferSource"_utf16);
-    auto buffer = buffer_or_error.release_value();
 
-    auto decoded_or_error = m_streaming_decoder->to_utf8(buffer.bytes());
-    if (decoded_or_error.is_error() && decoded_or_error.error().code() != ENOMEM)
-        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Decoding failed"sv };
-    auto decoded = TRY_OR_THROW_OOM(vm, move(decoded_or_error));
+    auto const input_copy = buffer_or_error.release_value();
 
-    // 3-4. Run "processing an item" until the input is exhausted, accumulating the output, then enqueue any non-empty
-    //      result. If processing returns error, throw a TypeError.
-    return enqueue_decoded_output(decoded);
+    // 3. Let output be the I/O queue of scalar values « end-of-queue ».
+    TextDecoderOutputQueue output;
+
+    // 4. While true:
+    bool did_read_bytes = false;
+    auto read_item = [&]() -> Variant<ReadonlyBytes, EndOfQueue> {
+        if (did_read_bytes)
+            return EndOfQueue {};
+        did_read_bytes = true;
+        return input_copy.bytes();
+    };
+
+    while (true) {
+        // 1. Let item be the result of reading from decoder’s I/O queue.
+        auto item = read_item();
+
+        // 2. If item is end-of-queue:
+        if (item.has<EndOfQueue>()) {
+            // 1. Let outputChunk be the result of running serialize I/O queue with decoder and output.
+            auto output_chunk = TRY(serialize_io_queue(vm, output));
+
+            // 2. If outputChunk is not the empty string, then enqueue outputChunk in decoder’s transform.
+            TRY(enqueue_decoded_output(output_chunk));
+
+            // 3. Return.
+            return {};
+        }
+
+        // 3. Let result be the result of processing an item with item, decoder’s decoder, decoder’s I/O queue, output, and decoder’s
+        //    error mode.
+        auto result = process_an_item(vm, item.get<ReadonlyBytes>(), output);
+
+        // 4. If result is error, then throw a TypeError.
+        if (result.is_error())
+            return result.release_error();
+    }
 }
 
 // https://encoding.spec.whatwg.org/#flush-and-enqueue
 WebIDL::ExceptionOr<void> TextDecoderStream::flush_and_enqueue()
 {
-    // 1-3. Drain decoder's I/O queue and run "processing an item" to completion.
-    auto decoded_or_error = m_streaming_decoder->finish();
-    if (decoded_or_error.is_error() && decoded_or_error.error().code() != ENOMEM)
-        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Decoding failed"sv };
-    auto decoded = TRY_OR_THROW_OOM(vm(), move(decoded_or_error));
-    return enqueue_decoded_output(decoded);
+    // 1. Let output be the I/O queue of scalar values « end-of-queue ».
+    TextDecoderOutputQueue output;
+
+    // 2. While true:
+    // NB: TextCodec::StreamingDecoder keeps any cross-chunk decoder state internally. Since flushing reads only
+    //     end-of-queue from the decoder's I/O queue, we write out that single read instead of materializing a queue and
+    //     looping over it.
+    // 1. Let item be the result of reading from this’s I/O queue.
+    auto item = EndOfQueue {};
+
+    // 2. Let result be the result of processing an item with item, this’s decoder, decoder’s I/O queue, output, and decoder’s
+    //    error mode.
+    auto result = process_an_item(vm(), item, output);
+
+    // 3. If result is finished:
+    //     1. Let outputChunk be the result of running serialize I/O queue with decoder and output.
+    //     2. If outputChunk is not the empty string, then enqueue outputChunk in decoder’s transform.
+    //     3. Return.
+    if (!result.is_error()) {
+        auto output_chunk = TRY(serialize_io_queue(vm(), output));
+        TRY(enqueue_decoded_output(output_chunk));
+        return {};
+    }
+
+    // 4. Otherwise, if result is error, throw a TypeError.
+    return result.release_error();
 }
 
 WebIDL::ExceptionOr<void> TextDecoderStream::enqueue_decoded_output(String const& decoded)
@@ -600947,7 +601135,7 @@ public:
     virtual ~TextDecoderStream() override;
 
 private:
-    TextDecoderStream(JS::Realm&, GC::Ref<Streams::TransformStream>, TextCodec::Decoder&, FlyString encoding, TextCodec::ErrorMode, bool ignore_bom);
+    TextDecoderStream(JS::Realm&, GC::Ref<Streams::TransformStream>, FlyString encoding, TextCodec::ErrorMode, bool ignore_bom);
 
     virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Cell::Visitor&) override;
@@ -600956,9 +601144,6 @@ private:
     WebIDL::ExceptionOr<void> flush_and_enqueue();
 
     WebIDL::ExceptionOr<void> enqueue_decoded_output(String const&);
-
-    // https://encoding.spec.whatwg.org/#textdecodercommon-i-o-queue
-    NonnullOwnPtr<TextCodec::StreamingDecoder> m_streaming_decoder;
 };
 
 }
@@ -660764,153 +660949,3 @@ public:
     virtual HTMLElement& text_control_to_html_element() override { return *this; }
     virtual void did_edit_text_node(FlyString const& input_type, Optional<Utf16String> const& data) override;
     virtual GC::Ptr<DOM::Text> form_associated_element_to_text_node() override { return m_text_node; }
-    virtual GC::Ptr<DOM::Element> text_control_scroll_container() override { return m_inner_text_element; }
-
-    // https://html.spec.whatwg.org/multipage/input.html#has-a-periodic-domain/
-    bool has_periodic_domain() const { return type_state() == HTMLInputElement::TypeAttributeState::Time; }
-    // https://html.spec.whatwg.org/multipage/input.html#has-a-reversed-range
-    bool has_reversed_range() const;
-
-    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#definitions
-    virtual bool suffering_from_being_missing() const override;
-    virtual bool suffering_from_a_type_mismatch() const override;
-    virtual bool suffering_from_a_pattern_mismatch() const override;
-    virtual bool suffering_from_an_underflow() const override;
-    virtual bool suffering_from_an_overflow() const override;
-    virtual bool suffering_from_a_step_mismatch() const override;
-    virtual bool suffering_from_bad_input() const override;
-
-    virtual bool is_mutable() const override;
-    virtual bool uses_button_layout() const override;
-    bool is_allowed_to_be_readonly() const;
-
-private:
-    HTMLInputElement(DOM::Document&, DOM::QualifiedName);
-
-    void type_attribute_changed(TypeAttributeState old_state, TypeAttributeState new_state);
-    virtual void computed_properties_changed() override;
-
-    virtual bool is_presentational_hint(FlyString const&) const override;
-    virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
-    virtual EventResult handle_return_key(FlyString const& ui_input_type) override;
-
-    // ^DOM::Node
-    virtual bool is_html_input_element() const final { return true; }
-
-    // ^DOM::EventTarget
-    virtual void did_lose_focus() override;
-    virtual void did_receive_focus() override;
-    virtual void legacy_pre_activation_behavior() override;
-    virtual void legacy_cancelled_activation_behavior() override;
-    virtual void legacy_cancelled_activation_behavior_was_not_called() override;
-
-    // ^DOM::Element
-    virtual i32 default_tab_index_value() const override;
-
-    // https://html.spec.whatwg.org/multipage/input.html#image-button-state-(type=image):dimension-attributes
-    virtual bool supports_dimension_attributes() const override { return type_state() == TypeAttributeState::ImageButton; }
-
-    // ^Layout::ImageProvider
-    virtual GC::Ptr<HTML::DecodedImageData> decoded_image_data() const override { return image_data(); }
-
-    virtual void initialize(JS::Realm&) override;
-    virtual void visit_edges(Cell::Visitor&) override;
-    virtual void adopted_from(DOM::Document&) override;
-
-    Optional<double> convert_time_string_to_number(StringView input) const;
-    Optional<double> convert_string_to_number(StringView input) const;
-    Optional<double> convert_string_to_number(Utf16String const& input) const;
-    Utf16String convert_number_to_string(double input) const;
-
-    WebIDL::ExceptionOr<GC::Ptr<JS::Date>> convert_string_to_date(StringView input) const;
-    WebIDL::ExceptionOr<GC::Ptr<JS::Date>> convert_string_to_date(Utf16String const& input) const;
-    Utf16String convert_date_to_string(GC::Ref<JS::Date> input) const;
-
-    Optional<double> min() const;
-    Optional<double> max() const;
-    double default_step() const;
-    double step_scale_factor() const;
-    Optional<double> allowed_value_step() const;
-    double step_base() const;
-    WebIDL::ExceptionOr<void> step_up_or_down(bool is_down, WebIDL::Long n);
-
-    static TypeAttributeState parse_type_attribute(StringView);
-
-    Utf16String button_label() const;
-
-    void create_shadow_tree_if_needed();
-    void update_shadow_tree();
-    void create_button_input_shadow_tree();
-    void create_text_input_shadow_tree();
-    void create_color_input_shadow_tree();
-    void create_file_input_shadow_tree();
-    void create_range_input_shadow_tree();
-    WebIDL::ExceptionOr<void> run_input_activation_behavior(DOM::Event const&);
-    void set_checked_within_group();
-
-    void handle_maxlength_attribute();
-    WebIDL::ExceptionOr<void> handle_src_attribute(String const& value);
-
-    void user_interaction_did_change_input_value(FlyString const& input_type = {}, Optional<Utf16String> const& data = {});
-
-    // https://html.spec.whatwg.org/multipage/input.html#value-sanitization-algorithm
-    Utf16String value_sanitization_algorithm(Utf16String const&) const;
-
-    enum class ValueAttributeMode {
-        Value,
-        Default,
-        DefaultOn,
-        Filename,
-    };
-    static ValueAttributeMode value_attribute_mode_for_type_state(TypeAttributeState);
-    ValueAttributeMode value_attribute_mode() const;
-
-    void update_placeholder_visibility();
-    GC::Ptr<DOM::Element> m_placeholder_element;
-    GC::Ptr<DOM::Text> m_placeholder_text_node;
-
-    void update_button_input_shadow_tree();
-
-    void update_text_input_shadow_tree();
-    GC::Ptr<DOM::Element> m_inner_text_element;
-    GC::Ptr<DOM::Text> m_text_node;
-    bool m_checked { false };
-    GC::Ptr<DOM::Element> m_up_button_element;
-    GC::Ptr<DOM::Element> m_down_button_element;
-
-    void update_color_well_element();
-    GC::Ptr<DOM::Element> m_color_well_element;
-
-    void update_file_input_shadow_tree();
-    GC::Ptr<DOM::Element> m_file_button;
-    GC::Ptr<DOM::Element> m_file_label;
-
-    void update_slider_shadow_tree_elements();
-    GC::Ptr<DOM::Element> m_slider_runnable_track;
-    GC::Ptr<DOM::Element> m_slider_progress_element;
-    GC::Ptr<DOM::Element> m_slider_thumb;
-
-    GC::Ptr<DecodedImageData> image_data() const;
-    GC::Ptr<SharedResourceRequest> m_resource_request;
-    SelectedCoordinate m_selected_coordinate;
-
-    Optional<regex::ECMAScriptRegex> compiled_pattern_regular_expression() const;
-
-    Optional<GC::Ref<HTMLDataListElement const>> suggestions_source_element() const;
-
-    Optional<DOM::DocumentLoadEventDelayer> m_load_event_delayer;
-
-    // https://html.spec.whatwg.org/multipage/input.html#dom-input-indeterminate
-    bool m_indeterminate { false };
-
-    // https://html.spec.whatwg.org/multipage/input.html#concept-input-checked-dirty-flag
-    bool m_dirty_checkedness { false };
-
-    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-fe-dirty
-    bool m_dirty_value { false };
-
-    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#user-validity
-    bool m_user_validity { false };
-
-    // https://html.spec.whatwg.org/multipage/input.html#the-input-element:legacy-pre-activation-behavior
-    bool m_before_legacy_pre_activation_behavior_checked { false };
