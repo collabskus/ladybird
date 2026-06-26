@@ -140799,6 +140799,19 @@ FILE: Libraries/LibIPC/TransportSocket.cpp
 
 namespace IPC {
 
+Atomic<u32> TransportSocket::s_eof_drain_window_for_test_ms { 0 };
+Atomic<bool> TransportSocket::s_skip_inloop_read_for_test { false };
+
+void TransportSocket::set_eof_drain_window_for_test(u32 milliseconds)
+{
+    s_eof_drain_window_for_test_ms.store(milliseconds, AK::MemoryOrder::memory_order_relaxed);
+}
+
+void TransportSocket::set_skip_inloop_read_for_test(bool skip)
+{
+    s_skip_inloop_read_for_test.store(skip, AK::MemoryOrder::memory_order_relaxed);
+}
+
 ErrorOr<NonnullOwnPtr<TransportSocket>> TransportSocket::from_socket(NonnullOwnPtr<Core::LocalSocket> socket)
 {
     return make<TransportSocket>(move(socket));
@@ -140954,7 +140967,7 @@ intptr_t TransportSocket::io_thread_loop()
             (void)Core::System::read(m_wakeup_io_thread_read_fd->value(), { buf, sizeof(buf) });
         }
 
-        if (pollfds[0].revents & POLLIN)
+        if ((pollfds[0].revents & POLLIN) && !s_skip_inloop_read_for_test.load(AK::MemoryOrder::memory_order_relaxed))
             read_incoming_messages();
 
         if (pollfds[0].revents & POLLHUP) {
@@ -140981,7 +140994,15 @@ intptr_t TransportSocket::io_thread_loop()
 
     VERIFY(m_io_thread_state == IOThreadState::Stopped);
     if (!m_is_being_transferred.load(AK::MemoryOrder::memory_order_acquire)) {
+        // The loop may have stopped on a send-side failure (the peer closed its end while we still had data queued to
+        // send — so transfer_data() returned SocketClosed) without reading a final inbound message left buffered on the
+        // socket. Drain it before publishing EOF — so a message that arrived just before teardown (e.g., a cross-realm
+        // transform stream's "error") is actually delivered — rather than discarded.
+        read_incoming_messages();
+
+        Sync::MutexLocker locker(m_incoming_mutex);
         m_peer_eof = true;
+        m_incoming_eof = true;
         m_incoming_cv.broadcast();
         notify_read_available();
     }
@@ -141194,6 +141215,13 @@ void TransportSocket::read_incoming_messages()
         }
     }
 
+    if (m_peer_eof) {
+        if (auto window_ms = s_eof_drain_window_for_test_ms.load(AK::MemoryOrder::memory_order_relaxed); window_ms != 0) {
+            notify_read_available();
+            (void)Core::System::sleep_ms(window_ms);
+        }
+    }
+
     Checked<u32> received_fd_count = 0;
     Checked<u32> acknowledged_fd_count = 0;
     size_t index = 0;
@@ -141293,14 +141321,15 @@ void TransportSocket::read_incoming_messages()
         m_unprocessed_bytes.clear();
     }
 
-    if (!batch.is_empty()) {
+    bool const peer_eof = m_peer_eof;
+    if (!batch.is_empty() || peer_eof) {
         Sync::MutexLocker locker(m_incoming_mutex);
-        m_incoming_messages.extend(move(batch));
-        m_incoming_cv.broadcast();
-        notify_read_available();
-    }
-
-    if (m_peer_eof) {
+        if (!batch.is_empty())
+            m_incoming_messages.extend(move(batch));
+        // Publish EOF only after the final batch is appended — under the same lock the consumer drains with — so that a
+        // consumer which observes EOF has also taken every message that arrived before it.
+        if (peer_eof)
+            m_incoming_eof = true;
         m_incoming_cv.broadcast();
         notify_read_available();
     }
@@ -141309,13 +141338,15 @@ void TransportSocket::read_incoming_messages()
 TransportSocket::ShouldShutdown TransportSocket::read_as_many_messages_as_possible_without_blocking(Function<void(Message&&)>&& callback)
 {
     Vector<NonnullOwnPtr<Message>> messages;
+    bool eof;
     {
         Sync::MutexLocker locker(m_incoming_mutex);
         messages = move(m_incoming_messages);
+        eof = m_incoming_eof;
     }
     for (auto& message : messages)
         callback(move(*message));
-    return m_peer_eof ? ShouldShutdown::Yes : ShouldShutdown::No;
+    return eof ? ShouldShutdown::Yes : ShouldShutdown::No;
 }
 
 ErrorOr<TransportHandle> TransportSocket::release_for_transfer()
@@ -141427,6 +141458,17 @@ public:
 
     ErrorOr<TransportHandle> release_for_transfer();
 
+    // Test seam: When set to a non-zero value, the IO thread wakes the consumer and then pauses for the given duration
+    // on EOF — before the messages it has just read are parsed and appended. That forces a consumer drain into the
+    // narrow window between observing EOF and the final message becoming available — which is otherwise hit only under
+    // rare timing. No-op in production.
+    static void set_eof_drain_window_for_test(u32 milliseconds);
+
+    // Test seam: When set, the IO thread skips its in-loop read on POLLIN — modelling a stop path that ends the loop
+    // without having read a message already buffered on the socket (e.g. SocketClosed from a failed send). Exercises
+    // the loop-exit drain. No-op in production.
+    static void set_skip_inloop_read_for_test(bool);
+
 private:
     enum class TransferState {
         Continue,
@@ -141465,6 +141507,12 @@ private:
     Sync::Mutex m_incoming_mutex;
     Sync::ConditionVariable m_incoming_cv { m_incoming_mutex };
     Vector<NonnullOwnPtr<Message>> m_incoming_messages;
+    // Consumer-visible EOF, guarded by m_incoming_mutex. Distinct from m_peer_eof. This is set only after the final
+    // batch of messages have been parsed and appended to m_incoming_messages under the same lock.
+    bool m_incoming_eof { false };
+
+    static Atomic<u32> s_eof_drain_window_for_test_ms;
+    static Atomic<bool> s_skip_inloop_read_for_test;
 
     RefPtr<AutoCloseFileDescriptor> m_wakeup_io_thread_read_fd;
     RefPtr<AutoCloseFileDescriptor> m_wakeup_io_thread_write_fd;
@@ -361262,80 +361310,132 @@ fn parse_opaque_host(input: &str) -> Option<Host> {
 }
 
 // https://url.spec.whatwg.org/#concept-domain-to-ascii
+#[allow(clippy::needless_late_init)]
 pub(crate) fn domain_to_ascii(domain: &str, be_strict: bool) -> Option<String> {
-    // 1. Let result be the result of running Unicode ToASCII with domain_name set to domain,
-    //     CheckHyphens set to beStrict,
-    //     CheckBidi set to true,
-    //     CheckJoiners set to true,
-    //     UseSTD3ASCIIRules set to beStrict,
-    //     Transitional_Processing set to false,
-    //     VerifyDnsLength set to beStrict,
-    //     and IgnoreInvalidPunycode set to false. [UTS46]
-    //
-    // NOTE: If beStrict is false, domain is an ASCII string, and strictly splitting domain on U+002E (.) does not
-    //       produce any item that starts with an ASCII case-insensitive match for "xn--", this step is equivalent to
-    //       ASCII lowercasing domain.
+    // 1. If beStrict is true:
+    if be_strict {
+        // 1. Let result be the result of running Unicode ToASCII with
+        //     domain_name set to domain,
+        //     CheckHyphens set to beStrict,
+        //     CheckBidi set to true,
+        //     CheckJoiners set to true,
+        //     UseSTD3ASCIIRules set to beStrict,
+        //     Transitional_Processing set to false,
+        //     VerifyDnsLength set to beStrict,
+        //     and IgnoreInvalidPunycode set to false. [UTS46]
+        let result = idna_to_ascii(
+            domain,
+            ToAsciiOptions {
+                check_hyphens: be_strict,
+                check_bidi: true,
+                check_joiners: true,
+                use_std3_ascii_rules: be_strict,
+                transitional_processing: false,
+                verify_dns_length: be_strict,
+                ignore_invalid_punycode: false,
+            },
+        );
 
-    // OPTIMIZATION: See spec note above.
-    if !be_strict && domain.is_ascii() {
-        // 3. If result is the empty string, domain-to-ASCII validation error, return failure.
-        if domain.is_empty() {
+        // 2. If result is a failure value, domain-to-ASCII validation error, return failure.
+        let Some(result) = result else {
             report_validation_error(State::Host, 0, None, "domain-to-ASCII");
             return None;
-        }
+        };
 
-        let mut slow_path = false;
-
-        for part in domain.split('.') {
-            if part.len() >= 4 && part[..4].eq_ignore_ascii_case("xn--") {
-                slow_path = true;
-                break;
-            }
-        }
-
-        if !slow_path {
-            let result = domain.to_ascii_lowercase();
-            return Some(result);
-        }
+        // 3. Return result.
+        return Some(result);
     }
 
-    // 2. If result is a failure value, domain-to-ASCII validation error, return failure.
-    let result = idna_to_ascii(
-        domain,
-        ToAsciiOptions {
-            check_hyphens: be_strict,
-            check_bidi: true,
-            check_joiners: true,
-            use_std3_ascii_rules: be_strict,
-            transitional_processing: false,
-            verify_dns_length: be_strict,
-            ignore_invalid_punycode: false,
-        },
-    )?;
+    // 2. Let result be null.
+    let result;
 
-    // 3. If beStrict is false:
-    if !be_strict {
-        // 1. If result is the empty string, domain-to-ASCII validation error, return failure.
-        if result.is_empty() {
+    // 3. If domain is an ASCII string:
+    if domain.is_ascii() {
+        // 1. If running Unicode ToASCII with
+        //     domain_name set to domain,
+        //     CheckHyphens set to false,
+        //     CheckBidi set to true,
+        //     CheckJoiners set to true,
+        //     UseSTD3ASCIIRules set to false,
+        //     Transitional_Processing set to false,
+        //     VerifyDnsLength set to false,
+        //     and IgnoreInvalidPunycode set to false
+        //  is a failure value, domain-to-ASCII validation error. [UTS46]
+        #[cfg(feature = "debug-validation-errors")]
+        if idna_to_ascii(
+            domain,
+            ToAsciiOptions {
+                check_hyphens: false,
+                check_bidi: true,
+                check_joiners: true,
+                use_std3_ascii_rules: false,
+                transitional_processing: false,
+                verify_dns_length: false,
+                ignore_invalid_punycode: false,
+            },
+        )
+        .is_none()
+        {
+            report_validation_error(State::Host, 0, None, "domain-to-ASCII");
+        }
+
+        // 2. Set result to domain, lowercased.
+        result = domain.to_ascii_lowercase();
+
+        // NOTE: When beStrict is false and domain is an ASCII string, Unicode ToASCII failures only
+        //       result in validation errors (instead of failing the whole algorithm) due to web
+        //       compatibility. IgnoreInvalidPunycode is not sufficient on its own, as Punycode can
+        //       decode successfully yet still fail validity criteria. E.g., xn--8i7caa decodes to
+        //       ｗｗｗ, whose code points have status "mapped". [UTS46]
+    }
+    // 4. Otherwise:
+    else {
+        // 1. Set result to the result of running Unicode ToASCII with
+        //     domain_name set to domain,
+        //     CheckHyphens set to beStrict,
+        //     CheckBidi set to true,
+        //     CheckJoiners set to true,
+        //     UseSTD3ASCIIRules set to beStrict,
+        //     Transitional_Processing set to false,
+        //     VerifyDnsLength set to beStrict,
+        //     and IgnoreInvalidPunycode set to false. [UTS46]
+        let ascii_domain = idna_to_ascii(
+            domain,
+            ToAsciiOptions {
+                check_hyphens: be_strict,
+                check_bidi: true,
+                check_joiners: true,
+                use_std3_ascii_rules: be_strict,
+                transitional_processing: false,
+                verify_dns_length: be_strict,
+                ignore_invalid_punycode: false,
+            },
+        );
+
+        // 2. If result is a failure value, domain-to-ASCII validation error, return failure.
+        let Some(ascii_domain) = ascii_domain else {
             report_validation_error(State::Host, 0, None, "domain-to-ASCII");
             return None;
-        }
+        };
 
-        // 2. If result contains a forbidden domain code point, domain-invalid-code-point validation error, return failure.
-        // NOTE: Due to web compatibility and compatibility with non-DNS-based systems the forbidden domain code points
-        //       are a subset of those disallowed when UseSTD3ASCIIRules is true. See also issue #397.
-        if result.chars().any(is_forbidden_domain_code_point) {
-            report_validation_error(State::Host, 0, None, "domain-invalid-code-point");
-            return None;
-        }
+        result = ascii_domain;
+    };
+
+    // 5. If result is the empty string, domain-to-ASCII validation error, return failure.
+    if result.is_empty() {
+        report_validation_error(State::Host, 0, None, "domain-to-ASCII");
+        return None;
     }
 
-    // 4. Assert: result is not the empty string and does not contain a forbidden domain code point.
-    // NOTE: Unicode IDNA Compatibility Processing guarantees this holds when beStrict is true. [UTS46]
-    assert!(!result.is_empty());
-    assert!(!result.chars().any(is_forbidden_domain_code_point));
+    // 6. If result contains a forbidden domain code point, domain-invalid-code-point validation error, return failure.
+    // NOTE: Due to web compatibility and compatibility with non-DNS-based systems the forbidden domain code points
+    //       are a subset of those disallowed when UseSTD3ASCIIRules is true. See also issue #397.
+    if result.chars().any(is_forbidden_domain_code_point) {
+        report_validation_error(State::Host, 0, None, "domain-invalid-code-point");
+        return None;
+    }
 
-    // 5. Return result.
+    // 7. Return result.
     // NOTE: This document and the web platform at large use Unicode IDNA Compatibility Processing and not IDNA2008. For
     //       instance, ☕.example becomes xn--53h.example and not failure. [UTS46] [RFC5890]
     Some(result)
@@ -413931,6 +414031,7 @@ set(SOURCES
     CSS/CountersSet.cpp
     CSS/CounterStyle.cpp
     CSS/CounterStyleDefinition.cpp
+    CSS/CustomPropertyRegistration.cpp
     CSS/CSS.cpp
     CSS/CSSAnimation.cpp
     CSS/CSSConditionRule.cpp
@@ -414117,6 +414218,7 @@ set(SOURCES
     CSS/StyleValues/FunctionStyleValue.cpp
     CSS/StyleValues/FontSourceStyleValue.cpp
     CSS/StyleValues/FontStyleStyleValue.cpp
+    CSS/StyleValues/FrequencyStyleValue.cpp
     CSS/StyleValues/GridAutoFlowStyleValue.cpp
     CSS/StyleValues/GridTemplateAreaStyleValue.cpp
     CSS/StyleValues/GridTrackPlacementStyleValue.cpp
@@ -414139,6 +414241,7 @@ set(SOURCES
     CSS/StyleValues/RatioStyleValue.cpp
     CSS/StyleValues/RectStyleValue.cpp
     CSS/StyleValues/RepeatStyleStyleValue.cpp
+    CSS/StyleValues/ResolutionStyleValue.cpp
     CSS/StyleValues/ScrollbarColorStyleValue.cpp
     CSS/StyleValues/ShadowStyleValue.cpp
     CSS/StyleValues/ShorthandStyleValue.cpp
@@ -414147,6 +414250,7 @@ set(SOURCES
     CSS/StyleValues/SuperellipseStyleValue.cpp
     CSS/StyleValues/TextIndentStyleValue.cpp
     CSS/StyleValues/TextUnderlinePositionStyleValue.cpp
+    CSS/StyleValues/TimeStyleValue.cpp
     CSS/StyleValues/TransformationStyleValue.cpp
     CSS/StyleValues/TreeCountingFunctionStyleValue.cpp
     CSS/StyleValues/TupleStyleValue.cpp
@@ -449756,12 +449860,12 @@ WebIDL::ExceptionOr<void> register_property(JS::VM& vm, Bindings::PropertyDefini
     //    an initial value of parsed initial value, and an inherit flag of inherit flag.
     CustomPropertyRegistration registered_property {
         .property_name = property_name,
-        .syntax = definition.syntax,
+        .syntax = maybe_syntax.release_nonnull(),
         .inherit = definition.inherits,
         .initial_value = initial_value_maybe,
     };
     // Append registered property to property set.
-    property_set.set(registered_property.property_name, registered_property);
+    property_set.set(registered_property.property_name, move(registered_property));
     document.did_change_custom_property_registrations();
 
     return {};
@@ -452659,12 +452763,12 @@ void FunctionParameterInternal::serialize(StringBuilder& builder) const
     }
 }
 
-GC::Ref<CSSFunctionRule> CSSFunctionRule::create(JS::Realm& realm, CSSRuleList& rules, FlyString name, Vector<FunctionParameterInternal> parameters, NonnullOwnPtr<Parser::SyntaxNode> return_type)
+GC::Ref<CSSFunctionRule> CSSFunctionRule::create(JS::Realm& realm, CSSRuleList& rules, FlyString name, Vector<FunctionParameterInternal> parameters, NonnullRefPtr<Parser::SyntaxNode> return_type)
 {
     return realm.create<CSSFunctionRule>(realm, rules, move(name), move(parameters), move(return_type));
 }
 
-CSSFunctionRule::CSSFunctionRule(JS::Realm& realm, CSSRuleList& rules, FlyString name, Vector<FunctionParameterInternal> parameters, NonnullOwnPtr<Parser::SyntaxNode> return_type)
+CSSFunctionRule::CSSFunctionRule(JS::Realm& realm, CSSRuleList& rules, FlyString name, Vector<FunctionParameterInternal> parameters, NonnullRefPtr<Parser::SyntaxNode> return_type)
     : CSSGroupingRule(realm, rules, Type::Function)
     , m_name(move(name))
     , m_parameters(move(parameters))
@@ -452777,7 +452881,7 @@ namespace Web::CSS {
 //     convenient types (i.e. not just strings)
 struct FunctionParameterInternal {
     FlyString name;
-    NonnullOwnPtr<Parser::SyntaxNode> type;
+    NonnullRefPtr<Parser::SyntaxNode> type;
     Optional<Vector<Parser::ComponentValue>> default_value;
 
     void serialize(StringBuilder& builder) const;
@@ -452798,7 +452902,7 @@ class CSSFunctionRule : public CSSGroupingRule {
     GC_DECLARE_ALLOCATOR(CSSFunctionRule);
 
 public:
-    static GC::Ref<CSSFunctionRule> create(JS::Realm&, CSSRuleList&, FlyString name, Vector<FunctionParameterInternal> parameters, NonnullOwnPtr<Parser::SyntaxNode> return_type);
+    static GC::Ref<CSSFunctionRule> create(JS::Realm&, CSSRuleList&, FlyString name, Vector<FunctionParameterInternal> parameters, NonnullRefPtr<Parser::SyntaxNode> return_type);
     virtual ~CSSFunctionRule() override = default;
 
     virtual void initialize(JS::Realm&) override;
@@ -452810,11 +452914,11 @@ public:
     String serialized() const override;
 
 private:
-    CSSFunctionRule(JS::Realm&, CSSRuleList&, FlyString name, Vector<FunctionParameterInternal> parameters, NonnullOwnPtr<Parser::SyntaxNode> return_type);
+    CSSFunctionRule(JS::Realm&, CSSRuleList&, FlyString name, Vector<FunctionParameterInternal> parameters, NonnullRefPtr<Parser::SyntaxNode> return_type);
 
     FlyString m_name;
     Vector<FunctionParameterInternal> m_parameters;
-    NonnullOwnPtr<Parser::SyntaxNode> m_return_type;
+    NonnullRefPtr<Parser::SyntaxNode> m_return_type;
 };
 
 }
@@ -458254,7 +458358,7 @@ interface CSSPerspective : CSSTransformComponent {
 FILE: Libraries/LibWeb/CSS/CSSPropertyRule.cpp
 /*
  * Copyright (c) 2024, Alex Ungurianu <alex@ungurianu.com>
- * Copyright (c) 2025, Sam Atkins <sam@ladybird.org>
+ * Copyright (c) 2025-2026, Sam Atkins <sam@ladybird.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -458269,15 +458373,16 @@ namespace Web::CSS {
 
 GC_DEFINE_ALLOCATOR(CSSPropertyRule);
 
-GC::Ref<CSSPropertyRule> CSSPropertyRule::create(JS::Realm& realm, Utf16FlyString name, FlyString syntax, bool inherits, RefPtr<StyleValue const> initial_value)
+GC::Ref<CSSPropertyRule> CSSPropertyRule::create(JS::Realm& realm, Utf16FlyString name, FlyString syntax, NonnullRefPtr<Parser::SyntaxNode> parsed_syntax, bool inherits, RefPtr<StyleValue const> initial_value)
 {
-    return realm.create<CSSPropertyRule>(realm, move(name), move(syntax), inherits, move(initial_value));
+    return realm.create<CSSPropertyRule>(realm, move(name), move(syntax), move(parsed_syntax), inherits, move(initial_value));
 }
 
-CSSPropertyRule::CSSPropertyRule(JS::Realm& realm, Utf16FlyString name, FlyString syntax, bool inherits, RefPtr<StyleValue const> initial_value)
+CSSPropertyRule::CSSPropertyRule(JS::Realm& realm, Utf16FlyString name, FlyString syntax, NonnullRefPtr<Parser::SyntaxNode> parsed_syntax, bool inherits, RefPtr<StyleValue const> initial_value)
     : CSSRule(realm, Type::Property)
     , m_name(move(name))
     , m_syntax(move(syntax))
+    , m_parsed_syntax(move(parsed_syntax))
     , m_inherits(inherits)
     , m_initial_value(move(initial_value))
 {
@@ -458300,7 +458405,7 @@ CustomPropertyRegistration CSSPropertyRule::to_registration() const
 {
     return CustomPropertyRegistration {
         .property_name = m_name,
-        .syntax = m_syntax.to_string(),
+        .syntax = m_parsed_syntax,
         .inherit = m_inherits,
         .initial_value = m_initial_value,
     };
@@ -458356,7 +458461,8 @@ void CSSPropertyRule::dump(StringBuilder& builder, int indent_levels) const
     builder.appendff("Name: {}\n", name());
 
     dump_indent(builder, indent_levels + 1);
-    builder.appendff("Syntax: {}\n", syntax());
+    builder.appendff("Syntax: `{}`\n", syntax());
+    m_parsed_syntax->dump(builder, indent_levels + 2);
 
     dump_indent(builder, indent_levels + 1);
     builder.appendff("Inherits: {}\n", inherits());
@@ -458396,7 +458502,7 @@ class CSSPropertyRule final : public CSSRule {
     GC_DECLARE_ALLOCATOR(CSSPropertyRule);
 
 public:
-    static GC::Ref<CSSPropertyRule> create(JS::Realm&, Utf16FlyString name, FlyString syntax, bool inherits, RefPtr<StyleValue const> initial_value);
+    static GC::Ref<CSSPropertyRule> create(JS::Realm&, Utf16FlyString name, FlyString syntax, NonnullRefPtr<Parser::SyntaxNode> parsed_syntax, bool inherits, RefPtr<StyleValue const> initial_value);
 
     virtual ~CSSPropertyRule() = default;
 
@@ -458409,7 +458515,7 @@ public:
     CustomPropertyRegistration to_registration() const;
 
 private:
-    CSSPropertyRule(JS::Realm&, Utf16FlyString name, FlyString syntax, bool inherits, RefPtr<StyleValue const> initial_value);
+    CSSPropertyRule(JS::Realm&, Utf16FlyString name, FlyString syntax, NonnullRefPtr<Parser::SyntaxNode> parsed_syntax, bool inherits, RefPtr<StyleValue const> initial_value);
 
     virtual void initialize(JS::Realm&) override;
     virtual String serialized() const override;
@@ -458417,6 +458523,7 @@ private:
 
     Utf16FlyString m_name;
     FlyString m_syntax;
+    NonnullRefPtr<Parser::SyntaxNode> m_parsed_syntax;
     bool m_inherits;
     RefPtr<StyleValue const> m_initial_value;
 };
@@ -466233,6 +466340,57 @@ private:
 
 }
 
+FILE: Libraries/LibWeb/CSS/CustomPropertyRegistration.cpp
+/*
+ * Copyright (c) 2026, Sam Atkins <sam@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <LibWeb/CSS/CalculationResolutionContext.h>
+#include <LibWeb/CSS/ComputedValues.h>
+#include <LibWeb/CSS/CustomPropertyRegistration.h>
+#include <LibWeb/CSS/Length.h>
+#include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/Parser/Syntax.h>
+#include <LibWeb/CSS/StyleValues/GuaranteedInvalidStyleValue.h>
+#include <LibWeb/DOM/Document.h>
+
+namespace Web::CSS {
+
+// https://drafts.css-houdini.org/css-properties-values-api/#calculation-of-computed-values
+NonnullRefPtr<StyleValue const> compute_registered_custom_property_value(CustomPropertyRegistration const& registration, NonnullRefPtr<StyleValue const> value, ComputationContext const& computation_context)
+{
+    // If the registration’s syntax is the universal syntax definition, the computed value is the same as for
+    // unregistered custom properties (either the specified value with variables substituted, or the guaranteed-invalid
+    // value).
+    if (registration.syntax->type() == Parser::SyntaxNode::NodeType::Universal)
+        return value;
+
+    // Otherwise...
+    // NB: Our regular computed-value computation already behaves how this wants.
+    return value->absolutized(computation_context);
+}
+
+NonnullRefPtr<StyleValue const> compute_registered_custom_property_initial_value(DOM::Document const& document, CustomPropertyRegistration const& registration)
+{
+    if (registration.computed_initial_value)
+        return *registration.computed_initial_value;
+
+    NonnullRefPtr<StyleValue const> computed_initial_value = GuaranteedInvalidStyleValue::create();
+    if (registration.initial_value) {
+        ComputationContext computation_context {
+            .length_resolution_context = Length::ResolutionContext::for_document(document),
+        };
+        computed_initial_value = compute_registered_custom_property_value(registration, *registration.initial_value, computation_context);
+    }
+
+    const_cast<CustomPropertyRegistration&>(registration).computed_initial_value = computed_initial_value;
+    return computed_initial_value;
+}
+
+}
+
 FILE: Libraries/LibWeb/CSS/CustomPropertyRegistration.h
 /*
  * Copyright (c) 2026, Sam Atkins <sam@ladybird.org>
@@ -466244,6 +466402,7 @@ FILE: Libraries/LibWeb/CSS/CustomPropertyRegistration.h
 
 #include <AK/RefPtr.h>
 #include <AK/Utf16FlyString.h>
+#include <LibWeb/CSS/Parser/Syntax.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
 #include <LibWeb/Forward.h>
 
@@ -466257,7 +466416,9 @@ struct CustomPropertyRegistration {
     Utf16FlyString property_name;
 
     // - a syntax (a syntax string)
-    String syntax;
+    //   NB: Spec actually wants this to be a parsed value, and that's what's most useful to us.
+    //       See https://drafts.css-houdini.org/css-properties-values-api/#register-a-custom-property
+    NonnullRefPtr<Parser::SyntaxNode> syntax;
 
     // - an inherit flag (a boolean)
     bool inherit;
@@ -466266,13 +466427,17 @@ struct CustomPropertyRegistration {
     //   NB: Spec actually wants this to be a parsed value, and that's what's most useful to us.
     //       See https://drafts.css-houdini.org/css-properties-values-api/#register-a-custom-property
     RefPtr<StyleValue const> initial_value;
+    RefPtr<StyleValue const> computed_initial_value { nullptr };
 };
+
+NonnullRefPtr<StyleValue const> compute_registered_custom_property_value(CustomPropertyRegistration const&, NonnullRefPtr<StyleValue const>, ComputationContext const&);
+NonnullRefPtr<StyleValue const> compute_registered_custom_property_initial_value(DOM::Document const&, CustomPropertyRegistration const&);
 
 inline bool operator==(CustomPropertyRegistration const& a, CustomPropertyRegistration const& b)
 {
     if (a.property_name != b.property_name)
         return false;
-    if (a.syntax != b.syntax)
+    if (a.syntax.ptr() != b.syntax.ptr() && !a.syntax->equals(*b.syntax))
         return false;
     if (a.inherit != b.inherit)
         return false;
@@ -486791,6 +486956,17 @@ void GuardedSubstitutionContexts::unguard(SubstitutionContext const& context)
     VERIFY(was_removed);
 }
 
+bool GuardedSubstitutionContexts::mark_existing_as_cyclic(SubstitutionContext const& context)
+{
+    for (auto& existing_context : m_contexts) {
+        if (existing_context == context) {
+            existing_context.is_cyclic = true;
+            return true;
+        }
+    }
+    return false;
+}
+
 Optional<ArbitrarySubstitutionFunction> to_arbitrary_substitution_function(FlyString const& name)
 {
     if (name.equals_ignoring_ascii_case("attr"sv))
@@ -486832,7 +487008,7 @@ static Vector<ComponentValue> mark_as_attr_tainted(Vector<ComponentValue> values
 }
 
 // https://drafts.csswg.org/css-values-5/#replace-an-attr-function
-static Vector<ComponentValue> replace_an_attr_function(DOM::AbstractElement& element, GuardedSubstitutionContexts& guarded_contexts, ArbitrarySubstitutionFunctionArguments const& arguments)
+static Vector<ComponentValue> replace_an_attr_function(DOM::AbstractElement& element, GuardedSubstitutionContexts& guarded_contexts, ArbitrarySubstitutionReplacementContext const& replacement_context, ArbitrarySubstitutionFunctionArguments const& arguments)
 {
     // 1. Let el be the element that the style containing the attr() function is being applied to.
     //    Let first arg be the first <declaration-value> in arguments.
@@ -486849,7 +487025,7 @@ static Vector<ComponentValue> replace_an_attr_function(DOM::AbstractElement& ele
     struct AttrUnit {
         FlyString name;
     };
-    Variant<Empty, NonnullOwnPtr<SyntaxNode>, RawStringKeyword, NumberKeyword, AttrUnit> syntax;
+    Variant<Empty, NonnullRefPtr<SyntaxNode>, RawStringKeyword, NumberKeyword, AttrUnit> syntax;
 
     auto failure = [&] -> Vector<ComponentValue> {
         // This is step 7, but defined here for convenience.
@@ -486863,14 +487039,14 @@ static Vector<ComponentValue> replace_an_attr_function(DOM::AbstractElement& ele
             return { ComponentValue { GuaranteedInvalidValue {} } };
 
         // 3. Substitute arbitrary substitution functions in second arg, and return the result.
-        return substitute_arbitrary_substitution_functions(element, guarded_contexts, second_argument.value());
+        return substitute_arbitrary_substitution_functions(element, guarded_contexts, replacement_context, second_argument.value());
     };
 
     // 2. Substitute arbitrary substitution functions in first arg, then parse it as <attr-name> <attr-type>?.
     //    If that returns failure, jump to the last step (labeled FAILURE).
     //    Otherwise, let attr name and syntax be the results of parsing (with syntax being null if <attr-type> was
     //    omitted), processed as specified in the definition of those arguments.
-    auto substituted = substitute_arbitrary_substitution_functions(element, guarded_contexts, first_argument);
+    auto substituted = substitute_arbitrary_substitution_functions(element, guarded_contexts, replacement_context, first_argument);
     TokenStream first_argument_tokens { substituted };
     // <attr-name> = [ <ident-token>? '|' ]? <ident-token>
     // FIXME: Support optional attribute namespace
@@ -486982,10 +487158,10 @@ static Vector<ComponentValue> replace_an_attr_function(DOM::AbstractElement& ele
     //    otherwise, jump to the last step (labeled FAILURE).
     auto parser = Parser::create(ParsingParams { element.element().document() }, attribute_value.value());
     auto unsubstituted_values = parser.parse_as_list_of_component_values();
-    auto substituted_values = substitute_arbitrary_substitution_functions(element, guarded_contexts, unsubstituted_values,
+    auto substituted_values = substitute_arbitrary_substitution_functions(element, guarded_contexts, replacement_context, unsubstituted_values,
         SubstitutionContext { SubstitutionContext::DependencyType::Attribute, attribute_name.to_string() });
 
-    auto parsed_value = parse_with_a_syntax(ParsingParams { element.document() }, substituted_values, *syntax.get<NonnullOwnPtr<SyntaxNode>>());
+    auto parsed_value = parse_with_a_syntax(ParsingParams { element.document() }, substituted_values, *syntax.get<NonnullRefPtr<SyntaxNode>>());
     if (parsed_value->is_guaranteed_invalid())
         return failure();
     return mark_as_attr_tainted(parsed_value->tokenize());
@@ -486995,7 +487171,7 @@ static Vector<ComponentValue> replace_an_attr_function(DOM::AbstractElement& ele
 }
 
 // https://drafts.csswg.org/css-env/#substitute-an-env
-static Vector<ComponentValue> replace_an_env_function(DOM::AbstractElement& element, GuardedSubstitutionContexts& guarded_contexts, ArbitrarySubstitutionFunctionArguments const& arguments)
+static Vector<ComponentValue> replace_an_env_function(DOM::AbstractElement& element, GuardedSubstitutionContexts& guarded_contexts, ArbitrarySubstitutionReplacementContext const& replacement_context, ArbitrarySubstitutionFunctionArguments const& arguments)
 {
     // AD-HOC: env() is not defined as an ASF (and was defined before the ASF concept was), but behaves a lot like one.
     // So, this is a combination of the spec's "substitute an env()" algorithm linked above, and the "replace a FOO function()" algorithms.
@@ -487005,7 +487181,7 @@ static Vector<ComponentValue> replace_an_env_function(DOM::AbstractElement& elem
     auto const second_argument = declaration_value_list.get(1);
 
     // AD-HOC: Substitute ASFs in the first argument.
-    auto substituted_first_argument = substitute_arbitrary_substitution_functions(element, guarded_contexts, first_argument);
+    auto substituted_first_argument = substitute_arbitrary_substitution_functions(element, guarded_contexts, replacement_context, first_argument);
 
     // AD-HOC: Parse the arguments.
     // env() = env( <custom-ident> <integer [0,∞]>*, <declaration-value>? )
@@ -487046,14 +487222,14 @@ static Vector<ComponentValue> replace_an_env_function(DOM::AbstractElement& elem
     //    the fallback value. If there are any env() references in the fallback, substitute them as well.
     // AD-HOC: Substitute all ASFs in the result.
     if (second_argument.has_value())
-        return substitute_arbitrary_substitution_functions(element, guarded_contexts, second_argument.value());
+        return substitute_arbitrary_substitution_functions(element, guarded_contexts, replacement_context, second_argument.value());
 
     // 3. Otherwise, the property or descriptor containing the env() function is invalid at computed-value time.
     return { ComponentValue { GuaranteedInvalidValue {} } };
 }
 
 // https://drafts.csswg.org/css-values-5/#replace-an-if-function
-static Vector<ComponentValue> replace_an_if_function(DOM::AbstractElement& element, GuardedSubstitutionContexts& guarded_contexts, ArbitrarySubstitutionFunctionArguments const& arguments)
+static Vector<ComponentValue> replace_an_if_function(DOM::AbstractElement& element, GuardedSubstitutionContexts& guarded_contexts, ArbitrarySubstitutionReplacementContext const& replacement_context, ArbitrarySubstitutionFunctionArguments const& arguments)
 {
     // NB: We create a single parser and reuse that for parsing all the conditions
     auto parser = Parser::create(ParsingParams { element.element().document() }, {});
@@ -487062,7 +487238,7 @@ static Vector<ComponentValue> replace_an_if_function(DOM::AbstractElement& eleme
     for (auto const& branch : arguments.get<IfArgs>()) {
         // 1. Substitute arbitrary substitution functions in the first <declaration-value> of branch, then parse the
         //    result as an <if-condition>. If parsing returns failure, continue; otherwise, let the result be condition.
-        auto substituted_condition = substitute_arbitrary_substitution_functions(element, guarded_contexts, branch.condition);
+        auto substituted_condition = substitute_arbitrary_substitution_functions(element, guarded_contexts, replacement_context, branch.condition);
         auto condition_is_attr_tainted = contains_attr_tainted_value(substituted_condition);
 
         TokenStream<ComponentValue> tokens { substituted_condition };
@@ -487086,7 +487262,7 @@ static Vector<ComponentValue> replace_an_if_function(DOM::AbstractElement& eleme
         if (!branch.value.has_value())
             return {};
 
-        auto result = substitute_arbitrary_substitution_functions(element, guarded_contexts, branch.value.value());
+        auto result = substitute_arbitrary_substitution_functions(element, guarded_contexts, replacement_context, branch.value.value());
         if (condition_is_attr_tainted)
             return mark_as_attr_tainted(move(result));
         return result;
@@ -487097,7 +487273,7 @@ static Vector<ComponentValue> replace_an_if_function(DOM::AbstractElement& eleme
 }
 
 // https://drafts.csswg.org/css-values-5/#replace-an-inherit-function
-static Vector<ComponentValue> replace_an_inherit_function(DOM::AbstractElement& element, GuardedSubstitutionContexts& guarded_contexts, ArbitrarySubstitutionFunctionArguments const& arguments)
+static Vector<ComponentValue> replace_an_inherit_function(DOM::AbstractElement& element, GuardedSubstitutionContexts& guarded_contexts, ArbitrarySubstitutionReplacementContext const& replacement_context, ArbitrarySubstitutionFunctionArguments const& arguments)
 {
     // To replace an inherit() function, given a list of arguments:
     auto const& declaration_value_list = arguments.get<DeclarationValueList>();
@@ -487106,7 +487282,7 @@ static Vector<ComponentValue> replace_an_inherit_function(DOM::AbstractElement& 
 
     // 1. Substitute arbitrary substitution functions in the first <declaration-value> of arguments, then parse it as a
     //    <custom-property-name>.
-    auto substituted_first_argument = substitute_arbitrary_substitution_functions(element, guarded_contexts, first_argument);
+    auto substituted_first_argument = substitute_arbitrary_substitution_functions(element, guarded_contexts, replacement_context, first_argument);
 
     TokenStream first_argument_tokens { substituted_first_argument };
     first_argument_tokens.discard_whitespace();
@@ -487128,14 +487304,14 @@ static Vector<ComponentValue> replace_an_inherit_function(DOM::AbstractElement& 
     // 3. Otherwise, if a second <declaration-value>? was passed in arguments, substitute arbitrary substitution
     //    functions in that argument, and return the result.
     if (second_argument.has_value())
-        return substitute_arbitrary_substitution_functions(element, guarded_contexts, second_argument.value());
+        return substitute_arbitrary_substitution_functions(element, guarded_contexts, replacement_context, second_argument.value());
 
     // 4. Otherwise, return the guaranteed-invalid value.
     return { ComponentValue { GuaranteedInvalidValue {} } };
 }
 
 // https://drafts.csswg.org/css-variables-1/#replace-a-var-function
-static Vector<ComponentValue> replace_a_var_function(DOM::AbstractElement& element, GuardedSubstitutionContexts& guarded_contexts, ArbitrarySubstitutionFunctionArguments const& arguments)
+static Vector<ComponentValue> replace_a_var_function(DOM::AbstractElement& element, GuardedSubstitutionContexts& guarded_contexts, ArbitrarySubstitutionReplacementContext const& replacement_context, ArbitrarySubstitutionFunctionArguments const& arguments)
 {
     // 1. Let el be the element that the style containing the var() function is being applied to.
     //    Let first arg be the first <declaration-value> in arguments.
@@ -487148,7 +487324,7 @@ static Vector<ComponentValue> replace_a_var_function(DOM::AbstractElement& eleme
     // 2. Substitute arbitrary substitution functions in first arg, then parse it as a <custom-property-name>.
     //    If parsing returned a <custom-property-name>, let result be the computed value of the corresponding custom
     //    property on el. Otherwise, let result be the guaranteed-invalid value.
-    auto substituted_first_argument = substitute_arbitrary_substitution_functions(element, guarded_contexts, first_argument);
+    auto substituted_first_argument = substitute_arbitrary_substitution_functions(element, guarded_contexts, replacement_context, first_argument);
     TokenStream name_tokens { substituted_first_argument };
     name_tokens.discard_whitespace();
     auto& name_token = name_tokens.consume_a_token();
@@ -487159,8 +487335,12 @@ static Vector<ComponentValue> replace_a_var_function(DOM::AbstractElement& eleme
         result = { ComponentValue { GuaranteedInvalidValue {} } };
     } else {
         // Look up the value of the custom property
-        auto& custom_property_name = name_token.token().ident();
-        auto custom_property_value = StyleComputer::compute_value_of_custom_property(element, Utf16FlyString::from_utf8(custom_property_name), guarded_contexts);
+        auto custom_property_name = Utf16FlyString::from_utf8(name_token.token().ident());
+        RefPtr<StyleValue const> custom_property_value;
+        if (auto const* computed_style = replacement_context.computed_style_for_custom_property_resolution)
+            custom_property_value = element.document().style_computer().compute_value_of_custom_property(*computed_style, element, custom_property_name, guarded_contexts);
+        else
+            custom_property_value = StyleComputer::compute_value_of_custom_property(element, custom_property_name, guarded_contexts);
         result = custom_property_value->tokenize();
     }
 
@@ -487169,13 +487349,13 @@ static Vector<ComponentValue> replace_a_var_function(DOM::AbstractElement& eleme
 
     // 4. If result contains the guaranteed-invalid value, and second arg was provided, set result to the result of substitute arbitrary substitution functions on second arg.
     if (contains_guaranteed_invalid_value(result) && second_argument.has_value())
-        result = substitute_arbitrary_substitution_functions(element, guarded_contexts, second_argument.value());
+        result = substitute_arbitrary_substitution_functions(element, guarded_contexts, replacement_context, second_argument.value());
 
     // 5. Return result.
     return result;
 }
 
-static ErrorOr<void> substitute_arbitrary_substitution_functions_step_2(DOM::AbstractElement& element, GuardedSubstitutionContexts& guarded_contexts, TokenStream<ComponentValue>& source, Vector<ComponentValue>& dest)
+static ErrorOr<void> substitute_arbitrary_substitution_functions_step_2(DOM::AbstractElement& element, GuardedSubstitutionContexts& guarded_contexts, ArbitrarySubstitutionReplacementContext const& replacement_context, TokenStream<ComponentValue>& source, Vector<ComponentValue>& dest)
 {
     // Step 2 of https://drafts.csswg.org/css-values-5/#substitute-arbitrary-substitution-function
     // 2. For each arbitrary substitution function func in values (ordered via a depth-first pre-order traversal) that
@@ -487208,7 +487388,7 @@ static ErrorOr<void> substitute_arbitrary_substitution_functions_step_2(DOM::Abs
 
                 // 4. Replace an arbitrary substitution function for func, given arguments, as defined by that function.
                 //    Let result be the returned list of component values.
-                auto result = replace_an_arbitrary_substitution_function(element, guarded_contexts, function_id, arguments);
+                auto result = replace_an_arbitrary_substitution_function(element, guarded_contexts, replacement_context, function_id, arguments);
 
                 // 5. If result contains the guaranteed-invalid value, replace func in values with the guaranteed-invalid value.
                 //    Otherwise, replace func in values with result.
@@ -487218,7 +487398,7 @@ static ErrorOr<void> substitute_arbitrary_substitution_functions_step_2(DOM::Abs
                     // NB: Because we're doing this in one pass recursively, we now need to substitute any ASFs in result.
                     TokenStream result_stream { result };
                     Vector<ComponentValue> result_after_processing;
-                    TRY(substitute_arbitrary_substitution_functions_step_2(element, guarded_contexts, result_stream, result_after_processing));
+                    TRY(substitute_arbitrary_substitution_functions_step_2(element, guarded_contexts, replacement_context, result_stream, result_after_processing));
 
                     // NB: Protect against the billion-laughs attack by limiting to an arbitrary large number of tokens.
                     // https://drafts.csswg.org/css-values-5/#long-substitution
@@ -487235,7 +487415,7 @@ static ErrorOr<void> substitute_arbitrary_substitution_functions_step_2(DOM::Abs
 
             Vector<ComponentValue> function_values;
             TokenStream source_function_contents { source_function.value };
-            TRY(substitute_arbitrary_substitution_functions_step_2(element, guarded_contexts, source_function_contents, function_values));
+            TRY(substitute_arbitrary_substitution_functions_step_2(element, guarded_contexts, replacement_context, source_function_contents, function_values));
             dest.empend(Function { source_function.name, move(function_values) });
             continue;
         }
@@ -487243,7 +487423,7 @@ static ErrorOr<void> substitute_arbitrary_substitution_functions_step_2(DOM::Abs
             auto const& source_block = value.block();
             TokenStream source_block_values { source_block.value };
             Vector<ComponentValue> block_values;
-            TRY(substitute_arbitrary_substitution_functions_step_2(element, guarded_contexts, source_block_values, block_values));
+            TRY(substitute_arbitrary_substitution_functions_step_2(element, guarded_contexts, replacement_context, source_block_values, block_values));
             dest.empend(SimpleBlock { source_block.token, move(block_values) });
             continue;
         }
@@ -487254,7 +487434,7 @@ static ErrorOr<void> substitute_arbitrary_substitution_functions_step_2(DOM::Abs
 }
 
 // https://drafts.csswg.org/css-values-5/#substitute-arbitrary-substitution-function
-Vector<ComponentValue> substitute_arbitrary_substitution_functions(DOM::AbstractElement& element, GuardedSubstitutionContexts& guarded_contexts, ReadonlySpan<ComponentValue> values, Optional<SubstitutionContext> context)
+Vector<ComponentValue> substitute_arbitrary_substitution_functions(DOM::AbstractElement& element, GuardedSubstitutionContexts& guarded_contexts, ArbitrarySubstitutionReplacementContext const& replacement_context, ReadonlySpan<ComponentValue> values, Optional<SubstitutionContext> context)
 {
     // To substitute arbitrary substitution functions in a sequence of component values values, given an optional
     // substitution context context:
@@ -487275,7 +487455,7 @@ Vector<ComponentValue> substitute_arbitrary_substitution_functions(DOM::Abstract
     //    is not nested in the contents of another arbitrary substitution function:
     Vector<ComponentValue> new_values;
     TokenStream source { values };
-    auto maybe_error = substitute_arbitrary_substitution_functions_step_2(element, guarded_contexts, source, new_values);
+    auto maybe_error = substitute_arbitrary_substitution_functions_step_2(element, guarded_contexts, replacement_context, source, new_values);
     if (maybe_error.is_error())
         return { ComponentValue { GuaranteedInvalidValue {} } };
 
@@ -487369,19 +487549,19 @@ Optional<ArbitrarySubstitutionFunctionArguments> parse_according_to_argument_gra
 }
 
 // https://drafts.csswg.org/css-values-5/#replace-an-arbitrary-substitution-function
-Vector<ComponentValue> replace_an_arbitrary_substitution_function(DOM::AbstractElement& element, GuardedSubstitutionContexts& guarded_contexts, ArbitrarySubstitutionFunction function, ArbitrarySubstitutionFunctionArguments const& arguments)
+Vector<ComponentValue> replace_an_arbitrary_substitution_function(DOM::AbstractElement& element, GuardedSubstitutionContexts& guarded_contexts, ArbitrarySubstitutionReplacementContext const& replacement_context, ArbitrarySubstitutionFunction function, ArbitrarySubstitutionFunctionArguments const& arguments)
 {
     switch (function) {
     case ArbitrarySubstitutionFunction::Attr:
-        return replace_an_attr_function(element, guarded_contexts, arguments);
+        return replace_an_attr_function(element, guarded_contexts, replacement_context, arguments);
     case ArbitrarySubstitutionFunction::Env:
-        return replace_an_env_function(element, guarded_contexts, arguments);
+        return replace_an_env_function(element, guarded_contexts, replacement_context, arguments);
     case ArbitrarySubstitutionFunction::If:
-        return replace_an_if_function(element, guarded_contexts, arguments);
+        return replace_an_if_function(element, guarded_contexts, replacement_context, arguments);
     case ArbitrarySubstitutionFunction::Inherit:
-        return replace_an_inherit_function(element, guarded_contexts, arguments);
+        return replace_an_inherit_function(element, guarded_contexts, replacement_context, arguments);
     case ArbitrarySubstitutionFunction::Var:
-        return replace_a_var_function(element, guarded_contexts, arguments);
+        return replace_a_var_function(element, guarded_contexts, replacement_context, arguments);
     }
     VERIFY_NOT_REACHED();
 }
@@ -487424,9 +487604,14 @@ class GuardedSubstitutionContexts {
 public:
     void guard(SubstitutionContext&);
     void unguard(SubstitutionContext const&);
+    bool mark_existing_as_cyclic(SubstitutionContext const&);
 
 private:
     Vector<SubstitutionContext&> m_contexts;
+};
+
+struct ArbitrarySubstitutionReplacementContext {
+    ComputedProperties const* computed_style_for_custom_property_resolution { nullptr };
 };
 
 enum class ArbitrarySubstitutionFunction : u8 {
@@ -487440,7 +487625,7 @@ enum class ArbitrarySubstitutionFunction : u8 {
 
 bool contains_guaranteed_invalid_value(ReadonlySpan<ComponentValue>);
 
-[[nodiscard]] Vector<ComponentValue> substitute_arbitrary_substitution_functions(DOM::AbstractElement&, GuardedSubstitutionContexts&, ReadonlySpan<ComponentValue>, Optional<SubstitutionContext> = {});
+[[nodiscard]] Vector<ComponentValue> substitute_arbitrary_substitution_functions(DOM::AbstractElement&, GuardedSubstitutionContexts&, ArbitrarySubstitutionReplacementContext const&, ReadonlySpan<ComponentValue>, Optional<SubstitutionContext> = {});
 
 using DeclarationValueList = Vector<ReadonlySpan<ComponentValue>>;
 
@@ -487454,7 +487639,7 @@ using ArbitrarySubstitutionFunctionArguments = Variant<DeclarationValueList, IfA
 // The returned argument spans borrow from the input component value list.
 [[nodiscard]] Optional<ArbitrarySubstitutionFunctionArguments> parse_according_to_argument_grammar(ArbitrarySubstitutionFunction, ReadonlySpan<ComponentValue>);
 
-[[nodiscard]] Vector<ComponentValue> replace_an_arbitrary_substitution_function(DOM::AbstractElement&, GuardedSubstitutionContexts&, ArbitrarySubstitutionFunction, ArbitrarySubstitutionFunctionArguments const&);
+[[nodiscard]] Vector<ComponentValue> replace_an_arbitrary_substitution_function(DOM::AbstractElement&, GuardedSubstitutionContexts&, ArbitrarySubstitutionReplacementContext const&, ArbitrarySubstitutionFunction, ArbitrarySubstitutionFunctionArguments const&);
 
 }
 
@@ -489924,6 +490109,7 @@ Parser::Parser(ParsingParams const& context, Vector<Token> tokens)
     , m_realm(context.realm)
     , m_parsing_mode(context.mode)
     , m_is_ua_style_sheet(context.is_ua_style_sheet)
+    , m_computed_style_for_custom_property_resolution(context.computed_style_for_custom_property_resolution)
     , m_tokens(move(tokens))
     , m_token_stream(m_tokens)
     , m_value_context(move(context.value_context))
@@ -492321,6 +492507,7 @@ struct WEB_API ParsingParams {
     GC::Ptr<DOM::Document const> document;
     ParsingMode mode { ParsingMode::Normal };
     IsUAStyleSheet is_ua_style_sheet { IsUAStyleSheet::No };
+    ComputedProperties const* computed_style_for_custom_property_resolution { nullptr };
 
     Vector<ValueParsingContext> value_context;
     Vector<RuleContext> rule_context;
@@ -492522,7 +492709,7 @@ private:
     struct FunctionPrelude {
         FlyString name;
         Vector<FunctionParameterInternal> parameters;
-        NonnullOwnPtr<SyntaxNode> return_type;
+        NonnullRefPtr<SyntaxNode> return_type;
     };
     Optional<FunctionPrelude> parse_function_prelude(TokenStream<ComponentValue>&);
 
@@ -492869,6 +493056,7 @@ private:
     GC::Ptr<JS::Realm> m_realm;
     ParsingMode m_parsing_mode { ParsingMode::Normal };
     IsUAStyleSheet m_is_ua_style_sheet { IsUAStyleSheet::No };
+    ComputedProperties const* m_computed_style_for_custom_property_resolution { nullptr };
 
     Vector<Token> m_tokens;
     TokenStream<Token> m_token_stream;
@@ -500173,7 +500361,7 @@ GC::Ptr<CSSPropertyRule> Parser::convert_to_property_rule(AtRule const& rule)
         }
     }
 
-    return CSSPropertyRule::create(realm(), move(name), syntax_maybe.value(), inherits_maybe.value(), move(initial_value_maybe));
+    return CSSPropertyRule::create(realm(), move(name), syntax_maybe.value(), maybe_syntax.release_nonnull(), inherits_maybe.value(), move(initial_value_maybe));
 }
 
 // https://drafts.csswg.org/css-cascade-6/#scope-atrule
@@ -500678,7 +500866,7 @@ GC::Ptr<CSSFontFeatureValuesRule> Parser::convert_to_font_feature_values_rule(At
     return font_feature_values_rule;
 }
 
-static OwnPtr<SyntaxNode> parse_css_type(TokenStream<ComponentValue>& tokens)
+static RefPtr<SyntaxNode> parse_css_type(TokenStream<ComponentValue>& tokens)
 {
     // https://drafts.csswg.org/css-mixins-1/#function-rule
     // <css-type> = <syntax-component> | <type()>
@@ -500764,7 +500952,7 @@ Optional<Parser::FunctionPrelude> Parser::parse_function_prelude(TokenStream<Com
         }
 
         // <css-type>?
-        NonnullOwnPtr<SyntaxNode> type = UniversalSyntaxNode::create();
+        NonnullRefPtr<SyntaxNode> type = UniversalSyntaxNode::create();
         if (auto maybe_type = parse_css_type(parameter_tokens))
             type = maybe_type.release_nonnull();
 
@@ -500813,7 +501001,7 @@ Optional<Parser::FunctionPrelude> Parser::parse_function_prelude(TokenStream<Com
 
     tokens.discard_whitespace();
 
-    NonnullOwnPtr<SyntaxNode> return_type = UniversalSyntaxNode::create();
+    NonnullRefPtr<SyntaxNode> return_type = UniversalSyntaxNode::create();
     if (tokens.next_token().is_ident("returns"sv)) {
         tokens.discard_a_token();
         tokens.discard_whitespace();
@@ -502990,15 +503178,25 @@ String UniversalSyntaxNode::to_string() const
     return "*"_string;
 }
 
+bool UniversalSyntaxNode::equals(SyntaxNode const& other) const
+{
+    return other.type() == type();
+}
+
+bool UniversalSyntaxNode::contains_value_type(ValueType) const
+{
+    return false;
+}
+
 void UniversalSyntaxNode::dump(StringBuilder& builder, int indent) const
 {
     builder.appendff("{: >{}}Universal\n", "", indent);
 }
 
-NonnullOwnPtr<TypeSyntaxNode> TypeSyntaxNode::create(FlyString type_name)
+NonnullRefPtr<TypeSyntaxNode> TypeSyntaxNode::create(FlyString type_name)
 {
     auto value_type = value_type_from_string(type_name);
-    return adopt_own(*new TypeSyntaxNode(move(type_name), move(value_type)));
+    return adopt_ref(*new TypeSyntaxNode(move(type_name), move(value_type)));
 }
 
 TypeSyntaxNode::TypeSyntaxNode(FlyString type_name, Optional<ValueType> value_type)
@@ -503013,6 +503211,20 @@ TypeSyntaxNode::~TypeSyntaxNode() = default;
 String TypeSyntaxNode::to_string() const
 {
     return MUST(String::formatted("<{}>", m_type_name));
+}
+
+bool TypeSyntaxNode::equals(SyntaxNode const& other) const
+{
+    if (other.type() != type())
+        return false;
+    auto const& other_type = static_cast<TypeSyntaxNode const&>(other);
+    // No need to compare m_type_name, because it corresponds exactly to m_value_type.
+    return m_value_type == other_type.m_value_type;
+}
+
+bool TypeSyntaxNode::contains_value_type(ValueType value_type) const
+{
+    return m_value_type == value_type;
 }
 
 void TypeSyntaxNode::dump(StringBuilder& builder, int indent) const
@@ -503034,12 +503246,26 @@ String IdentSyntaxNode::to_string() const
     return serialize_an_identifier(m_ident);
 }
 
+bool IdentSyntaxNode::equals(SyntaxNode const& other) const
+{
+    if (other.type() != type())
+        return false;
+    auto const& other_ident = static_cast<IdentSyntaxNode const&>(other);
+    return m_ident == other_ident.m_ident
+        && m_case_sensitivity == other_ident.m_case_sensitivity;
+}
+
+bool IdentSyntaxNode::contains_value_type(ValueType) const
+{
+    return false;
+}
+
 void IdentSyntaxNode::dump(StringBuilder& builder, int indent) const
 {
     builder.appendff("{: >{}}Ident: {}\n", "", indent, m_ident);
 }
 
-MultiplierSyntaxNode::MultiplierSyntaxNode(NonnullOwnPtr<SyntaxNode> child)
+MultiplierSyntaxNode::MultiplierSyntaxNode(NonnullRefPtr<SyntaxNode> child)
     : SyntaxNode(NodeType::Multiplier)
     , m_child(move(child))
 {
@@ -503052,13 +503278,26 @@ String MultiplierSyntaxNode::to_string() const
     return MUST(String::formatted("{}+", m_child->to_string()));
 }
 
+bool MultiplierSyntaxNode::equals(SyntaxNode const& other) const
+{
+    if (other.type() != type())
+        return false;
+    auto const& other_multiplier = static_cast<MultiplierSyntaxNode const&>(other);
+    return m_child->equals(other_multiplier.child());
+}
+
+bool MultiplierSyntaxNode::contains_value_type(ValueType value_type) const
+{
+    return m_child->contains_value_type(value_type);
+}
+
 void MultiplierSyntaxNode::dump(StringBuilder& builder, int indent) const
 {
     builder.appendff("{: >{}}Multiplier:\n", "", indent);
     m_child->dump(builder, indent + 2);
 }
 
-CommaSeparatedMultiplierSyntaxNode::CommaSeparatedMultiplierSyntaxNode(NonnullOwnPtr<SyntaxNode> child)
+CommaSeparatedMultiplierSyntaxNode::CommaSeparatedMultiplierSyntaxNode(NonnullRefPtr<SyntaxNode> child)
     : SyntaxNode(NodeType::CommaSeparatedMultiplier)
     , m_child(move(child))
 {
@@ -503071,13 +503310,26 @@ String CommaSeparatedMultiplierSyntaxNode::to_string() const
     return MUST(String::formatted("{}#", m_child->to_string()));
 }
 
+bool CommaSeparatedMultiplierSyntaxNode::equals(SyntaxNode const& other) const
+{
+    if (other.type() != type())
+        return false;
+    auto const& other_multiplier = static_cast<CommaSeparatedMultiplierSyntaxNode const&>(other);
+    return m_child->equals(other_multiplier.child());
+}
+
+bool CommaSeparatedMultiplierSyntaxNode::contains_value_type(ValueType value_type) const
+{
+    return m_child->contains_value_type(value_type);
+}
+
 void CommaSeparatedMultiplierSyntaxNode::dump(StringBuilder& builder, int indent) const
 {
     builder.appendff("{: >{}}CommaSeparatedMultiplier:\n", "", indent);
     m_child->dump(builder, indent + 2);
 }
 
-AlternativesSyntaxNode::AlternativesSyntaxNode(Vector<NonnullOwnPtr<SyntaxNode>> children)
+AlternativesSyntaxNode::AlternativesSyntaxNode(Vector<NonnullRefPtr<SyntaxNode>> children)
     : SyntaxNode(NodeType::Alternatives)
     , m_children(move(children))
 {
@@ -503102,6 +503354,29 @@ String AlternativesSyntaxNode::to_string() const
     return builder.to_string_without_validation();
 }
 
+bool AlternativesSyntaxNode::equals(SyntaxNode const& other) const
+{
+    if (other.type() != type())
+        return false;
+    auto const& other_alternatives = static_cast<AlternativesSyntaxNode const&>(other);
+    if (m_children.size() != other_alternatives.m_children.size())
+        return false;
+    for (size_t i = 0; i < m_children.size(); ++i) {
+        if (!m_children[i]->equals(other_alternatives.m_children[i]))
+            return false;
+    }
+    return true;
+}
+
+bool AlternativesSyntaxNode::contains_value_type(ValueType value_type) const
+{
+    for (auto const& child : m_children) {
+        if (child->contains_value_type(value_type))
+            return true;
+    }
+    return false;
+}
+
 void AlternativesSyntaxNode::dump(StringBuilder& builder, int indent) const
 {
     builder.appendff("{: >{}}Alternatives:\n", "", indent);
@@ -503121,7 +503396,7 @@ FILE: Libraries/LibWeb/CSS/Parser/Syntax.h
 #pragma once
 
 #include <AK/FlyString.h>
-#include <AK/NonnullOwnPtr.h>
+#include <AK/NonnullRefPtr.h>
 #include <AK/OwnPtr.h>
 #include <AK/String.h>
 #include <LibWeb/Export.h>
@@ -503129,7 +503404,7 @@ FILE: Libraries/LibWeb/CSS/Parser/Syntax.h
 
 namespace Web::CSS::Parser {
 
-class WEB_API SyntaxNode {
+class WEB_API SyntaxNode : public RefCounted<SyntaxNode> {
 public:
     enum class NodeType : u8 {
         Universal,
@@ -503144,6 +503419,14 @@ public:
 
     virtual ~SyntaxNode() = default;
     virtual String to_string() const = 0;
+
+    virtual bool equals(SyntaxNode const& other) const = 0;
+    virtual bool contains_value_type(ValueType) const = 0;
+    bool operator==(SyntaxNode const& other) const
+    {
+        return this->equals(other);
+    }
+
     virtual void dump(StringBuilder&, int indent) const = 0;
     String dump() const;
 
@@ -503160,13 +503443,15 @@ private:
 // '*'
 class UniversalSyntaxNode final : public SyntaxNode {
 public:
-    static NonnullOwnPtr<UniversalSyntaxNode> create()
+    static NonnullRefPtr<UniversalSyntaxNode> create()
     {
-        return adopt_own(*new UniversalSyntaxNode());
+        return adopt_ref(*new UniversalSyntaxNode());
     }
 
     virtual ~UniversalSyntaxNode() override;
     virtual String to_string() const override;
+    virtual bool equals(SyntaxNode const& other) const override;
+    virtual bool contains_value_type(ValueType) const override;
     virtual void dump(StringBuilder&, int indent) const override;
 
 private:
@@ -503176,9 +503461,9 @@ private:
 // 'foo'
 class IdentSyntaxNode final : public SyntaxNode {
 public:
-    static NonnullOwnPtr<IdentSyntaxNode> create(FlyString ident, CaseSensitivity case_sensitivity)
+    static NonnullRefPtr<IdentSyntaxNode> create(FlyString ident, CaseSensitivity case_sensitivity)
     {
-        return adopt_own(*new IdentSyntaxNode(move(ident), case_sensitivity));
+        return adopt_ref(*new IdentSyntaxNode(move(ident), case_sensitivity));
     }
 
     virtual ~IdentSyntaxNode() override;
@@ -503186,6 +503471,8 @@ public:
     CaseSensitivity case_sensitivity() const { return m_case_sensitivity; }
 
     virtual String to_string() const override;
+    virtual bool equals(SyntaxNode const& other) const override;
+    virtual bool contains_value_type(ValueType) const override;
     virtual void dump(StringBuilder&, int indent) const override;
 
 private:
@@ -503197,13 +503484,15 @@ private:
 // '<foo>'
 class TypeSyntaxNode final : public SyntaxNode {
 public:
-    static NonnullOwnPtr<TypeSyntaxNode> create(FlyString type_name);
+    static NonnullRefPtr<TypeSyntaxNode> create(FlyString type_name);
     virtual ~TypeSyntaxNode() override;
 
     FlyString const& type_name() const { return m_type_name; }
     Optional<ValueType> const& value_type() const { return m_value_type; }
 
     virtual String to_string() const override;
+    virtual bool equals(SyntaxNode const& other) const override;
+    virtual bool contains_value_type(ValueType) const override;
     virtual void dump(StringBuilder&, int indent) const override;
 
 private:
@@ -503215,58 +503504,64 @@ private:
 // '+'
 class MultiplierSyntaxNode final : public SyntaxNode {
 public:
-    static NonnullOwnPtr<MultiplierSyntaxNode> create(NonnullOwnPtr<SyntaxNode> child)
+    static NonnullRefPtr<MultiplierSyntaxNode> create(NonnullRefPtr<SyntaxNode> child)
     {
-        return adopt_own(*new MultiplierSyntaxNode(move(child)));
+        return adopt_ref(*new MultiplierSyntaxNode(move(child)));
     }
 
     virtual ~MultiplierSyntaxNode() override;
     SyntaxNode const& child() const { return *m_child; }
 
     virtual String to_string() const override;
+    virtual bool equals(SyntaxNode const& other) const override;
+    virtual bool contains_value_type(ValueType) const override;
     virtual void dump(StringBuilder&, int indent) const override;
 
 private:
-    MultiplierSyntaxNode(NonnullOwnPtr<SyntaxNode>);
-    NonnullOwnPtr<SyntaxNode> m_child;
+    MultiplierSyntaxNode(NonnullRefPtr<SyntaxNode>);
+    NonnullRefPtr<SyntaxNode> m_child;
 };
 
 // '#'
 class CommaSeparatedMultiplierSyntaxNode final : public SyntaxNode {
 public:
-    static NonnullOwnPtr<CommaSeparatedMultiplierSyntaxNode> create(NonnullOwnPtr<SyntaxNode> child)
+    static NonnullRefPtr<CommaSeparatedMultiplierSyntaxNode> create(NonnullRefPtr<SyntaxNode> child)
     {
-        return adopt_own(*new CommaSeparatedMultiplierSyntaxNode(move(child)));
+        return adopt_ref(*new CommaSeparatedMultiplierSyntaxNode(move(child)));
     }
 
     virtual ~CommaSeparatedMultiplierSyntaxNode() override;
     SyntaxNode const& child() const { return *m_child; }
 
     virtual String to_string() const override;
+    virtual bool equals(SyntaxNode const& other) const override;
+    virtual bool contains_value_type(ValueType) const override;
     virtual void dump(StringBuilder&, int indent) const override;
 
 private:
-    CommaSeparatedMultiplierSyntaxNode(NonnullOwnPtr<SyntaxNode>);
-    NonnullOwnPtr<SyntaxNode> m_child;
+    CommaSeparatedMultiplierSyntaxNode(NonnullRefPtr<SyntaxNode>);
+    NonnullRefPtr<SyntaxNode> m_child;
 };
 
 // Options separated by '|'
 class AlternativesSyntaxNode final : public SyntaxNode {
 public:
-    static NonnullOwnPtr<AlternativesSyntaxNode> create(Vector<NonnullOwnPtr<SyntaxNode>> children)
+    static NonnullRefPtr<AlternativesSyntaxNode> create(Vector<NonnullRefPtr<SyntaxNode>> children)
     {
-        return adopt_own(*new AlternativesSyntaxNode(move(children)));
+        return adopt_ref(*new AlternativesSyntaxNode(move(children)));
     }
 
     virtual ~AlternativesSyntaxNode() override;
-    ReadonlySpan<NonnullOwnPtr<SyntaxNode>> children() const { return m_children; }
+    ReadonlySpan<NonnullRefPtr<SyntaxNode>> children() const { return m_children; }
 
     virtual String to_string() const override;
+    virtual bool equals(SyntaxNode const& other) const override;
+    virtual bool contains_value_type(ValueType) const override;
     virtual void dump(StringBuilder&, int indent) const override;
 
 private:
-    AlternativesSyntaxNode(Vector<NonnullOwnPtr<SyntaxNode>>);
-    Vector<NonnullOwnPtr<SyntaxNode>> m_children;
+    AlternativesSyntaxNode(Vector<NonnullRefPtr<SyntaxNode>>);
+    Vector<NonnullRefPtr<SyntaxNode>> m_children;
 };
 
 }
@@ -503294,7 +503589,7 @@ FILE: Libraries/LibWeb/CSS/Parser/SyntaxParsing.cpp
 
 namespace Web::CSS::Parser {
 
-static OwnPtr<SyntaxNode> parse_syntax_single_component(TokenStream<ComponentValue>& tokens, LimitSingleComponentIdentToCustomIdent limit_single_component_ident_to_custom_ident)
+static RefPtr<SyntaxNode> parse_syntax_single_component(TokenStream<ComponentValue>& tokens, LimitSingleComponentIdentToCustomIdent limit_single_component_ident_to_custom_ident)
 {
     // <syntax-single-component> = '<' <syntax-type-name> '>' | <ident>
     // <syntax-type-name> = angle | color | custom-ident | image | integer
@@ -503362,7 +503657,7 @@ static Optional<char> parse_syntax_multiplier(TokenStream<ComponentValue>& token
     return {};
 }
 
-OwnPtr<SyntaxNode> parse_syntax_component(TokenStream<ComponentValue>& tokens, LimitSingleComponentIdentToCustomIdent limit_single_component_ident_to_custom_ident)
+RefPtr<SyntaxNode> parse_syntax_component(TokenStream<ComponentValue>& tokens, LimitSingleComponentIdentToCustomIdent limit_single_component_ident_to_custom_ident)
 {
     // <syntax-component> = <syntax-single-component> <syntax-multiplier>?
     //                    | '<' transform-list '>'
@@ -503423,7 +503718,7 @@ static Optional<char> parse_syntax_combinator(TokenStream<ComponentValue>& token
 }
 
 // https://drafts.csswg.org/css-values-5/#typedef-syntax
-OwnPtr<SyntaxNode> parse_as_syntax(Vector<ComponentValue> const& component_values, LimitSingleComponentIdentToCustomIdent limit_single_component_ident_to_custom_ident)
+RefPtr<SyntaxNode> parse_as_syntax(Vector<ComponentValue> const& component_values, LimitSingleComponentIdentToCustomIdent limit_single_component_ident_to_custom_ident)
 {
     // <syntax> = '*' | <syntax-component> [ <syntax-combinator> <syntax-component> ]* | <syntax-string>
     // <syntax-component> = <syntax-single-component> <syntax-multiplier>?
@@ -503469,7 +503764,7 @@ OwnPtr<SyntaxNode> parse_as_syntax(Vector<ComponentValue> const& component_value
     auto first = parse_syntax_component(tokens, limit_single_component_ident_to_custom_ident);
     if (!first)
         return nullptr;
-    Vector<NonnullOwnPtr<SyntaxNode>> syntax_components;
+    Vector<NonnullRefPtr<SyntaxNode>> syntax_components;
     syntax_components.append(first.release_nonnull());
 
     tokens.discard_whitespace();
@@ -503649,8 +503944,8 @@ enum class LimitSingleComponentIdentToCustomIdent : u8 {
     No,
     Yes,
 };
-WEB_API OwnPtr<SyntaxNode> parse_as_syntax(Vector<ComponentValue> const&, LimitSingleComponentIdentToCustomIdent = LimitSingleComponentIdentToCustomIdent::No);
-OwnPtr<SyntaxNode> parse_syntax_component(TokenStream<ComponentValue>&, LimitSingleComponentIdentToCustomIdent = LimitSingleComponentIdentToCustomIdent::No);
+WEB_API RefPtr<SyntaxNode> parse_as_syntax(Vector<ComponentValue> const&, LimitSingleComponentIdentToCustomIdent = LimitSingleComponentIdentToCustomIdent::No);
+RefPtr<SyntaxNode> parse_syntax_component(TokenStream<ComponentValue>&, LimitSingleComponentIdentToCustomIdent = LimitSingleComponentIdentToCustomIdent::No);
 
 NonnullRefPtr<StyleValue const> parse_with_a_syntax(ParsingParams const&, Vector<ComponentValue> const& input, SyntaxNode const& syntax);
 
@@ -511982,7 +512277,10 @@ NonnullRefPtr<StyleValue const> Parser::resolve_unresolved_style_value(DOM::Abst
 
     // 1. Substitute arbitrary substitution functions in prop’s value, given «"property", prop’s name» as the
     //    substitution context. Let result be the returned component value sequence.
-    auto result = substitute_arbitrary_substitution_functions(element, guarded_contexts, unresolved.values(), SubstitutionContext { SubstitutionContext::DependencyType::Property, property.to_string() });
+    auto replacement_context = ArbitrarySubstitutionReplacementContext {
+        .computed_style_for_custom_property_resolution = m_computed_style_for_custom_property_resolution,
+    };
+    auto result = substitute_arbitrary_substitution_functions(element, guarded_contexts, replacement_context, unresolved.values(), SubstitutionContext { SubstitutionContext::DependencyType::Property, property.to_string() });
 
     // 2. If result contains the guaranteed-invalid value, prop is invalid at computed-value time; return.
     if (contains_guaranteed_invalid_value(result))
@@ -523422,7 +523720,7 @@ FILE: Libraries/LibWeb/CSS/StyleComputer.cpp
 /*
  * Copyright (c) 2018-2025, Andreas Kling <andreas@ladybird.org>
  * Copyright (c) 2021, the SerenityOS developers.
- * Copyright (c) 2021-2025, Sam Atkins <sam@ladybird.org>
+ * Copyright (c) 2021-2026, Sam Atkins <sam@ladybird.org>
  * Copyright (c) 2024, Matthew Olsson <mattco@serenityos.org>
  *
  * SPDX-License-Identifier: BSD-2-Clause
@@ -523462,11 +523760,13 @@ FILE: Libraries/LibWeb/CSS/StyleComputer.cpp
 #include <LibWeb/CSS/CascadedProperties.h>
 #include <LibWeb/CSS/ComputedProperties.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
+#include <LibWeb/CSS/CustomPropertyRegistration.h>
 #include <LibWeb/CSS/FontComputer.h>
 #include <LibWeb/CSS/Interpolation.h>
 #include <LibWeb/CSS/InvalidationSet.h>
 #include <LibWeb/CSS/Parser/ArbitrarySubstitutionFunctions.h>
 #include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/Parser/SyntaxParsing.h>
 #include <LibWeb/CSS/PropertyNameAndID.h>
 #include <LibWeb/CSS/SelectorEngine.h>
 #include <LibWeb/CSS/StyleComputer.h>
@@ -525826,7 +526126,7 @@ void StyleComputer::compute_property_values(ComputedProperties::Builder& builder
     }
 }
 
-ComputationContext const& StyleComputer::get_computation_context_for_property(PropertyID property_id, ComputedProperties const& style, Optional<DOM::AbstractElement> abstract_element) const
+ComputationContext StyleComputer::make_computation_context_for_property(PropertyID property_id, ComputedProperties const& style, Optional<DOM::AbstractElement> abstract_element) const
 {
     auto subject_inline_axis_is_horizontal = [&]() {
         if (!abstract_element.has_value())
@@ -525861,76 +526161,101 @@ ComputationContext const& StyleComputer::get_computation_context_for_property(Pr
     case PropertyID::FontWidth:
     case PropertyID::MathDepth:
     case PropertyID::TextRendering: {
-        if (!m_cached_font_computation_context.has_value()) {
-            auto inheritance_parent = abstract_element.map([](auto& element) { return element.element_to_inherit_style_from(); }).value_or(OptionalNone {});
-            auto length_resolution_context = inheritance_parent.has_value()
-                ? Length::ResolutionContext::for_element(inheritance_parent.value())
-                : Length::ResolutionContext::for_document(m_document);
-            length_resolution_context.subject_inline_axis_is_horizontal = subject_inline_axis_is_horizontal;
-            length_resolution_context.subject_element = abstract_element.has_value() ? &abstract_element->element() : nullptr;
+        auto inheritance_parent = abstract_element.map([](auto& element) { return element.element_to_inherit_style_from(); }).value_or(OptionalNone {});
+        auto length_resolution_context = inheritance_parent.has_value()
+            ? Length::ResolutionContext::for_element(inheritance_parent.value())
+            : Length::ResolutionContext::for_document(m_document);
+        length_resolution_context.subject_inline_axis_is_horizontal = subject_inline_axis_is_horizontal;
+        length_resolution_context.subject_element = abstract_element.has_value() ? &abstract_element->element() : nullptr;
 
-            m_cached_font_computation_context = {
-                .length_resolution_context = length_resolution_context,
-                .abstract_element = abstract_element
-            };
-        }
-
-        return m_cached_font_computation_context.value();
+        return {
+            .length_resolution_context = length_resolution_context,
+            .abstract_element = abstract_element
+        };
     }
     case PropertyID::LineHeight: {
-        if (!m_cached_line_height_computation_context.has_value()) {
-            auto inheritance_parent = abstract_element.map([](auto& element) { return element.element_to_inherit_style_from(); }).value_or(OptionalNone {});
+        auto inheritance_parent = abstract_element.map([](auto& element) { return element.element_to_inherit_style_from(); }).value_or(OptionalNone {});
 
-            auto line_height_font_metrics = Length::FontMetrics {
-                style.font_size(),
-                style.first_available_computed_font(document().font_computer())->pixel_metrics(),
-                inheritance_parent.has_value() ? inheritance_parent->computed_properties()->line_height() : InitialValues::line_height()
-            };
+        auto line_height_font_metrics = Length::FontMetrics {
+            style.font_size(),
+            style.first_available_computed_font(document().font_computer())->pixel_metrics(),
+            inheritance_parent.has_value() ? inheritance_parent->computed_properties()->line_height() : InitialValues::line_height()
+        };
 
-            m_cached_line_height_computation_context = {
-                .length_resolution_context = {
-                    .viewport_rect = viewport_rect(),
-                    .font_metrics = line_height_font_metrics,
-                    .root_font_metrics = abstract_element.has_value() && abstract_element->element().is_html_html_element()
-                        ? line_height_font_metrics
-                        : m_root_element_font_metrics,
-                    .font_metrics_depend_on_viewport_metrics = style.font_metrics_depend_on_viewport_metrics(),
-                    .root_font_metrics_depend_on_viewport_metrics = abstract_element.has_value() && abstract_element->element().is_html_html_element()
-                        ? style.font_metrics_depend_on_viewport_metrics()
-                        : m_root_element_font_metrics_depend_on_viewport_metrics,
-                    .subject_inline_axis_is_horizontal = subject_inline_axis_is_horizontal,
-                    .subject_element = abstract_element.has_value() ? &abstract_element->element() : nullptr,
-                },
-                .abstract_element = abstract_element
-            };
-        }
-
-        return m_cached_line_height_computation_context.value();
+        return {
+            .length_resolution_context = {
+                .viewport_rect = viewport_rect(),
+                .font_metrics = line_height_font_metrics,
+                .root_font_metrics = abstract_element.has_value() && abstract_element->element().is_html_html_element()
+                    ? line_height_font_metrics
+                    : m_root_element_font_metrics,
+                .font_metrics_depend_on_viewport_metrics = style.font_metrics_depend_on_viewport_metrics(),
+                .root_font_metrics_depend_on_viewport_metrics = abstract_element.has_value() && abstract_element->element().is_html_html_element()
+                    ? style.font_metrics_depend_on_viewport_metrics()
+                    : m_root_element_font_metrics_depend_on_viewport_metrics,
+                .subject_inline_axis_is_horizontal = subject_inline_axis_is_horizontal,
+                .subject_element = abstract_element.has_value() ? &abstract_element->element() : nullptr,
+            },
+            .abstract_element = abstract_element
+        };
     }
     default: {
-        if (!m_cached_generic_computation_context.has_value()) {
-            m_cached_generic_computation_context = {
-                .length_resolution_context = {
-                    .viewport_rect = viewport_rect(),
-                    .font_metrics = {
-                        style.font_size(),
-                        style.first_available_computed_font(document().font_computer())->pixel_metrics(),
-                        style.line_height() },
-                    .root_font_metrics = m_root_element_font_metrics,
-                    .font_metrics_depend_on_viewport_metrics = style.font_metrics_depend_on_viewport_metrics(),
-                    .root_font_metrics_depend_on_viewport_metrics = abstract_element.has_value() && abstract_element->element().is_html_html_element() ? style.font_metrics_depend_on_viewport_metrics() : m_root_element_font_metrics_depend_on_viewport_metrics,
-                    .subject_inline_axis_is_horizontal = subject_inline_axis_is_horizontal,
-                    .subject_element = abstract_element.has_value() ? &abstract_element->element() : nullptr,
-                },
-                .abstract_element = abstract_element,
-                .color_scheme = style.color_scheme(document().page().preferred_color_scheme(), document().supported_color_schemes())
-            };
-        }
-        return m_cached_generic_computation_context.value();
+        return {
+            .length_resolution_context = {
+                .viewport_rect = viewport_rect(),
+                .font_metrics = {
+                    style.font_size(),
+                    style.first_available_computed_font(document().font_computer())->pixel_metrics(),
+                    style.line_height() },
+                .root_font_metrics = m_root_element_font_metrics,
+                .font_metrics_depend_on_viewport_metrics = style.font_metrics_depend_on_viewport_metrics(),
+                .root_font_metrics_depend_on_viewport_metrics = abstract_element.has_value() && abstract_element->element().is_html_html_element() ? style.font_metrics_depend_on_viewport_metrics() : m_root_element_font_metrics_depend_on_viewport_metrics,
+                .subject_inline_axis_is_horizontal = subject_inline_axis_is_horizontal,
+                .subject_element = abstract_element.has_value() ? &abstract_element->element() : nullptr,
+            },
+            .abstract_element = abstract_element,
+            .color_scheme = style.color_scheme(document().page().preferred_color_scheme(), document().supported_color_schemes())
+        };
     }
     }
 
     VERIFY_NOT_REACHED();
+}
+
+ComputationContext const& StyleComputer::get_computation_context_for_property(PropertyID property_id, ComputedProperties const& style, Optional<DOM::AbstractElement> abstract_element) const
+{
+    switch (property_id) {
+    case PropertyID::ColorScheme:
+    case PropertyID::FontFamily:
+    case PropertyID::FontFeatureSettings:
+    case PropertyID::FontKerning:
+    case PropertyID::FontOpticalSizing:
+    case PropertyID::FontSize:
+    case PropertyID::FontStyle:
+    case PropertyID::FontVariantAlternates:
+    case PropertyID::FontVariantCaps:
+    case PropertyID::FontVariantEastAsian:
+    case PropertyID::FontVariantEmoji:
+    case PropertyID::FontVariantLigatures:
+    case PropertyID::FontVariantNumeric:
+    case PropertyID::FontVariantPosition:
+    case PropertyID::FontVariationSettings:
+    case PropertyID::FontWeight:
+    case PropertyID::FontWidth:
+    case PropertyID::MathDepth:
+    case PropertyID::TextRendering:
+        if (!m_cached_font_computation_context.has_value())
+            m_cached_font_computation_context = make_computation_context_for_property(property_id, style, abstract_element);
+        return m_cached_font_computation_context.value();
+    case PropertyID::LineHeight:
+        if (!m_cached_line_height_computation_context.has_value())
+            m_cached_line_height_computation_context = make_computation_context_for_property(property_id, style, abstract_element);
+        return m_cached_line_height_computation_context.value();
+    default:
+        if (!m_cached_generic_computation_context.has_value())
+            m_cached_generic_computation_context = make_computation_context_for_property(property_id, style, abstract_element);
+        return m_cached_generic_computation_context.value();
+    }
 }
 
 void StyleComputer::resolve_effective_overflow_values(ComputedProperties::Builder& builder) const
@@ -526946,44 +527271,140 @@ static bool matches_subject_pseudo_class_bucket(PseudoClass pseudo_class, DOM::E
     }
 }
 
-NonnullRefPtr<StyleValue const> StyleComputer::compute_value_of_custom_property(DOM::AbstractElement abstract_element, Utf16FlyString const& name, Optional<Parser::GuardedSubstitutionContexts&> guarded_contexts)
+static NonnullRefPtr<StyleValue const> compute_inherited_custom_property_value(DOM::AbstractElement abstract_element, Utf16FlyString const& name, Optional<Parser::GuardedSubstitutionContexts&> guarded_contexts)
+{
+    auto element_to_inherit_style_from = abstract_element.element_to_inherit_style_from();
+    if (!element_to_inherit_style_from.has_value())
+        return abstract_element.document().custom_property_initial_value(name);
+    auto parent_data = inheritable_custom_property_data(element_to_inherit_style_from.value());
+    if (parent_data) {
+        auto const* parent_property = parent_data->get(name);
+        if (parent_property)
+            return parent_property->value;
+    }
+    return StyleComputer::compute_value_of_custom_property(element_to_inherit_style_from.value(), name, guarded_contexts);
+}
+
+template<typename ComputeRegisteredValue>
+static NonnullRefPtr<StyleValue const> compute_value_of_custom_property_impl(DOM::AbstractElement abstract_element, Utf16FlyString const& name, Optional<Parser::GuardedSubstitutionContexts&> guarded_contexts, ComputedProperties const* computed_style_for_custom_property_resolution, ComputeRegisteredValue compute_registered_value)
 {
     // https://drafts.csswg.org/css-variables/#propdef-
     // The computed value of a custom property is its specified value with any arbitrary-substitution functions replaced.
     // FIXME: These should probably be part of ComputedProperties.
     auto& document = abstract_element.document();
+    auto registration = document.get_registered_custom_property(name);
 
     auto value = abstract_element.get_custom_property(name);
     if (!value || value->is_initial())
         return document.custom_property_initial_value(name);
 
-    // Unset is the same as inherit for inherited properties, and by default all custom properties are inherited.
-    // FIXME: Support non-inherited registered custom properties.
-    if (value->is_inherit() || value->is_unset()) {
-        auto element_to_inherit_style_from = abstract_element.element_to_inherit_style_from();
-        if (!element_to_inherit_style_from.has_value())
-            return document.custom_property_initial_value(name);
-        auto inherited_value = element_to_inherit_style_from->get_custom_property(name);
-        if (!inherited_value)
-            return document.custom_property_initial_value(name);
-        return inherited_value.release_nonnull();
-    }
+    if (value->is_inherit())
+        return compute_inherited_custom_property_value(abstract_element, name, guarded_contexts);
+
+    // Unset is the same as inherit for inherited properties, and by default all unregistered custom properties inherit.
+    if (value->is_unset())
+        return registration.has_value() && !registration->inherit ? document.custom_property_initial_value(name) : compute_inherited_custom_property_value(abstract_element, name, guarded_contexts);
 
     if (value->is_revert()) {
         // FIXME: Implement reverting custom properties.
+        return value.release_nonnull();
     }
     if (value->is_revert_layer()) {
         // FIXME: Implement reverting custom properties.
+        return value.release_nonnull();
     }
 
-    if (!value->is_unresolved() || !value->as_unresolved().contains_arbitrary_substitution_function())
-        return value.release_nonnull();
+    NonnullRefPtr<StyleValue const> resolved_value = value.release_nonnull();
 
-    auto& unresolved = value->as_unresolved();
-    return Parser::Parser::resolve_unresolved_style_value(Parser::ParsingParams {}, abstract_element, PropertyNameAndID::from_name(name).release_value(), unresolved, guarded_contexts);
+    if (resolved_value->is_unresolved() && resolved_value->as_unresolved().contains_arbitrary_substitution_function()) {
+        auto& unresolved = resolved_value->as_unresolved();
+        auto parsing_params = Parser::ParsingParams { document };
+        parsing_params.computed_style_for_custom_property_resolution = computed_style_for_custom_property_resolution;
+        resolved_value = Parser::Parser::resolve_unresolved_style_value(parsing_params, abstract_element, PropertyNameAndID::from_name(name).release_value(), unresolved, guarded_contexts);
+    }
+
+    auto invalid_custom_property_fallback_value = [&](NonnullRefPtr<StyleValue const> invalid_value) {
+        // https://drafts.csswg.org/css-values-5/#invalid-substitution
+        // When property replacement results in a property’s value containing the guaranteed-invalid value, this makes
+        // the declaration invalid at computed-value time. When this happens, the computed value is one of the
+        // following depending on the property’s type:
+
+        // -> The property is a non-registered custom property
+        // -> The property is a registered custom property with universal syntax
+        if (!registration.has_value() || registration->syntax->type() == Parser::SyntaxNode::NodeType::Universal) {
+            // The computed value is the guaranteed-invalid value.
+            return invalid_value;
+        }
+
+        // -> Otherwise
+        {
+            // Either the property’s inherited value or its initial value depending on whether the property is
+            // inherited or not, respectively, as if the property’s value had been specified as the unset keyword.
+            if (registration->inherit)
+                return compute_inherited_custom_property_value(abstract_element, name, guarded_contexts);
+            return abstract_element.document().custom_property_initial_value(name);
+        }
+    };
+
+    if (resolved_value->is_guaranteed_invalid())
+        return invalid_custom_property_fallback_value(move(resolved_value));
+
+    if (!registration.has_value() || registration->syntax->type() == Parser::SyntaxNode::NodeType::Universal)
+        return resolved_value;
+
+    auto resolved_value_contains_attr_tainted_values = resolved_value->is_unresolved() && resolved_value->as_unresolved().contains_attr_tainted_values();
+    auto parsing_params = Parser::ParsingParams { document };
+    parsing_params.value_context.append(PropertyID::Custom);
+    auto parsed_value = Parser::parse_with_a_syntax(parsing_params, resolved_value->tokenize(), registration->syntax);
+    if (parsed_value->is_guaranteed_invalid())
+        return invalid_custom_property_fallback_value(move(parsed_value));
+
+    auto computed_value = compute_registered_value(*registration, move(parsed_value));
+    if (resolved_value_contains_attr_tainted_values)
+        return UnresolvedStyleValue::create(computed_value->tokenize(), {}, {}, UnresolvedStyleValue::SourceTextMode::Trim, true);
+    return computed_value;
 }
 
-void StyleComputer::compute_custom_properties(ComputedProperties&, DOM::AbstractElement abstract_element) const
+ComputationContext StyleComputer::fallback_computation_context_for_custom_property(DOM::AbstractElement const& abstract_element) const
+{
+    if (auto const* style = abstract_element.computed_properties())
+        return make_computation_context_for_property(PropertyID::Color, *style, abstract_element);
+
+    if (auto parent = abstract_element.element_to_inherit_style_from(); parent.has_value() && parent->computed_properties())
+        return make_computation_context_for_property(PropertyID::Color, *parent->computed_properties(), abstract_element);
+
+    auto length_resolution_context = Length::ResolutionContext::for_document(document());
+    length_resolution_context.subject_element = &abstract_element.element();
+    return {
+        .length_resolution_context = length_resolution_context,
+        .abstract_element = abstract_element,
+    };
+}
+
+NonnullRefPtr<StyleValue const> StyleComputer::compute_value_of_custom_property(DOM::AbstractElement abstract_element, Utf16FlyString const& name, Optional<Parser::GuardedSubstitutionContexts&> guarded_contexts)
+{
+    return compute_value_of_custom_property_impl(abstract_element, name, guarded_contexts, nullptr, [&](CustomPropertyRegistration const& registration, NonnullRefPtr<StyleValue const> parsed_value) {
+        // In the fallback path we may be resolving var() before this element's new ComputedProperties have been
+        // installed. Avoid freezing relative values against stale metrics; the consuming property can still compute
+        // them with its own context.
+        if (!parsed_value->is_computationally_independent())
+            return parsed_value;
+
+        auto const& style_computer = abstract_element.document().style_computer();
+        auto computation_context = style_computer.fallback_computation_context_for_custom_property(abstract_element);
+        return compute_registered_custom_property_value(registration, move(parsed_value), computation_context);
+    });
+}
+
+NonnullRefPtr<StyleValue const> StyleComputer::compute_value_of_custom_property(ComputedProperties const& computed_style, DOM::AbstractElement abstract_element, Utf16FlyString const& name, Optional<Parser::GuardedSubstitutionContexts&> guarded_contexts) const
+{
+    auto const& computation_context = get_computation_context_for_property(PropertyID::Color, computed_style, abstract_element);
+    return compute_value_of_custom_property_impl(abstract_element, name, guarded_contexts, &computed_style, [&](CustomPropertyRegistration const& registration, NonnullRefPtr<StyleValue const> parsed_value) {
+        return compute_registered_custom_property_value(registration, move(parsed_value), computation_context);
+    });
+}
+
+void StyleComputer::compute_custom_properties(ComputedProperties& computed_style, DOM::AbstractElement abstract_element) const
 {
     // https://drafts.csswg.org/css-variables/#propdef-
     // The computed value of a custom property is its specified value with any arbitrary-substitution functions replaced.
@@ -527010,7 +527431,7 @@ void StyleComputer::compute_custom_properties(ComputedProperties&, DOM::Abstract
 
     OrderedHashMap<Utf16FlyString, StyleProperty> resolved_own;
     for (auto const& [name, style_property] : data->own_values()) {
-        auto resolved_value = compute_value_of_custom_property(abstract_element, name);
+        auto resolved_value = compute_value_of_custom_property(computed_style, abstract_element, name);
         if (parent_data) {
             auto const* parent_property = parent_data->get(name);
             if (parent_property && resolved_value->equals(*parent_property->value))
@@ -528102,6 +528523,7 @@ public:
     [[nodiscard]] inline bool should_reject_with_ancestor_filter(Selector const&) const;
 
     static NonnullRefPtr<StyleValue const> compute_value_of_custom_property(DOM::AbstractElement, Utf16FlyString const& custom_property, Optional<Parser::GuardedSubstitutionContexts&> = {});
+    NonnullRefPtr<StyleValue const> compute_value_of_custom_property(ComputedProperties const&, DOM::AbstractElement, Utf16FlyString const& custom_property, Optional<Parser::GuardedSubstitutionContexts&> = {}) const;
 
     static NonnullRefPtr<StyleValue const> compute_value_of_property(PropertyID, NonnullRefPtr<StyleValue const> const& specified_value, Function<NonnullRefPtr<StyleValue const>(PropertyID)> const& get_property_specified_value, ComputationContext const&, double device_pixels_per_css_pixel);
     static NonnullRefPtr<StyleValue const> compute_animation_name(NonnullRefPtr<StyleValue const> const& absolutized_value);
@@ -528193,7 +528615,9 @@ private:
     mutable Optional<ComputationContext> m_cached_font_computation_context;
     mutable Optional<ComputationContext> m_cached_line_height_computation_context;
     mutable Optional<ComputationContext> m_cached_generic_computation_context;
+    ComputationContext make_computation_context_for_property(PropertyID, ComputedProperties const&, Optional<DOM::AbstractElement>) const;
     ComputationContext const& get_computation_context_for_property(PropertyID, ComputedProperties const&, Optional<DOM::AbstractElement>) const;
+    ComputationContext fallback_computation_context_for_custom_property(DOM::AbstractElement const&) const;
     void clear_computation_context_caches() const
     {
         const_cast<StyleComputer*>(this)->m_cached_font_computation_context = {};
@@ -533780,6 +534204,13 @@ AngleStyleValue::AngleStyleValue(Angle angle)
 
 AngleStyleValue::~AngleStyleValue() = default;
 
+ValueComparingNonnullRefPtr<StyleValue const> AngleStyleValue::absolutized(ComputationContext const&) const
+{
+    if (m_angle.unit() == canonical_angle_unit())
+        return *this;
+    return create(Angle::make_degrees(m_angle.to_degrees()));
+}
+
 void AngleStyleValue::serialize(StringBuilder& builder, SerializationMode mode) const
 {
     m_angle.serialize(builder, mode);
@@ -533823,6 +534254,8 @@ public:
     Angle const& angle() const { return m_angle; }
     virtual double raw_value() const override { return m_angle.raw_value(); }
     virtual FlyString unit_name() const override { return m_angle.unit_name(); }
+
+    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
 
     virtual void serialize(StringBuilder&, SerializationMode) const override;
 
@@ -543391,6 +543824,34 @@ private:
 
 }
 
+FILE: Libraries/LibWeb/CSS/StyleValues/FrequencyStyleValue.cpp
+/*
+ * Copyright (c) 2026, Sam Atkins <sam@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include "FrequencyStyleValue.h"
+
+namespace Web::CSS {
+
+ValueComparingNonnullRefPtr<StyleValue const> FrequencyStyleValue::absolutized(ComputationContext const&) const
+{
+    if (m_frequency.unit() == canonical_frequency_unit())
+        return *this;
+    return create(Frequency::make_hertz(m_frequency.to_hertz()));
+}
+
+bool FrequencyStyleValue::equals(StyleValue const& other) const
+{
+    if (type() != other.type())
+        return false;
+    auto const& other_frequency = other.as_frequency();
+    return m_frequency == other_frequency.m_frequency;
+}
+
+}
+
 FILE: Libraries/LibWeb/CSS/StyleValues/FrequencyStyleValue.h
 /*
  * Copyright (c) 2018-2020, Andreas Kling <andreas@ladybird.org>
@@ -543420,15 +543881,11 @@ public:
     virtual double raw_value() const override { return m_frequency.raw_value(); }
     virtual FlyString unit_name() const override { return m_frequency.unit_name(); }
 
+    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
+
     virtual void serialize(StringBuilder& builder, SerializationMode mode) const override { m_frequency.serialize(builder, mode); }
 
-    bool equals(StyleValue const& other) const override
-    {
-        if (type() != other.type())
-            return false;
-        auto const& other_frequency = other.as_frequency();
-        return m_frequency == other_frequency.m_frequency;
-    }
+    bool equals(StyleValue const& other) const override;
 
     virtual bool is_computationally_independent() const override { return true; }
 
@@ -547149,6 +547606,34 @@ private:
 
 }
 
+FILE: Libraries/LibWeb/CSS/StyleValues/ResolutionStyleValue.cpp
+/*
+ * Copyright (c) 2026, Sam Atkins <sam@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include "ResolutionStyleValue.h"
+
+namespace Web::CSS {
+
+ValueComparingNonnullRefPtr<StyleValue const> ResolutionStyleValue::absolutized(ComputationContext const&) const
+{
+    if (m_resolution.unit() == canonical_resolution_unit())
+        return *this;
+    return create(Resolution::make_dots_per_pixel(m_resolution.to_dots_per_pixel()));
+}
+
+bool ResolutionStyleValue::equals(StyleValue const& other) const
+{
+    if (type() != other.type())
+        return false;
+    auto const& other_resolution = other.as_resolution();
+    return m_resolution == other_resolution.m_resolution;
+}
+
+}
+
 FILE: Libraries/LibWeb/CSS/StyleValues/ResolutionStyleValue.h
 /*
  * Copyright (c) 2022-2024, Sam Atkins <sam@ladybird.org>
@@ -547175,17 +547660,13 @@ public:
     virtual double raw_value() const override { return m_resolution.raw_value(); }
     virtual FlyString unit_name() const override { return m_resolution.unit_name(); }
 
+    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
+
     virtual void serialize(StringBuilder& builder, SerializationMode mode) const override { m_resolution.serialize(builder, mode); }
 
     virtual bool is_computationally_independent() const override { return true; }
 
-    bool equals(StyleValue const& other) const override
-    {
-        if (type() != other.type())
-            return false;
-        auto const& other_resolution = other.as_resolution();
-        return m_resolution == other_resolution.m_resolution;
-    }
+    bool equals(StyleValue const& other) const override;
 
 private:
     explicit ResolutionStyleValue(Resolution resolution)
@@ -548796,7 +549277,7 @@ Vector<Parser::ComponentValue> StyleValue::tokenize() const
 {
     // This is an inefficient way of producing ComponentValues, but it's guaranteed to work for types that round-trip.
     // FIXME: Implement better versions in the subclasses.
-    return Parser::Parser::create(Parser::ParsingParams {}, to_string(SerializationMode::Normal)).parse_as_list_of_component_values();
+    return Parser::Parser::create(Parser::ParsingParams {}, to_string(SerializationMode::ResolvedValue)).parse_as_list_of_component_values();
 }
 
 // https://drafts.css-houdini.org/css-typed-om-1/#reify-as-a-cssstylevalue
@@ -549652,6 +550133,34 @@ private:
 
 }
 
+FILE: Libraries/LibWeb/CSS/StyleValues/TimeStyleValue.cpp
+/*
+ * Copyright (c) 2026, Sam Atkins <sam@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include "TimeStyleValue.h"
+
+namespace Web::CSS {
+
+ValueComparingNonnullRefPtr<StyleValue const> TimeStyleValue::absolutized(ComputationContext const&) const
+{
+    if (m_time.unit() == canonical_time_unit())
+        return *this;
+    return create(Time::make_seconds(m_time.to_seconds()));
+}
+
+bool TimeStyleValue::equals(StyleValue const& other) const
+{
+    if (type() != other.type())
+        return false;
+    auto const& other_time = other.as_time();
+    return m_time == other_time.m_time;
+}
+
+}
+
 FILE: Libraries/LibWeb/CSS/StyleValues/TimeStyleValue.h
 /*
  * Copyright (c) 2018-2020, Andreas Kling <andreas@ladybird.org>
@@ -549681,15 +550190,11 @@ public:
     virtual double raw_value() const override { return m_time.raw_value(); }
     virtual FlyString unit_name() const override { return m_time.unit_name(); }
 
+    virtual ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const override;
+
     virtual void serialize(StringBuilder& builder, SerializationMode mode) const override { m_time.serialize(builder, mode); }
 
-    bool equals(StyleValue const& other) const override
-    {
-        if (type() != other.type())
-            return false;
-        auto const& other_time = other.as_time();
-        return m_time == other_time.m_time;
-    }
+    bool equals(StyleValue const& other) const override;
 
     virtual bool is_computationally_independent() const override { return true; }
 
@@ -551013,6 +551518,7 @@ public:
 
     Vector<Parser::ComponentValue> values() const;
     bool contains_arbitrary_substitution_function() const { return m_substitution_functions_presence.has_any(); }
+    bool contains_attr_tainted_values() const { return m_contains_attr_tainted_values; }
     bool includes_attr_function() const { return m_substitution_functions_presence.attr; }
     bool includes_inherit_function() const { return m_substitution_functions_presence.inherit; }
     bool includes_if_function() const { return m_substitution_functions_presence.if_; }
@@ -557291,18 +557797,6 @@ static void relayout_svg_root(Layout::SVGSVGBox& svg_root)
     // Pre-populate the svg_root itself.
     if (auto paintable = svg_root.paintable_box())
         layout_state.populate_from_paintable(svg_root, *paintable);
-
-    // Pre-populate SVGGraphicsBox ancestors for get_parent_svg_transform().
-    for (auto* ancestor = svg_root.parent(); ancestor; ancestor = ancestor->parent()) {
-        if (auto const* svg_graphics_ancestor = as_if<Layout::SVGGraphicsBox>(*ancestor)) {
-            if (auto paintable = svg_graphics_ancestor->paintable_box())
-                layout_state.populate_from_paintable(*svg_graphics_ancestor, *paintable);
-        }
-        if (auto const* svg_svg_ancestor = as_if<Layout::SVGSVGBox>(*ancestor)) {
-            if (auto paintable = svg_svg_ancestor->paintable_box())
-                layout_state.populate_from_paintable(*svg_svg_ancestor, *paintable);
-        }
-    }
 
     // Pre-populate the viewport for position:fixed elements inside <foreignObject>.
     auto& viewport = svg_root.root();
@@ -564921,11 +565415,8 @@ Optional<CSS::CustomPropertyRegistration const&> Document::get_registered_custom
 NonnullRefPtr<CSS::StyleValue const> Document::custom_property_initial_value(Utf16FlyString const& name) const
 {
     auto maybe_custom_property = get_registered_custom_property(name);
-    if (maybe_custom_property.has_value()) {
-        if (maybe_custom_property->initial_value)
-            return *maybe_custom_property->initial_value;
-        return CSS::GuaranteedInvalidStyleValue::create();
-    }
+    if (maybe_custom_property.has_value())
+        return CSS::compute_registered_custom_property_initial_value(*this, maybe_custom_property.value());
 
     // For non-registered properties, the initial value is the guaranteed-invalid value.
     // See: https://drafts.csswg.org/css-variables/#propdef-
@@ -564939,7 +565430,7 @@ void Document::did_change_custom_property_registrations()
     // Custom property registration changes can alter inheritance and initial values even when no selector matching
     // changes. Registrations only move when a stylesheet containing an @property rule is added/removed or when
     // CSS.registerProperty() is called, so a full document restyle is cheap enough in practice.
-    invalidate_style(DOM::StyleInvalidationReason::Other);
+    invalidate_style(DOM::StyleInvalidationReason::CustomPropertyRegistrationChange);
 }
 
 void Document::build_registered_properties_cache()
@@ -589484,6 +589975,7 @@ namespace Web::DOM {
     X(CSSStylePropertiesSetPropertyStyleValue)      \
     X(CSSStylePropertiesTextChange)                 \
     X(CustomElementStateChange)                     \
+    X(CustomPropertyRegistrationChange)             \
     X(CustomStateSetChange)                         \
     X(EditingInsertion)                             \
     X(EditingDeletion)                              \
@@ -660478,577 +660970,3 @@ void HTMLInputElement::activation_behavior(DOM::Event const& event)
     if (!is_mutable() && !first_is_one_of(m_type, TypeAttributeState::Checkbox, TypeAttributeState::RadioButton))
         return;
 
-    // 2. Run element's input activation behavior, if any, and do nothing otherwise.
-    run_input_activation_behavior(event).release_value_but_fixme_should_propagate_errors();
-
-    // 3. If element has a form owner and element's type attribute is not in the Button state, then return.
-    if (form() != nullptr && type_state() != TypeAttributeState::Button)
-        return;
-
-    // 4. Run the popover target attribute activation behavior given element and event's target.
-    if (event.target() && event.target()->is_dom_node())
-        PopoverTargetAttributes::popover_target_activation_behaviour(*this, as<DOM::Node>(*event.target()));
-}
-
-bool HTMLInputElement::has_input_activation_behavior() const
-{
-    switch (type_state()) {
-    case TypeAttributeState::Checkbox:
-    case TypeAttributeState::Color:
-    case TypeAttributeState::FileUpload:
-    case TypeAttributeState::ImageButton:
-    case TypeAttributeState::RadioButton:
-    case TypeAttributeState::ResetButton:
-    case TypeAttributeState::SubmitButton:
-        return true;
-    default:
-        return false;
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#do-not-apply
-bool HTMLInputElement::select_applies() const
-{
-    switch (type_state()) {
-    case TypeAttributeState::Button:
-    case TypeAttributeState::Checkbox:
-    case TypeAttributeState::Hidden:
-    case TypeAttributeState::ImageButton:
-    case TypeAttributeState::RadioButton:
-    case TypeAttributeState::Range:
-    case TypeAttributeState::ResetButton:
-    case TypeAttributeState::SubmitButton:
-        return false;
-    default:
-        return true;
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#do-not-apply
-bool HTMLInputElement::selection_or_range_applies() const
-{
-    return selection_or_range_applies_for_type_state(type_state());
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#do-not-apply
-bool HTMLInputElement::selection_direction_applies() const
-{
-    switch (type_state()) {
-    case TypeAttributeState::Text:
-    case TypeAttributeState::Search:
-    case TypeAttributeState::Telephone:
-    case TypeAttributeState::URL:
-    case TypeAttributeState::Password:
-        return true;
-    default:
-        return false;
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#do-not-apply
-bool HTMLInputElement::pattern_applies() const
-{
-    switch (type_state()) {
-    case TypeAttributeState::Text:
-    case TypeAttributeState::Search:
-    case TypeAttributeState::Telephone:
-    case TypeAttributeState::URL:
-    case TypeAttributeState::Email:
-    case TypeAttributeState::Password:
-        return true;
-    default:
-        return false;
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#do-not-apply
-bool HTMLInputElement::multiple_applies() const
-{
-    switch (type_state()) {
-    case TypeAttributeState::Email:
-    case TypeAttributeState::FileUpload:
-        return true;
-    default:
-        return false;
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#do-not-apply
-bool HTMLInputElement::required_applies() const
-{
-    switch (type_state()) {
-    case TypeAttributeState::Text:
-    case TypeAttributeState::Search:
-    case TypeAttributeState::Telephone:
-    case TypeAttributeState::URL:
-    case TypeAttributeState::Email:
-    case TypeAttributeState::Password:
-    case TypeAttributeState::Date:
-    case TypeAttributeState::Month:
-    case TypeAttributeState::Week:
-    case TypeAttributeState::Time:
-    case TypeAttributeState::LocalDateAndTime:
-    case TypeAttributeState::Number:
-    case TypeAttributeState::Checkbox:
-    case TypeAttributeState::RadioButton:
-    case TypeAttributeState::FileUpload:
-        return true;
-    default:
-        return false;
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#do-not-apply
-bool HTMLInputElement::checked_applies(TypeAttributeState type_state)
-{
-    switch (type_state) {
-    case TypeAttributeState::Checkbox:
-    case TypeAttributeState::RadioButton:
-        return true;
-    default:
-        return false;
-    }
-}
-
-bool HTMLInputElement::checked_applies() const
-{
-    return checked_applies(type_state());
-}
-
-bool HTMLInputElement::has_selectable_text() const
-{
-    // Potential FIXME: Date, Month, Week, Time and LocalDateAndTime are rendered as a basic text input for now,
-    // thus they have selectable text, this need to change when we will have a visual date/time selector.
-
-    switch (type_state()) {
-    case TypeAttributeState::Text:
-    case TypeAttributeState::Search:
-    case TypeAttributeState::Telephone:
-    case TypeAttributeState::URL:
-    case TypeAttributeState::Password:
-    case TypeAttributeState::Date:
-    case TypeAttributeState::Month:
-    case TypeAttributeState::Week:
-    case TypeAttributeState::Time:
-    case TypeAttributeState::LocalDateAndTime:
-    case TypeAttributeState::Number:
-    case TypeAttributeState::Email:
-        return true;
-    default:
-        return false;
-    }
-}
-
-bool HTMLInputElement::selection_or_range_applies_for_type_state(TypeAttributeState type_state)
-{
-    switch (type_state) {
-    case TypeAttributeState::Text:
-    case TypeAttributeState::Search:
-    case TypeAttributeState::Telephone:
-    case TypeAttributeState::URL:
-    case TypeAttributeState::Password:
-        return true;
-    default:
-        return false;
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-input-element:event-change-2
-bool HTMLInputElement::change_event_applies() const
-{
-    switch (type_state()) {
-    case TypeAttributeState::Checkbox:
-    case TypeAttributeState::Color:
-    case TypeAttributeState::Date:
-    case TypeAttributeState::Email:
-    case TypeAttributeState::FileUpload:
-    case TypeAttributeState::LocalDateAndTime:
-    case TypeAttributeState::Month:
-    case TypeAttributeState::Number:
-    case TypeAttributeState::Password:
-    case TypeAttributeState::RadioButton:
-    case TypeAttributeState::Range:
-    case TypeAttributeState::Search:
-    case TypeAttributeState::Telephone:
-    case TypeAttributeState::Text:
-    case TypeAttributeState::Time:
-    case TypeAttributeState::URL:
-    case TypeAttributeState::Week:
-        return true;
-    default:
-        return false;
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-input-element:dom-input-valueasdate-3
-bool HTMLInputElement::value_as_date_applies() const
-{
-    switch (type_state()) {
-    case TypeAttributeState::Date:
-    case TypeAttributeState::Month:
-    case TypeAttributeState::Week:
-    case TypeAttributeState::Time:
-        return true;
-    default:
-        return false;
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-input-element:dom-input-valueasnumber-3
-bool HTMLInputElement::value_as_number_applies() const
-{
-    switch (type_state()) {
-    case TypeAttributeState::Date:
-    case TypeAttributeState::Month:
-    case TypeAttributeState::Week:
-    case TypeAttributeState::Time:
-    case TypeAttributeState::LocalDateAndTime:
-    case TypeAttributeState::Number:
-    case TypeAttributeState::Range:
-        return true;
-    default:
-        return false;
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-input-element:attr-input-step-3
-bool HTMLInputElement::step_applies() const
-{
-    return value_as_number_applies();
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-input-element:dom-input-stepup-3
-bool HTMLInputElement::step_up_or_down_applies() const
-{
-    return value_as_number_applies();
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-input-element:dom-input-value-2
-HTMLInputElement::ValueAttributeMode HTMLInputElement::value_attribute_mode_for_type_state(TypeAttributeState type_state)
-{
-    switch (type_state) {
-    case TypeAttributeState::Text:
-    case TypeAttributeState::Search:
-    case TypeAttributeState::Telephone:
-    case TypeAttributeState::URL:
-    case TypeAttributeState::Email:
-    case TypeAttributeState::Password:
-    case TypeAttributeState::Date:
-    case TypeAttributeState::Month:
-    case TypeAttributeState::Week:
-    case TypeAttributeState::Time:
-    case TypeAttributeState::LocalDateAndTime:
-    case TypeAttributeState::Number:
-    case TypeAttributeState::Range:
-    case TypeAttributeState::Color:
-        return ValueAttributeMode::Value;
-
-    case TypeAttributeState::Hidden:
-    case TypeAttributeState::SubmitButton:
-    case TypeAttributeState::ImageButton:
-    case TypeAttributeState::ResetButton:
-    case TypeAttributeState::Button:
-        return ValueAttributeMode::Default;
-
-    case TypeAttributeState::Checkbox:
-    case TypeAttributeState::RadioButton:
-        return ValueAttributeMode::DefaultOn;
-
-    case TypeAttributeState::FileUpload:
-        return ValueAttributeMode::Filename;
-    }
-
-    VERIFY_NOT_REACHED();
-}
-
-HTMLInputElement::ValueAttributeMode HTMLInputElement::value_attribute_mode() const
-{
-    return value_attribute_mode_for_type_state(type_state());
-}
-
-bool HTMLInputElement::is_focusable() const
-{
-    return m_type != TypeAttributeState::Hidden
-        && enabled()
-        && meets_focusable_area_rendering_requirements();
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#has-a-reversed-range
-bool HTMLInputElement::has_reversed_range() const
-{
-    auto minimum = min();
-    if (!minimum.has_value())
-        return false;
-    auto maximum = max();
-    if (!maximum.has_value())
-        return false;
-    // An element has a reversed range if it has a periodic domain and its maximum is less than its minimum.
-    return has_periodic_domain() && maximum.value() < minimum.value();
-}
-
-// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#suffering-from-being-missing
-bool HTMLInputElement::suffering_from_being_missing() const
-{
-    bool has_checkedness_false_for_all_elements_in_group = true;
-    bool has_required_element_in_group = false;
-    switch (type_state()) {
-    case TypeAttributeState::Checkbox:
-        // https://html.spec.whatwg.org/multipage/input.html#checkbox-state-(type%3Dcheckbox)%3Asuffering-from-being-missing
-        // If the element is required and its checkedness is false, then the element is suffering from being missing.
-        if (has_attribute(HTML::AttributeNames::required) && !checked())
-            return true;
-        break;
-    case TypeAttributeState::RadioButton:
-        // https://html.spec.whatwg.org/multipage/input.html#radio-button-state-(type%3Dradio)%3Asuffering-from-being-missing
-        // If an element in the radio button group is required, and all of the input elements in the radio button group
-        // have a checkedness that is false, then the element is suffering from being missing.
-        root().for_each_in_inclusive_subtree_of_type<HTML::HTMLInputElement>([&](auto& element) {
-            if (is_in_same_radio_button_group(*this, element)) {
-                if (element.checked())
-                    has_checkedness_false_for_all_elements_in_group = false;
-                if (element.has_attribute(HTML::AttributeNames::required))
-                    has_required_element_in_group = true;
-            }
-            return TraversalDecision::Continue;
-        });
-        if (has_checkedness_false_for_all_elements_in_group && has_required_element_in_group)
-            return true;
-        break;
-    case TypeAttributeState::FileUpload:
-        // https://html.spec.whatwg.org/multipage/input.html#file-upload-state-(type%3Dfile)%3Asuffering-from-being-missing
-        // If the element is required and the list of selected files is empty, then the element is suffering from being missing.
-        if (has_attribute(HTML::AttributeNames::required) && const_cast<HTMLInputElement&>(*this).files()->length() == 0)
-            return true;
-        break;
-    default:
-        break;
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#the-required-attribute%3Asuffering-from-being-missing
-    // If the element is required, and its value IDL attribute applies and is in the mode value, and the element is mutable, and the element's value is the empty
-    // string, then the element is suffering from being missing.
-    if (has_attribute(HTML::AttributeNames::required) && value_attribute_mode() == ValueAttributeMode::Value && is_mutable() && m_value.is_empty())
-        return true;
-
-    return false;
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#valid-e-mail-address
-static regex::ECMAScriptRegex& valid_email_address_regex()
-{
-    static NeverDestroyed<regex::ECMAScriptRegex> regex { MUST(regex::ECMAScriptRegex::compile(
-        "^[a-zA-Z0-9.!#$%&'*+\\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$"_utf16,
-        regex::ECMAScriptCompileFlags {})) };
-    return *regex;
-}
-
-// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#suffering-from-a-type-mismatch
-bool HTMLInputElement::suffering_from_a_type_mismatch() const
-{
-    auto input = value();
-    switch (type_state()) {
-    // https://html.spec.whatwg.org/multipage/input.html#url-state-(type%3Durl)%3Asuffering-from-a-type-mismatch
-    case TypeAttributeState::URL:
-        // While the value of the element is neither the empty string nor a valid absolute URL, the element is suffering from a type mismatch.
-        // AD-HOC: https://github.com/whatwg/html/issues/11083 and https://github.com/web-platform-tests/wpt/pull/51011
-        //         We intentionally don't check if the value is a "valid absolute URL", because that's not what other
-        //         engines actually do. So we instead just implement what matches the behavior in existing engines.
-        return !input.is_empty() && !URL::Parser::basic_parse(input.to_utf8_but_should_be_ported_to_utf16()).has_value();
-
-    // https://html.spec.whatwg.org/multipage/input.html#email-state-(type%3Demail)%3Asuffering-from-a-type-mismatch
-    case TypeAttributeState::Email: {
-        // When the multiple attribute is not specified on the element: While the value of the element is neither the
-        // empty string nor a single valid email address, the element is suffering from a type mismatch.
-        if (!has_attribute(HTML::AttributeNames::multiple))
-            return !input.is_empty() && valid_email_address_regex().exec(input.utf16_view(), 0) != regex::MatchResult::Match;
-
-        // When the multiple attribute is specified on the element: While the value of the element is not a valid email
-        // address list, the element is suffering from a type mismatch.
-        // https://html.spec.whatwg.org/multipage/input.html#valid-e-mail-address-list
-        // A valid email address list is a set of comma-separated tokens, where each token is itself a valid email
-        // address. To obtain the list of tokens from a valid email address list, an implementation must split the
-        // string on commas.
-        bool valid = true;
-
-        input.for_each_split_view(',', SplitBehavior::Nothing, [&](auto const& address) {
-            if (valid_email_address_regex().exec(address, 0) == regex::MatchResult::Match)
-                return IterationDecision::Continue;
-
-            valid = false;
-            return IterationDecision::Break;
-        });
-
-        return !valid;
-    }
-
-    default:
-        break;
-    }
-
-    return false;
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-pattern-attribute%3Asuffering-from-a-pattern-mismatch
-bool HTMLInputElement::suffering_from_a_pattern_mismatch() const
-{
-    // If the element's value is not the empty string, and either the element's multiple attribute is not specified or
-    // it does not apply to the input element given its type attribute's current state, and the element has a compiled
-    // pattern regular expression but that regular expression does not match the element's value, then the element is
-    // suffering from a pattern mismatch.
-
-    // If the element's value is not the empty string, and the element's multiple attribute is specified and applies to
-    // the input element, and the element has a compiled pattern regular expression but that regular expression does not
-    // match each of the element's values, then the element is suffering from a pattern mismatch.
-
-    if (!pattern_applies())
-        return false;
-
-    auto value = this->value();
-    if (value.is_empty())
-        return false;
-
-    auto regexp_object = compiled_pattern_regular_expression();
-    if (!regexp_object.has_value())
-        return false;
-
-    if (has_attribute(HTML::AttributeNames::multiple) && multiple_applies()) {
-        VERIFY(type_state() == HTMLInputElement::TypeAttributeState::Email);
-        bool valid = true;
-
-        value.for_each_split_view(',', SplitBehavior::Nothing, [&](auto const& value) {
-            if (regexp_object->exec(value, 0) == regex::MatchResult::Match)
-                return IterationDecision::Continue;
-
-            valid = false;
-            return IterationDecision::Break;
-        });
-
-        return !valid;
-    }
-
-    return regexp_object->exec(value.utf16_view(), 0) != regex::MatchResult::Match;
-}
-
-// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#suffering-from-an-underflow
-bool HTMLInputElement::suffering_from_an_underflow() const
-{
-    // and the result of applying the algorithm to convert a string to a number to the string given by the element's
-    // value is a number
-    auto result = convert_string_to_number(value());
-    if (!result.has_value())
-        return false;
-    auto number = result.value();
-    return is_number_underflowing(number);
-}
-
-bool HTMLInputElement::is_number_underflowing(double number) const
-{
-    // https://html.spec.whatwg.org/multipage/input.html#the-min-and-max-attributes%3Asuffering-from-an-underflow-2
-    // When the element has a minimum and does not have a reversed range,
-    auto minimum = min();
-    if (minimum.has_value() && !has_reversed_range()) {
-        // and the number obtained from that algorithm is less than the minimum, the element is suffering from an underflow.
-        return number < minimum.value();
-    }
-
-    if (!minimum.has_value())
-        return false;
-    auto maximum = max();
-    if (!maximum.has_value())
-        return false;
-    // https://html.spec.whatwg.org/multipage/input.html#the-min-and-max-attributes%3Asuffering-from-an-underflow-3
-    // When an element has a reversed range, and the number obtained from that algorithm is more than the maximum and
-    // less than the minimum, the element is simultaneously suffering from an underflow and suffering from an overflow.
-    return has_reversed_range() && number > maximum.value() && number < minimum.value();
-}
-
-// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#suffering-from-an-overflow
-bool HTMLInputElement::suffering_from_an_overflow() const
-{
-    // and the result of applying the algorithm to convert a string to a number to the string given by the element's
-    // value is a number
-    auto result = convert_string_to_number(value());
-    if (!result.has_value())
-        return false;
-    auto number = result.value();
-    return is_number_overflowing(number);
-}
-
-bool HTMLInputElement::is_number_overflowing(double number) const
-{
-    auto maximum = max();
-    // https://html.spec.whatwg.org/multipage/input.html#the-min-and-max-attributes%3Asuffering-from-an-overflow-2
-    // When the element has a maximum and does not have a reversed range,
-    if (maximum.has_value() && !has_reversed_range()) {
-        // and the number obtained from that algorithm is more than the maximum, the element is suffering from an overflow.
-        return number > maximum.value();
-    }
-
-    if (!maximum.has_value())
-        return false;
-    auto minimum = min();
-    if (!minimum.has_value())
-        return false;
-    // https://html.spec.whatwg.org/multipage/input.html#the-min-and-max-attributes%3Asuffering-from-an-underflow-3
-    // When an element has a reversed range, and the number obtained from that algorithm is more than the maximum and
-    // less than the minimum, the element is simultaneously suffering from an underflow and suffering from an overflow.
-    return has_reversed_range() && number > maximum.value() && number < minimum.value();
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#the-step-attribute%3Asuffering-from-a-step-mismatch
-bool HTMLInputElement::suffering_from_a_step_mismatch() const
-{
-    // and the result of applying the algorithm to convert a string to a number to the string given by the element's
-    // value is a number,
-    auto maybe_number = convert_string_to_number(value());
-    if (!maybe_number.has_value())
-        return false;
-    double number = maybe_number.value();
-    return is_number_mismatching_step(number);
-}
-
-bool HTMLInputElement::is_number_mismatching_step(double number) const
-{
-    // When the element has an allowed value step,
-    auto maybe_allowed_value_step = allowed_value_step();
-    if (!maybe_allowed_value_step.has_value())
-        return false;
-    double allowed_value_step = *maybe_allowed_value_step;
-    // and that number subtracted from the step base is not an integral multiple of the allowed value step, the element
-    // is suffering from a step mismatch.
-    return !is_integral_multiple(step_base() - number, allowed_value_step);
-}
-
-// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#suffering-from-bad-input
-bool HTMLInputElement::suffering_from_bad_input() const
-{
-    auto relevant_value = this->relevant_value();
-
-    switch (type_state()) {
-    case TypeAttributeState::Email:
-        // https://html.spec.whatwg.org/multipage/input.html#email-state-(type%3Demail)%3Asuffering-from-bad-input
-        // While the user interface is representing input that the user agent cannot convert to punycode, the control is suffering from bad input.
-        // FIXME: Implement this once email addresses are converted to punycode.
-
-        // https://html.spec.whatwg.org/multipage/input.html#email-state-(type%3Demail)%3Asuffering-from-bad-input-2
-        // While the user interface describes a situation where an individual value contains a U+002C COMMA (,) or is representing input that the user agent
-        // cannot convert to punycode, the control is suffering from bad input.
-        // FIXME: Implement this once email addresses are converted to punycode.
-        break;
-    case TypeAttributeState::Date:
-        // https://html.spec.whatwg.org/multipage/input.html#date-state-(type%3Ddate)%3Asuffering-from-bad-input
-        // While the user interface describes input that the user agent cannot convert to a valid date string, the control is suffering from bad input.
-        return !relevant_value.is_empty() && !is_valid_date_string(relevant_value);
-    case TypeAttributeState::Month:
-        // https://html.spec.whatwg.org/multipage/input.html#month-state-(type%3Dmonth)%3Asuffering-from-bad-input
-        // While the user interface describes input that the user agent cannot convert to a valid month string, the control is suffering from bad input.
-        return !relevant_value.is_empty() && !is_valid_month_string(relevant_value);
-    case TypeAttributeState::Week:
-        // https://html.spec.whatwg.org/multipage/input.html#week-state-(type%3Dweek)%3Asuffering-from-bad-input
-        // While the user interface describes input that the user agent cannot convert to a valid week string, the control is suffering from bad input.
-        return !relevant_value.is_empty() && !is_valid_week_string(relevant_value);
-    case TypeAttributeState::Time:
-        // https://html.spec.whatwg.org/multipage/#time-state-(type=time):suffering-from-bad-input
-        // While the user interface describes input that the user agent cannot convert to a valid time string, the control is suffering from bad input.
-        return !relevant_value.is_empty() && !is_valid_time_string(relevant_value);
-    case TypeAttributeState::LocalDateAndTime:
