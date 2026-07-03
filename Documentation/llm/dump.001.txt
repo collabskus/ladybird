@@ -441706,6 +441706,7 @@ FILE: Libraries/LibWeb/CSS/BooleanExpression.h
 #include <AK/String.h>
 #include <AK/Vector.h>
 #include <LibGC/Ptr.h>
+#include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/Forward.h>
 
 namespace Web::CSS {
@@ -441775,6 +441776,9 @@ constexpr StringView to_string(MatchResult result)
 struct BooleanExpressionEvaluationContext {
     GC::Ptr<DOM::Document const> document { nullptr };
     GC::Ptr<DOM::Element const> query_container { nullptr };
+    Optional<DOM::AbstractElement> style_query_element {};
+    Optional<Parser::GuardedSubstitutionContexts&> guarded_contexts {};
+    bool* did_evaluate_attr_tainted_style_query { nullptr };
 };
 
 struct ContainerQueryFeatureRequirements {
@@ -448066,15 +448070,26 @@ FILE: Libraries/LibWeb/CSS/ContainerQuery.cpp
 #include "ContainerQuery.h"
 #include <AK/NonnullRefPtr.h>
 #include <LibWeb/CSS/BooleanExpression.h>
+#include <LibWeb/CSS/CalculationResolutionContext.h>
 #include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/ComputedValues.h>
+#include <LibWeb/CSS/CustomPropertyRegistration.h>
+#include <LibWeb/CSS/Parser/ArbitrarySubstitutionFunctions.h>
+#include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/CSS/Parser/SyntaxParsing.h>
+#include <LibWeb/CSS/Serialize.h>
+#include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
 #include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
 #include <LibWeb/CSS/StyleValues/RatioStyleValue.h>
+#include <LibWeb/CSS/StyleValues/UnresolvedStyleValue.h>
 #include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/Dump.h>
+#include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/PaintableBox.h>
 
 namespace Web::CSS {
@@ -448224,6 +448239,225 @@ void SizeFeature::dump(StringBuilder& builder, int indent_levels) const
     builder.appendff("SizeFeature: {}\n", to_string());
 }
 
+NonnullOwnPtr<StyleFeature> StyleFeature::create_boolean(PropertyNameAndID property)
+{
+    return adopt_own(*new StyleFeature(move(property), {}));
+}
+
+NonnullOwnPtr<StyleFeature> StyleFeature::create_plain(PropertyNameAndID property, Vector<Parser::ComponentValue> value)
+{
+    return adopt_own(*new StyleFeature(move(property), move(value)));
+}
+
+static Optional<Keyword> single_css_wide_keyword(ReadonlySpan<Parser::ComponentValue> value)
+{
+    Parser::TokenStream tokens { value };
+    tokens.discard_whitespace();
+    if (!tokens.has_next_token())
+        return {};
+
+    auto const& token = tokens.consume_a_token();
+    tokens.discard_whitespace();
+    if (tokens.has_next_token() || !token.is(Parser::Token::Type::Ident))
+        return {};
+
+    auto keyword = keyword_from_string(token.token().ident());
+    if (!keyword.has_value())
+        return {};
+
+    if (first_is_one_of(keyword.value(), Keyword::Initial, Keyword::Inherit, Keyword::Unset, Keyword::Revert, Keyword::RevertLayer))
+        return keyword;
+    return {};
+}
+
+static NonnullRefPtr<StyleValue const> inherited_custom_property_value(DOM::AbstractElement const& element, Utf16FlyString const& name, DOM::Document const& document, Optional<Parser::GuardedSubstitutionContexts&> guarded_contexts)
+{
+    if (auto parent = element.element_to_inherit_style_from(); parent.has_value())
+        return StyleComputer::compute_value_of_custom_property(parent.value(), name, guarded_contexts);
+    return document.custom_property_initial_value(name);
+}
+
+static ColorResolutionContext fallback_color_resolution_context_for_style_query(DOM::AbstractElement const& element, ComputationContext const& computation_context)
+{
+    auto calculation_resolution_context = CalculationResolutionContext::from_computation_context(computation_context);
+    auto color_resolution_context_for_style = [&](ComputedProperties const& style) {
+        auto const& document = element.document();
+        auto color_scheme = style.color_scheme(document.page().preferred_color_scheme(), document.supported_color_schemes());
+        ColorResolutionContext color_resolution_context {
+            .color_scheme = color_scheme,
+            .current_color = InitialValues::color(),
+            .calculation_resolution_context = calculation_resolution_context,
+        };
+        color_resolution_context.current_color = style.color(PropertyID::Color, color_resolution_context);
+        return color_resolution_context;
+    };
+
+    if (auto const* style = element.computed_properties())
+        return color_resolution_context_for_style(*style);
+
+    if (auto parent = element.element_to_inherit_style_from(); parent.has_value() && parent->computed_properties())
+        return color_resolution_context_for_style(*parent->computed_properties());
+
+    return {
+        .color_scheme = element.document().page().preferred_color_scheme(),
+        .current_color = InitialValues::color(),
+        .calculation_resolution_context = calculation_resolution_context,
+    };
+}
+
+// https://drafts.csswg.org/css-conditional-5/#style-container
+MatchResult StyleFeature::evaluate(BooleanExpressionEvaluationContext const& context) const
+{
+    if (!context.style_query_element.has_value())
+        return MatchResult::Unknown;
+
+    // FIXME: Non-custom properties are valid style features, but if() is evaluated before the element's own
+    //        non-custom computed values exist. Supporting these requires on-demand property resolution.
+    if (!m_property.is_custom_property())
+        return MatchResult::False;
+
+    auto element = context.style_query_element.value();
+    auto const& document = context.document ? *context.document : element.document();
+    auto const& property_name = m_property.name();
+    Optional<Parser::GuardedSubstitutionContexts&> guarded_contexts;
+    if (context.guarded_contexts.has_value())
+        guarded_contexts = const_cast<Parser::GuardedSubstitutionContexts&>(context.guarded_contexts.value());
+    Optional<Keyword> query_css_wide_keyword;
+
+    if (guarded_contexts.has_value()) {
+        if (guarded_contexts->mark_existing_as_cyclic({ Parser::SubstitutionContext::DependencyType::Property, m_property.to_string() }))
+            return MatchResult::False;
+    }
+
+    if (m_value.has_value()) {
+        auto const& query_value = m_value.value();
+        if (Parser::contains_guaranteed_invalid_value(query_value))
+            return MatchResult::False;
+
+        if (auto css_wide_keyword = single_css_wide_keyword(query_value); css_wide_keyword.has_value()) {
+            if (first_is_one_of(css_wide_keyword.value(), Keyword::Revert, Keyword::RevertLayer))
+                return MatchResult::False;
+            query_css_wide_keyword = css_wide_keyword;
+        }
+    }
+
+    auto computed_value = StyleComputer::compute_value_of_custom_property(element, property_name, guarded_contexts);
+    auto computed_tokens = computed_value->tokenize();
+    if (context.did_evaluate_attr_tainted_style_query) {
+        if (Parser::contains_attr_tainted_value(computed_tokens))
+            *context.did_evaluate_attr_tainted_style_query = true;
+    }
+
+    auto registration = document.get_registered_custom_property(property_name);
+    auto computation_context = element.document().style_computer().fallback_computation_context_for_custom_property(element);
+    auto color_resolution_context = fallback_color_resolution_context_for_style_query(element, computation_context);
+    auto comparable_computed_value = computed_value;
+    if (registration.has_value() && computed_value->is_unresolved() && computed_value->as_unresolved().contains_attr_tainted_values()) {
+        // Registered custom properties with attr-tainted values are wrapped as unresolved values so tokenize()
+        // preserves the taint. Reparse that wrapper here so style queries can still compare the typed value.
+        // FIXME: Store the attr-tainted flag in a more sensible way so we don't have to do this!
+        auto parsed_computed_value = Parser::parse_with_a_syntax(Parser::ParsingParams { document }, computed_tokens, registration->syntax);
+        if (!parsed_computed_value->is_guaranteed_invalid())
+            comparable_computed_value = compute_registered_custom_property_value(registration.value(), move(parsed_computed_value), computation_context);
+    }
+
+    // A <style-feature-plain> evaluates to true if the computed value of the given property on the query container
+    // matches the given value (which is also computed with respect to the query container), and false otherwise.
+    auto style_values_are_equal = [&](StyleValue const& left, StyleValue const& right) -> bool {
+        if (left.is_guaranteed_invalid() || right.is_guaranteed_invalid())
+            return left.equals(right);
+
+        auto left_absolutized = left.absolutized(computation_context);
+        auto right_absolutized = right.absolutized(computation_context);
+
+        auto left_color = left_absolutized->to_color(color_resolution_context);
+        auto right_color = right_absolutized->to_color(color_resolution_context);
+        if (left_color.has_value() || right_color.has_value())
+            return left_color.has_value() && right_color.has_value() && left_color.value() == right_color.value();
+
+        auto calculation_resolution_context = CalculationResolutionContext::from_computation_context(computation_context);
+        auto left_resolved = left_absolutized->is_calculated()
+            ? left_absolutized->as_calculated().resolve_as_style_value(calculation_resolution_context)
+            : nullptr;
+        auto right_resolved = right_absolutized->is_calculated()
+            ? right_absolutized->as_calculated().resolve_as_style_value(calculation_resolution_context)
+            : nullptr;
+        if (left_resolved || right_resolved) {
+            auto const& comparable_left = left_resolved ? *left_resolved : *left_absolutized;
+            auto const& comparable_right = right_resolved ? *right_resolved : *right_absolutized;
+            return comparable_left.equals(comparable_right);
+        }
+
+        return left_absolutized->equals(*right_absolutized);
+    };
+
+    // A style feature without a value (<style-feature-boolean>) evaluates to true if the computed value is different
+    // from the initial value for the given property.
+    if (!m_value.has_value()) {
+        auto initial_value = document.custom_property_initial_value(property_name);
+        return as_match_result(!style_values_are_equal(*comparable_computed_value, *initial_value));
+    }
+
+    auto const& query_value = m_value.value();
+    if (query_css_wide_keyword.has_value()) {
+        switch (query_css_wide_keyword.value()) {
+        case Keyword::Initial: {
+            auto initial_value = document.custom_property_initial_value(property_name);
+            return as_match_result(style_values_are_equal(*comparable_computed_value, *initial_value));
+        }
+        case Keyword::Inherit: {
+            auto inherited_value = inherited_custom_property_value(element, property_name, document, guarded_contexts);
+            return as_match_result(style_values_are_equal(*comparable_computed_value, *inherited_value));
+        }
+        case Keyword::Unset: {
+            auto expected_value = !registration.has_value() || registration->inherit
+                ? inherited_custom_property_value(element, property_name, document, guarded_contexts)
+                : document.custom_property_initial_value(property_name);
+            return as_match_result(style_values_are_equal(*comparable_computed_value, *expected_value));
+        }
+        case Keyword::Revert:
+        case Keyword::RevertLayer:
+            VERIFY_NOT_REACHED();
+        default:
+            VERIFY_NOT_REACHED();
+        }
+    }
+
+    if (computed_value->is_guaranteed_invalid())
+        return MatchResult::False;
+
+    if (!registration.has_value()) {
+        auto computed_value_string = MUST(serialize_a_series_of_component_values(computed_tokens).trim_ascii_whitespace());
+        auto query_value_string = MUST(serialize_a_series_of_component_values(query_value).trim_ascii_whitespace());
+        return as_match_result(computed_value_string == query_value_string);
+    }
+
+    auto parsed_query_value = Parser::parse_with_a_syntax(Parser::ParsingParams { document }, query_value, registration->syntax);
+    if (parsed_query_value->is_guaranteed_invalid())
+        return MatchResult::False;
+    parsed_query_value = compute_registered_custom_property_value(registration.value(), move(parsed_query_value), computation_context);
+
+    return as_match_result(style_values_are_equal(*comparable_computed_value, *parsed_query_value));
+}
+
+void StyleFeature::collect_container_query_feature_requirements(ContainerQueryFeatureRequirements& requirements) const
+{
+    requirements.requires_style_container = true;
+}
+
+String StyleFeature::to_string() const
+{
+    if (!m_value.has_value())
+        return m_property.to_string();
+    return MUST(String::formatted("{}: {}", m_property.to_string(), serialize_a_series_of_component_values(m_value.value())));
+}
+
+void StyleFeature::dump(StringBuilder& builder, int indent_levels) const
+{
+    indent(builder, indent_levels);
+    builder.appendff("StyleFeature: {}\n", to_string());
+}
+
 NonnullRefPtr<ContainerQuery> ContainerQuery::create(NonnullOwnPtr<BooleanExpression>&& condition)
 {
     return adopt_ref(*new ContainerQuery(move(condition)));
@@ -448345,6 +448579,8 @@ FILE: Libraries/LibWeb/CSS/ContainerQuery.h
 #include <AK/RefCounted.h>
 #include <LibWeb/CSS/BooleanExpression.h>
 #include <LibWeb/CSS/FeatureQuery.h>
+#include <LibWeb/CSS/Parser/ComponentValue.h>
+#include <LibWeb/CSS/PropertyNameAndID.h>
 
 namespace Web::CSS {
 
@@ -448376,6 +448612,28 @@ private:
         : Base(type, id, move(value))
     {
     }
+};
+
+// https://drafts.csswg.org/css-conditional-5/#typedef-style-feature
+class StyleFeature final : public BooleanExpression {
+public:
+    static NonnullOwnPtr<StyleFeature> create_boolean(PropertyNameAndID);
+    static NonnullOwnPtr<StyleFeature> create_plain(PropertyNameAndID, Vector<Parser::ComponentValue> value);
+
+    virtual MatchResult evaluate(BooleanExpressionEvaluationContext const&) const override;
+    virtual void collect_container_query_feature_requirements(ContainerQueryFeatureRequirements&) const override;
+    virtual String to_string() const override;
+    virtual void dump(StringBuilder&, int indent_levels = 0) const override;
+
+private:
+    StyleFeature(PropertyNameAndID property, Optional<Vector<Parser::ComponentValue>> value)
+        : m_property(move(property))
+        , m_value(move(value))
+    {
+    }
+
+    PropertyNameAndID m_property;
+    Optional<Vector<Parser::ComponentValue>> m_value;
 };
 
 // https://drafts.csswg.org/css-conditional-5/#container-rule
@@ -487155,7 +487413,7 @@ bool contains_guaranteed_invalid_value(ReadonlySpan<ComponentValue> values)
     return false;
 }
 
-static bool contains_attr_tainted_value(ReadonlySpan<ComponentValue> values)
+bool contains_attr_tainted_value(ReadonlySpan<ComponentValue> values)
 {
     for (auto const& value : values) {
         if (value.contains_attr_tainted_value())
@@ -487397,6 +487655,7 @@ static Vector<ComponentValue> replace_an_if_function(DOM::AbstractElement& eleme
 {
     // NB: We create a single parser and reuse that for parsing all the conditions
     auto parser = Parser::create(ParsingParams { element.element().document() }, {});
+    bool did_evaluate_attr_tainted_condition = false;
 
     // 1. For each <if-args-branch> branch in arguments:
     for (auto const& branch : arguments.get<IfArgs>()) {
@@ -487416,8 +487675,15 @@ static Vector<ComponentValue> replace_an_if_function(DOM::AbstractElement& eleme
         //    «"property", referenced-property-name» would mark it as a cyclic substitution context, that query
         //    evaluates to false.
         //    If the result of condition is false, continue.
-        // FIXME: Implement the above behavior once we support style queries.
-        auto condition_evaluation_result = maybe_parsed_if_condition->evaluate({ .document = element.element().document() });
+        bool did_evaluate_attr_tainted_style_query = false;
+        auto condition_evaluation_result = maybe_parsed_if_condition->evaluate({
+            .document = element.element().document(),
+            .style_query_element = element,
+            .guarded_contexts = guarded_contexts,
+            .did_evaluate_attr_tainted_style_query = &did_evaluate_attr_tainted_style_query,
+        });
+
+        did_evaluate_attr_tainted_condition |= condition_is_attr_tainted || did_evaluate_attr_tainted_style_query;
 
         if (condition_evaluation_result == MatchResult::False)
             continue;
@@ -487427,7 +487693,7 @@ static Vector<ComponentValue> replace_an_if_function(DOM::AbstractElement& eleme
             return {};
 
         auto result = substitute_arbitrary_substitution_functions(element, guarded_contexts, replacement_context, branch.value.value());
-        if (condition_is_attr_tainted)
+        if (did_evaluate_attr_tainted_condition)
             return mark_as_attr_tainted(move(result));
         return result;
     }
@@ -487788,6 +488054,7 @@ enum class ArbitrarySubstitutionFunction : u8 {
 [[nodiscard]] Optional<ArbitrarySubstitutionFunction> to_arbitrary_substitution_function(FlyString const& name);
 
 bool contains_guaranteed_invalid_value(ReadonlySpan<ComponentValue>);
+bool contains_attr_tainted_value(ReadonlySpan<ComponentValue>);
 
 [[nodiscard]] Vector<ComponentValue> substitute_arbitrary_substitution_functions(DOM::AbstractElement&, GuardedSubstitutionContexts&, ArbitrarySubstitutionReplacementContext const&, ReadonlySpan<ComponentValue>, Optional<SubstitutionContext> = {});
 
@@ -490688,6 +490955,62 @@ OwnPtr<BooleanExpression> Parser::parse_container_query_condition(TokenStream<Co
     });
 }
 
+OwnPtr<BooleanExpression> Parser::parse_style_query(TokenStream<ComponentValue>& tokens, MatchResult result_for_general_enclosed)
+{
+    return parse_boolean_expression(tokens, result_for_general_enclosed, [this](auto& tokens) {
+        return parse_style_feature(tokens);
+    });
+}
+
+// https://drafts.csswg.org/css-conditional-5/#typedef-style-feature
+OwnPtr<BooleanExpression> Parser::parse_style_feature(TokenStream<ComponentValue>& tokens)
+{
+    // <style-feature> = <style-feature-plain> | <style-feature-boolean> | <style-range>
+    // FIXME: <style-range>
+
+    auto parse_style_feature_name = [](FlyString const& name) -> Optional<PropertyNameAndID> {
+        // The <style-feature-name> can be either a supported CSS property or a valid <custom-property-name>.
+        // NB: This is the same as what's allowed by PropertyNameAndID.
+        return PropertyNameAndID::from_name(Utf16FlyString::from_utf8(name));
+    };
+
+    // <style-feature-plain> = <style-feature-name> : <style-feature-value>
+    {
+        auto transaction = tokens.begin_transaction();
+        tokens.discard_whitespace();
+        m_rule_context.append(RuleContext::Style);
+        auto declaration = consume_a_declaration(tokens, Nested::No, SaveOriginalText::Yes);
+        m_rule_context.take_last();
+        if (declaration.has_value()) {
+            tokens.discard_whitespace();
+            if (tokens.has_next_token() || declaration->important == Important::Yes)
+                return nullptr;
+
+            auto style_feature_name = parse_style_feature_name(declaration->name);
+            if (!style_feature_name.has_value())
+                return nullptr;
+
+            transaction.commit();
+            return StyleFeature::create_plain(style_feature_name.release_value(), move(declaration->value));
+        }
+    }
+
+    // <style-feature-boolean> = <style-feature-name>
+    auto transaction = tokens.begin_transaction();
+    tokens.discard_whitespace();
+    auto const& token = tokens.consume_a_token();
+    tokens.discard_whitespace();
+    if (tokens.has_next_token() || !token.is(Token::Type::Ident))
+        return nullptr;
+
+    auto style_feature_name = parse_style_feature_name(token.token().ident());
+    if (!style_feature_name.has_value())
+        return nullptr;
+
+    transaction.commit();
+    return StyleFeature::create_boolean(style_feature_name.release_value());
+}
+
 OwnPtr<BooleanExpression> Parser::parse_container_query_feature(TokenStream<ComponentValue>& tokens)
 {
     // https://drafts.csswg.org/css-conditional-5/#typedef-query-in-parens
@@ -493178,6 +493501,8 @@ private:
     Optional<FeatureValue> parse_media_feature_value(MediaFeatureID, TokenStream<ComponentValue>&);
     OwnPtr<SizeFeature> parse_size_feature(TokenStream<ComponentValue>&);
     Optional<FeatureValue> parse_size_feature_value(SizeFeatureID, TokenStream<ComponentValue>&);
+    OwnPtr<BooleanExpression> parse_style_query(TokenStream<ComponentValue>&, MatchResult result_for_general_enclosed);
+    OwnPtr<BooleanExpression> parse_style_feature(TokenStream<ComponentValue>&);
 
     template<typename FeatureID, typename FeatureAcceptsKeyword, typename FeatureAcceptsType>
     Optional<FeatureValue> parse_feature_value(FeatureID, TokenStream<ComponentValue>&, FeatureAcceptsKeyword, FeatureAcceptsType);
@@ -512142,20 +512467,38 @@ OwnPtr<BooleanExpression> Parser::parse_if_condition(TokenStream<ComponentValue>
 
         auto const& function = maybe_function_token.function();
         TokenStream argument_tokens { function.value };
+        auto parse_entirely = [&argument_tokens](auto parse) -> OwnPtr<BooleanExpression> {
+            auto transaction = argument_tokens.begin_transaction();
+            auto parsed = parse(argument_tokens);
+            if (!parsed)
+                return nullptr;
+
+            argument_tokens.discard_whitespace();
+            if (argument_tokens.has_next_token())
+                return nullptr;
+
+            transaction.commit();
+            return parsed.template release_nonnull<BooleanExpression>();
+        };
 
         // supports( [ <ident> : <declaration-value> ] | <supports-condition> )
         if (function.name.equals_ignoring_ascii_case("supports"sv)) {
             // [ <ident> : <declaration-value> ]
-            m_rule_context.append(RuleContext::SupportsCondition);
-            auto maybe_supports_declaration = parse_supports_declaration(argument_tokens);
-            m_rule_context.take_last();
-
-            if (maybe_supports_declaration)
+            if (auto maybe_supports_declaration = parse_entirely([&](auto& tokens) {
+                    m_rule_context.append(RuleContext::SupportsCondition);
+                    auto supports = parse_supports_declaration(tokens);
+                    m_rule_context.take_last();
+                    return supports;
+                })) {
                 return maybe_supports_declaration;
+            }
 
             // <supports-condition>
-            if (auto maybe_supports_condition = parse_supports_condition(argument_tokens))
+            if (auto maybe_supports_condition = parse_entirely([&](auto& tokens) {
+                    return parse_supports_condition(tokens);
+                })) {
                 return maybe_supports_condition;
+            }
 
             return nullptr;
         }
@@ -512163,17 +512506,29 @@ OwnPtr<BooleanExpression> Parser::parse_if_condition(TokenStream<ComponentValue>
         // media( <media-feature> | <media-condition> )
         if (function.name.equals_ignoring_ascii_case("media"sv)) {
             // <media-feature>
-            if (auto maybe_media_feature = parse_media_feature(argument_tokens))
+            if (auto maybe_media_feature = parse_entirely([&](auto& tokens) {
+                    return parse_media_feature(tokens);
+                })) {
                 return maybe_media_feature;
+            }
 
             // <media-condition>
-            if (auto maybe_media_condition = parse_media_condition(argument_tokens))
+            if (auto maybe_media_condition = parse_entirely([&](auto& tokens) {
+                    return parse_media_condition(tokens);
+                })) {
                 return maybe_media_condition;
+            }
 
             return nullptr;
         }
 
-        // FIXME: Support style()
+        // style( <style-query> )
+        if (function.name.equals_ignoring_ascii_case("style"sv)) {
+            return parse_entirely([&](auto& tokens) {
+                return parse_style_query(tokens, MatchResult::False);
+            });
+        }
+
         return nullptr;
     });
 
@@ -512447,7 +512802,10 @@ NonnullRefPtr<StyleValue const> Parser::resolve_unresolved_style_value(DOM::Abst
     // FIXME: Parse according to @property syntax once we support that.
     if (property.is_custom_property()) {
         auto contains_attr_tainted_values = result.first_matching([](auto const& component_value) { return component_value.contains_attr_tainted_value(); }).has_value();
-        return UnresolvedStyleValue::create(move(result), {}, {}, UnresolvedStyleValue::SourceTextMode::Trim, contains_attr_tainted_values);
+        auto source_text_mode = unresolved.contains_arbitrary_substitution_function() && !contains_attr_tainted_values
+            ? UnresolvedStyleValue::SourceTextMode::TrimLeading
+            : UnresolvedStyleValue::SourceTextMode::Trim;
+        return UnresolvedStyleValue::create(move(result), {}, {}, source_text_mode, contains_attr_tainted_values);
     }
 
     auto expanded_value_tokens = TokenStream { result };
@@ -528732,6 +529090,7 @@ public:
 
     static NonnullRefPtr<StyleValue const> compute_value_of_custom_property(DOM::AbstractElement, Utf16FlyString const& custom_property, Optional<Parser::GuardedSubstitutionContexts&> = {});
     NonnullRefPtr<StyleValue const> compute_value_of_custom_property(ComputedProperties const&, DOM::AbstractElement, Utf16FlyString const& custom_property, Optional<Parser::GuardedSubstitutionContexts&> = {}) const;
+    ComputationContext fallback_computation_context_for_custom_property(DOM::AbstractElement const&) const;
 
     static NonnullRefPtr<StyleValue const> compute_value_of_property(PropertyID, NonnullRefPtr<StyleValue const> const& specified_value, Function<NonnullRefPtr<StyleValue const>(PropertyID)> const& get_property_specified_value, ComputationContext const&, double device_pixels_per_css_pixel);
     static NonnullRefPtr<StyleValue const> compute_animation_name(NonnullRefPtr<StyleValue const> const& absolutized_value);
@@ -528825,7 +529184,6 @@ private:
     mutable Optional<ComputationContext> m_cached_generic_computation_context;
     ComputationContext make_computation_context_for_property(PropertyID, ComputedProperties const&, Optional<DOM::AbstractElement>) const;
     ComputationContext const& get_computation_context_for_property(PropertyID, ComputedProperties const&, Optional<DOM::AbstractElement>) const;
-    ComputationContext fallback_computation_context_for_custom_property(DOM::AbstractElement const&) const;
     void clear_computation_context_caches() const
     {
         const_cast<StyleComputer*>(this)->m_cached_font_computation_context = {};
@@ -538859,6 +539217,35 @@ Optional<i32> CalculatedStyleValue::resolve_integer(CalculationResolutionContext
     return {};
 }
 
+RefPtr<StyleValue const> CalculatedStyleValue::resolve_as_style_value(CalculationResolutionContext const& context) const
+{
+    auto result = resolve_value(context);
+    if (!result.has_value() || !result->type.has_value())
+        return {};
+
+    if (result->type->matches_number(m_context.percentages_resolve_as)) {
+        if (m_context.resolve_numbers_as_integers)
+            return IntegerStyleValue::create(round_to_nearest_integer(result->value));
+        return NumberStyleValue::create(result->value);
+    }
+    if (result->type->matches_angle(m_context.percentages_resolve_as))
+        return AngleStyleValue::create(Angle::make_degrees(result->value));
+    if (result->type->matches_flex(m_context.percentages_resolve_as))
+        return FlexStyleValue::create(Flex::make_fr(result->value));
+    if (result->type->matches_frequency(m_context.percentages_resolve_as))
+        return FrequencyStyleValue::create(Frequency::make_hertz(result->value));
+    if (result->type->matches_length(m_context.percentages_resolve_as))
+        return LengthStyleValue::create(Length::make_px(result->value));
+    if (result->type->matches_percentage())
+        return PercentageStyleValue::create(Percentage { result->value });
+    if (result->type->matches_resolution(m_context.percentages_resolve_as))
+        return ResolutionStyleValue::create(Resolution::make_dots_per_pixel(result->value));
+    if (result->type->matches_time(m_context.percentages_resolve_as))
+        return TimeStyleValue::create(Time::make_seconds(result->value));
+
+    return {};
+}
+
 bool CalculatedStyleValue::contains_percentage() const
 {
     return m_calculation->contains_percentage();
@@ -539526,6 +539913,8 @@ public:
     bool resolves_to_number() const { return m_resolved_type.matches_number(m_context.percentages_resolve_as); }
     Optional<double> resolve_number(CalculationResolutionContext const&) const;
     Optional<i32> resolve_integer(CalculationResolutionContext const&) const;
+
+    RefPtr<StyleValue const> resolve_as_style_value(CalculationResolutionContext const&) const;
 
     bool resolves_to_dimension() const { return m_resolved_type.matches_dimension(); }
 
@@ -551528,6 +551917,8 @@ ValueComparingNonnullRefPtr<UnresolvedStyleValue const> UnresolvedStyleValue::cr
 
         if (source_text_mode == SourceTextMode::Trim)
             return MUST(serialize_a_series_of_component_values_preserving_original_source_text(values).trim_ascii_whitespace());
+        if (source_text_mode == SourceTextMode::TrimLeading)
+            return MUST(serialize_a_series_of_component_values_preserving_original_source_text(values).trim_ascii_whitespace(TrimMode::Left));
 
         return source_text_from_component_values(values, source_text_mode);
     }();
@@ -551715,6 +552106,7 @@ class UnresolvedStyleValue final : public StyleValue {
 public:
     enum class SourceTextMode : u8 {
         Trim,
+        TrimLeading,
         Preserve,
     };
 
@@ -660108,380 +660500,3 @@ static Optional<double> convert_local_date_and_time_string_to_number(StringView 
     return date_time.milliseconds_since_epoch();
 }
 
-// https://html.spec.whatwg.org/multipage/input.html#time-state-(type=time):concept-input-value-string-number
-Optional<double> HTMLInputElement::convert_time_string_to_number(StringView input) const
-{
-    // The algorithm to convert a string to a number, given a string input, is as follows: If parsing a time from input
-    // results in an error, then return an error; otherwise, return the number of milliseconds elapsed from midnight to
-    // the parsed time on a day with no time changes.
-    auto maybe_time = parse_time_string(realm(), input);
-    if (maybe_time.is_exception())
-        return {};
-    return maybe_time.value()->date_value();
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#concept-input-value-string-number
-Optional<double> HTMLInputElement::convert_string_to_number(StringView input) const
-{
-    // https://html.spec.whatwg.org/multipage/input.html#number-state-(type=number):concept-input-value-string-number
-    if (type_state() == TypeAttributeState::Number)
-        return parse_floating_point_number(input);
-
-    // https://html.spec.whatwg.org/multipage/input.html#range-state-(type=range):concept-input-value-string-number
-    if (type_state() == TypeAttributeState::Range)
-        return parse_floating_point_number(input);
-
-    if (type_state() == TypeAttributeState::Month)
-        return convert_month_string_to_number(input);
-
-    if (type_state() == TypeAttributeState::Week)
-        return convert_week_string_to_number(input);
-
-    if (type_state() == TypeAttributeState::Date)
-        return convert_date_string_to_number(input);
-
-    if (type_state() == TypeAttributeState::Time)
-        return convert_time_string_to_number(input);
-
-    if (type_state() == TypeAttributeState::LocalDateAndTime)
-        return convert_local_date_and_time_string_to_number(input);
-
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#concept-input-value-string-number
-Optional<double> HTMLInputElement::convert_string_to_number(Utf16String const& input) const
-{
-    // FIXME: Implement a UTF-16 GenericLexer.
-    if (!input.has_ascii_storage())
-        return {};
-    return convert_string_to_number(input.ascii_view());
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#month-state-(type=month):concept-input-value-number-string
-static Utf16String convert_number_to_month_string(double input)
-{
-    // The algorithm to convert a number to a string, given a number input, is as follows: Return a valid month
-    // string that represents the month that has input months between it and January 1970.
-    auto months = JS::modulo(input, 12);
-    auto year = 1970 + (input - months) / 12;
-
-    return Utf16String::formatted("{:04d}-{:02d}", static_cast<int>(year), static_cast<int>(months) + 1);
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#month-state-(type=month):concept-input-value-date-string
-static Utf16String convert_date_to_month_string(double input)
-{
-    // The algorithm to convert a number to a string, given a number input, is as follows: Return a valid month
-    // string that represents the month that has input months between it and January 1970.
-    auto date = AK::UnixDateTime::from_milliseconds_since_epoch(input);
-    return date.to_utf16_string("%Y-%m"sv, AK::UnixDateTime::LocalTime::No);
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#concept-input-value-number-string
-static Utf16String convert_number_to_week_string(double input)
-{
-    // The algorithm to convert a number to a string, given a number input, is as follows: Return a valid week string
-    // that represents the week that, in UTC, is current input milliseconds after midnight UTC on the morning of
-    // 1970-01-01 (the time represented by the value "1970-01-01T00:00:00.0Z").
-
-    // AD-HOC: Values outside the valid ECMSScript time value range cannot produce valid date strings.
-    if (!isfinite(input) || fabs(input) > JS::max_time_value)
-        return {};
-
-    auto year = JS::year_from_time(input);
-    auto month = JS::month_from_time(input) + 1; // Adjust for zero-based month
-    auto day = JS::date_from_time(input);
-
-    constexpr Array normalYearDays = { 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
-    constexpr Array leapYearDays = { 0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335 };
-
-    auto ordinal_day = (is_leap_year(year) ? leapYearDays[month - 1] : normalYearDays[month - 1]) + day;
-
-    unsigned week = (10 + ordinal_day - 1) / 7; // -1 because the day of the week is always monday
-    if (week > iso8061_weeks_in_year(year)) {
-        ++year;
-        week = 1;
-    }
-    return Utf16String::formatted("{:04d}-W{:02d}", year, week);
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#date-state-(type=date):concept-input-value-number-string
-static Utf16String convert_number_to_date_string(double input)
-{
-    // The algorithm to convert a number to a string, given a number input, is as follows: Return a valid
-    // date string that represents the date that, in UTC, is current input milliseconds after midnight UTC
-    // on the morning of 1970-01-01 (the time represented by the value "1970-01-01T00:00:00.0Z").
-    auto date = AK::UnixDateTime::from_milliseconds_since_epoch(input);
-    return date.to_utf16_string("%Y-%m-%d"sv, AK::UnixDateTime::LocalTime::No);
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#time-state-(type=time):concept-input-value-number-string
-static Utf16String convert_number_to_time_string(double input)
-{
-    // The algorithm to convert a number to a string, given a number input, is as follows: Return a valid time
-    // string that represents the time that is input milliseconds after midnight on a day with no time changes.
-
-    // NB: We don't use JS::*_from_time helpers here because they lose sub-day precision when |input| is much larger
-    //     than 2^53.
-    auto time_of_day = fmod(input, JS::ms_per_day);
-    if (time_of_day < 0)
-        time_of_day += JS::ms_per_day;
-
-    auto hours = static_cast<u32>(time_of_day / JS::ms_per_hour);
-    auto minutes = static_cast<u32>(fmod(time_of_day, JS::ms_per_hour) / JS::ms_per_minute);
-    auto seconds = static_cast<u32>(fmod(time_of_day, JS::ms_per_minute) / JS::ms_per_second);
-    auto milliseconds = static_cast<u32>(fmod(time_of_day, JS::ms_per_second));
-
-    if (milliseconds > 0)
-        return Utf16String::formatted("{:02d}:{:02d}:{:02d}.{:03d}", hours, minutes, seconds, milliseconds);
-    if (seconds > 0)
-        return Utf16String::formatted("{:02d}:{:02d}:{:02d}", hours, minutes, seconds);
-    return Utf16String::formatted("{:02d}:{:02d}", hours, minutes);
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#local-date-and-time-state-(type=datetime-local):concept-input-value-number-string
-static Utf16String convert_number_to_local_date_and_time_string(double input)
-{
-    // The algorithm to convert a number to a string, given a number input, is as follows: Return a valid
-    // normalized local date and time string that represents the date and time that is input milliseconds
-    // after midnight on the morning of 1970-01-01 (the time represented by the value "1970-01-01T00:00:00.0").
-
-    // AD-HOC: Values outside the valid ECMSScript time value range cannot produce valid date strings.
-    if (!isfinite(input) || fabs(input) > JS::max_time_value)
-        return {};
-
-    auto year = JS::year_from_time(input);
-    auto month = JS::month_from_time(input) + 1; // Adjust for zero-based month
-    auto day = JS::date_from_time(input);
-    auto hour = JS::hour_from_time(input);
-    auto minutes = JS::min_from_time(input);
-    auto seconds = JS::sec_from_time(input);
-    auto milliseconds = JS::ms_from_time(input);
-
-    if (milliseconds > 0)
-        return Utf16String::formatted("{:04d}-{:02d}-{:02d}T{:02d}:{:02d}:{:02d}.{:03d}", year, month, day, hour, minutes, seconds, milliseconds).trim("0"sv, TrimMode::Right);
-    if (seconds > 0)
-        return Utf16String::formatted("{:04d}-{:02d}-{:02d}T{:02d}:{:02d}:{:02d}", year, month, day, hour, minutes, seconds);
-    return Utf16String::formatted("{:04d}-{:02d}-{:02d}T{:02d}:{:02d}", year, month, day, hour, minutes);
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#concept-input-value-string-number
-Utf16String HTMLInputElement::convert_number_to_string(double input) const
-{
-    // https://html.spec.whatwg.org/multipage/input.html#number-state-(type=number):concept-input-value-number-string
-    if (type_state() == TypeAttributeState::Number)
-        return Utf16String::number(input);
-
-    // https://html.spec.whatwg.org/multipage/input.html#range-state-(type=range):concept-input-value-number-string
-    if (type_state() == TypeAttributeState::Range)
-        return Utf16String::number(input);
-
-    if (type_state() == TypeAttributeState::Month)
-        return convert_number_to_month_string(input);
-
-    if (type_state() == TypeAttributeState::Week)
-        return convert_number_to_week_string(input);
-
-    if (type_state() == TypeAttributeState::Date)
-        return convert_number_to_date_string(input);
-
-    if (type_state() == TypeAttributeState::Time)
-        return convert_number_to_time_string(input);
-
-    if (type_state() == TypeAttributeState::LocalDateAndTime)
-        return convert_number_to_local_date_and_time_string(input);
-
-    dbgln("HTMLInputElement::convert_number_to_string() not implemented for input type {}", type());
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#concept-input-value-string-date
-WebIDL::ExceptionOr<GC::Ptr<JS::Date>> HTMLInputElement::convert_string_to_date(StringView input) const
-{
-    // https://html.spec.whatwg.org/multipage/input.html#date-state-(type=date):concept-input-value-string-date
-    if (type_state() == TypeAttributeState::Date) {
-        // If parsing a date from input results in an error, then return an error;
-        auto maybe_date = parse_a_date_string(input);
-        if (!maybe_date.has_value())
-            return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Can't parse date string"sv };
-        auto date = maybe_date.value();
-
-        // otherwise, return a new Date object representing midnight UTC on the morning of the parsed date.
-        return JS::Date::create(realm(), JS::make_date(JS::make_day(date.year, date.month - 1, date.day), 0));
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#month-state-(type=month):concept-input-value-string-date
-    if (type_state() == TypeAttributeState::Month) {
-        // If parsing a month from input results in an error, then return an error;
-        auto maybe_year_and_month = parse_a_month_string(input);
-        if (!maybe_year_and_month.has_value())
-            return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Can't parse month string"sv };
-        auto year_and_month = maybe_year_and_month.value();
-
-        // otherwise, return a new Date object representing midnight UTC on the morning of the first day of the parsed month.
-        return JS::Date::create(realm(), JS::make_date(JS::make_day(year_and_month.year, year_and_month.month - 1, 1), 0));
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#week-state-(type=week):concept-input-value-string-date
-    if (type_state() == TypeAttributeState::Week) {
-        // If parsing a week from input results in an error, then return an error;
-        auto maybe_week = parse_a_week_string(input);
-        if (!maybe_week.has_value())
-            return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Can't parse week string"sv };
-        auto week = maybe_week.value();
-
-        // otherwise, return a new Date object representing midnight UTC on the morning of the Monday of the parsed week.
-        auto datetime = UnixDateTime::from_iso8601_week(week.week_year, week.week);
-        return JS::Date::create(realm(), datetime.milliseconds_since_epoch());
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#time-state-(type=time):concept-input-value-string-date
-    if (type_state() == TypeAttributeState::Time) {
-        // If parsing a time from input results in an error, then return an error;
-        auto maybe_time = parse_time_string(realm(), input);
-        if (maybe_time.is_exception())
-            return maybe_time.exception();
-
-        // otherwise, return a new Date object representing the parsed time in UTC on 1970-01-01.
-        return maybe_time.value();
-    }
-
-    dbgln("HTMLInputElement::convert_string_to_date() not implemented for input type {}", type());
-    return nullptr;
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#concept-input-value-string-date
-WebIDL::ExceptionOr<GC::Ptr<JS::Date>> HTMLInputElement::convert_string_to_date(Utf16String const& input) const
-{
-    // FIXME: Implement a UTF-16 GenericLexer.
-    if (!input.has_ascii_storage())
-        return nullptr;
-    return convert_string_to_date(input.ascii_view());
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#concept-input-value-date-string
-Utf16String HTMLInputElement::convert_date_to_string(GC::Ref<JS::Date> input) const
-{
-    // https://html.spec.whatwg.org/multipage/input.html#date-state-(type=date):concept-input-value-date-string
-    if (type_state() == TypeAttributeState::Date) {
-        // Return a valid date string that represents the date current at the time represented by input in the UTC time zone.
-        // https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#valid-date-string
-        return convert_number_to_date_string(input->date_value());
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#month-state-(type=month):concept-input-value-date-string
-    if (type_state() == TypeAttributeState::Month) {
-        // Return a valid month string that represents the month current at the time represented by input in the UTC time zone.
-        // https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#valid-month-string
-        return convert_date_to_month_string(input->date_value());
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#week-state-(type=week):concept-input-value-date-string
-    if (type_state() == TypeAttributeState::Week) {
-        // Return a valid week string that represents the week current at the time represented by input in the UTC time zone.
-        // https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#valid-week-string
-        return convert_number_to_week_string(input->date_value());
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#time-state-(type=time):concept-input-value-string-date
-    if (type_state() == TypeAttributeState::Time) {
-        // Return a valid time string that represents the UTC time component that is represented by input.
-        // https://html.spec.whatwg.org/multipage/common-microsyntaxes.html#valid-time-string
-        return convert_number_to_time_string(input->date_value());
-    }
-
-    dbgln("HTMLInputElement::convert_date_to_string() not implemented for input type {}", type());
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#attr-input-min
-Optional<double> HTMLInputElement::min() const
-{
-    // If the element has a min attribute, and the result of applying the algorithm to convert a string to a number to
-    // the value of the min attribute is a number, then that number is the element's minimum; otherwise, if the type
-    // attribute's current state defines a default minimum, then that is the minimum; otherwise, the element has no minimum.
-    if (auto min_string = get_attribute(HTML::AttributeNames::min); min_string.has_value()) {
-        if (auto min = convert_string_to_number(*min_string); min.has_value())
-            return *min;
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#range-state-(type=range):concept-input-min-default
-    if (type_state() == TypeAttributeState::Range)
-        return 0;
-
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#attr-input-max
-Optional<double> HTMLInputElement::max() const
-{
-    // If the element has a max attribute, and the result of applying the algorithm to convert a string to a number to the
-    // value of the max attribute is a number, then that number is the element's maximum; otherwise, if the type attribute's
-    // current state defines a default maximum, then that is the maximum; otherwise, the element has no maximum.
-    if (auto max_string = get_attribute(HTML::AttributeNames::max); max_string.has_value()) {
-        if (auto max = convert_string_to_number(*max_string); max.has_value())
-            return *max;
-    }
-
-    // https://html.spec.whatwg.org/multipage/input.html#range-state-(type=range):concept-input-max-default
-    if (type_state() == TypeAttributeState::Range)
-        return 100;
-
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#concept-input-step-default
-double HTMLInputElement::default_step() const
-{
-    // https://html.spec.whatwg.org/multipage/input.html#number-state-(type=number):concept-input-step-default
-    if (type_state() == TypeAttributeState::Number)
-        return 1;
-
-    // https://html.spec.whatwg.org/multipage/input.html#range-state-(type=range):concept-input-step-default
-    if (type_state() == TypeAttributeState::Range)
-        return 1;
-
-    // https://html.spec.whatwg.org/multipage/input.html#time-state-(type=time):concept-input-step-default
-    if (type_state() == TypeAttributeState::Time)
-        return 60;
-
-    // https://html.spec.whatwg.org/multipage/input.html#date-state-(type=date):concept-input-step-default
-    if (type_state() == TypeAttributeState::Date)
-        return 1;
-
-    // https://html.spec.whatwg.org/multipage/input.html#month-state-(type=month):concept-input-step-default
-    if (type_state() == TypeAttributeState::Month)
-        return 1;
-
-    // https://html.spec.whatwg.org/multipage/input.html#week-state-(type=week):concept-input-step-default
-    if (type_state() == TypeAttributeState::Week)
-        return 1;
-
-    // https://html.spec.whatwg.org/multipage/input.html#local-date-and-time-state-(type=datetime-local):concept-input-step-default
-    if (type_state() == TypeAttributeState::LocalDateAndTime)
-        return 60;
-
-    VERIFY_NOT_REACHED();
-}
-
-// https://html.spec.whatwg.org/multipage/input.html#concept-input-step-scale
-double HTMLInputElement::step_scale_factor() const
-{
-    // https://html.spec.whatwg.org/multipage/input.html#number-state-(type=number):concept-input-step-scale
-    if (type_state() == TypeAttributeState::Number)
-        return 1;
-
-    // https://html.spec.whatwg.org/multipage/input.html#range-state-(type=range):concept-input-step-scale
-    if (type_state() == TypeAttributeState::Range)
-        return 1;
-
-    // https://html.spec.whatwg.org/multipage/input.html#time-state-(type=time):concept-input-step-scale
-    if (type_state() == TypeAttributeState::Time)
-        return 1000;
-
-    // https://html.spec.whatwg.org/multipage/input.html#date-state-(type=date):concept-input-step-scale
-    if (type_state() == TypeAttributeState::Date)
-        return 86400000;
-
-    // https://html.spec.whatwg.org/multipage/input.html#month-state-(type=month):concept-input-step-scale
