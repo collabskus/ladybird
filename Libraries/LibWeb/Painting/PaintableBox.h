@@ -115,7 +115,7 @@ public:
     CSSPixelRect absolute_border_box_rect() const;
     CSSPixelRect overflow_clip_edge_rect() const;
 
-    // These united versions of the above rects take continuation into account.
+    // These united versions of the above rects include all paintables for this layout node.
     CSSPixelRect absolute_united_border_box_rect() const;
     CSSPixelRect absolute_united_content_rect() const;
     CSSPixelRect absolute_united_padding_box_rect() const;
@@ -314,6 +314,15 @@ public:
     void set_fixed_background_visual_context(VisualContextIndex index) { m_fixed_background_visual_context = index; }
     [[nodiscard]] Optional<VisualContextIndex> fixed_background_visual_context() const { return m_fixed_background_visual_context; }
 
+    // Range of visual context nodes this box appended during the last tree build, used for in-place value patching.
+    void set_visual_context_node_range(size_t begin, size_t end)
+    {
+        m_visual_context_nodes_begin = begin;
+        m_visual_context_nodes_end = end;
+    }
+    [[nodiscard]] size_t visual_context_nodes_begin() const { return m_visual_context_nodes_begin; }
+    [[nodiscard]] size_t visual_context_nodes_end() const { return m_visual_context_nodes_end; }
+
     [[nodiscard]] ScrollFrameIndex enclosing_scroll_frame_index() const { return m_enclosing_scroll_frame_index; }
 
     [[nodiscard]] ScrollFrameIndex own_scroll_frame_index() const { return m_own_scroll_frame_index; }
@@ -364,6 +373,8 @@ private:
     VisualContextIndex m_accumulated_visual_context_index { VISUAL_VIEWPORT_NODE_INDEX };
     VisualContextIndex m_accumulated_visual_context_for_descendants_index { VISUAL_VIEWPORT_NODE_INDEX };
     Optional<VisualContextIndex> m_fixed_background_visual_context;
+    size_t m_visual_context_nodes_begin { 0 };
+    size_t m_visual_context_nodes_end { 0 };
 
     Optional<BordersDataWithElementKind> m_override_borders_data;
     Optional<TableCellCoordinates> m_table_cell_coordinates;

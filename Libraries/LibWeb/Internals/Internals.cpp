@@ -97,6 +97,16 @@ void Internals::set_test_timeout(double milliseconds)
     page().client().page_did_set_test_timeout(milliseconds);
 }
 
+void Internals::force_incompatible_visual_context_tree_rebuild()
+{
+    auto& document = window().associated_document();
+    auto paintable = document.paintable();
+    if (!paintable)
+        return;
+    paintable->set_force_incompatible_visual_context_tree_rebuild_for_testing();
+    document.set_needs_accumulated_visual_contexts_update(true);
+}
+
 // https://web-platform-tests.org/writing-tests/reftests.html#components-of-a-reftest
 WebIDL::ExceptionOr<void> Internals::load_reference_test_metadata()
 {
@@ -411,9 +421,9 @@ void Internals::set_marked_text_from_input_method(Utf16String const& text)
     page().focused_navigable().set_marked_text_from_input_method(text);
 }
 
-void Internals::commit_text_from_input_method(Utf16String const& text)
+void Internals::commit_text_from_input_method(Utf16String const& text, WebIDL::Long replacement_start, WebIDL::Long replacement_length)
 {
-    page().focused_navigable().commit_text_from_input_method(text);
+    page().focused_navigable().commit_text_from_input_method(text, replacement_start, replacement_length);
 }
 
 void Internals::unmark_text_from_input_method()

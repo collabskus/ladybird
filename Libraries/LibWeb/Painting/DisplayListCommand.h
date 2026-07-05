@@ -39,6 +39,8 @@ class DisplayList;
     V(FillRect, fill_rect)                                                             \
     V(DrawScaledDecodedImageFrame, draw_scaled_decoded_image_frame)                    \
     V(DrawRepeatedDecodedImageFrame, draw_repeated_decoded_image_frame)                \
+    V(DrawRepeatedDisplayList, draw_repeated_display_list)                             \
+    V(DrawTiledDecodedImageFrame, draw_tiled_decoded_image_frame)                      \
     V(DrawCompositedContext, draw_composited_context)                                  \
     V(DrawCanvas, draw_canvas)                                                         \
     V(DrawVideoFrame, draw_video_frame)                                                \
@@ -163,6 +165,7 @@ struct DrawScaledDecodedImageFrame {
     static constexpr DisplayListCommandType command_type = DisplayListCommandType::DrawScaledDecodedImageFrame;
 
     Gfx::IntRect dst_rect;
+    Optional<Gfx::FloatRect> src_rect;
     ImageFrameResourceId frame_id;
     Gfx::ScalingMode scaling_mode;
 
@@ -184,6 +187,42 @@ struct DrawRepeatedDecodedImageFrame {
     ImageFrameResourceId frame_id;
     Gfx::ScalingMode scaling_mode;
     Repeat repeat;
+
+    [[nodiscard]] Gfx::IntRect bounding_rect() const { return clip_rect; }
+    void dump(StringBuilder&) const;
+};
+
+struct DrawRepeatedDisplayList {
+    static constexpr StringView command_name = "DrawRepeatedDisplayList"sv;
+    static constexpr DisplayListCommandType command_type = DisplayListCommandType::DrawRepeatedDisplayList;
+
+    struct Repeat {
+        bool x { false };
+        bool y { false };
+    };
+
+    Gfx::IntRect dst_rect;
+    Gfx::IntRect clip_rect;
+    DisplayListResourceId display_list_id;
+    Gfx::ScalingMode scaling_mode;
+    Repeat repeat;
+
+    [[nodiscard]] Gfx::IntRect bounding_rect() const { return clip_rect; }
+    void dump(StringBuilder&) const;
+};
+
+struct DrawTiledDecodedImageFrame {
+    static constexpr StringView command_name = "DrawTiledDecodedImageFrame"sv;
+    static constexpr DisplayListCommandType command_type = DisplayListCommandType::DrawTiledDecodedImageFrame;
+
+    Gfx::FloatRect tile_rect;
+    Gfx::IntRect clip_rect;
+    Gfx::FloatRect src_rect;
+    Gfx::FloatSize tile_step;
+    ImageFrameResourceId frame_id;
+    Gfx::ScalingMode scaling_mode;
+    Optional<u32> tile_count_x;
+    Optional<u32> tile_count_y;
 
     [[nodiscard]] Gfx::IntRect bounding_rect() const { return clip_rect; }
     void dump(StringBuilder&) const;

@@ -8,6 +8,21 @@
 
 namespace Web::Painting {
 
+static StringView scaling_mode_name(Gfx::ScalingMode scaling_mode)
+{
+    switch (scaling_mode) {
+    case Gfx::ScalingMode::None:
+        return "None"sv;
+    case Gfx::ScalingMode::Bilinear:
+        return "Bilinear"sv;
+    case Gfx::ScalingMode::BilinearMipmap:
+        return "BilinearMipmap"sv;
+    case Gfx::ScalingMode::NearestNeighbor:
+        return "NearestNeighbor"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
 Gfx::IntRect PaintOuterBoxShadow::bounding_rect() const
 {
     auto rect = shadow_rect;
@@ -33,11 +48,31 @@ void FillRect::dump(StringBuilder& builder) const
 void DrawScaledDecodedImageFrame::dump(StringBuilder& builder) const
 {
     builder.appendff(" dst_rect={}", dst_rect);
+    if (src_rect.has_value())
+        builder.appendff(" src_rect={}", src_rect.value());
 }
 
 void DrawRepeatedDecodedImageFrame::dump(StringBuilder& builder) const
 {
     builder.appendff(" dst_rect={} clip_rect={}", dst_rect, clip_rect);
+}
+
+void DrawRepeatedDisplayList::dump(StringBuilder& builder) const
+{
+    builder.appendff(" dst_rect={} clip_rect={} scaling_mode={}", dst_rect, clip_rect, scaling_mode_name(scaling_mode));
+}
+
+void DrawTiledDecodedImageFrame::dump(StringBuilder& builder) const
+{
+    builder.appendff(" tile_rect={} clip_rect={} src_rect={} tile_step={}", tile_rect, clip_rect, src_rect, tile_step);
+    if (tile_count_x.has_value())
+        builder.appendff(" tile_count_x={}", tile_count_x.value());
+    else
+        builder.appendff(" tile_count_x=repeat");
+    if (tile_count_y.has_value())
+        builder.appendff(" tile_count_y={}", tile_count_y.value());
+    else
+        builder.appendff(" tile_count_y=repeat");
 }
 
 void DrawCompositedContext::dump(StringBuilder& builder) const

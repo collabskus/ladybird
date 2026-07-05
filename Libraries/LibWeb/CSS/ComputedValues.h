@@ -427,6 +427,23 @@ struct BackgroundLayerData {
     MixBlendMode blend_mode { MixBlendMode::Normal };
 };
 
+struct BorderImageSideValues {
+    NonnullRefPtr<StyleValue const> top;
+    NonnullRefPtr<StyleValue const> right;
+    NonnullRefPtr<StyleValue const> bottom;
+    NonnullRefPtr<StyleValue const> left;
+};
+
+struct BorderImageData {
+    NonnullRefPtr<AbstractImageStyleValue const> source;
+    BorderImageSideValues slice;
+    BorderImageSideValues width;
+    BorderImageSideValues outset;
+    bool fill { false };
+    BorderImageRepeat repeat_x { BorderImageRepeat::Stretch };
+    BorderImageRepeat repeat_y { BorderImageRepeat::Stretch };
+};
+
 struct BorderData {
 public:
     Color color { Color::Transparent };
@@ -555,6 +572,15 @@ public:
     ~ComputedValues() = default;
 
     AspectRatio aspect_ratio() const { return m_noninherited.aspect_ratio; }
+    BoxSizing box_sizing_for_aspect_ratio() const
+    {
+        // https://drafts.csswg.org/css-sizing-4/#aspect-ratio
+        // For a preferred aspect ratio specified as `auto && <ratio>`, the ratio is applied to the content box.
+        if (aspect_ratio().use_natural_aspect_ratio_if_available)
+            return BoxSizing::ContentBox;
+        return box_sizing();
+    }
+
     Float float_() const { return m_noninherited.float_; }
     CSSPixels border_spacing_horizontal() const { return m_inherited.border_spacing_horizontal; }
     CSSPixels border_spacing_vertical() const { return m_inherited.border_spacing_vertical; }
@@ -710,6 +736,7 @@ public:
     BackgroundBox background_color_clip() const { return m_noninherited.background_color_clip; }
     Vector<BackgroundLayerData> const& background_layers() const { return m_noninherited.background_layers; }
     Vector<BackgroundLayerData> const& mask_layers() const { return m_noninherited.mask_layers; }
+    Optional<BorderImageData> const& border_image() const { return m_noninherited.border_image; }
 
     Color webkit_text_fill_color() const { return m_inherited.webkit_text_fill_color; }
 
@@ -902,6 +929,7 @@ protected:
         int order { InitialValues::order() };
         Vector<BackgroundLayerData> background_layers;
         Vector<BackgroundLayerData> mask_layers;
+        Optional<BorderImageData> border_image;
         FlexDirection flex_direction { InitialValues::flex_direction() };
         ColumnSpan column_span { InitialValues::column_span() };
         BackgroundBox background_color_clip { InitialValues::background_color_clip() };
@@ -1024,6 +1052,7 @@ public:
     void set_background_color_clip(BackgroundBox box) { m_noninherited.background_color_clip = box; }
     void set_background_layers(Vector<BackgroundLayerData>&& layers) { m_noninherited.background_layers = move(layers); }
     void set_mask_layers(Vector<BackgroundLayerData>&& layers) { m_noninherited.mask_layers = move(layers); }
+    void set_border_image(Optional<BorderImageData> border_image) { m_noninherited.border_image = move(border_image); }
     void set_float(Float value) { m_noninherited.float_ = value; }
     void set_clear(Clear value) { m_noninherited.clear = value; }
     void set_z_index(Optional<int> value) { m_noninherited.z_index = move(value); }

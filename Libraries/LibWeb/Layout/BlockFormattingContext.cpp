@@ -89,12 +89,9 @@ static bool margins_collapse_through(Box const& box, LayoutState& state)
     if (FormattingContext::creates_block_formatting_context(box))
         return false;
 
-    // https://drafts.csswg.org/css-flexbox-1/#flex-containers
-    // [..] the flex container’s margins do not collapse with the margins of its contents.
-    // https://drafts.csswg.org/css-grid-2/#grid-containers
-    // [..] the grid container’s margins do not collapse with the margins of its contents.
-    auto display = box.display();
-    if (display.is_flex_inside() || display.is_grid_inside())
+    // https://drafts.csswg.org/css-display-3/#independent-formatting-context
+    // NOTE: [..] margins do not collapse across formatting context boundaries.
+    if (FormattingContext::formatting_context_type_created_by_box(box).has_value())
         return false;
 
     // NB: This should take care of the height and min-height constraints.
@@ -545,9 +542,9 @@ void BlockFormattingContext::rebuild_float_bands()
 
     for (auto& floating_box : m_floats) {
         floating_box->margin_box_rect_in_root_coordinate_space = margin_box_rect_in_ancestor_coordinate_space(floating_box->used_values, root());
-        auto const* containing_block = floating_box->used_values.containing_block_used_values();
+        auto const* containing_block = floating_box->used_values.node().containing_block();
         VERIFY(containing_block);
-        auto containing_block_rect_in_root = content_box_rect_in_ancestor_coordinate_space(*containing_block, root());
+        auto containing_block_rect_in_root = content_box_rect_in_ancestor_coordinate_space(m_state.get(*containing_block), root());
         add_float_to_bands(*floating_box, containing_block_rect_in_root);
     }
 }
@@ -568,9 +565,9 @@ void BlockFormattingContext::avoid_float_intrusions(Box const& box, AvailableSpa
     while (true) {
         auto border_box_in_root_rect = content_box_rect_in_ancestor_coordinate_space(box_state, root());
         border_box_in_root_rect.translate_by(-box_state.border_box_left(), -box_state.border_box_top());
-        auto const* containing_block = box_state.containing_block_used_values();
+        auto const* containing_block = box.containing_block();
         VERIFY(containing_block);
-        auto containing_block_rect_in_root = content_box_rect_in_ancestor_coordinate_space(*containing_block, root());
+        auto containing_block_rect_in_root = content_box_rect_in_ancestor_coordinate_space(m_state.get(*containing_block), root());
         containing_block_rect_in_root.set_y(border_box_in_root_rect.y());
         containing_block_rect_in_root.set_height(box_state.border_box_height());
         auto const& band = band_at(border_box_in_root_rect.y());
@@ -681,14 +678,15 @@ void BlockFormattingContext::compute_width_for_block_level_replaced_element_in_n
     auto const padding_right = computed_values.padding().right().to_px_or_zero(width_of_containing_block);
 
     auto& box_state = m_state.get_mutable(box);
-    auto width = compute_width_for_replaced_element(box, available_space, containing_block_constraints);
     box_state.margin_left = margin_left;
     box_state.margin_right = margin_right;
     box_state.border_left = computed_values.border_left().width;
     box_state.border_right = computed_values.border_right().width;
     box_state.padding_left = padding_left;
     box_state.padding_right = padding_right;
-    box_state.set_content_width(calculate_inner_width(box, available_space.width, CSS::Size::make_px(width), containing_block_constraints));
+
+    auto width = compute_width_for_replaced_element(box, available_space, containing_block_constraints);
+    box_state.set_content_width(width);
 }
 
 void BlockFormattingContext::resolve_used_height_if_not_treated_as_auto(Box const& box, AvailableSpace const& available_space, ContainingBlockConstraints const& containing_block_constraints)
@@ -761,7 +759,7 @@ void BlockFormattingContext::resolve_used_height_if_treated_as_auto(Box const& b
         auto margins = box_state.margin_top + box_state.margin_bottom;
 
         // 2. Let size be the size of the initial containing block in the block flow direction minus margins.
-        auto size = box_state.containing_block_used_values()->content_height() - margins;
+        auto size = containing_block_constraints.percentage_basis_height.value_or(0) - margins;
 
         // 3. Return the bigger value of size and the normal border box size the element would have
         //    according to the CSS specification.
@@ -792,7 +790,7 @@ void BlockFormattingContext::resolve_used_height_if_treated_as_auto(Box const& b
             auto margins = box_state.margin_top + box_state.margin_bottom;
 
             // 2. Let size be the size of element's parent element's content box in the block flow direction minus margins.
-            auto size = box_state.containing_block_used_values()->content_height() - margins;
+            auto size = containing_block_constraints.percentage_basis_height.value_or(0) - margins;
 
             // 3. Return the bigger value of size and the normal border box size the element would have
             //    according to the CSS specification.
@@ -882,8 +880,18 @@ CSSPixels BlockFormattingContext::compute_auto_height_for_block_level_element(Bo
     // The element's height is the distance from its top content edge to the first applicable of the following:
 
     // 1. the bottom edge of the last line box, if the box establishes a inline formatting context with one or more lines
-    if (box.children_are_inline() && !box_state.line_boxes.is_empty())
-        return box_state.line_boxes.last().bottom();
+    if (box.children_are_inline() && !box_state.line_boxes.is_empty()) {
+        auto height = box_state.line_boxes.last().bottom();
+        if (box_state.line_boxes.last().has_block_level_box()) {
+            auto margin_bottom = m_margin_state.current_collapsed_margin();
+            if (box_state.padding_bottom == 0 && box_state.border_bottom == 0) {
+                m_margin_state.set_box_last_in_flow_child_margin_bottom_collapsed(true);
+                margin_bottom = 0;
+            }
+            height = max(CSSPixels(0), height + margin_bottom);
+        }
+        return height;
+    }
 
     // 2. the bottom edge of the bottom (possibly collapsed) margin of its last in-flow child, if the child's bottom margin does not collapse with the element's bottom margin
     // 3. the bottom border edge of the last in-flow child whose top margin doesn't collapse with the element's bottom margin
@@ -928,6 +936,29 @@ CSSPixels BlockFormattingContext::compute_auto_height_for_block_level_element(Bo
 
     // 4. zero, otherwise
     return 0;
+}
+
+void BlockFormattingContext::layout_interrupting_block_inside_inline_context(Box const& box, BlockContainer const& containing_block, LayoutInput const& layout_input, LineBuilder& line_builder)
+{
+    CSSPixels dummy_bottom_of_lowest_margin_box = 0;
+    CSSPixels block_bottom;
+    {
+        TemporaryChange<Optional<CSSPixels>> change { m_y_offset_of_current_block_container, line_builder.current_block_offset() };
+        layout_block_level_box(box, containing_block, dummy_bottom_of_lowest_margin_box, layout_input);
+        block_bottom = m_y_offset_of_current_block_container.value_or(line_builder.current_block_offset());
+    }
+    line_builder.append_block_level_box(box, block_bottom, m_margin_state.current_collapsed_margin());
+}
+
+CSSPixels BlockFormattingContext::commit_pending_margin_before_inline_content()
+{
+    auto margin_collapses_with_block_container = m_margin_state.has_block_container_waiting_for_final_y_position();
+    auto collapsed_margin = m_margin_state.current_collapsed_margin();
+
+    m_margin_state.update_block_waiting_for_final_y_position();
+    m_margin_state.reset();
+
+    return margin_collapses_with_block_container ? CSSPixels(0) : collapsed_margin;
 }
 
 void BlockFormattingContext::layout_block_level_box(Box const& box, BlockContainer const& block_container, CSSPixels& bottom_of_lowest_margin_box, LayoutInput const& layout_input)
@@ -989,7 +1020,8 @@ void BlockFormattingContext::layout_block_level_box(Box const& box, BlockContain
         if (!m_state.has_subtree_root()
             && document_element && document_element->unsafe_layout_node()
             && box.is_inclusive_ancestor_of(*document_element->unsafe_layout_node())) {
-            return m_state.get_mutable(box);
+            if (auto* existing_state = m_state.try_get_mutable(box))
+                return *existing_state;
         }
         return m_state.create(box, layout_input.containing_block_constraints.percentage_basis_width, layout_input.containing_block_constraints.percentage_basis_height);
     }();
@@ -1093,26 +1125,17 @@ void BlockFormattingContext::layout_block_level_box(Box const& box, BlockContain
 
         // For boxes with auto height but non-auto min-height, we need to determine if the content height is less than
         // min-height. If so, we run layout with min-height as the available height.
+        Optional<CSSPixels> measured_content_height;
         if (should_treat_height_as_auto(box, available_space, layout_input.containing_block_constraints) && !box.computed_values().min_height().is_auto()) {
-            LayoutState throwaway_state(box);
-            // Populate the entire containing block chain: the throwaway BFC may encounter abspos
-            // elements whose containing block is an ancestor above `box`. We stop when the source
-            // state lacks an entry, which happens when it is itself a nested throwaway state.
-            for (auto cb = box.containing_block(); cb; cb = cb->containing_block()) {
-                if (!m_state.try_get(*cb))
-                    break;
-                throwaway_state.populate_node_from(m_state, *cb);
-            }
-
-            throwaway_state.create(box, layout_input.containing_block_constraints.percentage_basis_width, layout_input.containing_block_constraints.percentage_basis_height);
-            auto measuring_context = create_independent_formatting_context_if_needed(throwaway_state, m_layout_mode, box);
-            measuring_context->run(layout_input.with_available_space(inner_available_space));
-            auto content_height = measuring_context->automatic_content_height();
+            auto content_height = measure_automatic_content_height(box, inner_available_space, layout_input.containing_block_constraints);
+            measured_content_height = content_height;
             auto min_height = calculate_inner_height(box, available_space, box.computed_values().min_height(), layout_input.containing_block_constraints);
             if (content_height < min_height) {
                 inner_available_space.height = AvailableSize::make_definite(min_height);
             }
         }
+
+        make_button_content_box_definite(box, available_space, layout_input.containing_block_constraints, measured_content_height);
 
         independent_formatting_context->run(layout_input.with_available_space(inner_available_space));
         if (is<TableWrapper>(block_container) && box.display().is_table_inside()) {
@@ -1124,28 +1147,27 @@ void BlockFormattingContext::layout_block_level_box(Box const& box, BlockContain
     } else {
         // This box participates in the current block container's flow.
         auto space_available_for_children = box.is_anonymous() ? available_space : box_state.available_inner_space_or_constraints_from(available_space);
-        if (box.children_are_inline()) {
-            layout_inline_children(as<BlockContainer>(box), layout_input, space_available_for_children);
-        } else {
-            auto registered_block_container_y_position_update_callback = false;
-            if (box_state.border_top > 0 || box_state.padding_top > 0) {
-                // margin-top of block container can't collapse with it's children if it has non zero border or padding
-                m_margin_state.reset();
-            } else if (!m_margin_state.has_block_container_waiting_for_final_y_position()) {
-                // margin-top of block container can be updated during children layout hence it's final y position yet to be determined
-                m_margin_state.register_block_container_y_position_update_callback([this, &box, y, introduce_clearance](CSSPixels margin_top) {
-                    if (introduce_clearance == DidIntroduceClearance::No) {
-                        place_block_level_element_in_normal_flow_vertically(box, margin_top + y);
-                    }
-                });
-                registered_block_container_y_position_update_callback = true;
-            }
+        auto registered_block_container_y_position_update_callback = false;
+        if (box_state.border_top > 0 || box_state.padding_top > 0) {
+            // margin-top of block container can't collapse with its children if it has non-zero border or padding.
+            m_margin_state.reset();
+        } else if (!m_margin_state.has_block_container_waiting_for_final_y_position()) {
+            // margin-top of block container can be updated during children layout hence its final y position is yet to be determined.
+            m_margin_state.register_block_container_y_position_update_callback([this, &box, y, introduce_clearance](CSSPixels margin_top) {
+                if (introduce_clearance == DidIntroduceClearance::No) {
+                    place_block_level_element_in_normal_flow_vertically(box, margin_top + y);
+                }
+            });
+            registered_block_container_y_position_update_callback = true;
+        }
 
+        if (box.children_are_inline())
+            layout_inline_children(as<BlockContainer>(box), layout_input, space_available_for_children);
+        else
             layout_block_level_children(as<BlockContainer>(box), layout_input, space_available_for_children);
 
-            if (registered_block_container_y_position_update_callback) {
-                m_margin_state.unregister_block_container_y_position_update_callback();
-            }
+        if (registered_block_container_y_position_update_callback) {
+            m_margin_state.unregister_block_container_y_position_update_callback();
         }
     }
 

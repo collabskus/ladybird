@@ -61,6 +61,7 @@
 namespace Web::CSS {
 
 class ImageStyleValueResource;
+enum class StyleUpdateMode : u8;
 
 }
 
@@ -394,11 +395,9 @@ public:
     void update_style();
     void invalidate_style_for_viewport_change();
     void update_style_if_needed_for_element(AbstractElement const&);
-    enum class StyleUpdateMode : u8 {
-        Normal,
-        StopAtDisplayNone,
-    };
-    CSS::ComputedProperties const* update_style_for_element(AbstractElement const&, StyleUpdateMode = StyleUpdateMode::Normal);
+    using StyleUpdateMode = CSS::StyleUpdateMode;
+    CSS::ComputedProperties const* update_style_for_element(AbstractElement const&);
+    CSS::ComputedProperties const* update_style_for_element(AbstractElement const&, StyleUpdateMode);
     [[nodiscard]] bool element_needs_style_update(AbstractElement const&) const;
     void update_layout(UpdateLayoutReason);
     void update_layout_if_needed_for_node(Node const&, UpdateLayoutReason);
@@ -406,6 +405,9 @@ public:
     void clear_devtools_layout_inspection_data();
     void update_paint_and_hit_testing_properties_if_needed();
     void update_animated_style_if_needed();
+    void update_style_computer_viewport_rect();
+    bool needs_animated_style_update() const { return m_needs_animated_style_update; }
+    bool is_running_update_layout() const { return m_is_running_update_layout; }
 
     void invalidate_layout_tree(InvalidateLayoutTreeReason);
     void invalidate_stacking_context_tree();
@@ -487,7 +489,14 @@ public:
     QuirksMode mode() const { return m_quirks_mode; }
     bool in_quirks_mode() const { return m_quirks_mode == QuirksMode::Yes; }
     bool in_limited_quirks_mode() const { return m_quirks_mode == QuirksMode::Limited; }
-    void set_quirks_mode(QuirksMode mode) { m_quirks_mode = mode; }
+    void set_quirks_mode(QuirksMode mode)
+    {
+        if (m_quirks_mode == mode)
+            return;
+        m_quirks_mode = mode;
+        // Quirks mode changes how id and class selectors match, so cached query results must not survive it.
+        bump_dom_tree_version();
+    }
 
     bool parser_cannot_change_the_mode() const { return m_parser_cannot_change_the_mode; }
     void set_parser_cannot_change_the_mode(bool parser_cannot_change_the_mode) { m_parser_cannot_change_the_mode = parser_cannot_change_the_mode; }
@@ -627,6 +636,8 @@ public:
     void run_the_scroll_steps();
 
     void evaluate_media_queries_and_report_changes();
+    bool needs_media_rule_evaluation() const { return m_needs_media_rule_evaluation; }
+    void evaluate_media_rules_for_style_update() { evaluate_media_rules(); }
     void set_needs_media_query_evaluation()
     {
         m_needs_media_query_list_evaluation = true;
@@ -677,6 +688,7 @@ public:
 
     bool needs_full_style_update() const { return m_needs_full_style_update; }
     void set_needs_full_style_update(bool b) { m_needs_full_style_update = b; }
+    void build_registered_properties_cache_for_style_update() { build_registered_properties_cache(); }
     void set_needs_container_query_evaluation_after_layout(Element const& query_container);
 
     [[nodiscard]] bool needs_full_layout_tree_update() const { return m_needs_full_layout_tree_update; }
@@ -890,6 +902,14 @@ public:
     void set_needs_animated_style_update();
 
     void set_needs_invalidation_of_elements_affected_by_has() { m_needs_invalidation_of_elements_affected_by_has = true; }
+    bool needs_invalidation_of_elements_affected_by_has() const { return m_needs_invalidation_of_elements_affected_by_has; }
+    bool consume_needs_invalidation_of_elements_affected_by_has()
+    {
+        if (!m_needs_invalidation_of_elements_affected_by_has)
+            return false;
+        m_needs_invalidation_of_elements_affected_by_has = false;
+        return true;
+    }
 
     // Test-only counters for observing style invalidation and recomputation work. See Internals.idl.
     struct StyleInvalidationCounters {
@@ -919,6 +939,8 @@ public:
 
     void set_needs_accumulated_visual_contexts_update(bool);
     bool needs_accumulated_visual_contexts_update() const { return m_needs_accumulated_visual_contexts_update; }
+    void schedule_accumulated_visual_context_value_update(Element&);
+    void schedule_accumulated_visual_context_value_update(Layout::Node const&);
 
     virtual JS::Value named_item_value(FlyString const& name) const override;
     virtual Vector<FlyString> supported_property_names() const override;
@@ -973,6 +995,7 @@ public:
     GC::Ptr<HTML::HTMLDialogElement> dialog_pointerdown_target() { return m_dialog_pointerdown_target; }
 
     size_t transition_generation() const { return m_transition_generation; }
+    void increment_transition_generation() { ++m_transition_generation; }
 
     // Does document represent an embedded svg img
     [[nodiscard]] bool is_decoded_svg() const { return m_is_decoded_svg; }
@@ -1125,6 +1148,7 @@ public:
     String dump_stacking_context_tree();
 
     CSS::Invalidation::StyleInvalidator& style_invalidator() { return m_style_invalidator; }
+    CSS::Invalidation::StyleInvalidator const& style_invalidator() const { return m_style_invalidator; }
 
     Optional<Vector<CSS::Parser::ComponentValue>> environment_variable_value(CSS::EnvironmentVariable, Span<i32> indices = {}) const;
 
@@ -1143,7 +1167,8 @@ public:
 
     void exit_pointer_lock();
 
-    Optional<CSS::SelectorList> const& parse_or_cache_selector_list(StringView) const;
+    RefPtr<SelectorQuery const> selector_query_for(StringView) const;
+    QuerySelectorResultCache& query_selector_result_cache();
 
     GC::Ptr<HTML::CustomElementRegistry> custom_element_registry() const;
     void set_custom_element_registry(GC::Ptr<HTML::CustomElementRegistry> custom_element_registry) { m_custom_element_registry = custom_element_registry; }
@@ -1524,6 +1549,7 @@ private:
     bool m_design_mode_enabled { false };
 
     bool m_needs_accumulated_visual_contexts_update { false };
+    Vector<WeakPtr<Painting::PaintableBox>> m_paintable_boxes_needing_visual_context_value_update;
     bool m_needs_invalidation_of_elements_affected_by_has { false };
     RefPtr<Painting::HitTestDisplayList> m_hit_test_display_list;
     Optional<CSSPixelRect> m_caret_hit_test_debug_rect;
@@ -1638,8 +1664,12 @@ private:
     // https://drafts.csswg.org/css-values-5/#random-caching
     HashMap<CSS::RandomCachingKey, double> m_element_shared_css_random_base_value_cache;
 
-    // Cache of parsed selector lists for querySelectorAll/querySelector/matches/closest.
-    mutable HashMap<String, Optional<CSS::SelectorList>> m_selector_query_cache;
+    // Cache of parsed selector queries for querySelectorAll/querySelector/matches/closest.
+    // A null value means the selector string failed to parse.
+    mutable HashMap<String, RefPtr<SelectorQuery const>> m_selector_query_cache;
+
+    // Cache of querySelectorAll results, validated lazily against dom_tree_version/character_data_version.
+    OwnPtr<QuerySelectorResultCache> m_query_selector_result_cache;
 
     // https://fullscreen.spec.whatwg.org/#list-of-pending-fullscreen-events
     Vector<PendingFullscreenEvent> m_pending_fullscreen_events;

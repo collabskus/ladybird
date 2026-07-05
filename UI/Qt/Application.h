@@ -34,6 +34,7 @@ public:
 
     Function<void(URL::URL)> on_open_file;
     BrowserWindow& new_window(Vector<URL::URL> const& initial_urls, WindowConfiguration const& = {}, BrowserWindow::IsPopupWindow is_popup_window = BrowserWindow::IsPopupWindow::No, Tab* parent_tab = nullptr, Optional<u64> page_index = {});
+    WindowConfiguration configuration_for_new_window() const;
     void open_new_tab();
     void open_new_window();
     void focus_location_editor();
@@ -45,11 +46,12 @@ public:
     QMenu* qt_bookmarks_menu() const;
 
     BrowserWindow& active_window() const { return *m_active_window; }
-    void set_active_window(BrowserWindow& w) { m_active_window = &w; }
+    void set_active_window(BrowserWindow&);
     BrowserWindow* active_window_if_any() const { return m_active_window; }
 
     Tab* active_tab() const { return m_active_window ? m_active_window->current_tab() : nullptr; }
     void update_reopen_recently_closed_actions() const;
+    void update_macos_application_menu() const;
 
 private:
     explicit Application();

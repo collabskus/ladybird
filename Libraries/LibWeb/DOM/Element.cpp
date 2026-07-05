@@ -50,6 +50,7 @@
 #include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
 #include <LibWeb/CSS/StyleValues/RandomValueSharingStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StyleValueList.h>
+#include <LibWeb/CSS/UpdateStyle.h>
 #include <LibWeb/CSS/VisualViewport.h>
 #include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/Attr.h>
@@ -59,6 +60,7 @@
 #include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/DOM/HTMLCollection.h>
 #include <LibWeb/DOM/NamedNodeMap.h>
+#include <LibWeb/DOM/SelectorQuery.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/Geometry/DOMRect.h>
@@ -120,6 +122,7 @@
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/AccumulatedVisualContext.h>
 #include <LibWeb/Painting/PaintableBox.h>
+#include <LibWeb/Painting/PaintableWithLines.h>
 #include <LibWeb/Painting/StackingContext.h>
 #include <LibWeb/Painting/ViewportPaintable.h>
 #include <LibWeb/PixelUnits.h>
@@ -1383,14 +1386,14 @@ GC::Ptr<ShadowRoot> Element::shadow_root_for_bindings() const
 WebIDL::ExceptionOr<bool> Element::matches(StringView selectors) const
 {
     // 1. Let s be the result of parse a selector from selectors.
-    auto const& maybe_selectors = document().parse_or_cache_selector_list(selectors);
+    auto query = document().selector_query_for(selectors);
 
     // 2. If s is failure, then throw a "SyntaxError" DOMException.
-    if (!maybe_selectors.has_value())
+    if (!query)
         return WebIDL::SyntaxError::create(realm(), "Failed to parse selector"_utf16);
 
     // 3. If the result of match a selector against an element, using s, this, and scoping root this, returns success, then return true; otherwise, return false.
-    for (auto const& s : maybe_selectors.value()) {
+    for (auto const& s : query->selectors()) {
         SelectorEngine::MatchContext context;
         if (SelectorEngine::matches(s, *this, nullptr, context, static_cast<ParentNode const*>(this)))
             return true;
@@ -1402,10 +1405,10 @@ WebIDL::ExceptionOr<bool> Element::matches(StringView selectors) const
 WebIDL::ExceptionOr<DOM::Element const*> Element::closest(StringView selectors) const
 {
     // 1. Let s be the result of parse a selector from selectors.
-    auto const& maybe_selectors = document().parse_or_cache_selector_list(selectors);
+    auto query = document().selector_query_for(selectors);
 
     // 2. If s is failure, then throw a "SyntaxError" DOMException.
-    if (!maybe_selectors.has_value())
+    if (!query)
         return WebIDL::SyntaxError::create(realm(), "Failed to parse selector"_utf16);
 
     auto matches_selectors = [this](CSS::SelectorList const& selector_list, Element const* element) {
@@ -1418,7 +1421,7 @@ WebIDL::ExceptionOr<DOM::Element const*> Element::closest(StringView selectors) 
         return false;
     };
 
-    auto const& selector_list = maybe_selectors.value();
+    auto const& selector_list = query->selectors();
 
     // 3. Let elements be this’s inclusive ancestors that are elements, in reverse tree order.
     for (auto* element = this; element; element = element->parent_element()) {
@@ -1651,6 +1654,12 @@ GC::Ref<Geometry::DOMRectList> Element::get_client_rects_for_bindings() const
     return Geometry::DOMRectList::create(realm(), move(rects));
 }
 
+static void append_transformed_border_box_rect(Vector<CSSPixelRect>& rects, Painting::PaintableBox const& paintable_box)
+{
+    auto absolute_rect = paintable_box.absolute_border_box_rect();
+    rects.append(paintable_box.transform_rect_to_viewport(absolute_rect, Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No));
+}
+
 static Vector<CSSPixelRect> compute_client_rects_assuming_layout_clean(Element const& element)
 {
     // 1. If the element on which it was invoked does not have an associated layout box return an empty DOMRectList
@@ -1671,9 +1680,27 @@ static Vector<CSSPixelRect> compute_client_rects_assuming_layout_clean(Element c
     //          are left in the final list.
 
     Vector<CSSPixelRect> rects;
+    if (auto const* inline_node = as_if<Layout::InlineNode>(element.layout_node())) {
+        Painting::PaintableWithLines const* paintable_with_only_block_level_fragments = nullptr;
+        for (auto const& paintable : inline_node->paintables()) {
+            auto const* paintable_with_lines = as_if<Painting::PaintableWithLines>(paintable.ptr());
+            if (!paintable_with_lines)
+                continue;
+            if (paintable_with_lines->has_only_block_level_fragments()) {
+                paintable_with_only_block_level_fragments = paintable_with_lines;
+                continue;
+            }
+            append_transformed_border_box_rect(rects, *paintable_with_lines);
+        }
+        // An inline element whose content is only interrupting blocks generates no line fragments, but per CSSOM
+        // we still report its (zero-sized) border area instead of an empty list.
+        if (rects.is_empty() && paintable_with_only_block_level_fragments)
+            append_transformed_border_box_rect(rects, *paintable_with_only_block_level_fragments);
+        return rects;
+    }
+
     if (auto paintable_box = element.paintable_box()) {
-        auto absolute_rect = paintable_box->absolute_border_box_rect();
-        rects.append(paintable_box->transform_rect_to_viewport(absolute_rect, Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No));
+        append_transformed_border_box_rect(rects, *paintable_box);
     } else if (element.paintable()) {
         dbgln("FIXME: Failed to get client rects for element ({})", element.debug_description());
     }

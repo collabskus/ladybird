@@ -36,6 +36,7 @@ public:
 
     void signal_test_is_done(String const& text);
     void set_test_timeout(double milliseconds);
+    void force_incompatible_visual_context_tree_rebuild();
     WebIDL::ExceptionOr<void> load_reference_test_metadata();
 
     WebIDL::ExceptionOr<String> set_time_zone(StringView time_zone);
@@ -67,7 +68,7 @@ public:
     String selected_text_for_clipboard();
 
     void set_marked_text_from_input_method(Utf16String const& text);
-    void commit_text_from_input_method(Utf16String const& text);
+    void commit_text_from_input_method(Utf16String const& text, WebIDL::Long replacement_start, WebIDL::Long replacement_length);
     void unmark_text_from_input_method();
     GC::Ptr<Geometry::DOMRect> current_caret_rect();
 

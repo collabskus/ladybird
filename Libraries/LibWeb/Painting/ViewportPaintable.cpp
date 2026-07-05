@@ -27,6 +27,7 @@
 namespace Web::Painting {
 
 AccumulatedVisualContextTree build_accumulated_visual_context_tree(ViewportPaintable&);
+bool update_accumulated_visual_context_values(ViewportPaintable&, PaintableBox&);
 void update_visual_viewport_accumulated_visual_context(ViewportPaintable&);
 
 NonnullRefPtr<ViewportPaintable> ViewportPaintable::create(Layout::Viewport const& layout_viewport)
@@ -219,10 +220,30 @@ void ViewportPaintable::assign_scroll_frames()
 void ViewportPaintable::assign_accumulated_visual_contexts()
 {
     auto visual_context_tree = build_accumulated_visual_context_tree(*this);
-    if (m_visual_context_tree.has_value() && visual_context_tree.is_compatible_with(*m_visual_context_tree))
+    auto is_compatible = m_visual_context_tree.has_value() && visual_context_tree.is_compatible_with(*m_visual_context_tree);
+    if (m_force_incompatible_visual_context_tree_rebuild_for_testing) {
+        m_force_incompatible_visual_context_tree_rebuild_for_testing = false;
+        is_compatible = false;
+    }
+    if (is_compatible) {
         visual_context_tree.reuse_version_from(*m_visual_context_tree);
+    } else {
+        document().set_needs_to_record_display_list();
+    }
     m_visual_context_tree = move(visual_context_tree);
     m_visual_context_tree_needs_compositor_update = true;
+}
+
+bool ViewportPaintable::update_accumulated_visual_context_values(PaintableBox& paintable_box)
+{
+    if (!m_visual_context_tree.has_value())
+        return false;
+    if (m_force_incompatible_visual_context_tree_rebuild_for_testing)
+        return false;
+    if (!Painting::update_accumulated_visual_context_values(*this, paintable_box))
+        return false;
+    m_visual_context_tree_needs_compositor_update = true;
+    return true;
 }
 
 void ViewportPaintable::update_visual_viewport_accumulated_visual_context()
