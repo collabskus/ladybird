@@ -46700,7 +46700,9 @@ FILE: AK/Windows.h
 
 #include <AK/Assertions.h>
 #include <AK/Diagnostics.h>
+#include <AK/Error.h>
 #include <AK/Platform.h>
+#include <AK/Vector.h>
 
 #ifdef AK_OS_WINDOWS
 #    define timeval dummy_timeval
@@ -46770,6 +46772,34 @@ inline struct SystemApi {
 #    pragma comment(lib, "ws2_32.lib")
 #    include <io.h>
 #    include <stdlib.h>
+
+// Converts UTF-8 text to a null-terminated UTF-16 string for use with wide-char Win32 APIs.
+inline ErrorOr<Vector<wchar_t>> to_wide_string(StringView utf8)
+{
+    int length = 0;
+    if (!utf8.is_empty()) {
+        length = MultiByteToWideChar(CP_UTF8, 0, utf8.characters_without_null_termination(), static_cast<int>(utf8.length()), nullptr, 0);
+        if (length == 0)
+            return Error::from_windows_error();
+    }
+
+    Vector<wchar_t> result;
+    TRY(result.try_resize(length + 1));
+    if (length > 0)
+        MultiByteToWideChar(CP_UTF8, 0, utf8.characters_without_null_termination(), static_cast<int>(utf8.length()), result.data(), length);
+    return result;
+}
+
+// Cached SYSTEM_INFO::dwAllocationGranularity — the required alignment for MapViewOfFile offsets.
+inline size_t system_allocation_granularity()
+{
+    static size_t granularity = [] {
+        SYSTEM_INFO system_info {};
+        GetSystemInfo(&system_info);
+        return static_cast<size_t>(system_info.dwAllocationGranularity);
+    }();
+    return granularity;
+}
 
 inline void initiate_wsa()
 {
@@ -63387,7 +63417,6 @@ set(SOURCES
     EventReceiver.cpp
     File.cpp
     ImmutableBytes.cpp
-    MappedFile.cpp
     MimeData.cpp
     Notifier.cpp
     ReportTime.cpp
@@ -63408,7 +63437,9 @@ if (WIN32)
     list(APPEND SOURCES
         AnonymousBufferWindows.cpp
         EventLoopImplementationWindows.cpp
+        FileWindows.cpp
         LocalServerWindows.cpp
+        MappedFileWindows.cpp
         ProcessWindows.cpp
         SocketWindows.cpp
         SocketpairWindows.cpp
@@ -63420,7 +63451,9 @@ else()
     list(APPEND SOURCES
         AnonymousBuffer.cpp
         EventLoopImplementationUnix.cpp
+        FilePosix.cpp
         LocalServer.cpp
+        MappedFile.cpp
         Process.cpp
         Socket.cpp
         System.cpp
@@ -63852,6 +63885,10 @@ FILE: Libraries/LibCore/Directory.cpp
 #include <LibCore/Directory.h>
 #include <LibCore/System.h>
 
+#ifdef AK_OS_WINDOWS
+#    include <AK/Windows.h>
+#endif
+
 namespace Core {
 
 // We assume that the fd is a valid directory.
@@ -63886,7 +63923,7 @@ ErrorOr<void> Directory::chown(uid_t uid, gid_t gid)
 
 ErrorOr<bool> Directory::is_valid_directory(int fd)
 {
-    auto stat = TRY(System::fstat(fd));
+    auto stat = TRY(File::fstat(fd));
     return stat.st_mode & S_IFDIR;
 }
 
@@ -63907,9 +63944,12 @@ ErrorOr<Directory> Directory::create(LexicalPath path, CreateDirectories create_
 {
     if (create_directories == CreateDirectories::Yes)
         TRY(ensure_directory(path, creation_mode));
-    // FIXME: doesn't work on Linux probably
-    auto fd = TRY(System::open(path.string(), O_CLOEXEC));
-    return adopt_fd(fd, move(path));
+    // Validate before leaking the fd out of the File, so that failure (e.g. ENOTDIR
+    // for an existing regular file) doesn't leak it.
+    auto file = TRY(File::open(path.string(), File::OpenMode::Read));
+    if (!TRY(is_valid_directory(file->fd())))
+        return Error::from_errno(ENOTDIR);
+    return Directory { file->leak_fd(), move(path) };
 }
 
 ErrorOr<void> Directory::ensure_directory(LexicalPath const& path, mode_t creation_mode)
@@ -63919,28 +63959,49 @@ ErrorOr<void> Directory::ensure_directory(LexicalPath const& path, mode_t creati
 
     TRY(ensure_directory(path.parent(), creation_mode));
 
-    auto return_value = System::mkdir(path.string(), creation_mode);
     // We don't care if the directory already exists.
+#ifdef AK_OS_WINDOWS
+    // NOTE: Windows directories have no POSIX permission bits; creation_mode is ignored.
+    auto wide_path = TRY(to_wide_string(path.string()));
+    if (!CreateDirectoryW(wide_path.data(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
+        return Error::from_windows_error();
+#else
+    auto return_value = System::mkdir(path.string(), creation_mode);
     if (return_value.is_error() && return_value.error().code() != EEXIST)
         return return_value;
-
+#endif
     return {};
 }
 
+#ifdef AK_OS_WINDOWS
 ErrorOr<NonnullOwnPtr<File>> Directory::open(StringView filename, File::OpenMode mode) const
 {
-    auto fd = TRY(System::openat(m_directory_fd, filename, File::open_mode_to_options(mode)));
+    // Windows has no fd-relative file APIs, so open by joined path instead.
+    return File::open(LexicalPath::join(m_path.string(), filename).string(), mode);
+}
+
+ErrorOr<struct stat> Directory::stat(StringView filename) const
+{
+    return File::stat(LexicalPath::join(m_path.string(), filename).string());
+}
+#else
+ErrorOr<NonnullOwnPtr<File>> Directory::open(StringView filename, File::OpenMode mode) const
+{
+    // NOTE: openat()'s creation mode defaulted to 0, which made files created through
+    //       Directory::open() unreadable and unwritable; use the same default as File::open().
+    auto fd = TRY(System::openat(m_directory_fd, filename, File::open_mode_to_options(mode), 0644));
     return File::adopt_fd(fd, mode);
 }
 
-ErrorOr<struct stat> Directory::stat(StringView filename, int flags) const
+ErrorOr<struct stat> Directory::stat(StringView filename) const
 {
-    return System::fstatat(m_directory_fd, filename, flags);
+    return System::fstatat(m_directory_fd, filename, 0);
 }
+#endif
 
 ErrorOr<struct stat> Directory::stat() const
 {
-    return System::fstat(m_directory_fd);
+    return File::fstat(m_directory_fd);
 }
 
 ErrorOr<void> Directory::for_each_entry(DirIterator::Flags flags, Core::Directory::ForEachEntryCallback callback)
@@ -64015,7 +64076,7 @@ public:
     static ErrorOr<Directory> adopt_fd(int fd, LexicalPath path);
 
     ErrorOr<NonnullOwnPtr<File>> open(StringView filename, File::OpenMode mode) const;
-    ErrorOr<struct stat> stat(StringView filename, int flags) const;
+    ErrorOr<struct stat> stat(StringView filename) const;
     ErrorOr<struct stat> stat() const;
     int fd() const { return m_directory_fd; }
 
@@ -66883,88 +66944,12 @@ ErrorOr<NonnullOwnPtr<File>> File::open_file_or_standard_stream(StringView filen
     }
 }
 
-int File::open_mode_to_options(OpenMode mode)
-{
-    int flags = 0;
-    if (has_flag(mode, OpenMode::ReadWrite)) {
-        flags |= O_RDWR | O_CREAT;
-    } else if (has_flag(mode, OpenMode::Read)) {
-        flags |= O_RDONLY;
-    } else if (has_flag(mode, OpenMode::Write)) {
-        flags |= O_WRONLY | O_CREAT;
-        bool should_truncate = !has_any_flag(mode, OpenMode::Append | OpenMode::MustBeNew);
-        if (should_truncate)
-            flags |= O_TRUNC;
-    }
-
-    if (has_flag(mode, OpenMode::Append))
-        flags |= O_APPEND;
-    if (has_flag(mode, OpenMode::Truncate))
-        flags |= O_TRUNC;
-    if (has_flag(mode, OpenMode::MustBeNew))
-        flags |= O_EXCL;
-    if (!has_flag(mode, OpenMode::KeepOnExec))
-        flags |= O_CLOEXEC;
-    if (has_flag(mode, OpenMode::Nonblocking)) {
-#if !defined(AK_OS_WINDOWS)
-        flags |= O_NONBLOCK;
-#else
-        dbgln("Core::File::OpenMode::Nonblocking is not implemented");
-        VERIFY_NOT_REACHED();
-#endif
-    }
-
-    // Some open modes, like `ReadWrite` imply the ability to create the file if it doesn't exist.
-    // Certain applications may not want this privilege, and for compatibility reasons, this is
-    // the easiest way to add this option.
-    if (has_flag(mode, OpenMode::DontCreate))
-        flags &= ~O_CREAT;
-
-    return flags;
-}
-
-ErrorOr<void> File::open_path(StringView filename, mode_t permissions)
-{
-    VERIFY(m_fd == -1);
-    auto flags = open_mode_to_options(m_mode);
-
-    m_fd = TRY(System::open(filename, flags, permissions));
-    return {};
-}
-
-ErrorOr<Bytes> File::read_some(Bytes buffer)
-{
-    if (!has_flag(m_mode, OpenMode::Read)) {
-        // NOTE: POSIX says that if the fd is not open for reading, the call
-        //       will return EBADF. Since we already know whether we can or
-        //       can't read the file, let's avoid a syscall.
-        return Error::from_errno(EBADF);
-    }
-
-    auto nread = TRY(System::read(m_fd, buffer));
-    m_last_read_was_eof = nread == 0;
-    m_file_offset += nread;
-    return buffer.trim(nread);
-}
-
 ErrorOr<ByteBuffer> File::read_until_eof(size_t block_size)
 {
     // Note: This is used as a heuristic, it's not valid for devices or virtual files.
-    auto const potential_file_size = TRY(System::fstat(m_fd)).st_size;
+    auto const potential_file_size = TRY(stat()).st_size;
 
     return read_until_eof_impl(block_size, potential_file_size);
-}
-
-ErrorOr<size_t> File::write_some(ReadonlyBytes buffer)
-{
-    if (!has_flag(m_mode, OpenMode::Write)) {
-        // NOTE: Same deal as Read.
-        return Error::from_errno(EBADF);
-    }
-
-    auto nwritten = TRY(System::write(m_fd, buffer));
-    m_file_offset += nwritten;
-    return nwritten;
 }
 
 bool File::is_eof() const { return m_last_read_was_eof; }
@@ -66988,50 +66973,9 @@ void File::close()
     m_fd = -1;
 }
 
-ErrorOr<size_t> File::seek(i64 offset, SeekMode mode)
-{
-    int syscall_mode;
-    switch (mode) {
-    case SeekMode::SetPosition:
-        syscall_mode = SEEK_SET;
-        break;
-    case SeekMode::FromCurrentPosition:
-        syscall_mode = SEEK_CUR;
-        break;
-    case SeekMode::FromEndPosition:
-        syscall_mode = SEEK_END;
-        break;
-    default:
-        VERIFY_NOT_REACHED();
-    }
-
-    size_t seek_result = TRY(System::lseek(m_fd, offset, syscall_mode));
-    m_file_offset = seek_result;
-    m_last_read_was_eof = false;
-    return seek_result;
-}
-
 ErrorOr<size_t> File::tell() const
 {
     return m_file_offset;
-}
-
-ErrorOr<void> File::truncate(size_t length)
-{
-    if (length > static_cast<size_t>(NumericLimits<off_t>::max()))
-        return Error::from_string_literal("Length is larger than the maximum supported length");
-
-    m_file_offset = min(length, m_file_offset);
-    return System::ftruncate(m_fd, length);
-}
-
-ErrorOr<void> File::set_blocking(bool enabled)
-{
-    // NOTE: This works fine on Serenity, but some systems out there don't support changing the blocking state of certain POSIX objects (message queues, pipes, etc) after their creation.
-    // Therefore, this method shouldn't be used in Lagom.
-    // https://github.com/SerenityOS/serenity/pull/18965#discussion_r1207951840
-    int value = enabled ? 0 : 1;
-    return System::ioctl(fd(), FIONBIO, &value);
 }
 
 }
@@ -67051,6 +66995,17 @@ FILE: Libraries/LibCore/File.h
 #include <AK/NonnullOwnPtr.h>
 #include <AK/Stream.h>
 #include <LibCore/Export.h>
+#include <sys/stat.h>
+
+#ifdef AK_OS_WINDOWS
+// The CRT's <sys/stat.h> lacks the POSIX file-type classification macros.
+#    ifndef S_ISDIR
+#        define S_ISDIR(mode) (((mode) & S_IFMT) == S_IFDIR)
+#    endif
+#    ifndef S_ISREG
+#        define S_ISREG(mode) (((mode) & S_IFMT) == S_IFREG)
+#    endif
+#endif
 
 namespace Core {
 
@@ -67107,12 +67062,19 @@ public:
     virtual ErrorOr<size_t> tell() const override;
     virtual ErrorOr<void> truncate(size_t length) override;
 
+    ErrorOr<struct stat> stat() const;
+
+    static ErrorOr<struct stat> stat(StringView path);
+    static ErrorOr<struct stat> fstat(int fd);
+
+#if !defined(AK_OS_WINDOWS)
     // Sets the blocking mode of the file. If blocking mode is disabled, reads
     // will fail with EAGAIN when there's no data available to read, and writes
     // will fail with EAGAIN when the data cannot be written without blocking
     // (due to the send buffer being full, for example).
     // See also Socket::set_blocking.
     ErrorOr<void> set_blocking(bool enabled);
+#endif
 
     int leak_fd()
     {
@@ -67131,7 +67093,10 @@ public:
             close();
     }
 
+#if !defined(AK_OS_WINDOWS)
+    // Translates an OpenMode into O_* flags; only meaningful for the POSIX backend.
     static int open_mode_to_options(OpenMode mode);
+#endif
 
 private:
     File(OpenMode mode, ShouldCloseFileDescriptor should_close = ShouldCloseFileDescriptor::Yes)
@@ -67154,6 +67119,142 @@ AK_ENUM_BITWISE_OPERATORS(File::OpenMode)
 
 using InputBufferedFile = InputBufferedSeekable<File>;
 using OutputBufferedFile = OutputBufferedSeekable<File>;
+
+}
+
+FILE: Libraries/LibCore/FilePosix.cpp
+/*
+ * Copyright (c) 2018-2021, Andreas Kling <andreas@ladybird.org>
+ * Copyright (c) 2021, sin-ack <sin-ack@protonmail.com>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <LibCore/File.h>
+#include <LibCore/System.h>
+
+#include <unistd.h>
+
+namespace Core {
+
+int File::open_mode_to_options(OpenMode mode)
+{
+    int flags = 0;
+    if (has_flag(mode, OpenMode::ReadWrite)) {
+        flags |= O_RDWR | O_CREAT;
+    } else if (has_flag(mode, OpenMode::Read)) {
+        flags |= O_RDONLY;
+    } else if (has_flag(mode, OpenMode::Write)) {
+        flags |= O_WRONLY | O_CREAT;
+        bool should_truncate = !has_any_flag(mode, OpenMode::Append | OpenMode::MustBeNew);
+        if (should_truncate)
+            flags |= O_TRUNC;
+    }
+
+    if (has_flag(mode, OpenMode::Append))
+        flags |= O_APPEND;
+    if (has_flag(mode, OpenMode::Truncate))
+        flags |= O_TRUNC;
+    if (has_flag(mode, OpenMode::MustBeNew))
+        flags |= O_EXCL;
+    if (!has_flag(mode, OpenMode::KeepOnExec))
+        flags |= O_CLOEXEC;
+    if (has_flag(mode, OpenMode::Nonblocking))
+        flags |= O_NONBLOCK;
+
+    // Some open modes, like `ReadWrite` imply the ability to create the file if it doesn't exist.
+    // Certain applications may not want this privilege, and for compatibility reasons, this is
+    // the easiest way to add this option.
+    if (has_flag(mode, OpenMode::DontCreate))
+        flags &= ~O_CREAT;
+
+    return flags;
+}
+
+ErrorOr<void> File::open_path(StringView filename, mode_t permissions)
+{
+    VERIFY(m_fd == -1);
+    auto flags = open_mode_to_options(m_mode);
+
+    m_fd = TRY(System::open(filename, flags, permissions));
+    return {};
+}
+
+ErrorOr<Bytes> File::read_some(Bytes buffer)
+{
+    if (!has_flag(m_mode, OpenMode::Read)) {
+        return Error::from_errno(EBADF);
+    }
+
+    auto nread = TRY(System::read(m_fd, buffer));
+    m_last_read_was_eof = nread == 0;
+    m_file_offset += nread;
+    return buffer.trim(nread);
+}
+
+ErrorOr<size_t> File::write_some(ReadonlyBytes buffer)
+{
+    if (!has_flag(m_mode, OpenMode::Write)) {
+        // NOTE: Same deal as Read.
+        return Error::from_errno(EBADF);
+    }
+
+    auto nwritten = TRY(System::write(m_fd, buffer));
+    m_file_offset += nwritten;
+    return nwritten;
+}
+
+ErrorOr<size_t> File::seek(i64 offset, SeekMode mode)
+{
+    int syscall_mode;
+    switch (mode) {
+    case SeekMode::SetPosition:
+        syscall_mode = SEEK_SET;
+        break;
+    case SeekMode::FromCurrentPosition:
+        syscall_mode = SEEK_CUR;
+        break;
+    case SeekMode::FromEndPosition:
+        syscall_mode = SEEK_END;
+        break;
+    default:
+        VERIFY_NOT_REACHED();
+    }
+
+    size_t seek_result = TRY(System::lseek(m_fd, offset, syscall_mode));
+    m_file_offset = seek_result;
+    m_last_read_was_eof = false;
+    return seek_result;
+}
+
+ErrorOr<void> File::truncate(size_t length)
+{
+    if (length > static_cast<size_t>(NumericLimits<off_t>::max()))
+        return Error::from_string_literal("Length is larger than the maximum supported length");
+
+    m_file_offset = min(length, m_file_offset);
+    return System::ftruncate(m_fd, length);
+}
+
+ErrorOr<struct stat> File::stat() const
+{
+    return System::fstat(m_fd);
+}
+
+ErrorOr<struct stat> File::stat(StringView path)
+{
+    return System::stat(path);
+}
+
+ErrorOr<struct stat> File::fstat(int fd)
+{
+    return System::fstat(fd);
+}
+
+ErrorOr<void> File::set_blocking(bool enabled)
+{
+    return System::set_socket_blocking(fd(), enabled);
+}
 
 }
 
@@ -67506,6 +67607,239 @@ ErrorOr<bool> FileWatcherBase::add_watch(ByteString, FileWatcherEvent::Type)
 ErrorOr<bool> FileWatcherBase::remove_watch(ByteString)
 {
     return Error::from_errno(ENOTSUP);
+}
+
+}
+
+FILE: Libraries/LibCore/FileWindows.cpp
+/*
+ * Copyright (c) 2026, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <LibCore/File.h>
+
+#include <AK/Windows.h>
+
+namespace Core {
+
+// Maps the CreateFileW/GetFileAttributesExW failures that Windows-reachable callers
+// match on into errno space.
+// FIXME: Replace ad-hoc errno matching with a portable error taxonomy.
+static Error open_error_from_windows_error()
+{
+    auto error = GetLastError();
+    switch (error) {
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:
+    case ERROR_INVALID_NAME:
+        return Error::from_errno(ENOENT);
+    case ERROR_ACCESS_DENIED:
+        return Error::from_errno(EACCES);
+    case ERROR_FILE_EXISTS:
+    case ERROR_ALREADY_EXISTS:
+        return Error::from_errno(EEXIST);
+    default:
+        return Error::from_windows_error(error);
+    }
+}
+
+static i64 unix_time_from_filetime(FILETIME file_time)
+{
+    // Seconds between the Windows epoch (1601-01-01) and the Unix epoch (1970-01-01).
+    static constexpr i64 windows_to_unix_epoch_offset_seconds = 11'644'473'600;
+    auto hundreds_of_nanoseconds = static_cast<i64>((static_cast<u64>(file_time.dwHighDateTime) << 32) | file_time.dwLowDateTime);
+    return hundreds_of_nanoseconds / 10'000'000 - windows_to_unix_epoch_offset_seconds;
+}
+
+ErrorOr<void> File::open_path(StringView filename, mode_t)
+{
+    VERIFY(m_fd == -1);
+
+    // NOTE: Windows files have no POSIX permission bits, so the mode argument is ignored
+    //       instead of being approximated.
+
+    if (has_flag(m_mode, OpenMode::Nonblocking)) {
+        dbgln("Core::File::OpenMode::Nonblocking is not implemented on Windows");
+        VERIFY_NOT_REACHED();
+    }
+
+    DWORD desired_access = 0;
+    if (has_flag(m_mode, OpenMode::Read))
+        desired_access |= GENERIC_READ;
+    if (has_flag(m_mode, OpenMode::Write)) {
+        // FILE_APPEND_DATA without FILE_WRITE_DATA makes WriteFile() always append,
+        // which matches POSIX O_APPEND semantics.
+        if (has_flag(m_mode, OpenMode::Append))
+            desired_access |= FILE_APPEND_DATA | SYNCHRONIZE;
+        else
+            desired_access |= GENERIC_WRITE;
+    }
+
+    // Mirror the POSIX backend's flag policy: write modes create unless DontCreate,
+    // write-only implies truncation unless appending or exclusive.
+    bool const may_create = has_flag(m_mode, OpenMode::Write) && !has_flag(m_mode, OpenMode::DontCreate);
+    bool should_truncate = has_flag(m_mode, OpenMode::Truncate);
+    if (!has_flag(m_mode, OpenMode::ReadWrite) && has_flag(m_mode, OpenMode::Write) && !has_any_flag(m_mode, OpenMode::Append | OpenMode::MustBeNew))
+        should_truncate = true;
+
+    DWORD creation_disposition;
+    if (has_flag(m_mode, OpenMode::MustBeNew) && may_create)
+        creation_disposition = CREATE_NEW;
+    else if (may_create)
+        creation_disposition = should_truncate ? CREATE_ALWAYS : OPEN_ALWAYS;
+    else
+        creation_disposition = should_truncate ? TRUNCATE_EXISTING : OPEN_EXISTING;
+
+    SECURITY_ATTRIBUTES security_attributes = {};
+    security_attributes.nLength = sizeof(security_attributes);
+    security_attributes.bInheritHandle = has_flag(m_mode, OpenMode::KeepOnExec);
+
+    auto wide_filename = TRY(to_wide_string(filename));
+
+    // Share as permissively as POSIX opens do. FILE_FLAG_BACKUP_SEMANTICS allows opening
+    // directories, which Core::Directory and the file:// directory listing depend on.
+    HANDLE handle = CreateFileW(
+        wide_filename.data(),
+        desired_access,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        &security_attributes,
+        creation_disposition,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
+        nullptr);
+    if (handle == INVALID_HANDLE_VALUE)
+        return open_error_from_windows_error();
+
+    m_fd = to_fd(handle);
+    return {};
+}
+
+ErrorOr<Bytes> File::read_some(Bytes buffer)
+{
+    if (!has_flag(m_mode, OpenMode::Read)) {
+        // NOTE: The POSIX backend also refuses reads on write-only files without a syscall.
+        return Error::from_errno(EBADF);
+    }
+
+    DWORD n_read = 0;
+    if (!ReadFile(to_handle(m_fd), buffer.data(), buffer.size(), &n_read, nullptr)) {
+        auto error = GetLastError();
+        // Reading a pipe whose write end has closed fails with ERROR_BROKEN_PIPE once
+        // drained; POSIX read() reports that (and end-of-file) as reading 0 bytes.
+        if (error != ERROR_BROKEN_PIPE && error != ERROR_HANDLE_EOF)
+            return Error::from_windows_error(error);
+        n_read = 0;
+    }
+    m_last_read_was_eof = n_read == 0;
+    m_file_offset += n_read;
+    return buffer.trim(n_read);
+}
+
+ErrorOr<size_t> File::write_some(ReadonlyBytes buffer)
+{
+    if (!has_flag(m_mode, OpenMode::Write)) {
+        // NOTE: Same deal as Read.
+        return Error::from_errno(EBADF);
+    }
+
+    DWORD n_written = 0;
+    if (!WriteFile(to_handle(m_fd), buffer.data(), buffer.size(), &n_written, nullptr))
+        return Error::from_windows_error();
+    m_file_offset += n_written;
+    return n_written;
+}
+
+ErrorOr<size_t> File::seek(i64 offset, SeekMode mode)
+{
+    DWORD move_method;
+    switch (mode) {
+    case SeekMode::SetPosition:
+        move_method = FILE_BEGIN;
+        break;
+    case SeekMode::FromCurrentPosition:
+        move_method = FILE_CURRENT;
+        break;
+    case SeekMode::FromEndPosition:
+        move_method = FILE_END;
+        break;
+    default:
+        VERIFY_NOT_REACHED();
+    }
+
+    LARGE_INTEGER new_pointer = {};
+    if (!SetFilePointerEx(to_handle(m_fd), { .QuadPart = offset }, &new_pointer, move_method))
+        return Error::from_windows_error();
+    m_file_offset = new_pointer.QuadPart;
+    m_last_read_was_eof = false;
+    return m_file_offset;
+}
+
+ErrorOr<void> File::truncate(size_t length)
+{
+    if (length > static_cast<size_t>(NumericLimits<i64>::max()))
+        return Error::from_string_literal("Length is larger than the maximum supported length");
+
+    // Truncates or extends without moving the file pointer; like POSIX ftruncate(),
+    // the caller-visible position is left unchanged (it may end up past EOF).
+    FILE_END_OF_FILE_INFO end_of_file_info = {};
+    end_of_file_info.EndOfFile.QuadPart = static_cast<LONGLONG>(length);
+    if (!SetFileInformationByHandle(to_handle(m_fd), FileEndOfFileInfo, &end_of_file_info, sizeof(end_of_file_info)))
+        return Error::from_windows_error();
+    return {};
+}
+
+ErrorOr<struct stat> File::stat() const
+{
+    return fstat(m_fd);
+}
+
+static struct stat stat_from_file_information(DWORD attributes, u64 file_size, FILETIME creation_time, FILETIME last_access_time, FILETIME last_write_time)
+{
+    struct stat st = {};
+    if (attributes & FILE_ATTRIBUTE_DIRECTORY)
+        st.st_mode = S_IFDIR | 0755;
+    else
+        st.st_mode = S_IFREG | ((attributes & FILE_ATTRIBUTE_READONLY) ? 0444 : 0644);
+    st.st_size = static_cast<decltype(st.st_size)>(file_size);
+    st.st_nlink = 1;
+    st.st_atime = unix_time_from_filetime(last_access_time);
+    st.st_mtime = unix_time_from_filetime(last_write_time);
+    st.st_ctime = unix_time_from_filetime(creation_time);
+    return st;
+}
+
+// FIXME: Unlike POSIX stat(), this doesn't follow symlinks (reparse points).
+ErrorOr<struct stat> File::stat(StringView path)
+{
+    auto wide_path = TRY(to_wide_string(path));
+    WIN32_FILE_ATTRIBUTE_DATA attribute_data = {};
+    if (!GetFileAttributesExW(wide_path.data(), GetFileExInfoStandard, &attribute_data))
+        return open_error_from_windows_error();
+
+    return stat_from_file_information(
+        attribute_data.dwFileAttributes,
+        (static_cast<u64>(attribute_data.nFileSizeHigh) << 32) | attribute_data.nFileSizeLow,
+        attribute_data.ftCreationTime,
+        attribute_data.ftLastAccessTime,
+        attribute_data.ftLastWriteTime);
+}
+
+ErrorOr<struct stat> File::fstat(int fd)
+{
+    BY_HANDLE_FILE_INFORMATION file_information = {};
+    if (!GetFileInformationByHandle(to_handle(fd), &file_information))
+        return Error::from_windows_error();
+
+    auto st = stat_from_file_information(
+        file_information.dwFileAttributes,
+        (static_cast<u64>(file_information.nFileSizeHigh) << 32) | file_information.nFileSizeLow,
+        file_information.ftCreationTime,
+        file_information.ftLastAccessTime,
+        file_information.ftLastWriteTime);
+    st.st_nlink = static_cast<decltype(st.st_nlink)>(file_information.nNumberOfLinks);
+    st.st_dev = file_information.dwVolumeSerialNumber;
+    return st;
 }
 
 }
@@ -68118,8 +68452,7 @@ bool LocalServer::listen(ByteString const& address)
         return false;
 
     m_fd = MUST(Core::System::socket(AF_LOCAL, SOCK_STREAM, 0));
-    int option = 1;
-    MUST(Core::System::ioctl(m_fd, FIONBIO, &option));
+    MUST(Core::System::set_socket_blocking(m_fd, false));
     auto const ret = SetHandleInformation(to_handle(m_fd), HANDLE_FLAG_INHERIT, 0);
     VERIFY(ret != 0);
 
@@ -68602,6 +68935,115 @@ public:
 private:
     NonnullOwnPtr<MappedFile> m_file;
 };
+
+}
+
+FILE: Libraries/LibCore/MappedFileWindows.cpp
+/*
+ * Copyright (c) 2018-2021, Andreas Kling <andreas@ladybird.org>
+ * Copyright (c) 2023, kleines Filmröllchen <filmroellchen@serenityos.org>
+ * Copyright (c) 2026, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/Checked.h>
+#include <AK/ScopeGuard.h>
+#include <LibCore/File.h>
+#include <LibCore/MappedFile.h>
+#include <LibCore/System.h>
+
+#include <AK/Windows.h>
+
+namespace Core {
+
+static constexpr size_t to_end_of_file = NumericLimits<size_t>::max();
+
+ErrorOr<NonnullOwnPtr<MappedFile>> MappedFile::map(StringView path, Mode mode)
+{
+    auto open_mode = mode == Mode::ReadOnly
+        ? File::OpenMode::Read
+        : File::OpenMode::ReadWrite | File::OpenMode::DontCreate;
+    auto file = TRY(File::open(path, open_mode));
+    return map_from_fd_and_close(file->leak_fd(), path, mode);
+}
+
+ErrorOr<NonnullOwnPtr<MappedFile>> MappedFile::map_from_file(NonnullOwnPtr<Core::File> stream, StringView path)
+{
+    return map_from_fd_and_close(stream->leak_fd(), path);
+}
+
+ErrorOr<NonnullOwnPtr<MappedFile>> MappedFile::map_from_fd_and_close(int fd, StringView path, Mode mode)
+{
+    return map_from_fd_range_and_close(fd, path, 0, to_end_of_file, mode);
+}
+
+ErrorOr<NonnullOwnPtr<MappedFile>> MappedFile::map_from_fd_range_and_close(int fd, StringView, off_t offset, size_t size, Mode mode)
+{
+    ScopeGuard fd_close_guard = [fd] {
+        (void)System::close(fd);
+    };
+
+    if (offset < 0 || !AK::is_within_range<size_t>(offset))
+        return Error::from_errno(EINVAL);
+
+    LARGE_INTEGER large_file_size = {};
+    if (!GetFileSizeEx(to_handle(fd), &large_file_size))
+        return Error::from_windows_error();
+
+    auto file_size = static_cast<size_t>(large_file_size.QuadPart);
+    auto requested_offset = static_cast<size_t>(offset);
+    if (requested_offset > file_size)
+        return Error::from_errno(EINVAL);
+    if (size == to_end_of_file)
+        size = file_size - requested_offset;
+    else if (size > file_size - requested_offset)
+        return Error::from_errno(EINVAL);
+
+    if (size == 0)
+        return adopt_own(*new MappedFile(nullptr, 0, nullptr, 0, mode));
+
+    // MapViewOfFile requires the offset to be aligned to the system allocation granularity.
+    auto aligned_offset = align_down_to(requested_offset, system_allocation_granularity());
+    auto offset_in_mapping = requested_offset - aligned_offset;
+
+    Checked<size_t> view_size = offset_in_mapping;
+    view_size += size;
+    if (view_size.has_overflow())
+        return Error::from_errno(EOVERFLOW);
+
+    // Like the POSIX backend, read-only mappings are shared and writable mappings are
+    // copy-on-write, so writes through a MappedFile never reach the underlying file.
+    HANDLE file_mapping = CreateFileMappingW(to_handle(fd), nullptr, mode == Mode::ReadOnly ? PAGE_READONLY : PAGE_WRITECOPY, 0, 0, nullptr);
+    if (!file_mapping)
+        return Error::from_windows_error();
+    ScopeGuard file_mapping_guard = [&] { CloseHandle(file_mapping); };
+
+    void* view = MapViewOfFile(file_mapping, mode == Mode::ReadOnly ? FILE_MAP_READ : FILE_MAP_COPY, static_cast<DWORD>(aligned_offset >> 32), static_cast<DWORD>(aligned_offset & 0xFFFFFFFF), view_size.value());
+    if (!view)
+        return Error::from_windows_error();
+
+    auto* data = static_cast<u8*>(view) + offset_in_mapping;
+    return adopt_own(*new MappedFile(view, view_size.value(), data, size, mode));
+}
+
+MappedFile::MappedFile(void* mapping, size_t mapping_size, void* data, size_t size, Mode mode)
+    : FixedMemoryStream(Bytes { data, size }, mode)
+    , m_mapping(mapping)
+    , m_mapping_size(mapping_size)
+    , m_data(data)
+    , m_size(size)
+{
+}
+
+MappedFile::~MappedFile()
+{
+    if (!m_mapping)
+        return;
+
+    if (!UnmapViewOfFile(m_mapping))
+        dbgln("Failed to unmap MappedFile (@ {:p}, {} bytes): {}", m_mapping, m_mapping_size, Error::from_windows_error());
+}
 
 }
 
@@ -69621,6 +70063,11 @@ void Process::terminate_immediately(int status)
     VERIFY_NOT_REACHED();
 }
 
+ErrorOr<void> Process::terminate_process(pid_t pid, TerminationMode mode)
+{
+    return System::kill(pid, mode == TerminationMode::Graceful ? SIGTERM : SIGKILL);
+}
+
 ErrorOr<String> Process::get_name()
 {
 #if defined(AK_OS_SERENITY)
@@ -69844,6 +70291,12 @@ public:
 
     [[noreturn]] static void terminate_immediately(int status);
 
+    enum class TerminationMode {
+        Graceful,
+        Forceful,
+    };
+    static ErrorOr<void> terminate_process(pid_t, TerminationMode);
+
     static void wait_for_debugger_and_break();
     static ErrorOr<bool> is_being_debugged();
 
@@ -69883,6 +70336,7 @@ FILE: Libraries/LibCore/ProcessWindows.cpp
  */
 
 #include <AK/Assertions.h>
+#include <AK/ScopeGuard.h>
 #include <AK/String.h>
 #include <AK/Utf16View.h>
 #include <AK/Vector.h>
@@ -69980,6 +70434,33 @@ void Process::terminate_immediately(int status)
     // DLL detach notifications and the other ExitProcess() teardown paths.
     TerminateProcess(GetCurrentProcess(), static_cast<UINT>(status));
     VERIFY_NOT_REACHED();
+}
+
+ErrorOr<void> Process::terminate_process(pid_t pid, TerminationMode mode)
+{
+    if (mode == TerminationMode::Graceful) {
+        // There is no SIGTERM equivalent on Windows; the closest honest approximation is
+        // asking every top-level window of the process to close. Console or windowless
+        // processes will not observe this.
+        if (!EnumWindows([](HWND hwnd, LPARAM l_param) -> BOOL {
+                DWORD window_pid = 0;
+                GetWindowThreadProcessId(hwnd, &window_pid);
+                if (window_pid == static_cast<DWORD>(l_param))
+                    PostMessage(hwnd, WM_CLOSE, 0, 0);
+                return TRUE;
+            },
+                pid))
+            return Error::from_windows_error();
+        return {};
+    }
+
+    HANDLE handle = OpenProcess(PROCESS_TERMINATE, FALSE, static_cast<DWORD>(pid));
+    if (!handle)
+        return Error::from_windows_error();
+    ScopeGuard close_handle = [&] { CloseHandle(handle); };
+    if (!TerminateProcess(handle, 1))
+        return Error::from_windows_error();
+    return {};
 }
 
 // Get the full path of the executable file of the current process
@@ -70588,9 +71069,9 @@ FILE: Libraries/LibCore/ResourceImplementation.cpp
 
 #include <AK/NeverDestroyed.h>
 #include <LibCore/DirIterator.h>
+#include <LibCore/File.h>
 #include <LibCore/ResourceImplementation.h>
 #include <LibCore/ResourceImplementationFile.h>
-#include <LibCore/System.h>
 
 namespace Core {
 
@@ -70639,7 +71120,7 @@ ErrorOr<NonnullRefPtr<Resource>> ResourceImplementation::load_from_uri(StringVie
     if (uri.starts_with(file_scheme)) {
         auto path = uri.substring_view(file_scheme.length());
         auto utf8_path = TRY(String::from_utf8(path));
-        auto st = TRY(System::stat(utf8_path));
+        auto st = TRY(File::stat(utf8_path));
         if (S_ISDIR(st.st_mode))
             return adopt_ref(*new Resource(utf8_path, Resource::Scheme::File, Resource::DirectoryTag {}, st.st_mtime));
         auto mapped_file = TRY(MappedFile::map(path));
@@ -70729,9 +71210,9 @@ FILE: Libraries/LibCore/ResourceImplementationFile.cpp
 #include <AK/LexicalPath.h>
 #include <AK/StringView.h>
 #include <LibCore/DirIterator.h>
+#include <LibCore/File.h>
 #include <LibCore/Resource.h>
 #include <LibCore/ResourceImplementationFile.h>
-#include <LibCore/System.h>
 
 namespace Core {
 
@@ -70749,7 +71230,7 @@ ErrorOr<NonnullRefPtr<Resource>> ResourceImplementationFile::load_from_resource_
     auto path = TRY(String::from_utf8(uri.substring_view(resource_scheme.length())));
     auto full_path = TRY(String::from_byte_string(LexicalPath::join(m_base_directory, path).string()));
 
-    auto st = TRY(System::stat(full_path));
+    auto st = TRY(File::stat(full_path));
 
     if (S_ISDIR(st.st_mode))
         return make_directory_resource(move(path), st.st_mtime);
@@ -72397,7 +72878,8 @@ ErrorOr<size_t> PosixSocketHelper::pending_bytes() const
     }
 
     u_long value = 0;
-    TRY(System::ioctl(m_fd, FIONREAD, &value));
+    if (::ioctlsocket(m_fd, FIONREAD, &value) == SOCKET_ERROR)
+        return Error::from_windows_error();
     return value;
 }
 
@@ -73485,6 +73967,12 @@ ErrorOr<int> socket(int domain, int type, int protocol)
     return fd;
 }
 
+ErrorOr<void> set_socket_blocking(int socket, bool enabled)
+{
+    int value = enabled ? 0 : 1;
+    return ioctl(socket, FIONBIO, &value);
+}
+
 ErrorOr<void> bind(int sockfd, struct sockaddr const* address, socklen_t address_length)
 {
     if (::bind(sockfd, address, address_length) < 0)
@@ -73913,58 +74401,81 @@ struct sockaddr;
 
 namespace Core::System {
 
-#if !defined(AK_OS_MACOS) && !defined(AK_OS_HAIKU)
+#if !defined(AK_OS_WINDOWS)
+
+#    if !defined(AK_OS_MACOS) && !defined(AK_OS_HAIKU)
 ErrorOr<int> accept4(int sockfd, struct sockaddr*, socklen_t*, int flags);
-#endif
+#    endif
 
 ErrorOr<void> sigaction(int signal, struct sigaction const* action, struct sigaction* old_action);
-#if defined(AK_OS_SOLARIS)
+#    if defined(AK_OS_SOLARIS)
 CORE_API ErrorOr<SIG_TYP> signal(int signal, SIG_TYP handler);
-#elif defined(AK_OS_BSD_GENERIC)
+#    elif defined(AK_OS_BSD_GENERIC)
 CORE_API ErrorOr<sig_t> signal(int signal, sig_t handler);
-#else
+#    else
 CORE_API ErrorOr<sighandler_t> signal(int signal, sighandler_t handler);
-#endif
+#    endif
 CORE_API ErrorOr<struct stat> fstat(int fd);
 ErrorOr<struct stat> fstatat(int fd, StringView path, int flags);
+ErrorOr<int> openat(int fd, StringView path, int options, mode_t mode = 0);
 CORE_API ErrorOr<int> fcntl(int fd, int command, ...);
 ErrorOr<void*> mmap(void* address, size_t, int protection, int flags, int fd, off_t, size_t alignment = 0, StringView name = {});
 ErrorOr<void> munmap(void* address, size_t);
-CORE_API ErrorOr<void*> reserve_address_space(size_t size);
-CORE_API ErrorOr<void> commit_memory(void* address, size_t size);
-CORE_API ErrorOr<void> decommit_memory(void* address, size_t size);
-CORE_API ErrorOr<void> release_address_space(void* address, size_t size);
 ErrorOr<int> anon_create(size_t size, int options);
 CORE_API ErrorOr<int> open(StringView path, int options, mode_t mode = 0);
-ErrorOr<int> openat(int fd, StringView path, int options, mode_t mode = 0);
-CORE_API ErrorOr<void> close(int fd);
 ErrorOr<void> ftruncate(int fd, off_t length);
 CORE_API ErrorOr<struct stat> stat(StringView path);
 CORE_API ErrorOr<struct stat> lstat(StringView path);
 CORE_API ErrorOr<size_t> read(int fd, Bytes buffer);
 CORE_API ErrorOr<size_t> write(int fd, ReadonlyBytes buffer);
-CORE_API ErrorOr<int> dup(int source_fd);
 ErrorOr<int> dup2(int source_fd, int destination_fd);
-CORE_API ErrorOr<ByteString> getcwd();
 CORE_API ErrorOr<void> ioctl(int fd, unsigned request, ...);
 ErrorOr<struct termios> tcgetattr(int fd);
 ErrorOr<void> tcsetattr(int fd, int optional_actions, struct termios const&);
 CORE_API ErrorOr<void> chmod(StringView pathname, mode_t mode);
 ErrorOr<off_t> lseek(int fd, off_t, int whence);
-
-CORE_API ErrorOr<bool> isatty(int fd);
 CORE_API ErrorOr<void> link(StringView old_path, StringView new_path);
 CORE_API ErrorOr<void> symlink(StringView target, StringView link_path);
 CORE_API ErrorOr<void> mkdir(StringView path, mode_t);
-CORE_API ErrorOr<void> chdir(StringView path);
 CORE_API ErrorOr<void> rmdir(StringView path);
 CORE_API ErrorOr<int> mkstemp(Span<char> pattern);
 CORE_API ErrorOr<void> fchmod(int fd, mode_t mode);
 CORE_API ErrorOr<void> rename(StringView old_path, StringView new_path);
 CORE_API ErrorOr<void> unlink(StringView path);
 CORE_API ErrorOr<void> utimensat(int fd, StringView path, struct timespec const times[2], int flag);
-CORE_API ErrorOr<Array<int, 2>> pipe2(int flags);
+CORE_API ErrorOr<void> access(StringView pathname, int mode, int flags = 0);
+ErrorOr<ByteString> readlink(StringView pathname);
+CORE_API ErrorOr<int> poll(Span<struct pollfd>, int timeout);
+// Use Core::Process::terminate_process() in portable code.
+CORE_API ErrorOr<void> kill(pid_t, int signal);
+CORE_API ErrorOr<void> chown(StringView pathname, uid_t uid, gid_t gid);
+ErrorOr<pid_t> posix_spawn(StringView path, posix_spawn_file_actions_t const* file_actions, posix_spawnattr_t const* attr, char* const arguments[], char* const envp[]);
+ErrorOr<pid_t> posix_spawnp(StringView path, posix_spawn_file_actions_t* const file_actions, posix_spawnattr_t* const attr, char* const arguments[], char* const envp[]);
 
+struct WaitPidResult {
+    pid_t pid;
+    int status;
+};
+CORE_API ErrorOr<WaitPidResult> waitpid(pid_t waitee, int options = 0);
+CORE_API ErrorOr<void> fchown(int fd, uid_t, gid_t);
+
+ErrorOr<rlimit> get_resource_limits(int resource);
+CORE_API ErrorOr<void> set_resource_limits(int resource, rlim_t limit);
+
+#endif
+
+CORE_API ErrorOr<void*> reserve_address_space(size_t size);
+CORE_API ErrorOr<void> commit_memory(void* address, size_t size);
+CORE_API ErrorOr<void> decommit_memory(void* address, size_t size);
+CORE_API ErrorOr<void> release_address_space(void* address, size_t size);
+
+CORE_API ErrorOr<void> close(int fd);
+CORE_API ErrorOr<int> dup(int source_fd);
+CORE_API ErrorOr<Array<int, 2>> pipe2(int flags);
+CORE_API ErrorOr<void> set_close_on_exec(int fd, bool enabled);
+CORE_API bool is_socket(int fd);
+
+// The socket section is portable: Winsock *is* the BSD socket API.
 CORE_API ErrorOr<int> socket(int domain, int type, int protocol);
 CORE_API ErrorOr<void> bind(int sockfd, struct sockaddr const*, socklen_t);
 CORE_API ErrorOr<void> listen(int sockfd, int backlog);
@@ -73981,41 +74492,18 @@ CORE_API ErrorOr<void> setsockopt(int sockfd, int level, int option, void const*
 ErrorOr<void> getsockname(int sockfd, struct sockaddr*, socklen_t*);
 ErrorOr<void> getpeername(int sockfd, struct sockaddr*, socklen_t*);
 CORE_API ErrorOr<void> socketpair(int domain, int type, int protocol, int sv[2]);
-
-CORE_API ErrorOr<void> access(StringView pathname, int mode, int flags = 0);
-ErrorOr<ByteString> readlink(StringView pathname);
-CORE_API ErrorOr<int> poll(Span<struct pollfd>, int timeout);
-
-CORE_API ErrorOr<void> kill(pid_t, int signal);
-#if !defined(AK_OS_WINDOWS)
-CORE_API ErrorOr<void> chown(StringView pathname, uid_t uid, gid_t gid);
-ErrorOr<pid_t> posix_spawn(StringView path, posix_spawn_file_actions_t const* file_actions, posix_spawnattr_t const* attr, char* const arguments[], char* const envp[]);
-ErrorOr<pid_t> posix_spawnp(StringView path, posix_spawn_file_actions_t* const file_actions, posix_spawnattr_t* const attr, char* const arguments[], char* const envp[]);
-
-struct WaitPidResult {
-    pid_t pid;
-    int status;
-};
-CORE_API ErrorOr<WaitPidResult> waitpid(pid_t waitee, int options = 0);
-CORE_API ErrorOr<void> fchown(int fd, uid_t, gid_t);
-#endif
-
+CORE_API ErrorOr<void> set_socket_blocking(int socket, bool enabled);
 ErrorOr<AddressInfoVector> getaddrinfo(char const* nodename, char const* servname, struct addrinfo const& hints);
 
+// Process and miscellaneous helpers; operation-named, native on all platforms.
+CORE_API ErrorOr<ByteString> getcwd();
+CORE_API ErrorOr<void> chdir(StringView path);
+CORE_API ErrorOr<bool> isatty(int fd);
 CORE_API unsigned hardware_concurrency();
 CORE_API u64 physical_memory_bytes();
-
 CORE_API ErrorOr<ByteString> current_executable_path();
-
-#if !defined(AK_OS_WINDOWS)
-ErrorOr<rlimit> get_resource_limits(int resource);
-CORE_API ErrorOr<void> set_resource_limits(int resource, rlim_t limit);
-#endif
-
 CORE_API int getpid();
-CORE_API bool is_socket(int fd);
 CORE_API ErrorOr<void> sleep_ms(u32 milliseconds);
-CORE_API ErrorOr<void> set_close_on_exec(int fd, bool enabled);
 
 CORE_API ErrorOr<size_t> transfer_file_through_socket(int source_fd, int target_fd, size_t source_offset, size_t source_length);
 
@@ -74134,12 +74622,12 @@ FILE: Libraries/LibCore/SystemWindows.cpp
 
 #include <AK/Array.h>
 #include <AK/ByteString.h>
-#include <AK/ScopeGuard.h>
+#include <AK/Checked.h>
+#include <LibCore/MappedFile.h>
 #include <LibCore/Process.h>
 #include <LibCore/SocketAddress.h>
 #include <LibCore/System.h>
 #include <direct.h>
-#include <sys/mman.h>
 
 #include <AK/Windows.h>
 #include <ws2tcpip.h>
@@ -74147,16 +74635,6 @@ FILE: Libraries/LibCore/SystemWindows.cpp
 namespace Core::System {
 
 int windows_socketpair(SOCKET socks[2], int make_overlapped);
-
-ErrorOr<int> open(StringView path, int options, mode_t mode)
-{
-    ByteString str = path;
-    int fd = _open(str.characters(), options | O_BINARY | _O_OBTAIN_DIR, mode);
-    if (fd < 0)
-        return Error::from_syscall("open"sv, errno);
-    ScopeGuard guard = [&] { _close(fd); };
-    return dup(_get_osfhandle(fd));
-}
 
 ErrorOr<void> close(int handle)
 {
@@ -74170,60 +74648,10 @@ ErrorOr<void> close(int handle)
     return {};
 }
 
-ErrorOr<size_t> read(int handle, Bytes buffer)
+ErrorOr<void> set_socket_blocking(int socket, bool enabled)
 {
-    DWORD n_read = 0;
-    if (!ReadFile(to_handle(handle), buffer.data(), buffer.size(), &n_read, NULL))
-        return Error::from_windows_error();
-    return n_read;
-}
-
-ErrorOr<size_t> write(int handle, ReadonlyBytes buffer)
-{
-    DWORD n_written = 0;
-    if (!WriteFile(to_handle(handle), buffer.data(), buffer.size(), &n_written, NULL))
-        return Error::from_windows_error();
-    return n_written;
-}
-
-ErrorOr<off_t> lseek(int handle, off_t offset, int origin)
-{
-    static_assert(FILE_BEGIN == SEEK_SET && FILE_CURRENT == SEEK_CUR && FILE_END == SEEK_END, "SetFilePointerEx origin values are incompatible with lseek");
-    LARGE_INTEGER new_pointer = {};
-    if (!SetFilePointerEx(to_handle(handle), { .QuadPart = offset }, &new_pointer, origin))
-        return Error::from_windows_error();
-    return new_pointer.QuadPart;
-}
-
-ErrorOr<void> ftruncate(int handle, off_t length)
-{
-    auto position = TRY(lseek(handle, 0, SEEK_CUR));
-    ScopeGuard restore_position = [&] { MUST(lseek(handle, position, SEEK_SET)); };
-
-    TRY(lseek(handle, length, SEEK_SET));
-
-    if (!SetEndOfFile(to_handle(handle)))
-        return Error::from_windows_error();
-    return {};
-}
-
-ErrorOr<struct stat> fstat(int handle)
-{
-    struct stat st = {};
-    int fd = _open_osfhandle(TRY(dup(handle)), 0);
-    ScopeGuard guard = [&] { _close(fd); };
-    if (::fstat(fd, &st) < 0)
-        return Error::from_syscall("fstat"sv, errno);
-    return st;
-}
-
-ErrorOr<void> ioctl(int fd, unsigned request, ...)
-{
-    va_list ap;
-    va_start(ap, request);
-    u_long* arg = va_arg(ap, u_long*);
-    va_end(ap);
-    if (::ioctlsocket(fd, request, arg) == SOCKET_ERROR)
+    u_long value = enabled ? 0 : 1;
+    if (::ioctlsocket(socket, FIONBIO, &value) == SOCKET_ERROR)
         return Error::from_windows_error();
     return {};
 }
@@ -74244,88 +74672,6 @@ ErrorOr<void> chdir(StringView path)
     ByteString path_string = path;
     if (::_chdir(path_string.characters()) < 0)
         return Error::from_syscall("chdir"sv, errno);
-    return {};
-}
-
-ErrorOr<struct stat> stat(StringView path)
-{
-    struct stat st = {};
-    ByteString path_string = path;
-    if (::stat(path_string.characters(), &st) < 0)
-        return Error::from_syscall("stat"sv, errno);
-    return st;
-}
-
-ErrorOr<void> rmdir(StringView path)
-{
-    ByteString path_string = path;
-    if (_rmdir(path_string.characters()) < 0)
-        return Error::from_syscall("rmdir"sv, errno);
-    return {};
-}
-
-ErrorOr<void> unlink(StringView path)
-{
-    ByteString path_string = path;
-    if (_unlink(path_string.characters()) < 0)
-        return Error::from_syscall("unlink"sv, errno);
-    return {};
-}
-
-ErrorOr<void> link(StringView old_path, StringView new_path)
-{
-    ByteString old_path_string = old_path;
-    ByteString new_path_string = new_path;
-    if (!CreateHardLinkA(new_path_string.characters(), old_path_string.characters(), nullptr))
-        return Error::from_windows_error();
-    return {};
-}
-
-ErrorOr<void> mkdir(StringView path, mode_t)
-{
-    ByteString str = path;
-    if (_mkdir(str.characters()) < 0)
-        return Error::from_syscall("mkdir"sv, errno);
-    return {};
-}
-
-ErrorOr<void> rename(StringView old_path, StringView new_path)
-{
-    ByteString old_path_string = old_path;
-    ByteString new_path_string = new_path;
-    if (!MoveFileExA(old_path_string.characters(), new_path_string.characters(), MOVEFILE_REPLACE_EXISTING))
-        return Error::from_windows_error();
-    return {};
-}
-
-ErrorOr<int> openat(int, StringView, int, mode_t)
-{
-    dbgln("Core::System::openat() is not implemented");
-    VERIFY_NOT_REACHED();
-}
-
-ErrorOr<struct stat> fstatat(int, StringView, int)
-{
-    dbgln("Core::System::fstatat() is not implemented");
-    VERIFY_NOT_REACHED();
-}
-
-ErrorOr<void*> mmap(void* address, size_t size, int protection, int flags, int file_handle, off_t offset, size_t alignment, StringView)
-{
-    // custom alignment is not supported
-    VERIFY(!alignment);
-    int fd = _open_osfhandle(TRY(dup(file_handle)), 0);
-    ScopeGuard guard = [&] { _close(fd); };
-    void* ptr = ::mmap(address, size, protection, flags, fd, offset);
-    if (ptr == MAP_FAILED)
-        return Error::from_syscall("mmap"sv, errno);
-    return ptr;
-}
-
-ErrorOr<void> munmap(void* address, size_t size)
-{
-    if (::munmap(address, size) < 0)
-        return Error::from_syscall("munmap"sv, errno);
     return {};
 }
 
@@ -74559,46 +74905,16 @@ ErrorOr<AddressInfoVector> getaddrinfo(char const* nodename, char const* servnam
     return AddressInfoVector { move(addresses), results };
 }
 
-ErrorOr<void> kill(pid_t pid, int signal)
-{
-    if (signal == SIGTERM) {
-        if (!EnumWindows([](HWND hwnd, LPARAM l_param) -> BOOL {
-                DWORD window_pid = 0;
-                GetWindowThreadProcessId(hwnd, &window_pid);
-                if (window_pid == static_cast<DWORD>(l_param)) {
-                    PostMessage(hwnd, WM_CLOSE, 0, 0);
-                }
-                return TRUE;
-            },
-                pid))
-            return Error::from_windows_error();
-    } else {
-        return Error::from_string_literal("Unsupported signal value");
-    }
-    return {};
-}
-
 ErrorOr<size_t> transfer_file_through_socket(int source_fd, int target_fd, size_t source_offset, size_t source_length)
 {
     // FIXME: We could use TransmitFile (https://learn.microsoft.com/en-us/windows/win32/api/mswsock/nf-mswsock-transmitfile)
     //        here. But in order to transmit a subset of the file, we have to use overlapped IO.
 
-    static auto allocation_granularity = []() {
-        SYSTEM_INFO system_info {};
-        GetSystemInfo(&system_info);
+    if (!AK::is_within_range<off_t>(source_offset))
+        return Error::from_errno(EOVERFLOW);
 
-        return system_info.dwAllocationGranularity;
-    }();
-
-    // MapViewOfFile requires the offset to be aligned to the system allocation granularity, so we must handle that here.
-    auto aligned_source_offset = (source_offset / allocation_granularity) * allocation_granularity;
-    auto offset_adjustment = source_offset - aligned_source_offset;
-    auto mapped_source_length = source_length + offset_adjustment;
-
-    auto* mapped = TRY(mmap(nullptr, mapped_source_length, PROT_READ, MAP_SHARED, source_fd, aligned_source_offset));
-    ScopeGuard guard { [&]() { (void)munmap(mapped, mapped_source_length); } };
-
-    return send(target_fd, { static_cast<u8*>(mapped) + offset_adjustment, source_length }, 0);
+    auto mapped_file = TRY(MappedFile::map_from_fd_range_and_close(TRY(dup(source_fd)), {}, static_cast<off_t>(source_offset), source_length));
+    return send(target_fd, mapped_file->bytes(), 0);
 }
 
 }
@@ -74806,8 +75122,8 @@ ErrorOr<NonnullRefPtr<TCPServer>> TCPServer::try_create()
         MUST(Core::System::close(fd));
     } };
 
+    TRY(Core::System::set_socket_blocking(fd, false));
     int option = 1;
-    TRY(Core::System::ioctl(fd, FIONBIO, &option));
     TRY(Core::System::setsockopt(fd, SOL_SOCKET, SO_OOBINLINE, &option, sizeof(option)));
     if (SetHandleInformation(to_handle(fd), HANDLE_FLAG_INHERIT, 0) == 0)
         return Error::from_windows_error();
@@ -74856,8 +75172,7 @@ ErrorOr<void> TCPServer::set_blocking(bool const blocking)
     // NOTE: Blocking does not seem to be supported. Error code returned is WSAEINVAL
     if (!blocking)
         return Error::from_string_literal("Core::TCPServer: WinSock2 does not support blocking");
-    int option = 1;
-    TRY(Core::System::ioctl(m_fd, FIONBIO, &option));
+    TRY(Core::System::set_socket_blocking(m_fd, false));
     return {};
 }
 
@@ -75894,8 +76209,7 @@ namespace Core {
 UDPServer::UDPServer()
 {
     m_fd = MUST(Core::System::socket(AF_INET, SOCK_DGRAM, 0));
-    int option = 1;
-    MUST(Core::System::ioctl(m_fd, FIONBIO, &option));
+    MUST(Core::System::set_socket_blocking(m_fd, false));
     auto const ret = SetHandleInformation(to_handle(m_fd), HANDLE_FLAG_INHERIT, 0);
     VERIFY(ret != 0);
 }
@@ -99533,11 +99847,14 @@ FILE: Libraries/LibFileSystem/FileSystem.cpp
 #include <AK/LexicalPath.h>
 #include <AK/ScopeGuard.h>
 #include <LibCore/DirIterator.h>
+#include <LibCore/File.h>
 #include <LibCore/System.h>
 #include <LibFileSystem/FileSystem.h>
 
 #if defined(AK_OS_WINDOWS)
-#    include <windows.h>
+#    include <direct.h>
+
+#    include <AK/Windows.h>
 #else
 #    include <sys/statvfs.h>
 
@@ -99554,6 +99871,49 @@ FILE: Libraries/LibFileSystem/FileSystem.cpp
 #endif
 
 namespace FileSystem {
+
+static ErrorOr<struct stat> stat_path(StringView path)
+{
+    return Core::File::stat(path);
+}
+
+static ErrorOr<struct stat> stat_fd(int fd)
+{
+    return Core::File::fstat(fd);
+}
+
+// LibFileSystem is the portable home for path operations, so it is the one place
+// (outside LibCore's own backends) still allowed to reach for platform primitives.
+// On Windows these forward to the CRT for now.
+// FIXME: Nativize the Windows half (DeleteFileW etc.) and map both platforms'
+//        errors into a portable taxonomy.
+#ifdef AK_OS_WINDOWS
+static ErrorOr<void> remove_file(StringView path)
+{
+    ByteString path_string = path;
+    if (::_unlink(path_string.characters()) < 0)
+        return Error::from_syscall("unlink"sv, errno);
+    return {};
+}
+
+static ErrorOr<void> remove_directory(StringView path)
+{
+    ByteString path_string = path;
+    if (::_rmdir(path_string.characters()) < 0)
+        return Error::from_syscall("rmdir"sv, errno);
+    return {};
+}
+#else
+static ErrorOr<void> remove_file(StringView path)
+{
+    return Core::System::unlink(path);
+}
+
+static ErrorOr<void> remove_directory(StringView path)
+{
+    return Core::System::rmdir(path);
+}
+#endif
 
 ErrorOr<ByteString> current_working_directory()
 {
@@ -99596,17 +99956,17 @@ ErrorOr<ByteString> real_path(StringView path)
 
 bool exists(StringView path)
 {
-    return !Core::System::stat(path).is_error();
+    return !stat_path(path).is_error();
 }
 
 bool exists(int fd)
 {
-    return !Core::System::fstat(fd).is_error();
+    return !stat_fd(fd).is_error();
 }
 
 bool is_regular_file(StringView path)
 {
-    auto st_or_error = Core::System::stat(path);
+    auto st_or_error = stat_path(path);
     if (st_or_error.is_error())
         return false;
     auto st = st_or_error.release_value();
@@ -99615,7 +99975,7 @@ bool is_regular_file(StringView path)
 
 bool is_regular_file(int fd)
 {
-    auto st_or_error = Core::System::fstat(fd);
+    auto st_or_error = stat_fd(fd);
     if (st_or_error.is_error())
         return false;
     auto st = st_or_error.release_value();
@@ -99624,7 +99984,7 @@ bool is_regular_file(int fd)
 
 bool is_directory(StringView path)
 {
-    auto st_or_error = Core::System::stat(path);
+    auto st_or_error = stat_path(path);
     if (st_or_error.is_error())
         return false;
     auto st = st_or_error.release_value();
@@ -99633,7 +99993,7 @@ bool is_directory(StringView path)
 
 bool is_directory(int fd)
 {
-    auto st_or_error = Core::System::fstat(fd);
+    auto st_or_error = stat_fd(fd);
     if (st_or_error.is_error())
         return false;
     auto st = st_or_error.release_value();
@@ -99859,9 +100219,23 @@ bool can_delete_or_move(StringView path)
 }
 #endif // !AK_OS_WINDOWS
 
+#ifdef AK_OS_WINDOWS
+ErrorOr<void> move_file(StringView destination_path, StringView source_path, PreserveMode)
+{
+    // NOTE: Unlike POSIX rename(), MoveFileExW is not guaranteed to replace an existing
+    //       destination atomically. MOVEFILE_COPY_ALLOWED provides the cross-volume
+    //       copy-and-delete fallback that the POSIX implementation does by hand.
+    auto wide_source_path = TRY(to_wide_string(source_path));
+    auto wide_destination_path = TRY(to_wide_string(destination_path));
+    if (!MoveFileExW(wide_source_path.data(), wide_destination_path.data(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED))
+        return Error::from_windows_error();
+    return {};
+}
+#endif
+
 ErrorOr<void> remove(StringView path, RecursionMode mode)
 {
-    if (is_directory(path) && mode == RecursionMode::Allowed) {
+    if (mode == RecursionMode::Allowed && is_directory(path)) {
         auto di = Core::DirIterator(path, Core::DirIterator::SkipParentAndBaseDir);
         if (di.has_error())
             return di.error();
@@ -99869,9 +100243,9 @@ ErrorOr<void> remove(StringView path, RecursionMode mode)
         while (di.has_next())
             TRY(remove(di.next_full_path(), RecursionMode::Allowed));
 
-        TRY(Core::System::rmdir(path));
+        TRY(remove_directory(path));
     } else {
-        TRY(Core::System::unlink(path));
+        TRY(remove_file(path));
     }
 
     return {};
@@ -99879,13 +100253,13 @@ ErrorOr<void> remove(StringView path, RecursionMode mode)
 
 ErrorOr<off_t> size_from_stat(StringView path)
 {
-    auto st = TRY(Core::System::stat(path));
+    auto st = TRY(stat_path(path));
     return st.st_size;
 }
 
 ErrorOr<off_t> size_from_fstat(int fd)
 {
-    auto st = TRY(Core::System::fstat(fd));
+    auto st = TRY(stat_fd(fd));
     return st.st_size;
 }
 
@@ -132779,7 +133153,7 @@ ErrorOr<void> CacheEntryWriter::flush_impl(NonnullRefPtr<HeaderList> request_hea
 
     TRY(m_file->flush_buffer());
     m_file.clear();
-    TRY(Core::System::rename(m_temporary_path->string(), m_path->string()));
+    TRY(FileSystem::move_file(m_path->string(), m_temporary_path->string()));
     remove_temporary_file.disarm();
 
     int body_fd = -1;
@@ -134117,7 +134491,7 @@ ErrorOr<bool> DiskCache::store_associated_data(URL::URL const& url, StringView m
         TRY(file->write_until_depleted(data));
     }
 
-    TRY(Core::System::rename(temporary_path.string(), path.string()));
+    TRY(FileSystem::move_file(path.string(), temporary_path.string()));
     remove_temporary_file.disarm();
     m_index.update_associated_data_size(cache_key, *vary_key, TRY(compute_associated_data_size(m_cache_directory, cache_key, *vary_key)));
     remove_entries_exceeding_cache_limit();
@@ -385738,7 +386112,7 @@ else()
 endif()
 
 ladybird_lib(LibWasm wasm EXPLICIT_SYMBOL_EXPORT)
-target_link_libraries(LibWasm PRIVATE LibCore PUBLIC LibSync LibGC)
+target_link_libraries(LibWasm PRIVATE LibCore LibFileSystem PUBLIC LibSync LibGC)
 
 target_compile_definitions(LibWasm PRIVATE
     WASM_COMPILED_FAULT_RECOVERY_SUPPORTED=${WASM_COMPILED_FAULT_RECOVERY_SUPPORTED}
@@ -385859,6 +386233,7 @@ FILE: Libraries/LibWasm/CraneliftBridge.cpp
 #include <CraneliftFFI.h>
 #include <LibCore/Process.h>
 #include <LibCore/System.h>
+#include <LibFileSystem/FileSystem.h>
 #include <LibWasm/AbstractMachine/BytecodeInterpreter.h>
 #include <LibWasm/AbstractMachine/Configuration.h>
 #include <LibWasm/Printer/Printer.h>
@@ -386967,7 +387342,7 @@ static StringView resolve_cranelift_compiler_path()
     // Lookup order: LADYBIRD_CRANELIFT_COMPILER, compile-time path, sibling-of-self.
     static NeverDestroyed<ByteString> s_path = []() -> ByteString {
         auto file_exists = [](ByteString const& path) {
-            return !Core::System::stat(path).is_error();
+            return FileSystem::exists(path);
         };
 
         if (auto const* env = getenv("LADYBIRD_CRANELIFT_COMPILER"); env && *env) {
@@ -417378,6 +417753,7 @@ set(SOURCES
     Painting/BorderRadiusCornerClipper.cpp
     Painting/BordersData.cpp
     Painting/BoxModelMetrics.cpp
+    Painting/Canvas2DCommandStream.cpp
     Painting/CanvasPaintable.cpp
     Painting/CheckBoxPaintable.cpp
     Painting/DisplayList.cpp
@@ -418793,6 +419169,7 @@ FILE: Libraries/LibWeb/Compositor/CompositorHost.cpp
 
 #include <LibGfx/PaintingSurface.h>
 #include <LibWeb/Compositor/CompositorHost.h>
+#include <LibWeb/Painting/Canvas2DCommandStream.h>
 #include <LibWeb/Painting/DisplayList.h>
 
 namespace Web::Compositor {
@@ -418820,6 +419197,9 @@ void CompositorContextHandle::stop_presenting_to_client()
 
 void CompositorContextHandle::update_display_list(NonnullRefPtr<Painting::DisplayList> display_list, Painting::AccumulatedVisualContextTree visual_context_tree, Painting::DisplayListResourceTransaction&& resource_transaction, Painting::ScrollStateSnapshot&& scroll_state_snapshot)
 {
+    // Pending canvas commands (and present markers) must reach the Compositor
+    // before a display list that samples the presented canvas surfaces.
+    m_host.flush_canvas_2d_stream();
     m_host.update_display_list(m_context_id, move(display_list), move(visual_context_tree), move(resource_transaction), move(scroll_state_snapshot));
 }
 
@@ -418871,12 +419251,19 @@ void CompositorContextHandle::viewport_size_updated(Gfx::IntSize viewport_size, 
 
 void CompositorContextHandle::present_frame(Gfx::IntRect viewport_rect)
 {
+    m_host.flush_canvas_2d_stream();
     m_host.present_frame(m_context_id, viewport_rect);
 }
 
 void CompositorContextHandle::request_screenshot(NonnullRefPtr<Gfx::PaintingSurface> target_surface, Function<void()>&& callback)
 {
+    m_host.flush_canvas_2d_stream();
     m_host.request_screenshot(m_context_id, move(target_surface), move(callback));
+}
+
+CompositorHost::CompositorHost()
+    : m_canvas_2d_stream(adopt_ref(*new Painting::Canvas2DCommandStream()))
+{
 }
 
 CompositorHost::~CompositorHost() = default;
@@ -418884,6 +419271,18 @@ CompositorHost::~CompositorHost() = default;
 OwnPtr<CompositorContextHandle> CompositorHost::create_context(CompositorContextId context_id)
 {
     return adopt_own(*new CompositorContextHandle(*this, context_id));
+}
+
+void CompositorHost::flush_canvas_2d_stream()
+{
+    if (m_canvas_2d_stream->is_empty())
+        return;
+    send_canvas_2d_stream(*m_canvas_2d_stream);
+}
+
+void CompositorHost::discard_canvas_2d_stream()
+{
+    (void)m_canvas_2d_stream->take_segments();
 }
 
 }
@@ -418958,6 +419357,10 @@ public:
 
     OwnPtr<CompositorContextHandle> create_context(CompositorContextId);
 
+    Painting::Canvas2DCommandStream& canvas_2d_stream() { return *m_canvas_2d_stream; }
+    void flush_canvas_2d_stream();
+    void discard_canvas_2d_stream();
+
     virtual RefPtr<WebGL::RemoteWebGLTransport> create_webgl_transport() = 0;
     virtual RefPtr<HTML::RemoteCanvas2DTransport> create_canvas_2d_transport() = 0;
 
@@ -418981,7 +419384,13 @@ public:
     virtual void request_screenshot(CompositorContextId, NonnullRefPtr<Gfx::PaintingSurface>, Function<void()>&& callback) = 0;
 
 protected:
-    CompositorHost() = default;
+    CompositorHost();
+
+    // Drains the stream, but only when the message can actually be delivered.
+    virtual void send_canvas_2d_stream(Painting::Canvas2DCommandStream&) = 0;
+
+private:
+    NonnullRefPtr<Painting::Canvas2DCommandStream> m_canvas_2d_stream;
 };
 
 }
@@ -483958,10 +484367,27 @@ void invalidate_node_style(DOM::Node& node, DOM::StyleInvalidationReason reason)
     mark_ancestors_as_having_child_needing_style_update(node);
 }
 
+static DOM::Node& disconnected_tree_root(DOM::Node& node)
+{
+    auto* root = &node;
+    while (auto* parent = root->parent_or_shadow_host())
+        root = parent;
+    return *root;
+}
+
 void invalidate_node_style_for_properties(DOM::Node& node, DOM::StyleInvalidationReason reason, Vector<CSS::InvalidationSet::Property> const& properties, DOM::StyleInvalidationOptions options)
 {
     if (node.is_character_data())
         return;
+
+    // OPTIMIZATION: A disconnected mutation cannot affect connected style. Avoid selector invalidation work and :has()
+    //               metadata collection for detached mutations, but keep the detached tree root dirty so CSSOM style
+    //               reads can refresh any cached computed properties.
+    if (!node.is_connected()) {
+        auto& root = disconnected_tree_root(node);
+        root.set_entire_subtree_needs_style_update(true);
+        return;
+    }
 
     auto& style_scope = node.style_scope();
 
@@ -515434,6 +515860,23 @@ NonnullRefPtr<StyleValue const> Parser::resolve_unresolved_style_value(ParsingPa
     return parser.resolve_unresolved_style_value(abstract_element, guarded_contexts, property, unresolved);
 }
 
+// If a component value sequence is a single CSS-wide keyword (inherit/initial/unset/revert/revert-layer),
+// returns that keyword.
+static Optional<Keyword> single_css_wide_keyword(Vector<ComponentValue> const& values)
+{
+    TokenStream tokens { values };
+    tokens.discard_whitespace();
+    if (!tokens.has_next_token())
+        return {};
+    auto const& token = tokens.consume_a_token();
+    tokens.discard_whitespace();
+    if (tokens.has_next_token() || !token.is(Token::Type::Ident))
+        return {};
+    if (!is_css_wide_keyword(token.token().ident()))
+        return {};
+    return keyword_from_string(token.token().ident());
+}
+
 // https://drafts.csswg.org/css-values-5/#property-replacement
 NonnullRefPtr<StyleValue const> Parser::resolve_unresolved_style_value(DOM::AbstractElement element, GuardedSubstitutionContexts& guarded_contexts, PropertyNameAndID const& property, UnresolvedStyleValue const& unresolved)
 {
@@ -515464,6 +515907,14 @@ NonnullRefPtr<StyleValue const> Parser::resolve_unresolved_style_value(DOM::Abst
     // NB: Custom properties have no grammar as such, so we skip this step for them.
     // FIXME: Parse according to @property syntax once we support that.
     if (property.is_custom_property()) {
+        // A CSS-wide keyword produced by substitution (e.g. as a var() fallback) is surfaced as the keyword itself
+        // rather than as literal tokens, so that custom property resolution applies its inherit/initial/unset/revert
+        // meaning instead of storing the raw "inherit"/etc. text.
+        if (unresolved.contains_arbitrary_substitution_function()) {
+            if (auto keyword = single_css_wide_keyword(result); keyword.has_value())
+                return KeywordStyleValue::create(keyword.value());
+        }
+
         auto contains_attr_tainted_values = result.first_matching([](auto const& component_value) { return component_value.contains_attr_tainted_value(); }).has_value();
         auto source_text_mode = unresolved.contains_arbitrary_substitution_function() && !contains_attr_tainted_values
             ? UnresolvedStyleValue::SourceTextMode::TrimLeading
@@ -530550,6 +531001,16 @@ static NonnullRefPtr<StyleValue const> compute_value_of_custom_property_impl(DOM
         auto parsing_params = Parser::ParsingParams { document };
         parsing_params.computed_style_for_custom_property_resolution = computed_style_for_custom_property_resolution;
         resolved_value = Parser::Parser::resolve_unresolved_style_value(parsing_params, abstract_element, PropertyNameAndID::from_name(name).release_value(), unresolved, guarded_contexts);
+
+        // A CSS-wide keyword produced by substitution takes on that keyword's meaning for the custom property,
+        // exactly as a literally-specified one would (handled above before substitution).
+        if (resolved_value->is_initial())
+            return document.custom_property_initial_value(name);
+        if (resolved_value->is_inherit())
+            return compute_inherited_custom_property_value(abstract_element, name, guarded_contexts);
+        if (resolved_value->is_unset())
+            return registration.has_value() && !registration->inherit ? document.custom_property_initial_value(name) : compute_inherited_custom_property_value(abstract_element, name, guarded_contexts);
+        // FIXME: Implement reverting custom properties for is_revert() / is_revert_layer().
     }
 
     auto invalid_custom_property_fallback_value = [&](NonnullRefPtr<StyleValue const> invalid_value) {
@@ -588933,6 +589394,7 @@ public:
     virtual bool is_svg_gradient_element() const { return false; }
     virtual bool is_svg_pattern_element() const { return false; }
     virtual bool is_svg_clip_path_element() const { return false; }
+    virtual bool is_svg_image_element() const { return false; }
     virtual bool is_svg_text_content_element() const { return false; }
 
     bool in_a_document_tree() const;
@@ -588977,8 +589439,10 @@ public:
     virtual bool is_html_slot_element() const { return false; }
     virtual bool is_html_embed_element() const { return false; }
     virtual bool is_html_object_element() const { return false; }
+    virtual bool is_html_canvas_element() const { return false; }
     virtual bool is_html_form_element() const { return false; }
     virtual bool is_html_image_element() const { return false; }
+    virtual bool is_html_video_element() const { return false; }
     virtual bool is_html_iframe_element() const { return false; }
     virtual bool is_html_div_element() const { return false; }
     virtual bool is_html_span_element() const { return false; }
@@ -621651,6 +622115,8 @@ namespace Web::Painting {
 
 class AccumulatedVisualContextTree;
 class BackingStore;
+class Canvas2DCommandStream;
+struct Canvas2DCommandStreamSegment;
 class ChromeWidget;
 class CanvasSurfaceRegistry;
 class DevicePixelConverter;
@@ -635594,7 +636060,9 @@ public:
     virtual bool create_context(Gfx::IntSize, bool alpha) = 0;
     virtual Optional<Painting::CanvasId> canvas_id() const = 0;
     virtual void destroy_context() = 0;
-    virtual void update_commands(Gfx::CanvasCommandList const&, bool commit) = 0;
+
+    virtual Painting::Canvas2DCommandStream& shared_stream() = 0;
+    virtual void flush_shared_stream() = 0;
 
     virtual RefPtr<Gfx::Bitmap> read_back_pixels(Gfx::IntRect const&) = 0;
 };
@@ -636003,6 +636471,7 @@ FILE: Libraries/LibWeb/HTML/CanvasRenderingContext2D.cpp
 #include <LibWeb/Infra/CharacterTypes.h>
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Page/Page.h>
+#include <LibWeb/Painting/Canvas2DCommandStream.h>
 #include <LibWeb/Painting/Paintable.h>
 #include <LibWeb/SVG/SVGImageElement.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
@@ -636178,11 +636647,19 @@ WebIDL::ExceptionOr<void> CanvasRenderingContext2D::draw_image_internal(CanvasIm
         scaling_mode = Gfx::ScalingMode::BilinearMipmap;
     }
 
-    if (auto* canvas_command_list = this->canvas_command_list()) {
-        if (auto const* source_canvas = image.get_pointer<GC::Ref<HTMLCanvasElement>>()) {
-            (*source_canvas)->ensure_backing_storage();
+    if (auto const* source_canvas = image.get_pointer<GC::Ref<HTMLCanvasElement>>()) {
+        // A 2D source needs no eager synchronization: its recorded commands
+        // precede this DrawCanvas in the shared ordered stream, so the replay
+        // sees them by construction. WebGL frames are presented by a separate
+        // message and the source's registry surface is its live drawing buffer,
+        // so present the source now and flush the DrawCanvas right after it,
+        // before a later WebGL frame can overtake the reference.
+        bool const source_is_2d = (*source_canvas)->canvas_rendering_context_2d() != nullptr;
+        (*source_canvas)->ensure_backing_storage();
+        if (!source_is_2d)
             (*source_canvas)->prepare_for_compositing();
-            if (auto source_canvas_id = (*source_canvas)->canvas_id(); source_canvas_id.has_value()) {
+        if (auto source_canvas_id = (*source_canvas)->canvas_id(); source_canvas_id.has_value()) {
+            if (auto* canvas_command_list = this->canvas_command_list()) {
                 canvas_command_list->append(Gfx::CanvasCommands::DrawCanvas {
                     .source_canvas_id = source_canvas_id->value(),
                     .dst_rect = destination_rect,
@@ -636193,20 +636670,25 @@ WebIDL::ExceptionOr<void> CanvasRenderingContext2D::draw_image_internal(CanvasIm
                     .compositing_and_blending_operator = drawing_state().current_compositing_and_blending_operator,
                 });
                 did_draw(destination_rect);
-                flush_recorded_commands(CommitCommands::No);
-
-                // 7. If image is not origin-clean, then set the CanvasRenderingContext2D's origin-clean flag to false.
-                if (image_is_not_origin_clean(image))
-                    m_origin_clean = false;
-
-                return {};
+                if (!source_is_2d)
+                    m_transport->flush_shared_stream();
             }
-        }
 
-        auto frame = canvas_image_source_frame(image);
-        if (!frame.has_value())
+            // 7. If image is not origin-clean, then set the CanvasRenderingContext2D's origin-clean flag to false.
+            if (image_is_not_origin_clean(image))
+                m_origin_clean = false;
+
             return {};
+        }
+    }
 
+    auto frame = canvas_image_source_frame(image);
+    if (!frame.has_value())
+        return {};
+
+    // NOTE: The readback fallback inside canvas_image_source_frame() may flush the
+    //       shared command stream, so the command list is fetched only afterwards.
+    if (auto* canvas_command_list = this->canvas_command_list()) {
         canvas_command_list->append(Gfx::CanvasCommands::DrawBitmap {
             .frame = *frame,
             .dst_rect = destination_rect,
@@ -636240,9 +636722,10 @@ Gfx::CanvasCommandList* CanvasRenderingContext2D::canvas_command_list()
     ensure_backing_storage();
     if (!has_backing_storage())
         return nullptr;
-    if (m_commands.size() >= max_pending_canvas_commands)
-        flush_recorded_commands(CommitCommands::No);
-    return &m_commands;
+    auto& stream = m_transport->shared_stream();
+    if (stream.total_command_count() >= max_pending_canvas_commands)
+        m_transport->flush_shared_stream();
+    return &stream.commands_for(*m_transport->canvas_id());
 }
 
 bool CanvasRenderingContext2D::ensure_remote_canvas_context()
@@ -636267,30 +636750,11 @@ bool CanvasRenderingContext2D::ensure_remote_canvas_context()
     return true;
 }
 
-void CanvasRenderingContext2D::flush_recorded_commands(CommitCommands commit)
-{
-    if (!m_transport)
-        return;
-
-    bool const should_commit = commit == CommitCommands::Yes;
-    if (m_commands.is_empty()) {
-        if (!should_commit || !m_has_uncommitted_remote_commands)
-            return;
-        m_transport->update_commands(m_commands, true);
-        m_has_uncommitted_remote_commands = false;
-        return;
-    }
-
-    auto commands = move(m_commands);
-    m_transport->update_commands(commands, should_commit);
-    m_has_uncommitted_remote_commands = !should_commit;
-}
-
 RefPtr<Gfx::Bitmap> CanvasRenderingContext2D::read_pixels(Gfx::IntRect const& rect)
 {
     if (!has_backing_storage())
         return nullptr;
-    flush_recorded_commands(CommitCommands::No);
+    m_transport->flush_shared_stream();
     return m_transport->read_back_pixels(rect);
 }
 
@@ -636304,7 +636768,9 @@ void CanvasRenderingContext2D::set_size(Gfx::IntSize const& size)
 
 void CanvasRenderingContext2D::prepare_for_compositing()
 {
-    flush_recorded_commands(CommitCommands::Yes);
+    if (!has_backing_storage())
+        return;
+    m_transport->shared_stream().record_present(*m_transport->canvas_id());
 }
 
 Optional<Painting::CanvasId> CanvasRenderingContext2D::canvas_id() const
@@ -636332,7 +636798,7 @@ void CanvasRenderingContext2D::notify_backing_storage_lost()
         // 3. Set context's context lost to true.
         set_context_lost(true);
 
-        // AD-HOC: Drop recorded-but-unflushed draw commands; they targeted the lost storage.
+        // AD-HOC: Release the remote context backing the lost storage.
         discard_backing_storage();
 
         // 4. Reset the rendering context to its default state given context.
@@ -636374,9 +636840,11 @@ void CanvasRenderingContext2D::ensure_backing_storage()
 
 void CanvasRenderingContext2D::discard_backing_storage()
 {
-    m_commands = {};
-    m_has_uncommitted_remote_commands = false;
     if (m_transport) {
+        // Flush the shared stream before destroying the context: it may still
+        // hold commands targeting this canvas, and DrawCanvas commands from
+        // other canvases referencing it, which must replay while it is alive.
+        m_transport->flush_shared_stream();
         m_transport->destroy_context();
         m_transport = nullptr;
     }
@@ -637655,21 +638123,13 @@ private:
     void paint_shadow_for_fill_internal(Gfx::Path const&, Gfx::WindingRule);
     void paint_shadow_for_stroke_internal(Gfx::Path const&, Gfx::Path::CapStyle, Gfx::Path::JoinStyle, Vector<float> const&);
 
-    enum class CommitCommands {
-        No,
-        Yes,
-    };
-    void flush_recorded_commands(CommitCommands);
-
     bool ensure_remote_canvas_context();
 
     bool has_backing_storage() const { return m_transport != nullptr; }
 
     GC::Ref<HTMLCanvasElement> m_element;
 
-    Gfx::CanvasCommandList m_commands;
     RefPtr<RemoteCanvas2DTransport> m_transport;
-    bool m_has_uncommitted_remote_commands { false };
 
     // https://html.spec.whatwg.org/multipage/canvas.html#concept-canvas-origin-clean
     bool m_origin_clean { true };
@@ -652363,6 +652823,8 @@ private:
     virtual void finalize() override;
     virtual void visit_edges(Cell::Visitor&) override;
 
+    virtual bool is_html_canvas_element() const override { return true; }
+
     virtual bool is_presentational_hint(FlyString const&) const override;
     virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
 
@@ -652378,6 +652840,23 @@ private:
     Variant<GC::Ref<HTML::CanvasRenderingContext2D>, GC::Ref<WebGL::WebGLRenderingContext>, GC::Ref<WebGL::WebGL2RenderingContext>, Empty> m_context;
     bool m_canvas_content_dirty { false };
 };
+
+}
+
+namespace Web::DOM {
+
+template<>
+inline bool Node::fast_is<HTML::HTMLCanvasElement>() const { return is_html_canvas_element(); }
+
+}
+
+namespace JS {
+
+template<>
+inline bool Object::fast_is<Web::HTML::HTMLCanvasElement>() const
+{
+    return is_dom_node() && static_cast<Web::DOM::Node const&>(*this).is_html_canvas_element();
+}
 
 }
 
@@ -660546,444 +661025,3 @@ public:
     virtual bool is_focusable() const override
     {
         return meets_focusable_area_rendering_requirements();
-    }
-
-    void set_current_navigation_was_lazy_loaded(bool value);
-
-    Optional<HighResolutionTime::DOMHighResTimeStamp> const& pending_resource_start_time() const { return m_pending_resource_start_time; }
-    void set_pending_resource_start_time(Optional<HighResolutionTime::DOMHighResTimeStamp> time) { m_pending_resource_start_time = time; }
-
-    Optional<URL::URL> const& pending_resource_timing_url() const { return m_pending_resource_timing_url; }
-    void set_pending_resource_timing_url(Optional<URL::URL> url) { m_pending_resource_timing_url = url; }
-
-    GC::Ref<DOM::DOMTokenList> sandbox();
-
-    SandboxingFlagSet iframe_sandboxing_flag_set() const { return m_iframe_sandboxing_flag_set; }
-
-    TrustedTypes::TrustedHTMLOrString srcdoc();
-    WebIDL::ExceptionOr<void> set_srcdoc(TrustedTypes::TrustedHTMLOrString const& value);
-
-    virtual void visit_edges(Cell::Visitor&) override;
-
-    void set_iframe_fullscreen_flag(bool iframe_fullscreen_flag) { m_iframe_fullscreen_flag = iframe_fullscreen_flag; }
-    bool iframe_fullscreen_flag() const { return m_iframe_fullscreen_flag; }
-
-private:
-    HTMLIFrameElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual void initialize(JS::Realm&) override;
-
-    // ^DOM::Node
-    virtual bool is_html_iframe_element() const override { return true; }
-
-    // ^DOM::Element
-    virtual void post_connection() override;
-    virtual void removed_from(IsSubtreeRoot, Node* old_ancestor, Node& old_root) override;
-    virtual void attribute_changed(FlyString const& name, Optional<String> const& old_value, Optional<String> const& value, Optional<FlyString> const& namespace_) override;
-    virtual i32 default_tab_index_value() const override;
-    virtual bool is_presentational_hint(FlyString const&) const override;
-    virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
-
-    // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:dimension-attributes
-    virtual bool supports_dimension_attributes() const override { return true; }
-
-    // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#process-the-iframe-attributes
-    void process_the_iframe_attributes(InitialInsertion = InitialInsertion::No);
-
-    // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#current-navigation-was-lazy-loaded
-    bool m_current_navigation_was_lazy_loaded { false };
-
-    // https://fullscreen.spec.whatwg.org/#iframe-fullscreen-flag
-    bool m_iframe_fullscreen_flag { false };
-
-    // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#iframe-pending-resource-timing-start-time
-    Optional<HighResolutionTime::DOMHighResTimeStamp> m_pending_resource_start_time = {};
-
-    // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#iframe-pending-resource-timing-url
-    Optional<URL::URL> m_pending_resource_timing_url {};
-
-    GC::Ptr<DOM::DOMTokenList> m_sandbox;
-
-    // https://html.spec.whatwg.org/multipage/browsers.html#iframe-sandboxing-flag-set
-    SandboxingFlagSet m_iframe_sandboxing_flag_set {};
-};
-
-WEB_API void run_iframe_load_event_steps(HTML::HTMLIFrameElement&);
-
-ReferrerPolicy::ReferrerPolicy determine_iframe_element_referrer_policy(GC::Ptr<DOM::Element> embedder);
-
-}
-
-namespace Web::DOM {
-
-template<>
-inline bool Node::fast_is<HTML::HTMLIFrameElement>() const { return is_html_iframe_element(); }
-
-}
-
-FILE: Libraries/LibWeb/HTML/HTMLIFrameElement.idl
-// https://html.spec.whatwg.org/multipage/iframe-embed-object.html#htmliframeelement
-[Exposed=Window]
-interface HTMLIFrameElement : HTMLElement {
-
-    [HTMLConstructor] constructor();
-
-    [CEReactions, Reflect, URL] attribute USVString src;
-    [CEReactions] attribute (TrustedHTML or Utf16DOMString) srcdoc;
-    [CEReactions, Reflect] attribute DOMString name;
-    [SameObject, PutForwards=value] readonly attribute DOMTokenList sandbox;
-    [CEReactions, Reflect] attribute DOMString allow;
-    [CEReactions, Reflect=allowfullscreen] attribute boolean allowFullscreen;
-    [CEReactions, Reflect] attribute DOMString width;
-    [CEReactions, Reflect] attribute DOMString height;
-    [CEReactions, Reflect=referrerpolicy, Enumerated=ReferrerPolicy] attribute DOMString referrerPolicy;
-    [CEReactions, Enumerated=LazyLoadingAttribute, Reflect] attribute DOMString loading;
-    readonly attribute Document? contentDocument;
-    readonly attribute WindowProxy? contentWindow;
-    Document? getSVGDocument();
-
-    // Obsolete
-    [CEReactions, Reflect] attribute DOMString align;
-    [CEReactions, Reflect] attribute DOMString scrolling;
-    [CEReactions, Reflect=frameborder] attribute DOMString frameBorder;
-    [CEReactions, Reflect=longdesc, URL] attribute USVString longDesc;
-
-    [CEReactions, LegacyNullToEmptyString, Reflect=marginheight] attribute DOMString marginHeight;
-    [CEReactions, LegacyNullToEmptyString, Reflect=marginwidth] attribute DOMString marginWidth;
-
-};
-
-FILE: Libraries/LibWeb/HTML/HTMLImageElement.cpp
-/*
- * Copyright (c) 2018-2024, Andreas Kling <andreas@ladybird.org>
- * Copyright (c) 2024, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <AK/NeverDestroyed.h>
-#include <LibCore/Timer.h>
-#include <LibGC/Weak.h>
-#include <LibGfx/Bitmap.h>
-#include <LibWeb/ARIA/Roles.h>
-#include <LibWeb/Bindings/HTMLImageElement.h>
-#include <LibWeb/CSS/ComputedProperties.h>
-#include <LibWeb/CSS/Parser/Parser.h>
-#include <LibWeb/CSS/StyleComputer.h>
-#include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
-#include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
-#include <LibWeb/CSS/StyleValues/LengthStyleValue.h>
-#include <LibWeb/DOM/Document.h>
-#include <LibWeb/DOM/DocumentObserver.h>
-#include <LibWeb/DOM/Event.h>
-#include <LibWeb/Fetch/Fetching/Fetching.h>
-#include <LibWeb/Fetch/Infrastructure/FetchController.h>
-#include <LibWeb/Fetch/Response.h>
-#include <LibWeb/HTML/BitmapDecodedImageData.h>
-#include <LibWeb/HTML/CORSSettingAttribute.h>
-#include <LibWeb/HTML/EventNames.h>
-#include <LibWeb/HTML/HTMLImageElement.h>
-#include <LibWeb/HTML/HTMLLinkElement.h>
-#include <LibWeb/HTML/HTMLPictureElement.h>
-#include <LibWeb/HTML/HTMLSourceElement.h>
-#include <LibWeb/HTML/ImageRequest.h>
-#include <LibWeb/HTML/ListOfAvailableImages.h>
-#include <LibWeb/HTML/Numbers.h>
-#include <LibWeb/HTML/Parser/HTMLParser.h>
-#include <LibWeb/HTML/PotentialCORSRequest.h>
-#include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
-#include <LibWeb/HTML/SharedResourceRequest.h>
-#include <LibWeb/HTML/SupportedImageTypes.h>
-#include <LibWeb/HTML/Window.h>
-#include <LibWeb/Layout/ImageBox.h>
-#include <LibWeb/Loader/ResourceLoader.h>
-#include <LibWeb/Painting/Paintable.h>
-#include <LibWeb/Painting/ViewportPaintable.h>
-#include <LibWeb/Platform/EventLoopPlugin.h>
-#include <LibWeb/Platform/ImageCodecPlugin.h>
-#include <LibWeb/SVG/SVGDecodedImageData.h>
-
-namespace Web::HTML {
-
-// We batch handling of successfully fetched images to avoid interleaving 1 image, 1 layout, 1 image, 1 layout, etc.
-// The processing timer is 1ms instead of 0ms, since layout is driven by a 0ms timer, and if we use 0ms here,
-// the event loop will process them in insertion order. This is a bit of a hack, but it works.
-struct BatchingDispatcher {
-public:
-    BatchingDispatcher()
-        : m_timer(Core::Timer::create_single_shot(1, [this] { process(); }))
-    {
-    }
-
-    void enqueue(GC::Root<GC::Function<void()>> callback)
-    {
-        // NOTE: We don't want to flush the queue on every image load, since that would be slow.
-        //       However, we don't want to keep growing the batch forever either.
-        static constexpr size_t max_loads_to_batch_before_flushing = 16;
-
-        m_queue.append(move(callback));
-        if (m_queue.size() < max_loads_to_batch_before_flushing)
-            m_timer->restart();
-    }
-
-private:
-    void process()
-    {
-        auto queue = move(m_queue);
-        for (auto& callback : queue)
-            callback->function()();
-    }
-
-    NonnullRefPtr<Core::Timer> m_timer;
-    Vector<GC::Root<GC::Function<void()>>> m_queue;
-};
-
-static BatchingDispatcher& batching_dispatcher()
-{
-    static NeverDestroyed<BatchingDispatcher> dispatcher;
-    return *dispatcher;
-}
-
-static bool image_element_dimensions_may_depend_on_intrinsic_size(Layout::ImageBox const& image_box)
-{
-    auto const& computed_values = image_box.computed_values();
-
-    auto size_is_definite = [](CSS::Size const& size) {
-        return size.is_length() || (size.is_calculated() && !size.contains_percentage());
-    };
-    auto size_constraint_is_definite_or_none = [&](CSS::Size const& size) {
-        return size.is_none() || size_is_definite(size);
-    };
-
-    auto const& width = computed_values.width();
-    auto const& height = computed_values.height();
-    if (!size_is_definite(width) || !size_is_definite(height))
-        return true;
-
-    auto const& min_width = computed_values.min_width();
-    auto const& min_height = computed_values.min_height();
-    if (!size_is_definite(min_width) || !size_is_definite(min_height))
-        return true;
-
-    auto const& max_width = computed_values.max_width();
-    auto const& max_height = computed_values.max_height();
-    if (!size_constraint_is_definite_or_none(max_width) || !size_constraint_is_definite_or_none(max_height))
-        return true;
-
-    return false;
-}
-
-static void reset_intrinsic_size_caches_after_image_data_change(Layout::ImageBox& image_box)
-{
-    image_box.reset_cached_intrinsic_sizes();
-    for (auto* ancestor = image_box.parent(); ancestor; ancestor = ancestor->parent()) {
-        auto* box = as_if<Layout::Box>(ancestor);
-        if (!box)
-            continue;
-        box->reset_cached_intrinsic_sizes();
-        if (box->is_absolutely_positioned() || box->is_svg_svg_box())
-            break;
-    }
-}
-
-static void set_needs_layout_update_or_repaint_after_image_data_change(HTMLImageElement& image_element, DOM::SetNeedsLayoutReason reason)
-{
-    auto layout_node = image_element.unsafe_layout_node();
-    auto* image_box = as_if<Layout::ImageBox>(layout_node);
-    if (!image_box || image_element_dimensions_may_depend_on_intrinsic_size(*image_box)) {
-        image_element.set_needs_layout_update(reason);
-        return;
-    }
-
-    reset_intrinsic_size_caches_after_image_data_change(*image_box);
-    image_element.set_needs_repaint();
-}
-
-GC_DEFINE_ALLOCATOR(HTMLImageElement);
-
-HTMLImageElement::HTMLImageElement(DOM::Document& document, DOM::QualifiedName qualified_name)
-    : HTMLElement(document, move(qualified_name))
-{
-    document.register_viewport_client(*this);
-}
-
-HTMLImageElement::~HTMLImageElement() = default;
-
-void HTMLImageElement::finalize()
-{
-    Base::finalize();
-    unregister_with_decoded_image_data_if_needed();
-    document().unregister_viewport_client(*this);
-}
-
-void HTMLImageElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLImageElement);
-    Base::initialize(realm);
-
-    m_current_request = ImageRequest::create(realm, document().page());
-
-    // AD-HOC: Create a DocumentObserver eagerly to handle document lifecycle changes.
-    //         The document_became_inactive callback handles the navigation case by clearing the load event delayer.
-    //         A document_became_active callback is set lazily by update_the_image_data() when
-    //         needed to restart image loading after the document becomes active again.
-    m_document_observer = realm.create<DOM::DocumentObserver>(realm, document());
-    m_document_observer->set_document_became_inactive([this]() {
-        m_load_event_delayer.clear();
-    });
-}
-
-void HTMLImageElement::adopted_from(DOM::Document& old_document)
-{
-    old_document.unregister_viewport_client(*this);
-    document().register_viewport_client(*this);
-
-    m_document_observer->set_document(document());
-    if (!old_document.is_fully_active() && document().is_fully_active()) {
-        if (auto callback = m_document_observer->document_became_active())
-            callback->function()();
-    }
-
-    if (m_load_event_delayer.has_value())
-        m_load_event_delayer.emplace(document());
-
-    // FIXME: The current and pending requests may still be pointing at the old document's SharedResourceRequests.
-}
-
-void HTMLImageElement::visit_edges(Cell::Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-    visitor.visit(m_current_request);
-    visitor.visit(m_pending_request);
-    visitor.visit(m_document_observer);
-    visitor.visit(m_dimension_attribute_source);
-    visit_lazy_loading_element(visitor);
-}
-
-// https://html.spec.whatwg.org/multipage/embedded-content.html#concept-img-dimension-attribute-source
-DOM::Element const& HTMLImageElement::dimension_attribute_source() const
-{
-    if (m_dimension_attribute_source)
-        return *m_dimension_attribute_source;
-    return *this;
-}
-
-void HTMLImageElement::set_dimension_attribute_source(DOM::Element const* source)
-{
-    if (m_dimension_attribute_source.ptr() != source) {
-        m_dimension_attribute_source = source;
-        set_needs_style_update(true);
-    }
-}
-
-bool HTMLImageElement::is_presentational_hint(FlyString const& name) const
-{
-    if (Base::is_presentational_hint(name))
-        return true;
-
-    return first_is_one_of(name,
-        HTML::AttributeNames::hspace,
-        HTML::AttributeNames::vspace,
-        HTML::AttributeNames::border);
-}
-
-void HTMLImageElement::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
-{
-    Base::apply_presentational_hints(properties);
-    for_each_attribute([&](auto& name, auto& value) {
-        if (name == HTML::AttributeNames::hspace) {
-            if (auto parsed_value = parse_dimension_value(value)) {
-                properties.append({ .property_id = CSS::PropertyID::MarginLeft, .value = *parsed_value });
-                properties.append({ .property_id = CSS::PropertyID::MarginRight, .value = *parsed_value });
-            }
-        } else if (name == HTML::AttributeNames::vspace) {
-            if (auto parsed_value = parse_dimension_value(value)) {
-                properties.append({ .property_id = CSS::PropertyID::MarginTop, .value = *parsed_value });
-                properties.append({ .property_id = CSS::PropertyID::MarginBottom, .value = *parsed_value });
-            }
-        } else if (name == HTML::AttributeNames::border) {
-            if (auto parsed_value = parse_non_negative_integer(value); parsed_value.has_value()) {
-                auto width_value = CSS::LengthStyleValue::create(CSS::Length::make_px(*parsed_value));
-                properties.append({ .property_id = CSS::PropertyID::BorderTopWidth, .value = width_value });
-                properties.append({ .property_id = CSS::PropertyID::BorderRightWidth, .value = width_value });
-                properties.append({ .property_id = CSS::PropertyID::BorderBottomWidth, .value = width_value });
-                properties.append({ .property_id = CSS::PropertyID::BorderLeftWidth, .value = width_value });
-
-                auto solid_value = CSS::KeywordStyleValue::create(CSS::Keyword::Solid);
-                properties.append({ .property_id = CSS::PropertyID::BorderTopStyle, .value = solid_value });
-                properties.append({ .property_id = CSS::PropertyID::BorderRightStyle, .value = solid_value });
-                properties.append({ .property_id = CSS::PropertyID::BorderBottomStyle, .value = solid_value });
-                properties.append({ .property_id = CSS::PropertyID::BorderLeftStyle, .value = solid_value });
-            }
-        }
-    });
-}
-
-void HTMLImageElement::form_associated_element_attribute_changed(FlyString const& name, Optional<String> const&, Optional<String> const& value, Optional<FlyString> const&)
-{
-    if (name == HTML::AttributeNames::crossorigin) {
-        m_cors_setting = cors_setting_attribute_from_keyword(value);
-    }
-
-    if (name.is_one_of(HTML::AttributeNames::src, HTML::AttributeNames::srcset)) {
-        update_the_image_data(true);
-    }
-
-    if (name == HTML::AttributeNames::alt) {
-        // NB: Called from attribute change handler, layout may be stale.
-        if (unsafe_layout_node())
-            did_update_alt_text(as<Layout::ImageBox>(*unsafe_layout_node()));
-    }
-
-    if (name == HTML::AttributeNames::decoding) {
-        if (value.has_value() && value->equals_ignoring_ascii_case("sync"sv))
-            dbgln("FIXME: HTMLImageElement.decoding = 'sync' is not implemented yet");
-    }
-}
-
-RefPtr<Layout::Node> HTMLImageElement::create_layout_node(CSS::ComputedProperties const& style)
-{
-    return make_ref_counted<Layout::ImageBox>(document(), *this, style, *this);
-}
-
-void HTMLImageElement::adjust_computed_style(CSS::ComputedProperties::Builder& style)
-{
-    // https://drafts.csswg.org/css-display-3/#unbox
-    if (style.display().is_contents())
-        style.set_property(CSS::PropertyID::Display, CSS::DisplayStyleValue::create(CSS::Display::from_short(CSS::Display::Short::None)));
-}
-
-// https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-width
-WebIDL::UnsignedLong HTMLImageElement::width() const
-{
-    const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLImageElementWidth);
-
-    // Return the rendered width of the image, in CSS pixels, if the image is being rendered.
-    if (auto paintable_box = this->paintable_box())
-        return paintable_box->content_width().to_int();
-
-    // On setting [the width or height IDL attribute], they must act as if they reflected the respective content attributes of the same name.
-    if (auto width_attr = get_attribute(HTML::AttributeNames::width); width_attr.has_value()) {
-        if (auto converted = parse_non_negative_integer(*width_attr); converted.has_value() && *converted <= 2147483647)
-            return *converted;
-    }
-
-    // ...or else the density-corrected intrinsic width and height of the image, in CSS pixels,
-    // if the image has intrinsic dimensions and is available but not being rendered.
-    if (auto width = intrinsic_width(); width.has_value() && *width > 0)
-        return width->to_int();
-
-    // ...or else 0, if the image is not available or does not have intrinsic dimensions.
-    return 0;
-}
-
-void HTMLImageElement::set_width(WebIDL::UnsignedLong width)
-{
-    if (width > 2147483647)
-        width = 0;
-    set_attribute_value(HTML::AttributeNames::width, String::number(width));
-}
-
-// https://html.spec.whatwg.org/multipage/embedded-content.html#dom-img-height
-WebIDL::UnsignedLong HTMLImageElement::height() const
-{
