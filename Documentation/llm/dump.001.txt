@@ -65417,7 +65417,6 @@ FILE: Libraries/LibCore/EventLoopImplementationUnix.cpp
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/BinaryHeap.h>
 #include <AK/HashMap.h>
 #include <AK/NeverDestroyed.h>
 #include <AK/Singleton.h>
@@ -65431,6 +65430,7 @@ FILE: Libraries/LibCore/EventLoopImplementationUnix.cpp
 #include <LibCore/Platform/ScopedAutoreleasePool.h>
 #include <LibCore/System.h>
 #include <LibCore/ThreadEventQueue.h>
+#include <LibCore/TimeoutSet.h>
 #include <LibSync/Mutex.h>
 #include <LibSync/Once.h>
 #include <LibSync/RWLock.h>
@@ -65443,7 +65443,6 @@ namespace Core {
 namespace {
 
 struct ThreadData;
-class TimeoutSet;
 
 thread_local ThreadData* s_this_thread_data;
 static pthread_key_t s_this_thread_data_key;
@@ -65489,136 +65488,6 @@ bool has_flag(int value, int flag)
 {
     return (value & flag) == flag;
 }
-
-class EventLoopTimeout {
-public:
-    static constexpr ssize_t INVALID_INDEX = NumericLimits<ssize_t>::max();
-
-    EventLoopTimeout() { }
-    virtual ~EventLoopTimeout() = default;
-
-    virtual void fire(TimeoutSet& timeout_set, MonotonicTime time) = 0;
-
-    MonotonicTime fire_time() const { return m_fire_time; }
-
-    void absolutize(Badge<TimeoutSet>, MonotonicTime current_time)
-    {
-        m_fire_time = current_time + m_duration;
-    }
-
-    ssize_t& index(Badge<TimeoutSet>) { return m_index; }
-    void set_index(Badge<TimeoutSet>, ssize_t index) { m_index = index; }
-
-    bool is_scheduled() const { return m_index != INVALID_INDEX; }
-
-    void set_sequence_id(u64 id) { m_sequence_id = id; }
-    u64 sequence_id() const { return m_sequence_id; }
-
-protected:
-    union {
-        AK::Duration m_duration;
-        MonotonicTime m_fire_time;
-    };
-
-private:
-    ssize_t m_index = INVALID_INDEX;
-    u64 m_sequence_id { 0 };
-};
-
-class TimeoutSet {
-public:
-    TimeoutSet() = default;
-
-    Optional<MonotonicTime> next_timer_expiration()
-    {
-        if (!m_heap.is_empty()) {
-            return m_heap.peek_min()->fire_time();
-        } else {
-            return {};
-        }
-    }
-
-    void absolutize_relative_timeouts(MonotonicTime current_time)
-    {
-        for (auto timeout : m_scheduled_timeouts) {
-            timeout->absolutize({}, current_time);
-            m_heap.insert(timeout);
-        }
-        m_scheduled_timeouts.clear();
-    }
-
-    size_t fire_expired(MonotonicTime current_time)
-    {
-        size_t fired_count = 0;
-        while (!m_heap.is_empty()) {
-            auto& timeout = *m_heap.peek_min();
-
-            if (timeout.fire_time() <= current_time) {
-                ++fired_count;
-                m_heap.pop_min();
-                timeout.set_index({}, EventLoopTimeout::INVALID_INDEX);
-                timeout.fire(*this, current_time);
-            } else {
-                break;
-            }
-        }
-        return fired_count;
-    }
-
-    void schedule_relative(EventLoopTimeout* timeout)
-    {
-        timeout->set_sequence_id(m_next_sequence_id++);
-        timeout->set_index({}, -1 - static_cast<ssize_t>(m_scheduled_timeouts.size()));
-        m_scheduled_timeouts.append(timeout);
-    }
-
-    void schedule_absolute(EventLoopTimeout* timeout)
-    {
-        timeout->set_sequence_id(m_next_sequence_id++);
-        m_heap.insert(timeout);
-    }
-
-    void unschedule(EventLoopTimeout* timeout)
-    {
-        if (timeout->index({}) < 0) {
-            size_t i = -1 - timeout->index({});
-            size_t j = m_scheduled_timeouts.size() - 1;
-            VERIFY(m_scheduled_timeouts[i] == timeout);
-            swap(m_scheduled_timeouts[i], m_scheduled_timeouts[j]);
-            swap(m_scheduled_timeouts[i]->index({}), m_scheduled_timeouts[j]->index({}));
-            (void)m_scheduled_timeouts.take_last();
-        } else {
-            m_heap.pop(timeout->index({}));
-        }
-        timeout->set_index({}, EventLoopTimeout::INVALID_INDEX);
-    }
-
-    void clear()
-    {
-        for (auto* timeout : m_heap.nodes_in_arbitrary_order())
-            timeout->set_index({}, EventLoopTimeout::INVALID_INDEX);
-        m_heap.clear();
-        for (auto* timeout : m_scheduled_timeouts)
-            timeout->set_index({}, EventLoopTimeout::INVALID_INDEX);
-        m_scheduled_timeouts.clear();
-    }
-
-private:
-    IntrusiveBinaryHeap<
-        EventLoopTimeout*,
-        decltype([](EventLoopTimeout* a, EventLoopTimeout* b) {
-            if (a->fire_time() == b->fire_time())
-                return a->sequence_id() < b->sequence_id();
-            return a->fire_time() < b->fire_time();
-        }),
-        decltype([](EventLoopTimeout* timeout, size_t index) {
-            timeout->set_index({}, static_cast<ssize_t>(index));
-        }),
-        8>
-        m_heap;
-    Vector<EventLoopTimeout*, 8> m_scheduled_timeouts;
-    u64 m_next_sequence_id { 0 };
-};
 
 class EventLoopTimer final : public EventLoopTimeout {
 public:
@@ -66229,13 +66098,16 @@ FILE: Libraries/LibCore/EventLoopImplementationWindows.cpp
  */
 
 #include <AK/Assertions.h>
+#include <AK/Atomic.h>
 #include <AK/Diagnostics.h>
 #include <AK/HashMap.h>
 #include <AK/NonnullOwnPtr.h>
+#include <AK/Time.h>
 #include <AK/Windows.h>
 #include <LibCore/EventLoopImplementationWindows.h>
 #include <LibCore/Notifier.h>
 #include <LibCore/ThreadEventQueue.h>
+#include <LibCore/TimeoutSet.h>
 #include <LibCore/Timer.h>
 #include <LibSync/Mutex.h>
 #include <LibSync/MutexProtected.h>
@@ -66300,16 +66172,61 @@ struct EventLoopWake final : CompletionPacket {
     OwnHandle wait_event;
 };
 
-struct EventLoopTimer final : CompletionPacket {
+// All timers of a thread share one waitable timer, armed for the earliest deadline. Own bookkeeping (rather than a
+// kernel timer object per Core timer) is used because the kernel delivers simultaneously signaled wait completion
+// packets in LIFO order, while timers that are due together must fire in registration order.
+struct EventLoopMasterTimer final : CompletionPacket {
 
-    ~EventLoopTimer()
+    ~EventLoopMasterTimer()
     {
         CancelWaitableTimer(timer.handle);
+        if (wait_packet_associated) {
+            NTSTATUS status = g_system.NtCancelWaitCompletionPacket(wait_packet.handle, TRUE);
+            VERIFY(NT_SUCCESS(status));
+        }
     }
 
     OwnHandle timer;
     OwnHandle wait_packet;
-    bool is_periodic;
+    bool wait_packet_associated { false };
+};
+
+class EventLoopTimer final : public EventLoopTimeout {
+public:
+    EventLoopTimer() = default;
+
+    void reload(MonotonicTime const& now) { m_fire_time = now + interval; }
+
+    virtual void fire(TimeoutSet& timeout_set, MonotonicTime current_time) override
+    {
+        auto strong_owner = owner.strong_ref();
+
+        if (!strong_owner)
+            return;
+
+        if (should_reload) {
+            MonotonicTime next_fire_time = m_fire_time + interval;
+            if (next_fire_time <= current_time) {
+                next_fire_time = current_time + interval;
+            }
+            m_fire_time = next_fire_time;
+            if (next_fire_time != current_time) {
+                timeout_set.schedule_absolute(this);
+            } else {
+                // NOTE: Unfortunately we need to treat timeouts with the zero interval in a
+                //       special way. TimeoutSet::schedule_absolute for them will result in an
+                //       infinite loop. TimeoutSet::schedule_relative, on the other hand, will do a
+                //       correct thing of scheduling them for the next iteration of the loop.
+                m_duration = {};
+                timeout_set.schedule_relative(this);
+            }
+        }
+
+        ThreadEventQueue::current().post_event(strong_owner, Event::Type::Timer);
+    }
+
+    AK::Duration interval;
+    bool should_reload { false };
     WeakPtr<EventReceiver> owner;
 };
 
@@ -66343,7 +66260,8 @@ struct ThreadData {
     }
 
     ThreadData()
-        : wake_data(make<EventLoopWake>())
+        : master_timer(make<EventLoopMasterTimer>())
+        , wake_data(make<EventLoopWake>())
     {
         wake_data->type = CompletionType::Wake;
         wake_data->wait_event.handle = CreateEvent(NULL, FALSE, FALSE, NULL);
@@ -66356,6 +66274,15 @@ struct ThreadData {
         VERIFY(NT_SUCCESS(status));
         status = g_system.NtAssociateWaitCompletionPacket(wake_data->wait_packet.handle, iocp.handle, wake_data->wait_event.handle, wake_data.ptr(), NULL, 0, 0, NULL);
         VERIFY(NT_SUCCESS(status));
+
+        master_timer->type = CompletionType::Timer;
+        // A high-resolution timer avoids rounding short deadlines up to the default ~16ms timer tick.
+        master_timer->timer.handle = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        if (!master_timer->timer.handle)
+            master_timer->timer.handle = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
+        VERIFY(master_timer->timer.handle);
+        status = g_system.NtCreateWaitCompletionPacket(&master_timer->wait_packet.handle, GENERIC_READ | GENERIC_WRITE, NULL);
+        VERIFY(NT_SUCCESS(status));
     }
     ~ThreadData()
     {
@@ -66366,14 +66293,54 @@ struct ThreadData {
     OwnHandle iocp;
 
     // These are only used to register and unregister. The event loop doesn't access these.
-    HashMap<intptr_t, NonnullOwnPtr<EventLoopTimer>> timers;
     HashMap<Notifier*, NonnullOwnPtr<EventLoopNotifier>> notifiers;
+
+    // Owns the timer allocations; ids stay valid until unregister_timer even after a one-shot timer fires.
+    HashMap<intptr_t, NonnullOwnPtr<EventLoopTimer>> timers;
+    TimeoutSet timeouts;
+    // The deadline the master timer is currently armed for, to skip redundant SetWaitableTimer calls.
+    Optional<MonotonicTime> armed_deadline;
+    NonnullOwnPtr<EventLoopMasterTimer> master_timer;
 
     // The wake completion packet is posted to the thread's event loop to wake it.
     NonnullOwnPtr<EventLoopWake> wake_data;
 };
 
 static Sync::MutexProtected<HashMap<pid_t, NonnullOwnPtr<EventLoopProcess>>> s_processes;
+
+// Arms (or disarms) the thread's shared waitable timer for the earliest pending deadline.
+static void arm_master_timer(ThreadData& thread_data)
+{
+    auto& master_timer = *thread_data.master_timer;
+
+    auto earliest = thread_data.timeouts.next_timer_expiration();
+
+    if (!earliest.has_value()) {
+        if (thread_data.armed_deadline.has_value()) {
+            CancelWaitableTimer(master_timer.timer.handle);
+            thread_data.armed_deadline = {};
+        }
+        return;
+    }
+
+    if (thread_data.armed_deadline == earliest)
+        return;
+
+    LARGE_INTEGER due_time = {};
+    // Measured in 0.1μs intervals; negative means relative to now. Round up so the timer doesn't fire
+    // before the deadline (and wake the loop with nothing due), and clamp to at least one interval so
+    // an already-passed deadline stays a relative time.
+    due_time.QuadPart = -AK::max<i64>(((*earliest - MonotonicTime::now()).to_nanoseconds() + 99) / 100, 1);
+    BOOL succeeded = SetWaitableTimer(master_timer.timer.handle, &due_time, 0, NULL, NULL, FALSE);
+    VERIFY(succeeded);
+    thread_data.armed_deadline = earliest;
+
+    if (!master_timer.wait_packet_associated) {
+        NTSTATUS status = g_system.NtAssociateWaitCompletionPacket(master_timer.wait_packet.handle, thread_data.iocp.handle, master_timer.timer.handle, &master_timer, NULL, 0, 0, NULL);
+        VERIFY(NT_SUCCESS(status));
+        master_timer.wait_packet_associated = true;
+    }
+}
 
 EventLoopImplementationWindows::EventLoopImplementationWindows()
     : m_wake_event(ThreadData::the()->wake_data->wait_event.handle)
@@ -66429,13 +66396,19 @@ size_t EventLoopImplementationWindows::pump(PumpMode pump_mode)
                 continue;
             }
             if (packet->type == CompletionType::Timer) {
-                auto* timer = static_cast<EventLoopTimer*>(packet);
-                if (auto owner = timer->owner.strong_ref())
-                    event_queue.post_event(owner, Event::Type::Timer);
-                if (timer->is_periodic) {
-                    NTSTATUS status = g_system.NtAssociateWaitCompletionPacket(timer->wait_packet.handle, thread_data->iocp.handle, timer->timer.handle, timer, NULL, 0, 0, NULL);
-                    VERIFY(NT_SUCCESS(status));
-                }
+                auto* master_timer = static_cast<EventLoopMasterTimer*>(packet);
+                master_timer->wait_packet_associated = false;
+                thread_data->armed_deadline = {};
+
+                // TimeoutSet fires due timers in registration order for equal deadlines. (This cannot rely on
+                // kernel wakeup order: simultaneously signaled wait completion packets are delivered in LIFO
+                // order.)
+                auto now = MonotonicTime::now();
+                thread_data->timeouts.fire_expired(now);
+                // Zero-interval reloads are rescheduled relative to defer them to the next pump.
+                thread_data->timeouts.absolutize_relative_timeouts(now);
+
+                arm_master_timer(*thread_data);
                 continue;
             }
             if (packet->type == CompletionType::Notifer) {
@@ -66545,47 +66518,32 @@ intptr_t EventLoopManagerWindows::register_timer(EventReceiver& object, int mill
     VERIFY(milliseconds >= 0);
     auto* thread_data = ThreadData::the();
     VERIFY(thread_data);
-    auto& timers = thread_data->timers;
 
-    // FIXME: This is a temporary fix for issue #3641
-    bool manual_reset = static_cast<Timer&>(object).is_single_shot();
-    HANDLE timer = CreateWaitableTimer(NULL, manual_reset, NULL);
-    VERIFY(timer);
+    auto timer = make<EventLoopTimer>();
+    timer->owner = object.make_weak_ptr();
+    timer->interval = AK::Duration::from_milliseconds(milliseconds);
+    timer->should_reload = should_reload;
+    timer->reload(MonotonicTime::now());
+    thread_data->timeouts.schedule_absolute(timer.ptr());
 
-    auto timer_data = make<EventLoopTimer>();
-    timer_data->type = CompletionType::Timer;
-    timer_data->timer.handle = timer;
-    timer_data->owner = object.make_weak_ptr();
-    timer_data->is_periodic = should_reload;
-    VERIFY(timer_data->timer.handle);
-
-    NTSTATUS status = g_system.NtCreateWaitCompletionPacket(&timer_data->wait_packet.handle, GENERIC_READ | GENERIC_WRITE, NULL);
-    VERIFY(NT_SUCCESS(status));
-
-    LARGE_INTEGER first_time = {};
-    // Measured in 0.1μs intervals, negative means starting from now
-    first_time.QuadPart = -10'000LL * milliseconds;
-    BOOL succeeded = SetWaitableTimer(timer_data->timer.handle, &first_time, should_reload ? milliseconds : 0, NULL, NULL, FALSE);
-    VERIFY(succeeded);
-
-    status = g_system.NtAssociateWaitCompletionPacket(timer_data->wait_packet.handle, thread_data->iocp.handle, timer_data->timer.handle, timer_data.ptr(), NULL, 0, 0, NULL);
-    VERIFY(NT_SUCCESS(status));
-
-    auto timer_id = reinterpret_cast<intptr_t>(timer_data.ptr());
-    VERIFY(!timers.get(timer_id).has_value());
-    timers.set(timer_id, move(timer_data));
+    // Ids are process-wide unique so a stale id (e.g. one unregistered from the wrong thread) can never
+    // match another thread's timer.
+    static Atomic<intptr_t> next_timer_id { 1 };
+    auto timer_id = next_timer_id.fetch_add(1, AK::MemoryOrder::memory_order_relaxed);
+    thread_data->timers.set(timer_id, move(timer));
+    arm_master_timer(*thread_data);
     return timer_id;
 }
 
 void EventLoopManagerWindows::unregister_timer(intptr_t timer_id)
 {
     if (auto* thread_data = ThreadData::the()) {
-        auto maybe_timer = thread_data->timers.take(timer_id);
-        if (!maybe_timer.has_value())
+        auto timer = thread_data->timers.take(timer_id);
+        if (!timer.has_value())
             return;
-        auto timer = move(maybe_timer.value());
-        NTSTATUS status = g_system.NtCancelWaitCompletionPacket(timer->wait_packet.handle, TRUE);
-        VERIFY(NT_SUCCESS(status));
+        if ((*timer)->is_scheduled())
+            thread_data->timeouts.unschedule(timer->ptr());
+        arm_master_timer(*thread_data);
     }
 }
 
@@ -75597,6 +75555,163 @@ private:
 
     struct Private;
     OwnPtr<Private> m_private;
+};
+
+}
+
+FILE: Libraries/LibCore/TimeoutSet.h
+/*
+ * Copyright (c) 2023, Andreas Kling <andreas@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Badge.h>
+#include <AK/BinaryHeap.h>
+#include <AK/NumericLimits.h>
+#include <AK/Optional.h>
+#include <AK/Time.h>
+#include <AK/Vector.h>
+
+namespace Core {
+
+class TimeoutSet;
+
+class EventLoopTimeout {
+public:
+    static constexpr ssize_t INVALID_INDEX = NumericLimits<ssize_t>::max();
+
+    EventLoopTimeout() { }
+    virtual ~EventLoopTimeout() = default;
+
+    virtual void fire(TimeoutSet& timeout_set, MonotonicTime time) = 0;
+
+    MonotonicTime fire_time() const { return m_fire_time; }
+
+    void absolutize(Badge<TimeoutSet>, MonotonicTime current_time)
+    {
+        m_fire_time = current_time + m_duration;
+    }
+
+    ssize_t& index(Badge<TimeoutSet>) { return m_index; }
+    void set_index(Badge<TimeoutSet>, ssize_t index) { m_index = index; }
+
+    bool is_scheduled() const { return m_index != INVALID_INDEX; }
+
+    void set_sequence_id(u64 id) { m_sequence_id = id; }
+    u64 sequence_id() const { return m_sequence_id; }
+
+protected:
+    union {
+        AK::Duration m_duration;
+        MonotonicTime m_fire_time;
+    };
+
+private:
+    ssize_t m_index = INVALID_INDEX;
+    u64 m_sequence_id { 0 };
+};
+
+class TimeoutSet {
+public:
+    TimeoutSet() = default;
+
+    Optional<MonotonicTime> next_timer_expiration()
+    {
+        if (!m_heap.is_empty()) {
+            return m_heap.peek_min()->fire_time();
+        } else {
+            return {};
+        }
+    }
+
+    void absolutize_relative_timeouts(MonotonicTime current_time)
+    {
+        for (auto timeout : m_scheduled_timeouts) {
+            timeout->absolutize({}, current_time);
+            m_heap.insert(timeout);
+        }
+        m_scheduled_timeouts.clear();
+    }
+
+    size_t fire_expired(MonotonicTime current_time)
+    {
+        size_t fired_count = 0;
+        while (!m_heap.is_empty()) {
+            auto& timeout = *m_heap.peek_min();
+
+            if (timeout.fire_time() <= current_time) {
+                ++fired_count;
+                m_heap.pop_min();
+                timeout.set_index({}, EventLoopTimeout::INVALID_INDEX);
+                timeout.fire(*this, current_time);
+            } else {
+                break;
+            }
+        }
+        return fired_count;
+    }
+
+    void schedule_relative(EventLoopTimeout* timeout)
+    {
+        timeout->set_sequence_id(m_next_sequence_id++);
+        timeout->set_index({}, -1 - static_cast<ssize_t>(m_scheduled_timeouts.size()));
+        m_scheduled_timeouts.append(timeout);
+    }
+
+    void schedule_absolute(EventLoopTimeout* timeout)
+    {
+        timeout->set_sequence_id(m_next_sequence_id++);
+        m_heap.insert(timeout);
+    }
+
+    void unschedule(EventLoopTimeout* timeout)
+    {
+        if (timeout->index({}) < 0) {
+            size_t i = -1 - timeout->index({});
+            size_t j = m_scheduled_timeouts.size() - 1;
+            VERIFY(m_scheduled_timeouts[i] == timeout);
+            swap(m_scheduled_timeouts[i], m_scheduled_timeouts[j]);
+            swap(m_scheduled_timeouts[i]->index({}), m_scheduled_timeouts[j]->index({}));
+            (void)m_scheduled_timeouts.take_last();
+        } else {
+            m_heap.pop(timeout->index({}));
+        }
+        timeout->set_index({}, EventLoopTimeout::INVALID_INDEX);
+    }
+
+    void clear()
+    {
+        for (auto* timeout : m_heap.nodes_in_arbitrary_order())
+            timeout->set_index({}, EventLoopTimeout::INVALID_INDEX);
+        m_heap.clear();
+        for (auto* timeout : m_scheduled_timeouts)
+            timeout->set_index({}, EventLoopTimeout::INVALID_INDEX);
+        m_scheduled_timeouts.clear();
+    }
+
+private:
+    struct TimeoutFiresBefore {
+        bool operator()(EventLoopTimeout* a, EventLoopTimeout* b) const
+        {
+            if (a->fire_time() == b->fire_time())
+                return a->sequence_id() < b->sequence_id();
+            return a->fire_time() < b->fire_time();
+        }
+    };
+
+    struct UpdateTimeoutIndex {
+        void operator()(EventLoopTimeout* timeout, size_t index) const
+        {
+            timeout->set_index({}, static_cast<ssize_t>(index));
+        }
+    };
+
+    IntrusiveBinaryHeap<EventLoopTimeout*, TimeoutFiresBefore, UpdateTimeoutIndex, 8> m_heap;
+    Vector<EventLoopTimeout*, 8> m_scheduled_timeouts;
+    u64 m_next_sequence_id { 0 };
 };
 
 }
@@ -417513,6 +417628,7 @@ set(SOURCES
     HTML/MimeType.cpp
     HTML/MimeTypeArray.cpp
     HTML/Navigable.cpp
+    HTML/NavigableId.cpp
     HTML/NavigableContainer.cpp
     HTML/NavigateEvent.cpp
     HTML/Navigation.cpp
@@ -528442,56 +528558,64 @@ void StyleComputer::collect_animation_into(DOM::AbstractElement abstract_element
 
     double progress = round(output_progress.value() * 100.0 * Animations::KeyframeEffect::AnimationKeyFrameKeyScaleFactor);
     // FIXME: Support progress values outside the range of i64.
-    i64 key = 0;
+    i64 current_key = 0;
     if (progress > NumericLimits<i64>::max()) {
-        key = NumericLimits<i64>::max();
+        current_key = NumericLimits<i64>::max();
     } else if (progress < NumericLimits<i64>::min()) {
-        key = NumericLimits<i64>::min();
+        current_key = NumericLimits<i64>::min();
     } else {
-        key = static_cast<i64>(progress);
+        current_key = static_cast<i64>(progress);
     }
-    auto keyframe_start_it = [&] {
-        if (output_progress.value() <= 0) {
-            return keyframes.begin();
-        }
-        auto potential_match = keyframes.find_largest_not_above_iterator(key);
-        auto next = potential_match;
-        ++next;
-        if (next.is_end()) {
-            --potential_match;
-        }
-        return potential_match;
-    }();
-    auto keyframe_start = static_cast<i64>(keyframe_start_it.key());
-    auto keyframe_values = *keyframe_start_it;
 
-    auto keyframe_end_it = ++keyframe_start_it;
-    VERIFY(!keyframe_end_it.is_end());
-    auto keyframe_end = static_cast<i64>(keyframe_end_it.key());
-    auto keyframe_end_values = *keyframe_end_it;
-
-    auto progress_in_keyframe = (progress - keyframe_start) / static_cast<double>(keyframe_end - keyframe_start);
+    // Each property is animated using its property-specific keyframes, so two properties in the same animation may be
+    // interpolated across different intervals.
+    // Collect the keyframes in ascending offset order, and index for each physical longhand the keyframes that specify
+    // it, so that the interval endpoints can be found separately for every property.
+    LogicalAliasMappingContext const logical_alias_mapping_context { computed_properties.writing_mode(), computed_properties.direction() };
+    struct KeyframeInfo {
+        i64 key { 0 };
+        Animations::KeyframeEffect::KeyFrameSet::ResolvedKeyFrame const* frame { nullptr };
+    };
+    Vector<KeyframeInfo> ordered_keyframes;
+    ordered_keyframes.ensure_capacity(keyframes.size());
+    HashMap<PropertyID, Vector<size_t>> keyframes_specifying_property;
+    for (auto it = keyframes.begin(); it != keyframes.end(); ++it) {
+        auto keyframe_index = ordered_keyframes.size();
+        auto add_physical_longhand = [&](PropertyID longhand_id) {
+            auto physical_longhand_id = map_logical_alias_to_physical_property(longhand_id, logical_alias_mapping_context);
+            auto& specifying_keyframes = keyframes_specifying_property.ensure(physical_longhand_id);
+            if (specifying_keyframes.is_empty() || specifying_keyframes.last() != keyframe_index)
+                specifying_keyframes.append(keyframe_index);
+        };
+        for (auto const& [property_id, value] : it->properties) {
+            value.visit(
+                [&](Animations::KeyframeEffect::KeyFrameSet::UseInitial) { add_physical_longhand(property_id); },
+                [&](NonnullRefPtr<StyleValue const> const& keyframe_value) {
+                    for_each_property_expanding_shorthands(property_id, *keyframe_value, [&](PropertyID longhand_id, StyleValue const&) {
+                        add_physical_longhand(longhand_id);
+                    });
+                });
+        }
+        ordered_keyframes.append({ static_cast<i64>(it.key()), &*it });
+    }
 
     // https://drafts.csswg.org/css-animations-1/#animation-timing-function
     // Apply the per-keyframe easing to the interval progress. The easing on a keyframe applies to the
     // interval from that keyframe to the next. If the keyframe doesn't specify an easing, use the
     // animation's default easing (from the animation-timing-function property).
-    auto resolved_easing = keyframe_values.easing.visit(
-        [](Empty) -> Optional<CSS::EasingFunction> { return {}; },
-        [](CSS::EasingFunction const& easing) -> Optional<CSS::EasingFunction> { return easing; },
-        [&](NonnullRefPtr<CSS::StyleValue const> const& value) -> Optional<CSS::EasingFunction> {
-            return resolve_keyframe_easing(*value, abstract_element);
-        });
-    if (resolved_easing.has_value()) {
-        progress_in_keyframe = resolved_easing->evaluate_at(progress_in_keyframe, false);
-    } else if (animation->is_css_animation()) {
-        progress_in_keyframe = static_cast<CSSAnimation const&>(*animation).default_easing().evaluate_at(progress_in_keyframe, false);
-    }
-
-    if constexpr (LIBWEB_CSS_ANIMATION_DEBUG) {
-        auto valid_properties = keyframe_values.properties.size();
-        dbgln("Animation {} contains {} properties to interpolate, progress = {}%", animation->id(), valid_properties, progress_in_keyframe * 100);
-    }
+    auto apply_keyframe_easing = [&](auto const& keyframe_easing, double interval_progress) {
+        auto resolved_easing = keyframe_easing.visit(
+            [](Empty) -> Optional<CSS::EasingFunction> { return {}; },
+            [](CSS::EasingFunction const& easing) -> Optional<CSS::EasingFunction> { return easing; },
+            [&](NonnullRefPtr<CSS::StyleValue const> const& value) -> Optional<CSS::EasingFunction> {
+                return resolve_keyframe_easing(*value, abstract_element);
+            });
+        if (resolved_easing.has_value())
+            return resolved_easing->evaluate_at(interval_progress, false);
+        if (animation->is_css_animation())
+            return static_cast<CSSAnimation const&>(*animation).default_easing().evaluate_at(interval_progress, false);
+        return interval_progress;
+    };
 
     // FIXME: Follow https://drafts.csswg.org/web-animations-1/#ref-for-computed-keyframes in whatever the right place is.
     auto compute_keyframe_values = [&computed_properties, &abstract_element, builder, this](auto const& keyframe_values) {
@@ -528641,10 +528765,6 @@ void StyleComputer::collect_animation_into(DOM::AbstractElement abstract_element
         return result;
     };
 
-    VERIFY(computation_context_cache_is_empty());
-    HashMap<PropertyID, RefPtr<StyleValue const>> computed_start_values = compute_keyframe_values(keyframe_values);
-    HashMap<PropertyID, RefPtr<StyleValue const>> computed_end_values = compute_keyframe_values(keyframe_end_values);
-    clear_computation_context_caches();
     auto to_composite_operation = [&](Bindings::CompositeOperationOrAuto composite_operation_or_auto) {
         switch (composite_operation_or_auto) {
         case Bindings::CompositeOperationOrAuto::Accumulate:
@@ -528661,23 +528781,49 @@ void StyleComputer::collect_animation_into(DOM::AbstractElement abstract_element
 
     auto is_result_of_transition = animation->is_css_transition() ? AnimatedPropertyResultOfTransition::Yes : AnimatedPropertyResultOfTransition::No;
 
-    auto start_composite_operation = to_composite_operation(keyframe_values.composite);
-    auto end_composite_operation = to_composite_operation(keyframe_end_values.composite);
+    Vector<HashMap<PropertyID, RefPtr<StyleValue const>>> keyframe_computed_values;
+    keyframe_computed_values.resize(ordered_keyframes.size());
+    auto computed_values_for_keyframe = [&](size_t index) -> HashMap<PropertyID, RefPtr<StyleValue const>> const& {
+        if (keyframe_computed_values[index].is_empty())
+            keyframe_computed_values[index] = compute_keyframe_values(*ordered_keyframes[index].frame);
+        return keyframe_computed_values[index];
+    };
 
-    for (auto const& it : computed_start_values) {
-        auto resolved_start_property = it.value;
-        RefPtr resolved_end_property = computed_end_values.get(it.key).value_or(nullptr);
+    VERIFY(computation_context_cache_is_empty());
+
+    for (auto const& [property_id, specifying_keyframes] : keyframes_specifying_property) {
+        // A property is usually specified by at least the initial and final keyframes, but a value that stays
+        // unresolved may leave a property with only one specifying keyframe. Such a property cannot be interpolated, so skip it.
+        if (specifying_keyframes.size() < 2)
+            continue;
+
+        auto start_keyframe = specifying_keyframes[0];
+        auto end_keyframe = specifying_keyframes[1];
+        for (size_t next = 2; next < specifying_keyframes.size(); ++next) {
+            if (current_key < ordered_keyframes[end_keyframe].key)
+                break;
+            start_keyframe = end_keyframe;
+            end_keyframe = specifying_keyframes[next];
+        }
+
+        auto start_key = ordered_keyframes[start_keyframe].key;
+        auto end_key = ordered_keyframes[end_keyframe].key;
+        double interval_progress = (static_cast<double>(current_key) - start_key) / static_cast<double>(end_key - start_key);
+        interval_progress = apply_keyframe_easing(ordered_keyframes[start_keyframe].frame->easing, interval_progress);
+
+        RefPtr<StyleValue const> resolved_start_property = computed_values_for_keyframe(start_keyframe).get(property_id).value_or(nullptr);
+        RefPtr<StyleValue const> resolved_end_property = computed_values_for_keyframe(end_keyframe).get(property_id).value_or(nullptr);
 
         if (!resolved_end_property) {
             if (resolved_start_property) {
-                computed_properties.set_animated_property(Badge<StyleComputer> {}, it.key, *resolved_start_property, is_result_of_transition);
-                dbgln_if(LIBWEB_CSS_ANIMATION_DEBUG, "No end property for property {}, using {}", string_from_property_id(it.key), resolved_start_property->to_string(SerializationMode::Normal));
+                computed_properties.set_animated_property(Badge<StyleComputer> {}, property_id, *resolved_start_property, is_result_of_transition);
+                dbgln_if(LIBWEB_CSS_ANIMATION_DEBUG, "No end property for property {}, using {}", string_from_property_id(property_id), resolved_start_property->to_string(SerializationMode::Normal));
             }
             continue;
         }
 
         if (resolved_end_property && !resolved_start_property)
-            resolved_start_property = property_initial_value(it.key);
+            resolved_start_property = property_initial_value(property_id);
 
         if (!resolved_start_property || !resolved_end_property)
             continue;
@@ -528687,26 +528833,28 @@ void StyleComputer::collect_animation_into(DOM::AbstractElement abstract_element
 
         // OPTIMIZATION: Values resulting from animations other than CSS transitions are overridden by important
         //               properties so there's no need to calculate them
-        if (!animation->is_css_transition() && computed_properties.is_property_important(it.key)) {
+        if (!animation->is_css_transition() && computed_properties.is_property_important(property_id)) {
             continue;
         }
 
-        auto const& underlying_value = computed_properties.property(it.key);
-        if (auto composited_start_value = composite_value(it.key, underlying_value, start, start_composite_operation))
+        auto const& underlying_value = computed_properties.property(property_id);
+        if (auto composited_start_value = composite_value(property_id, underlying_value, start, to_composite_operation(ordered_keyframes[start_keyframe].frame->composite)))
             start = *composited_start_value;
 
-        if (auto composited_end_value = composite_value(it.key, underlying_value, end, end_composite_operation))
+        if (auto composited_end_value = composite_value(property_id, underlying_value, end, to_composite_operation(ordered_keyframes[end_keyframe].frame->composite)))
             end = *composited_end_value;
 
-        if (auto next_value = interpolate_property(*effect->target(), it.key, *start, *end, progress_in_keyframe, AllowDiscrete::Yes)) {
-            dbgln_if(LIBWEB_CSS_ANIMATION_DEBUG, "Interpolated value for property {} at {}: {} -> {} = {}", string_from_property_id(it.key), progress_in_keyframe, start->to_string(SerializationMode::Normal), end->to_string(SerializationMode::Normal), next_value->to_string(SerializationMode::Normal));
-            computed_properties.set_animated_property(Badge<StyleComputer> {}, it.key, *next_value, is_result_of_transition);
+        if (auto next_value = interpolate_property(*effect->target(), property_id, *start, *end, interval_progress, AllowDiscrete::Yes)) {
+            dbgln_if(LIBWEB_CSS_ANIMATION_DEBUG, "Interpolated value for property {} at {}: {} -> {} = {}", string_from_property_id(property_id), interval_progress, start->to_string(SerializationMode::Normal), end->to_string(SerializationMode::Normal), next_value->to_string(SerializationMode::Normal));
+            computed_properties.set_animated_property(Badge<StyleComputer> {}, property_id, *next_value, is_result_of_transition);
         } else {
             // If interpolate_property() fails, the element should not be rendered
-            dbgln_if(LIBWEB_CSS_ANIMATION_DEBUG, "Interpolated value for property {} at {}: {} -> {} is invalid", string_from_property_id(it.key), progress_in_keyframe, start->to_string(SerializationMode::Normal), end->to_string(SerializationMode::Normal));
+            dbgln_if(LIBWEB_CSS_ANIMATION_DEBUG, "Interpolated value for property {} at {}: {} -> {} is invalid", string_from_property_id(property_id), interval_progress, start->to_string(SerializationMode::Normal), end->to_string(SerializationMode::Normal));
             computed_properties.set_animated_property(Badge<StyleComputer> {}, PropertyID::Visibility, KeywordStyleValue::create(Keyword::Hidden), is_result_of_transition);
         }
     }
+
+    clear_computation_context_caches();
 }
 
 void StyleComputer::process_animation_definitions(ComputedProperties const& computed_properties, CascadedProperties const& cascaded_properties, DOM::AbstractElement& abstract_element) const
@@ -642735,6 +642883,7 @@ FILE: Libraries/LibWeb/HTML/DocumentState.h
 #include <LibWeb/Export.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Forward.h>
+#include <LibWeb/HTML/NavigableId.h>
 #include <LibWeb/HTML/POSTResource.h>
 #include <LibWeb/HTML/SerializedPolicyContainer.h>
 #include <LibWeb/ReferrerPolicy/ReferrerPolicy.h>
@@ -642748,7 +642897,7 @@ public:
     ~DocumentState();
 
     struct NestedHistory {
-        String id;
+        NavigableId id;
         Vector<NonnullRefPtr<SessionHistoryEntry>> entries;
     };
 
@@ -660860,168 +661009,3 @@ void run_iframe_load_event_steps(HTMLIFrameElement& element)
         // 3. Let fallbackTimingInfo be a new fetch timing info whose start time is element's pending resource-timing
         //    start time and whose response end time is the current high resolution time given global.
         auto fallback_timing_info = Fetch::Infrastructure::FetchTimingInfo::create(element.vm());
-        fallback_timing_info->set_start_time(element.pending_resource_start_time().value());
-        fallback_timing_info->set_end_time(HighResolutionTime::current_high_resolution_time(global));
-
-        // 4. Mark resource timing given fallbackTimingInfo, the result of parsing element's pending resource-timing
-        //    URL, "iframe", global, the empty string, a new response body info, and 0.
-        // FIXME: Our URL is already parsed, how are we supposed to parse it?
-        ResourceTiming::PerformanceResourceTiming::mark_resource_timing(
-            fallback_timing_info,
-            element.pending_resource_timing_url()->to_string(),
-            "iframe"_fly_string,
-            global,
-            Optional<Fetch::Infrastructure::Response::CacheState> {},
-            Fetch::Infrastructure::Response::BodyInfo {},
-            0);
-
-        // 5. Set element's pending resource-timing start time to null.
-        element.set_pending_resource_start_time({});
-
-        // 6. Set element's pending resource-timing URL to null.
-        element.set_pending_resource_timing_url({});
-    }
-
-    // FIXME: 5. Set childDocument's iframe load in progress flag.
-
-    // 6. Fire an event named load at element.
-    element.dispatch_event(DOM::Event::create(element.realm(), HTML::EventNames::load));
-
-    // FIXME: 7. Unset childDocument's iframe load in progress flag.
-}
-
-// https://html.spec.whatwg.org/multipage/interaction.html#dom-tabindex
-i32 HTMLIFrameElement::default_tab_index_value() const
-{
-    // See the base function for the spec comments.
-    return 0;
-}
-
-bool HTMLIFrameElement::is_presentational_hint(FlyString const& name) const
-{
-    if (Base::is_presentational_hint(name))
-        return true;
-
-    return name == HTML::AttributeNames::frameborder;
-}
-
-void HTMLIFrameElement::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
-{
-    Base::apply_presentational_hints(properties);
-
-    // https://html.spec.whatwg.org/multipage/rendering.html#attributes-for-embedded-content-and-images:attr-iframe-frameborder
-    // When an iframe element has a frameborder attribute whose value, when parsed using the rules for parsing integers,
-    // is zero or an error, the user agent is expected to have presentational hints setting the element's
-    // 'border-top-width', 'border-right-width', 'border-bottom-width', and 'border-left-width' properties to zero.
-    if (auto frameborder_attribute = get_attribute(HTML::AttributeNames::frameborder); frameborder_attribute.has_value()) {
-        auto frameborder = parse_integer(*frameborder_attribute);
-        if (!frameborder.has_value() || frameborder == 0) {
-            auto zero = CSS::LengthStyleValue::create(CSS::Length::make_px(0));
-            properties.append({ .property_id = CSS::PropertyID::BorderTopWidth, .value = zero });
-            properties.append({ .property_id = CSS::PropertyID::BorderRightWidth, .value = zero });
-            properties.append({ .property_id = CSS::PropertyID::BorderBottomWidth, .value = zero });
-            properties.append({ .property_id = CSS::PropertyID::BorderLeftWidth, .value = zero });
-        }
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-sandbox
-GC::Ref<DOM::DOMTokenList> HTMLIFrameElement::sandbox()
-{
-    // The sandbox IDL attribute must reflect the sandbox content attribute.
-    if (!m_sandbox)
-        m_sandbox = DOM::DOMTokenList::create(*this, HTML::AttributeNames::sandbox);
-    return *m_sandbox;
-}
-
-void HTMLIFrameElement::visit_edges(Cell::Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-    visit_lazy_loading_element(visitor);
-    visitor.visit(m_sandbox);
-}
-
-void HTMLIFrameElement::set_current_navigation_was_lazy_loaded(bool value)
-{
-    m_current_navigation_was_lazy_loaded = value;
-
-    // An iframe element whose current navigation was lazy loaded boolean is false potentially delays the load event.
-    // https://html.spec.whatwg.org/multipage/iframe-embed-object.html#the-iframe-element:potentially-delays-the-load-event
-    set_potentially_delays_the_load_event(!value);
-}
-
-// https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-srcdoc
-TrustedTypes::TrustedHTMLOrString HTMLIFrameElement::srcdoc()
-{
-    // 1. Let attribute be the result of running get an attribute by namespace and local name given null, srcdoc's
-    //    local name, and this.
-    // 2. If attribute is null, then return the empty string.
-    // 3. Return attribute's value.
-    return Utf16String::from_utf8(get_attribute_value(AttributeNames::srcdoc));
-}
-
-// https://html.spec.whatwg.org/multipage/iframe-embed-object.html#dom-iframe-srcdoc
-WebIDL::ExceptionOr<void> HTMLIFrameElement::set_srcdoc(TrustedTypes::TrustedHTMLOrString const& value)
-{
-    // 1. Let compliantString be the result of invoking the Get Trusted Type compliant string algorithm with
-    //      TrustedHTML, this's relevant global object, the given value, "HTMLIFrameElement srcdoc", and "script".
-    auto const compliant_string = TRY(TrustedTypes::get_trusted_type_compliant_string(
-        TrustedTypes::TrustedTypeName::TrustedHTML,
-        HTML::relevant_global_object(*this),
-        value,
-        TrustedTypes::InjectionSink::HTMLIFrameElement_srcdoc,
-        TrustedTypes::Script.to_string()));
-
-    // 2. Set an attribute value given this, srcdoc's local name, and compliantString.
-    set_attribute_value(AttributeNames::srcdoc, compliant_string.to_utf8_but_should_be_ported_to_utf16());
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/browsers.html#determining-the-iframe-element-referrer-policy
-ReferrerPolicy::ReferrerPolicy determine_iframe_element_referrer_policy(GC::Ptr<DOM::Element> embedder)
-{
-    // 1. If embedder is an iframe element, then return embedder's referrerpolicy attribute's state's corresponding
-    //    keyword.
-    if (auto* iframe = as_if<HTMLIFrameElement>(embedder.ptr())) {
-        return ReferrerPolicy::from_string(iframe->get_attribute_value(HTML::AttributeNames::referrerpolicy)).value_or(ReferrerPolicy::ReferrerPolicy::EmptyString);
-    }
-
-    // 2. Return the empty string.
-    return ReferrerPolicy::ReferrerPolicy::EmptyString;
-}
-
-}
-
-FILE: Libraries/LibWeb/HTML/HTMLIFrameElement.h
-/*
- * Copyright (c) 2020-2021, Andreas Kling <andreas@ladybird.org>
- * Copyright (c) 2023, Sam Atkins <atkinssj@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <LibWeb/HTML/LazyLoadingElement.h>
-#include <LibWeb/HTML/NavigableContainer.h>
-
-namespace Web::HTML {
-
-class HTMLIFrameElement final
-    : public NavigableContainer
-    , public LazyLoadingElement<HTMLIFrameElement> {
-
-    WEB_PLATFORM_OBJECT(HTMLIFrameElement, NavigableContainer);
-    LAZY_LOADING_ELEMENT(HTMLIFrameElement);
-    GC_DECLARE_ALLOCATOR(HTMLIFrameElement);
-
-public:
-    virtual ~HTMLIFrameElement() override;
-
-    virtual RefPtr<Layout::Node> create_layout_node(CSS::ComputedProperties const&) override;
-    virtual void adjust_computed_style(CSS::ComputedProperties::Builder&) override;
-
-    // ^EventTarget
-    virtual bool is_focusable() const override
-    {
-        return meets_focusable_area_rendering_requirements();
