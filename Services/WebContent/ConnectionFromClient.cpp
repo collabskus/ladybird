@@ -742,8 +742,8 @@ void ConnectionFromClient::inspect_storage(u64 page_id, Web::StorageAPI::Storage
             continue;
 
         JsonObject item;
-        item.set("name"sv, name.release_value());
-        item.set("value"sv, value.release_value());
+        item.set("name"sv, name.release_value().to_utf8());
+        item.set("value"sv, value.release_value().to_utf8());
         storage_items.must_append(move(item));
     }
 
@@ -773,12 +773,12 @@ Messages::WebContentServer::SetSessionStorageItemResponse ConnectionFromClient::
     if (!storage.has_value())
         return Optional<WebView::StorageSetResult> {};
 
-    auto old_value = (*storage)->get_item(key);
-    auto result = (*storage)->set_item(key, value);
+    auto old_value = (*storage)->get_item(Utf16String::from_utf8(key));
+    auto result = (*storage)->set_item(Utf16String::from_utf8(key), Utf16String::from_utf8(value));
     if (result.is_exception())
         return WebView::StorageSetResult { WebView::StorageOperationError::QuotaExceededError };
 
-    return WebView::StorageSetResult { move(old_value) };
+    return WebView::StorageSetResult { old_value.map([](auto const& value) { return MUST(value.utf16_view().to_utf8()); }) };
 }
 
 Messages::WebContentServer::RemoveSessionStorageItemResponse ConnectionFromClient::remove_session_storage_item(u64 page_id, String key)
@@ -791,10 +791,10 @@ Messages::WebContentServer::RemoveSessionStorageItemResponse ConnectionFromClien
     if (!storage.has_value())
         return Optional<String> {};
 
-    auto old_value = (*storage)->get_item(key);
+    auto old_value = (*storage)->get_item(Utf16String::from_utf8(key));
     if (old_value.has_value())
-        (*storage)->remove_item(key);
-    return old_value;
+        (*storage)->remove_item(Utf16String::from_utf8(key));
+    return old_value.map([](auto const& value) { return MUST(value.utf16_view().to_utf8()); });
 }
 
 Messages::WebContentServer::ClearSessionStorageResponse ConnectionFromClient::clear_session_storage(u64 page_id)
@@ -2396,10 +2396,10 @@ void ConnectionFromClient::toggle_media_controls_state(u64 page_id)
         page->page().toggle_media_controls_state();
 }
 
-void ConnectionFromClient::toggle_page_mute_state(u64 page_id)
+void ConnectionFromClient::set_page_mute_state(u64 page_id, Web::HTML::MuteState mute_state)
 {
     if (auto page = this->page(page_id); page.has_value())
-        page->page().toggle_page_mute_state();
+        page->page().set_page_mute_state(mute_state);
 }
 
 void ConnectionFromClient::set_user_style(u64 page_id, String source)

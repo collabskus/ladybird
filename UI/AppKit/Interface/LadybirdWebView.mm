@@ -7,6 +7,7 @@
 #include <AK/Optional.h>
 #include <Interface/LadybirdWebViewBridge.h>
 #include <LibURL/URL.h>
+#include <LibWakeLock/DisplaySleepInhibitor.h>
 #include <LibWeb/HTML/SelectedFile.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/Utilities.h>
@@ -91,6 +92,7 @@ static Web::DevicePixelPoint node_picker_position_for(Ladybird::WebViewBridge co
 @interface LadybirdWebView () <NSDraggingDestination>
 {
     OwnPtr<Ladybird::WebViewBridge> m_web_view_bridge;
+    Optional<WakeLock::DisplaySleepInhibitor> m_screen_display_sleep_inhibitor;
 
     Optional<HideCursor> m_hidden_cursor;
 
@@ -106,6 +108,7 @@ static Web::DevicePixelPoint node_picker_position_for(Ladybird::WebViewBridge co
 @property (nonatomic, weak) id<LadybirdWebViewObserver> observer;
 @property (nonatomic, strong) NSMenu* page_context_menu;
 @property (nonatomic, strong) NSMenu* link_context_menu;
+@property (nonatomic, strong) NSMenu* selected_text_link_context_menu;
 @property (nonatomic, strong) NSMenu* image_context_menu;
 @property (nonatomic, strong) NSMenu* media_context_menu;
 @property (nonatomic, strong) NSMenu* select_dropdown;
@@ -191,6 +194,7 @@ static Web::DevicePixelPoint node_picker_position_for(Ladybird::WebViewBridge co
 
         self.page_context_menu = Ladybird::create_context_menu(self, [self view].page_context_menu());
         self.link_context_menu = Ladybird::create_context_menu(self, [self view].link_context_menu());
+        self.selected_text_link_context_menu = Ladybird::create_context_menu(self, [self view].selected_text_link_context_menu());
         self.image_context_menu = Ladybird::create_context_menu(self, [self view].image_context_menu());
         self.media_context_menu = Ladybird::create_context_menu(self, [self view].media_context_menu());
 
@@ -781,14 +785,14 @@ static Web::DevicePixelPoint node_picker_position_for(Ladybird::WebViewBridge co
                     }
                 },
                 [&](Web::HTML::FileFilter::MimeType const& filter) {
-                    auto* ns_mime_type = Ladybird::string_to_ns_string(filter.value);
+                    auto* ns_mime_type = Ladybird::utf16_string_to_ns_string(filter.value);
 
                     if (auto* ut_type = [UTType typeWithMIMEType:ns_mime_type]) {
                         [accepted_file_filters addObject:ut_type];
                     }
                 },
                 [&](Web::HTML::FileFilter::Extension const& filter) {
-                    auto* ns_extension = Ladybird::string_to_ns_string(filter.value);
+                    auto* ns_extension = Ladybird::utf16_string_to_ns_string(filter.value);
 
                     if (auto* ut_type = [UTType typeWithFilenameExtension:ns_extension]) {
                         [accepted_file_filters addObject:ut_type];
@@ -835,8 +839,9 @@ static Web::DevicePixelPoint node_picker_position_for(Ladybird::WebViewBridge co
         self.select_dropdown.minimumWidth = minimum_width;
 
         auto add_menu_item = [self](Web::HTML::SelectItemOption const& item_option, bool in_option_group) {
+            auto label = in_option_group ? Utf16String::formatted("    {}", item_option.label) : item_option.label;
             NSMenuItem* menuItem = [[NSMenuItem alloc]
-                initWithTitle:Ladybird::string_to_ns_string(in_option_group ? MUST(String::formatted("    {}", item_option.label)) : item_option.label)
+                initWithTitle:Ladybird::utf16_string_to_ns_string(label)
                        action:item_option.disabled ? nil : @selector(selectDropdownAction:)
                 keyEquivalent:@""];
             menuItem.representedObject = [NSNumber numberWithUnsignedInt:item_option.id];
@@ -848,7 +853,7 @@ static Web::DevicePixelPoint node_picker_position_for(Ladybird::WebViewBridge co
             if (item.has<Web::HTML::SelectItemOptionGroup>()) {
                 auto const& item_option_group = item.get<Web::HTML::SelectItemOptionGroup>();
                 NSMenuItem* subtitle = [[NSMenuItem alloc]
-                    initWithTitle:Ladybird::string_to_ns_string(item_option_group.label)
+                    initWithTitle:Ladybird::utf16_string_to_ns_string(item_option_group.label)
                            action:nil
                     keyEquivalent:@""];
                 [self.select_dropdown addItem:subtitle];
@@ -964,6 +969,25 @@ static Web::DevicePixelPoint node_picker_position_for(Ladybird::WebViewBridge co
             return;
         }
         [self.observer onAudioPlayStateChange:play_state];
+    };
+
+    m_web_view_bridge->on_screen_wake_lock_state_changed = [weak_self](auto wake_lock_state) {
+        LadybirdWebView* self = weak_self;
+        if (self == nil) {
+            return;
+        }
+
+        switch (wake_lock_state) {
+        case Web::ScreenWakeLockState::Released:
+            self->m_screen_display_sleep_inhibitor.clear();
+            break;
+        case Web::ScreenWakeLockState::Acquired:
+            if (self->m_screen_display_sleep_inhibitor.has_value())
+                break;
+            if (auto inhibitor = WakeLock::DisplaySleepInhibitor::create("Ladybird Content"sv); !inhibitor.is_error())
+                self->m_screen_display_sleep_inhibitor = inhibitor.release_value();
+            break;
+        }
     };
 }
 
