@@ -1125,7 +1125,7 @@ void HTMLInputElement::create_button_input_shadow_tree()
     shadow_root->set_user_agent_internal(true);
     set_shadow_root(shadow_root);
     auto text_container = MUST(DOM::create_element(document(), HTML::TagNames::span, Namespace::HTML));
-    text_container->set_attribute_value(HTML::AttributeNames::style, "display: inline-block; pointer-events: none;"_string);
+    text_container->set_attribute_value(HTML::AttributeNames::style, "display: inline-block; pointer-events: none;"_utf16);
 
     m_text_node = realm().create<DOM::Text>(document(), button_label());
     MUST(text_container->append_child(*m_text_node));
@@ -1211,14 +1211,14 @@ void HTMLInputElement::create_text_input_shadow_tree()
         m_up_button_element = MUST(DOM::create_element(document(), HTML::TagNames::button, Namespace::HTML));
 
         auto up_button_svg = MUST(DOM::create_element(document(), SVG::TagNames::svg, Namespace::SVG));
-        up_button_svg->set_attribute_value(HTML::AttributeNames::style, "width: 1em; height: 1em;"_string);
-        up_button_svg->set_attribute_value(SVG::AttributeNames::xmlns, Namespace::SVG.to_string());
-        up_button_svg->set_attribute_value(SVG::AttributeNames::viewBox, "0 0 24 24"_string);
+        up_button_svg->set_attribute_value(HTML::AttributeNames::style, "width: 1em; height: 1em;"_utf16);
+        up_button_svg->set_attribute_value(SVG::AttributeNames::xmlns, Namespace::SVG.to_utf16_string());
+        up_button_svg->set_attribute_value(SVG::AttributeNames::viewBox, "0 0 24 24"_utf16);
         MUST(m_up_button_element->append_child(up_button_svg));
 
         auto up_button_svg_path = MUST(DOM::create_element(document(), SVG::TagNames::path, Namespace::SVG));
-        up_button_svg_path->set_attribute_value(SVG::AttributeNames::fill, "currentColor"_string);
-        up_button_svg_path->set_attribute_value(SVG::AttributeNames::d, "M7.41,15.41L12,10.83L16.59,15.41L18,14L12,8L6,14L7.41,15.41Z"_string);
+        up_button_svg_path->set_attribute_value(SVG::AttributeNames::fill, "currentColor"_utf16);
+        up_button_svg_path->set_attribute_value(SVG::AttributeNames::d, "M7.41,15.41L12,10.83L16.59,15.41L18,14L12,8L6,14L7.41,15.41Z"_utf16);
         MUST(up_button_svg->append_child(up_button_svg_path));
 
         MUST(element->append_child(*m_up_button_element));
@@ -1250,14 +1250,14 @@ void HTMLInputElement::create_text_input_shadow_tree()
         m_down_button_element = MUST(DOM::create_element(document(), HTML::TagNames::button, Namespace::HTML));
 
         auto down_button_svg = MUST(DOM::create_element(document(), SVG::TagNames::svg, Namespace::SVG));
-        down_button_svg->set_attribute_value(HTML::AttributeNames::style, "width: 1em; height: 1em;"_string);
-        down_button_svg->set_attribute_value(SVG::AttributeNames::xmlns, Namespace::SVG.to_string());
-        down_button_svg->set_attribute_value(SVG::AttributeNames::viewBox, "0 0 24 24"_string);
+        down_button_svg->set_attribute_value(HTML::AttributeNames::style, "width: 1em; height: 1em;"_utf16);
+        down_button_svg->set_attribute_value(SVG::AttributeNames::xmlns, Namespace::SVG.to_utf16_string());
+        down_button_svg->set_attribute_value(SVG::AttributeNames::viewBox, "0 0 24 24"_utf16);
         MUST(m_down_button_element->append_child(down_button_svg));
 
         auto down_button_svg_path = MUST(DOM::create_element(document(), SVG::TagNames::path, Namespace::SVG));
-        down_button_svg_path->set_attribute_value(SVG::AttributeNames::fill, "currentColor"_string);
-        down_button_svg_path->set_attribute_value(SVG::AttributeNames::d, "M7.41,8.58L12,13.17L16.59,8.58L18,10L12,16L6,10L7.41,8.58Z"_string);
+        down_button_svg_path->set_attribute_value(SVG::AttributeNames::fill, "currentColor"_utf16);
+        down_button_svg_path->set_attribute_value(SVG::AttributeNames::d, "M7.41,8.58L12,13.17L16.59,8.58L18,10L12,16L6,10L7.41,8.58Z"_utf16);
         MUST(down_button_svg->append_child(down_button_svg_path));
 
         MUST(element->append_child(*m_down_button_element));
@@ -1294,7 +1294,7 @@ void HTMLInputElement::create_color_input_shadow_tree()
         padding: 4px;
         border: 1px solid ButtonBorder;
         background-color: ButtonFace;
-)~~~"_string);
+)~~~"_utf16);
 
     m_color_well_element = DOM::create_element(document(), HTML::TagNames::div, Namespace::HTML).release_value_but_fixme_should_propagate_errors();
     m_color_well_element->set_attribute_value(HTML::AttributeNames::style, R"~~~(
@@ -1302,7 +1302,7 @@ void HTMLInputElement::create_color_input_shadow_tree()
         height: 16px;
         border: 1px solid ButtonBorder;
         box-sizing: border-box;
-)~~~"_string);
+)~~~"_utf16);
     MUST(m_color_well_element->style_for_bindings()->set_property(CSS::PropertyID::BackgroundColor, color.utf16_view()));
 
     MUST(border->append_child(*m_color_well_element));
@@ -1330,7 +1330,7 @@ void HTMLInputElement::create_file_input_shadow_tree()
     m_file_button->set_associated_shadow_host_pseudo_element(CSS::PseudoElement::FileSelectorButton);
 
     m_file_label = DOM::create_element(document(), HTML::TagNames::label, Namespace::HTML).release_value_but_fixme_should_propagate_errors();
-    m_file_label->set_attribute_value(HTML::AttributeNames::style, "padding-left: 4px;"_string);
+    m_file_label->set_attribute_value(HTML::AttributeNames::style, "padding-left: 4px;"_utf16);
 
     auto on_button_click = [this](JS::VM&) {
         show_the_picker_if_applicable(*this);
@@ -1552,7 +1552,7 @@ void HTMLInputElement::did_lose_focus()
     commit_pending_changes();
 }
 
-void HTMLInputElement::form_associated_element_attribute_changed(FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<FlyString> const& namespace_)
+void HTMLInputElement::form_associated_element_attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
 {
     PopoverTargetAttributes::associated_attribute_changed(name, value, namespace_);
 
@@ -1621,14 +1621,21 @@ void HTMLInputElement::form_associated_element_attribute_changed(FlyString const
     }
 
     // AD-HOC: A change to any of these attributes can change whether the element satisfies its constraints, and
-    //         therefore which validity pseudo-classes match.
-    if (first_is_one_of(name, HTML::AttributeNames::type, HTML::AttributeNames::value, HTML::AttributeNames::required, HTML::AttributeNames::pattern, HTML::AttributeNames::min, HTML::AttributeNames::max, HTML::AttributeNames::step, HTML::AttributeNames::maxlength, HTML::AttributeNames::minlength, HTML::AttributeNames::multiple))
+    //         therefore which validity pseudo-classes match. Re-setting an attribute to its current value cannot
+    //         change validity, so skip the invalidation in that case.
+    if (old_value != value && first_is_one_of(name, HTML::AttributeNames::type, HTML::AttributeNames::value, HTML::AttributeNames::required, HTML::AttributeNames::pattern, HTML::AttributeNames::min, HTML::AttributeNames::max, HTML::AttributeNames::step, HTML::AttributeNames::maxlength, HTML::AttributeNames::minlength, HTML::AttributeNames::multiple))
         CSS::Invalidation::invalidate_style_after_validity_change(*this);
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#input-type-change
 void HTMLInputElement::type_attribute_changed(TypeAttributeState old_state, TypeAttributeState new_state)
 {
+    // NB: The steps below apply when the type attribute changes state. Re-setting the attribute to a value that
+    //     parses to the same state must not reset the element's internals; some sites re-set type="file" on a
+    //     hidden upload input on every keystroke, and rebuilding the internal shadow tree each time is wasteful.
+    if (old_state == new_state)
+        return;
+
     auto new_value_attribute_mode = value_attribute_mode_for_type_state(new_state);
     auto old_value_attribute_mode = value_attribute_mode_for_type_state(old_state);
 
@@ -1787,13 +1794,13 @@ HTMLInputElement::TypeAttributeState HTMLInputElement::parse_type_attribute(Utf1
     return HTMLInputElement::TypeAttributeState::Text;
 }
 
-StringView HTMLInputElement::type() const
+Utf16String HTMLInputElement::type() const
 {
     // FIXME: This should probably be `Reflect` in the IDL.
     switch (m_type) {
 #define __ENUMERATE_HTML_INPUT_TYPE_ATTRIBUTE(keyword, state) \
     case TypeAttributeState::state:                           \
-        return keyword##sv;
+        return keyword##_utf16;
         ENUMERATE_HTML_INPUT_TYPE_ATTRIBUTES
 #undef __ENUMERATE_HTML_INPUT_TYPE_ATTRIBUTE
     }
@@ -1801,7 +1808,7 @@ StringView HTMLInputElement::type() const
     VERIFY_NOT_REACHED();
 }
 
-void HTMLInputElement::set_type(String const& type)
+void HTMLInputElement::set_type(Utf16String const& type)
 {
     set_attribute_value(HTML::AttributeNames::type, type);
 }
@@ -2101,7 +2108,7 @@ EventResult HTMLInputElement::handle_return_key(FlyString const&)
     return EventResult::Handled;
 }
 
-bool HTMLInputElement::is_presentational_hint(FlyString const& name) const
+bool HTMLInputElement::is_presentational_hint(Utf16FlyString const& name) const
 {
     if (Base::is_presentational_hint(name))
         return true;
@@ -2349,7 +2356,7 @@ WebIDL::ExceptionOr<void> HTMLInputElement::set_size(WebIDL::UnsignedLong value)
         return WebIDL::IndexSizeError::create(realm(), "Size must be greater than zero"_utf16);
     if (value > 2147483647)
         value = 20;
-    set_attribute_value(HTML::AttributeNames::size, String::number(value));
+    set_attribute_value(HTML::AttributeNames::size, Utf16String::number(value));
     return {};
 }
 
@@ -2385,7 +2392,7 @@ void HTMLInputElement::set_height(WebIDL::UnsignedLong value)
     if (value > 2147483647)
         value = 0;
 
-    set_attribute_value(HTML::AttributeNames::height, String::number(value));
+    set_attribute_value(HTML::AttributeNames::height, Utf16String::number(value));
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#dom-input-width
@@ -2420,7 +2427,7 @@ void HTMLInputElement::set_width(WebIDL::UnsignedLong value)
     if (value > 2147483647)
         value = 0;
 
-    set_attribute_value(HTML::AttributeNames::width, String::number(value));
+    set_attribute_value(HTML::AttributeNames::width, Utf16String::number(value));
 }
 
 // https://html.spec.whatwg.org/multipage/input.html#month-state-(type=month):concept-input-value-string-number
