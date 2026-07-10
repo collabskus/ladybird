@@ -114240,6 +114240,10 @@ FILE: Libraries/LibGfx/Font/Font.cpp
 #include <LibGfx/Font/TypefaceSkia.h>
 #include <LibGfx/TextLayout.h>
 
+#if defined(USE_FONTCONFIG)
+#    include <LibGfx/Font/GlobalFontConfig.h>
+#endif
+
 #include <core/SkFont.h>
 #include <core/SkFontMetrics.h>
 #include <core/SkFontTypes.h>
@@ -114355,11 +114359,57 @@ hb_font_t* Font::harfbuzz_font() const
     return m_harfbuzz_font;
 }
 
+#if defined(USE_FONTCONFIG)
+static Optional<FontHintingStyle> s_hinting_override_for_testing;
+
+static SkFontHinting to_skia_hinting(FontHintingStyle style)
+{
+    switch (style) {
+    case FontHintingStyle::None:
+        return SkFontHinting::kNone;
+    case FontHintingStyle::Slight:
+        return SkFontHinting::kSlight;
+    case FontHintingStyle::Normal:
+        return SkFontHinting::kNormal;
+    case FontHintingStyle::Full:
+        return SkFontHinting::kFull;
+    }
+    VERIFY_NOT_REACHED();
+}
+#endif
+
+void force_hinting_for_testing([[maybe_unused]] Optional<FontHintingStyle> style)
+{
+#if defined(USE_FONTCONFIG)
+    s_hinting_override_for_testing = style;
+#endif
+}
+
+#if defined(USE_FONTCONFIG)
+FontHintingOptions Font::hinting_options(float scale) const
+{
+    if (!m_hinting_options.has_value() || m_hinting_options->scale != scale)
+        m_hinting_options = ScaledFontHintingOptions { scale, GlobalFontConfig::the().hinting_for_font(family(), pixel_size() * scale, weight(), slope()) };
+    return m_hinting_options->options;
+}
+#endif
+
 SkFont Font::skia_font(float scale) const
 {
     auto const& sk_typeface = as<TypefaceSkia>(*m_typeface).sk_typeface();
     auto sk_font = SkFont { sk_ref_sp(sk_typeface), pixel_size() * scale };
     sk_font.setSubpixel(true);
+
+#if defined(USE_FONTCONFIG)
+    if (s_hinting_override_for_testing.has_value()) {
+        sk_font.setHinting(to_skia_hinting(*s_hinting_override_for_testing));
+    } else {
+        auto options = hinting_options(scale);
+        sk_font.setHinting(to_skia_hinting(options.style));
+        sk_font.setForceAutoHinting(options.force_autohinting);
+    }
+#endif
+
     return sk_font;
 }
 
@@ -114434,6 +114484,7 @@ FILE: Libraries/LibGfx/Font/Font.h
 #include <AK/AtomicRefCounted.h>
 #include <AK/FlyString.h>
 #include <AK/HashMap.h>
+#include <AK/Optional.h>
 #include <AK/OwnPtr.h>
 #include <AK/RefPtr.h>
 #include <AK/Utf16String.h>
@@ -114483,6 +114534,20 @@ enum FontWidth {
 
 constexpr float text_shaping_resolution = 64;
 
+enum class FontHintingStyle {
+    None,
+    Slight,
+    Normal,
+    Full,
+};
+
+struct FontHintingOptions {
+    FontHintingStyle style { FontHintingStyle::Normal };
+    bool force_autohinting { false };
+};
+
+void force_hinting_for_testing(Optional<FontHintingStyle>);
+
 class Font : public AtomicRefCounted<Font> {
 public:
     Font(NonnullRefPtr<Typeface const>, float point_width, float point_height, FontVariationSettings const variations, ShapeFeatures const& features);
@@ -114525,6 +114590,16 @@ public:
 
 private:
     u64 m_id { 0 };
+
+#if defined(USE_FONTCONFIG)
+    FontHintingOptions hinting_options(float scale) const;
+
+    struct ScaledFontHintingOptions {
+        float scale;
+        FontHintingOptions options;
+    };
+    mutable Optional<ScaledFontHintingOptions> m_hinting_options;
+#endif
 
     mutable RefPtr<Font const> m_bold_variant;
     mutable hb_font_t* m_harfbuzz_font { nullptr };
@@ -115087,6 +115162,7 @@ FILE: Libraries/LibGfx/Font/GlobalFontConfig.cpp
  */
 
 #include <AK/Assertions.h>
+#include <AK/ByteString.h>
 #include <AK/NeverDestroyed.h>
 #include <LibGfx/Font/GlobalFontConfig.h>
 #include <fontconfig/fontconfig.h>
@@ -115100,6 +115176,62 @@ GlobalFontConfig::GlobalFontConfig()
 
     m_config = FcConfigGetCurrent();
     FcConfigReference(m_config);
+}
+
+FontHintingOptions GlobalFontConfig::hinting_for_font(FlyString const& family, float pixel_size, u16 weight, u8 slope)
+{
+    FontHintingOptions options;
+
+    FcPattern* pattern = FcPatternCreate();
+    if (!pattern)
+        return options;
+
+    auto family_name = family.bytes_as_string_view().to_byte_string();
+    FcPatternAddString(pattern, FC_FAMILY, reinterpret_cast<FcChar8 const*>(family_name.characters()));
+    FcPatternAddDouble(pattern, FC_PIXEL_SIZE, pixel_size);
+    FcPatternAddInteger(pattern, FC_WEIGHT, FcWeightFromOpenType(weight));
+
+    int slant = FC_SLANT_ROMAN;
+    if (slope == 1)
+        slant = FC_SLANT_ITALIC;
+    else if (slope == 2)
+        slant = FC_SLANT_OBLIQUE;
+    FcPatternAddInteger(pattern, FC_SLANT, slant);
+
+    FcConfigSubstitute(m_config, pattern, FcMatchPattern);
+    FcDefaultSubstitute(pattern);
+
+    // Substitute a duplicate of the query pattern in place of a matched font, so that font-target
+    // rules testing family or size apply without matching against the font set.
+    FcPattern* font_pattern = FcPatternDuplicate(pattern);
+    if (!font_pattern) {
+        FcPatternDestroy(pattern);
+        return options;
+    }
+    FcConfigSubstituteWithPat(m_config, font_pattern, pattern, FcMatchFont);
+
+    FcBool hinting_enabled = FcTrue;
+    FcPatternGetBool(font_pattern, FC_HINTING, 0, &hinting_enabled);
+
+    int hint_style = FC_HINT_FULL;
+    FcPatternGetInteger(font_pattern, FC_HINT_STYLE, 0, &hint_style);
+
+    if (!hinting_enabled || hint_style == FC_HINT_NONE)
+        options.style = FontHintingStyle::None;
+    else if (hint_style == FC_HINT_SLIGHT)
+        options.style = FontHintingStyle::Slight;
+    else if (hint_style == FC_HINT_MEDIUM)
+        options.style = FontHintingStyle::Normal;
+    else
+        options.style = FontHintingStyle::Full;
+
+    FcBool autohint = FcFalse;
+    FcPatternGetBool(font_pattern, FC_AUTOHINT, 0, &autohint);
+    options.force_autohinting = autohint;
+
+    FcPatternDestroy(font_pattern);
+    FcPatternDestroy(pattern);
+    return options;
 }
 
 GlobalFontConfig::~GlobalFontConfig()
@@ -115129,6 +115261,7 @@ FILE: Libraries/LibGfx/Font/GlobalFontConfig.h
 
 #pragma once
 
+#include <LibGfx/Font/Font.h>
 #include <fontconfig/fontconfig.h>
 
 namespace AK {
@@ -115144,6 +115277,8 @@ class GlobalFontConfig {
 public:
     static GlobalFontConfig& the();
     FcConfig* get();
+
+    FontHintingOptions hinting_for_font(FlyString const& family, float pixel_size, u16 weight, u8 slope);
 
 private:
     friend class AK::NeverDestroyed<GlobalFontConfig>;
@@ -312227,15 +312362,22 @@ FILE: Libraries/LibMedia/CodedVideoFrameData.h
 
 #pragma once
 
+#include <AK/Optional.h>
+#include <AK/Time.h>
+
 namespace Media {
 
 class CodedVideoFrameData {
 public:
-    CodedVideoFrameData()
+    explicit CodedVideoFrameData(Optional<AK::Duration> decode_timestamp = {})
+        : m_decode_timestamp(decode_timestamp)
     {
     }
 
+    Optional<AK::Duration> decode_timestamp() const { return m_decode_timestamp; }
+
 private:
+    Optional<AK::Duration> m_decode_timestamp;
 };
 
 }
@@ -317924,6 +318066,13 @@ static inline AK::Duration time_units_to_duration(i64 time_units, AVRational con
     return AK::Duration::from_time_units(time_units, time_base.num, time_base.den);
 }
 
+static AK::Duration frame_duration_from_frame_rate(AVRational const& frame_rate)
+{
+    if (frame_rate.num <= 0 || frame_rate.den <= 0)
+        return AK::Duration::zero();
+    return AK::Duration::from_time_units(frame_rate.den, 1, frame_rate.num);
+}
+
 static inline i64 duration_to_time_units(AK::Duration duration, AVRational const& time_base)
 {
     VERIFY(time_base.num > 0);
@@ -318245,9 +318394,15 @@ DecoderErrorOr<CodedFrame> FFmpegDemuxer::get_next_sample_for_track(Track const&
             track_context.timestamp_offset = track_context.pending_timestamp_offset.release_value();
 
         auto flags = (packet.flags & AV_PKT_FLAG_KEY) != 0 ? FrameFlags::Keyframe : FrameFlags::None;
+        auto duration = time_units_to_duration(packet.duration, stream.time_base);
+        // FIXME: This is a hack to work around a bug in libavformat where the stts box of an MP4 track is ignored if
+        //        it also contains a ctts box. This should not be necessary when we move to our own MP4 demuxer.
+        if (duration.is_zero() && track.type() == TrackType::Video)
+            duration = frame_duration_from_frame_rate(av_guess_frame_rate(&format_context, &stream, nullptr));
+
         auto sample = CodedFrame(
             track_context.timestamp_offset + time_units_to_duration(packet.pts, stream.time_base),
-            time_units_to_duration(packet.duration, stream.time_base),
+            duration,
             flags,
             move(packet_data),
             auxiliary_data);
@@ -319075,19 +319230,24 @@ FFmpegVideoDecoder::~FFmpegVideoDecoder()
     avcodec_free_context(&m_codec_context);
 }
 
-DecoderErrorOr<void> FFmpegVideoDecoder::receive_coded_data(AK::Duration timestamp, AK::Duration duration, ReadonlyBytes coded_data)
+DecoderErrorOr<void> FFmpegVideoDecoder::receive_coded_data(AK::Duration timestamp, AK::Duration duration, ReadonlyBytes coded_data, Optional<AK::Duration> decode_timestamp)
 {
     VERIFY(coded_data.size() < NumericLimits<int>::max());
 
     m_packet->data = const_cast<u8*>(coded_data.data());
     m_packet->size = static_cast<int>(coded_data.size());
     m_packet->pts = timestamp.to_microseconds();
-    m_packet->dts = m_packet->pts;
+    m_packet->dts = decode_timestamp.value_or(timestamp).to_microseconds();
     m_packet->duration = duration.to_microseconds();
+    auto packet_pts = m_packet->pts;
 
     auto result = avcodec_send_packet(m_codec_context, m_packet);
     switch (result) {
     case 0:
+        // Some FFmpeg decoders do not propagate packet duration to decoded frames, so
+        // remember the accepted packet duration by PTS and consume it on output.
+        if (!duration.is_zero())
+            m_frame_durations.set(packet_pts, duration);
         return {};
     case AVERROR(EAGAIN):
         return DecoderError::with_description(DecoderErrorCategory::NeedsMoreInput, "FFmpeg decoder cannot decode any more data until frames have been retrieved"sv);
@@ -319184,6 +319344,12 @@ DecoderErrorOr<NonnullRefPtr<VideoFrame>> FFmpegVideoDecoder::get_decoded_frame(
 
         auto timestamp = AK::Duration::from_microseconds(m_frame->pts);
         auto duration = AK::Duration::from_microseconds(m_frame->duration);
+        if (duration.is_zero()) {
+            if (auto packet_duration = m_frame_durations.take(m_frame->pts); packet_duration.has_value())
+                duration = *packet_duration;
+        } else {
+            m_frame_durations.remove(m_frame->pts);
+        }
 
         auto yuv_data = DECODER_TRY_ALLOC(Gfx::YUVData::create(gfx_size, bit_depth, subsampling, cicp));
 
@@ -319233,6 +319399,7 @@ DecoderErrorOr<NonnullRefPtr<VideoFrame>> FFmpegVideoDecoder::get_decoded_frame(
 
 void FFmpegVideoDecoder::flush()
 {
+    m_frame_durations.clear();
     avcodec_flush_buffers(m_codec_context);
 }
 
@@ -319247,6 +319414,7 @@ FILE: Libraries/LibMedia/FFmpeg/FFmpegVideoDecoder.h
 
 #pragma once
 
+#include <AK/HashMap.h>
 #include <LibMedia/CodecID.h>
 #include <LibMedia/Export.h>
 #include <LibMedia/VideoDecoder.h>
@@ -319261,7 +319429,7 @@ public:
     FFmpegVideoDecoder(AVCodecContext* codec_context, AVPacket* packet, AVFrame* frame);
     virtual ~FFmpegVideoDecoder() override;
 
-    virtual DecoderErrorOr<void> receive_coded_data(AK::Duration timestamp, AK::Duration duration, ReadonlyBytes coded_data) override;
+    virtual DecoderErrorOr<void> receive_coded_data(AK::Duration timestamp, AK::Duration duration, ReadonlyBytes coded_data, Optional<AK::Duration> decode_timestamp = {}) override;
     virtual void signal_end_of_stream() override;
     virtual DecoderErrorOr<NonnullRefPtr<VideoFrame>> get_decoded_frame(CodingIndependentCodePoints const& container_cicp) override;
 
@@ -319271,6 +319439,7 @@ private:
     AVCodecContext* m_codec_context;
     AVPacket* m_packet;
     AVFrame* m_frame;
+    HashMap<i64, AK::Duration> m_frame_durations;
 };
 
 }
@@ -323270,6 +323439,7 @@ FILE: Libraries/LibMedia/Producers/DecodedVideoProducer.cpp
  */
 
 #include <LibCore/EventLoop.h>
+#include <LibMedia/CodedVideoFrameData.h>
 #include <LibMedia/Demuxer.h>
 #include <LibMedia/FFmpeg/FFmpegVideoDecoder.h>
 #include <LibMedia/Sinks/VideoSink.h>
@@ -323725,7 +323895,8 @@ bool DecodedVideoProducer::ThreadData::handle_seek()
                 auto coded_frame = coded_frame_result.release_value();
                 dispatch_frame_end_time(coded_frame);
 
-                auto decode_result = m_decoder->receive_coded_data(coded_frame.timestamp(), coded_frame.duration(), coded_frame.data());
+                auto const& video_frame_data = coded_frame.auxiliary_data().get<CodedVideoFrameData>();
+                auto decode_result = m_decoder->receive_coded_data(coded_frame.timestamp(), coded_frame.duration(), coded_frame.data(), video_frame_data.decode_timestamp());
                 if (decode_result.is_error()) {
                     handle_error(decode_result.release_error());
                     return true;
@@ -323810,7 +323981,8 @@ void DecodedVideoProducer::ThreadData::push_data_and_decode_some_frames()
         auto coded_frame = sample_result.release_value();
         dispatch_frame_end_time(coded_frame);
 
-        auto decode_result = m_decoder->receive_coded_data(coded_frame.timestamp(), coded_frame.duration(), coded_frame.data());
+        auto const& video_frame_data = coded_frame.auxiliary_data().get<CodedVideoFrameData>();
+        auto decode_result = m_decoder->receive_coded_data(coded_frame.timestamp(), coded_frame.duration(), coded_frame.data(), video_frame_data.decode_timestamp());
         if (decode_result.is_error()) {
             set_halting_status_and_wait_for_seek(PipelineStatus::Error, decode_result.release_error());
             return;
@@ -325639,6 +325811,7 @@ FILE: Libraries/LibMedia/VideoDecoder.h
 #include <AK/ByteBuffer.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/NonnullRefPtr.h>
+#include <AK/Optional.h>
 #include <AK/Time.h>
 #include <LibMedia/Color/CodingIndependentCodePoints.h>
 
@@ -325650,8 +325823,8 @@ class VideoDecoder {
 public:
     virtual ~VideoDecoder() { }
 
-    virtual DecoderErrorOr<void> receive_coded_data(AK::Duration timestamp, AK::Duration duration, ReadonlyBytes coded_data) = 0;
-    DecoderErrorOr<void> receive_coded_data(AK::Duration timestamp, AK::Duration duration, ByteBuffer const& coded_data) { return receive_coded_data(timestamp, duration, coded_data.span()); }
+    virtual DecoderErrorOr<void> receive_coded_data(AK::Duration timestamp, AK::Duration duration, ReadonlyBytes coded_data, Optional<AK::Duration> decode_timestamp = {}) = 0;
+    DecoderErrorOr<void> receive_coded_data(AK::Duration timestamp, AK::Duration duration, ByteBuffer const& coded_data, Optional<AK::Duration> decode_timestamp = {}) { return receive_coded_data(timestamp, duration, coded_data.span(), decode_timestamp); }
     virtual void signal_end_of_stream() = 0;
     virtual DecoderErrorOr<NonnullRefPtr<VideoFrame>> get_decoded_frame(CodingIndependentCodePoints const& container_cicp) = 0;
 
@@ -660669,134 +660842,3 @@ static bool is_form_control(DOM::Element const& element, HTMLFormElement const& 
     if (!form_associated_element)
         return false;
 
-    if (form_associated_element->form() != &form)
-        return false;
-
-    if (!form_associated_element->is_listed())
-        return false;
-
-    return true;
-}
-
-// https://html.spec.whatwg.org/multipage/forms.html#dom-form-elements
-GC::Ref<HTMLFormControlsCollection> HTMLFormElement::elements() const
-{
-    if (!m_elements) {
-        auto& root = as<ParentNode>(const_cast<HTMLFormElement*>(this)->root());
-        m_elements = HTMLFormControlsCollection::create(root, DOM::HTMLCollection::Scope::Descendants, [this](Element const& element) {
-            return is_form_control(element, *this);
-        });
-    }
-    return *m_elements;
-}
-
-// https://html.spec.whatwg.org/multipage/forms.html#dom-form-length
-unsigned HTMLFormElement::length() const
-{
-    // The length IDL attribute must return the number of nodes represented by the elements collection.
-    return elements()->length();
-}
-
-// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#statically-validate-the-constraints
-HTMLFormElement::StaticValidationResult HTMLFormElement::statically_validate_constraints()
-{
-    // 1. Let controls be a list of all the submittable elements whose form owner is form, in tree order.
-    auto controls = get_submittable_elements();
-    // 2. Let invalid controls be an initially empty list of elements.
-    GC::RootVector<GC::Ref<DOM::Element>> invalid_controls;
-    // 3. For each element field in controls, in tree order:
-    for (auto& element : controls) {
-        auto& field = as<FormAssociatedElement>(*element);
-        // 1. If field is not a candidate for constraint validation, then move on to the next element.
-        if (!field.is_candidate_for_constraint_validation())
-            continue;
-        // 2. Otherwise, if field satisfies its constraints, then move on to the next element.
-        if (field.satisfies_its_constraints())
-            continue;
-        // 3. Otherwise, add field to invalid controls.
-        invalid_controls.append(field.form_associated_element_to_html_element());
-    }
-    // 4. If invalid controls is empty, then return a positive result.
-    if (invalid_controls.is_empty())
-        return { true, invalid_controls };
-    // 5. Let unhandled invalid controls be an initially empty list of elements.
-    GC::RootVector<GC::Ref<DOM::Element>> unhandled_invalid_controls;
-    // 6. For each element field in invalid controls, if any, in tree order:
-    for (auto& field : invalid_controls) {
-        // 1. Let notCanceled be the result of firing an event named invalid at field, with the cancelable attribute
-        // initialized to true.
-        auto not_canceled = field->dispatch_event(DOM::Event::create(this->realm(),
-            EventNames::invalid, { .cancelable = true }));
-        // 2. If notCanceled is true, then add field to unhandled invalid controls.
-        if (not_canceled)
-            unhandled_invalid_controls.append(field);
-    }
-    // 7. Return a negative result with the list of elements in the unhandled invalid controls list.
-    return { false, unhandled_invalid_controls };
-}
-
-// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#interactively-validate-the-constraints
-bool HTMLFormElement::interactively_validate_constraints()
-{
-    // 1. Statically validate the constraints of form, and let unhandled invalid controls be the list of elements returned if the result was negative.
-    // 2. If the result was positive, then return that result.
-    auto static_validation_result = statically_validate_constraints();
-    if (static_validation_result.result)
-        return true;
-    auto unhandled_invalid_controls = static_validation_result.unhandled_invalid_controls;
-
-    //  3. Report the problems with the constraints of at least one of the elements given in unhandled invalid controls to the user.
-    //     - User agents may focus one of those elements in the process, by running the focusing steps for that element, and may change the
-    //       scrolling position of the document, or perform some other action that brings the element to the user's attention.
-    //       For elements that are form-associated custom elements, user agents should use their validation anchor instead, for the purposes of these actions.
-    //     - User agents may report more than one constraint violation.
-    //     - User agents may coalesce related constraint violation reports if appropriate (e.g. if multiple radio buttons in a group are marked as required, only one error need be reported).
-    //     - If one of the controls is not being rendered (e.g. it has the hidden attribute set), then user agents may report a script error.
-    // FIXME: Does this align with other browsers?
-    auto first_invalid_control = unhandled_invalid_controls.first_matching([](auto control) {
-        return control->check_visibility({});
-    });
-    if (first_invalid_control.has_value()) {
-        auto control = first_invalid_control.release_value();
-        run_focusing_steps(control);
-        Bindings::ScrollIntoViewOptions scroll_options;
-        scroll_options.block = Bindings::ScrollLogicalPosition::Nearest;
-        scroll_options.inline_ = Bindings::ScrollLogicalPosition::Nearest;
-        scroll_options.behavior = Bindings::ScrollBehavior::Instant;
-        (void)control->scroll_into_view(scroll_options);
-    }
-
-    // 4. Return a negative result.
-    return false;
-}
-
-// https://html.spec.whatwg.org/multipage/forms.html#dom-form-checkvalidity
-WebIDL::ExceptionOr<bool> HTMLFormElement::check_validity()
-{
-    return statically_validate_constraints().result;
-}
-
-// https://html.spec.whatwg.org/multipage/forms.html#dom-form-reportvalidity
-WebIDL::ExceptionOr<bool> HTMLFormElement::report_validity()
-{
-    return interactively_validate_constraints();
-}
-
-// https://html.spec.whatwg.org/multipage/forms.html#category-submit
-Vector<GC::Ref<DOM::Element>> HTMLFormElement::get_submittable_elements()
-{
-    Vector<GC::Ref<DOM::Element>> submittable_elements;
-
-    root().for_each_in_subtree([&](auto& node) {
-        if (auto* form_associated_element = as_if<FormAssociatedElement>(node)) {
-            if (form_associated_element->is_submittable() && form_associated_element->form() == this)
-                submittable_elements.append(form_associated_element->form_associated_element_to_html_element());
-        }
-
-        return TraversalDecision::Continue;
-    });
-
-    return submittable_elements;
-}
-
-// https://html.spec.whatwg.org/multipage/forms.html#dom-form-rellist
