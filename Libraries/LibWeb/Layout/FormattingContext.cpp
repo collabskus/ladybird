@@ -692,14 +692,6 @@ CSSPixels FormattingContext::compute_auto_height_for_block_formatting_context_ro
 CSSPixels FormattingContext::measure_automatic_content_height(Box const& box, AvailableSpace const& inner_available_space, ContainingBlockConstraints const& containing_block_constraints)
 {
     LayoutState throwaway_state(box);
-    // Populate ancestor state: the throwaway formatting context may encounter abspos elements whose
-    // containing block is an ancestor above `box`, even if it is not in `box`'s containing block chain.
-    for (auto* ancestor = box.parent(); ancestor; ancestor = ancestor->parent()) {
-        auto* ancestor_box = as_if<Box>(*ancestor);
-        if (!ancestor_box || !m_state.try_get(*ancestor_box))
-            continue;
-        throwaway_state.populate_node_from(m_state, *ancestor_box);
-    }
     throwaway_state.create(box, containing_block_constraints.percentage_basis_width, containing_block_constraints.percentage_basis_height);
     auto measuring_context = create_independent_formatting_context_if_needed(throwaway_state, m_layout_mode, box);
     measuring_context->run(LayoutInput { inner_available_space, containing_block_constraints });
@@ -784,7 +776,6 @@ CSSPixels FormattingContext::compute_table_box_width_inside_table_wrapper(
     VERIFY(table_box.has_value());
 
     LayoutState throwaway_state(box);
-    throwaway_state.populate_node_from(m_state, *box.containing_block());
 
     // The table wrapper is invisible to percentage resolution, so the table box gets the
     // wrapper's constraints unchanged. Callers measuring a table wrapper for grid alignment
@@ -830,7 +821,6 @@ CSSPixels FormattingContext::compute_table_box_height_inside_table_wrapper(Box c
     auto available_height = height_of_containing_block - margin_top - margin_bottom;
 
     LayoutState throwaway_state(box);
-    throwaway_state.populate_node_from(m_state, *box.containing_block());
     throwaway_state.create(box, table_wrapper_constraints.percentage_basis_width, table_wrapper_constraints.percentage_basis_height);
 
     auto context = create_independent_formatting_context_if_needed(throwaway_state, LayoutMode::IntrinsicSizing, box);
@@ -2268,13 +2258,6 @@ void FormattingContext::layout_absolutely_positioned_element(Box& box, StaticPos
 
     auto const available_space = AvailableSpace(AvailableSize::make_definite(clamp_to_max_dimension_value(containing_block_info.rect.width())), AvailableSize::make_definite(clamp_to_max_dimension_value(containing_block_info.rect.height())));
 
-    auto& containing_block_state = m_state.get_mutable(*box.containing_block());
-
-    // The size of the containing block of an abspos box is always definite from the perspective of the abspos box.
-    // Since abspos boxes are laid out last, we can mark the containing block as having definite sizes at this point.
-    containing_block_state.set_has_definite_width(true);
-    containing_block_state.set_has_definite_height(true);
-
     auto const& computed_values = box.computed_values();
 
     auto const containing_block_width = available_space.width.to_px_or_zero();
@@ -2623,7 +2606,6 @@ CSSPixels FormattingContext::calculate_min_content_width(Layout::Box const& box,
         return cache.value();
 
     LayoutState throwaway_state(box);
-    throwaway_state.populate_node_from(m_state, *box.containing_block());
 
     auto& box_state = throwaway_state.create(box, containing_block_constraints.percentage_basis_width, containing_block_constraints.percentage_basis_height);
     box_state.width_constraint = SizeConstraint::MinContent;
@@ -2712,7 +2694,6 @@ CSSPixels FormattingContext::calculate_max_content_width(Layout::Box const& box,
         return cache.value();
 
     LayoutState throwaway_state(box);
-    throwaway_state.populate_node_from(m_state, *box.containing_block());
 
     auto const& actual_box_state = m_state.get(box);
 
@@ -2763,7 +2744,6 @@ CSSPixels FormattingContext::calculate_min_content_height(Layout::Box const& box
         return cache.value();
 
     LayoutState throwaway_state(box);
-    throwaway_state.populate_node_from(m_state, *box.containing_block());
 
     auto& box_state = throwaway_state.create(box, containing_block_constraints.percentage_basis_width, containing_block_constraints.percentage_basis_height);
     box_state.height_constraint = SizeConstraint::MinContent;
@@ -2799,7 +2779,6 @@ CSSPixels FormattingContext::calculate_max_content_height(Layout::Box const& box
         return cache_slot.value();
 
     LayoutState throwaway_state(box);
-    throwaway_state.populate_node_from(m_state, *box.containing_block());
 
     auto& box_state = throwaway_state.create(box, containing_block_constraints.percentage_basis_width, containing_block_constraints.percentage_basis_height);
     box_state.height_constraint = SizeConstraint::MaxContent;
