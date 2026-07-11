@@ -403824,15 +403824,8 @@ AnimationUpdateContext::~AnimationUpdateContext()
 
         if (invalidation.needs_relayout())
             target->set_needs_layout_update(DOM::SetNeedsLayoutReason::KeyframeEffect);
-        if (invalidation.needs_layout_tree_rebuild()) {
-            // We mark layout tree for rebuild starting from parent element to correctly invalidate
-            // "display" property change to/from "contents" value.
-            if (auto parent_element = target->parent_element()) {
-                parent_element->set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::KeyframeEffect);
-            } else {
-                target->set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::KeyframeEffect);
-            }
-        }
+        if (invalidation.needs_layout_tree_rebuild())
+            target->set_needs_layout_tree_rebuild(DOM::SetNeedsLayoutTreeUpdateReason::KeyframeEffect);
         if (invalidation.accumulated_visual_contexts() == CSS::AccumulatedVisualContextInvalidation::Rebuild) {
             element.document().set_needs_accumulated_visual_contexts_update(true);
         } else if (invalidation.accumulated_visual_contexts() == CSS::AccumulatedVisualContextInvalidation::UpdateValues) {
@@ -530431,6 +530424,32 @@ void StyleComputer::process_animation_definitions(ComputedProperties const& comp
     if (!element_animations)
         return;
 
+    // https://drafts.csswg.org/css-animations-1/#animations
+    // Setting the 'display' property to 'none' will terminate any running animation applied to the element and its
+    // descendants. If an element has a 'display' of 'none', updating 'display' to a value other than 'none' will
+    // start all animations applied to the element by the 'animation-name' property, as well as all animations
+    // applied to descendants with 'display' other than 'none'.
+    // NB: We must not start animations on elements that are not rendered due to display:none. Once display becomes
+    //     something other than none, the resulting style recomputation re-enters this function and starts them.
+    //     Termination of running animations when display becomes none is handled by
+    //     Element::play_or_cancel_animations_after_display_property_change().
+    // OPTIMIZATION: This involves an ancestor walk, so it's computed lazily since it's only needed on the path that
+    //               starts a brand new animation, not for the common case of an element without animations.
+    Optional<bool> in_display_none_subtree;
+    auto is_in_display_none_subtree = [&] {
+        if (!in_display_none_subtree.has_value()) {
+            bool result = computed_properties.display().is_none();
+            if (!result) {
+                if (abstract_element.pseudo_element().has_value())
+                    result = abstract_element.element().has_inclusive_ancestor_with_display_none_ignoring_animations();
+                else if (auto* parent = abstract_element.element().parent_or_shadow_host())
+                    result = parent->has_inclusive_ancestor_with_display_none_ignoring_animations();
+            }
+            in_display_none_subtree = result;
+        }
+        return in_display_none_subtree.value();
+    };
+
     HashTable<Utf16FlyString> defined_animation_names;
 
     for (auto const& animation_properties : animation_definitions) {
@@ -530467,8 +530486,11 @@ void StyleComputer::process_animation_definitions(ComputedProperties const& comp
         if (auto const& existing_animation = element_animations->get(animation_properties.name); existing_animation.has_value()) {
             as<Animations::KeyframeEffect>(*existing_animation.value()->effect()).set_key_frame_set(resolve_keyframes());
             existing_animation.value()->apply_css_properties(animation_properties);
-            return;
+            continue;
         }
+
+        if (is_in_display_none_subtree())
+            continue;
 
         // An animation applies to an element if its name appears as one of the identifiers in the computed value of the
         // animation-name property and the animation uses a valid @keyframes rule
@@ -559512,6 +559534,7 @@ FILE: Libraries/LibWeb/CSS/UpdateStyle.cpp
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/Node.h>
 #include <LibWeb/DOM/ShadowRoot.h>
+#include <LibWeb/HTML/HTMLSlotElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
 
@@ -559529,13 +559552,8 @@ static void apply_element_style_invalidation_after_style_change(DOM::Element& el
 
     if (invalidation.needs_relayout())
         element.set_needs_layout_update(DOM::SetNeedsLayoutReason::StyleChange);
-    if (invalidation.needs_layout_tree_rebuild()) {
-        // Mark the parent to handle display changes to/from contents correctly.
-        if (auto parent_element = element.parent_element())
-            parent_element->set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::StyleChange);
-        else
-            element.set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::StyleChange);
-    }
+    if (invalidation.needs_layout_tree_rebuild())
+        element.set_needs_layout_tree_rebuild(DOM::SetNeedsLayoutTreeUpdateReason::StyleChange);
 
     element.set_needs_style_update(false);
 }
@@ -559711,6 +559729,15 @@ static void enter_style_update_frame(StyleUpdateFrame& frame, StyleComputer& sty
 
 static bool should_update_style_for_child(StyleUpdateFrame const& frame, DOM::Node const& child, bool child_needs_inherited_style_update)
 {
+    // NB: Style inheritance follows the flat tree, so a slotted element inherits from its assigned slot. If that
+    //     slot has no computed style (because it sits in a display:none subtree that style update skips), the
+    //     slotted element's style cannot be computed either. Skip it; on-demand reads refresh it lazily via
+    //     update_style_for_element, and assigned slottables are invalidated when the slot eventually gets style.
+    if (auto const* element = as_if<DOM::Element>(child)) {
+        if (auto const slot = element->assigned_slot_internal(); slot && !slot->computed_properties())
+            return false;
+    }
+
     if (frame.traversal == StyleUpdateTraversal::TraverseDisplayNoneSubtrees) {
         if (auto const* element = as_if<DOM::Element>(child); element && !element->computed_properties())
             return true;
@@ -563775,7 +563802,7 @@ WebIDL::ExceptionOr<GC::Ref<Document>> Document::create_and_initialize(Type type
     document->m_about_base_url = navigation_params.about_base_url;
     document->set_url(*creation_url);
     document->m_readiness = HTML::DocumentReadyState::Loading;
-    document->set_allow_declarative_shadow_roots(true);
+    document->set_allow_declarative_shadow_roots(HTML::HTMLParser::AllowDeclarativeShadowRoots::Yes);
     document->set_custom_element_registry(realm.create<HTML::CustomElementRegistry>(realm));
 
     document->m_window = window;
@@ -563915,12 +563942,7 @@ Document::~Document() = default;
 void Document::set_temporary_document_for_fragment_parsing(Badge<HTML::HTMLParser>)
 {
     // https://html.spec.whatwg.org/multipage/parsing.html#html-fragment-parsing-algorithm
-    // AD-HOC: The HTML fragment parsing algorithm stages nodes in a temporary document before returning them.
-    // Treat that document as disconnected so post-connection steps happen only after the fragment is inserted
-    // into the context document.
-    // Spec issue: https://github.com/whatwg/html/issues/11023
     m_temporary_document_for_fragment_parsing = true;
-    set_is_connected(false);
 }
 
 void Document::set_style_invalidation_counter_dump_interval(Optional<u64> interval)
@@ -564375,16 +564397,23 @@ WebIDL::ExceptionOr<Document*> Document::open(Optional<String> const&, Optional<
     // 15. Set document to no-quirks mode.
     set_quirks_mode(QuirksMode::No);
 
-    // 16. Create a new HTML parser and associate it with document. This is a script-created parser (meaning that it can be closed by the document.open() and document.close() methods, and that the tokenizer will wait for an explicit call to document.close() before emitting an end-of-file token). The encoding confidence is irrelevant.
+    // 16. Create an HTML parser whose allow declarative shadow roots is document's allow declarative shadow roots, and
+    //     associate it with document. This is a script-created parser (meaning that it can be closed by the document.open()
+    //     and document.close() methods, and that the tokenizer will wait for an explicit call to document.close() before
+    //     emitting an end-of-file token). The encoding confidence is irrelevant.
     m_parser = HTML::HTMLParser::create_for_scripting(*this);
+    m_parser->set_allow_declarative_shadow_roots(allow_declarative_shadow_roots());
 
     // 17. Set the insertion point to point at just before the end of the input stream (which at this point will be empty).
     m_parser->tokenizer().update_insertion_point();
 
-    // 18. Update the current document readiness of document to "loading".
+    // 18. Set the parser's allow declarative shadow roots to true.
+    m_parser->set_allow_declarative_shadow_roots(HTML::HTMLParser::AllowDeclarativeShadowRoots::Yes);
+
+    // 19. Update the current document readiness of document to "loading".
     update_readiness(HTML::DocumentReadyState::Loading);
 
-    // 19. Return document.
+    // 20. Return document.
     return this;
 }
 
@@ -566499,7 +566528,11 @@ void Document::set_focused_area(GC::Ptr<Node> node)
     set_needs_repaint();
 
     // Scroll the viewport if necessary to make the newly focused element visible.
-    if (new_focused_element) {
+    // NB: Not if the focused element is a navigable container: focus moving into a frame lands on its container
+    //     element in this document, and other engines do not scroll embedded content into view on focus. Ad
+    //     scripts commonly pull focus into an offscreen iframe during page load, and scrolling to it would
+    //     hijack the viewport.
+    if (new_focused_element && !is<HTML::NavigableContainer>(*new_focused_element)) {
         new_focused_element->queue_an_element_task(HTML::Task::Source::UserInteraction, [new_focused_element] {
             if (new_focused_element->document().focused_area().ptr() != new_focused_element)
                 return;
@@ -568776,11 +568809,6 @@ GC::Ref<DOM::Document> Document::appropriate_template_contents_owner_document()
             if (document_type() == Type::HTML)
                 new_document->set_document_type(Type::HTML);
 
-            // AD-HOC: Copy over the "allow declarative shadow roots" flag, otherwise no elements inside templates will
-            //         be able to have declarative shadow roots.
-            // Spec issue: https://github.com/whatwg/html/issues/11955
-            new_document->set_allow_declarative_shadow_roots(allow_declarative_shadow_roots());
-
             // 3. Set document's associated inert template document to newDocument.
             m_associated_inert_template_document = new_document;
         }
@@ -570919,7 +570947,7 @@ Vector<GC::Root<Range>> Document::find_matching_text(String const& query, CaseSe
 }
 
 // https://dom.spec.whatwg.org/#document-allow-declarative-shadow-roots
-bool Document::allow_declarative_shadow_roots() const
+HTML::HTMLParser::AllowDeclarativeShadowRoots Document::allow_declarative_shadow_roots() const
 {
     return m_allow_declarative_shadow_roots;
 }
@@ -571250,7 +571278,7 @@ void Document::unfullscreen_element(GC::Ref<Element> element)
 }
 
 // https://dom.spec.whatwg.org/#document-allow-declarative-shadow-roots
-void Document::set_allow_declarative_shadow_roots(bool allow)
+void Document::set_allow_declarative_shadow_roots(HTML::HTMLParser::AllowDeclarativeShadowRoots allow)
 {
     m_allow_declarative_shadow_roots = allow;
 }
@@ -571261,11 +571289,13 @@ void Document::parse_html_from_a_string(Utf16View html)
     // 1. Set document's type to "html".
     set_document_type(DOM::Document::Type::HTML);
 
-    // 2. Create an HTML parser parser, associated with document.
+    // 2. Let parser be a new HTML parser whose allow declarative shadow roots is document's allow declarative shadow roots,
+    //    associated with document.
     // 3. Place html into the input stream for parser. The encoding confidence is irrelevant.
     // FIXME: We don't have the concept of encoding confidence yet.
     auto scripting_mode = is_scripting_enabled() ? HTML::ParserScriptingMode::Normal : HTML::ParserScriptingMode::Disabled;
     auto parser = HTML::HTMLParser::create_for_decoded_string(*this, html, scripting_mode, "UTF-8"sv);
+    parser->set_allow_declarative_shadow_roots(allow_declarative_shadow_roots());
 
     // 4. Start parser and let it run until it has consumed all the characters just inserted into the input stream.
     parser->run(as<HTML::Window>(HTML::relevant_global_object(*this)).associated_document().url());
@@ -571291,7 +571321,7 @@ WebIDL::ExceptionOr<GC::Root<DOM::Document>> Document::parse_html_unsafe(JS::VM&
     document->set_content_type("text/html"_string);
 
     // 3. Set document's allow declarative shadow roots to true.
-    document->set_allow_declarative_shadow_roots(true);
+    document->set_allow_declarative_shadow_roots(HTML::HTMLParser::AllowDeclarativeShadowRoots::Yes);
 
     // 4. Parse HTML from a string given document and compliantHTML.
     document->parse_html_from_a_string(compliant_html.utf16_view());
@@ -571300,7 +571330,7 @@ WebIDL::ExceptionOr<GC::Root<DOM::Document>> Document::parse_html_unsafe(JS::VM&
     auto& associated_document = as<HTML::Window>(realm.global_object()).associated_document();
     document->set_origin(associated_document.origin());
 
-    // 5. Return document.
+    // 4. Return document.
     return document;
 }
 
@@ -572563,6 +572593,7 @@ FILE: Libraries/LibWeb/DOM/Document.h
 #include <LibWeb/HTML/DocumentReadyState.h>
 #include <LibWeb/HTML/Focus.h>
 #include <LibWeb/HTML/PaintConfig.h>
+#include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/PreloadEntry.h>
 #include <LibWeb/HTML/SandboxingFlagSet.h>
 #include <LibWeb/HTML/Scripting/ScriptRegistry.h>
@@ -573130,8 +573161,8 @@ public:
     bool is_fully_active() const;
     bool is_active() const;
 
-    [[nodiscard]] bool allow_declarative_shadow_roots() const;
-    void set_allow_declarative_shadow_roots(bool);
+    [[nodiscard]] HTML::HTMLParser::AllowDeclarativeShadowRoots allow_declarative_shadow_roots() const;
+    void set_allow_declarative_shadow_roots(HTML::HTMLParser::AllowDeclarativeShadowRoots allow_declarative_shadow_roots);
 
     GC::Ref<HTML::History> history();
     GC::Ref<HTML::History> history() const;
@@ -574123,7 +574154,7 @@ private:
     GC::Ptr<HTML::HTMLDialogElement> m_dialog_pointerdown_target;
 
     // https://dom.spec.whatwg.org/#document-allow-declarative-shadow-roots
-    bool m_allow_declarative_shadow_roots { false };
+    HTML::HTMLParser::AllowDeclarativeShadowRoots m_allow_declarative_shadow_roots { HTML::HTMLParser::AllowDeclarativeShadowRoots::No };
 
     // https://w3c.github.io/selection-api/#dfn-has-scheduled-selectionchange-event
     bool m_has_scheduled_selectionchange_event { false };
@@ -574700,7 +574731,8 @@ static WebIDL::ExceptionOr<GC::Ref<DOM::Document>> load_html_document(HTML::Navi
         }));
     }
 
-    // 3. Otherwise, create an HTML parser and associate it with the document.
+    // 3. Otherwise, create an HTML parser whose allow declarative shadow roots is true and associate it with document.
+    //
     //    Each task that the networking task source places on the task queue while fetching runs must then fill the
     //    parser's input byte stream with the fetched bytes and cause the HTML parser to perform the appropriate
     //    processing of the input stream.
@@ -574715,6 +574747,7 @@ static WebIDL::ExceptionOr<GC::Ref<DOM::Document>> load_html_document(HTML::Navi
     else {
         auto body = GC::Ref { *navigation_params.response->body() };
         auto parser = HTML::IncrementalDocumentParser::create(document, body, navigation_params.response->url().value(), Fetch::Infrastructure::extract_mime_type(navigation_params.response->header_list()));
+        parser->set_allow_declarative_shadow_roots(HTML::HTMLParser::AllowDeclarativeShadowRoots::Yes);
         parser->start();
     }
 
@@ -576751,6 +576784,7 @@ FILE: Libraries/LibWeb/DOM/Element.cpp
 #include <LibWeb/DOM/Attr.h>
 #include <LibWeb/DOM/DOMTokenList.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/DOM/DocumentFragment.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/ElementFactory.h>
 #include <LibWeb/DOM/HTMLCollection.h>
@@ -577767,6 +577801,22 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_pseudo_element_styl
     return invalidation;
 }
 
+void Element::set_needs_layout_tree_rebuild(SetNeedsLayoutTreeUpdateReason reason)
+{
+    // NB: We normally mark the parent element for the rebuild rather than this element itself, so that a "display"
+    //     change to or from "contents" is handled correctly: an element with display:contents generates no box of its
+    //     own, so its children's boxes have to be inserted into (or removed from) the parent's subtree.
+    //     Top layer elements (open modal dialogs, popovers, fullscreen elements) are the exception. They generate
+    //     boxes as siblings of the root, and a dedicated top layer pass in the layout tree builder recreates their
+    //     boxes based on the element's own needs-layout-tree-update flag; the DOM parent's subtree rebuild skips them
+    //     entirely. Mark the element itself in that case. This still propagates child-needs-layout-tree-update up to
+    //     the document, which is what makes the top layer pass run.
+    if (auto parent = parent_element(); parent && !rendered_in_top_layer())
+        parent->set_needs_layout_tree_update(true, reason);
+    else
+        set_needs_layout_tree_update(true, reason);
+}
+
 void Element::apply_computed_style_to_layout_node_if_needed(CSS::RequiredInvalidationAfterStyleChange const& invalidation)
 {
     if (invalidation.needs_layout_tree_rebuild() || !unsafe_layout_node())
@@ -578218,27 +578268,29 @@ WebIDL::ExceptionOr<void> Element::set_inner_html(TrustedTypes::TrustedHTMLOrStr
         TrustedTypes::InjectionSink::Element_innerHTML,
         TrustedTypes::Script.to_string()));
 
-    // 2. Let context be this.
-    DOM::Node* context = this;
+    // 2. Let target be this.
+    Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> target = GC::Ref { *this };
 
-    // 3. Let fragment be the result of invoking the fragment parsing algorithm steps with context and compliantString.
-    auto fragment = TRY(as<Element>(*context).parse_fragment(compliant_string.utf16_view()));
-
-    // 4. If context is a template element, then set context to the template element's template contents (a DocumentFragment).
-    auto* template_element = as_if<HTML::HTMLTemplateElement>(*context);
+    // 3. If target is a template element, then set target to the template element's template contents (a DocumentFragment).
+    auto* template_element = as_if<HTML::HTMLTemplateElement>(*this);
     if (template_element)
-        context = template_element->content();
+        target = template_element->content();
 
-    // 5. Replace all with fragment within context.
-    context->replace_all(fragment);
+    // 4. Let fragment be the result of invoking the fragment parsing algorithm steps with target and compliantString.
+    auto fragment = TRY(parse_fragment(target, compliant_string.utf16_view()));
+
+    // 5. Replace all with fragment within target.
+    target.visit([&](auto node) {
+        node->replace_all(fragment);
+    });
 
     // NOTE: We don't invalidate style & layout for <template> elements since they don't affect rendering.
     if (!template_element) {
-        context->set_needs_style_update(true);
+        set_needs_style_update(true);
 
-        if (context->is_connected()) {
+        if (is_connected()) {
             // NOTE: Since the DOM has changed, we have to rebuild the layout tree.
-            context->set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::ElementSetInnerHTML);
+            set_needs_layout_tree_update(true, DOM::SetNeedsLayoutTreeUpdateReason::ElementSetInnerHTML);
         }
     }
 
@@ -579345,32 +579397,18 @@ bool Element::is_actually_disabled() const
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#fragment-parsing-algorithm-steps
-WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> Element::parse_fragment(Utf16View markup, HTML::ParserScriptingMode scripting_mode)
+WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> Element::parse_fragment(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> target, Utf16View markup, HTML::ParserScriptingMode scripting_mode)
 {
     // 1. Assert: scriptingMode is either Inert or Fragment.
     VERIFY(scripting_mode == HTML::ParserScriptingMode::Inert || scripting_mode == HTML::ParserScriptingMode::Fragment);
 
-    // 2. Let newChildren be null.
-    Vector<GC::Root<Node>> new_children;
+    // 2. If target's node document is an XML document, then return the result of invoking the XML fragment parsing
+    //    algorithm given target and markup.
+    if (target.visit([](auto node) { return node->document().is_xml_document(); }))
+        return XMLFragmentParser::parse_xml_fragment(target, markup);
 
-    // 3. If context's node document is an XML document, then set newChildren to the result of invoking the XML fragment parsing algorithm given context and markup.
-    if (document().is_xml_document()) {
-        new_children = TRY(XMLFragmentParser::parse_xml_fragment(*this, markup));
-    }
-    // 4. Otherwise, set newChildren to the result of invoking the HTML fragment parsing algorithm given context, markup, false, and scriptingMode.
-    else {
-        new_children = TRY(HTML::HTMLParser::parse_html_fragment(*this, markup, HTML::HTMLParser::AllowDeclarativeShadowRoots::No, scripting_mode));
-    }
-
-    // 5. Let fragment be a new DocumentFragment whose node document is context's node document.
-    auto fragment = realm().create<DOM::DocumentFragment>(document());
-
-    // 6. For each node of newChildren, in tree order: append node to fragment.
-    for (auto& child : new_children)
-        TRY(fragment->append_child(*child));
-
-    // 7. Return fragment.
-    return fragment;
+    // 3. Return the result of invoking the HTML fragment parsing algorithm given context, markup, false, and scriptingMode.
+    return HTML::HTMLParser::parse_html_fragment(target, markup, HTML::HTMLParser::AllowDeclarativeShadowRoots::No, scripting_mode);
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-outerhtml
@@ -579407,7 +579445,7 @@ WebIDL::ExceptionOr<void> Element::set_outer_html(TrustedTypes::TrustedHTMLOrStr
         parent = TRY(create_element(document(), HTML::TagNames::body, Namespace::HTML));
 
     // 6. Let fragment be the result of invoking the fragment parsing algorithm steps given parent and compliantString.
-    auto fragment = TRY(as<Element>(*parent).parse_fragment(compliant_string.utf16_view()));
+    auto fragment = TRY(Element::parse_fragment(GC::Ref { as<Element>(*parent) }, compliant_string.utf16_view()));
 
     // 6. Replace this with fragment within this's parent.
     TRY(this->parent()->replace_child(fragment, *this));
@@ -579468,7 +579506,7 @@ WebIDL::ExceptionOr<void> Element::insert_adjacent_html(String const& position, 
     }
 
     // 5. Let fragment be the result of invoking the fragment parsing algorithm steps with context and compliantString.
-    auto fragment = TRY(as<Element>(*context).parse_fragment(compliant_string.utf16_view()));
+    auto fragment = TRY(Element::parse_fragment(GC::Ref { as<Element>(*context) }, compliant_string.utf16_view()));
 
     // 6. Use the first matching item from this list:
 
@@ -581572,12 +581610,12 @@ WebIDL::ExceptionOr<void> Element::set_html_unsafe(TrustedTypes::TrustedHTMLOrSt
         TrustedTypes::Script.to_string()));
 
     // 2. Let target be this's template contents if this is a template element; otherwise this.
-    DOM::Node* target = this;
+    Variant<GC::Ref<DOM::Element>, GC::Ref<DOM::DocumentFragment>> target = GC::Ref { *this };
     if (is<HTML::HTMLTemplateElement>(*this))
-        target = as<HTML::HTMLTemplateElement>(*this).content().ptr();
+        target = as<HTML::HTMLTemplateElement>(*this).content();
 
     // 3. Unsafe set HTML given target, this, and compliantHTML.
-    TRY(target->unsafely_set_html(*this, compliant_html.utf16_view()));
+    TRY(unsafely_set_html(target, compliant_html.utf16_view()));
 
     return {};
 }
@@ -582189,6 +582227,8 @@ public:
     CSS::RequiredInvalidationAfterStyleChange recompute_style(bool& did_change_custom_properties);
     CSS::RequiredInvalidationAfterStyleChange recompute_inherited_style(ScheduleAnimationUpdate = ScheduleAnimationUpdate::No);
 
+    void set_needs_layout_tree_rebuild(SetNeedsLayoutTreeUpdateReason);
+
     Optional<CSS::PseudoElement> associated_shadow_host_pseudo_element() const { return m_associated_shadow_host_pseudo_element; }
     void set_associated_shadow_host_pseudo_element(CSS::PseudoElement pseudo_element);
 
@@ -582262,7 +582302,7 @@ public:
     CSS::StyleSheetList& document_or_shadow_root_style_sheets();
     ElementByIdMap& document_or_shadow_root_element_by_id_map();
 
-    WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> parse_fragment(Utf16View markup, HTML::ParserScriptingMode = HTML::ParserScriptingMode::Inert);
+    static WebIDL::ExceptionOr<GC::Ref<DOM::DocumentFragment>> parse_fragment(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> target, Utf16View markup, HTML::ParserScriptingMode = HTML::ParserScriptingMode::Inert);
 
     [[nodiscard]] GC::Ptr<Element const> element_to_inherit_style_from(Optional<CSS::PseudoElement>) const;
 
@@ -590112,21 +590152,16 @@ WebIDL::ExceptionOr<Utf16String> Node::serialize_fragment(HTML::RequireWellForme
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#unsafely-set-html
-WebIDL::ExceptionOr<void> Node::unsafely_set_html(Element& context_element, Utf16View html)
+WebIDL::ExceptionOr<void> Node::unsafely_set_html(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> target, Utf16View html)
 {
-    // 1. Let newChildren be the result of the HTML fragment parsing algorithm given contextElement, html, and true.
-    auto new_children = TRY(HTML::HTMLParser::parse_html_fragment(context_element, html, HTML::HTMLParser::AllowDeclarativeShadowRoots::Yes));
+    // FIXME: Update for sanitizer API.
+    // 7. Let fragment be the result of invoking the HTML fragment parsing algorithm given target, html, true, and scriptingMode.
+    auto fragment = TRY(HTML::HTMLParser::parse_html_fragment(target, html, HTML::HTMLParser::AllowDeclarativeShadowRoots::Yes));
 
-    // 2. Let fragment be a new DocumentFragment whose node document is contextElement’s node document.
-    auto fragment = realm().create<DocumentFragment>(context_element.document());
-
-    // 3. For each node in newChildren, append node to fragment.
-    for (auto& child : new_children)
-        // I don't know if this can throw here, but let's be safe.
-        (void)TRY(fragment->append_child(*child));
-
-    // 4. Replace all with fragment within contextElement.
-    replace_all(fragment);
+    // 9. Replace all with fragment within target.
+    target.visit([&](auto node) {
+        node->replace_all(fragment);
+    });
 
     return {};
 }
@@ -591768,7 +591803,7 @@ public:
 
     WebIDL::ExceptionOr<Utf16String> serialize_fragment(HTML::RequireWellFormed, FragmentSerializationMode = FragmentSerializationMode::Inner) const;
 
-    WebIDL::ExceptionOr<void> unsafely_set_html(Element&, Utf16View);
+    WebIDL::ExceptionOr<void> unsafely_set_html(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>>, Utf16View);
 
     void replace_all(GC::Ptr<Node>);
     void string_replace_all(Utf16String);
@@ -595064,7 +595099,7 @@ WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> Range::create_contextual_fragment
     }
 
     // 7. Return the result of invoking the fragment parsing algorithm steps with element, compliantString, and Fragment.
-    return element->parse_fragment(compliant_string.utf16_view(), HTML::ParserScriptingMode::Fragment);
+    return Element::parse_fragment(GC::Ref { *element }, compliant_string.utf16_view(), HTML::ParserScriptingMode::Fragment);
 }
 
 }
@@ -595803,14 +595838,10 @@ WebIDL::ExceptionOr<void> ShadowRoot::set_inner_html(TrustedTypes::TrustedHTMLOr
         TrustedTypes::InjectionSink::ShadowRoot_innerHTML,
         TrustedTypes::Script.to_string()));
 
-    // 2. Let context be this's host.
-    auto context = this->host();
-    VERIFY(context);
+    // 2. Let fragment be the result of invoking the fragment parsing algorithm steps with this and compliantString.
+    auto fragment = TRY(HTML::HTMLParser::parse_html_fragment(GC::Ref<DocumentFragment> { *this }, compliant_string.utf16_view()));
 
-    // 3. Let fragment be the result of invoking the fragment parsing algorithm steps with context and compliantString.
-    auto fragment = TRY(context->parse_fragment(compliant_string.utf16_view()));
-
-    // 4. Replace all with fragment within this.
+    // 3. Replace all with fragment within this.
     this->replace_all(fragment);
 
     // NOTE: We don't invalidate style & layout for <template> elements since they don't affect rendering.
@@ -595852,7 +595883,7 @@ WebIDL::ExceptionOr<void> ShadowRoot::set_html_unsafe(TrustedTypes::TrustedHTMLO
         TrustedTypes::Script.to_string()));
 
     // 2. Unsafely set HTML given this, this's shadow host, and compliantHTML.
-    TRY(unsafely_set_html(*this->host(), compliant_html.utf16_view()));
+    TRY(unsafely_set_html(GC::Ref<DocumentFragment> { *this }, compliant_html.utf16_view()));
 
     return {};
 }
@@ -595998,12 +596029,16 @@ static Vector<ExportedPart> parse_exportparts_attribute(Element const& element)
     if (!exportparts.has_value())
         return result;
 
-    exportparts->for_each_split_view(',', SplitBehavior::Nothing, [&](Utf16View mapping) {
+    exportparts->for_each_split_view(u',', SplitBehavior::Nothing, [&](Utf16View mapping) {
         auto trimmed = mapping.trim_ascii_whitespace();
         if (trimmed.is_empty())
             return IterationDecision::Continue;
 
-        auto parts = trimmed.split_view(':', SplitBehavior::KeepEmpty);
+        Vector<Utf16View, 2> parts;
+        trimmed.for_each_split_view(u':', SplitBehavior::KeepEmpty, [&](Utf16View part) {
+            parts.append(part);
+            return IterationDecision::Continue;
+        });
         if (parts.size() == 1) {
             auto name = Utf16FlyString::from_utf16(parts[0].trim_ascii_whitespace());
             result.append({ name, name });
@@ -596012,6 +596047,7 @@ static Vector<ExportedPart> parse_exportparts_attribute(Element const& element)
             auto outer_name = Utf16FlyString::from_utf16(parts[1].trim_ascii_whitespace());
             result.append({ inner_name, outer_name });
         }
+
         return IterationDecision::Continue;
     });
 
@@ -635402,7 +635438,7 @@ BrowsingContext::BrowsingContextAndDocument BrowsingContext::create_a_new_browsi
     document->set_about_base_url(creator_base_url);
 
     // allow declarative shadow roots: true
-    document->set_allow_declarative_shadow_roots(true);
+    document->set_allow_declarative_shadow_roots(HTML::HTMLParser::AllowDeclarativeShadowRoots::Yes);
 
     // custom element registry: A new CustomElementRegistry object.
     document->set_custom_element_registry(realm.create<CustomElementRegistry>(realm));
@@ -660729,67 +660765,3 @@ WebIDL::ExceptionOr<void> HTMLFormElement::submit_form(GC::Ref<HTMLElement> subm
 
     // 25. Select the appropriate row in the table below based on scheme as given by the first cell of each row.
     //     Then, select the appropriate cell on that row based on method as given in the first cell of each column.
-    //     Then, jump to the steps named in that cell and defined below the table.
-
-    //            | GET               | POST
-    // ------------------------------------------------------
-    // http       | Mutate action URL | Submit as entity body
-    // https      | Mutate action URL | Submit as entity body
-    // ftp        | Get action URL    | Get action URL
-    // javascript | Get action URL    | Get action URL
-    // data       | Mutate action URL | Get action URL
-    // mailto     | Mail with headers | Mail as body
-
-    // If scheme is not one of those listed in this table, then the behavior is not defined by this specification.
-    // User agents should, in the absence of another specification defining this, act in a manner analogous to that defined
-    // in this specification for similar schemes.
-
-    // AD-HOC: In accordance with the above paragraph, we implement file:// submission URLs the same as data: URLs.
-
-    // This should have been handled above.
-    VERIFY(method != MethodAttributeState::Dialog);
-
-    if (scheme.is_one_of("http"sv, "https"sv)) {
-        if (method == MethodAttributeState::GET)
-            TRY_OR_THROW_OOM(vm, mutate_action_url(parsed_action.release_value(), move(entry_list), move(encoding), *target_navigable, history_handling, options.user_involvement));
-        else
-            TRY_OR_THROW_OOM(vm, submit_as_entity_body(parsed_action.release_value(), move(entry_list), encoding_type, move(encoding), *target_navigable, history_handling, options.user_involvement));
-    } else if (scheme.is_one_of("ftp"sv, "javascript"sv)) {
-        get_action_url(parsed_action.release_value(), move(entry_list), *target_navigable, history_handling, options.user_involvement);
-    } else if (scheme.is_one_of("data"sv, "file"sv)) {
-        if (method == MethodAttributeState::GET)
-            TRY_OR_THROW_OOM(vm, mutate_action_url(parsed_action.release_value(), move(entry_list), move(encoding), *target_navigable, history_handling, options.user_involvement));
-        else
-            get_action_url(parsed_action.release_value(), move(entry_list), *target_navigable, history_handling, options.user_involvement);
-    } else if (scheme == "mailto"sv) {
-        if (method == MethodAttributeState::GET)
-            TRY_OR_THROW_OOM(vm, mail_with_headers(parsed_action.release_value(), move(entry_list), move(encoding), *target_navigable, history_handling, options.user_involvement));
-        else
-            TRY_OR_THROW_OOM(vm, mail_as_body(parsed_action.release_value(), move(entry_list), encoding_type, move(encoding), *target_navigable, history_handling, options.user_involvement));
-    } else {
-        dbgln("Failed to submit form: Unknown scheme: {}", scheme);
-        return {};
-    }
-
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#resetting-a-form
-void HTMLFormElement::reset_form()
-{
-    // 1. Let reset be the result of firing an event named reset at form, with the bubbles and cancelable attributes initialized to true.
-    auto reset_event = DOM::Event::create(realm(), HTML::EventNames::reset);
-    reset_event->set_bubbles(true);
-    reset_event->set_cancelable(true);
-
-    bool reset = dispatch_event(reset_event);
-
-    // 2. If reset is true, then invoke the reset algorithm of each resettable element whose form owner is form.
-    if (reset) {
-        GC::RootVector<GC::Ref<HTMLElement>> associated_elements_copy { m_associated_elements };
-        for (auto element : associated_elements_copy) {
-            auto& form_associated_element = as<FormAssociatedElement>(*element);
-            if (form_associated_element.is_resettable())
-                form_associated_element.reset_algorithm();
-        }
-    }
