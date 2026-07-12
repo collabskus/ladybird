@@ -563926,27 +563926,31 @@ Document::Document(JS::Realm& realm, URL::URL const& url)
     m_is_decoded_svg = m_page->client().is_svg_page_client();
 
     m_cursor_blink_timer = heap().allocate<GC::Timer>();
-    m_cursor_blink_timer->start_repeating(500, GC::create_function(heap(), [this] {
-        auto cursor_position = this->cursor_position();
-        if (!cursor_position)
-            return;
-
-        auto navigable = this->navigable();
-        if (!navigable || !navigable->is_focused())
-            return;
-
-        auto node = cursor_position->node();
-        if (auto* text = as_if<DOM::Text>(*node)) {
-            auto* layout_text_node = as_if<Layout::TextNode>(text->unsafe_layout_node());
-            if (!layout_text_node)
+    // NB: In test mode, the caret must not blink so we can deterministically generate display lists. The blink state
+    //     is set whenever the cursor moves (see reset_cursor_blink_cycle()), so the caret is still painted.
+    if (!HTML::Window::in_test_mode()) {
+        m_cursor_blink_timer->start_repeating(500, GC::create_function(heap(), [this] {
+            auto cursor_position = this->cursor_position();
+            if (!cursor_position)
                 return;
-            m_cursor_blink_state = !m_cursor_blink_state;
-            layout_text_node->set_needs_repaint();
-        } else if (node->unsafe_paintable()) {
-            m_cursor_blink_state = !m_cursor_blink_state;
-            node->set_needs_repaint();
-        }
-    }));
+
+            auto navigable = this->navigable();
+            if (!navigable || !navigable->is_focused())
+                return;
+
+            auto node = cursor_position->node();
+            if (auto* text = as_if<DOM::Text>(*node)) {
+                auto* layout_text_node = as_if<Layout::TextNode>(text->unsafe_layout_node());
+                if (!layout_text_node)
+                    return;
+                m_cursor_blink_state = !m_cursor_blink_state;
+                layout_text_node->set_needs_repaint();
+            } else if (node->unsafe_paintable()) {
+                m_cursor_blink_state = !m_cursor_blink_state;
+                node->set_needs_repaint();
+            }
+        }));
+    }
 
     HTML::main_thread_event_loop().register_document({}, *this);
 }
@@ -564150,6 +564154,7 @@ void Document::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_dialog_pointerdown_target);
     visitor.visit(m_console_client);
     visitor.visit(m_cursor_blink_timer);
+    visitor.visit(m_previously_repainted_cursor_position);
     visitor.visit(m_editing_host_manager);
     visitor.visit(m_local_storage_holder);
     visitor.visit(m_session_storage_holder);
@@ -571442,9 +571447,12 @@ Optional<CSSPixelRect> Document::current_caret_rect()
             return to_viewport_rect(*caret_rect);
     }
 
-    // Empty editable elements have no fragments; fall back to the padding-box corner.
+    // Empty editable elements have no fragments; fall back to the caret position for the cursor's child offset
+    // (which accounts for empty lines rendered by <br>), or the padding-box corner.
     if (auto* node_with_style = as_if<Layout::NodeWithStyleAndBoxModelMetrics>(*layout_node)) {
         auto paintable = node_with_style->first_paintable();
+        if (auto const* with_lines = as_if<Painting::PaintableWithLines>(paintable.ptr()))
+            return to_viewport_rect(with_lines->caret_rect_for_child_offset(position->offset()));
         if (auto const* box = paintable.ptr()) {
             auto content_box = box->absolute_padding_box_rect();
             return to_viewport_rect(CSSPixelRect { content_box.x(), content_box.y(), 1, node_with_style->computed_values().line_height() });
@@ -571464,18 +571472,25 @@ void Document::reset_cursor_blink_cycle()
 
 void Document::set_cursor_position_needs_repaint()
 {
+    auto repaint_position = [](DOM::Position& position) {
+        auto node = position.node();
+        if (auto* text = as_if<DOM::Text>(*node)) {
+            if (auto* layout_text_node = as_if<Layout::TextNode>(text->unsafe_layout_node()))
+                layout_text_node->set_needs_repaint();
+            return;
+        }
+        node->set_needs_repaint();
+    };
+
     auto position = cursor_position();
-    if (!position)
-        return;
 
-    auto node = position->node();
-    if (auto* text = as_if<DOM::Text>(*node)) {
-        if (auto* layout_text_node = as_if<Layout::TextNode>(text->unsafe_layout_node()))
-            layout_text_node->set_needs_repaint();
-        return;
-    }
+    // NB: Also repaint the node the cursor moved away from, so the old caret disappears.
+    if (m_previously_repainted_cursor_position && (!position || m_previously_repainted_cursor_position->node() != position->node()))
+        repaint_position(*m_previously_repainted_cursor_position);
+    m_previously_repainted_cursor_position = position;
 
-    node->set_needs_repaint();
+    if (position)
+        repaint_position(*position);
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#doc-container-document
@@ -574189,6 +574204,10 @@ private:
     GC::Ptr<GC::Timer> m_cursor_blink_timer;
     bool m_cursor_blink_state { false };
 
+    // The cursor position most recently invalidated for caret painting, so that moving the caret to another node
+    // also repaints the node it moved away from.
+    GC::Ptr<DOM::Position> m_previously_repainted_cursor_position;
+
     // NOTE: This is GC::Weak, not GC::Ptr, on purpose. We don't want the document to keep some old detached navigable alive.
     GC::Weak<HTML::LocalNavigable> m_navigable;
 
@@ -576554,13 +576573,13 @@ GC::Ptr<Selection::Selection> EditingHostManager::get_selection_for_navigation(C
     if (!selection)
         return {};
 
-    // and the focus node must be inside a text node,
+    // and the focus node must be a text node or an element directly housing the caret (e.g. an empty line),
     auto focus_node = selection->focus_node();
-    if (!is<Text>(focus_node.ptr()))
+    if (!focus_node || (!is<Text>(*focus_node) && !is<Element>(*focus_node)))
         return {};
 
     // and if we're performing collapsed navigation (i.e. moving the caret), the focus node must be editable.
-    if (collapse == CollapseSelection::Yes && !focus_node->is_editable())
+    if (collapse == CollapseSelection::Yes && !focus_node->is_editable_or_editing_host())
         return {};
 
     return selection;
@@ -593902,6 +593921,7 @@ void Range::update_associated_selection()
         return;
 
     document.reset_cursor_blink_cycle();
+    document.set_cursor_position_needs_repaint();
 
     // https://w3c.github.io/selection-api/#selectionchange-event
     // When the selection is dissociated with its range, associated with a new range, or the associated range's boundary
@@ -653865,8 +653885,11 @@ FILE: Libraries/LibWeb/HTML/HTMLBRElement.cpp
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/DOM/Text.h>
 #include <LibWeb/HTML/HTMLBRElement.h>
 #include <LibWeb/Layout/BreakNode.h>
+#include <LibWeb/Layout/ReplacedBox.h>
+#include <LibWeb/VisualLines.h>
 
 namespace Web::HTML {
 
@@ -653914,6 +653937,53 @@ void HTMLBRElement::apply_presentational_hints(Vector<CSS::StyleProperty>& prope
     });
 }
 
+// Rendered inline content that would appear before a <br> on its line.
+static bool is_rendered_inline_content(DOM::Node const& node)
+{
+    if (auto const* text = as_if<DOM::Text>(node)) {
+        for (auto const& line : collect_visual_lines(*text)) {
+            if (!line.fragments.is_empty())
+                return true;
+        }
+        return false;
+    }
+    if (auto const* element = as_if<DOM::Element>(node)) {
+        auto const* layout_node = element->layout_node();
+        if (!layout_node)
+            return false;
+        if (is<Layout::ReplacedBox>(*layout_node))
+            return true;
+        if (layout_node->display().is_inline_outside() && !layout_node->display().is_flow_inside())
+            return true;
+    }
+    return false;
+}
+
+// NB: Layout produces no fragments for <br>, so this walks the DOM back to the start of the containing block or a
+//     previous <br>, whichever comes first.
+bool HTMLBRElement::represents_empty_line() const
+{
+    if (!layout_node())
+        return false;
+
+    auto const* containing_block = layout_node()->containing_block();
+    if (!containing_block)
+        return false;
+    auto const* containing_block_dom_node = containing_block->dom_node();
+    if (!containing_block_dom_node)
+        return false;
+
+    for (auto const* previous = previous_in_pre_order(); previous && previous != containing_block_dom_node; previous = previous->previous_in_pre_order()) {
+        if (!containing_block_dom_node->is_inclusive_ancestor_of(*previous))
+            break;
+        if (is<HTMLBRElement>(*previous))
+            return true;
+        if (is_rendered_inline_content(*previous))
+            return false;
+    }
+    return true;
+}
+
 void HTMLBRElement::adjust_computed_style(CSS::ComputedProperties::Builder& style)
 {
     // https://drafts.csswg.org/css-display-3/#unbox
@@ -653950,6 +654020,10 @@ public:
     virtual bool is_presentational_hint(Utf16FlyString const&) const override;
     virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
     virtual void adjust_computed_style(CSS::ComputedProperties::Builder&) override;
+
+    // Whether this <br> renders an empty line, i.e. nothing else renders between the start of its line and the <br>
+    // itself. Such a <br> hosts a caret position on its parent, at its child index.
+    bool represents_empty_line() const;
 
 private:
     virtual bool is_html_br_element() const override { return true; }
@@ -660672,87 +660746,3 @@ WebIDL::ExceptionOr<void> HTMLFormElement::submit_form(GC::Ref<HTMLElement> subm
         m_firing_submission_events = false;
 
         // 8. If shouldContinue is false, then return.
-        if (!should_continue)
-            return {};
-
-        // 9. If form cannot navigate, then return.
-        // Spec Note: Cannot navigate is run again as dispatching the submit event could have changed the outcome.
-        if (cannot_navigate())
-            return {};
-    }
-
-    // 6. Let encoding be the result of picking an encoding for the form.
-    auto encoding = TRY_OR_THROW_OOM(vm, pick_an_encoding());
-
-    // 7. Let entry list be the result of constructing the entry list with form, submitter, and encoding.
-    auto entry_list_or_null = TRY(construct_entry_list(realm, *this, submitter, encoding));
-
-    // 8. Assert: entry list is not null.
-    VERIFY(entry_list_or_null.has_value());
-    auto entry_list = entry_list_or_null.release_value();
-
-    // 9. If form cannot navigate, then return.
-    // Spec Note: Cannot navigate is run again as dispatching the formdata event in constructing the entry list could
-    //            have changed the outcome.
-    if (cannot_navigate())
-        return {};
-
-    // 10. Let method be the submitter element's method.
-    auto method = method_state_from_form_element(submitter);
-
-    // 11. If method is dialog, then:
-    if (method == MethodAttributeState::Dialog) {
-        // 1. If form does not have an ancestor dialog element, then return.
-        // 2. Let subject be form's nearest ancestor dialog element.
-        auto* subject = first_ancestor_of_type<HTMLDialogElement>();
-        if (!subject)
-            return {};
-
-        // 3. Let result be null.
-        Optional<Utf16String> result;
-
-        // 4. If submitter is an input element whose type attribute is in the Image Button state, then:
-        if (is<HTMLInputElement>(*submitter)) {
-            auto const& input_element = static_cast<HTMLInputElement const&>(*submitter);
-
-            if (input_element.type_state() == HTMLInputElement::TypeAttributeState::ImageButton) {
-                // 1. Let (x, y) be the selected coordinate.
-                auto [x, y] = input_element.selected_coordinate();
-
-                // 2. Set result to the concatenation of x, ",", and y.
-                result = Utf16String::formatted("{},{}", x, y);
-            }
-        }
-
-        // 5. Otherwise, if submitter is a submit button, then set result to submitter's optional value.
-        else if (auto* form_associated_element = as_if<FormAssociatedElement>(*submitter); form_associated_element && form_associated_element->is_submit_button()) {
-            result = form_associated_element->optional_value();
-        }
-
-        // 6. Close the dialog subject with result and null.
-        subject->close_the_dialog(move(result), nullptr);
-
-        // 7. Return.
-        return {};
-    }
-
-    // 12. Let action be the submitter element's action.
-    auto action = action_from_form_element(submitter);
-
-    // 13. If action is the empty string, let action be the URL of the form document.
-    if (action.is_empty())
-        action = Utf16String::from_utf8(form_document->url_string());
-
-    // 14. Let parsed action be the result of encoding-parsing a URL given action, relative to submitter's node document.
-    auto parsed_action = submitter->document().encoding_parse_url(action);
-
-    // 15. If parsed action is failure, then return.
-    if (!parsed_action.has_value()) {
-        dbgln("Failed to submit form: Invalid URL: {}", action);
-        return {};
-    }
-
-    // 16. Let scheme be the scheme of parsed action.
-    auto const& scheme = parsed_action->scheme();
-
-    // 17. Let enctype be the submitter element's enctype.
