@@ -143,6 +143,8 @@ void CSSStyleSheet::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_owning_documents_or_shadow_roots);
     if (m_shared_single_constructed_sheet_style_cache)
         m_shared_single_constructed_sheet_style_cache->visit_edges(visitor);
+    if (m_cached_style_sheet_invalidation_set)
+        m_cached_style_sheet_invalidation_set->invalidation_set.visit_edges(visitor);
     for (auto& subresource : m_critical_subresources)
         subresource.visit_edges(visitor);
 }
@@ -451,7 +453,9 @@ NonnullRefPtr<StyleCache> CSSStyleSheet::shared_single_constructed_sheet_style_c
 void CSSStyleSheet::invalidate_shared_style_cache()
 {
     m_selector_insights = {};
+    m_cached_style_sheet_invalidation_set = nullptr;
     m_shared_single_constructed_sheet_style_cache = nullptr;
+    ++m_shared_style_cache_generation;
 
     // Imported rules contribute to their parent sheet's effective rules.
     if (auto* import_rule = as_if<CSSImportRule>(owner_rule().ptr())) {
