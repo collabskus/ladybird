@@ -11890,6 +11890,10 @@ FILE: AK/Debug.h.in
 #    cmakedefine01 SPAM_DEBUG
 #endif
 
+#ifndef STRUCTURED_SERIALIZE_DEBUG
+#    cmakedefine01 STRUCTURED_SERIALIZE_DEBUG
+#endif
+
 #ifndef SYNTAX_HIGHLIGHTING_DEBUG
 #    cmakedefine01 SYNTAX_HIGHLIGHTING_DEBUG
 #endif
@@ -22922,7 +22926,52 @@ public:
         return LEB128<ValueType> { result };
     }
 
+    ErrorOr<void> write_to_stream(Stream& stream) const
+    {
+        ErrorOr<void> result;
+        for_each_leb128_byte(m_value, [&](u8 byte) {
+            if (!result.is_error())
+                result = stream.write_value(byte);
+        });
+        return result;
+    }
+
+    template<typename Buffer>
+    static void append_to(Buffer& output, ValueType value)
+    {
+        for_each_leb128_byte(value, [&output](u8 byte) { output.append(byte); });
+    }
+
 private:
+    template<typename Callback>
+    static void for_each_leb128_byte(ValueType value, Callback&& callback)
+    requires(Unsigned<ValueType>)
+    {
+        do {
+            u8 byte = value & 0x7F;
+            value >>= 7;
+            if (value != 0)
+                byte |= 0x80; // More bytes follow.
+            callback(byte);
+        } while (value != 0);
+    }
+
+    template<typename Callback>
+    static void for_each_leb128_byte(ValueType value, Callback&& callback)
+    requires(Signed<ValueType>)
+    {
+        while (true) {
+            u8 byte = value & 0x7F;
+            value >>= 7; // Arithmetic shift; preserves the sign.
+            bool const sign_bit_set = (byte & 0x40) != 0;
+            if ((value == 0 && !sign_bit_set) || (value == -1 && sign_bit_set)) {
+                callback(byte);
+                return;
+            }
+            callback(static_cast<u8>(byte | 0x80));
+        }
+    }
+
     ValueType m_value { 0 };
 };
 
@@ -25077,6 +25126,7 @@ FILE: AK/MemoryStream.h
 
 #pragma once
 
+#include <AK/Checked.h>
 #include <AK/Error.h>
 #include <AK/OwnPtr.h>
 #include <AK/Stream.h>
@@ -25144,8 +25194,13 @@ public:
                 return Error::from_string_literal("Tried to obtain a non-const span from a read-only FixedMemoryStream");
         }
 
+        Checked<size_t> byte_count = sizeof(T);
+        byte_count *= count;
+        if (byte_count.has_overflow() || byte_count.value() > remaining())
+            return Error::from_string_literal("Read of out-of-bounds span from FixedMemoryStream");
+
         Span<T> span { reinterpret_cast<T*>(m_bytes.offset_pointer(m_offset)), count };
-        TRY(discard(sizeof(T) * count));
+        TRY(discard(byte_count.value()));
         return span;
     }
 
@@ -58577,6 +58632,306 @@ the same pipeline. Deferred dispatch is often used to keep lock ordering simple.
 Wake handlers must be removed before disconnecting or destroying a node. An upstream node must never
 invoke a handler after downstream has cleared it.
 
+FILE: Documentation/Omnibox.md
+# Omnibox
+
+Ladybird's omnibox combines URL entry, search, history, bookmarks, adaptive learning, and remote
+search suggestions. The implementation is shared by the Qt and AppKit frontends through
+`LibWebView`.
+
+The central rule is that ordering, automatic selection, and inline completion are separate
+decisions. A result may be useful enough to display near the top without being safe to select or
+complete automatically.
+
+## Code structure
+
+The implementation is divided into a few focused components:
+
+- `Omnibox` owns an editing session. It tracks the user's query, displayed text, selected row,
+  completion state, popup state, and active query generation.
+- `Autocomplete` coordinates local and remote suggestion delivery.
+- `AutocompleteService` runs local database work on a serial worker thread.
+- `AutocompleteRanker` retrieves and scores history, bookmark, and adaptive candidates.
+- `AutocompleteMuxer` merges duplicate destinations, applies diversity rules, and constructs the
+  final result list.
+- `HistoryStore`, `BookmarkStore`, and the omnibox engagement tables provide local evidence.
+- `UI/Qt/Autocomplete` and `UI/AppKit/Interface/Autocomplete` render the shared suggestion model.
+
+`OmniboxSuggestionProvider` is the boundary between the editing state machine and suggestion
+generation. The production provider wraps `Autocomplete`; tests use a scripted provider so they can
+deliver results in any order without relying on timing.
+
+## Query lifecycle
+
+Every edit starts a new query generation identified by an incrementing `AutocompleteQueryID`.
+Local retrieval begins immediately. Remote search suggestions are debounced for 100 milliseconds.
+
+The local worker owns a separate SQLite connection. There is at most one running local query and
+one pending query per client. A newer pending query replaces an older one. When possible, a newer
+query interrupts stale SQLite work rather than waiting for it to finish.
+
+Results are delivered incrementally:
+
+1. Local results are ranked and published.
+2. A remote response, if enabled and successful, is merged into the same query generation.
+3. The combined list is published again.
+
+Remote suggestions from the preceding query may remain visible while a compatible continuation is
+in flight. Only suggestions that still have the new input as a prefix are retained. A successful
+response replaces these provisional rows.
+
+The UI thread discards results when their query ID is no longer active. Ending an editing session,
+dismissing the popup, or starting another session cancels provider work and invalidates the active
+generation. Stale results can therefore neither reopen the popup nor become an Enter action.
+
+## Suggestion model
+
+`AutocompleteSuggestion` contains:
+
+- Its source: literal URL, history, bookmark, adaptive engagement, or search.
+- Destination text and optional title, subtitle, and favicon.
+- The input used for presentation highlighting.
+- A match class and separate relevance components.
+- Whether it is the verbatim action.
+- Whether it may be automatically selected.
+- Whether it may be used for inline completion.
+
+The score components are retained after ranking so duplicate destinations can combine independent
+history, bookmark, and adaptive evidence without losing their provenance.
+
+### Destination identity
+
+URL destinations are compared semantically. Scheme differences remain meaningful, while equivalent
+serializations of the same URL are merged. `www.` and bare hosts share a diversity family but are
+not otherwise treated as the same destination.
+
+Search destinations are identified by Unicode case-folded text with whitespace normalized. This
+allows an exact remote suggestion to merge with the verbatim search action.
+
+When history, bookmark, and adaptive candidates identify the same URL, their score components and
+eligibility flags are combined. Bookmark presentation is preferred so its title and favicon remain
+visible.
+
+## Matching
+
+URL matching accepts the forms users commonly type by ignoring an `http://` or `https://` prefix,
+and optionally `www.`, when comparing a query with a candidate. Matching is case-insensitive.
+
+Match classes, from strongest to weakest, include:
+
+- Exact URL.
+- URL prefix.
+- Exact bookmark title.
+- Title word prefix.
+- URL substring.
+- Title substring.
+- Exact or prefix adaptive association.
+
+Title matching uses Unicode case folding. URL completion uses ASCII case-insensitive comparison
+because serialized non-ASCII URL components are already encoded.
+
+Bookmark titles and folders normally participate after three input code points. An exact bookmark
+title participates at any non-empty length, so a bookmark named `GH` is retrieved by `GH`, `gh`, or
+`Gh`. This exception does not turn partial two-character title prefixes into candidates.
+
+An exact title match remains ineligible for automatic selection and inline completion. It is a
+strong retrieval signal, not permission to replace the user's search action or editor text.
+
+## Ranking
+
+Ranking is deterministic and uses bounded integer components. Match quality is the largest signal;
+history quality, bookmark evidence, and adaptive engagement then refine candidates within the same
+general match quality.
+
+### History
+
+History ranking distinguishes direct navigation intent from passive visits. Visit and direct-visit
+scores decay over time and are bounded before being added to a candidate score. Reloading or
+repeatedly encountering a page cannot produce unbounded relevance.
+
+For host-like input, history also creates aggregate origin candidates. Evidence comes from a capped
+number of distinct pages, which prevents one frequently reloaded deep page from making its origin
+look intentional. The origin may borrow a favicon from a matching page.
+
+Deep history pages are suppressed for one- and two-character host queries unless the input contains
+a URL path. This keeps short result lists from filling with incidental pages.
+
+### Bookmarks
+
+A bookmark contributes a fixed relevance bonus in addition to match quality. URL-prefix bookmark
+matches are strong navigation evidence. Bookmark title and folder matches are useful for retrieval
+but are not automatically selected or inline-completed.
+
+Deep bookmarks remain eligible for a two-character URL prefix. Exact short title matches also remain
+eligible, but do not become automatic actions.
+
+### Adaptive engagements
+
+The omnibox records committed input-to-destination associations. Search and URL destinations are
+stored separately. Explicit row choices and automatic commitments have separate counts.
+
+Exact associations are stronger than prefix associations. Short adaptive prefixes require repeated
+explicit use before they can become automatic:
+
+- A one-character deep destination requires three explicit uses.
+- A two-character deep destination requires two explicit uses.
+- Search-like adaptive URL inputs require two explicit uses.
+
+Adaptive scores decay with time. Prefix evidence is scaled by the square root of the typed-prefix
+length divided by the learned-input length, so very short prefixes receive less credit.
+
+Merely displaying, automatically highlighting, or hovering a suggestion does not record an
+engagement. A private session never records engagements.
+
+## Result composition
+
+The muxer first merges candidates with the same destination and sorts them by relevance. It then
+constructs a bounded result list while preserving the verbatim action and limiting repetition.
+
+The current limits are soft:
+
+- At most four local navigation rows before deferred local rows.
+- At most three remote search rows before deferred remote rows.
+- At most two rows per origin for ordinary host queries.
+- At most one row per origin and five total rows for one- and two-character host queries.
+
+Deferred source rows may fill unused space after the first pass. This prevents a source cap from
+leaving the popup unnecessarily sparse.
+
+For short queries, candidates from the same origin are collapsed to one representative. Proven
+adaptive destinations are preferred, followed by matching deep bookmarks, followed by origin rows.
+An exact bookmark-title match is treated as a matching deep bookmark for this decision, preventing
+an origin row from hiding it.
+
+The highest-ranked candidate eligible for automatic selection is moved to the first row. A
+higher-scoring but ineligible title or substring match may remain visible below it.
+
+## Automatic selection
+
+Automatic selection determines what Enter does when the user has not deliberately chosen another
+row. It does not imply inline completion.
+
+A candidate may be selected automatically when it is supported by strong navigational evidence,
+for example:
+
+- A sufficiently long URL prefix backed by direct visits.
+- A bookmark URL prefix of at least two characters.
+- An adaptive association whose evidence meets the short-prefix thresholds.
+
+Title-only, folder, substring, previous-search, and remote suggestion matches are not automatic URL
+actions. The verbatim URL-or-search action remains available in every non-empty result list.
+
+Automatic defaults use hysteresis during incremental refreshes. A challenger replaces the current
+default only when it exceeds the incumbent by both 10 percent and 100 relevance points. This avoids
+visible selection churn as local and remote results arrive.
+
+## Inline completion
+
+Inline completion is intentionally stricter than automatic selection. A candidate must:
+
+- Be eligible for automatic selection.
+- Be a URL-prefix match.
+- Extend the user's input at the end of the editor.
+- Produce a non-empty suffix after optional scheme and `www.` handling.
+- Not contain a query string unless an exact adaptive association permits it.
+
+Title, folder, substring, search, and literal URL candidates never inline-complete. The typed prefix
+is preserved exactly; only the borrowed suffix is selected.
+
+An existing completion is retained across forward typing while it remains valid and is within 150
+relevance points of the best inline candidate. A materially better non-inline default clears it.
+
+Backspace suppresses completion for the resulting input. Typing a different input lifts the
+suppression. Moving the cursor away from the end removes the completion and prevents late results
+from applying another one. Right Arrow and End accept a completion, adopt the displayed text as the
+new query, and requery it.
+
+## Editing and activation
+
+`Omnibox` keeps the user's query separate from borrowed display text. Display text has one of three
+provenances:
+
+- User text.
+- Inline completion.
+- Keyboard row preview.
+
+Arrow keys explicitly select rows. A selected row may preview its destination in the editor while
+the original query remains available for restoration. Pointer hover only changes row appearance; it
+does not select, preview, or train the result.
+
+Escape closes the popup and restores the query. Clicking outside does the same. If the user edits or
+rejects a completion, Enter commits the text currently owned by the user rather than silently
+choosing an unrelated automatic row.
+
+An explicitly selected row remains selected across a refresh of the same generation when a result
+with the same destination still exists. If it disappears, its preview is removed. Automatic
+selection is recalculated separately.
+
+Enter never waits for suggestions. If the displayed rows belong to an older query generation, the
+current input is immediately committed through normal URL-or-search resolution.
+
+## Persistence and deletion
+
+History stores visit counts, direct-visit counts, last-use timestamps, and decayed scores. Redirect
+chains distinguish direct navigation from visits produced by redirects so redirect targets do not
+inherit typed intent.
+
+Engagement rows store normalized input, destination kind, destination identity, explicit and
+automatic use counts, and the last-use time. Database migrations add these fields to existing
+profiles. The database layer supports floating-point values, statement interruption, and a busy
+timeout because autocomplete reads concurrently with history writes.
+
+Removing a history row also removes its engagement associations unless the destination remains
+bookmarked. Forgetting a site and clearing all history remove the corresponding associations.
+
+## Private browsing
+
+Private autocomplete reads normal-profile history, bookmarks, and adaptive associations so local
+suggestions remain useful. It does not write history or engagement data.
+
+Remote suggestions use the private RequestServer connection. No history, bookmark, or engagement
+data is sent to the search provider; the request contains only the query required by the configured
+autocomplete engine.
+
+## Presentation
+
+Both native frontends render the same ordered suggestion list without source headers. Search rows
+use a search icon. Local navigation rows use a favicon when available and otherwise a globe.
+Bookmarks receive a star badge.
+
+Matched portions of titles and URLs use shared match ranges from `LibWebView`, ensuring Qt and
+AppKit highlight the same text. The match uses both weight and brightness so it remains visible in
+dark and light themes.
+
+The popup displays at most six rows before scrolling. Rows with a title use two lines; URL-only and
+search rows use one. Selection and pointer hover have separate visual treatments.
+
+## Settings
+
+Remote search suggestions are controlled by the autocomplete-engine setting. Disabling suggestions
+clears the configured engine; the setting is persisted with the rest of the browser settings and is
+restored on the next launch.
+
+The search engine used for the verbatim action is independent of whether remote suggestions are
+enabled.
+
+## Tests
+
+The implementation has three main deterministic test layers:
+
+- `TestAutocompleteRanker` verifies matching, relevance components, eligibility, decay, and short
+  query behavior.
+- `TestAutocompleteMuxer` verifies destination merging, diversity, source limits, verbatim
+  preservation, and representative selection.
+- `TestOmnibox` drives the editing state machine with a scripted provider, covering stale delivery,
+  completion acceptance and rejection, selection preservation, activation, and engagement recording.
+
+`TestAutocomplete` exercises the asynchronous integration with the application, service worker,
+bookmark updates, private-profile reads, and remote failure handling. History-store tests cover
+persisted ranking state, migrations, and deletion behavior.
+
+Tests control result delivery or inject a clock rather than depending on wall-clock timing.
+
 FILE: Documentation/Patterns.md
 # Coding Patterns
 
@@ -59041,6 +59396,7 @@ If you have any questions that are not answered here or in the [FAQ](FAQ.md), yo
 
 ## Browser/LibWeb
 * [General Architecture](ProcessArchitecture.md)
+* [Omnibox Design](Omnibox.md)
 * [LibWeb: From Loading to Painting](LibWebFromLoadingToPainting.md)
 * [LibWeb: Browsing Contexts and Navigables](BrowsingContextsAndNavigables.md)
 * [How to Add a CSS Property](CSSProperties.md)
@@ -83591,8 +83947,8 @@ public:
         return Curves::SECPxxxr1Point::scalar_to_bytes(m_d, m_scalar_size);
     }
 
-    Optional<Vector<int> const&> parameters() const { return m_parameters; }
-    Optional<ECPublicKey const&> public_key() const { return m_public_key; }
+    Optional<Vector<int>> const& parameters() const { return m_parameters; }
+    Optional<ECPublicKey> const& public_key() const { return m_public_key; }
 
     ErrorOr<ByteBuffer> export_as_der() const;
 
@@ -85548,6 +85904,7 @@ static constexpr StringView sql_error(int error_code)
     __ENUMERATE_TYPE(u32)                \
     __ENUMERATE_TYPE(unsigned long)      \
     __ENUMERATE_TYPE(unsigned long long) \
+    __ENUMERATE_TYPE(double)             \
     __ENUMERATE_TYPE(bool)
 
 ErrorOr<NonnullRefPtr<Database>> Database::create_memory_backed()
@@ -85611,6 +85968,42 @@ void Database::execute_statement_internal(StatementID statement_id, OnResult on_
     }
 }
 
+Database::StatementExecutionOutcome Database::execute_interruptible_statement_internal(StatementID statement_id, OnResult on_result)
+{
+    auto* statement = prepared_statement(statement_id);
+
+    while (true) {
+        auto result = sqlite3_step(statement);
+
+        switch (result) {
+        case SQLITE_DONE:
+            SQL_MUST(sqlite3_reset(statement));
+            return StatementExecutionOutcome::Completed;
+
+        case SQLITE_ROW:
+            if (on_result)
+                on_result(statement_id);
+            continue;
+
+        case SQLITE_INTERRUPT:
+            // sqlite3_reset() reports the interrupted statement's error code, so intentionally ignore
+            // its result here. Resetting still makes the prepared statement reusable.
+            sqlite3_reset(statement);
+            return StatementExecutionOutcome::Interrupted;
+
+        default:
+            sqlite3_reset(statement);
+            warnln("\033[31;1mDatabase error\033[0m: {}: {}", sql_error(result), sqlite3_errmsg(m_database));
+            VERIFY_NOT_REACHED();
+        }
+    }
+}
+
+void Database::interrupt()
+{
+    sqlite3_interrupt(m_database);
+}
+
 ErrorOr<void> Database::try_execute_statement_internal(StatementID statement_id, OnResult on_result)
 {
     auto* statement = prepared_statement(statement_id);
@@ -85668,6 +86061,8 @@ ErrorOr<void> Database::try_apply_placeholder(StatementID statement_id, int inde
         SQL_TRY(sqlite3_bind_blob(statement, index, value.characters(), static_cast<int>(value.length()), SQLITE_TRANSIENT));
     } else if constexpr (IsSame<ValueType, UnixDateTime>) {
         TRY(try_apply_placeholder(statement_id, index, value.offset_to_epoch().to_milliseconds()));
+    } else if constexpr (IsSame<ValueType, double>) {
+        SQL_TRY(sqlite3_bind_double(statement, index, value));
     } else if constexpr (IsIntegral<ValueType>) {
         if constexpr (sizeof(ValueType) <= sizeof(int))
             SQL_TRY(sqlite3_bind_int(statement, index, static_cast<int>(value)));
@@ -85701,6 +86096,8 @@ ValueType Database::result_column(StatementID statement_id, int column)
     } else if constexpr (IsSame<ValueType, UnixDateTime>) {
         auto milliseconds = result_column<sqlite3_int64>(statement_id, column);
         return UnixDateTime::from_milliseconds_since_epoch(milliseconds);
+    } else if constexpr (IsSame<ValueType, double>) {
+        return sqlite3_column_double(statement, column);
     } else if constexpr (IsIntegral<ValueType>) {
         if constexpr (sizeof(ValueType) <= sizeof(int))
             return static_cast<ValueType>(sqlite3_column_int(statement, column));
@@ -85877,6 +86274,14 @@ ErrorOr<void> Database::set_synchronous_pragma(Synchronous synchronous)
     return {};
 }
 
+ErrorOr<void> Database::set_busy_timeout(i32 milliseconds)
+{
+    if (milliseconds < 0)
+        return Error::from_string_literal("Database busy timeout must not be negative");
+    SQL_TRY(sqlite3_busy_timeout(m_database, milliseconds));
+    return {};
+}
+
 }
 
 FILE: Libraries/LibDatabase/Database.h
@@ -85924,6 +86329,11 @@ public:
 
     using OnResult = Function<void(StatementID)>;
 
+    enum class StatementExecutionOutcome {
+        Completed,
+        Interrupted,
+    };
+
     Optional<LexicalPath> const& database_path() const { return m_database_path; }
 
     ErrorOr<StatementID> prepare_statement(StringView statement);
@@ -85943,6 +86353,22 @@ public:
         VERIFY(bound_parameter_count(statement_id) == index - 1);
         execute_statement_internal(statement_id, move(on_result));
     }
+
+    // Unlike execute_statement(), this treats sqlite3_interrupt() as an expected outcome. Other SQL
+    // errors remain fatal, matching execute_statement().
+    template<typename... PlaceholderValues>
+    StatementExecutionOutcome execute_interruptible_statement(StatementID statement_id, OnResult on_result, PlaceholderValues&&... placeholder_values)
+    {
+        int index = 1;
+        (apply_placeholder(statement_id, index++, forward<PlaceholderValues>(placeholder_values)), ...);
+
+        VERIFY(bound_parameter_count(statement_id) == index - 1);
+        return execute_interruptible_statement_internal(statement_id, move(on_result));
+    }
+
+    // SQLite permits this to be called from another thread. The caller must keep this Database alive
+    // until interrupt() returns.
+    void interrupt();
 
     template<typename ValueType>
     ValueType result_column(StatementID, int column);
@@ -86007,11 +86433,15 @@ public:
     };
     ErrorOr<void> set_synchronous_pragma(Synchronous);
 
+    // https://www.sqlite.org/c3ref/busy_timeout.html
+    ErrorOr<void> set_busy_timeout(i32 milliseconds);
+
 private:
     static ErrorOr<NonnullRefPtr<Database>> create(sqlite3*, Optional<LexicalPath> database_path = {});
     Database(sqlite3*, Optional<LexicalPath> database_path);
 
     void execute_statement_internal(StatementID, OnResult);
+    StatementExecutionOutcome execute_interruptible_statement_internal(StatementID, OnResult);
     ErrorOr<void> try_execute_statement_internal(StatementID, OnResult);
 
     int bound_parameter_count(StatementID);
@@ -414546,7 +414976,10 @@ FILE: Libraries/LibWeb/Bindings/MainThreadVM.cpp
  */
 
 #include <AK/NeverDestroyed.h>
+#include <LibCore/AnonymousBuffer.h>
+#include <LibGC/CellAllocator.h>
 #include <LibGC/DeferGC.h>
+#include <LibGfx/SystemTheme.h>
 #include <LibJS/Module.h>
 #include <LibJS/Runtime/AbstractOperations.h>
 #include <LibJS/Runtime/Array.h>
@@ -414557,9 +414990,13 @@ FILE: Libraries/LibWeb/Bindings/MainThreadVM.cpp
 #include <LibJS/Runtime/NativeFunction.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibJS/SourceTextModule.h>
+#include <LibURL/Origin.h>
+#include <LibURL/URL.h>
 #include <LibWeb/Bindings/ExceptionOrUtils.h>
+#include <LibWeb/Bindings/HostDefined.h>
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
+#include <LibWeb/Bindings/PrincipalHostDefined.h>
 #include <LibWeb/Bindings/PromiseRejectionEvent.h>
 #include <LibWeb/Bindings/WindowExposedInterfaces.h>
 #include <LibWeb/ContentSecurityPolicy/BlockingAlgorithms.h>
@@ -414579,10 +415016,12 @@ FILE: Libraries/LibWeb/Bindings/MainThreadVM.cpp
 #include <LibWeb/HTML/Scripting/Script.h>
 #include <LibWeb/HTML/Scripting/SimilarOriginWindowAgent.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
+#include <LibWeb/HTML/Scripting/WindowEnvironmentSettingsObject.h>
 #include <LibWeb/HTML/Scripting/WorkerAgent.h>
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/HTML/WindowProxy.h>
 #include <LibWeb/HTML/WorkletGlobalScope.h>
+#include <LibWeb/Page/Page.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/ServiceWorker/ServiceWorkerGlobalScope.h>
 #include <LibWeb/WebAssembly/WebAssembly.h>
@@ -415314,6 +415753,133 @@ NonnullOwnPtr<JS::ExecutionContext> create_a_new_javascript_realm(JS::VM& vm, Fu
     return realm_execution_context;
 }
 
+// The VM may already be up via the other helper or normal startup.
+static void ensure_main_thread_vm_initialized()
+{
+    if (main_thread_vm_ptr())
+        return;
+    Platform::EventLoopPlugin::install(*new Platform::EventLoopPlugin);
+    initialize_main_thread_vm(AgentType::SimilarOriginWindow);
+}
+
+GC::Ref<JS::Realm> create_a_simple_javascript_realm()
+{
+    ensure_main_thread_vm_initialized();
+
+    auto& vm = main_thread_vm();
+
+    GC::Ptr<HTML::Window> window;
+    auto execution_context = create_a_new_javascript_realm(
+        vm,
+        [&](JS::Realm& realm) -> JS::Object* {
+            window = HTML::Window::create(realm);
+            return window;
+        },
+        [&](JS::Realm&) -> JS::Object* {
+            return window;
+        });
+
+    auto& realm = *execution_context->realm;
+    auto intrinsics = realm.create<Intrinsics>(realm);
+    realm.set_host_defined(make<HostDefined>(intrinsics));
+
+    // Keep the realm current and alive, matching this VM's process-lifetime leak policy.
+    vm.push_execution_context(*execution_context.leak_ptr());
+
+    return realm;
+}
+
+namespace {
+
+// A do-nothing PageClient for tests and tools that need a Page without a UI, IPC peer, or renderer.
+class HeadlessPageClient final : public PageClient {
+    GC_CELL(HeadlessPageClient, PageClient);
+    GC_DECLARE_ALLOCATOR(HeadlessPageClient);
+
+public:
+    static GC::Ref<HeadlessPageClient> create(JS::VM& vm) { return vm.heap().allocate<HeadlessPageClient>(); }
+
+    virtual u64 id() const override { return 0; }
+    virtual Page& page() override { return *m_page; }
+    virtual Page const& page() const override { return *m_page; }
+    virtual bool is_connection_open() const override { return false; }
+    virtual Gfx::Palette palette() const override { return Gfx::Palette(*m_palette_impl); }
+    virtual DevicePixelRect screen_rect() const override { return {}; }
+    virtual double zoom_level() const override { return 1.0; }
+    virtual double device_pixel_ratio() const override { return 1.0; }
+    virtual double device_pixels_per_css_pixel() const override { return 1.0; }
+    virtual CSS::PreferredColorScheme preferred_color_scheme() const override { return CSS::PreferredColorScheme::Auto; }
+    virtual CSS::PreferredContrast preferred_contrast() const override { return CSS::PreferredContrast::NoPreference; }
+    virtual CSS::PreferredMotion preferred_motion() const override { return CSS::PreferredMotion::NoPreference; }
+    virtual size_t screen_count() const override { return 1; }
+    virtual Queue<QueuedInputEvent>& input_event_queue() override { return m_input_event_queue; }
+    virtual void report_finished_handling_input_event(u64, EventResult) override { }
+    virtual void request_frame() override { }
+    virtual void request_file(FileRequest) override { }
+    virtual bool is_headless() const override { return true; }
+
+    GC::Ptr<Page> m_page;
+
+private:
+    HeadlessPageClient()
+    {
+        auto buffer = MUST(Core::AnonymousBuffer::create_with_size(sizeof(Gfx::SystemTheme)));
+        m_palette_impl = Gfx::PaletteImpl::create_with_anonymous_buffer(buffer);
+    }
+
+    virtual void visit_edges(JS::Cell::Visitor& visitor) override
+    {
+        Base::visit_edges(visitor);
+        visitor.visit(m_page);
+    }
+
+    RefPtr<Gfx::PaletteImpl> m_palette_impl;
+    Queue<QueuedInputEvent> m_input_event_queue;
+};
+
+GC_DEFINE_ALLOCATOR(HeadlessPageClient);
+
+}
+
+GC::Ref<JS::Realm> create_a_principal_javascript_realm()
+{
+    ensure_main_thread_vm_initialized();
+
+    auto& vm = main_thread_vm();
+
+    auto page_client = HeadlessPageClient::create(vm);
+    auto page = Page::create(vm, *page_client);
+    page_client->m_page = page;
+
+    GC::Ptr<HTML::Window> window;
+    auto execution_context = create_a_new_javascript_realm(
+        vm,
+        [&](JS::Realm& realm) -> JS::Object* {
+            window = HTML::Window::create(realm);
+            return window;
+        },
+        [&](JS::Realm&) -> JS::Object* {
+            return window;
+        });
+
+    // Grab the realm before setup() takes ownership of the execution context.
+    auto realm = execution_context->realm;
+
+    HTML::WindowEnvironmentSettingsObject::setup(
+        *page,
+        URL::about_blank(),
+        move(execution_context),
+        nullptr,
+        URL::about_blank(),
+        URL::Origin::create_opaque());
+
+    // Keep the principal realm current and alive, matching create_a_simple_javascript_realm().
+    auto& settings = principal_host_defined_environment_settings_object(*realm);
+    vm.push_execution_context(settings.realm_execution_context());
+
+    return *realm;
+}
+
 // https://html.spec.whatwg.org/multipage/custom-elements.html#invoke-custom-element-reactions
 void invoke_custom_element_reactions(Vector<GC::Weak<DOM::Element>>& element_queue)
 {
@@ -415404,6 +415970,12 @@ WEB_API JS::VM& main_thread_vm();
 void queue_mutation_observer_microtask();
 WEB_API NonnullOwnPtr<JS::ExecutionContext> create_a_new_javascript_realm(JS::VM&, Function<JS::Object*(JS::Realm&)> create_global_object, Function<JS::Object*(JS::Realm&)> create_global_this_value);
 WEB_API void invoke_custom_element_reactions(Vector<GC::Weak<DOM::Element>>& element_queue);
+
+// Creates a bare Window-backed realm for tests and tools that do not need a full Document.
+WEB_API GC::Ref<JS::Realm> create_a_simple_javascript_realm();
+
+// Creates a principal realm backed by a Page and window environment settings object.
+WEB_API GC::Ref<JS::Realm> create_a_principal_javascript_realm();
 
 }
 
@@ -416273,22 +416845,28 @@ FILE: Libraries/LibWeb/Bindings/Serializable.h
 
 #pragma once
 
+#include <AK/Optional.h>
+#include <AK/Types.h>
 #include <LibWeb/Bindings/IntrinsicDefinitions.h>
+#include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/StructuredSerializeTypes.h>
 
 namespace Web::Bindings {
 
 // https://html.spec.whatwg.org/multipage/structured-data.html#serializable-objects
-class Serializable {
+class WEB_API Serializable {
 public:
     virtual ~Serializable() = default;
 
     // https://html.spec.whatwg.org/multipage/structured-data.html#serialization-steps
-    virtual WebIDL::ExceptionOr<void> serialization_steps(HTML::TransferDataEncoder&, bool for_storage, HTML::SerializationMemory&) = 0;
+    virtual WebIDL::ExceptionOr<void> serialization_steps(HTML::StructuredSerializeWriter&, bool for_storage, HTML::SerializationMemory&) = 0;
+
+    // Version of this type's storage body shape; starts at 1, with 0 reserved.
+    virtual u64 serialization_version() const { return 1; }
 
     // https://html.spec.whatwg.org/multipage/structured-data.html#deserialization-steps
-    virtual WebIDL::ExceptionOr<void> deserialization_steps(HTML::TransferDataDecoder&, HTML::DeserializationMemory&) = 0;
+    virtual WebIDL::ExceptionOr<void> deserialization_steps(HTML::StructuredSerializeReader&, HTML::DeserializationMemory&) = 0;
 };
 
 }
@@ -418114,7 +418692,7 @@ set(SOURCES
     HTML/MimeType.cpp
     HTML/MimeTypeArray.cpp
     HTML/Navigable.cpp
-    HTML/NavigableId.cpp
+    HTML/CrossProcessId.cpp
     HTML/NavigableContainer.cpp
     HTML/NavigateEvent.cpp
     HTML/Navigation.cpp
@@ -441556,12 +442134,15 @@ FILE: Libraries/LibWeb/Crypto/CryptoKey.cpp
  */
 
 #include <AK/Memory.h>
+#include <AK/StdLibExtras.h>
+#include <AK/Utf16String.h>
 #include <LibJS/Runtime/Array.h>
 #include <LibJS/Runtime/TypedArray.h>
 #include <LibJS/Runtime/ValueInlines.h>
 #include <LibWeb/Bindings/CryptoKey.h>
 #include <LibWeb/Bindings/ExceptionOrUtils.h>
 #include <LibWeb/Crypto/CryptoKey.h>
+#include <LibWeb/Crypto/CryptoKeySerializationTags.h>
 #include <LibWeb/Crypto/KeyAlgorithms.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
 #include <LibWeb/WebIDL/AbstractOperations.h>
@@ -441570,29 +442151,21 @@ namespace Web::Crypto {
 
 namespace {
 
-enum class HandleTag : u8 {
-    ByteBuffer = 0,
-    RSAPublicKey = 1,
-    RSAPrivateKey = 2,
-    ECPublicKey = 3,
-    ECPrivateKey = 4,
-    MLDSAPublicKey = 5,
-    MLDSAPrivateKey = 6,
-    MLKEMPublicKey = 7,
-    MLKEMPrivateKey = 8,
-    OKPPublicKey = 9,
-    OKPPrivateKey = 10,
-};
+WebIDL::ExceptionOr<HandleTag> decode_handle_tag(HTML::StructuredSerializeReader& decoder, JS::Realm& realm)
+{
+    auto tag = TRY(HTML::decode_or_throw_data_clone_error<u8>(realm, decoder));
+    if (!handle_tag_is_in_table(static_cast<HandleTag>(tag)))
+        return HTML::data_clone_error_from_serialization_error(realm, Error::from_string_literal("Invalid CryptoKey handle tag"));
+    return static_cast<HandleTag>(tag);
+}
 
-enum class KeyAlgorithmTag : u8 {
-    KeyAlgorithm = 0,
-    RsaKeyAlgorithm = 1,
-    RsaHashedKeyAlgorithm = 2,
-    EcKeyAlgorithm = 3,
-    AesKeyAlgorithm = 4,
-    HmacKeyAlgorithm = 5,
-    KmacKeyAlgorithm = 6,
-};
+WebIDL::ExceptionOr<KeyAlgorithmTag> decode_key_algorithm_tag(HTML::StructuredSerializeReader& decoder, JS::Realm& realm)
+{
+    auto tag = TRY(HTML::decode_or_throw_data_clone_error<u8>(realm, decoder));
+    if (!key_algorithm_tag_is_in_table(static_cast<KeyAlgorithmTag>(tag)))
+        return HTML::data_clone_error_from_serialization_error(realm, Error::from_string_literal("Invalid CryptoKey algorithm tag"));
+    return static_cast<KeyAlgorithmTag>(tag);
+}
 
 ::Crypto::UnsignedBigInteger big_integer_from_api_big_integer(JS::Uint8Array const& big_integer)
 {
@@ -441602,41 +442175,41 @@ enum class KeyAlgorithmTag : u8 {
     return ::Crypto::UnsignedBigInteger(0);
 }
 
-void serialize_key_algorithm(HTML::TransferDataEncoder& encoder, JS::Object const& object)
+void serialize_key_algorithm(HTML::StructuredSerializeWriter& encoder, JS::Object const& object)
 {
     if (auto const* algorithm = as_if<RsaHashedKeyAlgorithm>(object)) {
-        encoder.encode(KeyAlgorithmTag::RsaHashedKeyAlgorithm);
+        encoder.encode(to_underlying(KeyAlgorithmTag::RsaHashedKeyAlgorithm));
         encoder.encode(algorithm->name());
         encoder.encode(algorithm->modulus_length());
-        encoder.encode_unsigned_big_integer(big_integer_from_api_big_integer(*algorithm->public_exponent()));
+        HTML::encode_unsigned_big_integer(encoder, big_integer_from_api_big_integer(*algorithm->public_exponent()));
         encoder.encode(MUST(algorithm->hash().name(algorithm->vm())));
         return;
     }
 
     if (auto const* algorithm = as_if<RsaKeyAlgorithm>(object)) {
-        encoder.encode(KeyAlgorithmTag::RsaKeyAlgorithm);
+        encoder.encode(to_underlying(KeyAlgorithmTag::RsaKeyAlgorithm));
         encoder.encode(algorithm->name());
         encoder.encode(algorithm->modulus_length());
-        encoder.encode_unsigned_big_integer(big_integer_from_api_big_integer(*algorithm->public_exponent()));
+        HTML::encode_unsigned_big_integer(encoder, big_integer_from_api_big_integer(*algorithm->public_exponent()));
         return;
     }
 
     if (auto const* algorithm = as_if<EcKeyAlgorithm>(object)) {
-        encoder.encode(KeyAlgorithmTag::EcKeyAlgorithm);
+        encoder.encode(to_underlying(KeyAlgorithmTag::EcKeyAlgorithm));
         encoder.encode(algorithm->name());
         encoder.encode(algorithm->named_curve());
         return;
     }
 
     if (auto const* algorithm = as_if<AesKeyAlgorithm>(object)) {
-        encoder.encode(KeyAlgorithmTag::AesKeyAlgorithm);
+        encoder.encode(to_underlying(KeyAlgorithmTag::AesKeyAlgorithm));
         encoder.encode(algorithm->name());
         encoder.encode(algorithm->length());
         return;
     }
 
     if (auto const* algorithm = as_if<HmacKeyAlgorithm>(object)) {
-        encoder.encode(KeyAlgorithmTag::HmacKeyAlgorithm);
+        encoder.encode(to_underlying(KeyAlgorithmTag::HmacKeyAlgorithm));
         encoder.encode(algorithm->name());
         encoder.encode(algorithm->hash()->name());
         encoder.encode(algorithm->length());
@@ -441644,141 +442217,141 @@ void serialize_key_algorithm(HTML::TransferDataEncoder& encoder, JS::Object cons
     }
 
     if (auto const* algorithm = as_if<KmacKeyAlgorithm>(object)) {
-        encoder.encode(KeyAlgorithmTag::KmacKeyAlgorithm);
+        encoder.encode(to_underlying(KeyAlgorithmTag::KmacKeyAlgorithm));
         encoder.encode(algorithm->name());
         encoder.encode(algorithm->length());
         return;
     }
 
     auto const& algorithm = as<KeyAlgorithm>(object);
-    encoder.encode(KeyAlgorithmTag::KeyAlgorithm);
+    encoder.encode(to_underlying(KeyAlgorithmTag::KeyAlgorithm));
     encoder.encode(algorithm.name());
 }
 
-WebIDL::ExceptionOr<GC::Ref<JS::Object>> deserialize_key_algorithm(HTML::TransferDataDecoder& decoder, JS::Realm& realm)
+WebIDL::ExceptionOr<GC::Ref<JS::Object>> deserialize_key_algorithm(HTML::StructuredSerializeReader& decoder, JS::Realm& realm)
 {
-    auto tag = decoder.decode<KeyAlgorithmTag>();
+    auto tag = TRY(decode_key_algorithm_tag(decoder, realm));
     switch (tag) {
     case KeyAlgorithmTag::KeyAlgorithm: {
         auto algorithm = KeyAlgorithm::create(realm);
-        algorithm->set_name(decoder.decode<Utf16String>());
+        algorithm->set_name(TRY(HTML::decode_or_throw_data_clone_error<Utf16String>(realm, decoder)));
         return algorithm;
     }
     case KeyAlgorithmTag::RsaKeyAlgorithm: {
         auto algorithm = RsaKeyAlgorithm::create(realm);
-        algorithm->set_name(decoder.decode<Utf16String>());
-        algorithm->set_modulus_length(decoder.decode<u32>());
-        TRY(algorithm->set_public_exponent(TRY(decoder.decode_unsigned_big_integer(realm))));
+        algorithm->set_name(TRY(HTML::decode_or_throw_data_clone_error<Utf16String>(realm, decoder)));
+        algorithm->set_modulus_length(TRY(HTML::decode_or_throw_data_clone_error<u32>(realm, decoder)));
+        TRY(algorithm->set_public_exponent(TRY(HTML::decode_unsigned_big_integer(decoder, realm))));
         return algorithm;
     }
     case KeyAlgorithmTag::RsaHashedKeyAlgorithm: {
         auto algorithm = RsaHashedKeyAlgorithm::create(realm);
-        algorithm->set_name(decoder.decode<Utf16String>());
-        algorithm->set_modulus_length(decoder.decode<u32>());
-        TRY(algorithm->set_public_exponent(TRY(decoder.decode_unsigned_big_integer(realm))));
-        algorithm->set_hash(decoder.decode<Utf16String>());
+        algorithm->set_name(TRY(HTML::decode_or_throw_data_clone_error<Utf16String>(realm, decoder)));
+        algorithm->set_modulus_length(TRY(HTML::decode_or_throw_data_clone_error<u32>(realm, decoder)));
+        TRY(algorithm->set_public_exponent(TRY(HTML::decode_unsigned_big_integer(decoder, realm))));
+        algorithm->set_hash(TRY(HTML::decode_or_throw_data_clone_error<Utf16String>(realm, decoder)));
         return algorithm;
     }
     case KeyAlgorithmTag::EcKeyAlgorithm: {
         auto algorithm = EcKeyAlgorithm::create(realm);
-        algorithm->set_name(decoder.decode<Utf16String>());
-        algorithm->set_named_curve(decoder.decode<Utf16String>());
+        algorithm->set_name(TRY(HTML::decode_or_throw_data_clone_error<Utf16String>(realm, decoder)));
+        algorithm->set_named_curve(TRY(HTML::decode_or_throw_data_clone_error<Utf16String>(realm, decoder)));
         return algorithm;
     }
     case KeyAlgorithmTag::AesKeyAlgorithm: {
         auto algorithm = AesKeyAlgorithm::create(realm);
-        algorithm->set_name(decoder.decode<Utf16String>());
-        algorithm->set_length(decoder.decode<u16>());
+        algorithm->set_name(TRY(HTML::decode_or_throw_data_clone_error<Utf16String>(realm, decoder)));
+        algorithm->set_length(TRY(HTML::decode_or_throw_data_clone_error<u16>(realm, decoder)));
         return algorithm;
     }
     case KeyAlgorithmTag::HmacKeyAlgorithm: {
         auto algorithm = HmacKeyAlgorithm::create(realm);
-        algorithm->set_name(decoder.decode<Utf16String>());
+        algorithm->set_name(TRY(HTML::decode_or_throw_data_clone_error<Utf16String>(realm, decoder)));
         auto hash = KeyAlgorithm::create(realm);
-        hash->set_name(decoder.decode<Utf16String>());
+        hash->set_name(TRY(HTML::decode_or_throw_data_clone_error<Utf16String>(realm, decoder)));
         algorithm->set_hash(hash);
-        algorithm->set_length(decoder.decode<WebIDL::UnsignedLong>());
+        algorithm->set_length(TRY(HTML::decode_or_throw_data_clone_error<WebIDL::UnsignedLong>(realm, decoder)));
         return algorithm;
     }
     case KeyAlgorithmTag::KmacKeyAlgorithm: {
         auto algorithm = KmacKeyAlgorithm::create(realm);
-        algorithm->set_name(decoder.decode<Utf16String>());
-        algorithm->set_length(decoder.decode<WebIDL::UnsignedLong>());
+        algorithm->set_name(TRY(HTML::decode_or_throw_data_clone_error<Utf16String>(realm, decoder)));
+        algorithm->set_length(TRY(HTML::decode_or_throw_data_clone_error<WebIDL::UnsignedLong>(realm, decoder)));
         return algorithm;
     }
     }
     VERIFY_NOT_REACHED();
 }
 
-void serialize_handle(HTML::TransferDataEncoder& encoder, ByteBuffer const& buffer)
+void serialize_handle(HTML::StructuredSerializeWriter& encoder, ByteBuffer const& buffer)
 {
-    encoder.encode(HandleTag::ByteBuffer);
+    encoder.encode(to_underlying(HandleTag::ByteBuffer));
     encoder.encode(buffer);
 }
 
-void serialize_handle(HTML::TransferDataEncoder& encoder, ::Crypto::PK::RSAPublicKey const& key)
+void serialize_handle(HTML::StructuredSerializeWriter& encoder, ::Crypto::PK::RSAPublicKey const& key)
 {
-    encoder.encode(HandleTag::RSAPublicKey);
-    encoder.encode_unsigned_big_integer(key.modulus());
-    encoder.encode_unsigned_big_integer(key.public_exponent());
+    encoder.encode(to_underlying(HandleTag::RSAPublicKey));
+    HTML::encode_unsigned_big_integer(encoder, key.modulus());
+    HTML::encode_unsigned_big_integer(encoder, key.public_exponent());
 }
 
-WebIDL::ExceptionOr<::Crypto::PK::RSAPublicKey> deserialize_rsa_public_key(HTML::TransferDataDecoder& decoder, JS::Realm& realm)
+WebIDL::ExceptionOr<::Crypto::PK::RSAPublicKey> deserialize_rsa_public_key(HTML::StructuredSerializeReader& decoder, JS::Realm& realm)
 {
-    auto modulus = TRY(decoder.decode_unsigned_big_integer(realm));
-    auto public_exponent = TRY(decoder.decode_unsigned_big_integer(realm));
+    auto modulus = TRY(HTML::decode_unsigned_big_integer(decoder, realm));
+    auto public_exponent = TRY(HTML::decode_unsigned_big_integer(decoder, realm));
     return ::Crypto::PK::RSAPublicKey { move(modulus), move(public_exponent) };
 }
 
-void serialize_handle(HTML::TransferDataEncoder& encoder, ::Crypto::PK::RSAPrivateKey const& key)
+void serialize_handle(HTML::StructuredSerializeWriter& encoder, ::Crypto::PK::RSAPrivateKey const& key)
 {
-    encoder.encode(HandleTag::RSAPrivateKey);
-    encoder.encode_unsigned_big_integer(key.modulus());
-    encoder.encode_unsigned_big_integer(key.private_exponent());
-    encoder.encode_unsigned_big_integer(key.public_exponent());
-    encoder.encode_unsigned_big_integer(key.prime1());
-    encoder.encode_unsigned_big_integer(key.prime2());
-    encoder.encode_unsigned_big_integer(key.exponent1());
-    encoder.encode_unsigned_big_integer(key.exponent2());
-    encoder.encode_unsigned_big_integer(key.coefficient());
+    encoder.encode(to_underlying(HandleTag::RSAPrivateKey));
+    HTML::encode_unsigned_big_integer(encoder, key.modulus());
+    HTML::encode_unsigned_big_integer(encoder, key.private_exponent());
+    HTML::encode_unsigned_big_integer(encoder, key.public_exponent());
+    HTML::encode_unsigned_big_integer(encoder, key.prime1());
+    HTML::encode_unsigned_big_integer(encoder, key.prime2());
+    HTML::encode_unsigned_big_integer(encoder, key.exponent1());
+    HTML::encode_unsigned_big_integer(encoder, key.exponent2());
+    HTML::encode_unsigned_big_integer(encoder, key.coefficient());
 }
 
-WebIDL::ExceptionOr<::Crypto::PK::RSAPrivateKey> deserialize_rsa_private_key(HTML::TransferDataDecoder& decoder, JS::Realm& realm)
+WebIDL::ExceptionOr<::Crypto::PK::RSAPrivateKey> deserialize_rsa_private_key(HTML::StructuredSerializeReader& decoder, JS::Realm& realm)
 {
-    auto modulus = TRY(decoder.decode_unsigned_big_integer(realm));
-    auto private_exponent = TRY(decoder.decode_unsigned_big_integer(realm));
-    auto public_exponent = TRY(decoder.decode_unsigned_big_integer(realm));
-    auto prime1 = TRY(decoder.decode_unsigned_big_integer(realm));
-    auto prime2 = TRY(decoder.decode_unsigned_big_integer(realm));
-    auto exponent1 = TRY(decoder.decode_unsigned_big_integer(realm));
-    auto exponent2 = TRY(decoder.decode_unsigned_big_integer(realm));
-    auto coefficient = TRY(decoder.decode_unsigned_big_integer(realm));
+    auto modulus = TRY(HTML::decode_unsigned_big_integer(decoder, realm));
+    auto private_exponent = TRY(HTML::decode_unsigned_big_integer(decoder, realm));
+    auto public_exponent = TRY(HTML::decode_unsigned_big_integer(decoder, realm));
+    auto prime1 = TRY(HTML::decode_unsigned_big_integer(decoder, realm));
+    auto prime2 = TRY(HTML::decode_unsigned_big_integer(decoder, realm));
+    auto exponent1 = TRY(HTML::decode_unsigned_big_integer(decoder, realm));
+    auto exponent2 = TRY(HTML::decode_unsigned_big_integer(decoder, realm));
+    auto coefficient = TRY(HTML::decode_unsigned_big_integer(decoder, realm));
     return ::Crypto::PK::RSAPrivateKey { move(modulus), move(private_exponent), move(public_exponent), move(prime1), move(prime2), move(exponent1), move(exponent2), move(coefficient) };
 }
 
-void serialize_ec_public_key(HTML::TransferDataEncoder& encoder, ::Crypto::PK::ECPublicKey const& key)
+void serialize_ec_public_key(HTML::StructuredSerializeWriter& encoder, ::Crypto::PK::ECPublicKey const& key)
 {
     encoder.encode(MUST(key.x_bytes()));
     encoder.encode(MUST(key.y_bytes()));
 }
 
-void serialize_handle(HTML::TransferDataEncoder& encoder, ::Crypto::PK::ECPublicKey const& key)
+void serialize_handle(HTML::StructuredSerializeWriter& encoder, ::Crypto::PK::ECPublicKey const& key)
 {
-    encoder.encode(HandleTag::ECPublicKey);
+    encoder.encode(to_underlying(HandleTag::ECPublicKey));
     serialize_ec_public_key(encoder, key);
 }
 
-WebIDL::ExceptionOr<::Crypto::PK::ECPublicKey> deserialize_ec_public_key(HTML::TransferDataDecoder& decoder, JS::Realm& realm)
+WebIDL::ExceptionOr<::Crypto::PK::ECPublicKey> deserialize_ec_public_key(HTML::StructuredSerializeReader& decoder, JS::Realm& realm)
 {
-    auto x_bytes = TRY(decoder.decode_buffer(realm));
-    auto y_bytes = TRY(decoder.decode_buffer(realm));
+    auto x_bytes = TRY(HTML::decode_or_throw_data_clone_error<ByteBuffer>(realm, decoder));
+    auto y_bytes = TRY(HTML::decode_or_throw_data_clone_error<ByteBuffer>(realm, decoder));
     auto scalar_size = x_bytes.size();
     return ::Crypto::PK::ECPublicKey { ::Crypto::UnsignedBigInteger::import_data(x_bytes), ::Crypto::UnsignedBigInteger::import_data(y_bytes), scalar_size };
 }
 
-void serialize_handle(HTML::TransferDataEncoder& encoder, ::Crypto::PK::ECPrivateKey const& key)
+void serialize_handle(HTML::StructuredSerializeWriter& encoder, ::Crypto::PK::ECPrivateKey const& key)
 {
-    encoder.encode(HandleTag::ECPrivateKey);
+    encoder.encode(to_underlying(HandleTag::ECPrivateKey));
     encoder.encode(MUST(key.d_bytes()));
     encoder.encode(key.parameters());
     encoder.encode(key.public_key().has_value());
@@ -441786,94 +442359,95 @@ void serialize_handle(HTML::TransferDataEncoder& encoder, ::Crypto::PK::ECPrivat
         serialize_ec_public_key(encoder, *key.public_key());
 }
 
-WebIDL::ExceptionOr<::Crypto::PK::ECPrivateKey> deserialize_ec_private_key(HTML::TransferDataDecoder& decoder, JS::Realm& realm)
+WebIDL::ExceptionOr<::Crypto::PK::ECPrivateKey> deserialize_ec_private_key(HTML::StructuredSerializeReader& decoder, JS::Realm& realm)
 {
-    auto d_bytes = TRY(decoder.decode_buffer(realm));
+    auto d_bytes = TRY(HTML::decode_or_throw_data_clone_error<ByteBuffer>(realm, decoder));
     auto scalar_size = d_bytes.size();
     auto d = ::Crypto::UnsignedBigInteger::import_data(d_bytes);
-    auto parameters = decoder.decode<Optional<Vector<int>>>();
+
+    auto parameters = TRY(HTML::decode_or_throw_data_clone_error<Optional<Vector<int>>>(realm, decoder));
 
     Optional<::Crypto::PK::ECPublicKey> public_key;
-    if (decoder.decode<bool>())
+    if (TRY(HTML::decode_or_throw_data_clone_error<bool>(realm, decoder)))
         public_key = TRY(deserialize_ec_public_key(decoder, realm));
 
     return ::Crypto::PK::ECPrivateKey { move(d), scalar_size, move(parameters), move(public_key) };
 }
 
-void serialize_handle(HTML::TransferDataEncoder& encoder, ::Crypto::PK::MLDSAPublicKey const& key)
+void serialize_handle(HTML::StructuredSerializeWriter& encoder, ::Crypto::PK::MLDSAPublicKey const& key)
 {
-    encoder.encode(HandleTag::MLDSAPublicKey);
+    encoder.encode(to_underlying(HandleTag::MLDSAPublicKey));
     encoder.encode(key.public_key());
 }
 
-WebIDL::ExceptionOr<::Crypto::PK::MLDSAPublicKey> deserialize_mldsa_public_key(HTML::TransferDataDecoder& decoder, JS::Realm& realm)
+WebIDL::ExceptionOr<::Crypto::PK::MLDSAPublicKey> deserialize_mldsa_public_key(HTML::StructuredSerializeReader& decoder, JS::Realm& realm)
 {
-    return ::Crypto::PK::MLDSAPublicKey { TRY(decoder.decode_buffer(realm)) };
+    return ::Crypto::PK::MLDSAPublicKey { TRY(HTML::decode_or_throw_data_clone_error<ByteBuffer>(realm, decoder)) };
 }
 
-void serialize_handle(HTML::TransferDataEncoder& encoder, ::Crypto::PK::MLDSAPrivateKey const& key)
+void serialize_handle(HTML::StructuredSerializeWriter& encoder, ::Crypto::PK::MLDSAPrivateKey const& key)
 {
-    encoder.encode(HandleTag::MLDSAPrivateKey);
+    encoder.encode(to_underlying(HandleTag::MLDSAPrivateKey));
     encoder.encode(key.seed());
     encoder.encode(key.public_key());
     encoder.encode(key.private_key());
 }
 
-WebIDL::ExceptionOr<::Crypto::PK::MLDSAPrivateKey> deserialize_mldsa_private_key(HTML::TransferDataDecoder& decoder, JS::Realm& realm)
+WebIDL::ExceptionOr<::Crypto::PK::MLDSAPrivateKey> deserialize_mldsa_private_key(HTML::StructuredSerializeReader& decoder, JS::Realm& realm)
 {
-    auto seed = TRY(decoder.decode_buffer(realm));
-    auto public_key = TRY(decoder.decode_buffer(realm));
-    auto private_key = TRY(decoder.decode_buffer(realm));
+    auto seed = TRY(HTML::decode_or_throw_data_clone_error<ByteBuffer>(realm, decoder));
+    auto public_key = TRY(HTML::decode_or_throw_data_clone_error<ByteBuffer>(realm, decoder));
+    auto private_key = TRY(HTML::decode_or_throw_data_clone_error<ByteBuffer>(realm, decoder));
     return ::Crypto::PK::MLDSAPrivateKey { move(seed), move(public_key), move(private_key) };
 }
 
-void serialize_handle(HTML::TransferDataEncoder& encoder, ::Crypto::PK::MLKEMPublicKey const& key)
+void serialize_handle(HTML::StructuredSerializeWriter& encoder, ::Crypto::PK::MLKEMPublicKey const& key)
 {
-    encoder.encode(HandleTag::MLKEMPublicKey);
+    encoder.encode(to_underlying(HandleTag::MLKEMPublicKey));
     encoder.encode(key.public_key());
 }
 
-WebIDL::ExceptionOr<::Crypto::PK::MLKEMPublicKey> deserialize_mlkem_public_key(HTML::TransferDataDecoder& decoder, JS::Realm& realm)
+WebIDL::ExceptionOr<::Crypto::PK::MLKEMPublicKey> deserialize_mlkem_public_key(HTML::StructuredSerializeReader& decoder, JS::Realm& realm)
 {
-    return ::Crypto::PK::MLKEMPublicKey { TRY(decoder.decode_buffer(realm)) };
+    return ::Crypto::PK::MLKEMPublicKey { TRY(HTML::decode_or_throw_data_clone_error<ByteBuffer>(realm, decoder)) };
 }
 
-void serialize_handle(HTML::TransferDataEncoder& encoder, ::Crypto::PK::MLKEMPrivateKey const& key)
+void serialize_handle(HTML::StructuredSerializeWriter& encoder, ::Crypto::PK::MLKEMPrivateKey const& key)
 {
-    encoder.encode(HandleTag::MLKEMPrivateKey);
+    encoder.encode(to_underlying(HandleTag::MLKEMPrivateKey));
     encoder.encode(key.seed());
     encoder.encode(key.public_key());
     encoder.encode(key.private_key());
 }
 
-WebIDL::ExceptionOr<::Crypto::PK::MLKEMPrivateKey> deserialize_mlkem_private_key(HTML::TransferDataDecoder& decoder, JS::Realm& realm)
+WebIDL::ExceptionOr<::Crypto::PK::MLKEMPrivateKey> deserialize_mlkem_private_key(HTML::StructuredSerializeReader& decoder, JS::Realm& realm)
 {
-    auto seed = TRY(decoder.decode_buffer(realm));
-    auto public_key = TRY(decoder.decode_buffer(realm));
-    auto private_key = TRY(decoder.decode_buffer(realm));
+    auto seed = TRY(HTML::decode_or_throw_data_clone_error<ByteBuffer>(realm, decoder));
+    auto public_key = TRY(HTML::decode_or_throw_data_clone_error<ByteBuffer>(realm, decoder));
+    auto private_key = TRY(HTML::decode_or_throw_data_clone_error<ByteBuffer>(realm, decoder));
     return ::Crypto::PK::MLKEMPrivateKey { move(seed), move(public_key), move(private_key) };
 }
 
-void serialize_handle(HTML::TransferDataEncoder& encoder, OKPPublicKey const& key)
+void serialize_handle(HTML::StructuredSerializeWriter& encoder, OKPPublicKey const& key)
 {
-    encoder.encode(HandleTag::OKPPublicKey);
+    encoder.encode(to_underlying(HandleTag::OKPPublicKey));
     encoder.encode(key.bytes);
 }
 
-WebIDL::ExceptionOr<OKPPublicKey> deserialize_okp_public_key(HTML::TransferDataDecoder& decoder, JS::Realm& realm)
+WebIDL::ExceptionOr<OKPPublicKey> deserialize_okp_public_key(HTML::StructuredSerializeReader& decoder, JS::Realm& realm)
 {
-    return OKPPublicKey { TRY(decoder.decode_buffer(realm)) };
+    return OKPPublicKey { TRY(HTML::decode_or_throw_data_clone_error<ByteBuffer>(realm, decoder)) };
 }
 
-void serialize_handle(HTML::TransferDataEncoder& encoder, OKPPrivateKey const& key)
+void serialize_handle(HTML::StructuredSerializeWriter& encoder, OKPPrivateKey const& key)
 {
-    encoder.encode(HandleTag::OKPPrivateKey);
+    encoder.encode(to_underlying(HandleTag::OKPPrivateKey));
     encoder.encode(key.bytes);
 }
 
-WebIDL::ExceptionOr<OKPPrivateKey> deserialize_okp_private_key(HTML::TransferDataDecoder& decoder, JS::Realm& realm)
+WebIDL::ExceptionOr<OKPPrivateKey> deserialize_okp_private_key(HTML::StructuredSerializeReader& decoder, JS::Realm& realm)
 {
-    return OKPPrivateKey { TRY(decoder.decode_buffer(realm)) };
+    return OKPPrivateKey { TRY(HTML::decode_or_throw_data_clone_error<ByteBuffer>(realm, decoder)) };
 }
 
 }
@@ -442002,7 +442576,7 @@ JS_DEFINE_NATIVE_FUNCTION(CryptoKeyPair::private_key_getter)
     return TRY(Bindings::throw_dom_exception_if_needed(vm, [&] { return impl->private_key(); }));
 }
 
-WebIDL::ExceptionOr<void> CryptoKey::serialization_steps(HTML::TransferDataEncoder& serialized, bool, HTML::SerializationMemory&)
+WebIDL::ExceptionOr<void> CryptoKey::serialization_steps(HTML::StructuredSerializeWriter& serialized, bool, HTML::SerializationMemory&)
 {
     // 1. Set serialized.[[Type]] to the [[type]] internal slot of value.
     serialized.encode(m_type);
@@ -442022,28 +442596,27 @@ WebIDL::ExceptionOr<void> CryptoKey::serialization_steps(HTML::TransferDataEncod
     return {};
 }
 
-WebIDL::ExceptionOr<void> CryptoKey::deserialization_steps(HTML::TransferDataDecoder& serialized, HTML::DeserializationMemory&)
+WebIDL::ExceptionOr<void> CryptoKey::deserialization_steps(HTML::StructuredSerializeReader& serialized, HTML::DeserializationMemory&)
 {
     auto& realm = this->realm();
 
     // 1. Initialize the [[type]] internal slot of value to serialized.[[Type]].
-    m_type = serialized.decode<Bindings::KeyType>();
+    m_type = TRY(HTML::decode_or_throw_data_clone_error<Bindings::KeyType>(realm, serialized));
 
     // 2. Initialize the [[extractable]] internal slot of value to serialized.[[Extractable]].
-    m_extractable = serialized.decode<bool>();
+    m_extractable = TRY(HTML::decode_or_throw_data_clone_error<bool>(realm, serialized));
 
     // 3. Initialize the [[algorithm]] internal slot of value to the sub-deserialization of serialized.[[Algorithm]].
     m_algorithm_cached = TRY(deserialize_key_algorithm(serialized, realm));
 
     // 4. Initialize the [[usages]] internal slot of value to the sub-deserialization of serialized.[[Usages]].
-    auto usages = serialized.decode<Vector<Bindings::KeyUsage>>();
-    set_usages(move(usages));
+    set_usages(TRY(HTML::decode_or_throw_data_clone_error<Vector<Bindings::KeyUsage>>(realm, serialized)));
 
     // 5. Initialize the [[handle]] internal slot of value to serialized.[[Handle]].
-    auto tag = serialized.decode<HandleTag>();
+    auto tag = TRY(decode_handle_tag(serialized, realm));
     switch (tag) {
     case HandleTag::ByteBuffer:
-        m_key_data = TRY(serialized.decode_buffer(realm));
+        m_key_data = TRY(HTML::decode_or_throw_data_clone_error<ByteBuffer>(realm, serialized));
         break;
     case HandleTag::RSAPublicKey:
         m_key_data = TRY(deserialize_rsa_public_key(serialized, realm));
@@ -442114,7 +442687,7 @@ struct OKPPrivateKey {
     ByteBuffer bytes;
 };
 
-class CryptoKey final
+class WEB_API CryptoKey final
     : public Bindings::PlatformObject
     , public Bindings::Serializable {
     WEB_PLATFORM_OBJECT(CryptoKey, Bindings::PlatformObject);
@@ -442144,8 +442717,8 @@ public:
     InternalKeyData const& handle() const { return m_key_data; }
     Utf16String const& algorithm_name() const;
 
-    virtual WebIDL::ExceptionOr<void> serialization_steps(HTML::TransferDataEncoder&, bool for_storage, HTML::SerializationMemory&) override;
-    virtual WebIDL::ExceptionOr<void> deserialization_steps(HTML::TransferDataDecoder&, HTML::DeserializationMemory&) override;
+    virtual WebIDL::ExceptionOr<void> serialization_steps(HTML::StructuredSerializeWriter&, bool for_storage, HTML::SerializationMemory&) override;
+    virtual WebIDL::ExceptionOr<void> deserialization_steps(HTML::StructuredSerializeReader&, HTML::DeserializationMemory&) override;
 
 private:
     CryptoKey(JS::Realm&, InternalKeyData);
@@ -442205,6 +442778,103 @@ interface CryptoKey {
     readonly attribute object algorithm;
     readonly attribute object usages;
 };
+
+FILE: Libraries/LibWeb/Crypto/CryptoKeySerializationTags.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Array.h>
+#include <AK/Types.h>
+#include <LibWeb/HTML/StructuredSerializeTypes.h>
+
+namespace Web::Crypto {
+
+// HandleTag and KeyAlgorithmTag values are part of the stable storage serialization format.
+// Do not reorder or reuse values; leave removed tags reserved.
+enum class HandleTag : u8 {
+    ByteBuffer = 0,
+    RSAPublicKey = 1,
+    RSAPrivateKey = 2,
+    ECPublicKey = 3,
+    ECPrivateKey = 4,
+    MLDSAPublicKey = 5,
+    MLDSAPrivateKey = 6,
+    MLKEMPublicKey = 7,
+    MLKEMPrivateKey = 8,
+    OKPPublicKey = 9,
+    OKPPrivateKey = 10,
+};
+
+enum class KeyAlgorithmTag : u8 {
+    KeyAlgorithm = 0,
+    RsaKeyAlgorithm = 1,
+    RsaHashedKeyAlgorithm = 2,
+    EcKeyAlgorithm = 3,
+    AesKeyAlgorithm = 4,
+    HmacKeyAlgorithm = 5,
+    KmacKeyAlgorithm = 6,
+};
+
+struct HandleTagExpectation {
+    HandleTag tag;
+    HTML::Expectation expectation;
+};
+
+struct KeyAlgorithmTagExpectation {
+    KeyAlgorithmTag tag;
+    HTML::Expectation expectation;
+};
+
+// Only tags listed here can be decoded.
+static constexpr Array<HandleTagExpectation, 11> s_handle_tag_expectations { {
+    { HandleTag::ByteBuffer, HTML::Expectation::PositiveGolden },
+    { HandleTag::RSAPublicKey, HTML::Expectation::PositiveGolden },
+    { HandleTag::RSAPrivateKey, HTML::Expectation::PositiveGolden },
+    { HandleTag::ECPublicKey, HTML::Expectation::PositiveGolden },
+    { HandleTag::ECPrivateKey, HTML::Expectation::PositiveGolden },
+    { HandleTag::MLDSAPublicKey, HTML::Expectation::PositiveGolden },
+    { HandleTag::MLDSAPrivateKey, HTML::Expectation::PositiveGolden },
+    { HandleTag::MLKEMPublicKey, HTML::Expectation::PositiveGolden },
+    { HandleTag::MLKEMPrivateKey, HTML::Expectation::PositiveGolden },
+    { HandleTag::OKPPublicKey, HTML::Expectation::PositiveGolden },
+    { HandleTag::OKPPrivateKey, HTML::Expectation::PositiveGolden },
+} };
+
+// WebCrypto RSA keys always use RsaHashedKeyAlgorithm, so tag 1 is a documented reject.
+static constexpr Array<KeyAlgorithmTagExpectation, 7> s_key_algorithm_tag_expectations { {
+    { KeyAlgorithmTag::KeyAlgorithm, HTML::Expectation::PositiveGolden },
+    { KeyAlgorithmTag::RsaKeyAlgorithm, HTML::Expectation::DocumentedReject },
+    { KeyAlgorithmTag::RsaHashedKeyAlgorithm, HTML::Expectation::PositiveGolden },
+    { KeyAlgorithmTag::EcKeyAlgorithm, HTML::Expectation::PositiveGolden },
+    { KeyAlgorithmTag::AesKeyAlgorithm, HTML::Expectation::PositiveGolden },
+    { KeyAlgorithmTag::HmacKeyAlgorithm, HTML::Expectation::PositiveGolden },
+    { KeyAlgorithmTag::KmacKeyAlgorithm, HTML::Expectation::PositiveGolden },
+} };
+
+static constexpr bool handle_tag_is_in_table(HandleTag tag)
+{
+    for (auto const& entry : s_handle_tag_expectations) {
+        if (entry.tag == tag)
+            return true;
+    }
+    return false;
+}
+
+static constexpr bool key_algorithm_tag_is_in_table(KeyAlgorithmTag tag)
+{
+    for (auto const& entry : s_key_algorithm_tag_expectations) {
+        if (entry.tag == tag)
+            return true;
+    }
+    return false;
+}
+
+}
 
 FILE: Libraries/LibWeb/Crypto/KeyAlgorithms.cpp
 /*
@@ -442486,6 +443156,7 @@ FILE: Libraries/LibWeb/Crypto/KeyAlgorithms.h
 #include <LibCrypto/BigInt/UnsignedBigInteger.h>
 #include <LibJS/Runtime/Object.h>
 #include <LibWeb/Crypto/CryptoAlgorithms.h>
+#include <LibWeb/Export.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
 namespace Web::Crypto {
@@ -442519,7 +443190,8 @@ private:
 };
 
 // https://w3c.github.io/webcrypto/#RsaKeyAlgorithm-dictionary
-class RsaKeyAlgorithm : public KeyAlgorithm {
+// WEB_API-exported so tests can fabricate an encode-only RsaKeyAlgorithm.
+class WEB_API RsaKeyAlgorithm : public KeyAlgorithm {
     JS_OBJECT(RsaKeyAlgorithm, KeyAlgorithm);
     GC_DECLARE_ALLOCATOR(RsaKeyAlgorithm);
 
@@ -442574,7 +443246,8 @@ private:
 };
 
 // https://w3c.github.io/webcrypto/#EcKeyAlgorithm-dictionary
-class EcKeyAlgorithm : public KeyAlgorithm {
+// WEB_API-exported so tests can inspect decoded named_curve().
+class WEB_API EcKeyAlgorithm : public KeyAlgorithm {
     JS_OBJECT(EcKeyAlgorithm, KeyAlgorithm);
     GC_DECLARE_ALLOCATOR(EcKeyAlgorithm);
 
@@ -467502,6 +468175,8 @@ void CSSStyleSheet::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_owning_documents_or_shadow_roots);
     if (m_shared_single_constructed_sheet_style_cache)
         m_shared_single_constructed_sheet_style_cache->visit_edges(visitor);
+    if (m_cached_style_sheet_invalidation_set)
+        m_cached_style_sheet_invalidation_set->invalidation_set.visit_edges(visitor);
     for (auto& subresource : m_critical_subresources)
         subresource.visit_edges(visitor);
 }
@@ -467810,7 +468485,9 @@ NonnullRefPtr<StyleCache> CSSStyleSheet::shared_single_constructed_sheet_style_c
 void CSSStyleSheet::invalidate_shared_style_cache()
 {
     m_selector_insights = {};
+    m_cached_style_sheet_invalidation_set = nullptr;
     m_shared_single_constructed_sheet_style_cache = nullptr;
+    ++m_shared_style_cache_generation;
 
     // Imported rules contribute to their parent sheet's effective rules.
     if (auto* import_rule = as_if<CSSImportRule>(owner_rule().ptr())) {
@@ -468111,6 +468788,7 @@ FILE: Libraries/LibWeb/CSS/CSSStyleSheet.h
 
 #include <AK/Function.h>
 #include <AK/NonnullRefPtr.h>
+#include <AK/OwnPtr.h>
 #include <AK/RefPtr.h>
 #include <AK/Utf16View.h>
 #include <LibWeb/Bindings/CSSStyleSheet.h>
@@ -468129,6 +468807,7 @@ namespace Web::CSS {
 
 class CSSImportRule;
 class StyleScope;
+struct CachedStyleSheetInvalidationSet;
 struct ShadowRootStylesheetEffects;
 struct StyleCache;
 
@@ -468202,6 +468881,11 @@ public:
     void for_each_owning_style_scope(Function<void(StyleScope&)> const&) const;
     NonnullRefPtr<StyleCache> shared_single_constructed_sheet_style_cache();
     SelectorInsights const& selector_insights() const;
+    CachedStyleSheetInvalidationSet const& cached_style_sheet_invalidation_set() const;
+
+    // Bumped whenever state that shared style caches derive from changes (rule mutations, media match-state flips).
+    // Lets sheet-set style cache registry entries detect staleness at lookup time.
+    u64 shared_style_cache_generation() const { return m_shared_style_cache_generation; }
 
     Optional<Utf16FlyString> default_namespace() const;
     GC::Ptr<CSSNamespaceRule> default_namespace_rule() const { return m_default_namespace_rule; }
@@ -468263,7 +468947,9 @@ private:
     bool m_disallow_modification { false };
     Optional<bool> m_did_match;
     mutable Optional<SelectorInsights> m_selector_insights;
+    mutable OwnPtr<CachedStyleSheetInvalidationSet> m_cached_style_sheet_invalidation_set;
     RefPtr<StyleCache> m_shared_single_constructed_sheet_style_cache;
+    u64 m_shared_style_cache_generation { 0 };
 
     Vector<Subresource&> m_critical_subresources;
 
@@ -484664,13 +485350,12 @@ static void invalidate_style_of_elements_affected_by_pending_has_mutations(Style
     };
 
     auto& counters = style_scope.document().style_invalidation_counters();
-    if (!style_scope.has_valid_rule_cache())
-        ++counters.has_invalidation_rule_cache_builds;
 
-    // It's ok to call have_has_selectors() instead of may_have_has_selectors() here and force
-    // rule cache build, because it's going to be built soon anyway, since we could get here
-    // only from update_style().
-    if (!style_scope.have_has_selectors())
+    // NB: Use the may_have variants here so a scope whose rule cache is currently invalid doesn't have to rebuild
+    //     it just to answer the early-out. When the conservative answer is wrong (a sheet has :has() selectors that
+    //     are not currently effective), the ancestor walk below still terminates immediately unless elements carry
+    //     stale :has() scope flags, in which case we over-invalidate, which is safe.
+    if (!style_scope.may_have_has_selectors())
         return;
 
     ++counters.has_ancestor_walk_invocations;
@@ -484692,7 +485377,7 @@ static void invalidate_style_of_elements_affected_by_pending_has_mutations(Style
     GC::OrderedRootHashMap<GC::Ref<DOM::Node>, PendingHasInvalidationMutationFeatures> pending_has_invalidations;
     for (auto& [node, features] : style_scope.m_pending_has_invalidations)
         pending_has_invalidations.set(node, features);
-    bool should_scan_ancestor_siblings = style_scope.have_has_selectors_with_relative_selector_that_has_sibling_combinator();
+    bool should_scan_ancestor_siblings = style_scope.may_have_has_selectors_with_relative_selector_that_has_sibling_combinator();
     for (auto& [node, mutation_features] : pending_has_invalidations) {
         GC::RootHashTable<GC::Ref<DOM::Element>> elements_skipped_by_has_feature_filter;
         GC::RootVector<GC::Ref<DOM::Element>, 16> has_scope_ancestors;
@@ -484720,8 +485405,11 @@ static void invalidate_style_of_elements_affected_by_pending_has_mutations(Style
             ++counters.has_ancestor_walk_visits;
             bool can_skip_unchanged_has_fanout = !element->root().is_shadow_root() && !element->assigned_slot_internal() && !element->is_shadow_host();
             bool should_invalidate_descendants = element->affected_by_has_pseudo_class_in_non_subject_position();
-            if (should_invalidate_descendants && can_skip_unchanged_has_fanout)
+            if (should_invalidate_descendants && can_skip_unchanged_has_fanout) {
+                if (!style_scope.has_valid_rule_cache())
+                    ++counters.has_invalidation_rule_cache_builds;
                 should_invalidate_descendants = has_rule_that_may_be_affected_by_mutation(style_scope, element, mutation_features);
+            }
             if (element->affected_by_has_pseudo_class_in_subject_position() || should_invalidate_descendants) {
                 invalidate_element(element, should_invalidate_descendants ? DescendantHasInvalidation::Yes : DescendantHasInvalidation::No);
             } else {
@@ -484757,20 +485445,22 @@ static void invalidate_style_of_elements_affected_by_pending_has_mutations(Style
 
 void invalidate_style_for_pending_has_mutations(DOM::Document& document)
 {
-    invalidate_style_of_elements_affected_by_pending_has_mutations(document.style_scope());
-    document.for_each_shadow_root([&](auto& shadow_root) {
-        bool has_active_style_sheets = false;
-        shadow_root.for_each_active_css_style_sheet([&](auto&) {
-            has_active_style_sheets = true;
-        });
-        if (!has_active_style_sheets) {
-            // Without shadow stylesheets, this scope cannot contain :has() selectors.
-            // Document-level user rules are handled by the document style scope above.
-            shadow_root.style_scope().m_pending_has_invalidations.clear();
-            return;
-        }
-        invalidate_style_of_elements_affected_by_pending_has_mutations(shadow_root.style_scope());
-    });
+    auto& counters = document.style_invalidation_counters();
+
+    // Only scopes that actually scheduled pending :has() invalidations registered themselves, so we don't have to
+    // iterate every shadow root in the document here. A scope adopted into another document re-registers there
+    // (see StyleScope::node_was_adopted_from), so every scope in this list still belongs to this document.
+    // NB: Keep the taken list rooted: the invalidation below can allocate (rule cache and user stylesheet builds),
+    //     and the member vector we moved out of is no longer visited.
+    GC::RootVector<GC::Ref<DOM::Node>> scopes;
+    scopes.extend(document.take_style_scopes_with_pending_has_invalidations());
+    for (auto& node : scopes) {
+        ++counters.has_flush_scopes_examined;
+        auto& style_scope = node->is_shadow_root()
+            ? as<DOM::ShadowRoot>(*node).style_scope()
+            : document.style_scope();
+        invalidate_style_of_elements_affected_by_pending_has_mutations(style_scope);
+    }
 }
 
 static void schedule_has_invalidation_for_child_list_mutation(DOM::Node& parent, DOM::Node& mutation_root, StyleScope& scope, HasMutationKind kind)
@@ -536407,24 +537097,93 @@ StyleScope::StyleScope(GC::Ref<DOM::Node> node)
 {
 }
 
+bool SheetSetStyleCacheRegistry::entry_is_current(Entry const& entry)
+{
+    for (size_t i = 0; i < entry.sheets.size(); ++i) {
+        if (entry.sheets[i]->shared_style_cache_generation() != entry.sheet_generations[i])
+            return false;
+    }
+    return true;
+}
+
+static u32 hash_sheet_set(Vector<GC::Ref<CSSStyleSheet>> const& sheets)
+{
+    u32 hash = u64_hash(sheets.size());
+    for (auto const& sheet : sheets)
+        hash = pair_int_hash(hash, ptr_hash(sheet.ptr()));
+    return hash;
+}
+
+NonnullRefPtr<StyleCache> SheetSetStyleCacheRegistry::ensure_style_cache_for_sheet_set(Vector<GC::Ref<CSSStyleSheet>> const& sheets)
+{
+    auto hash = hash_sheet_set(sheets);
+    if (auto entries = m_entries_by_hash.get(hash); entries.has_value()) {
+        entries->remove_all_matching([](Entry const& entry) { return !entry_is_current(entry); });
+        for (auto& entry : *entries) {
+            if (entry.sheets == sheets)
+                return entry.style_cache;
+        }
+    }
+
+    // NB: Entries are only revalidated when their bucket is consulted, so purge entries registry-wide on every
+    //     insert: stale ones, and current ones whose cache no longer has any scope using it (the registry holds
+    //     the only reference). Otherwise abandoned sheet sets would keep their sheets and built caches alive
+    //     through visit_edges for the lifetime of the document. Inserts only happen once per distinct sheet set
+    //     and generation, so this walk stays rare.
+    m_entries_by_hash.remove_all_matching([](auto&, Vector<Entry>& entries) {
+        entries.remove_all_matching([](Entry const& entry) { return !entry_is_current(entry) || entry.style_cache->ref_count() == 1; });
+        return entries.is_empty();
+    });
+
+    Entry entry {
+        .sheets = sheets,
+        .sheet_generations = {},
+        .style_cache = StyleCache::create(),
+    };
+    entry.sheet_generations.ensure_capacity(sheets.size());
+    for (auto const& sheet : sheets)
+        entry.sheet_generations.append(sheet->shared_style_cache_generation());
+
+    auto style_cache = entry.style_cache;
+    m_entries_by_hash.ensure(hash).append(move(entry));
+    return style_cache;
+}
+
+void SheetSetStyleCacheRegistry::visit_edges(GC::Cell::Visitor& visitor)
+{
+    for (auto& [hash, entries] : m_entries_by_hash) {
+        for (auto& entry : entries) {
+            visitor.visit(entry.sheets);
+            entry.style_cache->visit_edges(visitor);
+        }
+    }
+}
+
 StyleCache& StyleScope::ensure_style_cache()
 {
     if (m_style_cache)
         return *m_style_cache;
 
-    if (auto* shadow_root = as_if<DOM::ShadowRoot>(*m_node)) {
-        GC::Ptr<CSSStyleSheet> constructed_style_sheet;
-        bool saw_more_than_one_style_sheet = false;
+    if (auto* shadow_root = as_if<DOM::ShadowRoot>(*m_node); shadow_root && !document().page().user_style().has_value()) {
+        Vector<GC::Ref<CSSStyleSheet>> sheets;
+        bool all_sheets_are_constructed = true;
         shadow_root->for_each_active_css_style_sheet([&](CSSStyleSheet& style_sheet) {
-            if (constructed_style_sheet) {
-                saw_more_than_one_style_sheet = true;
-                return;
-            }
-            constructed_style_sheet = style_sheet;
+            if (!style_sheet.constructed())
+                all_sheets_are_constructed = false;
+            else
+                sheets.append(style_sheet);
         });
 
-        if (constructed_style_sheet && !saw_more_than_one_style_sheet && constructed_style_sheet->constructed() && !document().page().user_style().has_value()) {
-            m_style_cache = constructed_style_sheet->shared_single_constructed_sheet_style_cache();
+        if (all_sheets_are_constructed && !sheets.is_empty()) {
+            if (sheets.size() == 1) {
+                m_style_cache = sheets.first()->shared_single_constructed_sheet_style_cache();
+                return *m_style_cache;
+            }
+
+            // OPTIMIZATION: Scopes whose active stylesheets are the same ordered set of constructed sheets can
+            //               share one cache, for the same reason the single-constructed-sheet cache above is
+            //               shareable: the contents only depend on the sheets and document-wide state.
+            m_style_cache = document().sheet_set_style_cache_registry().ensure_style_cache_for_sheet_set(sheets);
             return *m_style_cache;
         }
     }
@@ -536448,6 +537207,8 @@ void StyleScope::build_rule_cache()
     //               the shared cache itself (see CSSStyleSheet::invalidate_shared_style_cache()).
     if (style_cache.rule_cache)
         return;
+
+    ++document().style_invalidation_counters().scope_rule_cache_builds;
 
     style_cache.rule_cache = make<StyleRuleCache>();
     populate_rule_cache(*style_cache.rule_cache);
@@ -537406,11 +538167,6 @@ bool StyleScope::may_have_user_pseudo_class_selectors(PseudoClass pseudo_class) 
     return may_have_user_pseudo_class_selectors;
 }
 
-bool StyleScope::have_has_selectors() const
-{
-    return rule_cache().selector_insights.has_has_selectors;
-}
-
 bool StyleScope::may_have_has_selectors_with_relative_selector_that_has_sibling_combinator() const
 {
     if (!has_valid_rule_cache()) {
@@ -537424,11 +538180,6 @@ bool StyleScope::may_have_has_selectors_with_relative_selector_that_has_sibling_
         return may_have_has_selectors_with_relative_selector_that_has_sibling_combinator;
     }
 
-    return rule_cache().selector_insights.has_has_selectors_with_relative_selector_that_has_sibling_combinator;
-}
-
-bool StyleScope::have_has_selectors_with_relative_selector_that_has_sibling_combinator() const
-{
     return rule_cache().selector_insights.has_has_selectors_with_relative_selector_that_has_sibling_combinator;
 }
 
@@ -537456,6 +538207,27 @@ void StyleScope::for_each_active_css_style_sheet(Function<void(CSS::CSSStyleShee
     }
 }
 
+// The document keeps a list of the scopes with pending :has() invalidations so flushes only examine those. The
+// scope must appear in that list exactly once, so only the transition from an empty pending map registers it.
+void StyleScope::did_schedule_pending_has_invalidation(size_t previous_size)
+{
+    if (previous_size == 0)
+        document().register_style_scope_with_pending_has_invalidations(m_node);
+    document().set_needs_invalidation_of_elements_affected_by_has();
+}
+
+void StyleScope::node_was_adopted_from(DOM::Document& old_document)
+{
+    // Pending :has() invalidations registered this scope with its old document. Move the registration to the new
+    // document so the next flush there picks the scope up; the scheduling paths only register a scope when its
+    // pending map goes from empty to non-empty, so they would never re-register it themselves.
+    if (m_pending_has_invalidations.is_empty())
+        return;
+    old_document.unregister_style_scope_with_pending_has_invalidations(m_node);
+    document().register_style_scope_with_pending_has_invalidations(m_node);
+    document().set_needs_invalidation_of_elements_affected_by_has();
+}
+
 void StyleScope::schedule_ancestors_style_invalidation_due_to_presence_of_has(GC::Ref<DOM::Node> node)
 {
     auto previous_size = m_pending_has_invalidations.size();
@@ -537463,7 +538235,7 @@ void StyleScope::schedule_ancestors_style_invalidation_due_to_presence_of_has(GC
     if (m_pending_has_invalidations.size() == previous_size)
         return;
     mutation_features.is_conservative = true;
-    document().set_needs_invalidation_of_elements_affected_by_has();
+    did_schedule_pending_has_invalidation(previous_size);
 }
 
 static void merge_pending_has_invalidation_mutation_features(PendingHasInvalidationMutationFeatures& target, PendingHasInvalidationMutationFeatures const& source)
@@ -537567,7 +538339,7 @@ void StyleScope::record_pending_has_invalidation_mutation_features(GC::Ref<DOM::
         return;
     }
     existing_features = move(features);
-    document().set_needs_invalidation_of_elements_affected_by_has();
+    did_schedule_pending_has_invalidation(previous_size);
 }
 
 void StyleScope::record_pending_has_invalidation_mutation_features(GC::Ref<DOM::Node> scheduled_node, Vector<CSS::InvalidationSet::Property> const& properties)
@@ -537580,7 +538352,7 @@ void StyleScope::record_pending_has_invalidation_mutation_features(GC::Ref<DOM::
         return;
     }
     existing_features = move(features);
-    document().set_needs_invalidation_of_elements_affected_by_has();
+    did_schedule_pending_has_invalidation(previous_size);
 }
 
 RefPtr<CSS::CounterStyle const> StyleScope::get_registered_counter_style(Utf16FlyString const& name) const
@@ -537759,6 +538531,30 @@ struct StyleCache : public RefCounted<StyleCache> {
     void visit_edges(GC::Cell::Visitor&);
 };
 
+// Shared style caches for shadow-root scopes whose active stylesheets are the same ordered set of constructed
+// sheets. The cache contents only depend on the sheets and document-wide state, so all such scopes can use one
+// cache. Entries are validated against each sheet's shared-style-cache generation at lookup, so rule mutations and
+// media match-state flips (which bump the generation) make stale entries fall away lazily. Entries whose cache no
+// scope uses anymore get purged on insert, so abandoned sheet sets don't pin their caches for the document's
+// lifetime.
+class SheetSetStyleCacheRegistry {
+public:
+    NonnullRefPtr<StyleCache> ensure_style_cache_for_sheet_set(Vector<GC::Ref<CSSStyleSheet>> const& sheets);
+
+    void visit_edges(GC::Cell::Visitor&);
+
+private:
+    struct Entry {
+        Vector<GC::Ref<CSSStyleSheet>> sheets;
+        Vector<u64> sheet_generations;
+        NonnullRefPtr<StyleCache> style_cache;
+    };
+
+    static bool entry_is_current(Entry const&);
+
+    HashMap<u32, Vector<Entry>> m_entries_by_hash;
+};
+
 // A pure insertion cannot change interaction pseudo-class matching (:hover, :focus, etc): freshly inserted nodes
 // never carry such state, and inserting a node cannot flip it on existing elements. Removals and moves can relocate
 // interaction state, so they stay conservative.
@@ -537821,9 +538617,7 @@ public:
     [[nodiscard]] bool may_have_has_selectors() const;
     [[nodiscard]] bool may_have_user_has_selectors() const;
     [[nodiscard]] bool may_have_user_pseudo_class_selectors(PseudoClass) const;
-    [[nodiscard]] bool have_has_selectors() const;
     [[nodiscard]] bool may_have_has_selectors_with_relative_selector_that_has_sibling_combinator() const;
-    [[nodiscard]] bool have_has_selectors_with_relative_selector_that_has_sibling_combinator() const;
     [[nodiscard]] bool have_size_container_queries() const;
 
     void for_each_active_css_style_sheet(Function<void(CSS::CSSStyleSheet&)> const& callback) const;
@@ -537835,6 +538629,8 @@ public:
     void schedule_ancestors_style_invalidation_due_to_presence_of_has(GC::Ref<DOM::Node>);
     void record_pending_has_invalidation_mutation_features(GC::Ref<DOM::Node>, GC::Ref<DOM::Node>, bool includes_descendants, HasMutationKind);
     void record_pending_has_invalidation_mutation_features(GC::Ref<DOM::Node>, Vector<CSS::InvalidationSet::Property> const&);
+    void did_schedule_pending_has_invalidation(size_t previous_size);
+    void node_was_adopted_from(DOM::Document& old_document);
 
     template<typename T>
     Optional<T> dereference_global_tree_scoped_reference(Function<Optional<T>(StyleScope const&)> const& callback) const;
@@ -538790,6 +539586,43 @@ static bool rule_requires_broad_add_or_remove_invalidation(CSSRule const& rule)
     return false;
 }
 
+void StyleSheetInvalidationSet::visit_edges(GC::Cell::Visitor& visitor) const
+{
+    for (auto const& rule : pseudo_element_rules)
+        visitor.visit(rule.style_sheet_for_rule);
+    for (auto const& rule : trailing_universal_rules)
+        visitor.visit(rule.style_sheet_for_rule);
+}
+
+CachedStyleSheetInvalidationSet const& CSSStyleSheet::cached_style_sheet_invalidation_set() const
+{
+    if (m_cached_style_sheet_invalidation_set)
+        return *m_cached_style_sheet_invalidation_set;
+
+    if (auto document = owning_document())
+        ++document->style_invalidation_counters().style_sheet_invalidation_set_builds;
+
+    // OPTIMIZATION: Build the targeted invalidation set, check for broad-invalidation-triggering rule kinds, and
+    //               collect @keyframes names in a single walk over the sheet's effective rules, so the sheet's
+    //               @media gates evaluate once and every rule is visited once.
+    auto cached = make<CachedStyleSheetInvalidationSet>();
+    for_each_effective_rule(TraversalOrder::Preorder, [&](CSSRule const& rule) {
+        // Add/remove invalidation still has to look at effective non-style rules such as @keyframes or @layer, but
+        // inactive top-level media sheets should contribute nothing at all here.
+        if (!cached->contains_broad_invalidation_rule && rule_requires_broad_add_or_remove_invalidation(rule))
+            cached->contains_broad_invalidation_rule = true;
+        if (auto const* keyframes_rule = as_if<CSSKeyframesRule>(rule))
+            cached->keyframes_names.append(keyframes_rule->name());
+        if (cached->invalidation_set.invalidation_set.needs_invalidate_whole_subtree())
+            return;
+        if (auto const* style_rule = as_if<CSSStyleRule>(rule))
+            extend_style_sheet_invalidation_set_with_style_rule(cached->invalidation_set, *style_rule);
+    });
+
+    m_cached_style_sheet_invalidation_set = move(cached);
+    return *m_cached_style_sheet_invalidation_set;
+}
+
 void invalidate_style_for_stylesheet_change(DOM::Node& document_or_shadow_root, CSSStyleSheet const& sheet, DOM::StyleInvalidationReason reason)
 {
     if (sheet.rules().length() == 0) {
@@ -538811,32 +539644,25 @@ void invalidate_style_for_stylesheet_change(DOM::Node& document_or_shadow_root, 
         return;
     }
 
-    // OPTIMIZATION: Build the targeted invalidation set and check for broad-invalidation-triggering rule kinds in
-    //               a single walk over the sheet's effective rules, so the sheet's @media gates evaluate once and
-    //               every rule is visited once instead of twice.
-    StyleSheetInvalidationSet invalidation_set_result;
-    bool sheet_contains_broad_invalidation_rule = false;
-    sheet.for_each_effective_rule(TraversalOrder::Preorder, [&](CSSRule const& rule) {
-        // Add/remove invalidation still has to look at effective non-style rules such as @keyframes or @layer, but
-        // inactive top-level media sheets should contribute nothing at all here.
-        if (!sheet_contains_broad_invalidation_rule && rule_requires_broad_add_or_remove_invalidation(rule))
-            sheet_contains_broad_invalidation_rule = true;
-        if (invalidation_set_result.invalidation_set.needs_invalidate_whole_subtree())
-            return;
-        if (auto const* style_rule = as_if<CSSStyleRule>(rule))
-            extend_style_sheet_invalidation_set_with_style_rule(invalidation_set_result, *style_rule);
-    });
+    auto const& cached = sheet.cached_style_sheet_invalidation_set();
 
-    bool requires_broad_invalidation = invalidation_set_result.invalidation_set.needs_invalidate_whole_subtree()
-        || sheet_contains_broad_invalidation_rule;
-    add_shadow_root_stylesheet_effects_for_broad_invalidation(document_or_shadow_root, invalidation_set_result, requires_broad_invalidation);
+    bool requires_broad_invalidation = cached.invalidation_set.invalidation_set.needs_invalidate_whole_subtree()
+        || cached.contains_broad_invalidation_rule;
+    if (requires_broad_invalidation) {
+        // The broad path only consults the shadow-escape flags of the set, so merge the scope's current reach into
+        // a copy of those flags instead of mutating the cached set.
+        StyleSheetInvalidationSet broad_effects;
+        broad_effects.merge_shadow_escape_flags_from(cached.invalidation_set);
+        add_shadow_root_stylesheet_effects_for_broad_invalidation(document_or_shadow_root, broad_effects, true);
+        invalidate_root_for_style_sheet_change(document_or_shadow_root, broad_effects, reason, true);
+    } else {
+        invalidate_root_for_style_sheet_change(document_or_shadow_root, cached.invalidation_set, reason, false);
+    }
 
-    invalidate_root_for_style_sheet_change(document_or_shadow_root, invalidation_set_result, reason, requires_broad_invalidation);
-
-    // OPTIMIZATION: Walk @keyframes rules in the new sheet and dirty only the elements that already
-    //               reference each animation-name, so a sheet add carrying @keyframes does not have
-    //               to escalate to a whole-subtree restyle.
-    invalidate_root_for_keyframes_rules_in_sheet(document_or_shadow_root, sheet);
+    // OPTIMIZATION: Dirty only the elements that already reference each @keyframes animation-name in the sheet, so
+    //               a sheet add carrying @keyframes does not have to escalate to a whole-subtree restyle.
+    for (auto const& animation_name : cached.keyframes_names)
+        invalidate_root_for_keyframes_rule(document_or_shadow_root, animation_name);
 }
 
 void invalidate_owners_for_inserted_style_rule(CSSStyleSheet const& style_sheet, CSSStyleRule const& style_rule, DOM::StyleInvalidationReason reason)
@@ -539096,16 +539922,6 @@ void invalidate_root_for_keyframes_rule(DOM::Node& root, Utf16FlyString const& a
         });
 }
 
-void invalidate_root_for_keyframes_rules_in_sheet(DOM::Node& root, CSSStyleSheet const& sheet)
-{
-    sheet.for_each_effective_rule(TraversalOrder::Preorder, [&](CSSRule const& rule) {
-        auto const* keyframes_rule = as_if<CSSKeyframesRule>(rule);
-        if (!keyframes_rule)
-            return;
-        invalidate_root_for_keyframes_rule(root, keyframes_rule->name());
-    });
-}
-
 void invalidate_owners_for_inserted_keyframes_rule(CSSStyleSheet const& style_sheet, CSSKeyframesRule const& keyframes_rule)
 {
     for (auto& document_or_shadow_root : style_sheet.owning_documents_or_shadow_roots()) {
@@ -539136,6 +539952,7 @@ FILE: Libraries/LibWeb/CSS/StyleSheetInvalidation.h
 #include <AK/RefPtr.h>
 #include <AK/Utf16FlyString.h>
 #include <AK/Vector.h>
+#include <LibGC/Cell.h>
 #include <LibGC/Ptr.h>
 #include <LibWeb/CSS/Selector.h>
 #include <LibWeb/CSS/StyleInvalidationData.h>
@@ -539153,6 +539970,15 @@ struct StyleSheetInvalidationSet {
     bool may_match_light_dom_under_shadow_host { false };
     bool may_match_light_dom_outside_shadow_host { false };
 
+    // The broad add/remove invalidation path only consults the shadow-escape flags, so it merges just these into a
+    // fresh set instead of copying (or mutating) a whole cached set.
+    void merge_shadow_escape_flags_from(StyleSheetInvalidationSet const& other)
+    {
+        may_match_shadow_host |= other.may_match_shadow_host;
+        may_match_light_dom_under_shadow_host |= other.may_match_light_dom_under_shadow_host;
+        may_match_light_dom_outside_shadow_host |= other.may_match_light_dom_outside_shadow_host;
+    }
+
     struct PseudoElementInvalidationRule {
         InvalidationSet anchor_set;
         RefPtr<Selector> anchor_selector;
@@ -539166,6 +539992,17 @@ struct StyleSheetInvalidationSet {
     };
     Vector<PseudoElementInvalidationRule> pseudo_element_rules;
     Vector<TrailingUniversalInvalidationRule> trailing_universal_rules;
+
+    void visit_edges(GC::Cell::Visitor&) const;
+};
+
+// Cached result of walking a sheet's effective rules to derive its add/remove invalidation behavior. It depends only
+// on the sheet's own effective rules, so it lives on the CSSStyleSheet and is dropped alongside the sheet's other
+// shared caches when rules mutate or media match states change.
+struct CachedStyleSheetInvalidationSet {
+    StyleSheetInvalidationSet invalidation_set;
+    bool contains_broad_invalidation_rule { false };
+    Vector<Utf16FlyString> keyframes_names;
 };
 
 struct ShadowRootStylesheetEffects {
@@ -539246,13 +540083,6 @@ void invalidate_owners_for_inserted_style_rule(CSSStyleSheet const& style_sheet,
 // Apply a targeted invalidation to all documents and shadow roots that own `style_sheet` in response to inserting
 // `keyframes_rule` into it. Only elements already referencing the inserted animation-name are dirtied.
 void invalidate_owners_for_inserted_keyframes_rule(CSSStyleSheet const& style_sheet, CSSKeyframesRule const& keyframes_rule);
-
-// For every @keyframes rule contained in `sheet`, dirty only the elements (and pseudo-elements) under `root` that
-// already reference the keyframes name. When `root` is a shadow root, the walk also fans out to the shadow host (and
-// host-side light DOM) if any active rule in the same scope can match those nodes via :host or ::slotted(...). Used
-// by the sheet add/remove paths so a sheet that contains @keyframes does not have to fall back to a whole-subtree
-// invalidation.
-void invalidate_root_for_keyframes_rules_in_sheet(DOM::Node& root, CSSStyleSheet const& sheet);
 
 // Dirty only the elements (and pseudo-elements) under `root` that already reference `animation_name`. When `root` is
 // a shadow root, the walk also fans out to the shadow host side if active rules in the same scope can match there.
@@ -559527,6 +560357,7 @@ FILE: Libraries/LibWeb/CSS/UpdateStyle.cpp
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/Node.h>
+#include <LibWeb/DOM/PseudoElement.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/HTML/HTMLSlotElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
@@ -559840,6 +560671,15 @@ static void push_style_update_frame_for_child(GC::ConservativeVector<StyleUpdate
     return root_invalidation;
 }
 
+// The pending :has() flush is triggered by a document-level flag rather than the style invalidator queue, so
+// update_style() and the targeted path in update_style_for_element() have to consume it the same way. Keep that
+// in one place so the two paths cannot drift apart.
+static void flush_pending_has_invalidations(DOM::Document& document)
+{
+    if (document.consume_needs_invalidation_of_elements_affected_by_has())
+        Invalidation::invalidate_style_for_pending_has_mutations(document);
+}
+
 void update_style(DOM::Document& document)
 {
     // NOTE: If our parent document needs a relayout, we must do that *first*. This is required as it may cause the
@@ -559859,8 +560699,7 @@ void update_style(DOM::Document& document)
     // style change event. [CSS-Transitions-2]
     document.increment_transition_generation();
 
-    if (document.consume_needs_invalidation_of_elements_affected_by_has())
-        Invalidation::invalidate_style_for_pending_has_mutations(document);
+    flush_pending_has_invalidations(document);
 
     if (!document.style_invalidator().has_pending_invalidations() && !document.needs_full_style_update() && !document.needs_style_update() && !document.child_needs_style_update() && !document.needs_media_rule_evaluation())
         return;
@@ -559947,6 +560786,16 @@ ComputedProperties const* update_style_for_element(DOM::Document& document, DOM:
     // element on the path back down to the target. Normal mode also re-cascades the target path under display:none
     // ancestors, because the regular document traversal may leave those descendants stale.
 
+    // Element-backed pseudo-elements read their computed style from the element that backs them (for example,
+    // ::details-content reads from the slot inside the details element's UA shadow tree). Point the targeted walk
+    // at the backing element: the originating element's inheritance chain wouldn't include its dirty bits.
+    if (abstract_element.pseudo_element().has_value() && is_element_reference_pseudo_element(*abstract_element.pseudo_element())) {
+        if (auto pseudo_element = abstract_element.element().get_pseudo_element(*abstract_element.pseudo_element()); pseudo_element.has_value()) {
+            if (auto const* element_reference = as_if<DOM::ElementReferencePseudoElement>(*pseudo_element))
+                return update_style_for_element(document, DOM::AbstractElement { element_reference->referenced_element() }, mode);
+        }
+    }
+
     if (auto navigable = document.navigable(); navigable && navigable->container() && &navigable->container()->document() != &document)
         navigable->container()->document().update_layout(DOM::UpdateLayoutReason::ChildDocumentStyleUpdate);
 
@@ -559955,17 +560804,31 @@ ComputedProperties const* update_style_for_element(DOM::Document& document, DOM:
 
         document.update_animated_style_if_needed();
 
-        // Media query evaluation can enqueue normal style invalidations, so do it before deciding whether the full
-        // style traversal needs to run.
+        // Media query evaluation can enqueue normal style invalidations, so do it before deciding what pending
+        // invalidation work needs to run.
         if (document.needs_media_rule_evaluation())
             document.evaluate_media_rules_for_style_update();
 
-        if (!document.is_running_update_layout()
-            && (document.needs_full_style_update()
-                || document.needs_invalidation_of_elements_affected_by_has()
-                || document.style_invalidator().has_pending_invalidations()
-                || document.needs_style_update())) {
-            update_style(document);
+        if (!document.is_running_update_layout()) {
+            if (document.needs_full_style_update()) {
+                // A full style update bypasses per-node dirty bits, so the targeted path below can't tell which
+                // ancestors are stale; run the whole traversal.
+                update_style(document);
+            } else {
+                // Pending invalidations only mark elements dirty. Flush them so the inheritance-chain walk below
+                // sees correct dirty bits, without recomputing style for every dirty element in the document the
+                // way a full update_style() would. Elements outside the chain stay dirty until the next regular
+                // style update. The chain recompute below is still a style change event, so it gets a fresh
+                // transition generation just like the full update_style() it replaces. [CSS-Transitions-2]
+                document.increment_transition_generation();
+                flush_pending_has_invalidations(document);
+                // NB: Unlike update_style(), the invalidator only needs to run when its queue is non-empty: the
+                //     unconditional walk it would otherwise do just propagates entire-subtree dirty flags, which
+                //     the inheritance-chain walk below already checks on the path.
+                if (document.style_invalidator().has_pending_invalidations())
+                    document.style_invalidator().invalidate(document);
+                document.build_registered_properties_cache_for_style_update();
+            }
         }
     }
 
@@ -564138,6 +565001,8 @@ void Document::visit_edges(Cell::Visitor& visitor)
 
     visitor.visit(m_adopted_style_sheets);
     visitor.visit(m_script_blocking_style_sheet_set);
+    visitor.visit(m_style_scopes_with_pending_has_invalidations);
+    m_sheet_set_style_cache_registry.visit_edges(visitor);
 
     visitor.visit(m_active_view_transition);
     visitor.visit(m_dynamic_view_transition_style_sheet);
@@ -567881,6 +568746,17 @@ void Document::schedule_html_parser_end_check()
         m_html_parser_end_state->schedule_progress_check();
     if (m_parser)
         m_parser->schedule_resume_check();
+
+    // NB: Whatever unblocked this document's load event may also have been the last thing delaying the load event of
+    //     an ancestor document, since NavigableContainer::currently_delays_the_load_event() considers everything that
+    //     delays the load event of a container's active document. Wake ancestor parser end states so they notice.
+    //     This implements the re-evaluation implied by "the end" step 8, which spins the event loop until there is
+    //     nothing that delays the load event in the ancestor's document. Repeated wake-ups within one event loop
+    //     turn coalesce into a single deferred progress check via HTMLParserEndState::m_check_pending.
+    if (auto navigable = this->navigable()) {
+        if (auto container = navigable->container())
+            container->document().schedule_html_parser_end_check();
+    }
 }
 
 void Document::set_ready_for_post_load_tasks(bool ready)
@@ -573510,6 +574386,25 @@ public:
         return true;
     }
 
+    // Style scopes (the document or shadow roots) that have scheduled pending :has() invalidations, so flushing
+    // doesn't have to iterate every scope in the document.
+    void register_style_scope_with_pending_has_invalidations(Node& document_or_shadow_root)
+    {
+        m_style_scopes_with_pending_has_invalidations.append(document_or_shadow_root);
+    }
+
+    void unregister_style_scope_with_pending_has_invalidations(Node& document_or_shadow_root)
+    {
+        m_style_scopes_with_pending_has_invalidations.remove_first_matching([&](auto const& node) { return node.ptr() == &document_or_shadow_root; });
+    }
+
+    [[nodiscard]] Vector<GC::Ref<Node>> take_style_scopes_with_pending_has_invalidations()
+    {
+        return move(m_style_scopes_with_pending_has_invalidations);
+    }
+
+    CSS::SheetSetStyleCacheRegistry& sheet_set_style_cache_registry() { return m_sheet_set_style_cache_registry; }
+
     // Test-only counters for observing style invalidation and recomputation work. See Internals.idl.
     struct StyleInvalidationCounters {
         u64 has_ancestor_walk_invocations { 0 };
@@ -573517,6 +574412,7 @@ public:
         u64 has_ancestor_sibling_element_checks { 0 };
         u64 has_invalidation_metadata_candidates { 0 };
         u64 has_invalidation_rule_cache_builds { 0 };
+        u64 has_flush_scopes_examined { 0 };
         u64 has_match_invocations { 0 };
         u64 has_result_cache_hits { 0 };
         u64 has_result_cache_misses { 0 };
@@ -573530,6 +574426,8 @@ public:
         u64 descendant_slot_invalidation_subtree_scans { 0 };
         u64 media_rule_evaluations { 0 };
         u64 registered_properties_cache_rebuilds { 0 };
+        u64 style_sheet_invalidation_set_builds { 0 };
+        u64 scope_rule_cache_builds { 0 };
     };
     StyleInvalidationCounters& style_invalidation_counters() const { return m_style_invalidation_counters; }
     void reset_style_invalidation_counters() const;
@@ -574156,6 +575054,8 @@ private:
     bool m_needs_accumulated_visual_contexts_update { false };
     Vector<WeakPtr<Painting::Paintable>> m_paintable_boxes_needing_visual_context_value_update;
     bool m_needs_invalidation_of_elements_affected_by_has { false };
+    Vector<GC::Ref<Node>> m_style_scopes_with_pending_has_invalidations;
+    CSS::SheetSetStyleCacheRegistry m_sheet_set_style_cache_registry;
     RefPtr<Painting::HitTestDisplayList> m_hit_test_display_list;
     Optional<CSSPixelRect> m_caret_hit_test_debug_rect;
 
@@ -574600,6 +575500,12 @@ DocumentLoadEventDelayer::DocumentLoadEventDelayer(DocumentLoadEventDelayer&& de
 
 DocumentLoadEventDelayer& DocumentLoadEventDelayer::operator=(DocumentLoadEventDelayer&& delayer)
 {
+    if (this == &delayer)
+        return *this;
+
+    if (m_document)
+        m_document->decrement_number_of_things_delaying_the_load_event({});
+
     m_document = move(delayer.m_document);
     delayer.m_document = nullptr;
 
@@ -575358,6 +576264,26 @@ void DocumentObserver::set_document(GC::Ref<Document> document)
     document->register_document_observer({}, *this);
 }
 
+void DocumentObserver::retarget_for_adoption(GC::Ref<Document> new_document)
+{
+    bool was_fully_active = m_document->is_fully_active();
+    set_document(new_document);
+    bool is_fully_active = new_document->is_fully_active();
+
+    // NB: If the observed element moved between a fully active document and a document that is not fully active,
+    //     synthesize the matching activity transition, so that observers see the same sequence of transitions as if
+    //     the element had stayed put and its document had changed activity.
+    if (was_fully_active == is_fully_active)
+        return;
+    if (is_fully_active) {
+        if (m_document_became_active)
+            m_document_became_active->function()();
+    } else {
+        if (m_document_became_inactive)
+            m_document_became_inactive->function()();
+    }
+}
+
 void DocumentObserver::set_document_became_active(Function<void()> callback)
 {
     if (callback)
@@ -575454,6 +576380,10 @@ public:
 
     GC::Ref<Document> document() { return m_document; }
     void set_document(GC::Ref<Document>);
+
+    // Retargets this observer to the observed element's new document and synthesizes a became-active or
+    // became-inactive callback if the old and new documents differ in fully-active state.
+    void retarget_for_adoption(GC::Ref<Document>);
 
 private:
     explicit DocumentObserver(JS::Realm&, Document&);
@@ -595809,6 +596739,18 @@ void ShadowRoot::finalize()
     document().unregister_shadow_root({}, *this);
 }
 
+void ShadowRoot::adopted_from(Document& old_document)
+{
+    Base::adopted_from(old_document);
+
+    // The document tracks its shadow roots for document-wide walks (media invalidation, user style changes,
+    // tree-scoped name lookups), so adoption has to move this shadow root to the new document's list.
+    old_document.unregister_shadow_root({}, *this);
+    document().register_shadow_root({}, *this);
+
+    m_style_scope.node_was_adopted_from(old_document);
+}
+
 // https://fullscreen.spec.whatwg.org/#dom-document-fullscreenelement
 GC::Ptr<Element> ShadowRoot::fullscreen_element_for_bindings() const
 {
@@ -596271,6 +597213,7 @@ private:
     // ^Node
     virtual Utf16FlyString node_name() const override { return "#shadow-root"_utf16_fly_string; }
     virtual bool is_shadow_root() const final { return true; }
+    virtual void adopted_from(Document&) override;
 
     void calculate_part_element_map();
 
@@ -616976,7 +617919,7 @@ private:
     // https://fetch.spec.whatwg.org/#fetch-controller-report-timing-steps
     // serialized abort reason (default null)
     //     Null or a Record (result of StructuredSerialize).
-    Optional<HTML::SerializationRecord> m_serialized_abort_reason;
+    Optional<HTML::IPCSerializationRecord> m_serialized_abort_reason;
 
     // https://fetch.spec.whatwg.org/#fetch-controller-next-manual-redirect-steps
     // next manual redirect steps (default null)
@@ -622491,6 +623434,7 @@ FILE: Libraries/LibWeb/FileAPI/Blob.cpp
  */
 
 #include <AK/GenericLexer.h>
+#include <AK/Utf16String.h>
 #include <LibJS/Runtime/ArrayBuffer.h>
 #include <LibJS/Runtime/Completion.h>
 #include <LibJS/Runtime/TypedArray.h>
@@ -622640,13 +623584,13 @@ void Blob::initialize(JS::Realm& realm)
     Base::initialize(realm);
 }
 
-WebIDL::ExceptionOr<void> Blob::serialization_steps(HTML::TransferDataEncoder& serialized, bool, HTML::SerializationMemory&)
+WebIDL::ExceptionOr<void> Blob::serialization_steps(HTML::StructuredSerializeWriter& serialized, bool, HTML::SerializationMemory&)
 {
     //  FIXME: 1. Set serialized.[[SnapshotState]] to value’s snapshot state.
 
     // NON-STANDARD: FileAPI spec doesn't specify that type should be serialized, although
     //               to be conformant with other browsers this needs to be serialized.
-    serialized.encode(m_type);
+    serialized.encode(Utf16String::from_utf8(m_type));
 
     // 2. Set serialized.[[ByteSequence]] to value’s underlying byte sequence.
     serialized.encode(m_byte_buffer);
@@ -622654,7 +623598,7 @@ WebIDL::ExceptionOr<void> Blob::serialization_steps(HTML::TransferDataEncoder& s
     return {};
 }
 
-WebIDL::ExceptionOr<void> Blob::deserialization_steps(HTML::TransferDataDecoder& serialized, HTML::DeserializationMemory&)
+WebIDL::ExceptionOr<void> Blob::deserialization_steps(HTML::StructuredSerializeReader& serialized, HTML::DeserializationMemory&)
 {
     auto& realm = this->realm();
 
@@ -622662,10 +623606,10 @@ WebIDL::ExceptionOr<void> Blob::deserialization_steps(HTML::TransferDataDecoder&
 
     // NON-STANDARD: FileAPI spec doesn't specify that type should be deserialized, although
     //               to be conformant with other browsers this needs to be deserialized.
-    m_type = serialized.decode<String>();
+    m_type = TRY(HTML::decode_utf8_text_or_throw_data_clone_error(realm, serialized));
 
     // 2. Set value’s underlying byte sequence to serialized.[[ByteSequence]].
-    m_byte_buffer = TRY(serialized.decode_buffer(realm));
+    m_byte_buffer = TRY(HTML::decode_or_throw_data_clone_error<ByteBuffer>(realm, serialized));
 
     return {};
 }
@@ -623002,8 +623946,8 @@ public:
 
     GC::Ref<Streams::ReadableStream> get_stream();
 
-    virtual WebIDL::ExceptionOr<void> serialization_steps(HTML::TransferDataEncoder&, bool for_storage, HTML::SerializationMemory&) override;
-    virtual WebIDL::ExceptionOr<void> deserialization_steps(HTML::TransferDataDecoder&, HTML::DeserializationMemory&) override;
+    virtual WebIDL::ExceptionOr<void> serialization_steps(HTML::StructuredSerializeWriter&, bool for_storage, HTML::SerializationMemory&) override;
+    virtual WebIDL::ExceptionOr<void> deserialization_steps(HTML::StructuredSerializeReader&, HTML::DeserializationMemory&) override;
 
 protected:
     Blob(JS::Realm&, ByteBuffer, String type);
@@ -623265,6 +624209,7 @@ FILE: Libraries/LibWeb/FileAPI/File.cpp
  */
 
 #include <AK/Time.h>
+#include <AK/Utf16String.h>
 #include <LibJS/Runtime/Completion.h>
 #include <LibWeb/Bindings/File.h>
 #include <LibWeb/Bindings/Intrinsics.h>
@@ -623348,19 +624293,19 @@ WebIDL::ExceptionOr<GC::Ref<File>> File::construct_impl(JS::Realm& realm, BlobPa
     return create(realm, file_bits, file_name, options);
 }
 
-WebIDL::ExceptionOr<void> File::serialization_steps(HTML::TransferDataEncoder& serialized, bool, HTML::SerializationMemory&)
+WebIDL::ExceptionOr<void> File::serialization_steps(HTML::StructuredSerializeWriter& serialized, bool, HTML::SerializationMemory&)
 {
     // FIXME: 1. Set serialized.[[SnapshotState]] to value’s snapshot state.
 
     // NON-STANDARD: FileAPI spec doesn't specify that type should be serialized, although
     //               to be conformant with other browsers this needs to be serialized.
-    serialized.encode(m_type);
+    serialized.encode(Utf16String::from_utf8(m_type));
 
     // 2. Set serialized.[[ByteSequence]] to value’s underlying byte sequence.
     serialized.encode(m_byte_buffer);
 
     // 3. Set serialized.[[Name]] to the value of value’s name attribute.
-    serialized.encode(m_name);
+    serialized.encode(Utf16String::from_utf8(m_name));
 
     // 4. Set serialized.[[LastModified]] to the value of value’s lastModified attribute.
     serialized.encode(m_last_modified);
@@ -623368,7 +624313,7 @@ WebIDL::ExceptionOr<void> File::serialization_steps(HTML::TransferDataEncoder& s
     return {};
 }
 
-WebIDL::ExceptionOr<void> File::deserialization_steps(HTML::TransferDataDecoder& serialized, HTML::DeserializationMemory&)
+WebIDL::ExceptionOr<void> File::deserialization_steps(HTML::StructuredSerializeReader& serialized, HTML::DeserializationMemory&)
 {
     auto& realm = this->realm();
 
@@ -623376,16 +624321,16 @@ WebIDL::ExceptionOr<void> File::deserialization_steps(HTML::TransferDataDecoder&
 
     // NON-STANDARD: FileAPI spec doesn't specify that type should be deserialized, although
     //               to be conformant with other browsers this needs to be deserialized.
-    m_type = serialized.decode<String>();
+    m_type = TRY(HTML::decode_utf8_text_or_throw_data_clone_error(realm, serialized));
 
     // 2. Set value’s underlying byte sequence to serialized.[[ByteSequence]].
-    m_byte_buffer = TRY(serialized.decode_buffer(realm));
+    m_byte_buffer = TRY(HTML::decode_or_throw_data_clone_error<ByteBuffer>(realm, serialized));
 
     // 3. Initialize the value of value’s name attribute to serialized.[[Name]].
-    m_name = serialized.decode<String>();
+    m_name = TRY(HTML::decode_utf8_text_or_throw_data_clone_error(realm, serialized));
 
     // 4. Initialize the value of value’s lastModified attribute to serialized.[[LastModified]].
-    m_last_modified = serialized.decode<i64>();
+    m_last_modified = TRY(HTML::decode_or_throw_data_clone_error<i64>(realm, serialized));
 
     return {};
 }
@@ -623406,7 +624351,7 @@ FILE: Libraries/LibWeb/FileAPI/File.h
 
 namespace Web::FileAPI {
 
-class File : public Blob {
+class WEB_API File : public Blob {
     WEB_PLATFORM_OBJECT(File, Blob);
     GC_DECLARE_ALLOCATOR(File);
 
@@ -623422,8 +624367,8 @@ public:
     // https://w3c.github.io/FileAPI/#dfn-lastModified
     i64 last_modified() const { return m_last_modified; }
 
-    virtual WebIDL::ExceptionOr<void> serialization_steps(HTML::TransferDataEncoder&, bool for_storage, HTML::SerializationMemory&) override;
-    virtual WebIDL::ExceptionOr<void> deserialization_steps(HTML::TransferDataDecoder&, HTML::DeserializationMemory&) override;
+    virtual WebIDL::ExceptionOr<void> serialization_steps(HTML::StructuredSerializeWriter&, bool for_storage, HTML::SerializationMemory&) override;
+    virtual WebIDL::ExceptionOr<void> deserialization_steps(HTML::StructuredSerializeReader&, HTML::DeserializationMemory&) override;
 
 private:
     File(JS::Realm&, ByteBuffer, String file_name, String type, i64 last_modified);
@@ -623502,31 +624447,33 @@ void FileList::visit_edges(Cell::Visitor& visitor)
     visitor.visit(m_files);
 }
 
-WebIDL::ExceptionOr<void> FileList::serialization_steps(HTML::TransferDataEncoder& serialized, bool for_storage, HTML::SerializationMemory& memory)
+WebIDL::ExceptionOr<void> FileList::serialization_steps(HTML::StructuredSerializeWriter& serialized, bool for_storage, HTML::SerializationMemory& memory)
 {
     auto& vm = this->vm();
 
     // 1. Set serialized.[[Files]] to an empty list.
     // 2. For each file in value, append the sub-serialization of file to serialized.[[Files]].
-    serialized.encode(m_files.size());
+    serialized.encode(static_cast<u64>(m_files.size()));
 
     for (auto file : m_files)
-        serialized.append(TRY(HTML::structured_serialize_internal(vm, file, for_storage, memory)));
+        TRY(HTML::structured_serialize_internal(vm, serialized, file, for_storage, memory));
 
     return {};
 }
 
-WebIDL::ExceptionOr<void> FileList::deserialization_steps(HTML::TransferDataDecoder& serialized, HTML::DeserializationMemory& memory)
+WebIDL::ExceptionOr<void> FileList::deserialization_steps(HTML::StructuredSerializeReader& serialized, HTML::DeserializationMemory& memory)
 {
     auto& vm = this->vm();
     auto& realm = this->realm();
 
     // 1. For each file of serialized.[[Files]], add the sub-deserialization of file to value.
-    auto size = serialized.decode<size_t>();
+    auto size = TRY(HTML::decode_or_throw_data_clone_error<u64>(realm, serialized));
 
-    for (size_t i = 0; i < size; ++i) {
-        auto deserialized = TRY(HTML::structured_deserialize_internal(vm, serialized, realm, memory));
-        m_files.append(as<File>(deserialized.as_object()));
+    for (u64 i = 0; i < size; ++i) {
+        auto file = TRY(HTML::deserialize_nested_as<File>(vm, serialized, realm, memory));
+        // AD-HOC: A hostile count cannot be trusted; grow fallibly so it fails cleanly rather than aborting.
+        if (auto result = m_files.try_append(file); result.is_error())
+            return HTML::data_clone_error_from_serialization_error(realm, result.release_error());
     }
 
     return {};
@@ -623583,8 +624530,8 @@ public:
 
     virtual Optional<JS::Value> item_value(size_t index) const override;
 
-    virtual WebIDL::ExceptionOr<void> serialization_steps(HTML::TransferDataEncoder&, bool for_storage, HTML::SerializationMemory&) override;
-    virtual WebIDL::ExceptionOr<void> deserialization_steps(HTML::TransferDataDecoder&, HTML::DeserializationMemory&) override;
+    virtual WebIDL::ExceptionOr<void> serialization_steps(HTML::StructuredSerializeWriter&, bool for_storage, HTML::SerializationMemory&) override;
+    virtual WebIDL::ExceptionOr<void> deserialization_steps(HTML::StructuredSerializeReader&, HTML::DeserializationMemory&) override;
 
 private:
     explicit FileList(JS::Realm&);
@@ -625248,6 +626195,8 @@ class SharedResourceRequest;
 class SharedWorker;
 class SharedWorkerGlobalScope;
 class Storage;
+class StructuredSerializeReader;
+class StructuredSerializeWriter;
 class SubmitEvent;
 class TextMetrics;
 class TextTrack;
@@ -629155,7 +630104,7 @@ FILE: Libraries/LibWeb/Geometry/DOMMatrix.h
 namespace Web::Geometry {
 
 // https://drafts.fxtf.org/geometry/#dommatrix
-class DOMMatrix : public DOMMatrixReadOnly {
+class WEB_API DOMMatrix : public DOMMatrixReadOnly {
     WEB_PLATFORM_OBJECT(DOMMatrix, DOMMatrixReadOnly);
     GC_DECLARE_ALLOCATOR(DOMMatrix);
 
@@ -629983,7 +630932,7 @@ WebIDL::ExceptionOr<String> DOMMatrixReadOnly::to_string() const
 }
 
 // https://drafts.fxtf.org/geometry/#structured-serialization
-WebIDL::ExceptionOr<void> DOMMatrixReadOnly::serialization_steps(HTML::TransferDataEncoder& serialized, bool, HTML::SerializationMemory&)
+WebIDL::ExceptionOr<void> DOMMatrixReadOnly::serialization_steps(HTML::StructuredSerializeWriter& serialized, bool, HTML::SerializationMemory&)
 {
     serialized.encode(m_is_2d);
 
@@ -630046,22 +630995,28 @@ WebIDL::ExceptionOr<void> DOMMatrixReadOnly::serialization_steps(HTML::TransferD
 }
 
 // https://drafts.fxtf.org/geometry/#structured-serialization
-WebIDL::ExceptionOr<void> DOMMatrixReadOnly::deserialization_steps(HTML::TransferDataDecoder& serialized, HTML::DeserializationMemory&)
+WebIDL::ExceptionOr<void> DOMMatrixReadOnly::deserialization_steps(HTML::StructuredSerializeReader& serialized, HTML::DeserializationMemory&)
 {
-    bool is_2d = serialized.decode<bool>();
+    auto& realm = this->realm();
+
+    auto decode_double = [&]() {
+        return HTML::decode_or_throw_data_clone_error<double>(realm, serialized);
+    };
+
+    bool is_2d = TRY(HTML::decode_or_throw_data_clone_error<bool>(realm, serialized));
 
     // 1. If serialized.[[Is2D]] is true:
     if (is_2d) {
         // 1. Set value’s m11 element to serialized.[[M11]].
-        auto m11 = serialized.decode<double>();
+        auto m11 = TRY(decode_double());
         // 2. Set value’s m12 element to serialized.[[M12]].
-        auto m12 = serialized.decode<double>();
+        auto m12 = TRY(decode_double());
         // 3. Set value’s m13 element to 0.
         // 4. Set value’s m14 element to 0.
         // 5. Set value’s m21 element to serialized.[[M21]].
-        auto m21 = serialized.decode<double>();
+        auto m21 = TRY(decode_double());
         // 6. Set value’s m22 element to serialized.[[M22]].
-        auto m22 = serialized.decode<double>();
+        auto m22 = TRY(decode_double());
         // 7. Set value’s m23 element to 0.
         // 8. Set value’s m24 element to 0.
         // 9. Set value’s m31 element to 0.
@@ -630069,9 +631024,9 @@ WebIDL::ExceptionOr<void> DOMMatrixReadOnly::deserialization_steps(HTML::Transfe
         // 11. Set value’s m33 element to 1.
         // 12. Set value’s m34 element to 0.
         // 13. Set value’s m41 element to serialized.[[M41]].
-        auto m41 = serialized.decode<double>();
+        auto m41 = TRY(decode_double());
         // 14 Set value’s m42 element to serialized.[[M42]].
-        auto m42 = serialized.decode<double>();
+        auto m42 = TRY(decode_double());
         // 15. Set value’s m43 element to 0.
         // 16. Set value’s m44 element to 1.
         // 17. Set value’s is 2D to true.
@@ -630081,37 +631036,37 @@ WebIDL::ExceptionOr<void> DOMMatrixReadOnly::deserialization_steps(HTML::Transfe
     // 2. Otherwise:
     else {
         // 1. Set value’s m11 element to serialized.[[M11]].
-        auto m11 = serialized.decode<double>();
+        auto m11 = TRY(decode_double());
         // 2. Set value’s m12 element to serialized.[[M12]].
-        auto m12 = serialized.decode<double>();
+        auto m12 = TRY(decode_double());
         // 3. Set value’s m13 element to serialized.[[M13]].
-        auto m13 = serialized.decode<double>();
+        auto m13 = TRY(decode_double());
         // 4. Set value’s m14 element to serialized.[[M14]].
-        auto m14 = serialized.decode<double>();
+        auto m14 = TRY(decode_double());
         // 5. Set value’s m21 element to serialized.[[M21]].
-        auto m21 = serialized.decode<double>();
+        auto m21 = TRY(decode_double());
         // 6. Set value’s m22 element to serialized.[[M22]].
-        auto m22 = serialized.decode<double>();
+        auto m22 = TRY(decode_double());
         // 7. Set value’s m23 element to serialized.[[M23]].
-        auto m23 = serialized.decode<double>();
+        auto m23 = TRY(decode_double());
         // 8. Set value’s m24 element to serialized.[[M24]].
-        auto m24 = serialized.decode<double>();
+        auto m24 = TRY(decode_double());
         // 9. Set value’s m31 element to serialized.[[M31]].
-        auto m31 = serialized.decode<double>();
+        auto m31 = TRY(decode_double());
         // 10. Set value’s m32 element to serialized.[[M32]].
-        auto m32 = serialized.decode<double>();
+        auto m32 = TRY(decode_double());
         // 11. Set value’s m33 element to serialized.[[M33]].
-        auto m33 = serialized.decode<double>();
+        auto m33 = TRY(decode_double());
         // 12. Set value’s m34 element to serialized.[[M34]].
-        auto m34 = serialized.decode<double>();
+        auto m34 = TRY(decode_double());
         // 13. Set value’s m41 element to serialized.[[M41]].
-        auto m41 = serialized.decode<double>();
+        auto m41 = TRY(decode_double());
         // 14. Set value’s m42 element to serialized.[[M42]].
-        auto m42 = serialized.decode<double>();
+        auto m42 = TRY(decode_double());
         // 15. Set value’s m43 element to serialized.[[M43]].
-        auto m43 = serialized.decode<double>();
+        auto m43 = TRY(decode_double());
         // 16. Set value’s m44 element to serialized.[[M44]].
-        auto m44 = serialized.decode<double>();
+        auto m44 = TRY(decode_double());
         // 17. Set value’s is 2D to false.
 
         initialize_from_create_3d_matrix(m11, m12, m13, m14, m21, m22, m23, m24, m31, m32, m33, m34, m41, m42, m43, m44);
@@ -630302,7 +631257,7 @@ FILE: Libraries/LibWeb/Geometry/DOMMatrixReadOnly.h
 namespace Web::Geometry {
 
 // https://drafts.fxtf.org/geometry/#dommatrixreadonly
-class DOMMatrixReadOnly
+class WEB_API DOMMatrixReadOnly
     : public Bindings::PlatformObject
     , public Bindings::Serializable {
     WEB_PLATFORM_OBJECT(DOMMatrixReadOnly, Bindings::PlatformObject);
@@ -630369,8 +631324,8 @@ public:
 
     WebIDL::ExceptionOr<String> to_string() const;
 
-    virtual WebIDL::ExceptionOr<void> serialization_steps(HTML::TransferDataEncoder&, bool for_storage, HTML::SerializationMemory&) override;
-    virtual WebIDL::ExceptionOr<void> deserialization_steps(HTML::TransferDataDecoder&, HTML::DeserializationMemory&) override;
+    virtual WebIDL::ExceptionOr<void> serialization_steps(HTML::StructuredSerializeWriter&, bool for_storage, HTML::SerializationMemory&) override;
+    virtual WebIDL::ExceptionOr<void> deserialization_steps(HTML::StructuredSerializeReader&, HTML::DeserializationMemory&) override;
 
 protected:
     DOMMatrixReadOnly(JS::Realm&, double m11, double m12, double m21, double m22, double m41, double m42);
@@ -630680,7 +631635,7 @@ void DOMPointReadOnly::initialize(JS::Realm& realm)
     Base::initialize(realm);
 }
 
-WebIDL::ExceptionOr<void> DOMPointReadOnly::serialization_steps(HTML::TransferDataEncoder& serialized, bool, HTML::SerializationMemory&)
+WebIDL::ExceptionOr<void> DOMPointReadOnly::serialization_steps(HTML::StructuredSerializeWriter& serialized, bool, HTML::SerializationMemory&)
 {
     // 1. Set serialized.[[X]] to value’s x coordinate.
     serialized.encode(m_x);
@@ -630697,19 +631652,21 @@ WebIDL::ExceptionOr<void> DOMPointReadOnly::serialization_steps(HTML::TransferDa
     return {};
 }
 
-WebIDL::ExceptionOr<void> DOMPointReadOnly::deserialization_steps(HTML::TransferDataDecoder& serialized, HTML::DeserializationMemory&)
+WebIDL::ExceptionOr<void> DOMPointReadOnly::deserialization_steps(HTML::StructuredSerializeReader& serialized, HTML::DeserializationMemory&)
 {
+    auto& realm = this->realm();
+
     // 1. Set value’s x coordinate to serialized.[[X]].
-    m_x = serialized.decode<double>();
+    m_x = TRY(HTML::decode_or_throw_data_clone_error<double>(realm, serialized));
 
     // 2. Set value’s y coordinate to serialized.[[Y]].
-    m_y = serialized.decode<double>();
+    m_y = TRY(HTML::decode_or_throw_data_clone_error<double>(realm, serialized));
 
     // 3. Set value’s z coordinate to serialized.[[Z]].
-    m_z = serialized.decode<double>();
+    m_z = TRY(HTML::decode_or_throw_data_clone_error<double>(realm, serialized));
 
     // 4. Set value’s w coordinate to serialized.[[W]].
-    m_w = serialized.decode<double>();
+    m_w = TRY(HTML::decode_or_throw_data_clone_error<double>(realm, serialized));
 
     return {};
 }
@@ -630735,7 +631692,7 @@ FILE: Libraries/LibWeb/Geometry/DOMPointReadOnly.h
 namespace Web::Geometry {
 
 // https://drafts.fxtf.org/geometry/#dompointreadonly
-class DOMPointReadOnly
+class WEB_API DOMPointReadOnly
     : public Bindings::PlatformObject
     , public Bindings::Serializable {
     WEB_PLATFORM_OBJECT(DOMPointReadOnly, Bindings::PlatformObject);
@@ -630756,8 +631713,8 @@ public:
 
     WebIDL::ExceptionOr<GC::Ref<DOMPoint>> matrix_transform(Bindings::DOMMatrixInit&) const;
 
-    virtual WebIDL::ExceptionOr<void> serialization_steps(HTML::TransferDataEncoder&, bool for_storage, HTML::SerializationMemory&) override;
-    virtual WebIDL::ExceptionOr<void> deserialization_steps(HTML::TransferDataDecoder&, HTML::DeserializationMemory&) override;
+    virtual WebIDL::ExceptionOr<void> serialization_steps(HTML::StructuredSerializeWriter&, bool for_storage, HTML::SerializationMemory&) override;
+    virtual WebIDL::ExceptionOr<void> deserialization_steps(HTML::StructuredSerializeReader&, HTML::DeserializationMemory&) override;
 
 protected:
     DOMPointReadOnly(JS::Realm&, double x, double y, double z, double w);
@@ -630919,34 +631876,33 @@ GC::Ref<DOMRect> DOMQuad::get_bounds() const
 }
 
 // https://drafts.fxtf.org/geometry/#structured-serialization
-WebIDL::ExceptionOr<void> DOMQuad::serialization_steps(HTML::TransferDataEncoder& serialized, bool for_storage, HTML::SerializationMemory& memory)
+WebIDL::ExceptionOr<void> DOMQuad::serialization_steps(HTML::StructuredSerializeWriter& serialized, bool for_storage, HTML::SerializationMemory& memory)
 {
     auto& vm = this->vm();
 
     // 1. Set serialized.[[P1]] to the sub-serialization of value’s point 1.
-    serialized.append(TRY(HTML::structured_serialize_internal(vm, m_p1, for_storage, memory)));
+    TRY(HTML::structured_serialize_internal(vm, serialized, m_p1, for_storage, memory));
 
     // 2. Set serialized.[[P2]] to the sub-serialization of value’s point 2.
-    serialized.append(TRY(HTML::structured_serialize_internal(vm, m_p2, for_storage, memory)));
+    TRY(HTML::structured_serialize_internal(vm, serialized, m_p2, for_storage, memory));
 
     // 3. Set serialized.[[P3]] to the sub-serialization of value’s point 3.
-    serialized.append(TRY(HTML::structured_serialize_internal(vm, m_p3, for_storage, memory)));
+    TRY(HTML::structured_serialize_internal(vm, serialized, m_p3, for_storage, memory));
 
     // 4. Set serialized.[[P4]] to the sub-serialization of value’s point 4.
-    serialized.append(TRY(HTML::structured_serialize_internal(vm, m_p4, for_storage, memory)));
+    TRY(HTML::structured_serialize_internal(vm, serialized, m_p4, for_storage, memory));
 
     return {};
 }
 
 // https://drafts.fxtf.org/geometry/#structured-serialization
-WebIDL::ExceptionOr<void> DOMQuad::deserialization_steps(HTML::TransferDataDecoder& serialized, HTML::DeserializationMemory& memory)
+WebIDL::ExceptionOr<void> DOMQuad::deserialization_steps(HTML::StructuredSerializeReader& serialized, HTML::DeserializationMemory& memory)
 {
     auto& vm = this->vm();
     auto& realm = this->realm();
 
     auto deserialize_dom_point = [&](GC::Ref<DOMPoint>& storage) -> WebIDL::ExceptionOr<void> {
-        auto deserialized = TRY(HTML::structured_deserialize_internal(vm, serialized, realm, memory));
-        storage = as<DOMPoint>(deserialized.as_object());
+        storage = TRY(HTML::deserialize_nested_as<DOMPoint>(vm, serialized, realm, memory));
         return {};
     };
 
@@ -630999,7 +631955,7 @@ FILE: Libraries/LibWeb/Geometry/DOMQuad.h
 namespace Web::Geometry {
 
 // https://drafts.fxtf.org/geometry/#domquad
-class DOMQuad
+class WEB_API DOMQuad
     : public Bindings::PlatformObject
     , public Bindings::Serializable {
     WEB_PLATFORM_OBJECT(DOMQuad, Bindings::PlatformObject);
@@ -631021,8 +631977,8 @@ public:
 
     GC::Ref<DOMRect> get_bounds() const;
 
-    virtual WebIDL::ExceptionOr<void> serialization_steps(HTML::TransferDataEncoder&, bool for_storage, HTML::SerializationMemory&) override;
-    virtual WebIDL::ExceptionOr<void> deserialization_steps(HTML::TransferDataDecoder&, HTML::DeserializationMemory&) override;
+    virtual WebIDL::ExceptionOr<void> serialization_steps(HTML::StructuredSerializeWriter&, bool for_storage, HTML::SerializationMemory&) override;
+    virtual WebIDL::ExceptionOr<void> deserialization_steps(HTML::StructuredSerializeReader&, HTML::DeserializationMemory&) override;
 
 private:
     DOMQuad(JS::Realm&, Bindings::DOMPointInit const& p1, Bindings::DOMPointInit const& p2, Bindings::DOMPointInit const& p3, Bindings::DOMPointInit const& p4);
@@ -631138,7 +632094,7 @@ FILE: Libraries/LibWeb/Geometry/DOMRect.h
 namespace Web::Geometry {
 
 // https://drafts.fxtf.org/geometry/#DOMRect
-class DOMRect final : public DOMRectReadOnly {
+class WEB_API DOMRect final : public DOMRectReadOnly {
     WEB_PLATFORM_OBJECT(DOMRect, DOMRectReadOnly);
     GC_DECLARE_ALLOCATOR(DOMRect);
 
@@ -631364,7 +632320,7 @@ void DOMRectReadOnly::initialize(JS::Realm& realm)
 }
 
 // https://drafts.fxtf.org/geometry/#structured-serialization
-WebIDL::ExceptionOr<void> DOMRectReadOnly::serialization_steps(HTML::TransferDataEncoder& serialized, bool, HTML::SerializationMemory&)
+WebIDL::ExceptionOr<void> DOMRectReadOnly::serialization_steps(HTML::StructuredSerializeWriter& serialized, bool, HTML::SerializationMemory&)
 {
     // 1. Set serialized.[[X]] to value’s x coordinate.
     serialized.encode(x());
@@ -631382,19 +632338,21 @@ WebIDL::ExceptionOr<void> DOMRectReadOnly::serialization_steps(HTML::TransferDat
 }
 
 // https://drafts.fxtf.org/geometry/#structured-serialization
-WebIDL::ExceptionOr<void> DOMRectReadOnly::deserialization_steps(HTML::TransferDataDecoder& serialized, HTML::DeserializationMemory&)
+WebIDL::ExceptionOr<void> DOMRectReadOnly::deserialization_steps(HTML::StructuredSerializeReader& serialized, HTML::DeserializationMemory&)
 {
+    auto& realm = this->realm();
+
     // 1. Set value’s x coordinate to serialized.[[X]].
-    auto x = serialized.decode<double>();
+    auto x = TRY(HTML::decode_or_throw_data_clone_error<double>(realm, serialized));
 
     // 2. Set value’s y coordinate to serialized.[[Y]].
-    auto y = serialized.decode<double>();
+    auto y = TRY(HTML::decode_or_throw_data_clone_error<double>(realm, serialized));
 
     // 3. Set value’s width to serialized.[[Width]].
-    auto width = serialized.decode<double>();
+    auto width = TRY(HTML::decode_or_throw_data_clone_error<double>(realm, serialized));
 
     // 4. Set value’s height to serialized.[[Height]].
-    auto height = serialized.decode<double>();
+    auto height = TRY(HTML::decode_or_throw_data_clone_error<double>(realm, serialized));
 
     m_rect = { x, y, width, height };
     return {};
@@ -631421,7 +632379,7 @@ FILE: Libraries/LibWeb/Geometry/DOMRectReadOnly.h
 namespace Web::Geometry {
 
 // https://drafts.fxtf.org/geometry/#domrectreadonly
-class DOMRectReadOnly
+class WEB_API DOMRectReadOnly
     : public Bindings::PlatformObject
     , public Bindings::Serializable {
     WEB_PLATFORM_OBJECT(DOMRectReadOnly, Bindings::PlatformObject);
@@ -631467,8 +632425,8 @@ public:
         return min(x(), x() + width());
     }
 
-    virtual WebIDL::ExceptionOr<void> serialization_steps(HTML::TransferDataEncoder&, bool for_storage, HTML::SerializationMemory&) override;
-    virtual WebIDL::ExceptionOr<void> deserialization_steps(HTML::TransferDataDecoder&, HTML::DeserializationMemory&) override;
+    virtual WebIDL::ExceptionOr<void> serialization_steps(HTML::StructuredSerializeWriter&, bool for_storage, HTML::SerializationMemory&) override;
+    virtual WebIDL::ExceptionOr<void> deserialization_steps(HTML::StructuredSerializeReader&, HTML::DeserializationMemory&) override;
 
 protected:
     DOMRectReadOnly(JS::Realm&, double x, double y, double width, double height);
@@ -635168,7 +636126,7 @@ ErrorOr<Web::HTML::BroadcastChannelMessage> decode(Decoder& decoder)
     auto storage_key = TRY(decoder.decode<Web::StorageAPI::StorageKey>());
     auto channel_name = TRY(decoder.decode<Utf16String>());
     auto source_origin = TRY(decoder.decode<URL::Origin>());
-    auto serialized_message = TRY(decoder.decode<Web::HTML::SerializationRecord>());
+    auto serialized_message = TRY(decoder.decode<Web::HTML::IPCSerializationRecord>());
     auto source_process_id = TRY(decoder.decode<i32>());
     auto source_channel_id = TRY(decoder.decode<u64>());
 
@@ -635207,7 +636165,7 @@ struct WEB_API BroadcastChannelMessage {
     StorageAPI::StorageKey storage_key;
     Utf16String channel_name;
     URL::Origin source_origin;
-    SerializationRecord serialized_message;
+    IPCSerializationRecord serialized_message;
     pid_t source_process_id { -1 };
     u64 source_channel_id { 0 };
 };
@@ -641987,6 +642945,130 @@ void check_if_access_between_two_browsing_contexts_should_be_reported(GC::Ptr<Br
 
 }
 
+FILE: Libraries/LibWeb/HTML/CrossProcessId.cpp
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <LibIPC/Decoder.h>
+#include <LibIPC/Encoder.h>
+#include <LibWeb/HTML/CrossProcessId.h>
+
+namespace IPC {
+
+template<>
+ErrorOr<void> encode(Encoder& encoder, Web::HTML::CrossProcessId const& id)
+{
+    TRY(encoder.encode(id.namespace_id));
+    TRY(encoder.encode(id.local_id));
+    return {};
+}
+
+template<>
+ErrorOr<Web::HTML::CrossProcessId> decode(Decoder& decoder)
+{
+    return Web::HTML::CrossProcessId {
+        .namespace_id = TRY(decoder.decode<u64>()),
+        .local_id = TRY(decoder.decode<u64>()),
+    };
+}
+
+template<>
+ErrorOr<void> encode(Encoder& encoder, Web::HTML::CrossProcessIdAllocator const& allocator)
+{
+    TRY(encoder.encode(allocator.namespace_id));
+    TRY(encoder.encode(allocator.next_local_id));
+    return {};
+}
+
+template<>
+ErrorOr<Web::HTML::CrossProcessIdAllocator> decode(Decoder& decoder)
+{
+    return Web::HTML::CrossProcessIdAllocator {
+        .namespace_id = TRY(decoder.decode<u64>()),
+        .next_local_id = TRY(decoder.decode<u64>()),
+    };
+}
+
+}
+
+FILE: Libraries/LibWeb/HTML/CrossProcessId.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Assertions.h>
+#include <AK/Format.h>
+#include <AK/HashFunctions.h>
+#include <AK/Traits.h>
+#include <AK/Types.h>
+#include <LibIPC/Forward.h>
+#include <LibWeb/Export.h>
+
+namespace Web::HTML {
+
+class CrossProcessId {
+public:
+    u64 namespace_id { 0 };
+    u64 local_id { 0 };
+
+    bool operator==(CrossProcessId const&) const = default;
+};
+
+class CrossProcessIdAllocator {
+public:
+    u64 namespace_id { 0 };
+    u64 next_local_id { 1 };
+
+    CrossProcessId allocate()
+    {
+        VERIFY(namespace_id > 0);
+        VERIFY(next_local_id > 0);
+        return CrossProcessId {
+            .namespace_id = namespace_id,
+            .local_id = next_local_id++,
+        };
+    }
+};
+
+}
+
+template<>
+struct AK::Traits<Web::HTML::CrossProcessId> : public DefaultTraits<Web::HTML::CrossProcessId> {
+    static unsigned hash(Web::HTML::CrossProcessId const& id)
+    {
+        return pair_int_hash(Traits<u64>::hash(id.namespace_id), Traits<u64>::hash(id.local_id));
+    }
+};
+
+namespace IPC {
+
+template<>
+WEB_API ErrorOr<void> encode(Encoder&, Web::HTML::CrossProcessId const&);
+template<>
+WEB_API ErrorOr<Web::HTML::CrossProcessId> decode(Decoder&);
+
+template<>
+WEB_API ErrorOr<void> encode(Encoder&, Web::HTML::CrossProcessIdAllocator const&);
+template<>
+WEB_API ErrorOr<Web::HTML::CrossProcessIdAllocator> decode(Decoder&);
+
+}
+
+template<>
+struct AK::Formatter<Web::HTML::CrossProcessId> : Formatter<FormatString> {
+    ErrorOr<void> format(FormatBuilder& builder, Web::HTML::CrossProcessId const& id)
+    {
+        return Formatter<FormatString>::format(builder, "{}:{}"sv, id.namespace_id, id.local_id);
+    }
+};
+
 FILE: Libraries/LibWeb/HTML/CustomElements/CustomElementDefinition.cpp
 /*
  * Copyright (c) 2024, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
@@ -644993,6 +646075,7 @@ FILE: Libraries/LibWeb/HTML/DocumentState.h
 
 #pragma once
 
+#include <AK/Optional.h>
 #include <AK/RefCounted.h>
 #include <AK/Utf16String.h>
 #include <LibURL/Origin.h>
@@ -645000,7 +646083,7 @@ FILE: Libraries/LibWeb/HTML/DocumentState.h
 #include <LibWeb/Export.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Forward.h>
-#include <LibWeb/HTML/NavigableId.h>
+#include <LibWeb/HTML/CrossProcessId.h>
 #include <LibWeb/HTML/POSTResource.h>
 #include <LibWeb/HTML/SerializedPolicyContainer.h>
 #include <LibWeb/ReferrerPolicy/ReferrerPolicy.h>
@@ -645014,7 +646097,7 @@ public:
     ~DocumentState();
 
     struct NestedHistory {
-        NavigableId id;
+        CrossProcessId id;
         Vector<NonnullRefPtr<SessionHistoryEntry>> entries;
     };
 
@@ -645024,6 +646107,9 @@ public:
 
     [[nodiscard]] Optional<UniqueNodeID> document_id() const { return m_document_id; }
     void set_document_id(Optional<UniqueNodeID> document_id) { m_document_id = document_id; }
+
+    [[nodiscard]] Optional<CrossProcessId> cross_process_id() const { return m_cross_process_id; }
+    void set_cross_process_id(Optional<CrossProcessId> id) { m_cross_process_id = id; }
 
     [[nodiscard]] Variant<SerializedPolicyContainer, Client> const& history_policy_container() const { return m_history_policy_container; }
     void set_history_policy_container(Variant<SerializedPolicyContainer, Client> history_policy_container) { m_history_policy_container = move(history_policy_container); }
@@ -645065,6 +646151,10 @@ private:
     // NOTE: We store the document's unique ID rather than a pointer to the document, because DocumentState is
     //       decoupled from the document's lifetime (LocalNavigable owns the document directly).
     Optional<UniqueNodeID> m_document_id;
+
+    // AD-HOC: Stable identity used by the UI-process session history mirror to preserve shared document states
+    //         across IPC and WebContent process swaps.
+    Optional<CrossProcessId> m_cross_process_id;
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#document-state-history-policy-container
     Variant<SerializedPolicyContainer, Client> m_history_policy_container { Client::Tag };
@@ -655033,6 +656123,11 @@ void HTMLCanvasElement::prepare_for_compositing()
         return;
     m_canvas_content_dirty = false;
 
+    // NB: The content generation is recorded into DrawCanvas display list commands, letting display list damage
+    //     computation see that the canvas content changed. Canvases are prepared for compositing before painting
+    //     in the rendering update, so display lists recorded in the same update pick up the new generation.
+    ++m_content_generation;
+
     m_context.visit(
         [](GC::Ref<CanvasRenderingContext2D>& context) {
             context->prepare_for_compositing();
@@ -655139,6 +656234,8 @@ public:
 
     Optional<Painting::CanvasId> canvas_id() const;
 
+    u64 content_generation() const { return m_content_generation; }
+
     Optional<Gfx::IntSize> canvas_surface_content_size() const;
 
     void ensure_backing_storage();
@@ -655170,6 +656267,7 @@ private:
 
     Variant<GC::Ref<HTML::CanvasRenderingContext2D>, GC::Ref<WebGL::WebGLRenderingContext>, GC::Ref<WebGL::WebGL2RenderingContext>, Empty> m_context;
     bool m_canvas_content_dirty { false };
+    u64 m_content_generation { 0 };
 };
 
 }
@@ -659403,1346 +660501,3 @@ WebIDL::UnsignedLong HTMLElement::computed_heading_level() const
         level = 1;
     // 3. If element's local name is h2, then set level to 2.
     else if (local_name() == TagNames::h2)
-        level = 2;
-    // 4. If element's local name is h3, then set level to 3.
-    else if (local_name() == TagNames::h3)
-        level = 3;
-    // 5. If element's local name is h4, then set level to 4.
-    else if (local_name() == TagNames::h4)
-        level = 4;
-    // 6. If element's local name is h5, then set level to 5.
-    else if (local_name() == TagNames::h5)
-        level = 5;
-    // 7. If element's local name is h6, then set level to 6.
-    else if (local_name() == TagNames::h6)
-        level = 6;
-
-    // 8. Assert: level is not 0.
-    VERIFY(level != 0);
-
-    // 9. Increment level by the result of getting an element's computed heading offset given element.
-    level += computed_heading_offset();
-
-    // 10. If level is greater than 9, then return 9.
-    if (level > 9)
-        return 9;
-
-    // 11. Return level.
-    return level;
-}
-
-WebIDL::UnsignedLong HTMLElement::computed_heading_offset() const
-{
-    // 1. Let offset be 0.
-    auto offset = 0u;
-
-    // 2. Let inclusiveAncestor be element.
-    DOM::Node const* inclusive_ancestor = this;
-
-    // 3. While inclusiveAncestor is not null:
-    while (inclusive_ancestor) {
-        // 1. Let nextOffset be 0.
-        auto next_offset = 0u;
-
-        // 2. If inclusiveAncestor is an HTML element and has a headingoffset attribute, then parse its value using the
-        //    rules for parsing non-negative integers.
-        //    If the result of parsing the value is not an error, then set nextOffset to that value.
-        auto const* inclusive_ancestor_html_element = as_if<HTMLElement>(*inclusive_ancestor);
-        if (inclusive_ancestor_html_element) {
-            if (auto attribute = inclusive_ancestor_html_element->get_attribute(AttributeNames::headingoffset); attribute.has_value()) {
-                if (auto heading_offset = parse_non_negative_integer(attribute.value()); heading_offset.has_value())
-                    next_offset = *heading_offset;
-            }
-        }
-
-        // 3. Increment offset by nextOffset.
-        offset += next_offset;
-
-        // 4. If inclusiveAncestor is an HTML element and has a headingreset attribute, then return offset.
-        if (inclusive_ancestor_html_element && inclusive_ancestor_html_element->has_attribute(AttributeNames::headingreset))
-            return offset;
-
-        // 5. Set inclusiveAncestor to the parent node of inclusiveAncestor within the flat tree.
-        inclusive_ancestor = inclusive_ancestor->flat_tree_parent();
-    }
-
-    // 4. Return offset.
-    return offset;
-}
-
-}
-
-FILE: Libraries/LibWeb/HTML/HTMLElement.h
-/*
- * Copyright (c) 2018-2022, Andreas Kling <andreas@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/Optional.h>
-#include <LibWeb/Bindings/HTMLElement.h>
-#include <LibWeb/DOM/Element.h>
-#include <LibWeb/Export.h>
-#include <LibWeb/HTML/EventNames.h>
-#include <LibWeb/HTML/FormAssociatedElement.h>
-#include <LibWeb/HTML/GlobalEventHandlers.h>
-#include <LibWeb/HTML/HTMLOrSVGOrMathMLElement.h>
-#include <LibWeb/HTML/ToggleTaskTracker.h>
-#include <LibWeb/HTML/TokenizedFeatures.h>
-
-namespace Web::HTML {
-
-// https://html.spec.whatwg.org/multipage/dom.html#attr-dir
-#define ENUMERATE_HTML_ELEMENT_DIR_ATTRIBUTES   \
-    __ENUMERATE_HTML_ELEMENT_DIR_ATTRIBUTE(ltr) \
-    __ENUMERATE_HTML_ELEMENT_DIR_ATTRIBUTE(rtl) \
-    __ENUMERATE_HTML_ELEMENT_DIR_ATTRIBUTE(auto)
-
-// https://html.spec.whatwg.org/multipage/interaction.html#attr-contenteditable
-enum class ContentEditableState : u8 {
-    True,
-    False,
-    PlaintextOnly,
-    Inherit,
-};
-
-using TogglePopoverOptionsOrForceBoolean = Variant<Bindings::TogglePopoverOptions, bool>;
-
-enum class ThrowExceptions {
-    Yes,
-    No,
-};
-
-enum class FocusPreviousElement {
-    Yes,
-    No,
-};
-
-enum class FireEvents {
-    Yes,
-    No,
-};
-
-enum class ExpectedToBeShowing {
-    Yes,
-    No,
-};
-
-enum class IgnoreDomState {
-    Yes,
-    No,
-};
-
-enum class IsPopover {
-    Yes,
-    No,
-};
-
-class WEB_API HTMLElement
-    : public DOM::Element
-    , public HTML::GlobalEventHandlers
-    , public HTML::HTMLOrSVGOrMathMLElement<HTMLElement>
-    , public FormAssociatedElement {
-    WEB_PLATFORM_OBJECT(HTMLElement, DOM::Element);
-    GC_DECLARE_ALLOCATOR(HTMLElement);
-
-public:
-    virtual ~HTMLElement() override;
-
-    Optional<Utf16String> title() const { return attribute(HTML::AttributeNames::title); }
-
-    bool translate() const;
-    void set_translate(bool);
-
-    Utf16String dir() const;
-    void set_dir(Utf16String const&);
-
-    virtual bool is_focusable() const override;
-    bool is_content_editable() const;
-    StringView content_editable() const;
-    ContentEditableState content_editable_state() const { return m_content_editable_state; }
-    WebIDL::ExceptionOr<void> set_content_editable(StringView);
-
-    Utf16String inner_text();
-    void set_inner_text(Utf16View const&);
-
-    [[nodiscard]] Utf16String outer_text();
-    WebIDL::ExceptionOr<void> set_outer_text(Utf16View const&);
-
-    int offset_top() const;
-    int offset_left() const;
-    int offset_width() const;
-    int offset_height() const;
-    GC::Ptr<Element> offset_parent() const;
-    GC::Ptr<Element> scroll_parent() const;
-
-    Variant<bool, double, String, Empty> hidden() const;
-    void set_hidden(Variant<bool, double, String, Empty> const&);
-
-    void click();
-
-    [[nodiscard]] Utf16String access_key_label() const;
-
-    bool spellcheck() const;
-    void set_spellcheck(bool);
-
-    Utf16String writing_suggestions() const;
-    void set_writing_suggestions(Utf16String const&);
-
-    enum class AutocapitalizationHint {
-        Default,
-        None,
-        Sentences,
-        Words,
-        Characters
-    };
-
-    AutocapitalizationHint own_autocapitalization_hint() const;
-    Utf16String autocapitalize() const;
-    void set_autocapitalize(Utf16String const&);
-
-    enum class AutocorrectionState {
-        On,
-        Off
-    };
-
-    AutocorrectionState used_autocorrection_state() const;
-    bool autocorrect() const;
-    void set_autocorrect(bool);
-
-    bool fire_a_synthetic_pointer_event(FlyString const& type, DOM::Element& target, bool not_trusted);
-
-    // https://html.spec.whatwg.org/multipage/forms.html#category-label
-    virtual bool is_labelable() const { return is_form_associated_custom_element(); }
-
-    GC::Ptr<DOM::NodeList> labels();
-
-    virtual Optional<ARIA::Role> default_role() const override;
-
-    WebIDL::ExceptionOr<GC::Ref<ElementInternals>> attach_internals();
-
-    void set_popover(Optional<Utf16String> value);
-    Optional<Utf16String> popover() const;
-    Optional<String> opened_in_popover_mode() const { return m_opened_in_popover_mode; }
-
-    virtual void removed_from(IsSubtreeRoot, Node* old_ancestor, Node& old_root) override;
-    virtual void moved_from(IsSubtreeRoot, GC::Ptr<DOM::Node> old_ancestor) override;
-
-    enum class PopoverVisibilityState : u8 {
-        Hidden,
-        Showing,
-    };
-    PopoverVisibilityState popover_visibility_state() const { return m_popover_visibility_state; }
-
-    WebIDL::ExceptionOr<void> show_popover_for_bindings(Bindings::ShowPopoverOptions const& = {});
-    WebIDL::ExceptionOr<void> hide_popover_for_bindings();
-    WebIDL::ExceptionOr<bool> toggle_popover(TogglePopoverOptionsOrForceBoolean const&);
-
-    WebIDL::ExceptionOr<bool> check_popover_validity(ExpectedToBeShowing expected_to_be_showing, ThrowExceptions throw_exceptions, GC::Ptr<DOM::Document>, IgnoreDomState ignore_dom_state);
-    WebIDL::ExceptionOr<void> show_popover(ThrowExceptions throw_exceptions, GC::Ptr<HTMLElement> source);
-    WebIDL::ExceptionOr<void> hide_popover(FocusPreviousElement focus_previous_element, FireEvents fire_events, ThrowExceptions throw_exceptions, IgnoreDomState ignore_dom_state, GC::Ptr<HTMLElement> source);
-
-    static void hide_all_popovers_until(Variant<GC::Ptr<HTMLElement>, GC::Ptr<DOM::Document>> endpoint, FocusPreviousElement focus_previous_element, FireEvents fire_events);
-    static GC::Ptr<HTMLElement> topmost_popover_ancestor(GC::Ptr<DOM::Node> new_popover_or_top_layer_element, Vector<GC::Ref<HTMLElement>> const& popover_list, GC::Ptr<HTMLElement> source, IsPopover is_popover);
-
-    static void light_dismiss_open_popovers(UIEvents::PointerEvent const&, GC::Ptr<DOM::Node>);
-
-    bool is_inert() const { return m_inert; }
-
-    bool draggable() const;
-    void set_draggable(bool draggable);
-
-    virtual bool is_valid_command(Utf16String const&) { return false; }
-    virtual void command_steps(DOM::Element&, Utf16String const&) { }
-
-    bool is_form_associated_custom_element() const;
-
-    // https://html.spec.whatwg.org/multipage/rendering.html#button-layout
-    virtual bool uses_button_layout() const { return false; }
-
-    WebIDL::UnsignedLong computed_heading_level() const;
-    WebIDL::UnsignedLong computed_heading_offset() const;
-
-protected:
-    HTMLElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual void initialize(JS::Realm&) override;
-
-    virtual void attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_) override;
-    virtual WebIDL::ExceptionOr<void> cloned(DOM::Node&, bool) const override;
-    virtual void inserted() override;
-
-    virtual void visit_edges(Cell::Visitor&) override;
-
-    void set_inert(bool inert) { m_inert = inert; }
-    void set_subtree_inertness(bool is_inert);
-
-    [[nodiscard]] Utf16String get_the_text_steps();
-
-    virtual void adjust_computed_style(CSS::ComputedProperties::Builder&) override;
-
-private:
-    virtual bool is_html_element() const final { return true; }
-
-    // ^FormAssociatedElement
-    virtual HTMLElement& form_associated_element_to_html_element() override { return *this; }
-
-    // ^HTML::GlobalEventHandlers
-    virtual GC::Ptr<DOM::EventTarget> global_event_handlers_to_event_target(FlyString const&) override { return *this; }
-    virtual void did_receive_focus() override;
-    virtual void did_lose_focus() override;
-
-    GC::Ref<DOM::DocumentFragment> rendered_text_fragment(Utf16View const& input);
-
-    GC::Ptr<DOM::NodeList> m_labels;
-
-    void queue_a_popover_toggle_event_task(String old_state, String new_state, GC::Ptr<HTMLElement> source);
-
-    static Optional<Utf16String> popover_value_to_state(Optional<Utf16String> const& value);
-    void hide_popover_stack_until(Vector<GC::Ref<HTMLElement>> const& popover_list, FocusPreviousElement focus_previous_element, FireEvents fire_events);
-    GC::Ptr<HTMLElement> nearest_inclusive_open_popover();
-    GC::Ptr<HTMLElement> nearest_inclusive_target_popover();
-    static void close_entire_popover_list(Vector<GC::Ref<HTMLElement>> const& popover_list, FocusPreviousElement focus_previous_element, FireEvents fire_events);
-    static GC::Ptr<HTMLElement> topmost_clicked_popover(GC::Ptr<DOM::Node> node);
-    size_t popover_stack_position();
-
-    // https://html.spec.whatwg.org/multipage/custom-elements.html#attached-internals
-    GC::Ptr<ElementInternals> m_attached_internals;
-
-    // https://html.spec.whatwg.org/multipage/interaction.html#attr-contenteditable
-    ContentEditableState m_content_editable_state { ContentEditableState::Inherit };
-
-    // https://html.spec.whatwg.org/multipage/interaction.html#click-in-progress-flag
-    bool m_click_in_progress { false };
-
-    bool m_inert { false };
-
-    // Popover API
-
-    // https://html.spec.whatwg.org/multipage/popover.html#popover-visibility-state
-    PopoverVisibilityState m_popover_visibility_state { PopoverVisibilityState::Hidden };
-
-    // https://html.spec.whatwg.org/multipage/popover.html#popover-showing-or-hiding
-    bool m_popover_showing_or_hiding { false };
-
-    // https://html.spec.whatwg.org/multipage/popover.html#popover-trigger
-    GC::Ptr<HTMLElement> m_popover_trigger;
-
-    // https://html.spec.whatwg.org/multipage/popover.html#the-popover-attribute:toggle-task-tracker
-    Optional<ToggleTaskTracker> m_popover_toggle_task_tracker;
-
-    // https://html.spec.whatwg.org/multipage/popover.html#popover-close-watcher
-    GC::Ptr<CloseWatcher> m_popover_close_watcher;
-
-    Optional<String> m_opened_in_popover_mode;
-};
-
-}
-
-namespace Web::DOM {
-
-template<>
-inline bool Node::fast_is<HTML::HTMLElement>() const { return is_html_element(); }
-
-}
-
-namespace JS {
-
-template<>
-inline bool Object::fast_is<Web::HTML::HTMLElement>() const
-{
-    return is_dom_node() && static_cast<Web::DOM::Node const&>(*this).is_html_element();
-}
-
-}
-
-FILE: Libraries/LibWeb/HTML/HTMLElement.idl
-// https://html.spec.whatwg.org/multipage/semantics.html#htmlelement
-[Exposed=Window]
-interface HTMLElement : Element {
-
-    [HTMLConstructor] constructor();
-
-    // metadata attributes
-    [Reflect, CEReactions] attribute DOMString title;
-    [Reflect, CEReactions] attribute DOMString lang;
-    [CEReactions] attribute boolean translate;
-    [CEReactions] attribute Utf16DOMString dir;
-
-    // user interaction
-    [CEReactions] attribute (boolean or unrestricted double or DOMString)? hidden;
-    [Reflect, CEReactions] attribute boolean inert;
-    undefined click();
-    [Reflect=accesskey, CEReactions] attribute Utf16DOMString accessKey;
-    readonly attribute Utf16DOMString accessKeyLabel;
-    [CEReactions] attribute boolean draggable;
-    [CEReactions] attribute boolean spellcheck;
-    [CEReactions] attribute Utf16DOMString writingSuggestions;
-    [CEReactions] attribute Utf16DOMString autocapitalize;
-    [CEReactions] attribute boolean autocorrect;
-
-    [LegacyNullToEmptyString, CEReactions] attribute Utf16DOMString innerText;
-    [LegacyNullToEmptyString, CEReactions] attribute Utf16DOMString outerText;
-
-    ElementInternals attachInternals();
-
-    // The popover API
-    [ImplementedAs=show_popover_for_bindings] undefined showPopover(optional ShowPopoverOptions options = {});
-    [ImplementedAs=hide_popover_for_bindings] undefined hidePopover();
-    boolean togglePopover(optional (TogglePopoverOptions or boolean) options = {});
-    [CEReactions] attribute Utf16DOMString? popover;
-    
-    // FIXME: Should be `[CEReactions, Reflect, ReflectRange=(0, 8)]`
-    [CEReactions, Reflect, ReflectRange=(0, 8)] attribute unsigned long headingOffset;
-    [CEReactions, Reflect] attribute boolean headingReset;
-
-    // https://drafts.csswg.org/cssom-view/#extensions-to-the-htmlelement-interface
-    readonly attribute Element? scrollParent;
-    readonly attribute Element? offsetParent;
-    readonly attribute long offsetTop;
-    readonly attribute long offsetLeft;
-    readonly attribute long offsetWidth;
-    readonly attribute long offsetHeight;
-
-};
-
-// https://html.spec.whatwg.org/multipage/dom.html#showpopoveroptions
-dictionary ShowPopoverOptions {
-    HTMLElement source;
-};
-
-// https://html.spec.whatwg.org/multipage/dom.html#togglepopoveroptions
-dictionary TogglePopoverOptions : ShowPopoverOptions {
-    boolean force;
-};
-
-HTMLElement includes GlobalEventHandlers;
-HTMLElement includes ElementContentEditable;
-HTMLElement includes HTMLOrSVGOrMathMLElement;
-
-// https://html.spec.whatwg.org/multipage/interaction.html#attr-enterkeyhint
-enum EnterKeyHint {
-    "enter",
-    "done",
-    "go",
-    "next",
-    "previous",
-    "search",
-    "send"
-};
-
-// https://html.spec.whatwg.org/multipage/interaction.html#attr-inputmode
-enum InputMode {
-    "none",
-    "text",
-    "tel",
-    "url",
-    "email",
-    "numeric",
-    "decimal",
-    "search"
-};
-
-// https://html.spec.whatwg.org/multipage/interaction.html#elementcontenteditable
-interface mixin ElementContentEditable {
-    [CEReactions] attribute DOMString contentEditable;
-    [Reflect=enterkeyhint, Enumerated=EnterKeyHint, CEReactions] attribute DOMString enterKeyHint;
-    readonly attribute boolean isContentEditable;
-    [Reflect=inputmode, Enumerated=InputMode, CEReactions] attribute DOMString inputMode;
-};
-
-HTMLElement includes ElementCSSInlineStyle;
-
-FILE: Libraries/LibWeb/HTML/HTMLEmbedElement.cpp
-/*
- * Copyright (c) 2020, the SerenityOS developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibWeb/Bindings/HTMLEmbedElement.h>
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/CSS/ComputedProperties.h>
-#include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
-#include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
-#include <LibWeb/HTML/HTMLEmbedElement.h>
-#include <LibWeb/HTML/Parser/HTMLParser.h>
-
-namespace Web::HTML {
-
-GC_DEFINE_ALLOCATOR(HTMLEmbedElement);
-
-HTMLEmbedElement::HTMLEmbedElement(DOM::Document& document, DOM::QualifiedName qualified_name)
-    : HTMLElement(document, move(qualified_name))
-{
-}
-
-HTMLEmbedElement::~HTMLEmbedElement() = default;
-
-void HTMLEmbedElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLEmbedElement);
-    Base::initialize(realm);
-}
-
-bool HTMLEmbedElement::is_presentational_hint(Utf16FlyString const& name) const
-{
-    if (Base::is_presentational_hint(name))
-        return true;
-
-    return first_is_one_of(name,
-        HTML::AttributeNames::align,
-        HTML::AttributeNames::height,
-        HTML::AttributeNames::hspace,
-        HTML::AttributeNames::vspace,
-        HTML::AttributeNames::width);
-}
-
-void HTMLEmbedElement::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
-{
-    Base::apply_presentational_hints(properties);
-    for_each_attribute([&](auto& name, auto& value) {
-        if (name == HTML::AttributeNames::align) {
-            // https://html.spec.whatwg.org/multipage/rendering.html#attributes-for-embedded-content-and-images
-            // When an embed, iframe, img, or object element, or an input element whose type attribute is in the Image Button state,
-            // has an align attribute whose value is an ASCII case-insensitive match for the string "center" or the string "middle",
-            // the user agent is expected to act as if the element's 'vertical-align' property was set to a value that aligns the
-            // vertical middle of the element with the parent element's baseline.
-            // FIXME: This should use legacy baseline-middle alignment instead of CSS vertical-align: middle,
-            //        as Firefox and Chrome do with engine-specific legacy values.
-            if (value.equals_ignoring_ascii_case("center"sv) || value.equals_ignoring_ascii_case("middle"sv))
-                properties.append({ .property_id = CSS::PropertyID::VerticalAlign, .value = CSS::KeywordStyleValue::create(CSS::Keyword::Middle) });
-        } else if (name == HTML::AttributeNames::height) {
-            if (auto parsed_value = parse_dimension_value(value))
-                properties.append({ .property_id = CSS::PropertyID::Height, .value = *parsed_value });
-        }
-        // https://html.spec.whatwg.org/multipage/rendering.html#attributes-for-embedded-content-and-images:maps-to-the-dimension-property
-        else if (name == HTML::AttributeNames::hspace) {
-            if (auto parsed_value = parse_dimension_value(value)) {
-                properties.append({ .property_id = CSS::PropertyID::MarginLeft, .value = *parsed_value });
-                properties.append({ .property_id = CSS::PropertyID::MarginRight, .value = *parsed_value });
-            }
-        } else if (name == HTML::AttributeNames::vspace) {
-            if (auto parsed_value = parse_dimension_value(value)) {
-                properties.append({ .property_id = CSS::PropertyID::MarginTop, .value = *parsed_value });
-                properties.append({ .property_id = CSS::PropertyID::MarginBottom, .value = *parsed_value });
-            }
-        } else if (name == HTML::AttributeNames::width) {
-            if (auto parsed_value = parse_dimension_value(value)) {
-                properties.append({ .property_id = CSS::PropertyID::Width, .value = *parsed_value });
-            }
-        }
-    });
-}
-
-void HTMLEmbedElement::adjust_computed_style(CSS::ComputedProperties::Builder& style)
-{
-    // https://drafts.csswg.org/css-display-3/#unbox
-    if (style.display().is_contents())
-        style.set_property(CSS::PropertyID::Display, CSS::DisplayStyleValue::create(CSS::Display::from_short(CSS::Display::Short::None)));
-}
-
-}
-
-FILE: Libraries/LibWeb/HTML/HTMLEmbedElement.h
-/*
- * Copyright (c) 2020, the SerenityOS developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <LibWeb/HTML/HTMLElement.h>
-
-namespace Web::HTML {
-
-class HTMLEmbedElement final : public HTMLElement {
-    WEB_PLATFORM_OBJECT(HTMLEmbedElement, HTMLElement);
-    GC_DECLARE_ALLOCATOR(HTMLEmbedElement);
-
-public:
-    virtual ~HTMLEmbedElement() override;
-
-private:
-    HTMLEmbedElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual bool is_html_embed_element() const override { return true; }
-    virtual void initialize(JS::Realm&) override;
-    virtual bool is_presentational_hint(Utf16FlyString const&) const override;
-    virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
-    virtual void adjust_computed_style(CSS::ComputedProperties::Builder&) override;
-};
-
-}
-
-namespace Web::DOM {
-
-template<>
-inline bool Node::fast_is<HTML::HTMLEmbedElement>() const { return is_html_embed_element(); }
-
-}
-
-FILE: Libraries/LibWeb/HTML/HTMLEmbedElement.idl
-// https://html.spec.whatwg.org/multipage/semantics.html#htmlembedelement
-[Exposed=Window]
-interface HTMLEmbedElement : HTMLElement {
-
-    [HTMLConstructor] constructor();
-
-    [CEReactions, Reflect, URL] attribute USVString src;
-    [CEReactions, Reflect] attribute DOMString type;
-    [CEReactions, Reflect] attribute DOMString width;
-    [CEReactions, Reflect] attribute DOMString height;
-    [FIXME] Document? getSVGDocument();
-
-    // Obsolete
-    [CEReactions, Reflect] attribute DOMString align;
-    [CEReactions, Reflect] attribute Utf16DOMString name;
-
-};
-
-FILE: Libraries/LibWeb/HTML/HTMLFieldSetElement.cpp
-/*
- * Copyright (c) 2020, the SerenityOS developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibWeb/Bindings/HTMLFieldSetElement.h>
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/HTML/HTMLButtonElement.h>
-#include <LibWeb/HTML/HTMLFieldSetElement.h>
-#include <LibWeb/HTML/HTMLInputElement.h>
-#include <LibWeb/HTML/HTMLLegendElement.h>
-#include <LibWeb/HTML/HTMLObjectElement.h>
-#include <LibWeb/HTML/HTMLOutputElement.h>
-#include <LibWeb/HTML/HTMLSelectElement.h>
-#include <LibWeb/HTML/HTMLTextAreaElement.h>
-#include <LibWeb/Layout/FieldSetBox.h>
-
-namespace Web::HTML {
-
-GC_DEFINE_ALLOCATOR(HTMLFieldSetElement);
-
-HTMLFieldSetElement::HTMLFieldSetElement(DOM::Document& document, DOM::QualifiedName qualified_name)
-    : HTMLElement(document, move(qualified_name))
-{
-}
-
-HTMLFieldSetElement::~HTMLFieldSetElement() = default;
-
-void HTMLFieldSetElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLFieldSetElement);
-    Base::initialize(realm);
-}
-
-void HTMLFieldSetElement::visit_edges(Cell::Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-    visitor.visit(m_elements);
-}
-
-// https://html.spec.whatwg.org/multipage/form-elements.html#concept-fieldset-disabled
-bool HTMLFieldSetElement::is_disabled() const
-{
-    // A fieldset element is a disabled fieldset if it matches any of the following conditions:
-    // - Its disabled attribute is specified
-    if (has_attribute(AttributeNames::disabled))
-        return true;
-
-    // - It is a descendant of another fieldset element whose disabled attribute is specified, and is not a descendant of that fieldset element's first legend element child, if any.
-    for (auto* fieldset_ancestor = first_ancestor_of_type<HTMLFieldSetElement>(); fieldset_ancestor; fieldset_ancestor = fieldset_ancestor->first_ancestor_of_type<HTMLFieldSetElement>()) {
-        if (fieldset_ancestor->has_attribute(HTML::AttributeNames::disabled)) {
-            auto* first_legend_element_child = fieldset_ancestor->first_child_of_type<HTMLLegendElement>();
-            if (!first_legend_element_child || !is_descendant_of(*first_legend_element_child))
-                return true;
-        }
-    }
-
-    return false;
-}
-
-void HTMLFieldSetElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16String> const& old_value, Optional<Utf16String> const& value, Optional<Utf16FlyString> const& namespace_)
-{
-    Base::attribute_changed(name, old_value, value, namespace_);
-
-    if (name == HTML::AttributeNames::disabled) {
-        for_each_in_subtree_of_type<HTMLElement>([](auto& element) {
-            if (element.is_form_associated_custom_element())
-                element.update_face_disabled_state();
-            return TraversalDecision::Continue;
-        });
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/form-elements.html#dom-fieldset-elements
-GC::Ptr<DOM::HTMLCollection> const& HTMLFieldSetElement::elements()
-{
-    // The elements IDL attribute must return an HTMLCollection rooted at the fieldset element, whose filter matches listed elements.
-    if (!m_elements) {
-        m_elements = DOM::HTMLCollection::create(*this, DOM::HTMLCollection::Scope::Descendants, [](DOM::Element const& element) {
-            if (auto const* form_associated_element = as_if<FormAssociatedElement>(element); form_associated_element && form_associated_element->is_listed())
-                return true;
-
-            return false;
-        });
-    }
-    return m_elements;
-}
-
-Layout::FieldSetBox* HTMLFieldSetElement::layout_node()
-{
-    return static_cast<Layout::FieldSetBox*>(Node::layout_node());
-}
-
-RefPtr<Layout::Node> HTMLFieldSetElement::create_layout_node(CSS::ComputedProperties const& style)
-{
-    return make_ref_counted<Layout::FieldSetBox>(document(), *this, style);
-}
-
-}
-
-FILE: Libraries/LibWeb/HTML/HTMLFieldSetElement.h
-/*
- * Copyright (c) 2020, the SerenityOS developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <LibWeb/ARIA/Roles.h>
-#include <LibWeb/DOM/HTMLCollection.h>
-#include <LibWeb/HTML/HTMLElement.h>
-
-namespace Web::HTML {
-
-class HTMLFieldSetElement final
-    : public HTMLElement {
-    WEB_PLATFORM_OBJECT(HTMLFieldSetElement, HTMLElement);
-    GC_DECLARE_ALLOCATOR(HTMLFieldSetElement);
-
-public:
-    virtual ~HTMLFieldSetElement() override;
-
-    String const& type() const
-    {
-        static String const& fieldset = *new String("fieldset"_string);
-        return fieldset;
-    }
-
-    bool is_disabled() const;
-
-    GC::Ptr<DOM::HTMLCollection> const& elements();
-
-    // ^FormAssociatedElement
-    virtual bool is_form_associated_element() const override { return true; }
-
-    // ^FormAssociatedElement
-    // https://html.spec.whatwg.org/multipage/forms.html#category-listed
-    virtual bool is_listed() const override { return true; }
-
-    // https://html.spec.whatwg.org/multipage/forms.html#category-autocapitalize
-    virtual bool is_autocapitalize_and_autocorrect_inheriting() const override { return true; }
-
-    virtual Optional<ARIA::Role> default_role() const override { return ARIA::Role::group; }
-
-    virtual RefPtr<Layout::Node> create_layout_node(CSS::ComputedProperties const&) override;
-    Layout::FieldSetBox* layout_node();
-    Layout::FieldSetBox const* layout_node() const;
-
-private:
-    HTMLFieldSetElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual void initialize(JS::Realm&) override;
-    virtual void visit_edges(Cell::Visitor&) override;
-
-    virtual void attribute_changed(Utf16FlyString const&, Optional<Utf16String> const&, Optional<Utf16String> const&, Optional<Utf16FlyString> const&) override;
-
-    virtual bool is_html_fieldset_element() const override { return true; }
-
-    GC::Ptr<DOM::HTMLCollection> m_elements;
-};
-
-}
-
-namespace Web::DOM {
-
-template<>
-inline bool Node::fast_is<HTML::HTMLFieldSetElement>() const { return is_html_fieldset_element(); }
-
-}
-
-FILE: Libraries/LibWeb/HTML/HTMLFieldSetElement.idl
-// https://html.spec.whatwg.org/multipage/semantics.html#htmlfieldsetelement
-[Exposed=Window]
-interface HTMLFieldSetElement : HTMLElement {
-    [HTMLConstructor] constructor();
-
-    [CEReactions, Reflect] attribute boolean disabled;
-    readonly attribute HTMLFormElement? form;
-    [CEReactions, Reflect] attribute Utf16DOMString name;
-
-    readonly attribute DOMString type;
-
-    [SameObject] readonly attribute HTMLCollection elements;
-
-    readonly attribute boolean willValidate;
-    [SameObject] readonly attribute ValidityState validity;
-    readonly attribute Utf16DOMString validationMessage;
-    boolean checkValidity();
-    boolean reportValidity();
-    undefined setCustomValidity(DOMString error);
-};
-
-FILE: Libraries/LibWeb/HTML/HTMLFontElement.cpp
-/*
- * Copyright (c) 2018-2020, Andreas Kling <andreas@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibWeb/Bindings/HTMLFontElement.h>
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/CSS/ComputedProperties.h>
-#include <LibWeb/CSS/Parser/Parser.h>
-#include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
-#include <LibWeb/HTML/HTMLFontElement.h>
-#include <LibWeb/HTML/Parser/HTMLParser.h>
-#include <LibWeb/Infra/CharacterTypes.h>
-
-namespace Web::HTML {
-
-GC_DEFINE_ALLOCATOR(HTMLFontElement);
-
-enum class Mode {
-    RelativePlus,
-    RelativeMinus,
-    Absolute,
-};
-
-static size_t code_unit_length(StringView string)
-{
-    return string.length();
-}
-
-static size_t code_unit_length(Utf16View string)
-{
-    return string.length_in_code_units();
-}
-
-static u32 code_unit_at(StringView string, size_t index)
-{
-    return string[index];
-}
-
-static u32 code_unit_at(Utf16View string, size_t index)
-{
-    return string.code_unit_at(index);
-}
-
-// https://html.spec.whatwg.org/multipage/rendering.html#rules-for-parsing-a-legacy-font-size
-template<typename StringType>
-static Optional<CSS::Keyword> parse_legacy_font_size_impl(StringType input)
-{
-    // 1. Let input be the attribute's value.
-    // 2. Let position be a pointer into input, initially pointing at the start of the string.
-    size_t position = 0;
-
-    // 3. Skip ASCII whitespace within input given position.
-    while (position < code_unit_length(input) && Web::Infra::is_ascii_whitespace(code_unit_at(input, position)))
-        ++position;
-
-    // 4. If position is past the end of input, there is no presentational hint. Return.
-    if (position == code_unit_length(input))
-        return {};
-
-    // 5. If the character at position is a U+002B PLUS SIGN character (+), then let mode be relative-plus, and advance position to the next character. Otherwise, if the character at position is a U+002D HYPHEN-MINUS character (-), then let mode be relative-minus, and advance position to the next character. Otherwise, let mode be absolute.
-    Mode mode { Mode::Absolute };
-
-    if (code_unit_at(input, position) == '+') {
-        mode = Mode::RelativePlus;
-        ++position;
-    } else if (code_unit_at(input, position) == '-') {
-        mode = Mode::RelativeMinus;
-        ++position;
-    }
-
-    // 6. Collect a sequence of code points that are ASCII digits from input given position, and let digits be the resulting sequence.
-    size_t start_index = position;
-    while (position < code_unit_length(input) && is_ascii_digit(code_unit_at(input, position)))
-        ++position;
-
-    auto digits = input.substring_view(start_index, position - start_index);
-    auto value_or_empty = digits.template to_number<i32>();
-
-    // 7. If digits is the empty string, there is no presentational hint. Return.
-    if (!value_or_empty.has_value())
-        return {};
-
-    // 8. Interpret digits as a base-ten integer. Let value be the resulting number.
-    auto value = value_or_empty.release_value();
-
-    // 9. If mode is relative-plus, then increment value by 3. If mode is relative-minus, then let value be the result of subtracting value from 3.
-    if (mode == Mode::RelativePlus)
-        value += 3;
-    else if (mode == Mode::RelativeMinus)
-        value = 3 - value;
-
-    // 10. If value is greater than 7, let it be 7.
-    if (value > 7)
-        value = 7;
-
-    // 11. If value is less than 1, let it be 1.
-    if (value < 1)
-        value = 1;
-
-    // 12. Set the 'font-size' property to the keyword corresponding to the value of value according to the following table:
-    switch (value) {
-    case 1:
-        return CSS::Keyword::XSmall;
-    case 2:
-        return CSS::Keyword::Small;
-    case 3:
-        return CSS::Keyword::Medium;
-    case 4:
-        return CSS::Keyword::Large;
-    case 5:
-        return CSS::Keyword::XLarge;
-    case 6:
-        return CSS::Keyword::XxLarge;
-    case 7:
-        return CSS::Keyword::XxxLarge;
-    default:
-        VERIFY_NOT_REACHED();
-    }
-}
-
-Optional<CSS::Keyword> HTMLFontElement::parse_legacy_font_size(StringView string)
-{
-    return parse_legacy_font_size_impl(string);
-}
-
-Optional<CSS::Keyword> HTMLFontElement::parse_legacy_font_size(Utf16View string)
-{
-    return parse_legacy_font_size_impl(string);
-}
-
-HTMLFontElement::HTMLFontElement(DOM::Document& document, DOM::QualifiedName qualified_name)
-    : HTMLElement(document, move(qualified_name))
-{
-}
-
-HTMLFontElement::~HTMLFontElement() = default;
-
-void HTMLFontElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLFontElement);
-    Base::initialize(realm);
-}
-
-bool HTMLFontElement::is_presentational_hint(Utf16FlyString const& name) const
-{
-    if (Base::is_presentational_hint(name))
-        return true;
-
-    return first_is_one_of(name,
-        HTML::AttributeNames::color,
-        HTML::AttributeNames::face,
-        HTML::AttributeNames::size);
-}
-
-void HTMLFontElement::apply_presentational_hints(Vector<CSS::StyleProperty>& properties) const
-{
-    Base::apply_presentational_hints(properties);
-    for_each_attribute([&](auto& name, auto& value) {
-        if (name == AttributeNames::color) {
-            // https://html.spec.whatwg.org/multipage/rendering.html#phrasing-content-3:rules-for-parsing-a-legacy-colour-value
-            auto color = parse_legacy_color_value(value);
-            if (color.has_value())
-                properties.append({ .property_id = CSS::PropertyID::Color, .value = CSS::ColorStyleValue::create_from_color(color.value(), CSS::ColorSyntax::Legacy) });
-        } else if (name == AttributeNames::size) {
-            // When a font element has a size attribute, the user agent is expected to use the following steps, known as the rules for parsing a legacy font size, to treat the attribute as a presentational hint setting the element's 'font-size' property:
-            auto font_size_or_empty = parse_legacy_font_size(value);
-            if (font_size_or_empty.has_value()) {
-                auto font_size = string_from_keyword(font_size_or_empty.release_value());
-                if (auto parsed_value = parse_css_value(CSS::Parser::ParsingParams { document() }, font_size, CSS::PropertyID::FontSize))
-                    properties.append({ .property_id = CSS::PropertyID::FontSize, .value = parsed_value.release_nonnull() });
-            }
-        } else if (name == AttributeNames::face) {
-            // When a font element has a face attribute, the user agent is expected to treat the attribute as a presentational hint setting the element's 'font-family' property to the attribute's value.
-            if (auto parsed_value = parse_css_value(CSS::Parser::ParsingParams { document() }, value, CSS::PropertyID::FontFamily))
-                properties.append({ .property_id = CSS::PropertyID::FontFamily, .value = parsed_value.release_nonnull() });
-        }
-    });
-}
-
-}
-
-FILE: Libraries/LibWeb/HTML/HTMLFontElement.h
-/*
- * Copyright (c) 2018-2020, Andreas Kling <andreas@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <LibWeb/HTML/HTMLElement.h>
-
-namespace Web::HTML {
-
-class HTMLFontElement final : public HTMLElement {
-    WEB_PLATFORM_OBJECT(HTMLFontElement, HTMLElement);
-    GC_DECLARE_ALLOCATOR(HTMLFontElement);
-
-public:
-    virtual ~HTMLFontElement() override;
-
-    virtual bool is_presentational_hint(Utf16FlyString const&) const override;
-    virtual void apply_presentational_hints(Vector<CSS::StyleProperty>&) const override;
-
-    static Optional<CSS::Keyword> parse_legacy_font_size(StringView);
-    static Optional<CSS::Keyword> parse_legacy_font_size(Utf16View);
-
-private:
-    HTMLFontElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual void initialize(JS::Realm&) override;
-};
-
-}
-
-FILE: Libraries/LibWeb/HTML/HTMLFontElement.idl
-// https://html.spec.whatwg.org/multipage/semantics.html#htmlfontelement
-[Exposed=Window]
-interface HTMLFontElement : HTMLElement {
-
-    [HTMLConstructor] constructor();
-
-    [CEReactions, LegacyNullToEmptyString, Reflect] attribute DOMString color;
-    [CEReactions, Reflect] attribute DOMString face;
-    [CEReactions, Reflect] attribute DOMString size;
-
-};
-
-FILE: Libraries/LibWeb/HTML/HTMLFormControlsCollection.cpp
-/*
- * Copyright (c) 2023, Shannon Booth <shannon@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibWeb/Bindings/HTMLFormControlsCollection.h>
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/DOM/Element.h>
-#include <LibWeb/DOM/HTMLCollection.h>
-#include <LibWeb/DOM/ParentNode.h>
-#include <LibWeb/HTML/HTMLFormControlsCollection.h>
-#include <LibWeb/HTML/RadioNodeList.h>
-
-namespace Web::HTML {
-
-GC_DEFINE_ALLOCATOR(HTMLFormControlsCollection);
-
-GC::Ref<HTMLFormControlsCollection> HTMLFormControlsCollection::create(DOM::ParentNode& root, Scope scope, Function<bool(DOM::Element const&)> filter)
-{
-    return root.realm().create<HTMLFormControlsCollection>(root, scope, move(filter));
-}
-
-HTMLFormControlsCollection::HTMLFormControlsCollection(DOM::ParentNode& root, Scope scope, Function<bool(DOM::Element const&)> filter)
-    : DOM::HTMLCollection(root, scope, move(filter))
-{
-}
-
-HTMLFormControlsCollection::~HTMLFormControlsCollection() = default;
-
-void HTMLFormControlsCollection::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLFormControlsCollection);
-    Base::initialize(realm);
-}
-
-// https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#dom-htmlformcontrolscollection-nameditem
-Variant<Empty, GC::Ref<DOM::Element>, GC::Ref<RadioNodeList>> HTMLFormControlsCollection::named_item_or_radio_node_list(Utf16String const& name) const
-{
-    return named_item_or_radio_node_list(Utf16FlyString::from_utf16(name.utf16_view()));
-}
-
-// https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#dom-htmlformcontrolscollection-nameditem
-Variant<Empty, GC::Ref<DOM::Element>, GC::Ref<RadioNodeList>> HTMLFormControlsCollection::named_item_or_radio_node_list(Utf16FlyString const& name) const
-{
-    // 1. If name is the empty string, return null and stop the algorithm.
-    if (name.is_empty())
-        return {};
-
-    // 2. If, at the time the method is called, there is exactly one node in the collection that has either an id attribute or a name attribute equal to name, then return that node and stop the algorithm.
-    // 3. Otherwise, if there are no nodes in the collection that have either an id attribute or a name attribute equal to name, then return null and stop the algorithm.
-    DOM::Element* matching_element = nullptr;
-    bool multiple_matching = false;
-
-    auto collection = collect_matching_elements();
-    for (auto const& element : collection) {
-        if (element->id() != name && element->name() != name)
-            continue;
-
-        if (matching_element) {
-            multiple_matching = true;
-            break;
-        }
-
-        matching_element = element;
-    }
-
-    if (!matching_element)
-        return {};
-
-    if (!multiple_matching)
-        return GC::Ref { *matching_element };
-
-    // 4. Otherwise, create a new RadioNodeList object representing a live view of the HTMLFormControlsCollection object, further filtered so that the only nodes in the
-    //    RadioNodeList object are those that have either an id attribute or a name attribute equal to name. The nodes in the RadioNodeList object must be sorted in tree
-    //    order. Return that RadioNodeList object.
-    return RadioNodeList::create(realm(), root(), DOM::LiveNodeList::Scope::Descendants, [name](auto const& node) {
-        if (!is<DOM::Element>(node))
-            return false;
-
-        auto const& element = as<DOM::Element>(node);
-        return element.id() == name || element.name() == name;
-    });
-}
-
-JS::Value HTMLFormControlsCollection::named_item_value(Utf16FlyString const& name) const
-{
-    return named_item_or_radio_node_list(name).visit(
-        [](Empty) -> JS::Value { return JS::js_undefined(); },
-        [](auto const& value) -> JS::Value { return value; });
-}
-
-}
-
-FILE: Libraries/LibWeb/HTML/HTMLFormControlsCollection.h
-/*
- * Copyright (c) 2023, Shannon Booth <shannon@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <LibWeb/DOM/HTMLCollection.h>
-
-namespace Web::HTML {
-
-class HTMLFormControlsCollection : public DOM::HTMLCollection {
-    WEB_PLATFORM_OBJECT(HTMLFormControlsCollection, DOM::HTMLCollection);
-    GC_DECLARE_ALLOCATOR(HTMLFormControlsCollection);
-
-public:
-    [[nodiscard]] static GC::Ref<HTMLFormControlsCollection> create(DOM::ParentNode& root, Scope, ESCAPING Function<bool(DOM::Element const&)> filter);
-
-    virtual ~HTMLFormControlsCollection() override;
-
-    Variant<Empty, GC::Ref<DOM::Element>, GC::Ref<RadioNodeList>> named_item_or_radio_node_list(Utf16String const& name) const;
-    Variant<Empty, GC::Ref<DOM::Element>, GC::Ref<RadioNodeList>> named_item_or_radio_node_list(Utf16FlyString const& name) const;
-
-protected:
-    virtual void initialize(JS::Realm&) override;
-
-    virtual JS::Value named_item_value(Utf16FlyString const& name) const final;
-
-private:
-    HTMLFormControlsCollection(DOM::ParentNode& root, Scope, ESCAPING Function<bool(DOM::Element const&)> filter);
-};
-
-}
-
-FILE: Libraries/LibWeb/HTML/HTMLFormControlsCollection.idl
-// https://html.spec.whatwg.org/multipage/common-dom-interfaces.html#htmlformcontrolscollection
-[Exposed=Window]
-interface HTMLFormControlsCollection : HTMLCollection {
-    [ImplementedAs=named_item_or_radio_node_list] getter (RadioNodeList or Element)? namedItem(Utf16DOMString name); // shadows inherited namedItem()
-};
-
-FILE: Libraries/LibWeb/HTML/HTMLFormElement.cpp
-/*
- * Copyright (c) 2018-2021, Andreas Kling <andreas@ladybird.org>
- * Copyright (c) 2023, Kenneth Myhra <kennethmyhra@serenityos.org>
- * Copyright (c) 2023, Luke Wilde <lukew@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <AK/GenericLexer.h>
-#include <AK/QuickSort.h>
-#include <AK/StringBuilder.h>
-#include <LibTextCodec/Decoder.h>
-#include <LibWeb/Bindings/ExceptionOrUtils.h>
-#include <LibWeb/Bindings/HTMLFormElement.h>
-#include <LibWeb/DOM/DOMTokenList.h>
-#include <LibWeb/DOM/Document.h>
-#include <LibWeb/DOM/Event.h>
-#include <LibWeb/DOMURL/DOMURL.h>
-#include <LibWeb/HTML/BrowsingContext.h>
-#include <LibWeb/HTML/EventNames.h>
-#include <LibWeb/HTML/Focus.h>
-#include <LibWeb/HTML/FormControlInfrastructure.h>
-#include <LibWeb/HTML/HTMLButtonElement.h>
-#include <LibWeb/HTML/HTMLDialogElement.h>
-#include <LibWeb/HTML/HTMLFieldSetElement.h>
-#include <LibWeb/HTML/HTMLFormControlsCollection.h>
-#include <LibWeb/HTML/HTMLFormElement.h>
-#include <LibWeb/HTML/HTMLImageElement.h>
-#include <LibWeb/HTML/HTMLInputElement.h>
-#include <LibWeb/HTML/HTMLObjectElement.h>
-#include <LibWeb/HTML/HTMLOutputElement.h>
-#include <LibWeb/HTML/HTMLSelectElement.h>
-#include <LibWeb/HTML/HTMLTextAreaElement.h>
-#include <LibWeb/HTML/LocalNavigable.h>
-#include <LibWeb/HTML/RadioNodeList.h>
-#include <LibWeb/HTML/SubmitEvent.h>
-#include <LibWeb/Infra/CharacterTypes.h>
-#include <LibWeb/Infra/Strings.h>
-#include <LibWeb/Page/Page.h>
-
-namespace Web::HTML {
-
-GC_DEFINE_ALLOCATOR(HTMLFormElement);
-
-HTMLFormElement::HTMLFormElement(DOM::Document& document, DOM::QualifiedName qualified_name)
-    : HTMLElement(document, move(qualified_name))
-{
-    m_legacy_platform_object_flags = LegacyPlatformObjectFlags {
-        .supports_indexed_properties = true,
-        .supports_named_properties = true,
-        .has_legacy_unenumerable_named_properties_interface_extended_attribute = true,
-        .has_legacy_override_built_ins_interface_extended_attribute = true,
-    };
-}
-
-HTMLFormElement::~HTMLFormElement() = default;
-
-void HTMLFormElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLFormElement);
-    Base::initialize(realm);
-}
-
-void HTMLFormElement::visit_edges(Cell::Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-    visitor.visit(m_elements);
-    visitor.visit(m_associated_elements);
-    visitor.visit(m_planned_navigation);
-    visitor.visit(m_rel_list);
-    visitor.visit(m_past_names_map);
-}
-
-// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#implicit-submission
-WebIDL::ExceptionOr<void> HTMLFormElement::implicitly_submit_form()
-{
-    // If the user agent supports letting the user submit a form implicitly (for example, on some platforms hitting the
-    // "enter" key while a text control is focused implicitly submits the form), then doing so for a form, whose default
-    // button has activation behavior and is not disabled, must cause the user agent to fire a click event at that
-    // default button.
-    if (auto* default_button = this->default_button()) {
-        auto& default_button_element = default_button->form_associated_element_to_html_element();
-
-        if (default_button_element.has_activation_behavior() && default_button->enabled())
-            default_button_element.click();
-
-        return {};
-    }
-
-    // If the form has no submit button, then the implicit submission mechanism must perform the following steps:
-
-    // 1. If the form has more than one field that blocks implicit submission, then return.
-    if (number_of_fields_blocking_implicit_submission() > 1)
-        return {};
-
-    // 2. Submit the form element from the form element itself with userInvolvement set to "activation".
-    TRY(submit_form(*this, { .user_involvement = UserNavigationInvolvement::Activation }));
-
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-form-submit
-WebIDL::ExceptionOr<void> HTMLFormElement::submit_form(GC::Ref<HTMLElement> submitter, SubmitFormOptions options)
-{
-    auto& vm = this->vm();
-    auto& realm = this->realm();
-
-    // 1. If form cannot navigate, then return.
-    if (cannot_navigate())
-        return {};
-
-    // 2. If form's constructing entry list is true, then return.
-    if (m_constructing_entry_list)
-        return {};
-
-    // 3. Let form document be form's node document.
-    GC::Ref<DOM::Document> form_document = this->document();
-
-    // 4. If form document's active sandboxing flag set has its sandboxed forms browsing context flag set, then return.
-    if (has_flag(form_document->active_sandboxing_flag_set(), HTML::SandboxingFlagSet::SandboxedForms))
-        return {};
-
-    // 5. If the submitted from submit() method flag is not set, then:
-    if (!options.from_submit_binding) {
-        // 1. If form's firing submission events is true, then return.
-        if (m_firing_submission_events)
-            return {};
-
-        // 2. Set form's firing submission events to true.
-        m_firing_submission_events = true;
-
-        // 3. For each element field in the list of submittable elements whose form owner is form, set field's user validity to true.
-        for (auto& element : get_submittable_elements()) {
-            // NOTE: Only input, select and textarea elements have a user validity flag.
-            //       See https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#user-validity
-            if (is<HTMLInputElement>(*element)) {
-                (&as<HTMLInputElement>(*element))->set_user_validity(true);
-            } else if (is<HTMLSelectElement>(*element)) {
-                (&as<HTMLSelectElement>(*element))->set_user_validity(true);
-            } else if (is<HTMLTextAreaElement>(*element)) {
-                (&as<HTMLTextAreaElement>(*element))->set_user_validity(true);
-            }
-        }
-
-        // 4. If the submitter element's no-validate state is false, then interactively validate the constraints
-        //    of form and examine the result. If the result is negative (i.e., the constraint validation concluded
-        //    that there were invalid fields and probably informed the user of this), then:
-        if (!submitter->novalidate_state()) {
-            auto validation_result = interactively_validate_constraints();
-            if (!validation_result) {
-                // 1. Set form's firing submission events to false.
-                m_firing_submission_events = false;
-
-                // 2. Return.
-                return {};
-            }
-        }
-
-        // 5. Let submitterButton be null if submitter is form. Otherwise, let submitterButton be submitter.
-        GC::Ptr<HTMLElement> submitter_button;
-        if (submitter != this)
-            submitter_button = submitter;
-
-        // 6. Let shouldContinue be the result of firing an event named submit at form using SubmitEvent, with the
-        //    submitter attribute initialized to submitterButton, the bubbles attribute initialized to true, and the
-        //    cancelable attribute initialized to true.
-        Bindings::SubmitEventInit event_init {};
-        event_init.submitter = submitter_button;
-        auto submit_event = SubmitEvent::create(realm, EventNames::submit, event_init);
-        submit_event->set_bubbles(true);
-        submit_event->set_cancelable(true);
-        bool should_continue = dispatch_event(*submit_event);
-
-        // 7. Set form's firing submission events to false.
-        m_firing_submission_events = false;
-
-        // 8. If shouldContinue is false, then return.
