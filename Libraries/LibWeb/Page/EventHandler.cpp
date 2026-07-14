@@ -643,7 +643,14 @@ EventResult EventHandler::handle_mouseup(CSSPixelPoint visual_viewport_position,
         return EventResult::Dropped;
 
     auto coordinates = compute_mouse_event_coordinates(visual_viewport_position, viewport_position, *paintable, *layout_node);
-    dispatch_a_pointer_event_for_a_device_that_supports_hover(PointerEventType::PointerUp, *node, chrome_widget, coordinates, screen_position, {}, button, buttons, modifiers, click_count);
+    [[maybe_unused]] auto dispatch_result = dispatch_a_pointer_event_for_a_device_that_supports_hover(PointerEventType::PointerUp, *node, chrome_widget, coordinates, screen_position, {}, button, buttons, modifiers, click_count);
+
+#if defined(AK_OS_MACOS)
+    // INTEROP: Blink, WebKit, and Gecko defer changing a selection clicked for a possible drag until an uncancelled
+    //          mouseup. Blink and WebKit clear non-editable selections, while Gecko collapses them to a caret.
+    if (m_mousedown_preserved_selection && dispatch_result == PointerEventDispatchResult::RunDefaultActions)
+        finish_selection_from_preserved_mousedown(*document, visual_viewport_position);
+#endif
 
     // FIXME: Per spec, the click target should be the nearest common inclusive ancestor of the pointerdown
     //        and pointerup targets. Currently we require an exact match.
@@ -2222,6 +2229,29 @@ void EventHandler::start_selection_from_preserved_mousedown(DOM::Document& docum
     if (auto container = AutoScrollHandler::find_scrollable_ancestor(*caret_position->paintable))
         m_auto_scroll_handler = make<AutoScrollHandler>(m_navigable, *container);
 }
+
+void EventHandler::finish_selection_from_preserved_mousedown(DOM::Document& document, CSSPixelPoint visual_viewport_position)
+{
+    m_mousedown_preserved_selection = false;
+
+    if (!m_mousedown_visual_viewport_position.has_value() || *m_mousedown_visual_viewport_position != visual_viewport_position)
+        return;
+
+    document.update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseUp);
+    if (!paint_root())
+        return;
+
+    auto caret_position = document.caret_position_from_point_for_selection_start(visual_viewport_position);
+    if (!caret_position.has_value())
+        return;
+
+    if (auto* target = document.active_input_events_target(&*caret_position->boundary.node)) {
+        target->set_selection_anchor(*caret_position->boundary.node, caret_position->boundary.offset, caret_position->affinity);
+    } else if (auto selection = document.get_selection()) {
+        selection->remove_all_ranges();
+        document.set_needs_repaint(Badge<EventHandler> {});
+    }
+}
 #endif
 
 void EventHandler::run_activation_behavior(GC::Ref<DOM::Node> node, unsigned button, unsigned modifiers)
@@ -2389,11 +2419,6 @@ bool EventHandler::maybe_request_paste_for_middle_click(DOM::Document& document,
 static void set_user_selection(GC::Ptr<DOM::Node> anchor_node, size_t anchor_offset, GC::Ptr<DOM::Node> focus_node, size_t focus_offset, Selection::Selection* selection, CSS::UserSelect user_select)
 {
     auto move_focus_before_node = [&](GC::Ref<DOM::Node> node) -> bool {
-        focus_node = node->previous_in_pre_order();
-        if (focus_node) {
-            focus_offset = focus_node->length();
-            return true;
-        }
         if (!node->parent())
             return false;
         focus_node = *node->parent();
@@ -2402,13 +2427,6 @@ static void set_user_selection(GC::Ptr<DOM::Node> anchor_node, size_t anchor_off
     };
 
     auto move_focus_after_node = [&](GC::Ref<DOM::Node> node) -> bool {
-        focus_node = node->next_in_pre_order();
-        while (focus_node && node->is_inclusive_ancestor_of(*focus_node))
-            focus_node = focus_node->next_in_pre_order();
-        if (focus_node) {
-            focus_offset = 0;
-            return true;
-        }
         if (!node->parent())
             return false;
         focus_node = *node->parent();
@@ -2427,12 +2445,12 @@ static void set_user_selection(GC::Ptr<DOM::Node> anchor_node, size_t anchor_off
         //     focus node, as this means they are inside the same contain element, or not in a contain element at all.
         //     This takes care of the "selection trying to escape from a contain" case.
         while (
-            (!potential_contain_node->is_element() || !potential_contain_node->layout_node() || potential_contain_node->layout_node()->user_select_used_value() != CSS::UserSelect::Contain) && potential_contain_node->parent() && !potential_contain_node->is_inclusive_ancestor_of(*focus_node)) {
+            (!potential_contain_node->is_element() || potential_contain_node->user_select_used_value() != CSS::UserSelect::Contain) && potential_contain_node->parent() && !potential_contain_node->is_inclusive_ancestor_of(*focus_node)) {
             potential_contain_node = potential_contain_node->parent();
         }
 
         if (
-            potential_contain_node->layout_node() && potential_contain_node->layout_node()->user_select_used_value() == CSS::UserSelect::Contain && !potential_contain_node->is_inclusive_ancestor_of(*focus_node)) {
+            potential_contain_node->is_element() && potential_contain_node->user_select_used_value() == CSS::UserSelect::Contain && !potential_contain_node->is_inclusive_ancestor_of(*focus_node)) {
             if (focus_node->is_before(*potential_contain_node)) {
                 focus_offset = 0;
             } else {
@@ -2452,11 +2470,11 @@ static void set_user_selection(GC::Ptr<DOM::Node> anchor_node, size_t anchor_off
             auto target_node = potential_contain_node;
             potential_contain_node = focus_node;
             while (
-                (!potential_contain_node->is_element() || !potential_contain_node->layout_node() || potential_contain_node->layout_node()->user_select_used_value() != CSS::UserSelect::Contain) && potential_contain_node->parent() && potential_contain_node != target_node) {
+                (!potential_contain_node->is_element() || potential_contain_node->user_select_used_value() != CSS::UserSelect::Contain) && potential_contain_node->parent() && potential_contain_node != target_node) {
                 potential_contain_node = potential_contain_node->parent();
             }
             if (
-                potential_contain_node->layout_node() && potential_contain_node->layout_node()->user_select_used_value() == CSS::UserSelect::Contain && !potential_contain_node->is_inclusive_ancestor_of(*anchor_node)) {
+                potential_contain_node->is_element() && potential_contain_node->user_select_used_value() == CSS::UserSelect::Contain && !potential_contain_node->is_inclusive_ancestor_of(*anchor_node)) {
                 if (potential_contain_node->is_before(*anchor_node)) {
                     if (!move_focus_after_node(*potential_contain_node))
                         return;
@@ -2481,7 +2499,7 @@ static void set_user_selection(GC::Ptr<DOM::Node> anchor_node, size_t anchor_off
 
         // A selection started outside of this element must not end in this element. If the user attempts to create such
         // a selection, the UA must instead end the selection range at the element boundary.
-        while (focus_node->parent() && focus_node->parent()->layout_node()->user_select_used_value() == CSS::UserSelect::None) {
+        while (focus_node->parent() && focus_node->parent()->user_select_used_value() == CSS::UserSelect::None) {
             focus_node = focus_node->parent();
         }
         if (focus_node->is_before(*anchor_node)) {
@@ -2500,7 +2518,7 @@ static void set_user_selection(GC::Ptr<DOM::Node> anchor_node, size_t anchor_off
         // then the selection must contain the entire element including all its descendants. If the element is selected
         // and the used value of 'user-select' on its parent is 'all', then the parent must be included in the selection,
         // recursively.
-        while (focus_node->parent() && focus_node->parent()->layout_node()->user_select_used_value() == CSS::UserSelect::All) {
+        while (focus_node->parent() && focus_node->parent()->user_select_used_value() == CSS::UserSelect::All) {
             if (anchor_node == focus_node) {
                 anchor_node = focus_node->parent();
             }
