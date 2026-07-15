@@ -404603,6 +404603,9 @@ AnimationUpdateContext::~AnimationUpdateContext()
                 pseudo_element_node->apply_style(*style);
         }
 
+        if (invalidation.changes_containing_block_establishment)
+            target->document().partial_relayout_invalidation().record_escape(DOM::PartialRelayoutEscapeReason::ContainingBlockEstablishmentChangedByKeyframeEffect);
+
         if (invalidation.needs_relayout())
             target->set_needs_layout_update(DOM::SetNeedsLayoutReason::KeyframeEffect);
         if (invalidation.needs_layout_tree_rebuild())
@@ -420308,31 +420311,15 @@ Optional<AsyncScrollNodeID> AsyncScrollTree::scrollable_ancestor_for_node(AsyncS
     return {};
 }
 
-Optional<Painting::ScrollFrameIndex> AsyncScrollTree::parent_scroll_frame_index(Painting::ScrollFrameIndex scroll_frame_index) const
-{
-    for (auto const& node : m_scroll_nodes) {
-        if (node.node_id.scroll_frame_index != scroll_frame_index)
-            continue;
-        if (!node.parent_node_id.has_value())
-            return {};
-        return node.parent_node_id->scroll_frame_index;
-    }
-
-    if (auto const* sticky_area = sticky_area_for_scroll_frame_index(scroll_frame_index))
-        return sticky_area->parent_scroll_frame_index;
-
-    return {};
-}
-
-Gfx::FloatPoint AsyncScrollTree::cumulative_device_offset_for_frame(Painting::ScrollFrameIndex scroll_frame_index, Painting::ScrollStateSnapshot const& scroll_state_snapshot) const
+Gfx::FloatPoint AsyncScrollTree::cumulative_device_sticky_offset_for_frame(Painting::ScrollFrameIndex scroll_frame_index, Painting::ScrollStateSnapshot const& scroll_state_snapshot) const
 {
     Gfx::FloatPoint offset;
     for (auto index = scroll_frame_index; index.value();) {
-        offset.translate_by(scroll_state_snapshot.device_offset_for_index(index));
-        auto parent_index = parent_scroll_frame_index(index);
-        if (!parent_index.has_value())
+        auto const* sticky_area = sticky_area_for_scroll_frame_index(index);
+        if (!sticky_area)
             break;
-        index = *parent_index;
+        offset.translate_by(scroll_state_snapshot.device_offset_for_index(index));
+        index = sticky_area->parent_scroll_frame_index;
     }
     return offset;
 }
@@ -420377,9 +420364,7 @@ void AsyncScrollTree::update_sticky_offsets(Painting::ScrollStateSnapshot& scrol
         if (!sticky_area.nearest_scrolling_ancestor_index.value())
             continue;
 
-        Gfx::FloatPoint parent_sticky_offset;
-        if (sticky_area.parent_scroll_frame_index.value() && sticky_area_for_scroll_frame_index(sticky_area.parent_scroll_frame_index))
-            parent_sticky_offset = cumulative_device_offset_for_frame(sticky_area.parent_scroll_frame_index, scroll_state_snapshot);
+        auto parent_sticky_offset = cumulative_device_sticky_offset_for_frame(sticky_area.parent_scroll_frame_index, scroll_state_snapshot);
 
         auto sticky_position_in_ancestor = sticky_area.position_relative_to_scroll_ancestor.translated(parent_sticky_offset);
 
@@ -420699,8 +420684,7 @@ private:
     AsyncScrollNode const* scroll_node_for_stable_id(AsyncScrollNodeStableID) const;
     AsyncStickyArea const* sticky_area_for_scroll_frame_index(Painting::ScrollFrameIndex) const;
     Optional<AsyncScrollNodeID> scrollable_ancestor_for_node(AsyncScrollNodeID, Painting::ScrollStateSnapshot const&, Gfx::FloatPoint delta) const;
-    Optional<Painting::ScrollFrameIndex> parent_scroll_frame_index(Painting::ScrollFrameIndex) const;
-    Gfx::FloatPoint cumulative_device_offset_for_frame(Painting::ScrollFrameIndex, Painting::ScrollStateSnapshot const&) const;
+    Gfx::FloatPoint cumulative_device_sticky_offset_for_frame(Painting::ScrollFrameIndex, Painting::ScrollStateSnapshot const&) const;
     Gfx::FloatPoint apply_scroll_delta_to_node(AsyncScrollNode const&, Gfx::FloatPoint delta, Painting::ScrollStateSnapshot&);
     void update_sticky_offsets(Painting::ScrollStateSnapshot&) const;
 
@@ -489399,7 +489383,10 @@ double Length::container_relative_length_to_px_without_rounding(ResolutionContex
 
         auto paintable_box = query_container->unsafe_paintable_box();
         if (!paintable_box) {
-            if (!subject.document().layout_is_up_to_date())
+            // A running partial relayout pass reports layout as up to date, but a container
+            // with no paintable yet still needs the post-layout evaluation, which routes the
+            // follow-up pass to the full layout path that resolves the container's size.
+            if (!subject.document().layout_is_up_to_date() || subject.document().is_running_update_layout())
                 const_cast<DOM::Document&>(subject.document()).set_needs_container_query_evaluation_after_layout(*query_container);
             return 0.0;
         }
@@ -535718,6 +535705,7 @@ FILE: Libraries/LibWeb/CSS/StyleInvalidation.cpp
 
 #include <LibWeb/CSS/PropertyID.h>
 #include <LibWeb/CSS/StyleInvalidation.h>
+#include <LibWeb/CSS/StyleValues/CustomIdentStyleValue.h>
 #include <LibWeb/CSS/StyleValues/FilterValueListStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
 #include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
@@ -535768,6 +535756,84 @@ static bool is_stacking_context_creating_value(CSS::PropertyID property_id, Styl
         // For properties we haven't optimized (contain, container-type, will-change, all),
         // assume any value creates stacking context to be safe
         return true;
+    }
+}
+
+// Mirrors the checks in Layout::Node::establishes_a_fixed_positioning_containing_block().
+static bool is_containing_block_establishing_value(CSS::PropertyID property_id, StyleValue const* value)
+{
+    if (!value)
+        return false;
+
+    switch (property_id) {
+    case CSS::PropertyID::Transform:
+        if (value->to_keyword() == CSS::Keyword::None)
+            return false;
+        if (value->is_value_list())
+            return value->as_value_list().size() > 0;
+        return value->is_transformation();
+    case CSS::PropertyID::Translate:
+    case CSS::PropertyID::Rotate:
+    case CSS::PropertyID::Scale:
+    case CSS::PropertyID::Perspective:
+        return value->to_keyword() != CSS::Keyword::None;
+    case CSS::PropertyID::TransformStyle:
+        return value->to_keyword() == CSS::Keyword::Preserve3d;
+    case CSS::PropertyID::Filter:
+    case CSS::PropertyID::BackdropFilter:
+        if (value->is_keyword())
+            return value->to_keyword() != CSS::Keyword::None;
+        return value->is_filter_value_list();
+    case CSS::PropertyID::Contain: {
+        // contain: none | strict | content | [ size || inline-size || layout || style || paint ]
+        // Only layout and paint containment (which strict and content include) establish a
+        // containing block; size, inline-size and style containment do not.
+        auto keyword_establishes_containing_block = [](CSS::Keyword keyword) {
+            return AK::first_is_one_of(keyword, CSS::Keyword::Strict, CSS::Keyword::Content, CSS::Keyword::Layout, CSS::Keyword::Paint);
+        };
+        if (value->is_keyword())
+            return keyword_establishes_containing_block(value->to_keyword());
+        if (value->is_value_list()) {
+            for (auto const& entry : value->as_value_list().values()) {
+                if (entry->is_keyword() && keyword_establishes_containing_block(entry->to_keyword()))
+                    return true;
+            }
+            return false;
+        }
+        return true;
+    }
+    case CSS::PropertyID::WillChange: {
+        // will-change establishes a containing block only when it mentions a property whose
+        // non-initial value would, or `position`, which additionally lets a non-atomic inline
+        // establish an absolute positioning containing block.
+        auto entry_establishes_containing_block = [](StyleValue const& entry) {
+            if (!entry.is_custom_ident())
+                return false;
+            auto property = property_id_from_string(entry.as_custom_ident().custom_ident());
+            if (!property.has_value())
+                return false;
+            return AK::first_is_one_of(*property,
+                CSS::PropertyID::Transform, CSS::PropertyID::Translate, CSS::PropertyID::Rotate,
+                CSS::PropertyID::Scale, CSS::PropertyID::Perspective, CSS::PropertyID::TransformStyle,
+                CSS::PropertyID::Filter, CSS::PropertyID::BackdropFilter, CSS::PropertyID::Contain,
+                CSS::PropertyID::Position);
+        };
+        if (value->to_keyword() == CSS::Keyword::Auto)
+            return false;
+        if (value->is_value_list()) {
+            for (auto const& entry : value->as_value_list().values()) {
+                if (entry_establishes_containing_block(entry))
+                    return true;
+            }
+            return false;
+        }
+        return entry_establishes_containing_block(*value);
+    }
+    case CSS::PropertyID::ContainerType:
+        // container-type: size and inline-size apply layout containment; normal does not.
+        return value->to_keyword() == CSS::Keyword::Size || value->to_keyword() == CSS::Keyword::InlineSize;
+    default:
+        return false;
     }
 }
 
@@ -535952,6 +536018,9 @@ RequiredInvalidationAfterStyleChange compute_property_invalidation(CSS::Property
         }
     }
 
+    if (is_containing_block_establishing_value(property_id, old_value) != is_containing_block_establishing_value(property_id, new_value))
+        invalidation.changes_containing_block_establishment = true;
+
     bool needs_repaint = true;
     if (CSS::property_affects_accumulated_visual_contexts(property_id)) {
         if (accumulated_visual_context_change_is_value_only(property_id, old_value, new_value))
@@ -536027,6 +536096,10 @@ struct RequiredInvalidationAfterStyleChange {
     bool recompute_descendant_styles : 1 { false };
     // At least one inherited longhand changed, so shadow-tree descendants may need inherited style recomputation.
     bool inherited_style_changed : 1 { false };
+    // The element gained or lost a containing block for absolutely/fixed positioned
+    // descendants. Containing block pointers are only recomputed by a full layout pass, so
+    // partial relayout boundary qualification cannot be trusted until one runs.
+    bool changes_containing_block_establishment : 1 { false };
 
     void operator|=(RequiredInvalidationAfterStyleChange const& other)
     {
@@ -536036,6 +536109,7 @@ struct RequiredInvalidationAfterStyleChange {
         m_needs_scrollable_overflow_recalculation |= other.m_needs_scrollable_overflow_recalculation;
         recompute_descendant_styles |= other.recompute_descendant_styles;
         inherited_style_changed |= other.inherited_style_changed;
+        changes_containing_block_establishment |= other.changes_containing_block_establishment;
     }
 
     [[nodiscard]] bool is_none() const
@@ -536044,7 +536118,8 @@ struct RequiredInvalidationAfterStyleChange {
             && m_accumulated_visual_contexts == AccumulatedVisualContextInvalidation::None
             && !m_needs_scrollable_overflow_recalculation
             && !recompute_descendant_styles
-            && !inherited_style_changed;
+            && !inherited_style_changed
+            && !changes_containing_block_establishment;
     }
 
     static RequiredInvalidationAfterStyleChange full()
@@ -561375,6 +561450,7 @@ FILE: Libraries/LibWeb/CSS/UpdateStyle.cpp
 #include <LibWeb/HTML/HTMLSlotElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
+#include <LibWeb/Layout/Box.h>
 
 namespace Web::CSS {
 
@@ -561391,8 +561467,28 @@ static void apply_element_style_invalidation_after_style_change(DOM::Element& el
     if (invalidation.needs_scrollable_overflow_recalculation())
         element.document().schedule_scrollable_overflow_recalculation(element);
 
-    if (invalidation.needs_relayout())
-        element.set_needs_layout_update(DOM::SetNeedsLayoutReason::StyleChange);
+    if (invalidation.changes_containing_block_establishment)
+        element.document().partial_relayout_invalidation().record_escape(DOM::PartialRelayoutEscapeReason::ContainingBlockEstablishmentChangedByStyleChange);
+
+    if (invalidation.needs_relayout()) {
+        // A relayout-only style change on an absolutely positioned partial relayout boundary
+        // stays confined to it: the box contributes nothing to ancestor layout, and partial
+        // relayout re-resolves the boundary's own size and position. A rendered ::backdrop
+        // disqualifies the element, because pseudo-element style diffs are merged into the
+        // element's invalidation while the ::backdrop box is a sibling of the element's box,
+        // outside the subtree a boundary-self relayout covers.
+        auto* box = as_if<Layout::Box>(element.unsafe_layout_node());
+        if (!invalidation.needs_layout_tree_rebuild()
+            && box
+            && box->is_absolutely_positioned()
+            && box->is_partial_relayout_boundary()
+            && !element.pseudo_element_unsafe_layout_node(CSS::PseudoElement::Backdrop)) {
+            box->set_needs_own_geometry_update();
+            element.set_needs_layout_update(DOM::SetNeedsLayoutReason::StyleChange, Layout::LayoutUpdatePropagation::BoundarySelfOnly);
+        } else {
+            element.set_needs_layout_update(DOM::SetNeedsLayoutReason::StyleChange);
+        }
+    }
     if (invalidation.needs_layout_tree_rebuild())
         element.set_needs_layout_tree_rebuild(DOM::SetNeedsLayoutTreeUpdateReason::StyleChange);
 
@@ -564122,6 +564218,8 @@ public:
     void register_name(Utf16FlyString const& name, GC::Ref<Element>);
     void unregister_name(Utf16FlyString const& name, GC::Ref<Element>);
     GC::Ptr<Element> last_element_by_name_matching(Utf16FlyString const& name, Function<bool(Element&)> const& is_acceptable) const;
+
+    [[nodiscard]] bool has_registered_names() const { return !m_map.is_empty(); }
 
     template<typename Visitor>
     void visit_edges(Visitor& visitor) { visitor.visit(m_map); }
@@ -566935,9 +567033,36 @@ void Document::invalidate_layout_tree(InvalidateLayoutTreeReason reason)
     tear_down_layout_tree();
 }
 
-void Document::mark_svg_root_as_needing_relayout(Layout::SVGSVGBox& svg_root)
+void Document::PartialRelayoutInvalidation::record_boundary(Layout::Box& box)
 {
-    m_svg_roots_needing_relayout.set(svg_root.make_weak_ptr<Layout::SVGSVGBox>());
+    m_registered_roots.set(box.make_weak_ptr<Layout::Box>());
+}
+
+void Document::PartialRelayoutInvalidation::record_escape(PartialRelayoutEscapeReason reason)
+{
+    dbgln_if(UPDATE_LAYOUT_DEBUG, "Pending updates escape partial relayout boundaries ({})", to_string(reason));
+    m_escapes = true;
+}
+
+void Document::PartialRelayoutInvalidation::clear_escape(PartialRelayoutEscapeClearReason reason)
+{
+    if (m_escapes)
+        dbgln_if(UPDATE_LAYOUT_DEBUG, "Pending updates no longer escape partial relayout boundaries ({})", to_string(reason));
+    m_escapes = false;
+}
+
+// Anchor names publish geometry that anchor() functions on positioned boxes anywhere in the
+// document consume, and only a full layout pass re-resolves all of them, so anchor positioning
+// in use takes updates off the partial relayout path entirely.
+bool Document::any_anchor_names_are_registered() const
+{
+    if (m_anchor_name_map.has_registered_names())
+        return true;
+    for (auto const& shadow_root : m_shadow_roots) {
+        if (shadow_root.anchor_name_map().has_registered_names())
+            return true;
+    }
+    return false;
 }
 
 void Document::set_needs_container_query_evaluation_after_layout(Element const& query_container)
@@ -566945,27 +567070,102 @@ void Document::set_needs_container_query_evaluation_after_layout(Element const& 
     m_query_containers_needing_container_query_evaluation_after_layout.set(const_cast<Element&>(query_container));
 }
 
-static void relayout_svg_root(Layout::SVGSVGBox& svg_root)
+static void compute_subtree_layout(Layout::Box& subtree_root, Layout::LayoutState& layout_state, Painting::Paintable const& root_geometry_source)
 {
-    Layout::LayoutState layout_state(svg_root, Layout::LayoutState::Purpose::Commit);
+    // The boundary's own size and position are frozen at the previous layout's values.
+    layout_state.populate_from_paintable(subtree_root, root_geometry_source);
 
-    // Pre-populate the svg_root itself.
-    if (auto paintable = svg_root.paintable_box())
-        layout_state.populate_from_paintable(svg_root, *paintable);
+    // Pre-populate the viewport for position:fixed elements inside the subtree.
+    auto& viewport = subtree_root.root();
+    if (auto paintable = viewport.paintable_box())
+        layout_state.populate_from_paintable(viewport, *paintable);
 
-    auto const& svg_state = layout_state.get(svg_root);
-    auto content_width = svg_state.content_width();
-    auto content_height = svg_state.content_height();
+    auto const& root_state = layout_state.get(subtree_root);
+    auto available_space = Layout::AvailableSpace(
+        Layout::AvailableSize::make_definite(root_state.content_width()),
+        Layout::AvailableSize::make_definite(root_state.content_height()));
 
-    Layout::SVGFormattingContext svg_context(layout_state, Layout::LayoutMode::Normal, svg_root, nullptr);
-    auto available_space = Layout::AvailableSpace(Layout::AvailableSize::make_definite(content_width), Layout::AvailableSize::make_definite(content_height));
-    svg_context.run(Layout::LayoutInput { available_space });
-    layout_state.commit(svg_root);
+    auto context = Layout::FormattingContext::create_independent_formatting_context_if_needed(
+        layout_state, Layout::LayoutMode::Normal, subtree_root, nullptr);
+    VERIFY(context);
 
-    svg_root.for_each_in_inclusive_subtree([](auto& node) {
+    // NOTE: containing_block_constraints stays empty: the subtree root has definite sizes in
+    //       both axes, so nothing below it resolves percentages against inherited constraints.
+    context->run(Layout::LayoutInput { available_space });
+
+    // Lay out the subtree root's own absolutely positioned children, like the parent formatting
+    // context would do after dimensioning the root box during a full layout.
+    context->parent_context_did_dimension_child_root_box();
+}
+
+static void relayout_subtree(Layout::Box& subtree_root, Painting::Paintable& old_paintable)
+{
+    Layout::LayoutState layout_state(subtree_root, Layout::LayoutState::Purpose::Commit);
+    // Absolutely positioned boundaries re-resolve their own size and position by replaying
+    // their layout from saved inputs; SVG root boundaries keep the frozen geometry from the
+    // previous layout, taken from the old paintable since a replaced box no longer has one.
+    if (subtree_root.is_absolutely_positioned())
+        Layout::FormattingContext::layout_absolutely_positioned_element_from_saved_inputs(layout_state, subtree_root);
+    else
+        compute_subtree_layout(subtree_root, layout_state, old_paintable);
+    // The commit takes over the old paintable's position in the paint tree, whether the
+    // subtree root reuses it (a surviving box) or replaces it (a rebuilt box).
+    layout_state.commit(subtree_root, old_paintable);
+
+    subtree_root.for_each_in_inclusive_subtree([](auto& node) {
         node.reset_needs_layout_update();
         return TraversalDecision::Continue;
     });
+}
+
+// The pre-order traversal visits ancestors before the descendants that mark them, so clearing
+// the flag on visit and marking upwards compose within one walk.
+void Document::recompute_containing_block_and_derive_abspos_escape_flags(Layout::Node& layout_node)
+{
+    layout_node.recompute_containing_block({});
+
+    auto* box = as_if<Layout::Box>(layout_node);
+    if (!box)
+        return;
+    box->set_abspos_descendant_escapes(false);
+
+    if (!box->is_absolutely_positioned())
+        return;
+    auto const* containing_block = box->containing_block();
+    for (auto* ancestor = box->parent(); ancestor && ancestor != containing_block; ancestor = ancestor->parent()) {
+        if (auto* ancestor_box = as_if<Layout::Box>(*ancestor))
+            ancestor_box->set_abspos_descendant_escapes(true);
+    }
+}
+
+// Refreshes every structure derived from committed layout results, shared by the partial and
+// full layout paths so neither can forget one.
+void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed)
+{
+    // NB: Called during layout update.
+    m_layout_root->invalidate_text_blocks_cache();
+
+    invalidate_stacking_context_tree();
+    set_needs_to_record_display_list();
+    set_needs_to_refresh_scroll_state(true);
+
+    unsafe_paintable()->reassign_scroll_frames();
+
+    set_needs_accumulated_visual_contexts_update(true);
+    update_paint_and_hit_testing_properties_if_needed();
+
+    // Selection state lives on paintable fragments, which the commit has rebuilt.
+    if (auto range = get_selection()->range())
+        unsafe_paintable()->recompute_selection_states(*range);
+
+    if (layout_tree_changed == LayoutTreeChanged::Yes) {
+        // Broadcast the current viewport rect to any new paintables, so they know whether
+        // they're visible or not, and re-collect the content-visibility:auto set.
+        inform_all_viewport_clients_about_the_current_viewport_rect();
+        collect_paintable_boxes_with_auto_content_visibility();
+    }
+
+    m_document->set_needs_repaint();
 }
 
 static void propagate_scrollbar_width_to_viewport(Element& root_element, Layout::Viewport& viewport)
@@ -567054,6 +567254,164 @@ void Document::update_layout_if_needed_for_node(Node const& node, UpdateLayoutRe
         update_layout(reason);
 }
 
+bool Document::needs_style_update_after_layout()
+{
+    return !m_query_containers_needing_container_query_evaluation_after_layout.is_empty()
+        || m_needs_animated_style_update
+        || m_needs_invalidation_of_elements_affected_by_has
+        || m_style_invalidator->has_pending_invalidations()
+        || needs_full_style_update()
+        || needs_style_update()
+        || child_needs_style_update();
+}
+
+// Attempts to satisfy the pending layout update by re-laying out only the registered partial
+// relayout boundary subtrees. Runs the incremental layout tree build itself when tree updates
+// are pending (consuming `needs_layout_tree_rebuild`), so an ineligible update continues to
+// the full layout path without rebuilding again.
+Document::PartialRelayoutResult Document::try_partial_relayout(HashTable<WeakPtr<Layout::Box>> registered_partial_relayout_roots, bool& needs_layout_tree_rebuild, bool should_collect_devtools_layout_data)
+{
+    if (!m_layout_root
+        || needs_full_layout_tree_update()
+        || m_partial_relayout_invalidation.escapes()
+        || registered_partial_relayout_roots.is_empty()
+        || m_layout_root->needs_layout_update()
+        || !m_query_containers_needing_container_query_evaluation_after_layout.is_empty()
+        || layout_node_indices_outgrew_dense_range()
+        || should_collect_devtools_layout_data
+        || any_anchor_names_are_registered())
+        return PartialRelayoutResult::NotEligible;
+
+    bool layout_tree_was_built_in_partial_branch = false;
+    bool pending_updates_escaped_during_partial_build = false;
+    Vector<Layout::Node*> rebuilt_subtree_roots;
+    if (needs_layout_tree_rebuild) {
+        auto tree_build_timer = Core::ElapsedTimer::start_new(Core::TimerType::Precise);
+        Layout::TreeBuilder tree_builder;
+        m_layout_root = as<Layout::Viewport>(*tree_builder.build(*this));
+        needs_layout_tree_rebuild = false;
+        layout_tree_was_built_in_partial_branch = true;
+        pending_updates_escaped_during_partial_build = m_partial_relayout_invalidation.escapes()
+            || tree_builder.layout_tree_update_escaped_rebuild_roots();
+        m_partial_relayout_invalidation.clear_escape(PartialRelayoutEscapeClearReason::PartialLayoutTreeBuild);
+        rebuilt_subtree_roots = tree_builder.rebuilt_subtree_roots();
+
+        if constexpr (UPDATE_LAYOUT_DEBUG) {
+            dbgln("TREEBUILD {} µs", tree_build_timer.elapsed_time().to_microseconds());
+        }
+    }
+
+    if (m_layout_root->needs_layout_update() || pending_updates_escaped_during_partial_build)
+        return PartialRelayoutResult::NotEligible;
+
+    // Nodes created by the incremental build have no containing blocks assigned yet, and the
+    // mutation may have moved where existing out-of-flow descendants belong; recompute both so
+    // boundary qualification below reads facts matching the just-built tree.
+    for (auto* rebuilt_root : rebuilt_subtree_roots) {
+        rebuilt_root->for_each_in_inclusive_subtree([](Layout::Node& node) {
+            recompute_containing_block_and_derive_abspos_escape_flags(node);
+            return TraversalDecision::Continue;
+        });
+    }
+
+    // Collect the live boundary set from the post-build tree: registered boundaries that
+    // survived the build, plus the nearest boundary containing each rebuilt subtree - which
+    // re-discovers a boundary whose own box the build replaced, since the saved layout inputs
+    // carried over to the replacement.
+    struct PartialRelayoutRoot {
+        Layout::Box* box { nullptr };
+        RefPtr<Painting::Paintable> old_paintable;
+    };
+    Vector<PartialRelayoutRoot> partial_relayout_roots;
+    HashTable<Layout::Box*> collected_boundaries;
+    auto collect_boundary = [&](Layout::Box& box, bool box_was_replaced) {
+        if (collected_boundaries.set(&box) != AK::HashSetResult::InsertedNewEntry)
+            return true;
+
+        RefPtr<Painting::Paintable> old_paintable = box.paintable_box();
+        if (!old_paintable && box_was_replaced && box.dom_node()) {
+            // A replaced box has no paintable yet; the previous one stays referenced by the
+            // DOM node until the next commit replaces it there.
+            old_paintable = box.dom_node()->unsafe_paintable();
+        }
+        if (!old_paintable)
+            return false;
+
+        // A replaced box applies the saved-inputs validity check unconditionally: the change
+        // that drove the replacement cannot be classified anymore.
+        bool saved_inputs_may_be_style_stale = box.needs_own_geometry_update() || box_was_replaced;
+        if (saved_inputs_may_be_style_stale && box.is_absolutely_positioned() && !Layout::FormattingContext::can_replay_saved_abspos_layout_inputs_after_style_change(box))
+            return false;
+
+        partial_relayout_roots.append({
+            .box = &box,
+            .old_paintable = old_paintable,
+        });
+        return true;
+    };
+
+    for (auto const& root : registered_partial_relayout_roots) {
+        auto* box = root.ptr();
+        // A boundary that did not survive the build was either replaced (re-discovered
+        // through the rebuilt subtree roots below) or removed together with the dirt
+        // inside it (the removal dirtied its parent, whose own marking covers the
+        // mutation).
+        if (!box || !box->parent())
+            continue;
+        if (!box->is_partial_relayout_boundary() || !collect_boundary(*box, false))
+            return PartialRelayoutResult::NotEligible;
+    }
+
+    for (auto* rebuilt_root : rebuilt_subtree_roots) {
+        // Every rebuilt subtree must lie inside a boundary for its dirt to be confined.
+        // The rebuilt box itself may qualify with its paintable still pending; boundaries
+        // above it were not replaced and must have one.
+        Layout::Box* containing_boundary = nullptr;
+        if (auto* rebuilt_box = as_if<Layout::Box>(*rebuilt_root); rebuilt_box && rebuilt_box->is_partial_relayout_boundary(Layout::RequireExistingPaintable::No))
+            containing_boundary = rebuilt_box;
+        for (auto* ancestor = rebuilt_root->parent(); !containing_boundary && ancestor; ancestor = ancestor->parent()) {
+            if (auto* ancestor_box = as_if<Layout::Box>(*ancestor); ancestor_box && ancestor_box->is_partial_relayout_boundary())
+                containing_boundary = ancestor_box;
+        }
+        if (!containing_boundary || !collect_boundary(*containing_boundary, containing_boundary == rebuilt_root))
+            return PartialRelayoutResult::NotEligible;
+    }
+
+    // A root nested inside another root is relaid out as part of the ancestor's subtree.
+    partial_relayout_roots.remove_all_matching([&](auto const& root) {
+        for (auto* ancestor = root.box->parent(); ancestor; ancestor = ancestor->parent()) {
+            if (auto* ancestor_box = as_if<Layout::Box>(*ancestor); ancestor_box && collected_boundaries.contains(ancestor_box))
+                return true;
+        }
+        return false;
+    });
+
+    if (partial_relayout_roots.is_empty())
+        return PartialRelayoutResult::NotEligible;
+
+    for (auto const& root : partial_relayout_roots) {
+        relayout_subtree(*root.box, *root.old_paintable);
+        // NB: The subtree commit reset the root's descendant paintables, and the subtree's
+        //     new size may change ancestor scrollable overflow; scheduling the root covers both.
+        schedule_scrollable_overflow_recalculation(*root.box);
+    }
+
+    // The rebuild can replace boxes referenced by the contained-boxes map cached at the
+    // last full layout; refresh it before scheduled overflow measurement follows them.
+    if (layout_tree_was_built_in_partial_branch) {
+        auto work = Layout::collect_scrollable_overflow_measurement_work(*m_layout_root);
+        m_scrollable_overflow_contained_boxes_from_last_layout = move(work.contained_boxes_map);
+    }
+
+    update_scrollable_overflow(UpdateScrollableOverflowMode::Scheduled);
+    ++m_partial_layout_count;
+
+    after_layout_commit(layout_tree_was_built_in_partial_branch ? LayoutTreeChanged::Yes : LayoutTreeChanged::No);
+    if (needs_style_update_after_layout() || !layout_is_up_to_date())
+        return PartialRelayoutResult::NeedsAnotherLayoutPass;
+    return PartialRelayoutResult::Done;
+}
+
 void Document::update_layout(UpdateLayoutReason reason)
 {
     auto navigable = this->navigable();
@@ -567065,16 +567423,6 @@ void Document::update_layout(UpdateLayoutReason reason)
     ScopeGuard guard = [&] {
         m_is_running_update_layout = false;
         page().client().flush_pending_dom_mutations();
-    };
-
-    auto needs_style_update_after_layout = [&] {
-        return !m_query_containers_needing_container_query_evaluation_after_layout.is_empty()
-            || m_needs_animated_style_update
-            || m_needs_invalidation_of_elements_affected_by_has
-            || m_style_invalidator->has_pending_invalidations()
-            || needs_full_style_update()
-            || needs_style_update()
-            || child_needs_style_update();
     };
 
     constexpr size_t max_container_query_layout_passes = 8;
@@ -567090,41 +567438,22 @@ void Document::update_layout(UpdateLayoutReason reason)
             return;
         }
 
-        auto svg_roots_to_relayout = move(m_svg_roots_needing_relayout);
+        auto registered_partial_relayout_roots = m_partial_relayout_invalidation.take_registered_roots();
 
         // NOTE: If this is a document hosting <template> contents, layout is unnecessary.
         if (m_created_for_appropriate_template_contents)
             return;
 
-        auto const needs_layout_tree_rebuild = !m_layout_root || needs_layout_tree_update() || child_needs_layout_tree_update() || needs_full_layout_tree_update();
+        auto needs_layout_tree_rebuild = !m_layout_root || needs_layout_tree_update() || child_needs_layout_tree_update() || needs_full_layout_tree_update();
 
-        // Partial SVG relayout
-        if (!needs_layout_tree_rebuild && !svg_roots_to_relayout.is_empty() && !m_layout_root->needs_layout_update()) {
-            for (auto const& svg_root : svg_roots_to_relayout) {
-                if (svg_root) {
-                    relayout_svg_root(*svg_root);
-                    // NB: The subtree commit reset the SVG root's descendant paintables, and the subtree's
-                    //     new size may change ancestor scrollable overflow; scheduling the root covers both.
-                    schedule_scrollable_overflow_recalculation(*svg_root);
-                }
-            }
-
-            update_scrollable_overflow(UpdateScrollableOverflowMode::Scheduled);
-
-            invalidate_stacking_context_tree();
-            set_needs_to_record_display_list();
-
-            set_needs_accumulated_visual_contexts_update(true);
-            update_paint_and_hit_testing_properties_if_needed();
-            m_document->set_needs_repaint();
+        switch (try_partial_relayout(move(registered_partial_relayout_roots), needs_layout_tree_rebuild, should_collect_devtools_layout_data)) {
+        case PartialRelayoutResult::Done:
             return;
+        case PartialRelayoutResult::NeedsAnotherLayoutPass:
+            continue;
+        case PartialRelayoutResult::NotEligible:
+            break;
         }
-
-        // Clear text blocks cache so we rebuild them on the next find action.
-        if (m_layout_root)
-            m_layout_root->invalidate_text_blocks_cache();
-
-        set_needs_to_record_display_list();
 
         auto* document_element = this->document_element();
         auto viewport_rect = navigable->viewport_rect();
@@ -567158,10 +567487,16 @@ void Document::update_layout(UpdateLayoutReason reason)
             if (auto* node_with_style = as_if<Layout::NodeWithStyle>(layout_node))
                 node_with_style->set_layout_index(layout_index_counter++);
 
-            layout_node.recompute_containing_block({});
+            recompute_containing_block_and_derive_abspos_escape_flags(layout_node);
 
             return TraversalDecision::Continue;
         });
+
+        // The walk above re-derived every fact partial relayout boundary qualification depends
+        // on, so pending changes that escaped classification are accounted for from here on.
+        m_partial_relayout_invalidation.clear_escape(PartialRelayoutEscapeClearReason::FullLayoutPass);
+
+        reset_layout_node_index_counter(layout_index_counter);
 
         Layout::LayoutState layout_state;
         layout_state.ensure_capacity(layout_index_counter);
@@ -567210,32 +567545,9 @@ void Document::update_layout(UpdateLayoutReason reason)
         style_invalidation_counters().relayouts_performed++;
         update_scrollable_overflow(UpdateScrollableOverflowMode::AfterLayout);
 
-        // Broadcast the current viewport rect to any new paintables, so they know whether they're visible or not.
-        inform_all_viewport_clients_about_the_current_viewport_rect();
+        ++m_full_layout_count;
 
-        m_document->set_needs_repaint();
-
-        // NB: Called during layout update.
-        unsafe_paintable()->assign_scroll_frames();
-
-        set_needs_accumulated_visual_contexts_update(true);
-        update_paint_and_hit_testing_properties_if_needed();
-
-        if (auto range = get_selection()->range()) {
-            unsafe_paintable()->recompute_selection_states(*range);
-        }
-
-        // Collect elements with content-visibility: auto. This is used in the HTML event loop to avoid traversing the whole tree every time.
-        Vector<WeakPtr<Painting::Paintable>> paintable_boxes_with_auto_content_visibility;
-        unsafe_paintable()->for_each_in_subtree_of_type<Painting::Paintable>([&](auto& paintable_box) {
-            if (paintable_box.dom_node()
-                && paintable_box.dom_node()->is_element()
-                && paintable_box.computed_values().content_visibility() == CSS::ContentVisibility::Auto) {
-                paintable_boxes_with_auto_content_visibility.append(paintable_box);
-            }
-            return TraversalDecision::Continue;
-        });
-        unsafe_paintable()->set_paintable_boxes_with_auto_content_visibility(move(paintable_boxes_with_auto_content_visibility));
+        after_layout_commit(LayoutTreeChanged::Yes);
 
         m_layout_root->for_each_in_inclusive_subtree([](auto& node) {
             node.reset_needs_layout_update();
@@ -567273,6 +567585,21 @@ void Document::update_layout(UpdateLayoutReason reason)
     VERIFY(layout_is_up_to_date());
 }
 
+// Collect elements with content-visibility: auto. This is used in the HTML event loop to avoid traversing the whole tree every time.
+void Document::collect_paintable_boxes_with_auto_content_visibility()
+{
+    Vector<WeakPtr<Painting::Paintable>> paintables_with_auto_content_visibility;
+    unsafe_paintable()->for_each_in_subtree_of_type<Painting::Paintable>([&](auto& paintable) {
+        if (paintable.dom_node()
+            && paintable.dom_node()->is_element()
+            && paintable.computed_values().content_visibility() == CSS::ContentVisibility::Auto) {
+            paintables_with_auto_content_visibility.append(paintable);
+        }
+        return TraversalDecision::Continue;
+    });
+    unsafe_paintable()->set_paintable_boxes_with_auto_content_visibility(move(paintables_with_auto_content_visibility));
+}
+
 void Document::clear_devtools_layout_inspection_data()
 {
     clear_grid_highlighted_node(nullptr);
@@ -567299,7 +567626,7 @@ bool Document::layout_is_up_to_date() const
         && !needs_layout_tree_update()
         && !child_needs_layout_tree_update()
         && !needs_full_layout_tree_update()
-        && m_svg_roots_needing_relayout.is_empty();
+        && !m_partial_relayout_invalidation.has_registered_roots();
 }
 
 void Document::update_style_computer_viewport_rect()
@@ -574685,6 +575012,30 @@ Utf16View to_string(UpdateLayoutReason reason)
     VERIFY_NOT_REACHED();
 }
 
+Utf16View to_string(PartialRelayoutEscapeReason reason)
+{
+    switch (reason) {
+#define ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASON(e) \
+    case PartialRelayoutEscapeReason::e:            \
+        return #e##sv;
+        ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASONS(ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASON)
+#undef ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASON
+    }
+    VERIFY_NOT_REACHED();
+}
+
+Utf16View to_string(PartialRelayoutEscapeClearReason reason)
+{
+    switch (reason) {
+#define ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASON(e) \
+    case PartialRelayoutEscapeClearReason::e:             \
+        return #e##sv;
+        ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASONS(ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASON)
+#undef ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASON
+    }
+    VERIFY_NOT_REACHED();
+}
+
 void Document::add_pending_css_import_rule(Badge<CSS::CSSImportRule>, GC::Ref<CSS::CSSImportRule> rule)
 {
     m_pending_css_import_rules.set(rule);
@@ -574923,6 +575274,33 @@ enum class UpdateLayoutReason {
 };
 
 [[nodiscard]] Utf16View to_string(UpdateLayoutReason);
+
+#define ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASONS(X)       \
+    X(AnchorNamesUnregisteredByElementRemoval)             \
+    X(AnchorNamesUnregisteredByStyleChange)                \
+    X(ContainingBlockEstablishmentChangedByKeyframeEffect) \
+    X(ContainingBlockEstablishmentChangedByStyleChange)    \
+    X(DirtyDomNodeHasDetachedLayoutNode)
+
+enum class PartialRelayoutEscapeReason {
+#define ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASON(e) e,
+    ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASONS(ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASON)
+#undef ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASON
+};
+
+[[nodiscard]] Utf16View to_string(PartialRelayoutEscapeReason);
+
+#define ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASONS(X) \
+    X(FullLayoutPass)                                      \
+    X(PartialLayoutTreeBuild)
+
+enum class PartialRelayoutEscapeClearReason {
+#define ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASON(e) e,
+    ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASONS(ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASON)
+#undef ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_CLEAR_REASON
+};
+
+[[nodiscard]] Utf16View to_string(PartialRelayoutEscapeClearReason);
 
 // https://html.spec.whatwg.org/multipage/dom.html#document-load-timing-info
 struct DocumentLoadTimingInfo {
@@ -575166,7 +575544,14 @@ public:
     CSS::ComputedProperties const* update_style_for_element(AbstractElement const&, StyleUpdateMode);
     [[nodiscard]] bool element_needs_style_update(AbstractElement const&) const;
     void update_layout(UpdateLayoutReason);
+    enum class PartialRelayoutResult : u8 {
+        NotEligible,
+        Done,
+        NeedsAnotherLayoutPass,
+    };
     void update_layout_if_needed_for_node(Node const&, UpdateLayoutReason);
+    [[nodiscard]] u64 partial_layout_count() const { return m_partial_layout_count; }
+    [[nodiscard]] u64 full_layout_count() const { return m_full_layout_count; }
     [[nodiscard]] bool layout_is_up_to_date() const;
     void clear_devtools_layout_inspection_data();
     enum class UpdateScrollableOverflowMode : u8 {
@@ -575466,7 +575851,43 @@ public:
     [[nodiscard]] bool needs_full_layout_tree_update() const { return m_needs_full_layout_tree_update; }
     void set_needs_full_layout_tree_update(bool b) { m_needs_full_layout_tree_update = b; }
 
-    void mark_svg_root_as_needing_relayout(Layout::SVGSVGBox&);
+    // Layout indices key the per-pass used values store in LayoutState. Every layout node gets
+    // one at construction; a full layout pass renumbers the whole tree densely and resets the
+    // counter past the dense range.
+    [[nodiscard]] u32 allocate_layout_node_index() { return m_next_layout_node_index++; }
+    void reset_layout_node_index_counter(u32 next_index)
+    {
+        m_next_layout_node_index = next_index;
+        m_layout_node_index_count_after_last_full_pass = next_index;
+    }
+
+    // The per-pass used values store sizes its page table by the highest index it touches, and
+    // partial relayout never renumbers, so between-pass indices grow its cost without bound.
+    // Once they outgrow the dense range, the next layout must be a full, renumbering pass.
+    [[nodiscard]] bool layout_node_indices_outgrew_dense_range() const
+    {
+        return m_next_layout_node_index > 2 * m_layout_node_index_count_after_last_full_pass + 2048;
+    }
+
+    // Attribution of pending updates for partial relayout. Invariant: every update recorded
+    // since the last layout pass is either attributed to a boundary in the registered root
+    // set, or the escape bit is set. The dispatch may only run partial relayout while the
+    // escape bit is clear; a full layout pass re-derives every fact boundary qualification
+    // depends on, so it clears the bit.
+    class PartialRelayoutInvalidation {
+    public:
+        void record_boundary(Layout::Box&);
+        void record_escape(PartialRelayoutEscapeReason);
+        void clear_escape(PartialRelayoutEscapeClearReason);
+        [[nodiscard]] bool escapes() const { return m_escapes; }
+        [[nodiscard]] bool has_registered_roots() const { return !m_registered_roots.is_empty(); }
+        [[nodiscard]] HashTable<WeakPtr<Layout::Box>> take_registered_roots() { return move(m_registered_roots); }
+
+    private:
+        HashTable<WeakPtr<Layout::Box>> m_registered_roots;
+        bool m_escapes { false };
+    };
+    [[nodiscard]] PartialRelayoutInvalidation& partial_relayout_invalidation() { return m_partial_relayout_invalidation; }
 
     void set_needs_to_refresh_scroll_state(bool b);
 
@@ -576018,6 +576439,16 @@ private:
     void tear_down_layout_tree();
 
     void update_active_element();
+    void collect_paintable_boxes_with_auto_content_visibility();
+    bool needs_style_update_after_layout();
+    bool any_anchor_names_are_registered() const;
+    PartialRelayoutResult try_partial_relayout(HashTable<WeakPtr<Layout::Box>> registered_partial_relayout_roots, bool& needs_layout_tree_rebuild, bool should_collect_devtools_layout_data);
+    static void recompute_containing_block_and_derive_abspos_escape_flags(Layout::Node&);
+    enum class LayoutTreeChanged : u8 {
+        No,
+        Yes,
+    };
+    void after_layout_commit(LayoutTreeChanged);
 
     void run_unloading_cleanup_steps();
 
@@ -576218,7 +576649,13 @@ private:
 
     bool m_is_running_update_layout { false };
 
-    HashTable<WeakPtr<Layout::SVGSVGBox>> m_svg_roots_needing_relayout;
+    u32 m_next_layout_node_index { 0 };
+    u32 m_layout_node_index_count_after_last_full_pass { 0 };
+
+    PartialRelayoutInvalidation m_partial_relayout_invalidation;
+
+    u64 m_partial_layout_count { 0 };
+    u64 m_full_layout_count { 0 };
 
     bool m_needs_animated_style_update { false };
 
@@ -580236,14 +580673,24 @@ CSS::RequiredInvalidationAfterStyleChange Element::recompute_style(bool& did_cha
         auto& anchor_names = as_if<ShadowRoot>(root())
             ? as<ShadowRoot>(root()).anchor_name_map()
             : document().anchor_name_map();
+        bool element_had_registered_anchor_names = false;
         if (m_computed_properties) {
             m_computed_properties->for_each_anchor_name([&](Utf16FlyString const& name) {
+                element_had_registered_anchor_names = true;
                 anchor_names.unregister_name(name, *this);
             });
         }
+        bool element_has_anchor_names = false;
         new_computed_properties->for_each_anchor_name([&](Utf16FlyString const& name) {
+            element_has_anchor_names = true;
             anchor_names.register_name(name, *this);
         });
+
+        // Anchor names that vanish here become invisible to the dispatch-time check of the
+        // live anchor-name maps, while positioned boxes anywhere may hold geometry resolved
+        // against them; names still registered keep that check refusing partial relayout.
+        if (element_had_registered_anchor_names && !element_has_anchor_names)
+            document().partial_relayout_invalidation().record_escape(PartialRelayoutEscapeReason::AnchorNamesUnregisteredByStyleChange);
     }
 
     auto old_non_animated_display_is_none = m_computed_properties ? m_computed_properties->property(CSS::PropertyID::Display, CSS::ComputedProperties::WithAnimationsApplied::No).as_display().display().is_none() : true;
@@ -581050,9 +581497,15 @@ void Element::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor, No
             auto& anchor_names = is<ShadowRoot>(old_root)
                 ? as<ShadowRoot>(old_root).anchor_name_map()
                 : document().anchor_name_map();
+            bool element_had_registered_anchor_names = false;
             m_computed_properties->for_each_anchor_name([&](Utf16FlyString const& name) {
+                element_had_registered_anchor_names = true;
                 anchor_names.unregister_name(name, *this);
             });
+            // Positioned boxes anywhere may hold geometry resolved against these names, which
+            // the dispatch-time check of the live anchor-name maps can no longer see.
+            if (element_had_registered_anchor_names)
+                document().partial_relayout_invalidation().record_escape(PartialRelayoutEscapeReason::AnchorNamesUnregisteredByElementRemoval);
         }
     }
 
@@ -590235,6 +590688,7 @@ FILE: Libraries/LibWeb/DOM/Node.cpp
 #include <LibWeb/DOM/CDATASection.h>
 #include <LibWeb/DOM/CharacterData.h>
 #include <LibWeb/DOM/Comment.h>
+#include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/DocumentFragment.h>
 #include <LibWeb/DOM/DocumentType.h>
 #include <LibWeb/DOM/Element.h>
@@ -590277,6 +590731,7 @@ FILE: Libraries/LibWeb/DOM/Node.cpp
 #include <LibWeb/Infra/CharacterTypes.h>
 #include <LibWeb/Infra/SerializedURL.h>
 #include <LibWeb/InvalidateDisplayList.h>
+#include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/TextOffsetMapping.h>
@@ -591988,6 +592443,24 @@ EventTarget* Node::get_parent(Event const&)
     return parent();
 }
 
+// Whether the reason describes a mutation that only affects the node's children and can never
+// change the node's own box kind, so a rebuild on a partial relayout boundary stays confined
+// to its subtree. Reasons not classified here forfeit partial relayout for their mutations.
+static bool is_structural_boundary_self_rebuild_reason(SetNeedsLayoutTreeUpdateReason reason)
+{
+    switch (reason) {
+    case SetNeedsLayoutTreeUpdateReason::NodeInsertBefore:
+    case SetNeedsLayoutTreeUpdateReason::NodeRemove:
+    case SetNeedsLayoutTreeUpdateReason::NodeSetTextContent:
+    case SetNeedsLayoutTreeUpdateReason::CharacterDataReplaceData:
+    case SetNeedsLayoutTreeUpdateReason::ElementSetInnerHTML:
+    case SetNeedsLayoutTreeUpdateReason::ShadowRootSetInnerHTML:
+        return true;
+    default:
+        return false;
+    }
+}
+
 void Node::set_needs_layout_tree_update(bool value, SetNeedsLayoutTreeUpdateReason reason)
 {
     if (m_needs_layout_tree_update == value)
@@ -592038,11 +592511,25 @@ void Node::set_needs_layout_tree_update(bool value, SetNeedsLayoutTreeUpdateReas
 
         // NB: Propagating layout invalidation, layout is not up to date.
         if (auto layout_node = this->unsafe_layout_node()) {
-            layout_node->set_needs_layout_update(SetNeedsLayoutReason::LayoutTreeUpdate);
+            if (!layout_node->parent() && !layout_node->is_viewport())
+                document().partial_relayout_invalidation().record_escape(PartialRelayoutEscapeReason::DirtyDomNodeHasDetachedLayoutNode);
+
+            bool registered_boundary_self_rebuild = false;
+            if (auto* box = as_if<Layout::Box>(layout_node); box
+                && is_structural_boundary_self_rebuild_reason(reason)
+                && box->is_partial_relayout_boundary()) {
+                box->set_needs_layout_update(SetNeedsLayoutReason::LayoutTreeUpdate, Layout::LayoutUpdatePropagation::BoundarySelfOnly);
+                registered_boundary_self_rebuild = true;
+            } else {
+                layout_node->set_needs_layout_update(SetNeedsLayoutReason::LayoutTreeUpdate);
+            }
 
             // If the layout node has an anonymous parent, rebuild from the nearest non-anonymous ancestor.
+            // A boundary that registered itself for a structural change skips this escalation: a child-list
+            // mutation cannot change its own box kind, so replacing its box in place cannot require
+            // restructuring the surrounding anonymous siblings.
             // FIXME: This is not optimal, and we should figure out how to rebuild a smaller part of the tree.
-            if (layout_node->parent() && layout_node->parent()->is_anonymous()) {
+            if (!registered_boundary_self_rebuild && layout_node->parent() && layout_node->parent()->is_anonymous()) {
                 auto* ancestor = layout_node->parent();
                 while (ancestor && ancestor->is_anonymous())
                     ancestor = ancestor->parent();
@@ -592050,6 +592537,9 @@ void Node::set_needs_layout_tree_update(bool value, SetNeedsLayoutTreeUpdateReas
                     ancestor->dom_node()->set_needs_layout_tree_update(true, reason);
             }
         }
+        // NB: A dirty node with no layout node needs no escape tracking: rebuilding it either
+        //     still produces no layout node, or the change is covered by the escalations
+        //     above, which mark a node whose layout node classifies it in the ancestor walk.
     }
 }
 
@@ -593053,8 +593543,13 @@ void Node::set_needs_repaint(InvalidateDisplayList should_invalidate_display_lis
 
 void Node::set_needs_layout_update(SetNeedsLayoutReason reason)
 {
+    set_needs_layout_update(reason, Layout::LayoutUpdatePropagation::ThroughAncestors);
+}
+
+void Node::set_needs_layout_update(SetNeedsLayoutReason reason, Layout::LayoutUpdatePropagation propagation)
+{
     if (auto* node = unsafe_layout_node()) {
-        node->set_needs_layout_update(reason);
+        node->set_needs_layout_update(reason, propagation);
         document().set_needs_repaint(Badge<Node> {}, InvalidateDisplayList::No);
     }
 }
@@ -593870,6 +594365,12 @@ enum class UserSelect : u8;
 
 }
 
+namespace Web::Layout {
+
+enum class LayoutUpdatePropagation : u8;
+
+}
+
 namespace Web::DOM {
 
 enum class NameOrDescription {
@@ -594187,6 +594688,7 @@ public:
 
     void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::Yes);
     void set_needs_layout_update(SetNeedsLayoutReason);
+    void set_needs_layout_update(SetNeedsLayoutReason, Layout::LayoutUpdatePropagation);
 
     void clear_layout_node_and_paintable(Badge<Document>);
     void set_layout_node(Badge<Layout::Node>, Layout::Node&);
@@ -659973,543 +660475,3 @@ void HTMLElement::initialize(JS::Realm& realm)
 void HTMLElement::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
-    HTMLOrSVGOrMathMLElement::visit_edges(visitor);
-    FormAssociatedElement::visit_edges(visitor);
-    visitor.visit(m_labels);
-    visitor.visit(m_attached_internals);
-    visitor.visit(m_popover_trigger);
-    visitor.visit(m_popover_close_watcher);
-}
-
-// https://html.spec.whatwg.org/multipage/dom.html#dom-translate
-bool HTMLElement::translate() const
-{
-    // The translate IDL attribute must, on getting, return true if the element's translation mode is
-    // translate-enabled, and false otherwise
-    return translation_mode() == TranslationMode::TranslateEnabled;
-}
-
-// https://html.spec.whatwg.org/multipage/dom.html#dom-translate
-void HTMLElement::set_translate(bool new_value)
-{
-    // On setting, it must set the content attribute's value to "yes" if the new value is true, and set the content
-    // attribute's value to "no" otherwise.
-    if (new_value)
-        set_attribute_value(HTML::AttributeNames::translate, "yes"_utf16);
-    else
-        set_attribute_value(HTML::AttributeNames::translate, "no"_utf16);
-}
-
-// https://html.spec.whatwg.org/multipage/dom.html#dom-dir
-Utf16FlyString HTMLElement::dir() const
-{
-    // FIXME: This should probably be `Reflect` in the IDL.
-    // The dir IDL attribute on an element must reflect the dir content attribute of that element, limited to only known values.
-    auto dir = get_attribute_value_view(HTML::AttributeNames::dir);
-
-    if (dir.has_value() && dir->equals_ignoring_ascii_case(u"ltr"sv))
-        return "ltr"_utf16_fly_string;
-    if (dir.has_value() && dir->equals_ignoring_ascii_case(u"rtl"sv))
-        return "rtl"_utf16_fly_string;
-    if (dir.has_value() && dir->equals_ignoring_ascii_case(u"auto"sv))
-        return "auto"_utf16_fly_string;
-
-    return {};
-}
-
-void HTMLElement::set_dir(Utf16View dir)
-{
-    set_attribute_value(HTML::AttributeNames::dir, dir);
-}
-
-bool HTMLElement::is_focusable() const
-{
-    return (Base::is_focusable() || is_editing_host())
-        && meets_focusable_area_rendering_requirements();
-}
-
-// https://html.spec.whatwg.org/multipage/interaction.html#dom-iscontenteditable
-bool HTMLElement::is_content_editable() const
-{
-    // The isContentEditable IDL attribute, on getting, must return true if the element is either an editing host or
-    // editable, and false otherwise.
-    return is_editable_or_editing_host();
-}
-
-Utf16FlyString HTMLElement::content_editable() const
-{
-    switch (m_content_editable_state) {
-    case ContentEditableState::True:
-        return "true"_utf16_fly_string;
-    case ContentEditableState::False:
-        return "false"_utf16_fly_string;
-    case ContentEditableState::PlaintextOnly:
-        return "plaintext-only"_utf16_fly_string;
-    case ContentEditableState::Inherit:
-        return "inherit"_utf16_fly_string;
-    }
-    VERIFY_NOT_REACHED();
-}
-
-// https://html.spec.whatwg.org/multipage/interaction.html#contenteditable
-WebIDL::ExceptionOr<void> HTMLElement::set_content_editable(Utf16FlyString const& content_editable)
-{
-    if (content_editable.equals_ignoring_ascii_case(u"inherit"sv)) {
-        remove_attribute(HTML::AttributeNames::contenteditable);
-        return {};
-    }
-    if (content_editable.equals_ignoring_ascii_case(u"true"sv)) {
-        set_attribute_value(HTML::AttributeNames::contenteditable, "true"_utf16);
-        return {};
-    }
-    if (content_editable.equals_ignoring_ascii_case(u"plaintext-only"sv)) {
-        set_attribute_value(HTML::AttributeNames::contenteditable, "plaintext-only"_utf16);
-        return {};
-    }
-    if (content_editable.equals_ignoring_ascii_case(u"false"sv)) {
-        set_attribute_value(HTML::AttributeNames::contenteditable, "false"_utf16);
-        return {};
-    }
-    return WebIDL::SyntaxError::create(realm(), "Invalid contentEditable value, must be 'true', 'false', 'plaintext-only' or 'inherit'"_utf16);
-}
-
-// https://html.spec.whatwg.org/multipage/dom.html#set-the-inner-text-steps
-void HTMLElement::set_inner_text(Utf16View const& text)
-{
-    // 1. Let fragment be the rendered text fragment for value given element's node document.
-    auto fragment = rendered_text_fragment(text);
-
-    // 2. Replace all with fragment within element.
-    replace_all(fragment);
-
-    set_needs_style_update(true);
-}
-
-// https://html.spec.whatwg.org/multipage/dom.html#merge-with-the-next-text-node
-static void merge_with_the_next_text_node(DOM::Text& node)
-{
-    // 1. Let next be node's next sibling.
-    auto next = node.next_sibling();
-
-    // 2. If next is not a Text node, then return.
-    auto* text = as_if<DOM::Text>(next);
-    if (!text)
-        return;
-
-    // 3. Replace data with node, node's data's length, 0, and next's data.
-    MUST(node.replace_data(node.length_in_utf16_code_units(), 0, text->data()));
-
-    // 4. Remove next.
-    next->remove();
-}
-
-// https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute:dom-outertext-2
-WebIDL::ExceptionOr<void> HTMLElement::set_outer_text(Utf16View const& value)
-{
-    // 1. If this's parent is null, then throw a "NoModificationAllowedError" DOMException.
-    if (!parent())
-        return WebIDL::NoModificationAllowedError::create(realm(), "setOuterText: parent is null"_utf16);
-
-    // 2. Let next be this's next sibling.
-    auto* next = next_sibling();
-
-    // 3. Let previous be this's previous sibling.
-    auto* previous = previous_sibling();
-
-    // 4. Let fragment be the rendered text fragment for the given value given this's node document.
-    auto fragment = rendered_text_fragment(value);
-
-    // 5. If fragment has no children, then append a new Text node whose data is the empty string and node document is this's node document to fragment.
-    if (!fragment->has_children())
-        MUST(fragment->append_child(document().create_text_node({})));
-
-    // 6. Replace this with fragment within this's parent.
-    TRY(parent()->replace_child(fragment, *this));
-
-    // 7. If next is non-null and next's previous sibling is a Text node, then merge with the next text node given next's previous sibling.
-    if (next && is<DOM::Text>(next->previous_sibling()))
-        merge_with_the_next_text_node(static_cast<DOM::Text&>(*next->previous_sibling()));
-
-    // 8. If previous is a Text node, then merge with the next text node given previous.
-    if (auto* previous_text = as_if<DOM::Text>(previous))
-        merge_with_the_next_text_node(*previous_text);
-
-    set_needs_style_update(true);
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/dom.html#rendered-text-fragment
-GC::Ref<DOM::DocumentFragment> HTMLElement::rendered_text_fragment(Utf16View const& input)
-{
-    // 1. Let fragment be a new DocumentFragment whose node document is document.
-    auto fragment = realm().create<DOM::DocumentFragment>(document());
-
-    // 2. Let position be a position variable for input, initially pointing at the start of input.
-    size_t position = 0;
-
-    // 3. Let text be the empty string.
-    // 4. While position is not past the end of input:
-    while (position < input.length_in_code_units()) {
-        auto start = position;
-
-        // 1. Collect a sequence of code points that are not U+000A LF or U+000D CR from input given position, and set
-        //    text to the result.
-        while (position < input.length_in_code_units() && !first_is_one_of(input.code_unit_at(position), u'\n', u'\r'))
-            ++position;
-
-        auto text = input.substring_view(start, position - start);
-
-        // 2. If text is not the empty string, then append a new Text node whose data is text and node document is
-        //    document to fragment.
-        if (!text.is_empty()) {
-            MUST(fragment->append_child(document().create_text_node(Utf16String::from_utf16(text))));
-        }
-
-        // 3. While position is not past the end of input, and the code point at position is either U+000A LF or U+000D CR:
-        while (position < input.length_in_code_units() && first_is_one_of(input.code_unit_at(position), u'\n', u'\r')) {
-            // 1. If the code point at position is U+000D CR and the next code point is U+000A LF, then advance position
-            //    to the next code point in input.
-            if (input.code_unit_at(position) == '\r') {
-                if (position + 1 < input.length_in_code_units() && input.code_unit_at(position + 1) == '\n')
-                    ++position;
-            }
-
-            // 2. Advance position to the next code point in input.
-            ++position;
-
-            // 3. Append the result of creating an element given document, "br", and the HTML namespace to fragment.
-            auto br_element = MUST(DOM::create_element(document(), HTML::TagNames::br, Namespace::HTML));
-            MUST(fragment->append_child(br_element));
-        }
-    }
-
-    // 5. Return fragment.
-    return fragment;
-}
-
-struct RequiredLineBreakCount {
-    int count { 0 };
-};
-
-// https://html.spec.whatwg.org/multipage/dom.html#rendered-text-collection-steps
-static Vector<Variant<Utf16String, RequiredLineBreakCount>> rendered_text_collection_steps(DOM::Node const& node)
-{
-    // 1. Let items be the result of running the rendered text collection steps with each child node of node in tree
-    //    order, and then concatenating the results to a single list.
-    Vector<Variant<Utf16String, RequiredLineBreakCount>> items;
-    node.for_each_child([&](auto const& child) {
-        auto child_items = rendered_text_collection_steps(child);
-        items.extend(move(child_items));
-        return IterationDecision::Continue;
-    });
-
-    // NOTE: Steps are re-ordered here a bit.
-
-    // 3. If node is not being rendered, then return items.
-    //    For the purpose of this step, the following elements must act as described
-    //    if the computed value of the 'display' property is not 'none':
-    //    FIXME: - select elements have an associated non-replaced inline CSS box whose child boxes include only those of optgroup and option element child nodes;
-    //    FIXME: - optgroup elements have an associated non-replaced block-level CSS box whose child boxes include only those of option element child nodes; and
-    //    FIXME: - option elements have an associated non-replaced block-level CSS box whose child boxes are as normal for non-replaced block-level CSS boxes.
-    auto* layout_node = node.layout_node();
-    if (!layout_node)
-        return items;
-    if (!layout_node->has_style_or_parent_with_style())
-        return items;
-
-    auto const& computed_values = layout_node->computed_values();
-
-    // 2. If node's computed value of 'visibility' is not 'visible', then return items.
-    if (computed_values.visibility() != CSS::Visibility::Visible)
-        return items;
-
-    // AD-HOC: If node's computed value of 'content-visibility' is 'hidden', then return items.
-    if (computed_values.content_visibility() == CSS::ContentVisibility::Hidden)
-        return items;
-
-    // 4. If node is a Text node, then for each CSS text box produced by node, in content order, compute the text of the
-    //    box after application of the CSS 'white-space' processing rules and 'text-transform' rules, set items to the
-    //    list of the resulting strings, and return items.
-
-    //    FIXME: The CSS 'white-space' processing rules are slightly modified: collapsible spaces at the end of lines are
-    //    always collapsed, but they are only removed if the line is the last line of the block, or it ends with a br
-    //    element. Soft hyphens should be preserved. [CSSTEXT]
-
-    if (auto const* layout_text_node = as_if<Layout::TextNode>(layout_node)) {
-        Layout::TextOffsetMapping mapping { layout_text_node->dom_node() };
-        mapping.for_each_fragment([&](Layout::TextNode const& slice) {
-            Layout::TextNode::ChunkIterator iterator { slice, false, false };
-            while (true) {
-                auto chunk = iterator.next();
-                if (!chunk.has_value())
-                    break;
-                items.append(Utf16String::from_utf16(chunk.release_value().view));
-            }
-        });
-        return items;
-    }
-
-    // 5. If node is a br element, then append a string containing a single U+000A LF code point to items.
-    if (is<HTML::HTMLBRElement>(node)) {
-        items.append("\n"_utf16);
-        return items;
-    }
-
-    auto display = computed_values.display();
-
-    // 6. If node's computed value of 'display' is 'table-cell', and node's CSS box is not the last 'table-cell' box of its enclosing 'table-row' box, then append a string containing a single U+0009 TAB code point to items.
-    if (display.is_table_cell() && node.next_sibling())
-        items.append("\t"_utf16);
-
-    // 7. If node's computed value of 'display' is 'table-row', and node's CSS box is not the last 'table-row' box of the nearest ancestor 'table' box, then append a string containing a single U+000A LF code point to items.
-    if (display.is_table_row() && node.next_sibling())
-        items.append("\n"_utf16);
-
-    // 8. If node is a p element, then append 2 (a required line break count) at the beginning and end of items.
-    if (is<HTML::HTMLParagraphElement>(node)) {
-        items.prepend(RequiredLineBreakCount { 2 });
-        items.append(RequiredLineBreakCount { 2 });
-    }
-
-    // 9. If node's used value of 'display' is block-level or 'table-caption', then append 1 (a required line break count) at the beginning and end of items. [CSSDISPLAY]
-    if (display.is_block_outside() || display.is_table_caption()) {
-        items.prepend(RequiredLineBreakCount { 1 });
-        items.append(RequiredLineBreakCount { 1 });
-    }
-
-    // 10. Return items.
-    return items;
-}
-
-// https://html.spec.whatwg.org/multipage/dom.html#get-the-text-steps
-Utf16String HTMLElement::get_the_text_steps()
-{
-    // 1. If element is not being rendered or if the user agent is a non-CSS user agent, then return element's descendant text content.
-    document().update_layout(DOM::UpdateLayoutReason::HTMLElementGetTheTextSteps);
-    if (!layout_node())
-        return descendant_text_content();
-
-    // 2. Let results be a new empty list.
-    Vector<Variant<Utf16String, RequiredLineBreakCount>> results;
-
-    // 3. For each child node node of element:
-    for_each_child([&](Node const& node) {
-        // 1. Let current be the list resulting in running the rendered text collection steps with node.
-        //    Each item in results will either be a string or a positive integer (a required line break count).
-        auto current = rendered_text_collection_steps(node);
-
-        // 2. For each item item in current, append item to results.
-        results.extend(move(current));
-        return IterationDecision::Continue;
-    });
-
-    // 4. Remove any items from results that are the empty string.
-    results.remove_all_matching([](auto& item) {
-        return item.visit(
-            [](Utf16String const& string) { return string.is_empty(); },
-            [](RequiredLineBreakCount const&) { return false; });
-    });
-
-    // 5. Remove any runs of consecutive required line break count items at the start or end of results.
-    while (!results.is_empty() && results.first().has<RequiredLineBreakCount>())
-        results.take_first();
-    while (!results.is_empty() && results.last().has<RequiredLineBreakCount>())
-        results.take_last();
-
-    // 6. Replace each remaining run of consecutive required line break count items with a string consisting of as many
-    //    U+000A LF code points as the maximum of the values in the required line break count items.
-    Utf16StringBuilder builder;
-    for (size_t i = 0; i < results.size(); ++i) {
-        results[i].visit(
-            [&](Utf16String const& string) {
-                builder.append(string);
-            },
-            [&](RequiredLineBreakCount const& line_break_count) {
-                int max_line_breaks = line_break_count.count;
-                size_t j = i + 1;
-                while (j < results.size() && results[j].has<RequiredLineBreakCount>()) {
-                    max_line_breaks = max(max_line_breaks, results[j].get<RequiredLineBreakCount>().count);
-                    ++j;
-                }
-
-                // Skip over the run of required line break counts.
-                i = j - 1;
-
-                builder.append_repeated_ascii('\n', max_line_breaks);
-            });
-    }
-
-    // 7. Return the concatenation of the string items in results.
-    return builder.to_string();
-}
-
-// https://html.spec.whatwg.org/multipage/dom.html#dom-innertext
-Utf16String HTMLElement::inner_text()
-{
-    // The innerText and outerText getter steps are to return the result of running get the text steps with this.
-    return get_the_text_steps();
-}
-
-// https://html.spec.whatwg.org/multipage/dom.html#dom-outertext
-Utf16String HTMLElement::outer_text()
-{
-    // The innerText and outerText getter steps are to return the result of running get the text steps with this.
-    return get_the_text_steps();
-}
-
-static bool any_ancestor_establishes_a_fixed_position_containing_block(Layout::NodeWithStyle const& node)
-{
-    // https://www.w3.org/TR/css-position-3/#fixed-positioning-containing-block
-    // The containing block is established by the nearest ancestor box that establishes an fixed positioning containing
-    // block, with the bounds of the containing block determined identically to the absolute positioning containing block.
-    for (auto ancestor = node.containing_block(); ancestor; ancestor = ancestor->containing_block()) {
-        if (ancestor->establishes_a_fixed_positioning_containing_block())
-            return true;
-    }
-    return false;
-}
-
-// https://drafts.csswg.org/cssom-view/#dom-htmlelement-scrollparent
-GC::Ptr<DOM::Element> HTMLElement::scroll_parent() const
-{
-    // NOTE: We have to ensure that the layout is up-to-date before querying the layout tree.
-    const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLElementScrollParent);
-
-    // 1. If any of the following holds true, return null and terminate this algorithm:
-    //    - The element does not have an associated box.
-    //    - The element is the root element.
-    //    - The element is the body element.
-    //    - The element’s computed value of the position property is fixed and no ancestor establishes a fixed position containing block.
-    if (!layout_node())
-        return nullptr;
-    if (is_document_element())
-        return nullptr;
-    if (is_html_body_element())
-        return nullptr;
-    bool const no_ancestor_establishes_a_fixed_position_containing_block = !any_ancestor_establishes_a_fixed_position_containing_block(*layout_node());
-    if (layout_node()->is_fixed_position() && no_ancestor_establishes_a_fixed_position_containing_block)
-        return nullptr;
-
-    // 2. Let ancestor be the containing block of the element in the flat tree and repeat these substeps:
-    auto ancestor = layout_node()->containing_block();
-    while (ancestor) {
-        // 1. If ancestor is the initial containing block, return the scrollingElement for the element’s document if it
-        //    is not closed-shadow-hidden from the element, otherwise return null.
-        if (ancestor->is_viewport()) {
-            auto const scrolling_element = document().scrolling_element();
-            if (scrolling_element && !scrolling_element->is_closed_shadow_hidden_from(*this))
-                return const_cast<Element*>(scrolling_element.ptr());
-            return nullptr;
-        }
-
-        // 2. If ancestor is not closed-shadow-hidden from the element, and is a scroll container, terminate this
-        //    algorithm and return ancestor.
-        if ((ancestor->dom_node() && !ancestor->dom_node()->is_closed_shadow_hidden_from(*this))
-            && ancestor->is_scroll_container()) {
-            return const_cast<Element*>(static_cast<DOM::Element const*>(ancestor->dom_node()));
-        }
-
-        // 3. If the computed value of the position property of ancestor is fixed, and no ancestor establishes a fixed
-        //    position containing block, terminate this algorithm and return null.
-        if (ancestor->computed_values().position() == CSS::Positioning::Fixed && no_ancestor_establishes_a_fixed_position_containing_block)
-            return nullptr;
-
-        // 4. Let ancestor be the containing block of ancestor in the flat tree.
-        ancestor = ancestor->containing_block();
-    }
-
-    return nullptr;
-}
-
-// https://drafts.csswg.org/cssom-view-1/#dom-htmlelement-offsetparent
-GC::Ptr<DOM::Element> HTMLElement::offset_parent() const
-{
-    // NOTE: We have to ensure that the layout is up-to-date before querying the layout tree.
-    const_cast<DOM::Document&>(document()).update_layout_if_needed_for_node(*this, DOM::UpdateLayoutReason::HTMLElementOffsetParent);
-
-    // 1. If any of the following holds true return null and terminate this algorithm:
-    //    - The element does not have an associated box.
-    //    - The element is the root element.
-    //    - The element is the HTML body element.
-    //    - The element’s computed value of the position property is fixed and no ancestor establishes a fixed position containing block.
-    if (!layout_node())
-        return nullptr;
-    if (is_document_element())
-        return nullptr;
-    if (is_html_body_element())
-        return nullptr;
-    bool const no_ancestor_establishes_a_fixed_position_containing_block = !any_ancestor_establishes_a_fixed_position_containing_block(*layout_node());
-    if (layout_node()->is_fixed_position() && no_ancestor_establishes_a_fixed_position_containing_block)
-        return nullptr;
-
-    // NB: The spec does not define "the element is in a fixed position containing block".  Other engines treat it as
-    //     holding only when the element itself is fixed-positioned. We also set it to true for the remainder of the
-    //     walk once a fixed-positioned ancestor is crossed.
-    auto element_is_in_a_fixed_position_containing_block = layout_node()->is_fixed_position();
-
-    // 2. Let ancestor be the parent of the element in the flat tree and repeat these substeps:
-    auto ancestor = first_flat_tree_ancestor_of_type<DOM::Element>();
-    while (true) {
-        // 1. If ancestor is closed-shadow-hidden from the element, its computed value of the position property is
-        //    fixed, and no ancestor establishes a fixed position containing block, terminate this algorithm and return
-        //    null.
-        bool ancestor_is_closed_shadow_hidden = ancestor->is_closed_shadow_hidden_from(*this);
-        bool ancestor_is_fixed_position = ancestor->computed_properties()->position() == CSS::Positioning::Fixed;
-        auto const* ancestor_layout_node = ancestor->layout_node();
-        if (ancestor_is_closed_shadow_hidden
-            && ancestor_is_fixed_position
-            && no_ancestor_establishes_a_fixed_position_containing_block)
-            return nullptr;
-
-        // 2. If ancestor is not closed-shadow-hidden from the element and satisfies at least one of the following,
-        //    terminate this algorithm and return ancestor.
-        if (!ancestor_is_closed_shadow_hidden) {
-            // NB: An ancestor in the flat tree may not have a layout node (e.g., it has display: none).
-            //     Such ancestors can't be positioned or establish containing blocks, so we skip those checks.
-            // - The element is in a fixed position containing block, and ancestor is a containing block for
-            //   fixed-positioned descendants.
-            if (element_is_in_a_fixed_position_containing_block) {
-                if (ancestor_layout_node && ancestor_layout_node->establishes_a_fixed_positioning_containing_block())
-                    return const_cast<Element*>(ancestor);
-            }
-            // - The element is not in a fixed position containing block, and:
-            else {
-                // - ancestor is a containing block of absolutely-positioned descendants (regardless of whether there
-                //   are any absolutely-positioned descendants).
-                // NB: is_positioned() covers positioned inline ancestors, which
-                //     establishes_an_absolute_positioning_containing_block() excludes because they do not generate a
-                //     box.
-                if (ancestor_layout_node && (ancestor_layout_node->is_positioned() || ancestor_layout_node->establishes_an_absolute_positioning_containing_block()))
-                    return const_cast<Element*>(ancestor);
-                // - It is the body element.
-                if (ancestor->is_html_body_element())
-                    return const_cast<Element*>(ancestor);
-                // - The computed value of the position property of the element is static and the ancestor is one of
-                //   the following HTML elements: td, th, or table.
-                if (computed_properties()->position() == CSS::Positioning::Static && ancestor->local_name().is_one_of(HTML::TagNames::td, HTML::TagNames::th, HTML::TagNames::table))
-                    return const_cast<Element*>(ancestor);
-            }
-            // - FIXME: The element has a different effective zoom than ancestor.
-        }
-
-        if (ancestor_layout_node && ancestor_layout_node->is_fixed_position())
-            element_is_in_a_fixed_position_containing_block = true;
-
-        // 3. If there is no more parent of ancestor in the flat tree, terminate this algorithm and return null.
-        auto parent_of_ancestor = ancestor->first_flat_tree_ancestor_of_type<DOM::Element>();
-        if (!parent_of_ancestor)
-            return nullptr;
-
-        // 4. Let ancestor be the parent of ancestor in the flat tree.
-        ancestor = parent_of_ancestor;
-    }
-}
-
-// https://www.w3.org/TR/cssom-view-1/#dom-htmlelement-offsettop
-int HTMLElement::offset_top() const
-{
-    // 1. If the element is the HTML body element or does not have any associated CSS layout box
-    //    return zero and terminate this algorithm.
-    if (is<HTML::HTMLBodyElement>(*this))
-        return 0;
-
