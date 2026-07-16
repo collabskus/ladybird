@@ -17,7 +17,6 @@
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/StyleScope.h>
 #include <LibWeb/CSS/StyleValues/BorderImageSliceStyleValue.h>
-#include <LibWeb/CSS/StyleValues/ColorSchemeStyleValue.h>
 #include <LibWeb/CSS/StyleValues/FilterValueListStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/KeywordStyleValue.h>
@@ -95,7 +94,7 @@ void Paintable::set_containing_block(Paintable* containing_block)
     invalidate_absolute_geometry_cache(InvalidateDescendantGeometry::No);
 }
 
-CSS::ImmutableComputedValues const& Paintable::computed_values() const
+CSS::ComputedValues const& Paintable::computed_values() const
 {
     return layout_node().computed_values();
 }
@@ -310,31 +309,25 @@ Paintable::SelectionStyle Paintable::selection_style_for_node(Layout::Node const
     if (!element)
         return default_style_for_color_scheme(style_source.computed_values().color_scheme());
 
-    auto color_scheme_is_normal = element->computed_properties()->property(CSS::PropertyID::ColorScheme).as_color_scheme().schemes().is_empty();
+    auto color_scheme_is_normal = element->computed_values()->color_schemes().is_empty();
     auto use_palette_for_normal_color_scheme = color_scheme_is_normal && !layout_node.document().supported_color_schemes().has_value();
     auto default_style = default_style_for_color_scheme(style_source.computed_values().color_scheme(), use_palette_for_normal_color_scheme);
 
     auto style_from_element = [&](DOM::Element const& element) -> Optional<SelectionStyle> {
-        auto element_layout_node = element.layout_node();
-        if (!element_layout_node)
-            return {};
-
-        auto computed_selection_style = element.computed_properties(CSS::PseudoElement::Selection);
+        auto computed_selection_style = element.computed_values(CSS::PseudoElement::Selection);
         if (!computed_selection_style)
             return {};
 
-        auto context = CSS::ColorResolutionContext::for_layout_node_with_style(*element_layout_node);
-
         SelectionStyle style;
-        style.background_color = computed_selection_style->color(CSS::PropertyID::BackgroundColor, context);
+        style.background_color = computed_selection_style->background_color();
 
         // Only use text color if it was explicitly set in the ::selection rule, not inherited.
         if (!computed_selection_style->is_property_inherited(CSS::PropertyID::Color))
-            style.text_color = computed_selection_style->color(CSS::PropertyID::Color, context);
+            style.text_color = computed_selection_style->color();
 
         // Only use text-shadow if it was explicitly set in the ::selection rule, not inherited.
         if (!computed_selection_style->is_property_inherited(CSS::PropertyID::TextShadow)) {
-            auto const& css_shadows = computed_selection_style->text_shadow(*element_layout_node);
+            auto const& css_shadows = computed_selection_style->text_shadow();
             Vector<ShadowData> shadows;
             shadows.ensure_capacity(css_shadows.size());
             for (auto const& shadow : css_shadows)
@@ -347,7 +340,7 @@ Paintable::SelectionStyle Paintable::selection_style_for_node(Layout::Node const
             style.text_decoration = TextDecorationStyle {
                 .line = computed_selection_style->text_decoration_line(),
                 .style = computed_selection_style->text_decoration_style(),
-                .color = computed_selection_style->color(CSS::PropertyID::TextDecorationColor, context),
+                .color = computed_selection_style->text_decoration_color(),
             };
         }
 
@@ -1387,28 +1380,28 @@ NonnullRefPtr<Scrollbar> Paintable::ensure_scrollbar(ScrollDirection direction)
 
 static CSS::Overflow overflow_value_applied_to_viewport_for_wheel_scrolling(DOM::Document const& document, Paintable::ScrollDirection direction)
 {
-    auto overflow_for_direction = [direction](CSS::ComputedProperties const& computed_properties) {
+    auto overflow_for_direction = [direction](CSS::ComputedValues const& computed_values) {
         return direction == Paintable::ScrollDirection::Horizontal
-            ? computed_properties.overflow_x()
-            : computed_properties.overflow_y();
+            ? computed_values.overflow_x()
+            : computed_values.overflow_y();
     };
 
     auto* root_element = document.document_element();
-    if (!root_element || !root_element->computed_properties())
+    if (!root_element || !root_element->computed_values())
         return CSS::Overflow::Auto;
 
     auto* overflow_origin_element = root_element;
-    if (root_element->is_html_html_element() && root_element->computed_properties()->contain().is_empty()) {
-        auto root_overflow_x = root_element->computed_properties()->overflow_x();
-        auto root_overflow_y = root_element->computed_properties()->overflow_y();
+    if (root_element->is_html_html_element() && root_element->computed_values()->contain().is_empty()) {
+        auto root_overflow_x = root_element->computed_values()->overflow_x();
+        auto root_overflow_y = root_element->computed_values()->overflow_y();
         if (root_overflow_x == CSS::Overflow::Visible && root_overflow_y == CSS::Overflow::Visible) {
             auto* body_element = root_element->first_child_of_type<HTML::HTMLBodyElement>();
-            if (body_element && body_element->computed_properties() && body_element->computed_properties()->contain().is_empty())
+            if (body_element && body_element->computed_values() && body_element->computed_values()->contain().is_empty())
                 overflow_origin_element = body_element;
         }
     }
 
-    auto overflow = overflow_for_direction(*overflow_origin_element->computed_properties());
+    auto overflow = overflow_for_direction(*overflow_origin_element->computed_values());
     if (overflow == CSS::Overflow::Visible)
         return CSS::Overflow::Auto;
     if (overflow == CSS::Overflow::Clip)
@@ -2152,27 +2145,29 @@ static CSSPixelRect destination_rect_for_track(BorderImageGrid const& grid, Bord
 static ResolvedBorderImageGeometry resolve_border_image_geometry(CSS::BorderImageData const& border_image, Gfx::IntSize source_size, CSSPixelRect border_box_rect, PixelBox border_width)
 {
     // https://drafts.csswg.org/css-backgrounds-3/#border-image-slice
-    auto resolve_slice = [](CSS::StyleValue const& value, CSSPixels reference_length) {
-        if (value.is_percentage())
-            return CSSPixels::nearest_value_for(reference_length * value.as_percentage().percentage().as_fraction());
-        return CSSPixels(value.as_number().number());
+    auto resolve_slice = [](CSS::BorderImageSliceValue const& value, CSSPixels reference_length) {
+        return value.visit(
+            [](double number) { return CSSPixels(number); },
+            [&](CSS::Percentage percentage) { return CSSPixels::nearest_value_for(reference_length * percentage.as_fraction()); },
+            [&](NonnullRefPtr<CSS::CalculatedStyleValue const> const& calculated) {
+                if (calculated->resolves_to_percentage())
+                    return CSSPixels::nearest_value_for(reference_length * calculated->resolve_percentage({}).value().as_fraction());
+                return CSSPixels(calculated->resolve_number({}).value());
+            });
     };
 
-    auto resolve_outset = [](CSS::StyleValue const& value, CSSPixels border_width) {
-        if (value.is_number())
-            return CSSPixels::nearest_value_for(border_width * value.as_number().number());
-        return CSS::Length::from_style_value(value, {}).absolute_length_to_px();
+    auto resolve_outset = [](CSS::BorderImageOutsetValue const& value, CSSPixels border_width) {
+        return value.visit(
+            [&](double number) { return CSSPixels::nearest_value_for(border_width * number); },
+            [](CSS::Length const& length) { return length.absolute_length_to_px(); });
     };
 
     // https://drafts.csswg.org/css-backgrounds-3/#border-image-width
-    auto resolve_width = [](CSS::StyleValue const& value, CSSPixels border_width, CSSPixels reference_length, CSSPixels auto_width) {
-        if (value.is_number())
-            return CSSPixels::nearest_value_for(border_width * value.as_number().number());
-        if (value.is_percentage())
-            return CSSPixels::nearest_value_for(reference_length * value.as_percentage().percentage().as_fraction());
-        if (value.to_keyword() == CSS::Keyword::Auto)
-            return auto_width;
-        return CSS::Length::from_style_value(value, {}).absolute_length_to_px();
+    auto resolve_width = [](CSS::BorderImageWidthValue const& value, CSSPixels border_width, CSSPixels reference_length, CSSPixels auto_width) {
+        return value.visit(
+            [&](double number) { return CSSPixels::nearest_value_for(border_width * number); },
+            [&](CSS::LengthPercentage const& length_percentage) { return length_percentage.to_px(reference_length); },
+            [&](CSS::BorderImageWidthAuto) { return auto_width; });
     };
 
     auto shrink_opposite_sides_to_fit = [](CSSPixels& first, CSSPixels& second, CSSPixels available) {
@@ -2336,15 +2331,15 @@ static void paint_border_image_slice(DisplayListRecordingContext& context, Gfx::
 static bool paint_border_image(DisplayListRecordingContext& context, Paintable const& paintable_box, BordersData const& borders_data, CSSPixelRect const& border_box_rect)
 {
     auto const& border_image = paintable_box.computed_values().border_image();
-    if (!border_image.has_value())
+    if (!border_image.source)
         return false;
 
     // FIXME: Support all abstract image sources here. NodeWithStyle loads and observes gradients and
     // image-set(), but this painting path currently only handles raster images.
-    if (!border_image->source->is_image())
+    if (!border_image.source->is_image())
         return false;
 
-    auto const& image = border_image->source->as_image();
+    auto const& image = border_image.source->as_image();
     auto const& document = paintable_box.document();
     if (!image.is_paintable(document))
         return false;
@@ -2360,10 +2355,10 @@ static bool paint_border_image(DisplayListRecordingContext& context, Paintable c
         .bottom = borders_data.bottom.width,
         .left = borders_data.left.width,
     };
-    auto geometry = resolve_border_image_geometry(*border_image, frame.size(), border_box_rect, border_width);
+    auto geometry = resolve_border_image_geometry(border_image, frame.size(), border_box_rect, border_width);
 
-    auto repeat_x = border_image->repeat_x;
-    auto repeat_y = border_image->repeat_y;
+    auto repeat_x = border_image.repeat_x;
+    auto repeat_y = border_image.repeat_y;
 
     auto image_rendering = paintable_box.computed_values().image_rendering();
 
@@ -2399,7 +2394,7 @@ static bool paint_border_image(DisplayListRecordingContext& context, Paintable c
 
     for (auto row : { BorderImageTrack::Start, BorderImageTrack::Center, BorderImageTrack::End }) {
         for (auto column : { BorderImageTrack::Start, BorderImageTrack::Center, BorderImageTrack::End }) {
-            if (column == BorderImageTrack::Center && row == BorderImageTrack::Center && !border_image->fill)
+            if (column == BorderImageTrack::Center && row == BorderImageTrack::Center && !border_image.fill)
                 continue; // The centre is only painted when the 'fill' keyword is present.
             paint_piece(column, row);
         }
