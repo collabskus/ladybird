@@ -135164,20 +135164,20 @@ static constexpr StringView cache_directory_for_mode(DiskCache::Mode mode)
     switch (mode) {
     case DiskCache::Mode::Normal:
         return "Cache"sv;
-    case DiskCache::Mode::Partitioned:
-        // FIXME: Ideally, we could support multiple RequestServer processes using the same database by setting a
-        //        reasonable busy timeout. We would also have to prevent multiple processes writing to the same cache
-        //        entry file at the same time with some interprocess locking mechanism.
-        return "PartitionedCache"sv;
     case DiskCache::Mode::Testing:
         return "TestCache"sv;
     }
     VERIFY_NOT_REACHED();
 }
 
-ErrorOr<DiskCache> DiskCache::create(Mode mode, LexicalPath cache_root)
+ErrorOr<Optional<DiskCache>> DiskCache::create(Mode mode, LexicalPath const& cache_root)
 {
     auto cache_directory = cache_root.append(cache_directory_for_mode(mode));
+
+    // Start with a clean slate in test mode. The index is in-memory, but the cache files themselves are leftover.
+    if (mode == Mode::Testing)
+        (void)FileSystem::remove(cache_directory.string(), FileSystem::RecursionMode::Allowed);
+
     TRY(Core::Directory::create(cache_directory, Core::Directory::CreateDirectories::Yes));
 
     auto database = mode == DiskCache::Mode::Normal
@@ -135185,16 +135185,14 @@ ErrorOr<DiskCache> DiskCache::create(Mode mode, LexicalPath cache_root)
         : TRY(Database::Database::create_memory_backed());
 
     if (TRY(CacheIndex::migrate_schema(*database)) == Database::MigrationOutcome::DatabaseTooNew) {
-        // Entry file names are derived from the cache key, so writing into the existing cache
-        // directory without its index would corrupt entries the newer build's index refers to.
-        // Partitioned mode is already a per-process transient cache in its own directory.
-        // (A fresh memory-backed database always migrates, so this is necessarily Mode::Normal.)
-        dbgln("Disk cache index was created by a newer Ladybird version; using a transient cache this session");
-        return create(Mode::Partitioned, move(cache_root));
+        // Entry file names are derived from the cache key, so writing into the existing cache directory without its
+        // index would corrupt entries the newer build's index refers to. (A fresh memory-backed database always
+        // migrates, so this is necessarily Mode::Normal.)
+        dbgln("Disk cache index was created by a newer Ladybird version; disabling disk cache for this session");
+        return OptionalNone {};
     }
 
     auto index = TRY(CacheIndex::create(database, cache_directory));
-
     return DiskCache { mode, move(database), move(cache_directory), move(index) };
 }
 
@@ -135204,19 +135202,12 @@ DiskCache::DiskCache(Mode mode, NonnullRefPtr<Database::Database> database, Lexi
     , m_cache_directory(move(cache_directory))
     , m_index(move(index))
 {
-    if (m_mode == Mode::Partitioned)
-        m_partitioned_cache_key = String::number(Core::System::getpid());
 }
 
 DiskCache::DiskCache(DiskCache&&) = default;
 DiskCache& DiskCache::operator=(DiskCache&&) = default;
 
-DiskCache::~DiskCache()
-{
-    // Clean up cache directories in testing modes to prevent endless growth of disk usage.
-    if (m_mode != Mode::Normal)
-        remove_entries_accessed_since(UnixDateTime::earliest());
-}
+DiskCache::~DiskCache() = default;
 
 Variant<Optional<CacheEntryWriter&>, DiskCache::CacheHasOpenEntry> DiskCache::create_entry(CacheRequest& request, URL::URL const& url, StringView method, HeaderList const& request_headers, UnixDateTime request_start_time)
 {
@@ -135229,7 +135220,7 @@ Variant<Optional<CacheEntryWriter&>, DiskCache::CacheHasOpenEntry> DiskCache::cr
     }
 
     auto serialized_url = serialize_url_for_cache_storage(url);
-    auto cache_key = create_cache_key(serialized_url, method, m_partitioned_cache_key);
+    auto cache_key = create_cache_key(serialized_url, method);
 
     if (check_if_cache_has_open_entry(request, cache_key, url, CheckReaderEntries::Yes))
         return CacheHasOpenEntry {};
@@ -135259,7 +135250,7 @@ Variant<Optional<CacheEntryReader&>, DiskCache::CacheHasOpenEntry> DiskCache::op
         return Optional<CacheEntryReader&> {};
 
     auto serialized_url = serialize_url_for_cache_storage(url);
-    auto cache_key = create_cache_key(serialized_url, method, m_partitioned_cache_key);
+    auto cache_key = create_cache_key(serialized_url, method);
 
     if (check_if_cache_has_open_entry(request, cache_key, url, open_mode == OpenMode::Read ? CheckReaderEntries::No : CheckReaderEntries::Yes))
         return CacheHasOpenEntry {};
@@ -135358,7 +135349,7 @@ ErrorOr<bool> DiskCache::create_synthetic_entry(URL::URL const& url, StringView 
         return false;
 
     auto serialized_url = serialize_url_for_cache_storage(url);
-    auto cache_key = create_cache_key(serialized_url, method, m_partitioned_cache_key);
+    auto cache_key = create_cache_key(serialized_url, method);
     constexpr u64 synthetic_vary_key = 0;
 
     if (m_index.has_entry(cache_key, synthetic_vary_key))
@@ -135376,7 +135367,7 @@ ErrorOr<bool> DiskCache::store_associated_data(URL::URL const& url, StringView m
         return false;
 
     auto serialized_url = serialize_url_for_cache_storage(url);
-    auto cache_key = create_cache_key(serialized_url, method, m_partitioned_cache_key);
+    auto cache_key = create_cache_key(serialized_url, method);
     if (!vary_key.has_value()) {
         auto index_entry = m_index.find_entry(cache_key, request_headers);
         if (!index_entry.has_value())
@@ -135411,7 +135402,7 @@ ErrorOr<Optional<ByteBuffer>> DiskCache::retrieve_associated_data(URL::URL const
         return Optional<ByteBuffer> {};
 
     auto serialized_url = serialize_url_for_cache_storage(url);
-    auto cache_key = create_cache_key(serialized_url, method, m_partitioned_cache_key);
+    auto cache_key = create_cache_key(serialized_url, method);
     if (!vary_key.has_value()) {
         auto index_entry = m_index.find_entry(cache_key, request_headers);
         if (!index_entry.has_value())
@@ -135439,7 +135430,7 @@ ErrorOr<Optional<CacheEntryBodyFile>> DiskCache::retrieve_associated_data_file(U
         return Optional<CacheEntryBodyFile> {};
 
     auto serialized_url = serialize_url_for_cache_storage(url);
-    auto cache_key = create_cache_key(serialized_url, method, m_partitioned_cache_key);
+    auto cache_key = create_cache_key(serialized_url, method);
     if (!vary_key.has_value()) {
         auto index_entry = m_index.find_entry(cache_key, request_headers);
         if (!index_entry.has_value())
@@ -135598,15 +135589,11 @@ public:
     enum class Mode {
         Normal,
 
-        // In partitioned mode, the cache is enabled as normal, but each RequestServer process operates with a unique
-        // disk cache database.
-        Partitioned,
-
         // In test mode, we only enable caching of responses on a per-request basis, signified by a request header. The
         // response headers will include some status on how the request was handled.
         Testing,
     };
-    static ErrorOr<DiskCache> create(Mode, LexicalPath cache_root);
+    static ErrorOr<Optional<DiskCache>> create(Mode, LexicalPath const& cache_root);
 
     DiskCache(DiskCache&&);
     DiskCache& operator=(DiskCache&&);
@@ -135653,8 +135640,6 @@ private:
     void delete_entry(u64 cache_key, u64 vary_key);
 
     Mode m_mode;
-    Optional<String> m_partitioned_cache_key;
-
     NonnullRefPtr<Database::Database> m_database;
 
     struct OpenCacheEntry {
@@ -136044,14 +136029,11 @@ static u64 serialize_hash(Crypto::Hash::SHA1& hasher)
     return result;
 }
 
-u64 create_cache_key(StringView url, StringView method, Optional<String const&> extra_cache_key)
+u64 create_cache_key(StringView url, StringView method)
 {
     auto hasher = Crypto::Hash::SHA1::create();
     hasher->update(url);
     hasher->update(method);
-
-    if (extra_cache_key.has_value())
-        hasher->update(*extra_cache_key);
 
     return serialize_hash(*hasher);
 }
@@ -136750,7 +136732,7 @@ u64 compute_maximum_disk_cache_size(u64 free_bytes, u64 limit_maximum_disk_cache
 u64 compute_maximum_disk_cache_entry_size(u64 maximum_disk_cache_size);
 
 String serialize_url_for_cache_storage(URL::URL const&);
-u64 create_cache_key(StringView url, StringView method, Optional<String const&> extra_cache_key = {});
+u64 create_cache_key(StringView url, StringView method);
 u64 create_vary_key(HeaderList const& request_headers, HeaderList const& response_headers);
 LexicalPath path_for_cache_entry(LexicalPath const& cache_directory, u64 cache_key, u64 vary_key);
 LexicalPath path_for_cache_entry_associated_data(LexicalPath const& cache_directory, u64 cache_key, u64 vary_key, CacheEntryAssociatedData);
@@ -472739,7 +472721,7 @@ void CSSStyleSheet::recalculate_rule_caches()
         }
         case CSSRule::Type::Namespace: {
             auto& namespace_rule = as<CSSNamespaceRule>(*rule);
-            if (!namespace_rule.namespace_uri().is_empty() && namespace_rule.prefix().is_empty())
+            if (namespace_rule.prefix().is_empty())
                 m_default_namespace_rule = namespace_rule;
 
             m_namespace_rules.set(namespace_rule.prefix(), namespace_rule);
@@ -532484,6 +532466,11 @@ static inline bool matches_pseudo_class(CSS::Selector::SimpleSelector::PseudoCla
     return false;
 }
 
+static bool is_in_null_namespace(DOM::Element const& element)
+{
+    return !element.namespace_uri().has_value() || element.namespace_uri()->is_empty();
+}
+
 static ALWAYS_INLINE bool matches_namespace(
     CSS::Selector::SimpleSelector::QualifiedName const& qualified_name,
     DOM::Element const& element,
@@ -532495,11 +532482,14 @@ static ALWAYS_INLINE bool matches_namespace(
         if (!style_sheet_for_rule || !style_sheet_for_rule->default_namespace_rule())
             return true;
         // "Otherwise it is equivalent to ns|E where ns is the default namespace."
+        if (style_sheet_for_rule->default_namespace_rule()->namespace_uri().is_empty())
+            return is_in_null_namespace(element);
+
         return element.namespace_uri().has_value()
             && fly_string_equals_utf16(style_sheet_for_rule->default_namespace_rule()->namespace_uri(), element.namespace_uri()->view());
     case CSS::Selector::SimpleSelector::QualifiedName::NamespaceType::None:
         // "elements with name E without a namespace"
-        return !element.namespace_uri().has_value();
+        return is_in_null_namespace(element);
     case CSS::Selector::SimpleSelector::QualifiedName::NamespaceType::Any:
         // "elements with name E in any namespace, including those without a namespace"
         return true;
@@ -532517,7 +532507,7 @@ static ALWAYS_INLINE bool matches_namespace(
         // In CSS Namespaces a namespace name consisting of the empty string is taken to represent the null namespace
         // or lack of a namespace.
         if (selector_namespace.has_value() && selector_namespace.value().is_empty())
-            return !element.namespace_uri().has_value();
+            return is_in_null_namespace(element);
 
         return selector_namespace.has_value()
             && element.namespace_uri().has_value()
@@ -534345,12 +534335,14 @@ RuleCache const* StyleComputer::rule_cache_for_cascade_origin(CascadeOrigin casc
 
 [[nodiscard]] static bool filter_namespace_rule(Optional<Utf16FlyString> const& element_namespace_uri, MatchingRule const& rule)
 {
-    // FIXME: Filter out non-default namespace using prefixes
-    if (rule.default_namespace.has_value()) {
-        if (!element_namespace_uri.has_value() || element_namespace_uri->view() != rule.default_namespace->view())
-            return false;
-    }
-    return true;
+    if (!rule.element_namespace_filter.has_value())
+        return true;
+
+    if (rule.element_namespace_filter->is_empty())
+        return !element_namespace_uri.has_value() || element_namespace_uri->is_empty();
+
+    return element_namespace_uri.has_value()
+        && element_namespace_uri->view() == rule.element_namespace_filter->view();
 }
 
 NonnullRefPtr<InvalidationPlan> StyleComputer::invalidation_plan_for_properties(Vector<InvalidationSet::Property> const& properties, StyleScope const& style_scope) const
@@ -541784,6 +541776,51 @@ void MatchingRule::visit_edges(GC::Cell::Visitor& visitor) const
     visitor.visit(scope_rule);
 }
 
+static Optional<Utf16FlyString> namespace_filter_for_qualified_name(Selector::SimpleSelector::QualifiedName const& qualified_name, CSSStyleSheet const& style_sheet)
+{
+    switch (qualified_name.namespace_type) {
+    case Selector::SimpleSelector::QualifiedName::NamespaceType::Default:
+        return style_sheet.default_namespace();
+    case Selector::SimpleSelector::QualifiedName::NamespaceType::None:
+        return Utf16FlyString {};
+    case Selector::SimpleSelector::QualifiedName::NamespaceType::Any:
+        return {};
+    case Selector::SimpleSelector::QualifiedName::NamespaceType::Named:
+        return style_sheet.namespace_uri(qualified_name.namespace_);
+    }
+    VERIFY_NOT_REACHED();
+}
+
+static Selector::CompoundSelector const& target_compound_selector_for_namespace_filter(Selector const& selector)
+{
+    auto const& compound_selectors = selector.compound_selectors();
+    VERIFY(!compound_selectors.is_empty());
+
+    if (auto compound_selector = compound_selectors.last_matching([](auto const& compound_selector) {
+            return compound_selector.combinator != Selector::Combinator::PseudoElement;
+        });
+        compound_selector.has_value())
+        return compound_selector.value();
+
+    return compound_selectors.first();
+}
+
+static Optional<Utf16FlyString> element_namespace_filter_for_rule(Selector const& selector, CSSStyleSheet const& style_sheet)
+{
+    if (selector.is_slotted() || selector.has_part_pseudo_element())
+        return {};
+
+    auto const& compound_selector = target_compound_selector_for_namespace_filter(selector);
+    for (auto const& simple_selector : compound_selector.simple_selectors) {
+        if (simple_selector.type == Selector::SimpleSelector::Type::TagName
+            || simple_selector.type == Selector::SimpleSelector::Type::Universal) {
+            return namespace_filter_for_qualified_name(simple_selector.qualified_name(), style_sheet);
+        }
+    }
+
+    return style_sheet.default_namespace();
+}
+
 void RuleCache::visit_edges(GC::Cell::Visitor& visitor)
 {
     auto visit_vector = [&](auto& vector) {
@@ -542309,7 +542346,7 @@ void StyleScope::make_rule_cache_for_cascade_origin(CascadeOrigin cascade_origin
                     .sheet = current_style_sheet,
                     .container_rule = container_rule,
                     .scope_rule = scope_rule,
-                    .default_namespace = current_style_sheet.default_namespace(),
+                    .element_namespace_filter = element_namespace_filter_for_rule(selector, current_style_sheet),
                     .selector = selector,
                     .selector_index = selector_index,
                     .style_sheet_index = style_sheet_index,
@@ -543179,7 +543216,7 @@ struct MatchingRule {
     GC::Ptr<CSSStyleSheet const> sheet;
     GC::Ptr<CSSContainerRule const> container_rule;
     GC::Ptr<CSSRule const> scope_rule; // Either CSSScopeRule or CSSImportRule
-    Optional<Utf16FlyString> default_namespace;
+    Optional<Utf16FlyString> element_namespace_filter;
     Selector const& selector;
     size_t selector_index { 0 };
     size_t style_sheet_index { 0 };
@@ -658938,19 +658975,3 @@ WebIDL::ExceptionOr<Optional<GC::ConservativeVector<XHR::FormDataEntry>>> constr
             }
             // 2. Otherwise, for each file in selected files, create an entry with name and a File object representing the file, and append it to entry list.
             else {
-                for (size_t i = 0; i < file_element->files()->length(); i++) {
-                    auto file = GC::Ref { *file_element->files()->item(i) };
-                    entry_list.append(TRY(create_entry(realm, name.view(), Variant<GC::Ref<FileAPI::Blob>, Utf16String> { GC::Ref<FileAPI::Blob> { file } })));
-                }
-            }
-        }
-        // 9. Otherwise, if the field element is an input element whose type attribute is in the Hidden state and name is an ASCII case-insensitive match for "_charset_":
-        else if (auto* hidden_input = as_if<HTMLInputElement>(*control); hidden_input && hidden_input->type_state() == HTMLInputElement::TypeAttributeState::Hidden && name.equals_ignoring_ascii_case(u"_charset_"sv)) {
-            // 1. Let charset be the name of encoding if encoding is given, and "UTF-8" otherwise.
-            auto charset = encoding.value_or("UTF-8"_utf16);
-
-            // 2. Create an entry with name and charset, and append it to entry list.
-            entry_list.append(TRY(create_entry(realm, name.view(), charset)));
-        }
-        // 10. Otherwise, create an entry with name and the value of the field element, and append it to entry list.
-        else {
