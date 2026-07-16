@@ -1767,7 +1767,7 @@ static Optional<CSSPixelRect> compute_inline_containing_block_rect(InlineNode co
             : child_used_values->border_box_height();
         auto const block_axis_line_height = inline_node.computed_values().line_height();
         auto const block_axis_start = [&] {
-            if (fragment.layout_node().computed_values().block_axis_is_reverse())
+            if (fragment.style_source().computed_values().block_axis_is_reverse())
                 return fragment.block_offset() + child_used_values->border_box_right() - block_axis_line_height;
             return fragment.block_offset() - (is_horizontal ? child_used_values->border_box_top() : child_used_values->border_box_left());
         }();
@@ -1802,7 +1802,8 @@ static Optional<CSSPixelRect> compute_inline_containing_block_rect(InlineNode co
         }
 
         for (auto child = node.first_child(); child; child = child->next_sibling()) {
-            if (child->is_absolutely_positioned() || child->is_floating())
+            auto const* child_with_style = as_if<NodeWithStyle>(*child);
+            if (child_with_style && (child_with_style->is_absolutely_positioned() || child_with_style->is_floating()))
                 continue;
             auto const* child_used_values = state.try_get(*child);
             auto child_offset = child_used_values ? offset + child_used_values->content_offset() : offset;

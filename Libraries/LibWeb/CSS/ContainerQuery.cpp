@@ -32,6 +32,7 @@
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/Dump.h>
+#include <LibWeb/Layout/Node.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/Paintable.h>
 
@@ -182,19 +183,55 @@ void SizeFeature::dump(StringBuilder& builder, int indent_levels) const
     builder.appendff("SizeFeature: {}\n", to_string());
 }
 
+NonnullOwnPtr<StyleQueryFunction> StyleQueryFunction::create(NonnullOwnPtr<BooleanExpression>&& query)
+{
+    return adopt_own(*new StyleQueryFunction(move(query)));
+}
+
+StyleQueryFunction::StyleQueryFunction(NonnullOwnPtr<BooleanExpression>&& query)
+    : m_query(move(query))
+{
+}
+
+MatchResult StyleQueryFunction::evaluate(BooleanExpressionEvaluationContext const& context) const
+{
+    return m_query->evaluate(context);
+}
+
+void StyleQueryFunction::collect_container_query_feature_requirements(ContainerQueryFeatureRequirements& requirements) const
+{
+    m_query->collect_container_query_feature_requirements(requirements);
+}
+
+void StyleQueryFunction::serialize_to(Utf16StringBuilder& builder) const
+{
+    builder.append("style("_utf16);
+    m_query->serialize_to(builder);
+    builder.append(")"_utf16);
+}
+
+void StyleQueryFunction::dump(StringBuilder& builder, int indent_levels) const
+{
+    indent(builder, indent_levels);
+    builder.append("StyleQueryFunction:\n"sv);
+    m_query->dump(builder, indent_levels + 1);
+}
+
 NonnullOwnPtr<StyleFeature> StyleFeature::create_boolean(PropertyNameAndID property)
 {
     return adopt_own(*new StyleFeature(StyleFeaturePlain {
         .property = move(property),
         .value = {},
+        .original_value_text = {},
     }));
 }
 
-NonnullOwnPtr<StyleFeature> StyleFeature::create_plain(PropertyNameAndID property, Vector<Parser::ComponentValue> value)
+NonnullOwnPtr<StyleFeature> StyleFeature::create_plain(PropertyNameAndID property, Vector<Parser::ComponentValue> value, Optional<String> original_value_text)
 {
     return adopt_own(*new StyleFeature(StyleFeaturePlain {
         .property = move(property),
         .value = move(value),
+        .original_value_text = move(original_value_text),
     }));
 }
 
@@ -473,7 +510,9 @@ MatchResult StyleFeature::evaluate(BooleanExpressionEvaluationContext const& con
     if (auto const* range = m_feature.get_pointer<StyleRange>())
         return evaluate_style_range(*range, context);
 
-    auto const& [property, value] = m_feature.get<StyleFeaturePlain>();
+    auto const& feature = m_feature.get<StyleFeaturePlain>();
+    auto const& property = feature.property;
+    auto const& value = feature.value;
 
     // FIXME: Non-custom properties are valid style features, but if() is evaluated before the element's own
     //        non-custom computed values exist. Supporting these requires on-demand property resolution.
@@ -629,8 +668,12 @@ void StyleFeature::serialize_to(Utf16StringBuilder& builder) const
             if (!feature.value.has_value())
                 return;
             builder.append_ascii(": "sv);
-            auto serialized_value = serialize_a_series_of_component_values(feature.value.value());
-            builder.append(serialized_value.utf16_view());
+            if (feature.original_value_text.has_value()) {
+                builder.append(feature.original_value_text->bytes_as_string_view());
+            } else {
+                auto serialized_value = serialize_a_series_of_component_values(feature.value.value());
+                builder.append(serialized_value.utf16_view());
+            }
         },
         [&](StyleRange const& range) {
             auto serialized_left = serialize_style_range_value_to_utf16(range.left);
@@ -732,6 +775,7 @@ MatchResult ContainerQuery::evaluate(DOM::AbstractElement const& element, Option
         return m_condition->evaluate({
             .document = &element.document(),
             .query_container = container,
+            .style_query_element = DOM::AbstractElement { *container },
         });
     }
 

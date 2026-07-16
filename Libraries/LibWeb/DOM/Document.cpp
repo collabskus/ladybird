@@ -6241,7 +6241,7 @@ static CSSPixelRect compute_intersection(GC::Ref<Element> target, CSSPixelRect t
 
                 // Apply scroll margin to expand the scrollport for scroll containers.
                 auto& scroll_margin = observer.scroll_margin_values();
-                auto const& layout_node = container->layout_node_with_style_and_box_metrics();
+                auto const& layout_node = container->layout_node();
                 if (layout_node.is_scroll_container() && !scroll_margin.is_empty()) {
                     clip_rect.inflate(
                         scroll_margin[0].to_px(clip_rect.height()),
@@ -8814,6 +8814,10 @@ RefPtr<Painting::DisplayList> Document::record_display_list(HTML::PaintConfig co
 {
     update_paint_and_hit_testing_properties_if_needed();
     VERIFY(paintable());
+
+    // Drop the inspector-overlay context nodes appended by the previous recording; this appends its own. Safe because
+    // the pruned tree only reaches the compositor together with (or after) the display list recorded against it here.
+    paintable()->prune_inspector_overlay_visual_contexts();
 
     auto display_list = Painting::DisplayList::create(paintable()->visual_context_tree());
     Painting::DisplayListRecorder display_list_recorder(display_list, paintable()->visual_context_tree(), resource_storage);

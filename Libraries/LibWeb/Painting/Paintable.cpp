@@ -84,22 +84,15 @@ DOM::Document& Paintable::document()
 
 RefPtr<Paintable> Paintable::containing_block() const
 {
-    if (m_containing_block.has_value()) {
-        if (auto containing_block = m_containing_block->strong_ref())
-            return containing_block;
-    }
+    return m_containing_block;
+}
 
-    auto containing_block = [&] -> RefPtr<Paintable> {
-        auto containing_layout_box = layout_node().containing_block();
-        if (!containing_layout_box)
-            return nullptr;
-        auto paintable_box = containing_layout_box->paintable_box();
-        if (!paintable_box)
-            return nullptr;
-        return const_cast<Paintable&>(*paintable_box);
-    }();
+void Paintable::set_containing_block(Paintable* containing_block)
+{
+    if (m_containing_block == containing_block)
+        return;
     m_containing_block = containing_block;
-    return containing_block;
+    invalidate_absolute_geometry_cache(InvalidateDescendantGeometry::No);
 }
 
 CSS::ImmutableComputedValues const& Paintable::computed_values() const
@@ -206,6 +199,8 @@ void Paintable::paint_with_inspector_overlay_context(DisplayListRecordingContext
                 relevant_indices.append(i);
         }
 
+        // NB: These nodes are transient: they're only referenced by the display list being recorded right now — and the
+        //     next recording prunes them again (see ViewportPaintable::prune_inspector_overlay_visual_contexts).
         auto overlay_visual_context_index = VISUAL_VIEWPORT_NODE_INDEX;
         for (auto const& source_visual_context_index : relevant_indices.in_reverse())
             overlay_visual_context_index = visual_context_tree.append(visual_context_tree.node_at(source_visual_context_index).data, overlay_visual_context_index);
@@ -290,6 +285,8 @@ Paintable::SelectionStyle Paintable::selection_style_for_node(Layout::Node const
     // Selections render in a muted color while the window does not have focus.
     auto navigable = layout_node.document().navigable();
     auto window_is_active = navigable && navigable->is_focused();
+    auto const* layout_node_with_style = as_if<Layout::NodeWithStyle>(layout_node);
+    auto const& style_source = layout_node_with_style ? *layout_node_with_style : *layout_node.parent();
 
     auto default_style_for_color_scheme = [&](CSS::PreferredColorScheme color_scheme, bool use_palette_for_normal_color_scheme = true) {
         auto palette = layout_node.document().page().palette();
@@ -305,17 +302,17 @@ Paintable::SelectionStyle Paintable::selection_style_for_node(Layout::Node const
 
     // For text nodes, check the parent element since text nodes don't have computed properties.
     if (!node)
-        return default_style_for_color_scheme(layout_node.computed_values().color_scheme());
+        return default_style_for_color_scheme(style_source.computed_values().color_scheme());
 
     DOM::Element const* element = as_if<DOM::Element>(*node);
     if (!element)
         element = node->parent_element();
     if (!element)
-        return default_style_for_color_scheme(layout_node.computed_values().color_scheme());
+        return default_style_for_color_scheme(style_source.computed_values().color_scheme());
 
     auto color_scheme_is_normal = element->computed_properties()->property(CSS::PropertyID::ColorScheme).as_color_scheme().schemes().is_empty();
     auto use_palette_for_normal_color_scheme = color_scheme_is_normal && !layout_node.document().supported_color_schemes().has_value();
-    auto default_style = default_style_for_color_scheme(layout_node.computed_values().color_scheme(), use_palette_for_normal_color_scheme);
+    auto default_style = default_style_for_color_scheme(style_source.computed_values().color_scheme(), use_palette_for_normal_color_scheme);
 
     auto style_from_element = [&](DOM::Element const& element) -> Optional<SelectionStyle> {
         auto element_layout_node = element.layout_node();
@@ -418,7 +415,7 @@ void Paintable::scroll_text_offset_into_view(DOM::Text const& text, size_t offse
 {
     auto scroll_to_cursor = [&](PaintableFragment const& fragment) {
         auto cursor_rect = fragment.range_rect(SelectionState::StartAndEnd, offset, offset);
-        auto const& computed_values = fragment.layout_node().computed_values();
+        auto const& computed_values = fragment.style_source().computed_values();
         if (computed_values.writing_mode() == CSS::WritingMode::HorizontalTb) {
             if (computed_values.inline_axis_is_reverse())
                 cursor_rect.set_x(cursor_rect.x() - 1);
@@ -752,10 +749,8 @@ static Color effective_scrollbar_background_color(Paintable const& paintable_box
     auto background_color = paintable_box.document().canvas_background_color();
 
     Vector<Layout::NodeWithStyle const*> ancestors;
-    for (auto const* layout_node = &paintable_box.layout_node(); layout_node; layout_node = layout_node->parent()) {
-        if (auto const* layout_node_with_style = as_if<Layout::NodeWithStyle>(layout_node))
-            ancestors.append(layout_node_with_style);
-    }
+    for (Layout::NodeWithStyle const* layout_node = &paintable_box.layout_node(); layout_node; layout_node = layout_node->parent())
+        ancestors.append(layout_node);
 
     for (auto const* layout_node : ancestors.in_reverse()) {
         auto const& layout_node_with_style = *layout_node;
@@ -863,7 +858,7 @@ static void record_blocking_wheel_event_region(Paintable const& paintable_box, D
 ResolvedCSSFilter resolve_css_filter(CSS::Filter const& computed_filter, Paintable const& paintable_box)
 {
     auto const& computed_values = paintable_box.computed_values();
-    auto const& layout_node = paintable_box.layout_node_with_style_and_box_metrics();
+    auto const& layout_node = paintable_box.layout_node();
 
     ResolvedCSSFilter result;
     for (auto const& filter_operation : computed_filter.filters()) {
@@ -940,7 +935,7 @@ NonnullRefPtr<Paintable> Paintable::create(Layout::Box const& layout_box)
     return adopt_ref(*new Paintable(layout_box));
 }
 
-Paintable::Paintable(Layout::Node const& layout_node)
+Paintable::Paintable(Layout::NodeWithStyleAndBoxModelMetrics const& layout_node)
     : m_layout_node(layout_node)
 {
     auto& computed_values = layout_node.computed_values();
@@ -962,7 +957,7 @@ Paintable::Paintable(Layout::Node const& layout_node)
 }
 
 Paintable::Paintable(Layout::Box const& layout_box)
-    : Paintable(static_cast<Layout::Node const&>(layout_box))
+    : Paintable(static_cast<Layout::NodeWithStyleAndBoxModelMetrics const&>(layout_box))
 {
 }
 
@@ -974,7 +969,7 @@ Paintable::~Paintable()
 
 void Paintable::detach_from_layout_node(Badge<Layout::Node>)
 {
-    m_containing_block.clear();
+    m_containing_block = nullptr;
     m_layout_node.clear();
     detach_chrome_widgets();
 }
@@ -993,11 +988,6 @@ void Paintable::detach_chrome_widgets()
         m_resize_handle->detach_from_paintable({});
         m_resize_handle = nullptr;
     }
-}
-
-Layout::NodeWithStyleAndBoxModelMetrics const& Paintable::layout_node_with_style_and_box_metrics() const
-{
-    return as<Layout::NodeWithStyleAndBoxModelMetrics const>(layout_node());
 }
 
 bool Paintable::has_css_transform() const
@@ -1064,7 +1054,7 @@ void Paintable::reset_for_relayout()
     while (first_child())
         first_child()->remove();
 
-    m_containing_block = {};
+    m_containing_block = nullptr;
 
     m_offset = {};
     m_content_size = {};
@@ -1375,7 +1365,7 @@ CSSPixelRect Paintable::overflow_clip_edge_rect() const
 Optional<CSSPixelRect> Paintable::get_clip_rect() const
 {
     auto clip = computed_values().clip();
-    if (clip.is_rect() && layout_node_with_style_and_box_metrics().is_absolutely_positioned()) {
+    if (clip.is_rect() && layout_node().is_absolutely_positioned()) {
         auto border_box = absolute_border_box_rect();
         return clip.to_rect().resolved(border_box);
     }
@@ -2487,18 +2477,18 @@ bool Paintable::has_css_borders() const
 void Paintable::paint_background(DisplayListRecordingContext& context) const
 {
     // If the body's background properties were propagated to the root element, do not re-paint the body's background.
-    if (body_background_is_propagated_to_root(layout_node_with_style_and_box_metrics()))
+    if (body_background_is_propagated_to_root(layout_node()))
         return;
 
     auto const& computed_values = this->computed_values();
 
     // https://drafts.csswg.org/css-backgrounds/#root-background
-    if (layout_node_with_style_and_box_metrics().is_root_element()) {
+    if (layout_node().is_root_element()) {
         auto background_rect = absolute_border_box_rect();
         Color background_color = computed_values.background_color();
         auto const* background_layers = &computed_values.background_layers();
 
-        auto& html_element = as<HTML::HTMLHtmlElement>(*layout_node_with_style_and_box_metrics().dom_node());
+        auto& html_element = as<HTML::HTMLHtmlElement>(*layout_node().dom_node());
         if (html_element.should_use_body_background_properties()) {
             background_layers = document().background_layers();
             background_color = document().background_color();
@@ -2807,7 +2797,7 @@ ScrollFrameIndex Paintable::nearest_scroll_frame_index() const
 {
     if (is_fixed_position())
         return {};
-    auto paintable = this->containing_block();
+    auto const* paintable = containing_block_ptr();
     while (paintable) {
         if (paintable->own_scroll_frame_index().value())
             return paintable->own_scroll_frame_index();
@@ -2815,7 +2805,7 @@ ScrollFrameIndex Paintable::nearest_scroll_frame_index() const
         // because they must reference a scrollport for their sticky offset computation.
         if (paintable->is_fixed_position() && !is_sticky_position())
             return {};
-        paintable = paintable->containing_block();
+        paintable = paintable->containing_block_ptr();
     }
     return {};
 }
