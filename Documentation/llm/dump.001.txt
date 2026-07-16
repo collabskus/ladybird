@@ -566153,6 +566153,7 @@ void Document::visit_edges(Cell::Visitor& visitor)
 
     visitor.visit(m_top_layer_elements);
     visitor.visit(m_top_layer_pending_removals);
+    visitor.visit(m_elements_with_pending_top_layer_membership_change);
     visitor.visit(m_showing_auto_popover_list);
     visitor.visit(m_showing_hint_popover_list);
     visitor.visit(m_popover_pointerdown_target);
@@ -567152,7 +567153,6 @@ void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed)
     unsafe_paintable()->reassign_scroll_frames();
 
     set_needs_accumulated_visual_contexts_update(true);
-    update_paint_and_hit_testing_properties_if_needed();
 
     // Selection state lives on paintable fragments, which the commit has rebuilt.
     if (auto range = get_selection()->range())
@@ -567428,6 +567428,7 @@ void Document::update_layout(UpdateLayoutReason reason)
     constexpr size_t max_container_query_layout_passes = 8;
     for (size_t layout_pass = 0; layout_pass < max_container_query_layout_passes; ++layout_pass) {
         update_style();
+        process_pending_top_layer_layout_changes();
 
         auto const should_collect_devtools_layout_data = page().client().has_active_devtools_client();
         auto const force_devtools_layout_data_collection = should_collect_devtools_layout_data
@@ -567574,6 +567575,10 @@ void Document::update_layout(UpdateLayoutReason reason)
         }
 
         if (needs_style_update_after_layout())
+            continue;
+
+        // A zone rebuild requested during layout tree construction runs as another pass.
+        if (m_top_layer_needs_layout_zone_rebuild || !m_elements_with_pending_top_layer_membership_change.is_empty())
             continue;
 
         // The pass cap above bounds repeated container query style/layout cycles.
@@ -568221,7 +568226,7 @@ static CSSPixelPoint compute_mouse_event_offset(CSSPixelPoint position, Painting
 {
     auto inverse_transform_point = [](Painting::Paintable const& paintable_box, CSSPixelPoint position) -> Optional<CSSPixelPoint> {
         auto viewport_paintable = paintable_box.document().unsafe_paintable();
-        if (!viewport_paintable || !viewport_paintable->has_visual_context_tree())
+        if (!viewport_paintable)
             return {};
         auto pixel_ratio = static_cast<float>(paintable_box.document().page().client().device_pixels_per_css_pixel());
         auto const& visual_context_tree = viewport_paintable->visual_context_tree();
@@ -573296,7 +573301,7 @@ void Document::add_an_element_to_the_top_layer(GC::Ref<Element> element)
     // FIXME: 4. At the UA !important cascade origin, add a rule targeting el containing an overlay: auto declaration.
     element->set_rendered_in_top_layer(true);
     element->set_needs_style_update(true);
-    invalidate_layout_tree(InvalidateLayoutTreeReason::DocumentAddAnElementToTheTopLayer);
+    m_elements_with_pending_top_layer_membership_change.append(element);
 }
 
 // https://drafts.csswg.org/css-position-4/#request-an-element-to-be-removed-from-the-top-layer
@@ -573311,7 +573316,7 @@ void Document::request_an_element_to_be_remove_from_the_top_layer(GC::Ref<Elemen
     // FIXME: 3. Remove the UA !important overlay: auto rule targeting el.
     element->set_rendered_in_top_layer(false);
     element->set_needs_style_update(true);
-    invalidate_layout_tree(InvalidateLayoutTreeReason::DocumentRequestAnElementToBeRemovedFromTheTopLayer);
+    m_elements_with_pending_top_layer_membership_change.append(element);
 
     // 4. Append el to doc’s pending top layer removals.
     m_top_layer_pending_removals.set(element);
@@ -573331,7 +573336,7 @@ void Document::remove_an_element_from_the_top_layer_immediately(GC::Ref<Element>
     element->set_rendered_in_top_layer(false);
     element->set_needs_style_update(true);
 
-    invalidate_layout_tree(InvalidateLayoutTreeReason::DocumentImmediatelyRemoveElementFromTheTopLayer);
+    m_elements_with_pending_top_layer_membership_change.append(element);
 }
 
 // https://drafts.csswg.org/css-position-4/#process-top-layer-removals
@@ -573352,9 +573357,66 @@ void Document::process_top_layer_removals()
         m_top_layer_elements.remove(element);
         m_top_layer_pending_removals.remove(element);
     }
+}
 
-    if (!elements_to_remove.is_empty())
-        invalidate_layout_tree(InvalidateLayoutTreeReason::DocumentPendingTopLayerRemovalsProcessed);
+// The top layer is treated as a single rebuild zone: any membership change detaches the box
+// subtree of every rendered member and re-marks the members, after which the top layer pass of
+// the tree builder recreates all their boxes in top layer order. Runs after style update so
+// that elements that left the top layer are classified by their up-to-date computed display.
+void Document::process_pending_top_layer_layout_changes()
+{
+    if (m_elements_with_pending_top_layer_membership_change.is_empty() && !m_top_layer_needs_layout_zone_rebuild)
+        return;
+
+    auto elements_with_membership_change = move(m_elements_with_pending_top_layer_membership_change);
+    m_top_layer_needs_layout_zone_rebuild = false;
+
+    // An already pending full build recreates every box anyway.
+    if (!m_layout_root || needs_full_layout_tree_update())
+        return;
+
+    // Marks are applied only after every detach has run: detaching clears the flags across the
+    // detached subtree and would wipe the fresh mark of a member nested inside another member.
+    GC::RootVector<GC::Ref<Element>> elements_to_mark_for_layout_tree_update;
+
+    for (auto const& element : elements_with_membership_change) {
+        // NB: Elements that changed membership more than once are processed by their final state.
+        if (element->rendered_in_top_layer()) {
+            // An entering element whose box is still attached at its normal position leaves
+            // anonymous wrappers and inline fragments behind; the parent subtree rebuild heals
+            // that structure, while the top layer pass rebuilds the element itself.
+            // NB: Called during top layer processing, outside layout tree construction.
+            auto* element_layout_node = element->unsafe_layout_node();
+            bool element_has_box_at_normal_position = element_layout_node && element_layout_node->parent() && !element_layout_node->topmost_layout_node_of_top_layer_placement();
+            if (element_has_box_at_normal_position) {
+                if (auto* flat_tree_parent = element->flat_tree_parent(); flat_tree_parent && !flat_tree_parent->is_document())
+                    flat_tree_parent->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::TopLayerMembershipChange);
+            }
+        } else {
+            // A leaving element that is still rendered (fullscreen exit, mostly) needs a box
+            // back among already-built sibling boxes, which only a full rebuild can order.
+            bool element_is_still_rendered = element->is_connected()
+                && element->computed_properties()
+                && !element->computed_properties()->display().is_none();
+            if (element_is_still_rendered) {
+                invalidate_layout_tree(InvalidateLayoutTreeReason::TopLayerElementStillRenderedAfterRemoval);
+                return;
+            }
+            Layout::TreeBuilder::detach_top_layer_element_layout_subtree(element);
+            if (element->is_connected())
+                elements_to_mark_for_layout_tree_update.append(element);
+        }
+    }
+
+    for (auto const& member : m_top_layer_elements) {
+        if (!member->rendered_in_top_layer())
+            continue;
+        Layout::TreeBuilder::detach_top_layer_element_layout_subtree(member);
+        elements_to_mark_for_layout_tree_update.append(member);
+    }
+
+    for (auto const& element : elements_to_mark_for_layout_tree_update)
+        element->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::TopLayerMembershipChange);
 }
 
 // https://html.spec.whatwg.org/multipage/popover.html#topmost-auto-popover
@@ -575186,11 +575248,8 @@ enum class QuirksMode {
     Yes
 };
 
-#define ENUMERATE_INVALIDATE_LAYOUT_TREE_REASONS(X)       \
-    X(DocumentAddAnElementToTheTopLayer)                  \
-    X(DocumentRequestAnElementToBeRemovedFromTheTopLayer) \
-    X(DocumentImmediatelyRemoveElementFromTheTopLayer)    \
-    X(DocumentPendingTopLayerRemovalsProcessed)
+#define ENUMERATE_INVALIDATE_LAYOUT_TREE_REASONS(X) \
+    X(TopLayerElementStillRenderedAfterRemoval)
 
 enum class InvalidateLayoutTreeReason {
 #define ENUMERATE_INVALIDATE_LAYOUT_TREE_REASON(e) e,
@@ -576200,7 +576259,10 @@ public:
     void remove_an_element_from_the_top_layer_immediately(GC::Ref<Element>);
     void process_top_layer_removals();
 
+    void set_top_layer_needs_layout_zone_rebuild() { m_top_layer_needs_layout_zone_rebuild = true; }
+
     OrderedHashTable<GC::Ref<Element>> const& top_layer_elements() const { return m_top_layer_elements; }
+    bool top_layer_pending_removals_contains(GC::Ref<Element> element) const { return m_top_layer_pending_removals.contains(element); }
 
     // AD-HOC: These lists are managed dynamically instead of being generated as needed.
     // Spec issue: https://github.com/whatwg/html/issues/11007
@@ -576437,6 +576499,7 @@ private:
 
     void clear_layout_and_paintable_nodes_for_inactive_document();
     void tear_down_layout_tree();
+    void process_pending_top_layer_layout_changes();
 
     void update_active_element();
     void collect_paintable_boxes_with_auto_content_visibility();
@@ -576842,6 +576905,8 @@ private:
     // instead they generate boxes as if they were siblings of the root element.
     OrderedHashTable<GC::Ref<Element>> m_top_layer_elements;
     OrderedHashTable<GC::Ref<Element>> m_top_layer_pending_removals;
+    Vector<GC::Ref<Element>> m_elements_with_pending_top_layer_membership_change;
+    bool m_top_layer_needs_layout_zone_rebuild { false };
 
     Vector<GC::Ref<HTML::HTMLElement>> m_showing_auto_popover_list;
     Vector<GC::Ref<HTML::HTMLElement>> m_showing_hint_popover_list;
@@ -580598,7 +580663,20 @@ void Element::set_needs_layout_tree_rebuild(SetNeedsLayoutTreeUpdateReason reaso
     //     boxes based on the element's own needs-layout-tree-update flag; the DOM parent's subtree rebuild skips them
     //     entirely. Mark the element itself in that case. This still propagates child-needs-layout-tree-update up to
     //     the document, which is what makes the top layer pass run.
-    if (auto parent = parent_element(); parent && !rendered_in_top_layer())
+    // NB: Called outside layout tree construction.
+    auto* layout_node = unsafe_layout_node();
+    // An element that just left the top layer keeps its box as a viewport child until the
+    // pending membership change is processed, so the parent must not be rebuilt for it either.
+    bool element_box_is_placed_in_top_layer = layout_node && layout_node->topmost_layout_node_of_top_layer_placement();
+    if (rendered_in_top_layer() || element_box_is_placed_in_top_layer) {
+        // An attached box is replaced in its viewport slot, keeping top layer order; a fresh
+        // insert of a detached member appends out of order, so it needs a zone rebuild.
+        if (!layout_node || !layout_node->parent())
+            document().set_top_layer_needs_layout_zone_rebuild();
+        set_needs_layout_tree_update(true, reason);
+        return;
+    }
+    if (auto parent = parent_element())
         parent->set_needs_layout_tree_update(true, reason);
     else
         set_needs_layout_tree_update(true, reason);
@@ -592455,6 +592533,9 @@ static bool is_structural_boundary_self_rebuild_reason(SetNeedsLayoutTreeUpdateR
     case SetNeedsLayoutTreeUpdateReason::CharacterDataReplaceData:
     case SetNeedsLayoutTreeUpdateReason::ElementSetInnerHTML:
     case SetNeedsLayoutTreeUpdateReason::ShadowRootSetInnerHTML:
+    // The box of an element that entered the top layer leaves the parent's subtree,
+    // which is a child-list change.
+    case SetNeedsLayoutTreeUpdateReason::TopLayerMembershipChange:
         return true;
     default:
         return false;
@@ -592594,6 +592675,14 @@ void Node::removed_from(IsSubtreeRoot, Node*, Node&)
     m_in_editable_subtree = false;
     m_inside_blocking_wheel_event_handler = false;
     clear_layout_node_paintable();
+    // A top layer element's box is a viewport child rather than part of the parent's box
+    // subtree, so the parent rebuild triggered by this removal can never detach it.
+    if (m_layout_node) {
+        if (auto* top_layer_placement = m_layout_node->topmost_layout_node_of_top_layer_placement()) {
+            top_layer_placement->prepare_subtree_for_detach_from_layout_tree();
+            top_layer_placement->remove();
+        }
+    }
     m_layout_node = nullptr;
     m_paintable = nullptr;
 
@@ -594429,7 +594518,8 @@ enum class SetNeedsLayoutReason {
     X(NodeSetTextContent)                                 \
     X(None)                                               \
     X(ShadowRootSetInnerHTML)                             \
-    X(StyleChange)
+    X(StyleChange)                                        \
+    X(TopLayerMembershipChange)
 
 enum class SetNeedsLayoutTreeUpdateReason {
 #define ENUMERATE_SET_NEEDS_LAYOUT_TREE_UPDATE_REASON(e) e,
@@ -659484,7 +659574,10 @@ WebIDL::ExceptionOr<void> HTMLDialogElement::show_a_modal_dialog(HTMLDialogEleme
 
     // 15. If subject's node document's top layer does not already contain subject, then add an element to the top
     //     layer given subject.
-    if (!subject.document().top_layer_elements().contains(subject))
+    // AD-HOC: A dialog closed and re-shown before removals were processed is contained only as
+    //         a pending removal; adding again cancels that pending removal.
+    if (!subject.document().top_layer_elements().contains(subject)
+        || subject.document().top_layer_pending_removals_contains(subject))
         subject.document().add_an_element_to_the_top_layer(subject);
 
     // FIXME: 16. Set subject's previously focused element to the focused element.
@@ -660282,196 +660375,3 @@ FILE: Libraries/LibWeb/HTML/HTMLDListElement.h
 #include <LibWeb/HTML/HTMLElement.h>
 
 namespace Web::HTML {
-
-class HTMLDListElement final : public HTMLElement {
-    WEB_PLATFORM_OBJECT(HTMLDListElement, HTMLElement);
-    GC_DECLARE_ALLOCATOR(HTMLDListElement);
-
-public:
-    virtual ~HTMLDListElement() override;
-
-private:
-    HTMLDListElement(DOM::Document&, DOM::QualifiedName);
-
-    virtual void initialize(JS::Realm&) override;
-};
-
-}
-
-FILE: Libraries/LibWeb/HTML/HTMLDListElement.idl
-// https://html.spec.whatwg.org/multipage/semantics.html#htmldlistelement
-[Exposed=Window]
-interface HTMLDListElement : HTMLElement {
-
-    [HTMLConstructor] constructor();
-
-    [CEReactions, Reflect] attribute boolean compact;
-
-};
-
-FILE: Libraries/LibWeb/HTML/HTMLDocument.cpp
-/*
- * Copyright (c) 2023, Andreas Kling <andreas@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibWeb/Bindings/HTMLDocument.h>
-#include <LibWeb/HTML/HTMLDocument.h>
-
-namespace Web::HTML {
-
-GC_DEFINE_ALLOCATOR(HTMLDocument);
-
-HTMLDocument::HTMLDocument(JS::Realm& realm, URL::URL const& url)
-    : Document(realm, url)
-{
-}
-
-HTMLDocument::~HTMLDocument() = default;
-
-WebIDL::ExceptionOr<GC::Ref<HTMLDocument>> HTMLDocument::construct_impl(JS::Realm& realm)
-{
-    return HTMLDocument::create(realm);
-}
-
-GC::Ref<HTMLDocument> HTMLDocument::create(JS::Realm& realm, URL::URL const& url)
-{
-    return realm.create<HTMLDocument>(realm, url);
-}
-
-void HTMLDocument::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLDocument);
-    Base::initialize(realm);
-}
-
-}
-
-FILE: Libraries/LibWeb/HTML/HTMLDocument.h
-/*
- * Copyright (c) 2023, Andreas Kling <andreas@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <LibWeb/DOM/Document.h>
-
-namespace Web::HTML {
-
-// NOTE: This class is not currently in the specifications but it *is* implemented by all major browsers.
-//       There is discussion about bringing it back:
-//       https://github.com/whatwg/html/issues/4792
-//       https://github.com/whatwg/dom/issues/221
-class HTMLDocument final : public DOM::Document {
-    WEB_PLATFORM_OBJECT(HTMLDocument, DOM::Document);
-    GC_DECLARE_ALLOCATOR(HTMLDocument);
-
-public:
-    virtual ~HTMLDocument() override;
-
-    [[nodiscard]] static GC::Ref<HTMLDocument> create(JS::Realm&, URL::URL const& url = URL::about_blank());
-    WebIDL::ExceptionOr<GC::Ref<HTMLDocument>> construct_impl(JS::Realm&);
-
-private:
-    virtual void initialize(JS::Realm&) override;
-
-    HTMLDocument(JS::Realm&, URL::URL const&);
-};
-
-}
-
-FILE: Libraries/LibWeb/HTML/HTMLDocument.idl
-// https://html.spec.whatwg.org/multipage/nav-history-apis.html#htmldocument
-[Exposed=Window]
-interface HTMLDocument : Document {
-};
-
-
-FILE: Libraries/LibWeb/HTML/HTMLElement.cpp
-/*
- * Copyright (c) 2018-2024, Andreas Kling <andreas@ladybird.org>
- * Copyright (c) 2025, Jelle Raaijmakers <jelle@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <AK/Utf16StringBuilder.h>
-#include <LibJS/Runtime/NativeFunction.h>
-#include <LibWeb/ARIA/Roles.h>
-#include <LibWeb/Bindings/ExceptionOrUtils.h>
-#include <LibWeb/Bindings/HTMLElement.h>
-#include <LibWeb/Bindings/PointerEvent.h>
-#include <LibWeb/CSS/ComputedProperties.h>
-#include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
-#include <LibWeb/DOM/Document.h>
-#include <LibWeb/DOM/EditingHostManager.h>
-#include <LibWeb/DOM/ElementFactory.h>
-#include <LibWeb/DOM/IDLEventListener.h>
-#include <LibWeb/DOM/LiveNodeList.h>
-#include <LibWeb/DOM/Position.h>
-#include <LibWeb/DOM/Range.h>
-#include <LibWeb/DOM/ShadowRoot.h>
-#include <LibWeb/HTML/BrowsingContext.h>
-#include <LibWeb/HTML/CloseWatcher.h>
-#include <LibWeb/HTML/CustomElements/CustomElementDefinition.h>
-#include <LibWeb/HTML/CustomElements/CustomElementRegistry.h>
-#include <LibWeb/HTML/ElementInternals.h>
-#include <LibWeb/HTML/EventHandler.h>
-#include <LibWeb/HTML/HTMLAnchorElement.h>
-#include <LibWeb/HTML/HTMLBRElement.h>
-#include <LibWeb/HTML/HTMLBaseElement.h>
-#include <LibWeb/HTML/HTMLBodyElement.h>
-#include <LibWeb/HTML/HTMLDialogElement.h>
-#include <LibWeb/HTML/HTMLElement.h>
-#include <LibWeb/HTML/HTMLImageElement.h>
-#include <LibWeb/HTML/HTMLInputElement.h>
-#include <LibWeb/HTML/HTMLLabelElement.h>
-#include <LibWeb/HTML/HTMLObjectElement.h>
-#include <LibWeb/HTML/HTMLParagraphElement.h>
-#include <LibWeb/HTML/Numbers.h>
-#include <LibWeb/HTML/PopoverTargetAttributes.h>
-#include <LibWeb/HTML/ToggleEvent.h>
-#include <LibWeb/HTML/Window.h>
-#include <LibWeb/Infra/CharacterTypes.h>
-#include <LibWeb/Infra/Strings.h>
-#include <LibWeb/Layout/Box.h>
-#include <LibWeb/Layout/TextNode.h>
-#include <LibWeb/Layout/TextOffsetMapping.h>
-#include <LibWeb/Namespace.h>
-#include <LibWeb/Painting/Paintable.h>
-#include <LibWeb/Selection/Selection.h>
-#include <LibWeb/UIEvents/EventNames.h>
-#include <LibWeb/UIEvents/PointerEvent.h>
-#include <LibWeb/WebIDL/DOMException.h>
-#include <LibWeb/WebIDL/ExceptionOr.h>
-
-namespace Web::HTML {
-
-GC_DEFINE_ALLOCATOR(HTMLElement);
-
-static Optional<Utf16View> optional_utf16_view(Optional<Utf16String> const& string)
-{
-    if (!string.has_value())
-        return {};
-    return string->utf16_view();
-}
-
-HTMLElement::HTMLElement(DOM::Document& document, DOM::QualifiedName qualified_name)
-    : Element(document, move(qualified_name))
-{
-}
-
-HTMLElement::~HTMLElement() = default;
-
-void HTMLElement::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(HTMLElement);
-    Base::initialize(realm);
-}
-
-void HTMLElement::visit_edges(Cell::Visitor& visitor)
-{
-    Base::visit_edges(visitor);
