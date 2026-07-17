@@ -140221,8 +140221,8 @@ void ResourceLoader::handle_file_load_request(LoadRequest& request, FileHandler 
         on_load_counter_change();
 }
 
-template<typename Callback>
-void ResourceLoader::handle_about_load_request(LoadRequest const& request, Callback callback)
+template<typename ResourceHandler, typename ErrorHandler>
+void ResourceLoader::handle_about_load_request(LoadRequest const& request, ResourceHandler on_resource, ErrorHandler on_error)
 {
     auto const& url = request.url().value();
 
@@ -140244,16 +140244,15 @@ void ResourceLoader::handle_about_load_request(LoadRequest const& request, Callb
         if (!resource.is_error()) {
             auto const& buffer = resource.value()->data();
             ReadonlyBytes data(buffer.data(), buffer.size());
-            callback(data, timing_info, response_headers);
+            on_resource(data, timing_info, response_headers);
             return;
         }
     }
 
     Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(
         m_heap,
-        [callback, timing_info, response_headers = move(response_headers)]() mutable {
-            auto buffer = ByteString::empty().to_byte_buffer();
-            callback(buffer.bytes(), timing_info, response_headers);
+        [on_error, error_message = ByteString::formatted("No such about page: {}", serialized_path)]() {
+            on_error(error_message);
         }));
 }
 
@@ -140315,11 +140314,16 @@ RefPtr<Requests::Request> ResourceLoader::load(LoadRequest& request, GC::Root<On
     if (url.scheme() == "about"sv) {
         handle_about_load_request(
             request,
-            [on_headers_received = move(on_headers_received), on_data_received = move(on_data_received), on_complete = move(on_complete), request](ReadonlyBytes data, Requests::RequestTimingInfo const& timing_info, HTTP::HeaderList const& response_headers) {
+            [on_headers_received = move(on_headers_received), on_data_received = move(on_data_received), on_complete, request](ReadonlyBytes data, Requests::RequestTimingInfo const& timing_info, HTTP::HeaderList const& response_headers) {
                 log_success(request);
                 on_headers_received->function()(nullptr, response_headers, {}, {}, {}, {}, Requests::CameFromCache::No);
                 on_data_received->function()(Requests::ResponseData::from_bytes(data));
                 on_complete->function()(true, timing_info, {});
+            },
+            [on_complete, request](ByteString const& message) {
+                log_failure(request, message);
+                Requests::RequestTimingInfo fixme_implement_timing_info {};
+                on_complete->function()(false, fixme_implement_timing_info, StringView(message));
             });
         return nullptr;
     }
@@ -140581,8 +140585,8 @@ private:
     };
     template<typename FileHandler, typename ErrorHandler>
     void handle_file_load_request(LoadRequest& request, FileHandler on_file, ErrorHandler on_error);
-    template<typename Callback>
-    void handle_about_load_request(LoadRequest const& request, Callback callback);
+    template<typename ResourceHandler, typename ErrorHandler>
+    void handle_about_load_request(LoadRequest const& request, ResourceHandler on_resource, ErrorHandler on_error);
     template<typename ResourceHandler, typename ErrorHandler>
     void handle_resource_load_request(LoadRequest const& request, ResourceHandler on_resource, ErrorHandler on_error);
 
@@ -195928,8 +195932,8 @@ Vector<Utf16String> SessionStorageBottle::keys() const
 
 Optional<Utf16String> SessionStorageBottle::get(Utf16View key) const
 {
-    if (auto value = m_map.get(key); value.has_value())
-        return value.value();
+    if (auto entry = m_map.get(key); entry.has_value())
+        return entry->value;
     return OptionalNone {};
 }
 
@@ -195937,20 +195941,19 @@ StorageSetResult SessionStorageBottle::set(Utf16View key, Utf16View value)
 {
     auto old_value = get(key);
 
+    auto new_size = storage_quota_size(key) + storage_quota_size(value);
+
     if (m_quota.has_value()) {
         size_t current_size = 0;
-        for (auto const& [existing_key, existing_value] : m_map) {
-            if (existing_key.utf16_view() != key) {
-                current_size += storage_quota_size(existing_key.utf16_view());
-                current_size += storage_quota_size(existing_value.utf16_view());
-            }
+        for (auto const& [existing_key, existing_entry] : m_map) {
+            if (existing_key.utf16_view() != key)
+                current_size += existing_entry.quota_size;
         }
-        size_t new_size = storage_quota_size(key) + storage_quota_size(value);
         if (current_size + new_size > m_quota.value())
             return WebView::StorageOperationError::QuotaExceededError;
     }
 
-    m_map.set(Utf16String::from_utf16(key), Utf16String::from_utf16(value));
+    m_map.set(Utf16String::from_utf16(key), { Utf16String::from_utf16(value), new_size });
     return old_value;
 }
 
@@ -196085,8 +196088,14 @@ private:
     {
     }
 
+    struct Entry {
+        Utf16String value;
+        // Bytes this entry contributes toward the bottle's quota: Its key plus its value.
+        size_t quota_size { 0 };
+    };
+
     // A storage bottle has a map, which is initially an empty map
-    OrderedHashMap<Utf16String, Utf16String> m_map;
+    OrderedHashMap<Utf16String, Entry> m_map;
 };
 
 using BottleMap = Array<GC::Ptr<StorageBottle>, to_underlying(StorageEndpointType::Count)>;
@@ -279196,10 +279205,12 @@ FILE: Libraries/LibWebView/Autocomplete.cpp
 #include <LibWebView/HistoryDebug.h>
 #include <LibWebView/HistoryStore.h>
 #include <LibWebView/URL.h>
+#include <LibWebView/WebUI.h>
 
 namespace WebView {
 
 static constexpr auto file_url_prefix = "file://"sv;
+static constexpr auto about_url_prefix = "about:"sv;
 
 static constexpr auto builtin_autocomplete_engines = to_array<AutocompleteEngine>({
     { "DuckDuckGo"sv, "https://duckduckgo.com/ac/?q={}"sv },
@@ -279319,6 +279330,37 @@ Vector<String> filter_remote_autocomplete_suggestions(StringView input, Vector<S
     suggestions.remove_all_matching([input](auto const& suggestion) {
         return !suggestion.bytes_as_string_view().starts_with(input, CaseSensitivity::CaseInsensitive);
     });
+    return suggestions;
+}
+
+Vector<AutocompleteSuggestion> web_ui_autocomplete_suggestions(StringView input)
+{
+    if (!input.starts_with(about_url_prefix, CaseSensitivity::CaseInsensitive))
+        return {};
+
+    Vector<AutocompleteSuggestion> suggestions;
+    suggestions.ensure_capacity(WebUI::pages().size());
+
+    for (auto const& page : WebUI::pages()) {
+        auto url = MUST(String::formatted("about:{}", page.host));
+        if (!url.bytes_as_string_view().starts_with(input, CaseSensitivity::CaseInsensitive))
+            continue;
+
+        suggestions.unchecked_append({
+            .source = AutocompleteSuggestionSource::WebUI,
+            .text = move(url),
+            .title = MUST(String::from_utf8(page.title)),
+            .subtitle = {},
+            .favicon_base64_png = {},
+            .highlight_input = {},
+            .match_class = AutocompleteMatchClass::URLPrefix,
+            .relevance = 1100,
+            .is_verbatim = false,
+            .can_be_automatically_selected = true,
+            .can_be_inline_completed = true,
+        });
+    }
+
     return suggestions;
 }
 
@@ -279447,6 +279489,13 @@ void Autocomplete::query_autocomplete_engine(AutocompleteQueryID query_id, Strin
         return;
     }
 
+    if (m_trimmed_query.bytes_as_string_view().starts_with(about_url_prefix, CaseSensitivity::CaseInsensitive)) {
+        m_remote_suggestions.clear();
+        m_remote_query_complete = true;
+        dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Skipping remote autocomplete for about URL query '{}'", m_trimmed_query);
+        return;
+    }
+
     auto engine = Application::settings().autocomplete_engine();
     if (!engine.has_value()) {
         m_remote_suggestions.clear();
@@ -279534,13 +279583,15 @@ void Autocomplete::deliver_current_result()
     if (!m_query_id.has_value())
         return;
 
-    auto verbatim_suggestion = literal_url_suggestion(m_query);
-    if (!verbatim_suggestion.has_value())
+    auto web_ui_suggestions = web_ui_autocomplete_suggestions(m_trimmed_query);
+    auto verbatim_suggestion = web_ui_suggestions.is_empty() ? literal_url_suggestion(m_query) : Optional<AutocompleteSuggestion> {};
+    if (web_ui_suggestions.is_empty() && !verbatim_suggestion.has_value())
         verbatim_suggestion = search_for_query_suggestion(m_query);
+    web_ui_suggestions.extend(m_local_suggestions);
     auto merged_suggestions = mux_autocomplete_suggestions(
         m_trimmed_query,
         move(verbatim_suggestion),
-        m_local_suggestions,
+        move(web_ui_suggestions),
         make_remote_suggestions(m_remote_suggestions),
         m_max_suggestions);
     for (auto& suggestion : merged_suggestions)
@@ -279716,6 +279767,7 @@ static constexpr auto default_autocomplete_suggestion_limit = 8uz;
 
 enum class AutocompleteSuggestionSource {
     LiteralURL,
+    WebUI,
     History,
     Bookmark,
     Adaptive,
@@ -279769,6 +279821,7 @@ WEBVIEW_API Optional<AutocompleteEngine const&> find_autocomplete_engine_by_name
 WEBVIEW_API String autocomplete_suggestion_display_text(AutocompleteSuggestion const&);
 WEBVIEW_API Vector<AutocompleteMatchRange> autocomplete_match_ranges(StringView input, StringView text);
 WEBVIEW_API Vector<String> filter_remote_autocomplete_suggestions(StringView input, Vector<String> suggestions);
+WEBVIEW_API Vector<AutocompleteSuggestion> web_ui_autocomplete_suggestions(StringView input);
 WEBVIEW_API bool autocomplete_urls_match(StringView left, StringView right);
 WEBVIEW_API bool autocomplete_url_can_complete(StringView query, StringView suggestion);
 
@@ -295874,17 +295927,15 @@ StorageSetResult StorageJar::TransientStorage::set_item(StorageLocation const& k
     u64 current_size = 0;
 
     for (auto const& [existing_key, existing_entry] : m_storage_items) {
-        if (existing_key.storage_endpoint == key.storage_endpoint && existing_key.storage_key == key.storage_key && existing_key.bottle_key != key.bottle_key) {
-            current_size += storage_quota_size(existing_key.bottle_key);
-            current_size += storage_quota_size(existing_entry.value);
-        }
+        if (existing_key.storage_endpoint == key.storage_endpoint && existing_key.storage_key == key.storage_key && existing_key.bottle_key != key.bottle_key)
+            current_size += existing_entry.quota_size;
     }
 
     auto new_size = storage_quota_size(key.bottle_key) + storage_quota_size(value);
     if (current_size + new_size > LOCAL_STORAGE_QUOTA)
         return StorageOperationError::QuotaExceededError;
 
-    m_storage_items.set(key, { value, UnixDateTime::now() });
+    m_storage_items.set(key, { value, UnixDateTime::now(), new_size });
     return old_value;
 }
 
@@ -295929,7 +295980,7 @@ Requests::CacheSizes StorageJar::TransientStorage::estimate_storage_size_accesse
     Requests::CacheSizes sizes;
 
     for (auto const& [key, entry] : m_storage_items) {
-        auto size = key.storage_key.byte_count() + storage_quota_size(key.bottle_key) + storage_quota_size(entry.value);
+        auto size = key.storage_key.byte_count() + entry.quota_size;
         sizes.total += size;
 
         if (entry.last_access_time >= since)
@@ -296072,10 +296123,8 @@ u64 StorageJar::TransientStorage::usage(String const& storage_key)
 {
     u64 current_size_in_bytes = 0;
     for (auto const& [key, entry] : m_storage_items) {
-        if (key.storage_key == storage_key) {
-            current_size_in_bytes += storage_quota_size(key.bottle_key);
-            current_size_in_bytes += storage_quota_size(entry.value);
-        }
+        if (key.storage_key == storage_key)
+            current_size_in_bytes += entry.quota_size;
     }
     return current_size_in_bytes;
 }
@@ -296164,6 +296213,8 @@ private:
         struct Entry {
             Utf16String value;
             UnixDateTime last_access_time;
+            // Bytes this entry contributes toward its storage key's quota: Its bottle key plus its value.
+            u64 quota_size { 0 };
         };
 
         HashMap<StorageLocation, Entry> m_storage_items;
@@ -302609,6 +302660,31 @@ FILE: Libraries/LibWebView/WebUI.cpp
 
 namespace WebView {
 
+static constexpr auto s_pages = to_array<WebUI::Page>({
+    { "about"sv, "About URLs"sv, WebUI::PageType::Static },
+    { "bookmarks"sv, "Bookmarks"sv, WebUI::PageType::Dynamic },
+    { "downloads"sv, "Downloads"sv, WebUI::PageType::Dynamic },
+    { "history"sv, "History"sv, WebUI::PageType::Dynamic },
+    { "newtab"sv, "New Tab"sv, WebUI::PageType::Static },
+    { "processes"sv, "Task Manager"sv, WebUI::PageType::Dynamic },
+    { "settings"sv, "Settings"sv, WebUI::PageType::Dynamic },
+    { "version"sv, "Version"sv, WebUI::PageType::Dynamic },
+});
+
+ReadonlySpan<WebUI::Page> WebUI::pages()
+{
+    return s_pages;
+}
+
+Optional<WebUI::Page const&> WebUI::page_for_host(StringView host)
+{
+    for (auto const& page : s_pages) {
+        if (page.host == host)
+            return page;
+    }
+    return {};
+}
+
 template<typename WebUIType>
 static ErrorOr<NonnullRefPtr<WebUIType>> create_web_ui(WebContentClient& client, u64 page_id, String host)
 {
@@ -302625,23 +302701,27 @@ static ErrorOr<NonnullRefPtr<WebUIType>> create_web_ui(WebContentClient& client,
 
 ErrorOr<RefPtr<WebUI>> WebUI::create(WebContentClient& client, u64 page_id, String host)
 {
+    auto page = page_for_host(host);
+    if (!page.has_value() || page->type == PageType::Static)
+        return nullptr;
+
     RefPtr<WebUI> web_ui;
 
-    if (host == "bookmarks"sv)
+    if (page->host == "bookmarks"sv)
         web_ui = TRY(create_web_ui<BookmarksUI>(client, page_id, move(host)));
-    else if (host == "downloads"sv)
+    else if (page->host == "downloads"sv)
         web_ui = TRY(create_web_ui<DownloadsUI>(client, page_id, move(host)));
-    else if (host == "history"sv)
+    else if (page->host == "history"sv)
         web_ui = TRY(create_web_ui<HistoryUI>(client, page_id, move(host)));
-    else if (host == "processes"sv)
+    else if (page->host == "processes"sv)
         web_ui = TRY(create_web_ui<ProcessesUI>(client, page_id, move(host)));
-    else if (host == "settings"sv)
+    else if (page->host == "settings"sv)
         web_ui = TRY(create_web_ui<SettingsUI>(client, page_id, move(host)));
-    else if (host == "version"sv)
+    else if (page->host == "version"sv)
         web_ui = TRY(create_web_ui<VersionUI>(client, page_id, move(host)));
 
-    if (web_ui)
-        web_ui->register_interfaces();
+    VERIFY(web_ui);
+    web_ui->register_interfaces();
 
     return web_ui;
 }
@@ -302692,8 +302772,11 @@ FILE: Libraries/LibWebView/WebUI.h
 #include <AK/HashMap.h>
 #include <AK/JsonValue.h>
 #include <AK/NonnullRefPtr.h>
+#include <AK/Optional.h>
 #include <AK/RefPtr.h>
+#include <AK/Span.h>
 #include <AK/String.h>
+#include <AK/StringView.h>
 #include <AK/Types.h>
 #include <LibIPC/ConnectionToServer.h>
 #include <LibIPC/Transport.h>
@@ -302707,6 +302790,19 @@ class WEBVIEW_API WebUI
     : public IPC::ConnectionToServer<WebUIClientEndpoint, WebUIServerEndpoint>
     , public WebUIClientEndpoint {
 public:
+    enum class PageType {
+        Static,
+        Dynamic,
+    };
+
+    struct Page {
+        StringView host;
+        StringView title;
+        PageType type;
+    };
+
+    static ReadonlySpan<Page> pages();
+    static Optional<Page const&> page_for_host(StringView);
     static ErrorOr<RefPtr<WebUI>> create(WebContentClient&, u64 page_id, String host);
     virtual ~WebUI();
 
@@ -634078,132 +634174,3 @@ body { margin: 0; }
 
 FILE: Tests/LibWeb/Ref/input/background-clip-text-inside-scrollable.html
 <!DOCTYPE html>
-<link rel="match" href="../expected/background-clip-text-inside-scrollable-ref.html" />
-<style>
-    * {
-        scrollbar-width: none;
-    }
-
-    #text {
-        background: linear-gradient(#6d98cc, #8a64e5);
-        background-clip: text;
-        color: transparent;
-        font-size: 50px;
-    }
-
-    #scrollable {
-        width: 300px;
-        height: 300px;
-        border: 1px solid black;
-        overflow: scroll;
-    }
-</style>
-<div id="scrollable">
-    <div style="height: 200px"></div>
-    Clip<span id="text">Text</span>
-    <div style="height: 600px"></div>
-</div>
-<script>
-    const scrollContainer = document.getElementById("scrollable");
-    scrollContainer.scrollTop = 200;
-</script>
-
-FILE: Tests/LibWeb/Ref/input/background-clip-text.html
-<!doctype html>
-<link rel="match" href="../expected/background-clip-text-ref.html" />
-<style>
-* { outline: 1px solid black; font-size: 100px; }
-.overflow-hidden {
-    overflow: hidden;
-}
-.background-clip-text {
-    background-clip: text;
-}
-</style><body><div>hello</div><div class="overflow-hidden"><div class="background-clip-text">x
-
-FILE: Tests/LibWeb/Ref/input/background-size-auto-svg-no-intrinsic-size.html
-<!DOCTYPE html>
-<link rel="match" href="../expected/background-size-auto-svg-no-intrinsic-size-ref.html">
-<style>
-div {
-    width: 100px;
-    height: 50px;
-    background: url(../data/50x50-green.svg) no-repeat;
-}
-</style>
-<div></div>
-
-FILE: Tests/LibWeb/Ref/input/background-size-calc.html
-<!DOCTYPE html>
-<html>
-<head>
-    <link rel="match" href="../expected/background-size-calc-ref.html" />
-    <style>
-        span {
-            display: inline-block;
-            min-width: 12px;
-            min-height: 12px;
-            background-image: url("../data/2x2checkerboard.png");
-            background-size: calc(max(0.75em, 12px));
-        }
-    </style>
-</head>
-<body><span></span>
-
-FILE: Tests/LibWeb/Ref/input/background-size-near-zero-svg.html
-<!DOCTYPE html>
-<link rel="match" href="../expected/background-size-near-zero-svg-ref.html">
-<div style="background-image: url(../data/50x50-green.svg);
-            width: 100px; height: 100px; background-size: 0.2px 0.2px">
-</div>
-
-FILE: Tests/LibWeb/Ref/input/bitmaps-with-scroll-offset.html
-<!DOCTYPE html>
-<link rel="match" href="../expected/bitmaps-with-scroll-offset-ref.html" />
-<style>
-html { scrollbar-width: none; }
-body {
-  position: relative;
-  height: 400vh;
-}
-#container {
-  position: absolute;
-  top: 200px;
-}
-#background-image {
-  display: inline-block;
-  width: 120px;
-  height: 120px;
-  background-image: url("../../Assets/120.png");
-  background-repeat: no-repeat;
-}
-</style>
-<div id="container">
-  <img src="../../Assets/120.png" />
-  <div id="background-image"></div>
-</div>
-<script>
-window.scrollTo(0, 200);
-</script>
-
-FILE: Tests/LibWeb/Ref/input/block-element-inside-inline-element.html
-<!DOCTYPE html>
-<html>
-<head>
-    <link rel="match" href="../expected/block-element-inside-inline-element-ref.html" />
-</head>
-<body>
-    <!-- Block at end of inline element -->
-    <b>foo<div>bar</div></b>
-    <!-- Block at beginning of inline element -->
-    <hr>
-    <b><div>foo</div>bar</b>
-    <!-- Block in middle of inline element -->
-    <hr>
-    <b>foo<div>bar</div>baz</b>
-    <!-- Block in middle of two inline elements -->
-    <hr>
-    <b>foo<i>bar<div>baz</div>lorem</i>ipsum</b>
-    <!-- Multiple subsequent blocks -->
-    <hr>
-    <b>foo<div>bar</div><div>baz</div>lorem</b>
