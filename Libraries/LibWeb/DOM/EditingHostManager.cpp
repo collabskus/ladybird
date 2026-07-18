@@ -11,6 +11,7 @@
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/Editing/CommandNames.h>
 #include <LibWeb/Selection/Selection.h>
+#include <LibWeb/Selection/SelectionModifier.h>
 #include <LibWeb/UIEvents/InputTypes.h>
 
 namespace Web::DOM {
@@ -49,14 +50,10 @@ void EditingHostManager::handle_insert(Utf16FlyString const&, Utf16View value)
 
 void EditingHostManager::select_all()
 {
-    if (!m_active_contenteditable_element) {
+    if (!m_active_contenteditable_element)
         return;
-    }
     auto selection = m_document->get_selection();
-    if (!selection->anchor_node() || !selection->focus_node()) {
-        return;
-    }
-    MUST(selection->set_base_and_extent(*selection->anchor_node(), 0, *selection->focus_node(), selection->focus_node()->length()));
+    Selection::SelectionModifier(*selection).select_all();
 }
 
 void EditingHostManager::set_selection_anchor(GC::Ref<DOM::Node> anchor_node, size_t anchor_offset, TextAffinity affinity)
@@ -103,15 +100,7 @@ void EditingHostManager::move_cursor_to_start(CollapseSelection collapse)
     auto selection = get_selection_for_navigation(collapse);
     if (!selection)
         return;
-    auto node = selection->focus_node();
-
-    if (collapse == CollapseSelection::Yes) {
-        MUST(selection->collapse(node, 0));
-        m_document->reset_cursor_blink_cycle();
-    } else {
-        MUST(selection->set_base_and_extent(*selection->anchor_node(), selection->anchor_offset(), *node, 0));
-    }
-    selection->scroll_focus_into_view();
+    Selection::SelectionModifier(*selection).modify(collapse == CollapseSelection::Yes ? Selection::SelectionAlteration::Move : Selection::SelectionAlteration::Extend, Selection::SelectionDirection::Backward, Selection::SelectionGranularity::LineBoundary);
 }
 
 void EditingHostManager::move_cursor_to_end(CollapseSelection collapse)
@@ -119,15 +108,39 @@ void EditingHostManager::move_cursor_to_end(CollapseSelection collapse)
     auto selection = get_selection_for_navigation(collapse);
     if (!selection)
         return;
-    auto node = selection->focus_node();
+    Selection::SelectionModifier(*selection).modify(collapse == CollapseSelection::Yes ? Selection::SelectionAlteration::Move : Selection::SelectionAlteration::Extend, Selection::SelectionDirection::Forward, Selection::SelectionGranularity::LineBoundary);
+}
 
-    if (collapse == CollapseSelection::Yes) {
-        m_document->reset_cursor_blink_cycle();
-        MUST(selection->collapse(node, node->length()));
-    } else {
-        MUST(selection->set_base_and_extent(*selection->anchor_node(), selection->anchor_offset(), *node, node->length()));
-    }
-    selection->scroll_focus_into_view();
+void EditingHostManager::move_cursor_to_start_of_document(CollapseSelection collapse)
+{
+    auto selection = get_selection_for_navigation(collapse);
+    if (!selection)
+        return;
+    Selection::SelectionModifier(*selection).modify(collapse == CollapseSelection::Yes ? Selection::SelectionAlteration::Move : Selection::SelectionAlteration::Extend, Selection::SelectionDirection::Backward, Selection::SelectionGranularity::DocumentBoundary);
+}
+
+void EditingHostManager::move_cursor_to_end_of_document(CollapseSelection collapse)
+{
+    auto selection = get_selection_for_navigation(collapse);
+    if (!selection)
+        return;
+    Selection::SelectionModifier(*selection).modify(collapse == CollapseSelection::Yes ? Selection::SelectionAlteration::Move : Selection::SelectionAlteration::Extend, Selection::SelectionDirection::Forward, Selection::SelectionGranularity::DocumentBoundary);
+}
+
+void EditingHostManager::move_cursor_to_previous_page(CollapseSelection collapse)
+{
+    auto selection = get_selection_for_navigation(collapse);
+    if (!selection)
+        return;
+    Selection::SelectionModifier(*selection).modify(collapse == CollapseSelection::Yes ? Selection::SelectionAlteration::Move : Selection::SelectionAlteration::Extend, Selection::SelectionDirection::Backward, Selection::SelectionGranularity::Page);
+}
+
+void EditingHostManager::move_cursor_to_next_page(CollapseSelection collapse)
+{
+    auto selection = get_selection_for_navigation(collapse);
+    if (!selection)
+        return;
+    Selection::SelectionModifier(*selection).modify(collapse == CollapseSelection::Yes ? Selection::SelectionAlteration::Move : Selection::SelectionAlteration::Extend, Selection::SelectionDirection::Forward, Selection::SelectionGranularity::Page);
 }
 
 void EditingHostManager::increment_cursor_position_offset(CollapseSelection collapse)
