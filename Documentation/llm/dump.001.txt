@@ -144713,6 +144713,7 @@ FILE: Libraries/LibJS/AsmIntGen/src/allocator.rs
 use crate::instructions::{InstructionInfo, OperandKind, lookup};
 use crate::parser::{AsmInstruction, Handler, Operand, Program};
 use crate::registers::{Arch, mapping_for, register_cost, resolve_register};
+use crate::shared::get_immediate_value;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Registers x86-64 calls clobber (caller-saved). System V AMD64.
@@ -144782,7 +144783,9 @@ pub fn flatten_and_allocate(
     arch: Arch,
     macro_counter: &mut u32,
 ) -> Result<Vec<AsmInstruction>, AllocationError> {
-    let flat = flatten(handler, program, macro_counter);
+    let mut flat = flatten(handler, program, macro_counter);
+    fold_single_use_load_branches(&mut flat);
+    fold_byte_load_branches(&mut flat, program);
     let needs = flat
         .iter()
         .any(|i| i.mnemonic == "temp" || i.mnemonic == "ftemp");
@@ -144791,6 +144794,276 @@ pub fn flatten_and_allocate(
     }
     let assignments = allocate(handler, &flat, program, arch)?;
     Ok(rewrite(flat, &assignments))
+}
+
+/// Fold a load used only by an adjacent equality branch into a branch that
+/// reads the memory operand directly.
+fn fold_single_use_load_branches(instructions: &mut Vec<AsmInstruction>) {
+    let register_uses = count_register_uses(instructions);
+    let mut index = 0;
+    while index + 1 < instructions.len() {
+        if !matches!(instructions[index].mnemonic.as_str(), "load32" | "load64")
+            || !matches!(instructions[index + 1].mnemonic.as_str(), "branch_eq" | "branch_ne")
+        {
+            index += 1;
+            continue;
+        }
+
+        let Some(Operand::Register(load_register)) = instructions[index].operands.first() else {
+            index += 1;
+            continue;
+        };
+        let branch_register_index = instructions[index + 1]
+            .operands
+            .iter()
+            .take(2)
+            .position(|operand| matches!(operand, Operand::Register(branch_register) if branch_register == load_register));
+        let Some(branch_register_index) = branch_register_index else {
+            index += 1;
+            continue;
+        };
+        if register_uses.get(load_register).copied() != Some(2) {
+            index += 1;
+            continue;
+        }
+        let comparison_register_index = 1 - branch_register_index;
+        let Some(Operand::Register(comparison_register)) = instructions[index + 1].operands.get(comparison_register_index) else {
+            index += 1;
+            continue;
+        };
+        if instructions[index].mnemonic == "load32"
+            && !register_contains_zero_extended_u32(instructions, index, comparison_register)
+        {
+            index += 1;
+            continue;
+        }
+        let Some(memory) = instructions[index].operands.get(1).cloned() else {
+            index += 1;
+            continue;
+        };
+        let Some(label) = instructions[index + 1].operands.get(2).cloned() else {
+            index += 1;
+            continue;
+        };
+        let width = if instructions[index].mnemonic == "load32" { "32" } else { "64" };
+        let comparison = if instructions[index + 1].mnemonic == "branch_eq" { "eq" } else { "ne" };
+        let branch_mnemonic = match (width, comparison) {
+            ("32", "eq") => "branch32_memory_eq",
+            ("32", "ne") => "branch32_memory_ne",
+            ("64", "eq") => "branch64_memory_eq",
+            ("64", "ne") => "branch64_memory_ne",
+            _ => unreachable!(),
+        };
+
+        instructions[index + 1] = AsmInstruction {
+            mnemonic: branch_mnemonic.to_string(),
+            operands: vec![memory, Operand::Register(comparison_register.clone()), label],
+        };
+        instructions.remove(index);
+    }
+}
+
+fn register_contains_zero_extended_u32(
+    instructions: &[AsmInstruction],
+    before_index: usize,
+    register: &str,
+) -> bool {
+    for instruction in instructions[..before_index].iter().rev() {
+        if instruction_may_change_control_flow(instruction) {
+            return false;
+        }
+        let Some(info) = lookup(&instruction.mnemonic) else {
+            continue;
+        };
+        for (operand_index, operand) in instruction.operands.iter().enumerate() {
+            if !matches!(operand, Operand::Register(output) if output == register) {
+                continue;
+            }
+            if !matches!(operand_kind_at(info, operand_index), OperandKind::GprOut | OperandKind::GprInOut) {
+                continue;
+            }
+            return matches!(instruction.mnemonic.as_str(), "load32" | "load_pair32");
+        }
+    }
+    false
+}
+
+/// Fold a byte load whose result is used only by the immediately following
+/// branch into a branch that reads memory directly. This exposes a single
+/// compare/test-memory operation to backends that support one while avoiding
+/// an otherwise unnecessary named temporary on other architectures.
+fn fold_byte_load_branches(instructions: &mut Vec<AsmInstruction>, program: &Program) {
+    let mut index = 0;
+    while index + 1 < instructions.len() {
+        let branch_mnemonic = match (
+            instructions[index].mnemonic.as_str(),
+            instructions[index + 1].mnemonic.as_str(),
+        ) {
+            ("load8", "branch_eq") => "branch8_eq",
+            ("load8", "branch_ne") => "branch8_ne",
+            ("load8", "branch_bits_set") => "branch8_bits_set",
+            ("load8", "branch_bits_clear") => "branch8_bits_clear",
+            ("load8", "branch_zero") => "branch8_eq",
+            ("load8", "branch_nonzero") => "branch8_ne",
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+
+        let Some(Operand::Register(load_register)) = instructions[index].operands.first() else {
+            index += 1;
+            continue;
+        };
+        if !matches!(
+            instructions[index + 1].operands.first(),
+            Some(Operand::Register(branch_register)) if branch_register == load_register
+        ) || !loaded_value_is_dead_after_branch(instructions, index, load_register)
+        {
+            index += 1;
+            continue;
+        }
+
+        let Some(memory) = instructions[index].operands.get(1).cloned() else {
+            index += 1;
+            continue;
+        };
+        let (immediate, label_index) = match instructions[index + 1].mnemonic.as_str() {
+            "branch_zero" | "branch_nonzero" => (Operand::Immediate(0), 1),
+            _ => {
+                let Some(immediate) = instructions[index + 1].operands.get(1).cloned() else {
+                    index += 1;
+                    continue;
+                };
+                (immediate, 2)
+            }
+        };
+        if !matches!(get_immediate_value(&immediate, program), Some(0..=255)) {
+            index += 1;
+            continue;
+        }
+        let Some(label) = instructions[index + 1].operands.get(label_index).cloned() else {
+            index += 1;
+            continue;
+        };
+
+        instructions[index + 1] = AsmInstruction {
+            mnemonic: branch_mnemonic.to_string(),
+            operands: vec![memory, immediate, label],
+        };
+        instructions.remove(index);
+    }
+}
+
+fn loaded_value_is_dead_after_branch(
+    instructions: &[AsmInstruction],
+    load_index: usize,
+    register: &str,
+) -> bool {
+    let tail = &instructions[load_index + 2..];
+    if !tail.iter().any(|instruction| instruction_references_register(instruction, register)) {
+        return true;
+    }
+
+    if !tail.first().is_some_and(|instruction| instruction_redefines_register_without_reading(instruction, register)) {
+        return false;
+    }
+
+    let branch_index = load_index + 1;
+    let Some(target_index) = branch_target_index(instructions, branch_index) else {
+        return false;
+    };
+    if target_index <= branch_index {
+        return false;
+    }
+    if target_index == load_index + 2 {
+        return true;
+    }
+    register_is_redefined_before_use_on_linear_path(instructions, target_index, register)
+}
+
+fn instruction_references_register(instruction: &AsmInstruction, register: &str) -> bool {
+    instruction
+        .operands
+        .iter()
+        .any(|operand| operand_references_register(operand, register))
+}
+
+fn operand_references_register(operand: &Operand, register: &str) -> bool {
+    match operand {
+        Operand::Register(name) => name == register,
+        Operand::Memory { base, index, scale } => {
+            base == register
+                || index.as_deref() == Some(register)
+                || scale.as_deref() == Some(register)
+        }
+        _ => false,
+    }
+}
+
+fn instruction_redefines_register_without_reading(
+    instruction: &AsmInstruction,
+    register: &str,
+) -> bool {
+    let Some(info) = lookup(&instruction.mnemonic) else {
+        return false;
+    };
+    instruction.operands.iter().enumerate().any(|(operand_index, operand)| {
+        matches!(operand, Operand::Register(output) if output == register)
+            && matches!(operand_kind_at(info, operand_index), OperandKind::GprOut)
+            && instruction
+                .operands
+                .iter()
+                .filter(|operand| operand_references_register(operand, register))
+                .count()
+                == 1
+    })
+}
+
+fn instruction_may_change_control_flow(instruction: &AsmInstruction) -> bool {
+    instruction.mnemonic == "label"
+        || instruction.mnemonic == "cold"
+        || lookup(&instruction.mnemonic).is_some_and(|info| info.terminal)
+        || instruction
+            .operands
+            .iter()
+            .any(|operand| matches!(operand, Operand::Label(_)))
+}
+
+fn branch_target_index(instructions: &[AsmInstruction], branch_index: usize) -> Option<usize> {
+    let label = instructions[branch_index].operands.iter().find_map(|operand| {
+        if let Operand::Label(label) = operand {
+            Some(label)
+        } else {
+            None
+        }
+    })?;
+    instructions.iter().position(|instruction| {
+        instruction.mnemonic == "label"
+            && matches!(instruction.operands.first(), Some(Operand::Label(candidate)) if candidate == label)
+    })
+}
+
+fn register_is_redefined_before_use_on_linear_path(
+    instructions: &[AsmInstruction],
+    start_index: usize,
+    register: &str,
+) -> bool {
+    for (index, instruction) in instructions.iter().enumerate().skip(start_index) {
+        if instruction_redefines_register_without_reading(instruction, register) {
+            return true;
+        }
+        if instruction_references_register(instruction, register) {
+            return false;
+        }
+        if lookup(&instruction.mnemonic).is_some_and(|info| info.terminal) {
+            return true;
+        }
+        if index != start_index && instruction_may_change_control_flow(instruction) {
+            return false;
+        }
+    }
+    true
 }
 
 // ============================================================================
@@ -145926,6 +146199,182 @@ end
     }
 
     #[test]
+    fn folds_single_use_byte_load_into_branch() {
+        let src = "
+const KIND = 3
+handler Test
+    temp kind
+    load8 kind, [values, 4]
+    branch_eq kind, KIND, .slow
+.slow:
+    exit
+end
+";
+        let out = build(src, Arch::X86_64).expect("allocation should succeed");
+
+        assert!(!out.iter().any(|insn| insn.mnemonic == "load8"));
+        assert!(out.iter().any(|insn| insn.mnemonic == "branch8_eq"));
+    }
+
+    #[test]
+    fn preserves_byte_load_when_result_is_reused() {
+        let src = "
+const KIND = 3
+handler Test
+    temp kind
+    load8 kind, [values, 4]
+    branch_eq kind, KIND, .slow
+    add kind, 1
+.slow:
+    exit
+end
+";
+        let out = build(src, Arch::X86_64).expect("allocation should succeed");
+
+        assert!(out.iter().any(|insn| insn.mnemonic == "load8"));
+        assert!(!out.iter().any(|insn| insn.mnemonic == "branch8_eq"));
+    }
+
+    #[test]
+    fn folds_byte_loads_when_temporary_is_redefined() {
+        let src = "
+handler Test
+    temp flag
+    load8 flag, [values, 4]
+    branch_zero flag, .slow
+    load8 flag, [values, 5]
+    branch_nonzero flag, .slow
+.slow:
+    exit
+end
+";
+        let out = build(src, Arch::X86_64).expect("allocation should succeed");
+
+        assert!(!out.iter().any(|insn| insn.mnemonic == "load8"));
+        assert_eq!(out.iter().filter(|insn| insn.mnemonic == "branch8_eq").count(), 1);
+        assert_eq!(out.iter().filter(|insn| insn.mnemonic == "branch8_ne").count(), 1);
+    }
+
+    #[test]
+    fn preserves_byte_load_when_branch_target_uses_value_before_redefinition() {
+        let src = "
+const KIND = 3
+handler Test
+    temp flag
+    load8 flag, [values, 4]
+    branch_eq flag, KIND, .use
+    load8 flag, [values, 5]
+.use:
+    store_operand m_dst, flag
+end
+";
+        let out = build(src, Arch::X86_64).expect("allocation should succeed");
+
+        assert_eq!(out.iter().filter(|insn| insn.mnemonic == "load8").count(), 2);
+        assert!(!out.iter().any(|insn| insn.mnemonic == "branch8_eq"));
+    }
+
+    #[test]
+    fn folds_single_use_load64_into_memory_branch() {
+        let src = "
+handler Test
+    temp object, actual, expected
+    mov object, 1
+    mov expected, 2
+    load64 actual, [object, 8]
+    branch_ne actual, expected, .slow
+.slow:
+    exit
+end
+";
+        let out = build(src, Arch::X86_64).expect("allocation should succeed");
+
+        assert!(!out.iter().any(|insn| insn.mnemonic == "load64"));
+        assert!(out.iter().any(|insn| insn.mnemonic == "branch64_memory_ne"));
+    }
+
+    #[test]
+    fn folds_single_use_load32_into_memory_branch() {
+        let src = "
+handler Test
+    temp object, actual, expected, unused
+    mov object, 1
+    load_pair32 expected, unused, [object, 0], [object, 4]
+    load32 actual, [object, 8]
+    branch_ne expected, actual, .slow
+.slow:
+    exit
+end
+";
+        let out = build(src, Arch::X86_64).expect("allocation should succeed");
+
+        assert_eq!(out.iter().filter(|insn| insn.mnemonic == "load32").count(), 0);
+        assert!(out.iter().any(|insn| insn.mnemonic == "branch32_memory_ne"));
+    }
+
+    #[test]
+    fn preserves_load32_when_comparison_definition_may_not_dominate() {
+        let src = "
+handler Test
+    temp object, actual, expected, condition
+    mov object, 1
+    mov expected, 0x100000000
+    mov condition, 1
+    branch_zero condition, .join
+    load32 expected, [object, 4]
+.join:
+    load32 actual, [object, 8]
+    branch_eq actual, expected, .slow
+.slow:
+    exit
+end
+";
+        let out = build(src, Arch::X86_64).expect("allocation should succeed");
+
+        assert!(out.iter().any(|insn| insn.mnemonic == "load32"));
+        assert!(!out.iter().any(|insn| insn.mnemonic == "branch32_memory_eq"));
+    }
+
+    #[test]
+    fn preserves_load32_when_comparison_may_exceed_u32() {
+        let src = "
+handler Test
+    temp object, actual, expected
+    mov object, 1
+    mov expected, 2
+    load32 actual, [object, 8]
+    branch_ne actual, expected, .slow
+.slow:
+    exit
+end
+";
+        let out = build(src, Arch::X86_64).expect("allocation should succeed");
+
+        assert!(out.iter().any(|insn| insn.mnemonic == "load32"));
+        assert!(!out.iter().any(|insn| insn.mnemonic == "branch32_memory_ne"));
+    }
+
+    #[test]
+    fn preserves_load64_when_result_is_reused() {
+        let src = "
+handler Test
+    temp object, actual, expected
+    mov object, 1
+    mov expected, 2
+    load64 actual, [object, 8]
+    branch_ne actual, expected, .slow
+    add actual, 1
+.slow:
+    exit
+end
+";
+        let out = build(src, Arch::X86_64).expect("allocation should succeed");
+
+        assert!(out.iter().any(|insn| insn.mnemonic == "load64"));
+        assert!(!out.iter().any(|insn| insn.mnemonic == "branch64_memory_ne"));
+    }
+
+    #[test]
     fn allocates_two_temps_to_distinct_registers_when_overlapping() {
         let src = "
 handler Test
@@ -146337,8 +146786,9 @@ use crate::allocator::flatten_and_allocate;
 use crate::parser::{AsmInstruction, Handler, ObjectFormat, Operand, Program};
 use crate::registers::{Arch, resolve_register};
 use crate::shared::{
-    AdjacentMemoryPair, HandlerState, get_immediate_value, resolve_adjacent_memory_pair,
-    outline_cold_blocks, resolve_field_ref, resolve_label, substitute_macro, uniquify_macro_labels, w,
+    AdjacentMemoryPair, HandlerState, get_immediate_value, omit_jumps_to_next_label,
+    outline_cold_blocks, resolve_adjacent_memory_pair, resolve_field_ref, resolve_label,
+    substitute_macro, uniquify_macro_labels, w,
 };
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -146860,8 +147310,10 @@ fn generate_handler(
     // x21 = pb + pc is set by the dispatch sequence that branches here.
     // It is callee-saved, so it survives C++ calls within the handler.
 
-    let (hot_instructions, cold_instructions) = outline_cold_blocks(&instructions)
+    let (mut hot_instructions, mut cold_instructions) = outline_cold_blocks(&instructions)
         .unwrap_or_else(|error| panic!("invalid cold block in handler '{}': {error}", handler.name));
+    omit_jumps_to_next_label(&mut hot_instructions);
+    omit_jumps_to_next_label(&mut cold_instructions);
 
     for instruction in &hot_instructions {
         emit_instruction(out, instruction, handler, program, &mut state, pinned);
@@ -148493,8 +148945,12 @@ fn emit_instruction(
                 let dst = resolve_op(&insn.operands[0], handler, program);
                 let src = resolve_op(&insn.operands[1], handler, program);
                 if let Some(val) = get_immediate_value(&insn.operands[2], program) {
-                    emit_mov_imm(out, "x9", val);
-                    w!(out, "    mul {dst}, {src}, x9");
+                    if val > 0 && (val as u64).is_power_of_two() {
+                        w!(out, "    lsl {dst}, {src}, #{}", (val as u64).trailing_zeros());
+                    } else {
+                        emit_mov_imm(out, "x9", val);
+                        w!(out, "    mul {dst}, {src}, x9");
+                    }
                 } else {
                     let imm_reg = resolve_op(&insn.operands[2], handler, program);
                     w!(out, "    mul {dst}, {src}, {imm_reg}");
@@ -148526,7 +148982,9 @@ fn emit_instruction(
             if insn.operands.len() == 2 {
                 let dst = resolve_op(&insn.operands[0], handler, program);
                 if let Some(val) = get_immediate_value(&insn.operands[1], program) {
-                    w!(out, "    lsl {dst}, {dst}, #{val}");
+                    if val != 0 {
+                        w!(out, "    lsl {dst}, {dst}, #{val}");
+                    }
                 } else {
                     let count = resolve_op(&insn.operands[1], handler, program);
                     w!(out, "    lsl {dst}, {dst}, {count}");
@@ -148538,7 +148996,9 @@ fn emit_instruction(
             if insn.operands.len() == 2 {
                 let dst = resolve_op(&insn.operands[0], handler, program);
                 if let Some(val) = get_immediate_value(&insn.operands[1], program) {
-                    w!(out, "    lsr {dst}, {dst}, #{val}");
+                    if val != 0 {
+                        w!(out, "    lsr {dst}, {dst}, #{val}");
+                    }
                 } else {
                     let count = resolve_op(&insn.operands[1], handler, program);
                     w!(out, "    lsr {dst}, {dst}, {count}");
@@ -148550,7 +149010,9 @@ fn emit_instruction(
             if insn.operands.len() == 2 {
                 let dst = resolve_op(&insn.operands[0], handler, program);
                 if let Some(val) = get_immediate_value(&insn.operands[1], program) {
-                    w!(out, "    asr {dst}, {dst}, #{val}");
+                    if val != 0 {
+                        w!(out, "    asr {dst}, {dst}, #{val}");
+                    }
                 } else {
                     let count = resolve_op(&insn.operands[1], handler, program);
                     w!(out, "    asr {dst}, {dst}, {count}");
@@ -148785,6 +149247,56 @@ fn emit_instruction(
                     w!(out, "    cmp {a}, {b}");
                 }
                 w!(out, "    {cc} {label}");
+            }
+        }
+
+        "branch32_memory_eq" | "branch32_memory_ne" => {
+            if insn.operands.len() == 3 {
+                let memory = resolve_op(&insn.operands[0], handler, program);
+                let memory = parse_mem(&memory).expect("invalid branch32 memory operand");
+                let value = to_w_reg(&resolve_op(&insn.operands[1], handler, program));
+                let label = resolve_label(&insn.operands[2], handler);
+                emit_mem_load(out, "w9", &memory, 4, false);
+                w!(out, "    cmp w9, {value}");
+                let condition = if m == "branch32_memory_eq" { "b.eq" } else { "b.ne" };
+                w!(out, "    {condition} {label}");
+            }
+        }
+
+        "branch64_memory_eq" | "branch64_memory_ne" => {
+            if insn.operands.len() == 3 {
+                let memory = resolve_op(&insn.operands[0], handler, program);
+                let memory = parse_mem(&memory).expect("invalid branch64 memory operand");
+                let value = resolve_op(&insn.operands[1], handler, program);
+                let label = resolve_label(&insn.operands[2], handler);
+                emit_mem_load(out, "x9", &memory, 8, false);
+                w!(out, "    cmp x9, {value}");
+                let condition = if m == "branch64_memory_eq" { "b.eq" } else { "b.ne" };
+                w!(out, "    {condition} {label}");
+            }
+        }
+
+        "branch8_eq" | "branch8_ne" | "branch8_bits_set" | "branch8_bits_clear" => {
+            if insn.operands.len() == 3 {
+                let memory = resolve_op(&insn.operands[0], handler, program);
+                let immediate = get_immediate_value(&insn.operands[1], program)
+                    .expect("branch8 immediate must resolve at code generation time");
+                let label = resolve_label(&insn.operands[2], handler);
+                let memory = parse_mem(&memory).expect("invalid branch8 memory operand");
+                emit_mem_load(out, "w9", &memory, 1, false);
+                if matches!(m.as_str(), "branch8_eq" | "branch8_ne") && immediate == 0 {
+                    let operation = if m == "branch8_eq" { "cbz" } else { "cbnz" };
+                    w!(out, "    {operation} w9, {label}");
+                } else if matches!(m.as_str(), "branch8_eq" | "branch8_ne") {
+                    emit_cmp_imm(out, "x9", immediate, pinned);
+                    let condition = if m == "branch8_eq" { "b.eq" } else { "b.ne" };
+                    w!(out, "    {condition} {label}");
+                } else {
+                    emit_mov_imm(out, "x10", immediate);
+                    w!(out, "    tst x9, x10");
+                    let condition = if m == "branch8_bits_clear" { "b.eq" } else { "b.ne" };
+                    w!(out, "    {condition} {label}");
+                }
             }
         }
 
@@ -149360,6 +149872,61 @@ mod tests {
     }
 
     #[test]
+    fn omits_immediate_zero_shift() {
+        let program = coff_program(Vec::new());
+        let handler = &program.handlers[0];
+        let pinned = PinnedConstants::new(&program);
+
+        for mnemonic in ["shl", "shr", "sar"] {
+            let instruction = AsmInstruction {
+                mnemonic: mnemonic.into(),
+                operands: vec![Operand::Register("x1".into()), Operand::Immediate(0)],
+            };
+            let mut out = String::new();
+            let mut state = HandlerState::new();
+
+            emit_instruction(
+                &mut out,
+                &instruction,
+                handler,
+                &program,
+                &mut state,
+                &pinned,
+            );
+
+            assert!(out.is_empty());
+        }
+    }
+
+    #[test]
+    fn lowers_power_of_two_multiply_to_shift() {
+        let program = coff_program(Vec::new());
+        let handler = &program.handlers[0];
+        let pinned = PinnedConstants::new(&program);
+        let instruction = AsmInstruction {
+            mnemonic: "mul".into(),
+            operands: vec![
+                Operand::Register("x1".into()),
+                Operand::Register("x2".into()),
+                Operand::Immediate(64),
+            ],
+        };
+        let mut out = String::new();
+        let mut state = HandlerState::new();
+
+        emit_instruction(
+            &mut out,
+            &instruction,
+            handler,
+            &program,
+            &mut state,
+            &pinned,
+        );
+
+        assert_eq!(out, "    lsl x1, x2, #6\n");
+    }
+
+    #[test]
     fn coff_raw_native_call_uses_windows_arm64_sret() {
         let output = generate(&coff_program(vec![AsmInstruction {
             mnemonic: "call_raw_native".into(),
@@ -149371,6 +149938,31 @@ mod tests {
         assert!(output.contains("    blr x9"));
         assert!(output.contains("    ldr x1, [sp, #120]"));
         assert!(output.contains("    ldr x0, [sp, #112]"));
+    }
+
+    #[test]
+    fn byte_memory_zero_branch_uses_cbz() {
+        let output = generate(&coff_program(vec![
+            AsmInstruction {
+                mnemonic: "branch8_eq".into(),
+                operands: vec![
+                    Operand::Memory {
+                        base: "x0".into(),
+                        index: Some("4".into()),
+                        scale: None,
+                    },
+                    Operand::Immediate(0),
+                    Operand::Label(".zero".into()),
+                ],
+            },
+            AsmInstruction {
+                mnemonic: "label".into(),
+                operands: vec![Operand::Label(".zero".into())],
+            },
+        ]));
+
+        assert!(output.contains("    ldrb w9, [x0, #4]"));
+        assert!(output.contains("    cbz w9, .Lasm_Call.zero"));
     }
 
     #[test]
@@ -149400,7 +149992,7 @@ use crate::registers::{Arch, resolve_register};
 use crate::shared::{
     HandlerState, ResolvedMemoryIndex, get_immediate_value, resolve_adjacent_memory_pair,
     resolve_field_ref, resolve_label, resolve_memory_operand, substitute_macro,
-    outline_cold_blocks, uniquify_macro_labels, w,
+    omit_jumps_to_next_label, outline_cold_blocks, uniquify_macro_labels, w,
 };
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -149855,8 +150447,10 @@ fn generate_handler(out: &mut String, handler: &Handler, program: &Program, abi:
     w!(out, ".p2align 4");
     w!(out, "asm_handler_{}:", handler.name);
 
-    let (hot_instructions, cold_instructions) = outline_cold_blocks(&instructions)
+    let (mut hot_instructions, mut cold_instructions) = outline_cold_blocks(&instructions)
         .unwrap_or_else(|error| panic!("invalid cold block in handler '{}': {error}", handler.name));
+    omit_jumps_to_next_label(&mut hot_instructions);
+    omit_jumps_to_next_label(&mut cold_instructions);
 
     for instruction in &hot_instructions {
         emit_instruction(out, instruction, handler, program, &mut state, abi);
@@ -150279,18 +150873,14 @@ fn emit_instruction(
                 let dst = resolve_op(&insn.operands[0], handler, program);
                 let src = resolve_op(&insn.operands[1], handler, program);
                 let fail = resolve_label(&insn.operands[2], handler);
-                // Truncate to i64 first, check for cvttsd2si overflow sentinel
-                w!(out, "    cvttsd2si {dst}, {src}");
-                w!(out, "    mov rcx, 0x8000000000000000");
-                w!(out, "    cmp {dst}, rcx");
-                w!(out, "    je {fail}");
-                // Check it fits in i32
+                // Convert through i32 and require an exact round trip. The
+                // parity check rejects NaN, which x86 otherwise reports as
+                // equal after an unordered floating-point comparison.
+                w!(out, "    cvttsd2si {}, {src}", to_32bit_reg(&dst));
                 w!(out, "    movsxd rcx, {}", to_32bit_reg(&dst));
-                w!(out, "    cmp {dst}, rcx");
-                w!(out, "    jne {fail}");
-                // Round-trip: convert back and compare
-                w!(out, "    cvtsi2sd xmm3, {dst}");
+                w!(out, "    cvtsi2sd xmm3, rcx");
                 w!(out, "    ucomisd {src}, xmm3");
+                w!(out, "    jp {fail}");
                 w!(out, "    jne {fail}");
             }
         }
@@ -150496,14 +151086,29 @@ fn emit_instruction(
             }
         }
 
-        // mul: maps to x86 imul (2-operand: dst *= src, or 3-operand: dst = src * imm)
+        // mul: use a shift for in-place power-of-two scaling, otherwise map to x86 imul.
         "mul" => {
-            let ops: Vec<String> = insn
-                .operands
-                .iter()
-                .map(|o| resolve_op(o, handler, program))
-                .collect();
-            w!(out, "    imul {}", ops.join(", "));
+            if insn.operands.len() == 3 {
+                let dst = resolve_op(&insn.operands[0], handler, program);
+                let src = resolve_op(&insn.operands[1], handler, program);
+                if let Some(value) = get_immediate_value(&insn.operands[2], program)
+                    && value > 0
+                    && (value as u64).is_power_of_two()
+                    && dst == src
+                {
+                    w!(out, "    shl {dst}, {}", (value as u64).trailing_zeros());
+                } else {
+                    let value = resolve_op(&insn.operands[2], handler, program);
+                    w!(out, "    imul {dst}, {src}, {value}");
+                }
+            } else {
+                let ops: Vec<String> = insn
+                    .operands
+                    .iter()
+                    .map(|o| resolve_op(o, handler, program))
+                    .collect();
+                w!(out, "    imul {}", ops.join(", "));
+            }
         }
 
         "exit" => {
@@ -150930,9 +151535,10 @@ fn emit_instruction(
         "shl" | "shr" | "sar" => {
             let dst = resolve_op(&insn.operands[0], handler, program);
             if insn.operands.len() == 2 {
-                if get_immediate_value(&insn.operands[1], program).is_some() {
-                    let count = resolve_op(&insn.operands[1], handler, program);
-                    w!(out, "    {m} {dst}, {count}");
+                if let Some(count) = get_immediate_value(&insn.operands[1], program) {
+                    if count != 0 {
+                        w!(out, "    {m} {dst}, {count}");
+                    }
                 } else {
                     let count = resolve_op(&insn.operands[1], handler, program);
                     if count != "rcx" {
@@ -150992,6 +151598,49 @@ fn emit_instruction(
                 };
                 w!(out, "    cmp {a}, {b}");
                 w!(out, "    {cc} {label}");
+            }
+        }
+
+        "branch32_memory_eq" | "branch32_memory_ne" => {
+            if insn.operands.len() == 3 {
+                let memory = resolve_op(&insn.operands[0], handler, program);
+                let value = to_32bit_reg(&resolve_op(&insn.operands[1], handler, program));
+                let label = resolve_label(&insn.operands[2], handler);
+                let condition = if m == "branch32_memory_eq" { "je" } else { "jne" };
+                w!(out, "    cmp DWORD PTR {memory}, {value}");
+                w!(out, "    {condition} {label}");
+            }
+        }
+
+        "branch64_memory_eq" | "branch64_memory_ne" => {
+            if insn.operands.len() == 3 {
+                let memory = resolve_op(&insn.operands[0], handler, program);
+                let value = resolve_op(&insn.operands[1], handler, program);
+                let label = resolve_label(&insn.operands[2], handler);
+                let condition = if m == "branch64_memory_eq" { "je" } else { "jne" };
+                w!(out, "    cmp QWORD PTR {memory}, {value}");
+                w!(out, "    {condition} {label}");
+            }
+        }
+
+        "branch8_eq" | "branch8_ne" | "branch8_bits_set" | "branch8_bits_clear" => {
+            if insn.operands.len() == 3 {
+                let memory = resolve_op(&insn.operands[0], handler, program);
+                let immediate = get_immediate_value(&insn.operands[1], program)
+                    .expect("branch8 immediate must resolve at code generation time");
+                let label = resolve_label(&insn.operands[2], handler);
+                let operation = if matches!(m.as_str(), "branch8_eq" | "branch8_ne") {
+                    "cmp"
+                } else {
+                    "test"
+                };
+                let condition = if matches!(m.as_str(), "branch8_eq" | "branch8_bits_clear") {
+                    "jz"
+                } else {
+                    "jnz"
+                };
+                w!(out, "    {operation} BYTE PTR {memory}, {immediate}");
+                w!(out, "    {condition} {label}");
             }
         }
 
@@ -151315,6 +151964,121 @@ mod tests {
         assert!(out.contains("bt rdx, 32"));
         assert!(out.contains("jnc .Lasm_Call.slow"));
         assert!(!out.contains("test rdx, 4294967296"));
+    }
+
+    #[test]
+    fn omits_immediate_zero_shift() {
+        let program = test_program();
+        let handler = call_handler();
+        for mnemonic in ["shl", "shr", "sar"] {
+            let instruction = AsmInstruction {
+                mnemonic: mnemonic.into(),
+                operands: vec![Operand::Register("rdx".into()), Operand::Immediate(0)],
+            };
+            let mut out = String::new();
+            let mut state = HandlerState::new();
+
+            emit_instruction(
+                &mut out,
+                &instruction,
+                &handler,
+                &program,
+                &mut state,
+                X86_64Abi::SysV,
+            );
+
+            assert!(out.is_empty());
+        }
+    }
+
+    #[test]
+    fn lowers_in_place_power_of_two_multiply_to_shift() {
+        let program = test_program();
+        let handler = call_handler();
+        let instruction = AsmInstruction {
+            mnemonic: "mul".into(),
+            operands: vec![
+                Operand::Register("rdx".into()),
+                Operand::Register("rdx".into()),
+                Operand::Immediate(64),
+            ],
+        };
+        let mut out = String::new();
+        let mut state = HandlerState::new();
+
+        emit_instruction(
+            &mut out,
+            &instruction,
+            &handler,
+            &program,
+            &mut state,
+            X86_64Abi::SysV,
+        );
+
+        assert_eq!(out, "    shl rdx, 6\n");
+    }
+
+    #[test]
+    fn double_to_int32_uses_exact_i32_round_trip() {
+        let program = test_program();
+        let handler = call_handler();
+        let instruction = AsmInstruction {
+            mnemonic: "double_to_int32".into(),
+            operands: vec![
+                Operand::Register("rdx".into()),
+                Operand::Register("xmm0".into()),
+                Operand::Label(".fail".into()),
+            ],
+        };
+        let mut out = String::new();
+        let mut state = HandlerState::new();
+
+        emit_instruction(
+            &mut out,
+            &instruction,
+            &handler,
+            &program,
+            &mut state,
+            X86_64Abi::SysV,
+        );
+
+        assert!(out.contains("cvttsd2si edx, xmm0"));
+        assert!(out.contains("movsxd rcx, edx"));
+        assert!(out.contains("jp .Lasm_Call.fail"));
+        assert!(!out.contains("0x8000000000000000"));
+    }
+
+    #[test]
+    fn lowers_byte_memory_branch_without_a_register_load() {
+        let program = test_program();
+        let handler = call_handler();
+        let instruction = AsmInstruction {
+            mnemonic: "branch8_bits_clear".into(),
+            operands: vec![
+                Operand::Memory {
+                    base: "rcx".into(),
+                    index: Some("4".into()),
+                    scale: None,
+                },
+                Operand::Immediate(2),
+                Operand::Label(".slow".into()),
+            ],
+        };
+        let mut out = String::new();
+        let mut state = HandlerState::new();
+
+        emit_instruction(
+            &mut out,
+            &instruction,
+            &handler,
+            &program,
+            &mut state,
+            X86_64Abi::SysV,
+        );
+
+        assert!(out.contains("test BYTE PTR [rcx + 4], 2"));
+        assert!(out.contains("jz .Lasm_Call.slow"));
+        assert!(!out.contains("movzx"));
     }
 
     #[test]
@@ -152254,6 +153018,78 @@ pub const INSTRUCTIONS: &[InstructionInfo] = &[
     // ------------------------------------------------------------------
     plain("branch_eq", &[GprIn, GprInOrImm, Label]),
     plain("branch_ne", &[GprIn, GprInOrImm, Label]),
+    info(
+        "branch32_memory_eq",
+        &[Memory, GprIn, Label],
+        None,
+        false,
+        false,
+        ArchSpec::NONE,
+        ArchSpec { clobbers_gpr: &["x9"], ..ArchSpec::NONE },
+    ),
+    info(
+        "branch32_memory_ne",
+        &[Memory, GprIn, Label],
+        None,
+        false,
+        false,
+        ArchSpec::NONE,
+        ArchSpec { clobbers_gpr: &["x9"], ..ArchSpec::NONE },
+    ),
+    info(
+        "branch64_memory_eq",
+        &[Memory, GprIn, Label],
+        None,
+        false,
+        false,
+        ArchSpec::NONE,
+        ArchSpec { clobbers_gpr: &["x9"], ..ArchSpec::NONE },
+    ),
+    info(
+        "branch64_memory_ne",
+        &[Memory, GprIn, Label],
+        None,
+        false,
+        false,
+        ArchSpec::NONE,
+        ArchSpec { clobbers_gpr: &["x9"], ..ArchSpec::NONE },
+    ),
+    info(
+        "branch8_eq",
+        &[Memory, Imm, Label],
+        None,
+        false,
+        false,
+        ArchSpec::NONE,
+        ArchSpec { clobbers_gpr: &["x9"], ..ArchSpec::NONE },
+    ),
+    info(
+        "branch8_ne",
+        &[Memory, Imm, Label],
+        None,
+        false,
+        false,
+        ArchSpec::NONE,
+        ArchSpec { clobbers_gpr: &["x9"], ..ArchSpec::NONE },
+    ),
+    info(
+        "branch8_bits_set",
+        &[Memory, Imm, Label],
+        None,
+        false,
+        false,
+        ArchSpec::NONE,
+        ArchSpec { clobbers_gpr: &["x9", "x10"], ..ArchSpec::NONE },
+    ),
+    info(
+        "branch8_bits_clear",
+        &[Memory, Imm, Label],
+        None,
+        false,
+        false,
+        ArchSpec::NONE,
+        ArchSpec { clobbers_gpr: &["x9", "x10"], ..ArchSpec::NONE },
+    ),
     plain("branch_ge_unsigned", &[GprIn, GprInOrImm, Label]),
     plain("branch_lt_signed", &[GprIn, GprInOrImm, Label]),
     plain("branch_le_signed", &[GprIn, GprInOrImm, Label]),
@@ -152499,6 +153335,14 @@ mod tests {
         "canonicalize_nan",
         "branch_eq",
         "branch_ne",
+        "branch32_memory_eq",
+        "branch32_memory_ne",
+        "branch64_memory_eq",
+        "branch64_memory_ne",
+        "branch8_eq",
+        "branch8_ne",
+        "branch8_bits_set",
+        "branch8_bits_clear",
         "branch_ge_unsigned",
         "branch_lt_signed",
         "branch_le_signed",
@@ -152830,6 +153674,14 @@ FILE: Libraries/LibJS/AsmIntGen/src/main.rs
 //!
 //! - `branch_eq a, b, label` -- Branch if `a == b`.
 //! - `branch_ne a, b, label` -- Branch if `a != b`.
+//! - `branch32_memory_eq [memory], value, label` -- Branch if a 32-bit memory
+//!   value equals the low 32 bits of a register. The `ne` variant branches
+//!   when they differ.
+//! - `branch64_memory_eq [memory], value, label` -- Branch if a 64-bit memory
+//!   value equals a register. The `ne` variant branches when they differ.
+//! - `branch8_eq [memory], immediate, label` -- Branch if the byte in memory
+//!   equals the immediate. The `ne`, `bits_set`, and `bits_clear` variants
+//!   perform the corresponding byte comparison or test.
 //! - `branch_ge_unsigned a, b, label` -- Branch if `a >= b` (unsigned).
 //! - `branch_zero a, label` -- Branch if `a == 0`.
 //! - `branch_nonzero a, label` -- Branch if `a != 0`.
@@ -153758,6 +154610,25 @@ pub fn outline_cold_blocks(instructions: &[AsmInstruction]) -> Result<(Vec<AsmIn
     ))
 }
 
+/// Remove unconditional jumps whose destination is already the next emitted
+/// instruction.
+pub fn omit_jumps_to_next_label(instructions: &mut Vec<AsmInstruction>) {
+    let mut index = 0;
+    while index + 1 < instructions.len() {
+        let jumps_to_next_label = instructions[index].mnemonic == "jmp"
+            && instructions[index + 1].mnemonic == "label"
+            && matches!(
+                (instructions[index].operands.first(), instructions[index + 1].operands.first()),
+                (Some(Operand::Label(target)), Some(Operand::Label(label))) if target == label
+            );
+        if jumps_to_next_label {
+            instructions.remove(index);
+        } else {
+            index += 1;
+        }
+    }
+}
+
 /// Mutable state accumulated during handler code generation.
 pub struct HandlerState {
     /// Cold fixup blocks emitted after the main handler body (e.g. NaN canonicalization).
@@ -153962,6 +154833,19 @@ mod tests {
         assert!(matches!(&uniquified[1].operands[0], Operand::Label(label) if label == ".slow"));
     }
 
+    #[test]
+    fn omits_jump_to_next_label() {
+        let mut instructions = vec![
+            AsmInstruction { mnemonic: "jmp".into(), operands: vec![Operand::Label(".done".into())] },
+            AsmInstruction { mnemonic: "label".into(), operands: vec![Operand::Label(".done".into())] },
+            AsmInstruction { mnemonic: "exit".into(), operands: vec![] },
+        ];
+
+        omit_jumps_to_next_label(&mut instructions);
+
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions[0].mnemonic, "label");
+    }
     use bytecode_def::OpLayout;
 
     fn test_program() -> Program {
@@ -154431,12 +155315,20 @@ macro coerce_to_int32s(lhs, rhs, lhs_int, rhs_int, fail)
 .rhs_done:
 end
 
+# Load two adjacent operand indices together so paired-load architectures can
+# read both immutable bytecode fields with one instruction.
+macro load_binary_operands(lhs, rhs)
+    temp lhs_index, rhs_index
+    load_pair32 lhs_index, rhs_index, [pb, pc, m_lhs], [pb, pc, m_rhs]
+    load64 lhs, [values, lhs_index, 8]
+    load64 rhs, [values, rhs_index, 8]
+end
+
 # Fast path for bitwise binary operations on int32/boolean/double operands.
 # op_insn: the bitwise instruction to apply (xor, and, or).
 macro bitwise_op(op_insn, slow_path_func)
     temp lhs, rhs, lhs_int, rhs_int, dst
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     coerce_to_int32s lhs, rhs, lhs_int, rhs_int, .slow
     op_insn lhs_int, rhs_int
     box_int32 dst, lhs_int
@@ -154447,15 +155339,16 @@ macro bitwise_op(op_insn, slow_path_func)
 end
 
 macro prefix_inc_dec(op32_overflow, fp_op, slow_path_func)
-    temp value, tag, int_value, dst
+    temp operand_index, value, tag, int_value, dst
     ftemp result_dbl, one_dbl
-    load_operand value, m_dst
+    load32 operand_index, [pb, pc, m_dst]
+    load64 value, [values, operand_index, 8]
     extract_tag tag, value
     branch_ne tag, INT32_TAG, .slow
     unbox_int32 int_value, value
     op32_overflow int_value, 1, .overflow
     box_int32_clean dst, int_value
-    store_operand m_dst, dst
+    store64 [values, operand_index, 8], dst
     dispatch_next
 .overflow: @cold
     unbox_int32 int_value, value
@@ -154464,23 +155357,24 @@ macro prefix_inc_dec(op32_overflow, fp_op, slow_path_func)
     fp_mov one_dbl, dst
     fp_op result_dbl, one_dbl
     fp_mov dst, result_dbl
-    store_operand m_dst, dst
+    store64 [values, operand_index, 8], dst
     dispatch_next
 .slow: @cold
     call_slow_path slow_path_func
 end
 
 macro postfix_inc_dec(op32_overflow, fp_op, slow_path_func)
-    temp value, tag, int_value, dst
+    temp operand_index, value, tag, int_value, dst
     ftemp result_dbl, one_dbl
-    load_operand value, m_src
+    load32 operand_index, [pb, pc, m_src]
+    load64 value, [values, operand_index, 8]
     extract_tag tag, value
     branch_ne tag, INT32_TAG, .slow
     store_operand m_dst, value
     unbox_int32 int_value, value
     op32_overflow int_value, 1, .overflow_after_store
     box_int32_clean dst, int_value
-    store_operand m_src, dst
+    store64 [values, operand_index, 8], dst
     dispatch_next
 .overflow_after_store: @cold
     unbox_int32 int_value, value
@@ -154489,7 +155383,7 @@ macro postfix_inc_dec(op32_overflow, fp_op, slow_path_func)
     fp_mov one_dbl, dst
     fp_op result_dbl, one_dbl
     fp_mov dst, result_dbl
-    store_operand m_src, dst
+    store64 [values, operand_index, 8], dst
     dispatch_next
 .slow: @cold
     call_slow_path slow_path_func
@@ -154497,8 +155391,7 @@ end
 
 macro int32_shift_op(op_insn, slow_path_func)
     temp lhs, rhs, lhs_tag, rhs_tag, lhs_int, count, dst
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     extract_tag lhs_tag, lhs
     branch_ne lhs_tag, INT32_TAG, .slow
     extract_tag rhs_tag, rhs
@@ -154523,8 +155416,7 @@ macro validate_callee_builtin(expected_builtin, fail)
     branch_ne scratch, OBJECT_TAG, fail
     unbox_object callee, callee
     load8 scratch, [callee, OBJECT_FLAGS]
-    and scratch, OBJECT_FLAG_IS_FUNCTION
-    branch_zero scratch, fail
+    branch_bits_clear scratch, OBJECT_FLAG_IS_FUNCTION, fail
     load8 scratch, [callee, FUNCTION_OBJECT_BUILTIN_HAS_VALUE]
     branch_zero scratch, fail
     load8 scratch, [callee, FUNCTION_OBJECT_BUILTIN_VALUE]
@@ -154613,10 +155505,9 @@ end
 macro walk_cached_env_chain(m_environment_field, target_env, bind_index, fail_label)
     temp exe, caches, coord_addr, hops, sentinel, flag
     load32 coord_addr, [pb, pc, m_cache]
-    mul coord_addr, coord_addr, ENVIRONMENT_COORDINATE_SIZE
     load64 exe, [exec_ctx, EXECUTION_CONTEXT_EXECUTABLE]
     load64 caches, [exe, EXECUTABLE_ENVIRONMENT_COORDINATE_CACHES_DATA]
-    add coord_addr, caches
+    lea coord_addr, [caches, coord_addr, ENVIRONMENT_COORDINATE_SIZE]
     load_pair32 hops, bind_index, [coord_addr, ENVIRONMENT_COORDINATE_HOPS], [coord_addr, ENVIRONMENT_COORDINATE_INDEX]
     mov sentinel, ENVIRONMENT_COORDINATE_INVALID
     branch_eq hops, sentinel, fail_label
@@ -154682,15 +155573,11 @@ end
 macro load_property_lookup_cache(cache, fail_label)
     temp exe, caches
     load32 cache, [pb, pc, m_cache]
-    mul cache, cache, PROPERTY_LOOKUP_CACHE_SIZE
     load64 exe, [exec_ctx, EXECUTION_CONTEXT_EXECUTABLE]
     load64 caches, [exe, EXECUTABLE_PROPERTY_LOOKUP_CACHES_DATA]
-    add cache, caches
-    load64 cache, [cache, PROPERTY_LOOKUP_CACHE_DATA]
+    load64 cache, [caches, cache, PROPERTY_LOOKUP_CACHE_SIZE]
     branch_zero cache, fail_label
-    branch_bits_clear cache, PROPERTY_LOOKUP_CACHE_POLYMORPHIC_DATA_TAG, .data_loaded
-    sub cache, PROPERTY_LOOKUP_CACHE_POLYMORPHIC_DATA_TAG
-.data_loaded:
+    and cache, PROPERTY_LOOKUP_CACHE_DATA_POINTER_MASK
 end
 
 macro load_global_variable_cache(cache)
@@ -154702,10 +155589,8 @@ macro load_global_variable_cache(cache)
     add cache, caches
 end
 
-macro caged_primitive_storage_address(dst, cage_base, cached_offset, index, shift)
-    mov dst, index
-    shl dst, shift
-    add dst, cached_offset
+macro caged_primitive_storage_address(dst, cage_base, cached_offset, index, scale)
+    lea dst, [cached_offset, index, scale]
     and dst, PRIMITIVE_STORAGE_CAGE_OFFSET_MASK
     add dst, cage_base
 end
@@ -154714,30 +155599,28 @@ end
 # Simple data movement
 # ============================================================================
 
+macro move_operand(dst_field, src_field)
+    temp dst_index, src_index, value
+    load_pair32 dst_index, src_index, [pb, pc, dst_field], [pb, pc, src_field]
+    load64 value, [values, src_index, 8]
+    store64 [values, dst_index, 8], value
+end
+
 handler Mov
-    temp value
-    load_operand value, m_src
-    store_operand m_dst, value
+    move_operand m_dst, m_src
     dispatch_next
 end
 
 handler Mov2
-    temp v1, v2
-    load_operand v1, m_src1
-    store_operand m_dst1, v1
-    load_operand v2, m_src2
-    store_operand m_dst2, v2
+    move_operand m_dst1, m_src1
+    move_operand m_dst2, m_src2
     dispatch_next
 end
 
 handler Mov3
-    temp v1, v2, v3
-    load_operand v1, m_src1
-    store_operand m_dst1, v1
-    load_operand v2, m_src2
-    store_operand m_dst2, v2
-    load_operand v3, m_src3
-    store_operand m_dst3, v3
+    move_operand m_dst1, m_src1
+    move_operand m_dst2, m_src2
+    move_operand m_dst3, m_src3
     dispatch_next
 end
 
@@ -154753,8 +155636,7 @@ end
 handler Add
     temp lhs, rhs, lhs_int, rhs_int, dst
     ftemp lhs_dbl, rhs_dbl
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     coerce_to_doubles lhs, rhs, lhs_int, rhs_int, lhs_dbl, rhs_dbl, .both_int, .slow
     fp_add lhs_dbl, rhs_dbl
     box_double_or_int32 dst, lhs_dbl
@@ -154784,8 +155666,7 @@ end
 handler Sub
     temp lhs, rhs, lhs_int, rhs_int, dst
     ftemp lhs_dbl, rhs_dbl
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     coerce_to_doubles lhs, rhs, lhs_int, rhs_int, lhs_dbl, rhs_dbl, .both_int, .slow
     fp_sub lhs_dbl, rhs_dbl
     box_double_or_int32 dst, lhs_dbl
@@ -154814,8 +155695,7 @@ end
 handler Mul
     temp lhs, rhs, lhs_int, rhs_int, dst, sign_check
     ftemp lhs_dbl, rhs_dbl
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     coerce_to_doubles lhs, rhs, lhs_int, rhs_int, lhs_dbl, rhs_dbl, .both_int, .slow
     fp_mul lhs_dbl, rhs_dbl
     box_double_or_int32 dst, lhs_dbl
@@ -154984,64 +155864,56 @@ end
 # combined with jump_binary_epilogue (provides .take_true, .take_false, .slow labels).
 handler JumpLessThan
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     numeric_compare_coerce lhs, rhs, branch_lt_signed, branch_fp_less, .take_true, .take_false, .slow
     jump_binary_epilogue asm_slow_path_jump_less_than
 end
 
 handler JumpGreaterThan
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     numeric_compare_coerce lhs, rhs, branch_gt_signed, branch_fp_greater, .take_true, .take_false, .slow
     jump_binary_epilogue asm_slow_path_jump_greater_than
 end
 
 handler JumpLessThanEquals
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     numeric_compare_coerce lhs, rhs, branch_le_signed, branch_fp_less_or_equal, .take_true, .take_false, .slow
     jump_binary_epilogue asm_slow_path_jump_less_than_equals
 end
 
 handler JumpGreaterThanEquals
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     numeric_compare_coerce lhs, rhs, branch_ge_signed, branch_fp_greater_or_equal, .take_true, .take_false, .slow
     jump_binary_epilogue asm_slow_path_jump_greater_than_equals
 end
 
 handler JumpLooselyEquals
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     loose_equality_core lhs, rhs, .take_true, .take_false, .slow
     jump_binary_epilogue asm_slow_path_jump_loosely_equals
 end
 
 handler JumpLooselyInequals
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     loose_equality_core lhs, rhs, .take_false, .take_true, .slow
     jump_binary_epilogue asm_slow_path_jump_loosely_inequals
 end
 
 handler JumpStrictlyEquals
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     strict_equality_core lhs, rhs, .take_true, .take_false, .slow
     jump_binary_epilogue asm_slow_path_jump_strictly_equals
 end
 
 handler JumpStrictlyInequals
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     strict_equality_core lhs, rhs, .take_false, .take_true, .slow
     jump_binary_epilogue asm_slow_path_jump_strictly_inequals
 end
@@ -155248,14 +156120,7 @@ macro load_binding_flags(env, idx, flags, flag)
 end
 
 macro load_environment_serial(env, serial)
-    temp rare_data
-    load64 rare_data, [env, DECLARATIVE_ENVIRONMENT_RARE_DATA]
-    branch_zero rare_data, .zero
-    load64 serial, [rare_data, DECLARATIVE_ENVIRONMENT_RARE_DATA_SERIAL]
-    jmp .done
-.zero:
-    mov serial, 0
-.done:
+    load64 serial, [env, DECLARATIVE_ENVIRONMENT_SERIAL]
 end
 
 # Inline environment chain walk + binding value load with TDZ check.
@@ -155458,8 +156323,7 @@ end
 handler Div
     temp lhs, rhs, tag, scratch_int, dst
     ftemp lhs_dbl, rhs_dbl
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     extract_tag tag, lhs
     branch_eq tag, INT32_TAG, .lhs_is_int32
     # tag already has lhs tag
@@ -155507,32 +156371,28 @@ end
 # The boolean_result_epilogue macro provides .store_true, .store_false, .slow labels.
 handler LessThan
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     numeric_compare lhs, rhs, branch_lt_signed, branch_fp_less, .store_true, .store_false, .slow
     boolean_result_epilogue asm_slow_path_less_than
 end
 
 handler LessThanEquals
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     numeric_compare lhs, rhs, branch_le_signed, branch_fp_less_or_equal, .store_true, .store_false, .slow
     boolean_result_epilogue asm_slow_path_less_than_equals
 end
 
 handler GreaterThan
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     numeric_compare lhs, rhs, branch_gt_signed, branch_fp_greater, .store_true, .store_false, .slow
     boolean_result_epilogue asm_slow_path_greater_than
 end
 
 handler GreaterThanEquals
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     numeric_compare lhs, rhs, branch_ge_signed, branch_fp_greater_or_equal, .store_true, .store_false, .slow
     boolean_result_epilogue asm_slow_path_greater_than_equals
 end
@@ -155670,8 +156530,7 @@ end
 handler UnsignedRightShift
     temp lhs, rhs, lhs_tag, rhs_tag, value, count, dst
     ftemp dst_dbl
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     extract_tag lhs_tag, lhs
     branch_ne lhs_tag, INT32_TAG, .slow
     extract_tag rhs_tag, rhs
@@ -155700,8 +156559,7 @@ end
 # Negative dividend falls to slow path to handle -0 and INT_MIN correctly.
 handler Mod
     temp lhs, rhs, lhs_tag, rhs_tag, lhs_int, rhs_int, quot, rem, dst
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     extract_tag lhs_tag, lhs
     branch_ne lhs_tag, INT32_TAG, .slow
     extract_tag rhs_tag, rhs
@@ -155729,16 +156587,14 @@ end
 # double with NaN awareness, string pointer shortcut, bigint -> slow path).
 handler StrictlyEquals
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     strict_equality_core lhs, rhs, .store_true, .store_false, .slow
     boolean_result_epilogue asm_slow_path_strictly_equals
 end
 
 handler StrictlyInequals
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     strict_equality_core lhs, rhs, .store_false, .store_true, .slow
     boolean_result_epilogue asm_slow_path_strictly_inequals
 end
@@ -155772,16 +156628,14 @@ end
 
 handler LooselyEquals
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     loose_equality_core lhs, rhs, .store_true, .store_false, .slow
     boolean_result_epilogue asm_slow_path_loosely_equals
 end
 
 handler LooselyInequals
     temp lhs, rhs
-    load_operand lhs, m_lhs
-    load_operand rhs, m_rhs
+    load_binary_operands lhs, rhs
     loose_equality_core lhs, rhs, .store_false, .store_true, .slow
     boolean_result_epilogue asm_slow_path_loosely_inequals
 end
@@ -155876,12 +156730,12 @@ handler PutByValue
     load_operand prop, m_property
     extract_tag base_tag, base
     branch_ne base_tag, OBJECT_TAG, .slow
-    # Check property is non-negative int32
+    # Check property is int32. Every fast path below performs an unsigned bounds
+    # check, which also rejects zero-extended negative indices.
     extract_tag prop_tag, prop
     branch_ne prop_tag, INT32_TAG, .slow
     mov index, prop
     and index, 0xFFFFFFFF
-    branch_bit_set index, 31, .slow
     unbox_object obj, base
     # Check IsTypedArray flag -- branch to typed-array path early.
     load8 flags, [obj, OBJECT_FLAGS]
@@ -155940,12 +156794,12 @@ handler PutByValue
     branch_eq kind_byte, TYPED_ARRAY_KIND_FLOAT32, .ta_store_float32
     branch_ne kind_byte, TYPED_ARRAY_KIND_FLOAT64, .try_typed_array_slow
     # Compute store address before check_is_double mangles its argument.
-    caged_primitive_storage_address addr, elements, cached_offset, index, 3
+    caged_primitive_storage_address addr, elements, cached_offset, index, 8
     check_is_double src, .try_typed_array_slow
     store64 [addr, 0], src
     dispatch_next
 .ta_store_float32:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 2
+    caged_primitive_storage_address addr, elements, cached_offset, index, 4
     check_is_double src, .try_typed_array_slow
     fp_mov src_dbl, src
     double_to_float src_dbl, src_dbl
@@ -155960,17 +156814,17 @@ handler PutByValue
     branch_any_eq kind_byte, TYPED_ARRAY_KIND_UINT16, TYPED_ARRAY_KIND_INT16, .ta_put_uint16
     jmp .try_typed_array_slow
 .ta_put_int32:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 2
+    caged_primitive_storage_address addr, elements, cached_offset, index, 4
     store32 [addr, 0], src_int32
     dispatch_next
 .ta_put_float32:
     int_to_double src_dbl, src_int32
     double_to_float src_dbl, src_dbl
-    caged_primitive_storage_address addr, elements, cached_offset, index, 2
+    caged_primitive_storage_address addr, elements, cached_offset, index, 4
     storef32 [addr, 0], src_dbl
     dispatch_next
 .ta_put_uint8_clamped:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 0
+    caged_primitive_storage_address addr, elements, cached_offset, index, 1
     branch_negative src_int32, .ta_put_uint8_clamped_zero
     mov max, 255
     branch_ge_unsigned src_int32, max, .ta_put_uint8_clamped_max
@@ -155985,11 +156839,11 @@ handler PutByValue
     store8 [addr, 0], src_int32
     dispatch_next
 .ta_put_uint8:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 0
+    caged_primitive_storage_address addr, elements, cached_offset, index, 1
     store8 [addr, 0], src_int32
     dispatch_next
 .ta_put_uint16:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 1
+    caged_primitive_storage_address addr, elements, cached_offset, index, 2
     store16 [addr, 0], src_int32
     dispatch_next
 .try_typed_array_slow: @cold
@@ -156002,7 +156856,7 @@ end
 
 # Inline cache fast path for property access (own + prototype chain).
 handler GetById
-    temp base, tag, obj, shape, plc, cache_shape, cache_proto, prop_offset, dict_gen, cur_dict_gen, props, value, result
+    temp base, tag, obj, shape, plc, cache_shape, cache_proto, prop_offset, dict_gen, cur_dict_gen, proto_cur_dict_gen, props, value, result
     load_operand base, m_base
     extract_tag tag, base
     branch_ne tag, OBJECT_TAG, .try_cache
@@ -156034,8 +156888,8 @@ handler GetById
     load8 tag, [prop_offset, PROTOTYPE_CHAIN_VALIDITY_VALID]
     branch_zero tag, .try_cache
     load_pair32 prop_offset, dict_gen, [plc, PROPERTY_LOOKUP_CACHE_ENTRY_PROPERTY_OFFSET], [plc, PROPERTY_LOOKUP_CACHE_ENTRY_DICTIONARY_GENERATION]
-    load32 cur_dict_gen, [shape, SHAPE_DICTIONARY_GENERATION]
-    branch_ne dict_gen, cur_dict_gen, .try_cache
+    load32 proto_cur_dict_gen, [shape, SHAPE_DICTIONARY_GENERATION]
+    branch_ne dict_gen, proto_cur_dict_gen, .try_cache
     load64 props, [cache_proto, OBJECT_NAMED_PROPERTIES]
     assert_nonzero props
     load64 value, [props, prop_offset, 8]
@@ -156108,7 +156962,6 @@ handler GetByValue
     branch_ne prop_tag, INT32_TAG, .slow
     mov index, prop
     and index, 0xFFFFFFFF
-    branch_bit_set index, 31, .slow
     unbox_object obj, base
     load8 flags, [obj, OBJECT_FLAGS]
     branch_bits_set flags, OBJECT_FLAG_IS_TYPED_ARRAY, .try_typed_array
@@ -156155,7 +157008,11 @@ handler GetByValue
     branch_ge_unsigned index, capacity, .try_typed_array_slow
     load8 kind_byte, [obj, TYPED_ARRAY_KIND]
     branch_eq kind_byte, TYPED_ARRAY_KIND_INT32, .ta_int32
-    branch_any_eq kind_byte, TYPED_ARRAY_KIND_UINT8, TYPED_ARRAY_KIND_UINT8_CLAMPED, .ta_uint8
+    branch_ge_unsigned kind_byte, TYPED_ARRAY_KIND_UINT16, .other_typed_array_kinds
+    caged_primitive_storage_address addr, elements, cached_offset, index, 1
+    load8 raw, [addr, 0]
+    jmp .ta_box_int32
+.other_typed_array_kinds:
     branch_eq kind_byte, TYPED_ARRAY_KIND_UINT16, .ta_uint16
     branch_eq kind_byte, TYPED_ARRAY_KIND_INT8, .ta_int8
     branch_eq kind_byte, TYPED_ARRAY_KIND_INT16, .ta_int16
@@ -156164,27 +157021,23 @@ handler GetByValue
     branch_eq kind_byte, TYPED_ARRAY_KIND_FLOAT64, .ta_float64
     jmp .try_typed_array_slow
 .ta_int32:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 2
+    caged_primitive_storage_address addr, elements, cached_offset, index, 4
     load32 raw, [addr, 0]
     jmp .ta_box_int32
-.ta_uint8:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 0
-    load8 raw, [addr, 0]
-    jmp .ta_box_int32
 .ta_uint16:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 1
+    caged_primitive_storage_address addr, elements, cached_offset, index, 2
     load16 raw, [addr, 0]
     jmp .ta_box_int32
 .ta_int8:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 0
+    caged_primitive_storage_address addr, elements, cached_offset, index, 1
     load8s raw, [addr, 0]
     jmp .ta_box_int32
 .ta_int16:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 1
+    caged_primitive_storage_address addr, elements, cached_offset, index, 2
     load16s raw, [addr, 0]
     jmp .ta_box_int32
 .ta_float32:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 2
+    caged_primitive_storage_address addr, elements, cached_offset, index, 4
     loadf32 slot_dbl, [addr, 0]
     float_to_double slot_dbl, slot_dbl
     fp_mov slot, slot_dbl
@@ -156194,7 +157047,7 @@ handler GetByValue
     branch_nonzero raw, .ta_f64_as_int
     jmp .ta_f64_as_int
 .ta_float64:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 3
+    caged_primitive_storage_address addr, elements, cached_offset, index, 8
     load64 slot, [addr, 0]
     fp_mov slot_dbl, slot
     # Exclude negative zero early (slot gets clobbered by double_to_int32).
@@ -156212,7 +157065,7 @@ handler GetByValue
     store_operand m_dst, dst
     dispatch_next
 .ta_uint32:
-    caged_primitive_storage_address addr, elements, cached_offset, index, 2
+    caged_primitive_storage_address addr, elements, cached_offset, index, 4
     load32 raw, [addr, 0]
     branch_bit_set raw, 31, .ta_uint32_to_double
     jmp .ta_box_int32
@@ -156248,7 +157101,7 @@ end
 # Fast path for Array.length (magical length property).
 # Also includes IC fast path for non-array objects (same as GetById).
 handler GetLength
-    temp base, tag, obj, flags, shape, plc, cache_shape, cache_proto, prop_offset, dict_gen, cur_dict_gen, props, value, length, sign_check, dst
+    temp base, tag, obj, flags, shape, plc, cache_shape, cache_proto, prop_offset, dict_gen, cur_dict_gen, props, value, length, dst
     ftemp length_dbl
     load_operand base, m_base
     extract_tag tag, base
@@ -156279,9 +157132,7 @@ handler GetLength
     # clear; otherwise widen to a double so the value isn't reinterpreted
     # as a negative int32.
     load32 length, [obj, OBJECT_INDEXED_ARRAY_LIKE_SIZE]
-    mov sign_check, length
-    shr sign_check, 31
-    branch_nonzero sign_check, .length_double
+    branch_bit_set length, 31, .length_double
     box_int32 dst, length
     store_operand m_dst, dst
     dispatch_next
@@ -156315,8 +157166,8 @@ handler GetGlobal
     assert_nonzero env
     load_global_variable_cache gvc
     assert_nonzero gvc
-    load64 cache_serial, [gvc, GLOBAL_VARIABLE_CACHE_ENVIRONMENT_SERIAL]
     load_environment_serial env, env_serial
+    load64 cache_serial, [gvc, GLOBAL_VARIABLE_CACHE_ENVIRONMENT_SERIAL]
     branch_ne cache_serial, env_serial, .slow
     # Shape-based fast path: check entries[0].shape matches global_object.shape
     # (falls through to env binding path on shape mismatch)
@@ -156324,9 +157175,9 @@ handler GetGlobal
     assert_nonzero shape
     load64 cache_shape, [gvc, GLOBAL_VARIABLE_CACHE_ENTRY_SHAPE]
     branch_ne cache_shape, shape, .try_env_binding
-    load32 cur_dict_gen, [shape, SHAPE_DICTIONARY_GENERATION]
     load_pair32 prop_offset, dict_gen, [gvc, GLOBAL_VARIABLE_CACHE_ENTRY_PROPERTY_OFFSET], [gvc, GLOBAL_VARIABLE_CACHE_ENTRY_DICTIONARY_GENERATION]
-    branch_ne dict_gen, cur_dict_gen, .try_env_binding
+    load32 cur_dict_gen, [shape, SHAPE_DICTIONARY_GENERATION]
+    branch_ne cur_dict_gen, dict_gen, .try_env_binding
     # IC hit! Load property value via get_direct
     load64 props, [global_object, OBJECT_NAMED_PROPERTIES]
     assert_nonzero props
@@ -156363,16 +157214,16 @@ handler SetGlobal
     assert_nonzero env
     load_global_variable_cache gvc
     assert_nonzero gvc
-    load64 cache_serial, [gvc, GLOBAL_VARIABLE_CACHE_ENVIRONMENT_SERIAL]
     load_environment_serial env, env_serial
+    load64 cache_serial, [gvc, GLOBAL_VARIABLE_CACHE_ENVIRONMENT_SERIAL]
     branch_ne cache_serial, env_serial, .slow
     load64 shape, [global_object, OBJECT_SHAPE]
     assert_nonzero shape
     load64 cache_shape, [gvc, GLOBAL_VARIABLE_CACHE_ENTRY_SHAPE]
     branch_ne cache_shape, shape, .try_env_binding
-    load32 cur_dict_gen, [shape, SHAPE_DICTIONARY_GENERATION]
     load_pair32 prop_offset, dict_gen, [gvc, GLOBAL_VARIABLE_CACHE_ENTRY_PROPERTY_OFFSET], [gvc, GLOBAL_VARIABLE_CACHE_ENTRY_DICTIONARY_GENERATION]
-    branch_ne dict_gen, cur_dict_gen, .try_env_binding
+    load32 cur_dict_gen, [shape, SHAPE_DICTIONARY_GENERATION]
+    branch_ne cur_dict_gen, dict_gen, .try_env_binding
     # IC hit! Load current value to check it's not an accessor.
     load64 props, [global_object, OBJECT_NAMED_PROPERTIES]
     assert_nonzero props
@@ -160568,7 +161419,7 @@ int main()
     // PropertyLookupCache layout
     outln("\n# PropertyLookupCache layout");
     EMIT_OFFSET(PROPERTY_LOOKUP_CACHE_DATA, PropertyLookupCache, m_data);
-    outln("const PROPERTY_LOOKUP_CACHE_POLYMORPHIC_DATA_TAG = {}", PropertyLookupCache::polymorphic_data_tag);
+    outln("const PROPERTY_LOOKUP_CACHE_DATA_POINTER_MASK = 0x{:X}", ~PropertyLookupCache::polymorphic_data_tag);
     EMIT_SIZEOF(PROPERTY_LOOKUP_CACHE_SIZE, PropertyLookupCache);
 
     // PropertyLookupCache::Entry layout
@@ -160723,7 +161574,7 @@ int main()
     // DeclarativeEnvironment layout
     outln("\n# DeclarativeEnvironment layout");
     EMIT_OFFSET(DECLARATIVE_ENVIRONMENT_RARE_DATA, DeclarativeEnvironment, m_rare_data);
-    EMIT_OFFSET(DECLARATIVE_ENVIRONMENT_RARE_DATA_SERIAL, DeclarativeEnvironment::RareData, m_environment_serial_number);
+    EMIT_OFFSET(DECLARATIVE_ENVIRONMENT_SERIAL, DeclarativeEnvironment, m_environment_serial_number);
 
     // GlobalVariableCache layout
     outln("\n# GlobalVariableCache layout");
@@ -160869,6 +161720,9 @@ int main()
 
     // TypedArrayBase::Kind enum values
     outln("\n# TypedArrayBase::Kind values");
+    static_assert(static_cast<u8>(TypedArrayBase::Kind::Uint8Array) == 0);
+    static_assert(static_cast<u8>(TypedArrayBase::Kind::Uint8ClampedArray) == 1);
+    static_assert(static_cast<u8>(TypedArrayBase::Kind::Uint16Array) == 2);
     outln("const TYPED_ARRAY_KIND_UINT8 = {}", static_cast<u8>(TypedArrayBase::Kind::Uint8Array));
     outln("const TYPED_ARRAY_KIND_UINT8_CLAMPED = {}", static_cast<u8>(TypedArrayBase::Kind::Uint8ClampedArray));
     outln("const TYPED_ARRAY_KIND_UINT16 = {}", static_cast<u8>(TypedArrayBase::Kind::Uint16Array));
@@ -189334,7 +190188,6 @@ bool DeclarativeEnvironment::RareData::is_empty() const
         && !m_dispose_capability.disposable_resource_stack
         && !m_environment_shape_cache
         && m_expected_binding_count == 0
-        && m_environment_serial_number == 0
         && !m_is_catch_environment;
 }
 
@@ -189357,7 +190210,7 @@ void DeclarativeEnvironment::increment_environment_serial_number()
         return;
     if (m_rare_data && m_rare_data->m_environment_shape_cache)
         return;
-    ++ensure_rare_data().m_environment_serial_number;
+    ++m_environment_serial_number;
 }
 
 bool DeclarativeEnvironment::is_catch_environment() const
@@ -189416,9 +190269,7 @@ DisposeCapability* DeclarativeEnvironment::dispose_capability_if_exists()
 
 u64 DeclarativeEnvironment::environment_serial_number() const
 {
-    if (!m_rare_data)
-        return 0;
-    return m_rare_data->m_environment_serial_number;
+    return m_environment_serial_number;
 }
 
 void DeclarativeEnvironment::append_binding(Binding binding)
@@ -189880,7 +190731,6 @@ private:
         DisposeCapability m_dispose_capability;
         GC::Ptr<EnvironmentShape>* m_environment_shape_cache { nullptr };
         size_t m_expected_binding_count { 0 };
-        u64 m_environment_serial_number { 0 };
         bool m_is_catch_environment { false };
     };
 
@@ -189987,6 +190837,7 @@ private:
     GC::Ptr<EnvironmentShape> m_shape;
     Vector<Value> m_binding_values;
     OwnPtr<RareData> m_rare_data;
+    u64 m_environment_serial_number { 0 };
 };
 
 inline ThrowCompletionOr<Value> DeclarativeEnvironment::get_binding_value_direct(VM& vm, size_t index) const
@@ -658566,595 +659417,3 @@ public:
     WebIDL::ExceptionOr<void> set_range_text(Utf16View replacement, WebIDL::UnsignedLong start, WebIDL::UnsignedLong end, Bindings::SelectionMode = Bindings::SelectionMode::Preserve);
 
     // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-setselectionrange
-    void set_the_selection_range(Optional<WebIDL::UnsignedLong> start, Optional<WebIDL::UnsignedLong> end, SelectionDirection direction = SelectionDirection::None, SelectionSource source = SelectionSource::DOM);
-
-    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#dom-textarea/input-setselectionrange
-    WebIDL::ExceptionOr<void> set_selection_range(Optional<WebIDL::UnsignedLong> start, Optional<WebIDL::UnsignedLong> end, Optional<Utf16String> const& direction);
-
-    // https://w3c.github.io/selection-api/#dfn-has-scheduled-selectionchange-event
-    bool has_scheduled_selectionchange_event() const { return m_has_scheduled_selectionchange_event; }
-    void set_scheduled_selectionchange_event(bool value) { m_has_scheduled_selectionchange_event = value; }
-
-    virtual HTMLElement& text_control_to_html_element() = 0;
-    HTMLElement const& text_control_to_html_element() const { return const_cast<FormAssociatedTextControlElement&>(*this).text_control_to_html_element(); }
-
-    virtual void did_edit_text_node(Utf16FlyString const& input_type, Optional<Utf16String> const& data) = 0;
-
-    virtual GC::Ptr<DOM::Text> form_associated_element_to_text_node() = 0;
-    virtual GC::Ptr<DOM::Text const> form_associated_element_to_text_node() const { return const_cast<FormAssociatedTextControlElement&>(*this).form_associated_element_to_text_node(); }
-
-    virtual GC::Ptr<DOM::Element> text_control_scroll_container() = 0;
-
-    virtual void handle_insert(Utf16FlyString const& input_type, Utf16View) override;
-    virtual void handle_delete(Utf16FlyString const& input_type, DispatchInputEvent = DispatchInputEvent::Yes) override;
-    virtual GC::Ptr<DOM::Node> mouse_selection_scope() override;
-    virtual void select_all() override;
-    virtual void set_selection_anchor(GC::Ref<DOM::Node>, size_t offset, TextAffinity = TextAffinity::Downstream) override;
-    virtual void set_selection_focus(GC::Ref<DOM::Node>, size_t offset, TextAffinity = TextAffinity::Downstream) override;
-    virtual void move_cursor_to_start(CollapseSelection) override;
-    virtual void move_cursor_to_end(CollapseSelection) override;
-    void move_cursor_to_start_of_current_line(CollapseSelection);
-    void move_cursor_to_end_of_current_line(CollapseSelection);
-    virtual void increment_cursor_position_offset(CollapseSelection) override;
-    virtual void decrement_cursor_position_offset(CollapseSelection) override;
-    virtual void increment_cursor_position_to_next_word(CollapseSelection) override;
-    virtual void decrement_cursor_position_to_previous_word(CollapseSelection) override;
-    virtual void increment_cursor_position_to_next_line(CollapseSelection) override;
-    virtual void decrement_cursor_position_to_previous_line(CollapseSelection) override;
-
-    GC::Ptr<DOM::Position> cursor_position() const;
-
-protected:
-    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-textarea/input-relevant-value
-    void relevant_value_was_changed();
-
-private:
-    virtual GC::Ref<JS::Cell> as_cell() override;
-
-    void collapse_selection_to_offset(size_t, TextAffinity = TextAffinity::Downstream);
-    void move_selection_end_to(size_t offset, TextAffinity, CollapseSelection);
-    void scroll_cursor_into_view();
-    void selection_was_changed(SelectionSource);
-
-    // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#concept-textarea/input-selection
-    WebIDL::UnsignedLong m_selection_start { 0 };
-    WebIDL::UnsignedLong m_selection_end { 0 };
-    SelectionDirection m_selection_direction { SelectionDirection::None };
-
-    // Disambiguates which visual line the selection end renders on when it sits at a soft wrap boundary.
-    TextAffinity m_selection_end_affinity { TextAffinity::Downstream };
-
-    // https://w3c.github.io/selection-api/#dfn-has-scheduled-selectionchange-event
-    bool m_has_scheduled_selectionchange_event { false };
-};
-
-}
-
-namespace Web::DOM {
-
-template<>
-inline bool Node::fast_is<HTML::FormAssociatedTextControlElement>() const { return is_html_input_element() || is_html_textarea_element(); }
-
-template<>
-WEB_API HTML::FormAssociatedTextControlElement* Node::fast_as<HTML::FormAssociatedTextControlElement>();
-template<>
-WEB_API HTML::FormAssociatedTextControlElement const* Node::fast_as<HTML::FormAssociatedTextControlElement>() const;
-
-}
-
-FILE: Libraries/LibWeb/HTML/FormControlInfrastructure.cpp
-/*
- * Copyright (c) 2023, Kenneth Myhra <kennethmyhra@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <AK/Random.h>
-#include <AK/Utf16StringBuilder.h>
-#include <LibWeb/FileAPI/File.h>
-#include <LibWeb/HTML/FormControlInfrastructure.h>
-#include <LibWeb/HTML/FormDataEvent.h>
-#include <LibWeb/HTML/HTMLButtonElement.h>
-#include <LibWeb/HTML/HTMLDataListElement.h>
-#include <LibWeb/HTML/HTMLInputElement.h>
-#include <LibWeb/HTML/HTMLOptionElement.h>
-#include <LibWeb/HTML/HTMLSelectElement.h>
-#include <LibWeb/Infra/Strings.h>
-
-namespace Web::HTML {
-
-static WebIDL::ExceptionOr<XHR::FormDataEntry> create_entry_with_scalar_name(JS::Realm& realm, Utf16String entry_name, Variant<GC::Ref<FileAPI::Blob>, Utf16String> const& value, Optional<Utf16String> const& filename)
-{
-    auto entry_value = TRY(value.visit(
-        // 2. If value is a string, then set value to the result of converting value into a scalar value string.
-        [&](Utf16String const& string) -> WebIDL::ExceptionOr<XHR::FormDataEntry::Value> {
-            return TRY_OR_THROW_OOM(realm.vm(), Infra::convert_to_scalar_value_string(string.utf16_view()));
-        },
-        // 3. Otherwise:
-        [&](GC::Ref<FileAPI::Blob> blob) -> WebIDL::ExceptionOr<XHR::FormDataEntry::Value> {
-            // 1. If value is not a File object, then set value to a new File object, representing the same bytes, whose
-            //    name attribute value is "blob".
-            if (!is<FileAPI::File>(*blob)) {
-                Bindings::FilePropertyBag options {};
-                options.type = blob->type();
-
-                blob = TRY(FileAPI::File::create(realm, { { blob } }, "blob"_utf16, move(options)));
-            }
-
-            // 2. If filename is given, then set value to a new File object, representing the same bytes, whose name
-            //    attribute is filename.
-            if (filename.has_value()) {
-                Bindings::FilePropertyBag options {};
-                options.type = blob->type();
-                options.last_modified = as<FileAPI::File>(*blob).last_modified();
-
-                blob = TRY(FileAPI::File::create(realm, { { blob } }, filename.value(), move(options)));
-            }
-
-            return GC::Ref { as<FileAPI::File>(*blob) };
-        }));
-
-    // 4. Return an entry whose name is name and whose value is value.
-    return XHR::FormDataEntry {
-        .name = move(entry_name),
-        .value = move(entry_value),
-    };
-}
-
-// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#create-an-entry
-WebIDL::ExceptionOr<XHR::FormDataEntry> create_entry(JS::Realm& realm, Utf16View name, Variant<GC::Ref<FileAPI::Blob>, Utf16String> const& value, Optional<Utf16String> const& filename)
-{
-    // 1. Set name to the result of converting name into a scalar value string.
-    auto entry_name = TRY_OR_THROW_OOM(realm.vm(), Infra::convert_to_scalar_value_string(name));
-    return create_entry_with_scalar_name(realm, move(entry_name), value, filename);
-}
-
-// https://html.spec.whatwg.org/multipage/custom-elements.html#face-entry-construction
-static WebIDL::ExceptionOr<void> construct_face_entry(JS::Realm& realm, GC::Ref<HTMLElement const> form_associated_custom_element, GC::ConservativeVector<XHR::FormDataEntry>& entry_list)
-{
-    // 1. If element's submission value is a list of entries, then append each item of element's submission value to
-    //    entry list, and return.
-    // NOTE: In this case, user agent does not refer to the name content attribute value. An implementation of
-    //       form-associated custom element is responsible to decide names of entries. They can be the name
-    //       content attribute value, they can be strings based on the name content attribute value, or they
-    //       can be unrelated to the name content attribute.
-    auto const& submission_value = form_associated_custom_element->face_submission_value();
-    if (auto const* form_data_entries = submission_value.get_pointer<GC::ConservativeVector<XHR::FormDataEntry>>()) {
-        entry_list.extend(*form_data_entries);
-        return {};
-    }
-
-    // 2. If the element does not have a name attribute specified, or its name attribute's value is the empty string, then return.
-    if (!form_associated_custom_element->name().has_value() || form_associated_custom_element->name()->is_empty())
-        return {};
-
-    // 3. If the element's submission value is not null, create an entry with the name attribute value and the submission value, and append it to entry list.
-    if (submission_value.has<Empty>())
-        return {};
-
-    auto name = form_associated_custom_element->name().value();
-    auto entry_submission_value = submission_value.visit(
-        [](GC::Ref<FileAPI::File> file) -> Variant<GC::Ref<FileAPI::Blob>, Utf16String> {
-            return GC::Ref<FileAPI::Blob> { file };
-        },
-        [](Utf16String const& string) -> Variant<GC::Ref<FileAPI::Blob>, Utf16String> {
-            return string;
-        },
-        [](auto&) -> Variant<GC::Ref<FileAPI::Blob>, Utf16String> {
-            // The other types were handled above.
-            VERIFY_NOT_REACHED();
-        });
-
-    auto entry = TRY(create_entry(realm, name.view(), entry_submission_value));
-    entry_list.append(entry);
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-the-form-data-set
-WebIDL::ExceptionOr<Optional<GC::ConservativeVector<XHR::FormDataEntry>>> construct_entry_list(JS::Realm& realm, HTMLFormElement& form, GC::Ptr<HTMLElement> submitter, Optional<Utf16String> encoding)
-{
-    // 1. If form's constructing entry list is true, then return null.
-    if (form.constructing_entry_list())
-        return OptionalNone {};
-
-    // 2. Set form's constructing entry list to true.
-    form.set_constructing_entry_list(true);
-
-    // 3. Let controls be a list of all the submittable elements whose form owner is form, in tree order.
-    auto controls = form.get_submittable_elements();
-
-    // 4. Let entry list be a new empty entry list.
-    GC::ConservativeVector<XHR::FormDataEntry> entry_list;
-
-    // 5. For each element field in controls, in tree order:
-    for (auto const& control : controls) {
-        auto const& control_as_form_associated_element = as<FormAssociatedElement>(*control);
-
-        // 1. If any of the following is true, then continue:
-        // - The field element has a datalist element ancestor.
-        if (control->first_ancestor_of_type<HTML::HTMLDataListElement>())
-            continue;
-        // - The field element is disabled.
-        if (control->is_actually_disabled())
-            continue;
-        // - The field element is a button but it is not submitter.
-        if (control_as_form_associated_element.is_button() && control.ptr() != submitter.ptr())
-            continue;
-        // - The field element is an input element whose type attribute is in the Checkbox state and whose checkedness is false.
-        // - The field element is an input element whose type attribute is in the Radio Button state and whose checkedness is false.
-        if (auto* input_element = as_if<HTMLInputElement>(*control)) {
-            if ((input_element->type_state() == HTMLInputElement::TypeAttributeState::Checkbox || input_element->type_state() == HTMLInputElement::TypeAttributeState::RadioButton) && !input_element->checked())
-                continue;
-        }
-
-        // 2. If the field element is an input element whose type attribute is in the Image Button state, then:
-        if (auto* input_element = as_if<HTML::HTMLInputElement>(*control); input_element && input_element->type_state() == HTMLInputElement::TypeAttributeState::ImageButton) {
-            // 1. If the field element is not submitter, then continue.
-            if (input_element != submitter.ptr())
-                continue;
-
-            // 2. If the field element has a name attribute specified and its value is not the empty string, let name be
-            //    that value followed by U+002E (.). Otherwise, let name be the empty string.
-            Utf16String name;
-            if (auto value = input_element->get_attribute(AttributeNames::name); value.has_value() && !value->is_empty())
-                name = Utf16String::formatted("{}.", *value);
-
-            // 3. Let namex be the concatenation of name and U+0078 (x).
-            auto name_x = Utf16String::formatted("{}x", name);
-
-            // 4. Let namey be the concatenation of name and U+0079 (y).
-            auto name_y = Utf16String::formatted("{}y", name);
-
-            // 5. Let (x, y) be the selected coordinate.
-            auto [x, y] = input_element->selected_coordinate();
-
-            // 6. Create an entry with namex and x, and append it to entry list.
-            entry_list.append(TRY(create_entry(realm, name_x.utf16_view(), Utf16String::number(x))));
-
-            // 7. Create an entry with namey and y, and append it to entry list.
-            entry_list.append(TRY(create_entry(realm, name_y.utf16_view(), Utf16String::number(y))));
-
-            // 8. Continue.
-            continue;
-        }
-
-        // 3. If the field is a form-associated custom element, then perform the entry construction algorithm given field and entry list, then continue.
-        if (control_as_form_associated_element.form_associated_element_to_html_element().is_form_associated_custom_element()) {
-            TRY(construct_face_entry(realm, control_as_form_associated_element.form_associated_element_to_html_element(), entry_list));
-            continue;
-        }
-
-        // 4. If either the field element does not have a name attribute specified, or its name attribute's value is the empty string, then continue.
-        if (!control->name().has_value() || control->name()->is_empty())
-            continue;
-
-        // 5. Let name be the value of the field element's name attribute.
-        auto name = control->name().value();
-
-        // 6. If the field element is a select element, then for each option element in the select element's list of options whose selectedness is true and that is not disabled, create an entry with name and the value of the option element, and append it to entry list.
-        if (auto* select_element = as_if<HTMLSelectElement>(*control)) {
-            for (auto const& option_element : select_element->list_of_options()) {
-                if (option_element->selected() && !option_element->disabled()) {
-                    entry_list.append(TRY(create_entry(realm, name.view(), option_element->value())));
-                }
-            }
-        }
-        // 7. Otherwise, if the field element is an input element whose type attribute is in the Checkbox state or the Radio Button state, then:
-        else if (auto* checkbox_or_radio_element = as_if<HTMLInputElement>(*control); checkbox_or_radio_element && (checkbox_or_radio_element->type_state() == HTMLInputElement::TypeAttributeState::Checkbox || checkbox_or_radio_element->type_state() == HTMLInputElement::TypeAttributeState::RadioButton) && checkbox_or_radio_element->checked()) {
-            //  1. If the field element has a value attribute specified, then let value be the value of that attribute; otherwise, let value be the string "on".
-            auto value = checkbox_or_radio_element->value();
-            if (value.is_empty())
-                value = "on"_utf16;
-
-            // 2. Create an entry with name and value, and append it to entry list.
-            auto checkbox_or_radio_element_name = checkbox_or_radio_element->name();
-            entry_list.append(TRY(create_entry(realm, checkbox_or_radio_element_name->view(), value)));
-        }
-        // 8. Otherwise, if the field element is an input element whose type attribute is in the File Upload state, then:
-        else if (auto* file_element = as_if<HTMLInputElement>(*control); file_element && file_element->type_state() == HTMLInputElement::TypeAttributeState::FileUpload) {
-            // 1. If there are no selected files, then create an entry with name and a new File object with an empty name, application/octet-stream as type, and an empty body, and append it to entry list.
-            if (file_element->files()->length() == 0) {
-                Bindings::FilePropertyBag options {};
-                options.type = "application/octet-stream"_utf16;
-                auto file = TRY(FileAPI::File::create(realm, {}, Utf16String {}, options));
-                entry_list.append(TRY(create_entry(realm, name.view(), Variant<GC::Ref<FileAPI::Blob>, Utf16String> { GC::Ref<FileAPI::Blob> { file } })));
-            }
-            // 2. Otherwise, for each file in selected files, create an entry with name and a File object representing the file, and append it to entry list.
-            else {
-                for (size_t i = 0; i < file_element->files()->length(); i++) {
-                    auto file = GC::Ref { *file_element->files()->item(i) };
-                    entry_list.append(TRY(create_entry(realm, name.view(), Variant<GC::Ref<FileAPI::Blob>, Utf16String> { GC::Ref<FileAPI::Blob> { file } })));
-                }
-            }
-        }
-        // 9. Otherwise, if the field element is an input element whose type attribute is in the Hidden state and name is an ASCII case-insensitive match for "_charset_":
-        else if (auto* hidden_input = as_if<HTMLInputElement>(*control); hidden_input && hidden_input->type_state() == HTMLInputElement::TypeAttributeState::Hidden && name.equals_ignoring_ascii_case(u"_charset_"sv)) {
-            // 1. Let charset be the name of encoding if encoding is given, and "UTF-8" otherwise.
-            auto charset = encoding.value_or("UTF-8"_utf16);
-
-            // 2. Create an entry with name and charset, and append it to entry list.
-            entry_list.append(TRY(create_entry(realm, name.view(), charset)));
-        }
-        // 10. Otherwise, create an entry with name and the value of the field element, and append it to entry list.
-        else {
-            entry_list.append(TRY(create_entry(realm, name.view(), control_as_form_associated_element.form_value())));
-        }
-
-        // 11. If the element has a dirname attribute, that attribute's value is not the empty string, and the element is an auto-directionality form-associated element:
-        if (auto attribute = control->get_attribute(HTML::AttributeNames::dirname); attribute.has_value() && !attribute.value().is_empty() && control->is_auto_directionality_form_associated_element()) {
-            // 1. Let dirname be the value of the element's dirname attribute.
-            auto dirname = attribute.value();
-
-            // 2. Let dir be the string "ltr" if the directionality of the element is 'ltr', and "rtl" otherwise (i.e., when the directionality of the element is 'rtl').
-            Utf16String dir = control->directionality() == DOM::Element::Directionality::Ltr ? "ltr"_utf16 : "rtl"_utf16;
-
-            // 3. Create an entry with dirname and dir, and append it to entry list.
-            entry_list.append(TRY(create_entry(realm, dirname, dir)));
-        }
-    }
-    // 6. Let form data be a new FormData object associated with entry list.
-    auto form_data = TRY(XHR::FormData::construct_impl(realm, move(entry_list)));
-
-    // 7. Fire an event named formdata at form using FormDataEvent, with the formData attribute initialized to form data and the bubbles attribute initialized to true.
-    Bindings::FormDataEventInit init { Bindings::EventInit {}, form_data };
-    auto form_data_event = TRY(FormDataEvent::construct_impl(realm, HTML::EventNames::formdata, init));
-    form_data_event->set_bubbles(true);
-    form.dispatch_event(form_data_event);
-
-    // 8. Set form's constructing entry list to false.
-    form.set_constructing_entry_list(false);
-
-    // 9. Return a clone of entry list.
-    return form_data->entry_list();
-}
-
-ErrorOr<Utf16String> normalize_line_breaks(Utf16View value)
-{
-    // Replace every occurrence of U+000D (CR) not followed by U+000A (LF), and every occurrence of U+000A (LF) not
-    // preceded by U+000D (CR) by a string consisting of a U+000D (CR) and U+000A (LF).
-    Utf16StringBuilder builder { value.length_in_code_units() };
-    size_t chunk_start = 0;
-    for (size_t i = 0; i < value.length_in_code_units();) {
-        auto code_unit = value.code_unit_at(i);
-        if (code_unit != '\r' && code_unit != '\n') {
-            ++i;
-            continue;
-        }
-
-        builder.append(value.substring_view(chunk_start, i - chunk_start));
-        if ((code_unit == '\r' && (i + 1 == value.length_in_code_units() || value.code_unit_at(i + 1) != '\n')) || code_unit == '\n') {
-            builder.append("\r\n"_utf16);
-            ++i;
-        } else {
-            builder.append(value.substring_view(i, 2));
-            i += 2;
-        }
-        chunk_start = i;
-    }
-    builder.append(value.substring_view(chunk_start));
-    return builder.to_string();
-}
-
-// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#multipart/form-data-encoding-algorithm
-ErrorOr<SerializedFormData> serialize_to_multipart_form_data(GC::ConservativeVector<XHR::FormDataEntry> const& entry_list)
-{
-    auto escape_line_feed_carriage_return_double_quote = [](Utf16View value) -> ErrorOr<Utf16String> {
-        Utf16StringBuilder builder { value.length_in_code_units() };
-        size_t chunk_start = 0;
-        for (size_t i = 0; i < value.length_in_code_units(); ++i) {
-            auto code_unit = value.code_unit_at(i);
-            if (code_unit != '\r' && code_unit != '\n' && code_unit != '"')
-                continue;
-
-            builder.append(value.substring_view(chunk_start, i - chunk_start));
-            switch (code_unit) {
-            case '\r':
-                builder.append("%0D"_utf16);
-                break;
-            case '\n':
-                builder.append("%0A"_utf16);
-                break;
-            case '"':
-                builder.append("%22"_utf16);
-                break;
-            default:
-                VERIFY_NOT_REACHED();
-            }
-            chunk_start = i + 1;
-        }
-        builder.append(value.substring_view(chunk_start));
-        return builder.to_string();
-    };
-
-    // The boundary used by the user agent in generating the return value of this algorithm is the multipart/form-data boundary string.
-    auto boundary = Utf16String::formatted("---------------------------{}", get_random<u64>());
-    auto boundary_utf8 = boundary.to_utf8();
-    StringBuilder builder;
-    // 1. For each entry of entry list:
-    for (auto const& entry : entry_list) {
-        TRY(builder.try_append(TRY(String::formatted("--{}\r\n", boundary_utf8))));
-
-        // Replace every occurrence of U+000D (CR) not followed by U+000A (LF), and every occurrence of U+000A (LF) not preceded by U+000D (CR) by a string consisting of a U+000D (CR) and U+000A (LF).
-        auto normalized_name = TRY(normalize_line_breaks(entry.name.utf16_view()));
-        // For field names replace any 0x0A (LF) bytes with the byte sequence `%0A`, 0x0D (CR) with `%0D` and 0x22 (") with `%22`
-        auto escaped_name = TRY(escape_line_feed_carriage_return_double_quote(normalized_name.utf16_view()));
-        auto escaped_name_utf8 = TRY(escaped_name.utf16_view().to_utf8());
-
-        TRY(entry.value.visit(
-            [&](GC::Ref<FileAPI::File> file) -> ErrorOr<void> {
-                // For filenames replace any 0x0A (LF) bytes with the byte sequence `%0A`, 0x0D (CR) with `%0D` and 0x22 (") with `%22`
-                auto escaped_filename = TRY(escape_line_feed_carriage_return_double_quote(file->name().utf16_view()));
-                auto escaped_filename_utf8 = TRY(escaped_filename.utf16_view().to_utf8());
-                // Add a `Content-Disposition` header with a `name` set to entry's name and `filename` set to entry's filename.
-                TRY(builder.try_append(TRY(String::formatted("Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n", escaped_name_utf8, escaped_filename_utf8))));
-                // The parts of the generated multipart/form-data resource that correspond to file fields must have a `Content-Type` header specified.
-                // RFC7578: If the contents of a file are to be sent, the file data SHOULD be labeled with an appropriate media type, if known, or
-                //          "application/octet-stream".
-                if (!file->type().is_empty()) {
-                    auto type = file->type().to_utf8();
-                    TRY(builder.try_append(TRY(String::formatted("Content-Type: {}\r\n\r\n", type))));
-                } else {
-                    TRY(builder.try_append("Content-Type: application/octet-stream\r\n\r\n"sv));
-                }
-                TRY(builder.try_append(file->raw_bytes()));
-                TRY(builder.try_append("\r\n"sv));
-                return {};
-            },
-            [&](Utf16String const& string) -> ErrorOr<void> {
-                // Replace every occurrence of U+000D (CR) not followed by U+000A (LF), and every occurrence of U+000A (LF) not preceded by U+000D (CR) by a string consisting of a U+000D (CR) and U+000A (LF).
-                auto normalized_value = TRY(normalize_line_breaks(string.utf16_view()));
-                // Add a `Content-Disposition` header with a `name` set to entry's name.
-                TRY(builder.try_append(TRY(String::formatted("Content-Disposition: form-data; name=\"{}\"\r\n\r\n", escaped_name_utf8))));
-                TRY(builder.try_append(TRY(String::formatted("{}\r\n", TRY(normalized_value.utf16_view().to_utf8())))));
-                return {};
-            }));
-    }
-    TRY(builder.try_append(TRY(String::formatted("--{}--\r\n", boundary_utf8))));
-
-    // 2. Return the byte sequence resulting from encoding the entry list using the rules described by RFC 7578, Returning Values from Forms: multipart/form-data, given the following conditions: [RFC7578]
-    auto serialized_data = TRY(builder.to_byte_buffer());
-    return SerializedFormData {
-        .boundary = move(boundary),
-        .serialized_data = move(serialized_data)
-    };
-}
-
-}
-
-FILE: Libraries/LibWeb/HTML/FormControlInfrastructure.h
-/*
- * Copyright (c) 2023, Kenneth Myhra <kennethmyhra@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/Utf16String.h>
-#include <AK/Utf16View.h>
-#include <LibWeb/XHR/FormData.h>
-
-namespace Web::HTML {
-
-struct SerializedFormData {
-    Utf16String boundary;
-    ByteBuffer serialized_data;
-};
-
-WebIDL::ExceptionOr<XHR::FormDataEntry> create_entry(JS::Realm& realm, Utf16View name, Variant<GC::Ref<FileAPI::Blob>, Utf16String> const& value, Optional<Utf16String> const& filename = {});
-WebIDL::ExceptionOr<Optional<GC::ConservativeVector<XHR::FormDataEntry>>> construct_entry_list(JS::Realm&, HTMLFormElement&, GC::Ptr<HTMLElement> submitter = nullptr, Optional<Utf16String> encoding = {});
-ErrorOr<Utf16String> normalize_line_breaks(Utf16View value);
-ErrorOr<SerializedFormData> serialize_to_multipart_form_data(GC::ConservativeVector<XHR::FormDataEntry> const& entry_list);
-
-}
-
-FILE: Libraries/LibWeb/HTML/FormDataEvent.cpp
-/*
- * Copyright (c) 2023, Kenneth Myhra <kennethmyhra@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibWeb/Bindings/FormDataEvent.h>
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/HTML/FormDataEvent.h>
-
-namespace Web::HTML {
-
-GC_DEFINE_ALLOCATOR(FormDataEvent);
-
-WebIDL::ExceptionOr<GC::Ref<FormDataEvent>> FormDataEvent::construct_impl(JS::Realm& realm, Utf16FlyString const& event_name, Bindings::FormDataEventInit const& event_init)
-{
-    return realm.create<FormDataEvent>(realm, event_name, event_init);
-}
-
-FormDataEvent::FormDataEvent(JS::Realm& realm, Utf16FlyString const& event_name, Bindings::FormDataEventInit const& event_init)
-    : DOM::Event(realm, event_name, event_init)
-    , m_form_data(event_init.form_data)
-{
-}
-
-FormDataEvent::~FormDataEvent() = default;
-
-void FormDataEvent::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(FormDataEvent);
-    Base::initialize(realm);
-}
-
-void FormDataEvent::visit_edges(Cell::Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-    visitor.visit(m_form_data);
-}
-
-}
-
-FILE: Libraries/LibWeb/HTML/FormDataEvent.h
-/*
- * Copyright (c) 2023, Kenneth Myhra <kennethmyhra@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <LibWeb/Bindings/FormDataEvent.h>
-#include <LibWeb/DOM/Event.h>
-#include <LibWeb/XHR/FormData.h>
-
-namespace Web::HTML {
-
-class FormDataEvent final : public DOM::Event {
-    WEB_PLATFORM_OBJECT(FormDataEvent, DOM::Event);
-    GC_DECLARE_ALLOCATOR(FormDataEvent);
-
-public:
-    static WebIDL::ExceptionOr<GC::Ref<FormDataEvent>> construct_impl(JS::Realm&, Utf16FlyString const& event_name, Bindings::FormDataEventInit const& event_init);
-
-    virtual ~FormDataEvent() override;
-
-    GC::Ptr<XHR::FormData> form_data() const { return m_form_data; }
-
-private:
-    FormDataEvent(JS::Realm&, Utf16FlyString const& event_name, Bindings::FormDataEventInit const& event_init);
-
-    void initialize(JS::Realm&) override;
-
-    virtual void visit_edges(Cell::Visitor&) override;
-
-    GC::Ptr<XHR::FormData> m_form_data;
-};
-
-}
-
-FILE: Libraries/LibWeb/HTML/FormDataEvent.idl
-// https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#the-formdataevent-interface
-[Exposed=Window]
-interface FormDataEvent : Event {
-    constructor([Utf16FlyString] Utf16DOMString type, FormDataEventInit eventInitDict);
-
-    readonly attribute FormData formData;
-};
-
-dictionary FormDataEventInit : EventInit {
-    required FormData formData;
-};
-
-FILE: Libraries/LibWeb/HTML/GlobalEventHandlers.cpp
-/*
- * Copyright (c) 2021, Andreas Kling <andreas@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibWeb/DOM/EventTarget.h>
-#include <LibWeb/HTML/EventNames.h>
-#include <LibWeb/HTML/GlobalEventHandlers.h>
-#include <LibWeb/UIEvents/EventNames.h>
-
-namespace Web::HTML {
-
-#undef __ENUMERATE
-#define __ENUMERATE(attribute_name, event_name)                                    \
-    void GlobalEventHandlers::set_##attribute_name(WebIDL::CallbackType* value)    \
