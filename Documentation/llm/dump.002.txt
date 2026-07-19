@@ -1,4 +1,1719 @@
-﻿    if (auto tail_length = string.length_in_code_units() - substart; tail_length != 0)
+﻿    //    1. Wait until the condition goal is met.
+    //    2. Queue a task on task source to:
+    //       1. Replace the JavaScript execution context stack with old stack.
+    //       2. Perform any steps that appear after this spin the event loop instance in the original algorithm.
+    //       NOTE: This is achieved by returning from the function.
+
+    Platform::EventLoopPlugin::the().spin_until(GC::create_function(heap(), [this, goal_condition] {
+        if (goal_condition->function()())
+            return true;
+        if (m_task_queue->has_runnable_tasks()) {
+            schedule();
+            // FIXME: Remove the platform event loop plugin so that this doesn't look out of place
+            Core::EventLoop::current().wake();
+        }
+        return goal_condition->function()();
+    }));
+
+    vm.restore_execution_context_stack();
+
+    // 7. Stop task, allowing whatever algorithm that invoked it to resume.
+    // NOTE: This is achieved by returning from the function.
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#event-loop-processing-model
+void EventLoop::process()
+{
+    // 1. Let oldestTask and taskStartTime be null.
+    GC::Ptr<Task> oldest_task;
+    [[maybe_unused]] double task_start_time = 0;
+
+    // Some algorithms request that steps or states only occur once the event loop has reached step 1.
+    // Invoke a set of tasks that these algorithms request us to in order to achieve this.
+    auto reached_step_1_tasks = move(m_reached_step_1_tasks);
+    for (auto& reached_step_1_task : reached_step_1_tasks)
+        reached_step_1_task->function()();
+
+    // 2. If the event loop has a task queue with at least one runnable task, then:
+    if (m_task_queue->has_runnable_tasks()) {
+        // 1. Let taskQueue be one such task queue, chosen in an implementation-defined manner.
+        auto task_queue = m_task_queue;
+
+        // 2. Set taskStartTime to the unsafe shared current time.
+        task_start_time = HighResolutionTime::unsafe_shared_current_time();
+
+        // 3. Set oldestTask to the first runnable task in taskQueue, and remove it from taskQueue.
+        oldest_task = task_queue->take_first_runnable();
+
+        // FIXME: 4. If oldestTask's document is not null, then record task start time given taskStartTime and oldestTask's document.
+
+        // 5. Set the event loop's currently running task to oldestTask.
+        m_currently_running_task = oldest_task.ptr();
+
+        // 6. Perform oldestTask's steps.
+        oldest_task->execute();
+
+        // 7. Set the event loop's currently running task back to null.
+        m_currently_running_task = nullptr;
+
+        // 8. Perform a microtask checkpoint.
+        perform_a_microtask_checkpoint();
+    }
+
+    // 3. Let taskEndTime be the unsafe shared current time. [HRT]
+    [[maybe_unused]] auto task_end_time = HighResolutionTime::unsafe_shared_current_time();
+
+    // 4. If oldestTask is not null, then:
+    if (oldest_task) {
+        // FIXME: 1. Let top-level browsing contexts be an empty set.
+        // FIXME: 2. For each environment settings object settings of oldestTask's script evaluation environment settings object set:
+        // FIXME: 2.1. Let global be settings's global object.
+        // FIXME: 2.2. If global is not a Window object, then continue.
+        // FIXME: 2.3. If global's browsing context is null, then continue.
+        // FIXME: 2.4. Let tlbc be global's browsing context's top-level browsing context.
+        // FIXME: 2.5. If tlbc is not null, then append it to top-level browsing contexts.
+        // FIXME: 3. Report long tasks, passing in taskStartTime, taskEndTime, top-level browsing contexts, and oldestTask.
+        // FIXME: 4. If oldestTask's document is not null, then record task end time given taskEndTime and oldestTask's document.
+    }
+
+    // 5. If this is a window event loop that has no runnable task in this event loop's task queues, then:
+    if (m_type == Type::Window && !m_task_queue->has_runnable_tasks()) {
+        // 1. Set this event loop's last idle period start time to the unsafe shared current time.
+        m_last_idle_period_start_time = HighResolutionTime::unsafe_shared_current_time();
+
+        // 2. Let computeDeadline be the following steps:
+        // Implemented in EventLoop::compute_deadline()
+
+        // 3. For each win of the same-loop windows for this event loop, perform the start an idle period algorithm for win with the following step: return the result of calling computeDeadline, coarsened given win's relevant settings object's cross-origin isolated capability. [REQUESTIDLECALLBACK]
+        for (auto& win : same_loop_windows()) {
+            win->start_an_idle_period();
+        }
+    }
+
+    // If there are eligible tasks in the queue, schedule a new round of processing. :^)
+    if (m_task_queue->has_runnable_tasks() || (!m_microtask_queue.is_empty() && !m_performing_a_microtask_checkpoint)) {
+        schedule();
+    }
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#event-loop-processing-model
+void EventLoop::queue_task_to_update_the_rendering()
+{
+    // FIXME: 1. Wait until at least one navigable whose active document's relevant agent's event loop is eventLoop might have a rendering opportunity.
+
+    // 2. Set eventLoop's last render opportunity time to the unsafe shared current time.
+    m_last_render_opportunity_time = HighResolutionTime::unsafe_shared_current_time();
+
+    // OPTIMIZATION: If there are already rendering tasks in the queue, we don't need to queue another one.
+    if (m_task_queue->has_rendering_tasks()) {
+        return;
+    }
+
+    // 3. For each navigable that has a rendering opportunity, queue a global task on the rendering task source given navigable's active window to update the rendering:
+    for (auto& navigable : all_local_navigables()) {
+        if (!navigable->is_traversable())
+            continue;
+        if (!navigable->has_a_rendering_opportunity())
+            continue;
+
+        auto document = navigable->active_document();
+        if (!document)
+            continue;
+        if (document->is_decoded_svg())
+            continue;
+
+        queue_global_task(Task::Source::Rendering, *navigable->active_window(), *m_rendering_task_function);
+    }
+}
+
+void EventLoop::process_input_events() const
+{
+    auto process_input_events_queue = [&](Page& page) {
+        auto& page_client = page.client();
+        auto& input_events_queue = page_client.input_event_queue();
+
+        // Process events only for this page, collecting others to re-enqueue
+        Queue<Web::QueuedInputEvent> events_for_other_pages;
+
+        while (!input_events_queue.is_empty()) {
+            auto event = input_events_queue.dequeue();
+
+            // Skip events that are not intended for this page
+            if (event.page_id != page_client.id()) {
+                events_for_other_pages.enqueue(move(event));
+                continue;
+            }
+
+            auto result = event.event.visit(
+                [&](KeyEvent const& key_event) {
+                    switch (key_event.type) {
+                    case KeyEvent::Type::KeyDown:
+                        return page.handle_keydown(key_event.key, key_event.modifiers, key_event.code_point, key_event.repeat, key_event.should_insert_text);
+                    case KeyEvent::Type::KeyUp:
+                        return page.handle_keyup(key_event.key, key_event.modifiers, key_event.code_point, key_event.repeat);
+                    }
+                    VERIFY_NOT_REACHED();
+                },
+                [&](MouseEvent const& mouse_event) {
+                    switch (mouse_event.type) {
+                    case MouseEvent::Type::MouseDown:
+                        return page.handle_mousedown(mouse_event.position, mouse_event.screen_position, mouse_event.button, mouse_event.buttons, mouse_event.modifiers, mouse_event.click_count);
+                    case MouseEvent::Type::MouseUp:
+                        return page.handle_mouseup(mouse_event.position, mouse_event.screen_position, mouse_event.button, mouse_event.buttons, mouse_event.modifiers);
+                    case MouseEvent::Type::MouseMove:
+                        return page.handle_mousemove(mouse_event.position, mouse_event.screen_position, mouse_event.buttons, mouse_event.modifiers);
+                    case MouseEvent::Type::MouseLeave:
+                        return page.handle_mouseleave();
+                    case MouseEvent::Type::MouseWheel:
+                        if (mouse_event.async_scroll_performed_default_action) {
+                            dbgln_if(COMPOSITOR_DEBUG, "[Compositor] Main thread handling DOM wheel after async default action");
+                            return page.handle_mousewheel(mouse_event.position, mouse_event.screen_position, mouse_event.button, mouse_event.buttons, mouse_event.modifiers, mouse_event.wheel_delta_x, mouse_event.wheel_delta_y, true);
+                        }
+                        return page.handle_mousewheel(mouse_event.position, mouse_event.screen_position, mouse_event.button, mouse_event.buttons, mouse_event.modifiers, mouse_event.wheel_delta_x, mouse_event.wheel_delta_y);
+                    }
+                    VERIFY_NOT_REACHED();
+                },
+                [&](Web::DragEvent& drag_event) {
+                    return page.handle_drag_and_drop_event(drag_event.type, drag_event.position, drag_event.screen_position, drag_event.button, drag_event.buttons, drag_event.modifiers, move(drag_event.files));
+                },
+                [&](Web::PinchEvent& pinch_event) {
+                    return page.handle_pinch_event(pinch_event.position, pinch_event.modifiers, pinch_event.scale_delta);
+                });
+
+            for (size_t i = 0; i < event.coalesced_event_count; ++i)
+                page_client.report_finished_handling_input_event(event.page_id, EventResult::Dropped);
+            page_client.did_handle_input_event(event.page_id, event.event);
+            page_client.report_finished_handling_input_event(event.page_id, result);
+        }
+
+        // Re-enqueue events for other pages
+        while (!events_for_other_pages.is_empty()) {
+            input_events_queue.enqueue(events_for_other_pages.dequeue());
+        }
+
+        page.handle_sdl_input_events();
+    };
+
+    auto documents_of_traversable_navigables = documents_in_this_event_loop_matching([&](auto const& document) {
+        if (document.is_decoded_svg())
+            return false;
+        if (!document.navigable())
+            return false;
+        if (!document.navigable()->is_traversable())
+            return false;
+        return true;
+    });
+
+    for (auto const& document : documents_of_traversable_navigables) {
+        process_input_events_queue(document->page());
+    }
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#update-the-rendering
+void EventLoop::update_the_rendering()
+{
+    VERIFY(!m_running_rendering_task);
+    m_running_rendering_task = true;
+    ScopeGuard const guard = [this] {
+        m_running_rendering_task = false;
+    };
+
+    process_input_events();
+
+    // 1. Let frameTimestamp be eventLoop's last render opportunity time.
+    auto frame_timestamp = m_last_render_opportunity_time;
+
+    // 2. Let docs be all fully active Document objects whose relevant agent's event loop is
+    //    eventLoop, sorted arbitrarily except that the following conditions must be met:
+    //    - Any Document B whose container document is A must be listed after A in the list.
+    //    - If there are two documents A and B that both have the same non-null container document
+    //      C, then the order of A and B in the list must match the shadow-including tree order
+    //      of their respective navigable containers in C's node tree.
+    // 3. Filter non-renderable documents: Remove from docs any Document object doc for which any of the following are true:
+    auto docs = documents_in_this_event_loop_matching([&](auto const& document) {
+        if (!document.is_fully_active())
+            return false;
+
+        // doc is render-blocked;
+        if (document.is_render_blocked()) {
+            return false;
+        }
+
+        // doc's visibility state is "hidden";
+        if (document.hidden())
+            return false;
+
+        // doc's rendering is suppressed for view transitions; or
+        if (document.rendering_suppression_for_view_transitions())
+            return false;
+
+        auto navigable = document.navigable();
+        if (!navigable)
+            return false;
+
+        // doc's node navigable doesn't currently have a rendering opportunity.
+        if (!navigable->has_a_rendering_opportunity())
+            return false;
+
+        return true;
+    });
+
+    // AD-HOC: Update all the displayed video frames on HTMLMediaElements in documents' pages.
+    for (auto& document : docs)
+        document->page().update_all_media_element_video_sinks();
+
+    // FIXME: 4. Unnecessary rendering: Remove from docs any Document object doc for which all of the following are true:
+
+    // FIXME: 5. Remove from docs all Document objects for which the user agent believes that it's preferable to skip updating the rendering for other reasons.
+
+    // FIXME: 6. For each doc of docs, reveal doc.
+
+    // 7. For each doc of docs, flush autofocus candidates for doc if its node navigable is a top-level traversable.
+    for (auto& document : docs) {
+        auto navigable = document->navigable();
+        if (navigable && navigable->is_top_level_traversable())
+            document->flush_autofocus_candidates();
+    }
+
+    // 8. For each doc of docs, run the resize steps for doc. [CSSOMVIEW]
+    for (auto& document : docs) {
+        document->run_the_resize_steps();
+    }
+
+    // 9. For each doc of docs, run the scroll steps for doc. [CSSOMVIEW]
+    for (auto& document : docs) {
+        if (auto navigable = document->navigable())
+            navigable->adopt_pending_async_scroll_offsets();
+        document->run_the_scroll_steps();
+    }
+
+    // 10. For each doc of docs, evaluate media queries and report changes for doc. [CSSOMVIEW]
+    for (auto& document : docs) {
+        document->evaluate_media_queries_and_report_changes();
+    }
+
+    // 11. For each doc of docs, update animations and send events for doc, passing in relative high resolution time given frameTimestamp and doc's relevant global object as the timestamp [WEBANIMATIONS]
+    for (auto& document : docs) {
+        document->update_animations_and_send_events(HighResolutionTime::relative_high_resolution_time(frame_timestamp, relevant_global_object(*document)));
+    };
+
+    // 12. For each doc of docs, run the fullscreen steps for doc. [FULLSCREEN]
+    for (auto& document : docs) {
+        document->run_fullscreen_steps();
+    }
+
+    // FIXME: 13. For each doc of docs, if the user agent detects that the backing storage associated with a CanvasRenderingContext2D or an OffscreenCanvasRenderingContext2D, context, has been lost, then it must run the context lost steps for each such context:
+
+    // 14. For each doc of docs, run the animation frame callbacks for doc, passing in the relative high resolution time given frameTimestamp and doc's relevant global object as the timestamp.
+    for (auto& document : docs) {
+        auto now = HighResolutionTime::relative_high_resolution_time(frame_timestamp, relevant_global_object(*document));
+        run_animation_frame_callbacks(*document, now);
+    }
+
+    // FIXME: 15. Let unsafeStyleAndLayoutStartTime be the unsafe shared current time.
+
+    // 16. For each doc of docs:
+    for (auto& document : docs) {
+        // 1. Let resizeObserverDepth be 0.
+        size_t resize_observer_depth = 0;
+
+        // 2. While true:
+        while (true) {
+            // 1. Recalculate styles and update layout for doc.
+            // NOTE: Recalculation of styles is handled by update_layout()
+            document->update_layout(DOM::UpdateLayoutReason::HTMLEventLoopRenderingUpdate);
+
+            // AD-HOC: Script that ran earlier in this rendering update may have spun the event loop (e.g. with a
+            //         synchronous XHR) and run tasks that stopped document from being actively rendered, for example
+            //         by detaching it from its navigable after its iframe was removed. update_layout() is a no-op for
+            //         such documents, which can leave them without a paint tree, so skip the rest of this step.
+            if (!document->navigable() || document->navigable()->active_document() != document)
+                break;
+
+            // Clamp viewport scroll offset to valid range after layout, in case the
+            // scrollable overflow area has shrunk (e.g. after a viewport size change).
+            if (auto navigable = document->navigable())
+                navigable->clamp_viewport_scroll_offset();
+
+            // 2. Let hadInitialVisibleContentVisibilityDetermination be false.
+            bool had_initial_visible_content_visibility_determination = false;
+
+            // 3. For each element element with 'auto' used value of 'content-visibility':
+            auto* document_element = document->document_element();
+            if (document_element) {
+                for (auto& paintable_box : document->paintable()->paintable_boxes_with_auto_content_visibility()) {
+                    auto& element = as<DOM::Element>(*paintable_box->dom_node());
+
+                    // 1. Let checkForInitialDetermination be true if element's proximity to the viewport is not determined and it is not relevant to the user. Otherwise, let checkForInitialDetermination be false.
+                    bool check_for_initial_determination = element.proximity_to_the_viewport() == Web::DOM::ProximityToTheViewport::NotDetermined && !element.is_relevant_to_the_user();
+
+                    // 2. Determine proximity to the viewport for element.
+                    element.determine_proximity_to_the_viewport();
+
+                    // 3. If checkForInitialDetermination is true and element is now relevant to the user, then set hadInitialVisibleContentVisibilityDetermination to true.
+                    if (check_for_initial_determination && element.is_relevant_to_the_user()) {
+                        had_initial_visible_content_visibility_determination = true;
+                    }
+                }
+            }
+
+            // 4. If hadInitialVisibleContentVisibilityDetermination is true, then continue.
+            if (had_initial_visible_content_visibility_determination)
+                continue;
+
+            // 5. Gather active resize observations at depth resizeObserverDepth for doc.
+            document->gather_active_observations_at_depth(resize_observer_depth);
+
+            // 6. If doc has active resize observations:
+            if (document->has_active_resize_observations()) {
+                // 1. Set resizeObserverDepth to the result of broadcasting active resize observations given doc.
+                resize_observer_depth = document->broadcast_active_resize_observations();
+
+                // 2. Continue.
+                continue;
+            }
+
+            // 7. Otherwise, break.
+            break;
+        }
+
+        // 3. If doc has skipped resize observations, then deliver resize loop error given doc.
+        if (document->has_skipped_resize_observations()) {
+            // FIXME: Deliver resize loop error.
+        }
+
+        // https://drafts.csswg.org/scroll-animations-1/#event-loop
+        // During step 7.14.1 of the HTML Processing Model, any created scroll progress timelines or view progress
+        // timelines are collected into a stale timelines set. After step 7.14 if any timelines' named timeline ranges
+        // have changed, these timelines are added to the stale timelines set. If there are any stale timelines they now
+        // update their current time and associated ranges, the set of stale timelines is cleared and we run an additional
+        // step to recalculate styles and update layout.
+
+        // AD-HOC: This was step 7.14.1 at the time the CSS web-animations spec was written, but it has since been
+        //         moved, see https://github.com/w3c/csswg-drafts/issues/12120
+
+        bool requires_style_and_layout_update = false;
+
+        TemporaryExecutionContext context { document->realm() };
+
+        for (auto const& timeline : document->associated_animation_timelines()) {
+            auto* scroll_timeline = as_if<Animations::ScrollTimeline>(*timeline);
+
+            if (!scroll_timeline)
+                continue;
+
+            if (!scroll_timeline->is_stale())
+                continue;
+
+            // NB: The passed timestamp is ignored for ScrollTimelines so we can just use 0.
+            timeline->update_current_time(0);
+            requires_style_and_layout_update = true;
+        }
+
+        if (requires_style_and_layout_update)
+            document->update_layout(DOM::UpdateLayoutReason::HTMLEventLoopRenderingUpdate);
+    }
+
+    // FIXME: 17. For each doc of docs, if the focused area of doc is not a focusable area, then run the focusing steps for doc's viewport, and set doc's relevant global object's navigation API's focus changed during ongoing navigation to false.
+
+    // 18. For each doc of docs, perform pending transition operations for doc. [CSSVIEWTRANSITIONS]
+    for (auto& document : docs) {
+        document->perform_pending_transition_operations();
+    }
+
+    // 19. For each doc of docs, run the update intersection observations steps for doc, passing in the relative high resolution time given now and doc's relevant global object as the timestamp. [INTERSECTIONOBSERVER]
+    for (auto& document : docs) {
+        // NB: Layout may have been invalidated by previous steps (e.g. view transitions at step 18).
+        //     Re-run layout here since intersection observations need up-to-date geometry.
+        document->update_layout(DOM::UpdateLayoutReason::HTMLEventLoopRenderingUpdate);
+
+        auto now = HighResolutionTime::relative_high_resolution_time(frame_timestamp, relevant_global_object(*document));
+        document->run_the_update_intersection_observations_steps(now);
+    }
+
+    // FIXME: 20. For each doc of docs, record rendering time for doc given unsafeStyleAndLayoutStartTime.
+
+    // FIXME: 21. For each doc of docs, mark paint timing for doc.
+
+    // AD-HOC: Flush dirty canvas contexts in documents' pages after callbacks
+    // have had a chance to update them, and before painting snapshots the frame.
+    for (auto& document : docs)
+        document->page().prepare_canvas_contexts_for_compositing();
+
+    // 22. For each doc of docs, update the rendering or user interface of doc and its node navigable to reflect the current state.
+    for (auto& doc : docs.in_reverse()) {
+        auto navigable = doc->navigable();
+        // AD-HOC: Script that ran earlier in this rendering update may have spun the event loop and run tasks that
+        //         detached doc from its navigable (e.g. after its iframe was removed).
+        if (!navigable || !navigable->needs_repaint())
+            continue;
+        // OPTIMIZATION: Don't paint navigables hidden by an ancestor iframe with visibility: hidden.
+        //               needs_repaint() stays true — so, once the navigable becomes visible, it's painted.
+        if (navigable->has_inclusive_ancestor_with_visibility_hidden())
+            continue;
+        if (navigable->is_svg_page())
+            continue;
+        if (auto document = navigable->active_document())
+            document->update_layout(DOM::UpdateLayoutReason::HTMLEventLoopRenderingUpdate);
+        navigable->paint_next_frame();
+        if (navigable->is_traversable()) {
+            auto traversable = navigable->traversable_navigable();
+            traversable->process_screenshot_requests();
+        }
+    }
+
+    // 23. For each doc of docs, process top layer removals given doc.
+    for (auto& document : docs) {
+        document->process_top_layer_removals();
+    }
+
+    for (auto& document : docs) {
+        // https://drafts.csswg.org/css-font-loading/#fontfaceset-pending-on-the-environment
+        // A FontFaceSet is pending on the environment if any of the following are true:
+        // - the document is still loading
+        // - the document has pending stylesheet requests
+        // FIXME: - the document has pending layout operations which might cause the user agent to request a font, or which depend on recently-loaded fonts
+        TemporaryExecutionContext context(document->realm(), TemporaryExecutionContext::CallbacksEnabled::Yes);
+        document->fonts()->set_is_pending_on_the_environment(document->readiness() == DocumentReadyState::Loading);
+    }
+}
+
+void run_when_event_loop_reaches_step_1(GC::Ref<GC::Function<void()>> steps)
+{
+    auto& event_loop = main_thread_event_loop();
+    event_loop.run_upon_reaching_step_1(steps);
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#queue-a-task
+TaskID queue_a_task(HTML::Task::Source source, GC::Ptr<EventLoop> event_loop, GC::Ptr<DOM::Document> document, GC::Ref<GC::Function<void()>> steps)
+{
+    // 1. If event loop was not given, set event loop to the implied event loop.
+    if (!event_loop)
+        event_loop = main_thread_event_loop();
+
+    // FIXME: 2. If document was not given, set document to the implied document.
+
+    // 3. Let task be a new task.
+    // 4. Set task's steps to steps.
+    // 5. Set task's source to source.
+    // 6. Set task's document to the document.
+    // 7. Set task's script evaluation environment settings object set to an empty set.
+    auto task = HTML::Task::create(event_loop->vm(), source, document, steps);
+
+    // 8. Let queue be the task queue to which source is associated on event loop.
+    // 9. Append task to queue.
+    if (source == HTML::Task::Source::Microtask)
+        event_loop->enqueue_microtask(task);
+    else
+        event_loop->task_queue().add(task);
+
+    return task->id();
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#queue-a-global-task
+TaskID queue_global_task(HTML::Task::Source source, JS::Object& global_object, GC::Ref<GC::Function<void()>> steps)
+{
+    // 1. Let event loop be global's relevant agent's event loop.
+    auto& event_loop = relevant_agent(global_object).event_loop;
+
+    // 2. Let document be global's associated Document, if global is a Window object; otherwise null.
+    DOM::Document* document { nullptr };
+    if (auto* window_object = as_if<HTML::Window>(global_object))
+        document = &window_object->associated_document();
+
+    // 3. Queue a task given source, event loop, document, and steps.
+    return queue_a_task(source, *event_loop, document, steps);
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#queue-a-microtask
+void queue_a_microtask(DOM::Document const* document, GC::Ref<GC::Function<void()>> steps)
+{
+    // 1. If event loop was not given, set event loop to the implied event loop.
+    auto& event_loop = HTML::main_thread_event_loop();
+
+    // FIXME: 2. If document was not given, set document to the implied document.
+
+    // 3. Let microtask be a new task.
+    // 4. Set microtask's steps to steps.
+    // 5. Set microtask's source to the microtask task source.
+    // 6. Set microtask's document to document.
+    auto& vm = event_loop.vm();
+    auto microtask = HTML::Task::create(vm, HTML::Task::Source::Microtask, document, steps);
+
+    // FIXME: 7. Set microtask's script evaluation environment settings object set to an empty set.
+
+    // 8. Enqueue microtask on event loop's microtask queue.
+    event_loop.enqueue_microtask(microtask);
+}
+
+void perform_a_microtask_checkpoint()
+{
+    main_thread_event_loop().perform_a_microtask_checkpoint();
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#perform-a-microtask-checkpoint
+void EventLoop::perform_a_microtask_checkpoint()
+{
+    if (execution_paused())
+        return;
+
+    // 1. If the event loop's performing a microtask checkpoint is true, then return.
+    if (m_performing_a_microtask_checkpoint)
+        return;
+
+    // NOTE: This assertion is per requirement 9.5 of the ECMA-262 spec, see: https://tc39.es/ecma262/#sec-jobs
+    // > At some future point in time, when there is no running context in the agent for which the job is scheduled and that agent's execution context stack is empty...
+    VERIFY(vm().execution_context_stack().is_empty());
+    VERIFY(!vm().has_running_execution_context());
+
+    // 2. Set the event loop's performing a microtask checkpoint to true.
+    m_performing_a_microtask_checkpoint = true;
+
+    // 3. While the event loop's microtask queue is not empty:
+    while (!m_microtask_queue.is_empty()) {
+        // 1. Let oldestMicrotask be the result of dequeuing from the event loop's microtask queue.
+        auto oldest_microtask = m_microtask_queue.dequeue();
+
+        // 2. Set the event loop's currently running task to oldestMicrotask.
+        m_currently_running_task = oldest_microtask;
+
+        // 3. Run oldestMicrotask.
+        oldest_microtask->execute();
+
+        // 4. Set the event loop's currently running task back to null.
+        m_currently_running_task = nullptr;
+    }
+
+    // 4. For each environment settings object settingsObject whose responsible event loop is this event loop, notify about rejected promises given settingsObject's global object.
+    auto environments = GC::RootVector { m_related_environment_settings_objects };
+    for (auto& environment_settings_object : environments) {
+        environment_settings_object->universal_global_scope().notify_about_rejected_promises({});
+    }
+
+    // 5. Cleanup Indexed Database transactions.
+    IndexedDB::cleanup_indexed_database_transactions(*this);
+
+    // 6. Perform ClearKeptObjects().
+    vm().finish_execution_generation();
+
+    // 7. Set the event loop's performing a microtask checkpoint to false.
+    m_performing_a_microtask_checkpoint = false;
+
+    // FIXME: 8. Record timing info for microtask checkpoint.
+}
+
+Vector<GC::Root<DOM::Document>> EventLoop::documents_in_this_event_loop_matching(Function<bool(DOM::Document&)> callback) const
+{
+    ensure_documents_sorted();
+    Vector<GC::Root<DOM::Document>> documents;
+    for (auto& document : m_documents) {
+        VERIFY(document);
+        if (document->is_decoded_svg())
+            continue;
+        if (!callback(*document))
+            continue;
+        documents.append(GC::make_root(*document));
+    }
+    return documents;
+}
+
+void EventLoop::register_document(Badge<DOM::Document>, DOM::Document& document)
+{
+    m_documents.append(&document);
+    m_documents_sort_dirty = true;
+}
+
+void EventLoop::unregister_document(Badge<DOM::Document>, DOM::Document& document)
+{
+    bool did_remove = m_documents.remove_first_matching([&](auto& entry) { return entry.ptr() == &document; });
+    VERIFY(did_remove);
+}
+
+void EventLoop::document_navigable_did_change(Badge<DOM::Document>)
+{
+    m_documents_sort_dirty = true;
+}
+
+void EventLoop::ensure_documents_sorted() const
+{
+    // https://html.spec.whatwg.org/multipage/webappapis.html#update-the-rendering step 3.2:
+    // - Any Document B whose container document is A must be listed after A in the list.
+    // - If there are two documents A and B that both have the same non-null container document
+    //   C, then the order of A and B in the list must match the shadow-including tree order
+    //   of their respective navigable containers in C's node tree.
+
+    if (!m_documents_sort_dirty)
+        return;
+    m_documents_sort_dirty = false;
+
+    HashMap<DOM::Document*, size_t> doc_to_index;
+    doc_to_index.ensure_capacity(m_documents.size());
+    for (size_t i = 0; i < m_documents.size(); ++i)
+        doc_to_index.set(m_documents[i].ptr(), i);
+
+    Vector<bool> visited;
+    visited.resize(m_documents.size());
+    Vector<GC::Weak<DOM::Document>> sorted;
+    sorted.ensure_capacity(m_documents.size());
+
+    auto visit = [&](auto& self, size_t idx) -> void {
+        if (visited[idx])
+            return;
+        visited[idx] = true;
+        if (auto navigable = m_documents[idx]->navigable()) {
+            if (auto container_doc = navigable->container_document()) {
+                if (auto container_idx = doc_to_index.get(container_doc.ptr()); container_idx.has_value())
+                    self(self, *container_idx);
+            }
+        }
+        sorted.append(m_documents[idx]);
+    };
+    for (size_t i = 0; i < m_documents.size(); ++i)
+        visit(visit, i);
+
+    m_documents = move(sorted);
+}
+
+void EventLoop::push_onto_backup_incumbent_realm_stack(GC::Ref<EnvironmentSettingsObject> environment_settings_object)
+{
+    m_backup_incumbent_realm_stack.append(environment_settings_object);
+}
+
+void EventLoop::pop_backup_incumbent_realm_stack()
+{
+    m_backup_incumbent_realm_stack.take_last();
+}
+
+EnvironmentSettingsObject& EventLoop::top_of_backup_incumbent_realm_stack()
+{
+    return m_backup_incumbent_realm_stack.last();
+}
+
+void EventLoop::register_environment_settings_object(Badge<EnvironmentSettingsObject>, EnvironmentSettingsObject& environment_settings_object)
+{
+    m_related_environment_settings_objects.append(&environment_settings_object);
+}
+
+void EventLoop::unregister_environment_settings_object(Badge<EnvironmentSettingsObject>, EnvironmentSettingsObject& environment_settings_object)
+{
+    bool did_remove = m_related_environment_settings_objects.remove_first_matching([&](auto& entry) { return entry == &environment_settings_object; });
+    VERIFY(did_remove);
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#same-loop-windows
+Vector<GC::Root<HTML::Window>> EventLoop::same_loop_windows() const
+{
+    Vector<GC::Root<HTML::Window>> windows;
+    for (auto& document : documents_in_this_event_loop_matching([](auto& document) { return document.is_fully_active(); })) {
+        windows.append(GC::make_root(document->window()));
+    }
+    return windows;
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#event-loop-processing-model:last-idle-period-start-time
+double EventLoop::compute_deadline() const
+{
+    // 1. Let deadline be this event loop's last idle period start time plus 50.
+    auto deadline = m_last_idle_period_start_time + 50;
+    // 2. Let hasPendingRenders be false.
+    auto has_pending_renders = false;
+    // 3. For each windowInSameLoop of the same-loop windows for this event loop:
+    for (auto& window : same_loop_windows()) {
+        // 1. If windowInSameLoop's map of animation frame callbacks is not empty,
+        //    or if the user agent believes that the windowInSameLoop might have pending rendering updates,
+        //    set hasPendingRenders to true.
+        if (window->has_animation_frame_callbacks())
+            has_pending_renders = true;
+        // FIXME: 2. Let timerCallbackEstimates be the result of getting the values of windowInSameLoop's map of active timers.
+        // FIXME: 3. For each timeoutDeadline of timerCallbackEstimates, if timeoutDeadline is less than deadline, set deadline to timeoutDeadline.
+    }
+    // 4. If hasPendingRenders is true, then:
+    if (has_pending_renders) {
+        // 1. Let nextRenderDeadline be this event loop's last render opportunity time plus (1000 divided by the current refresh rate).
+        // FIXME: Hardcoded to 60Hz
+        auto next_render_deadline = m_last_render_opportunity_time + (1000.0 / 60.0);
+        // 2. If nextRenderDeadline is less than deadline, then return nextRenderDeadline.
+        if (next_render_deadline < deadline)
+            return next_render_deadline;
+    }
+    // 5. Return deadline.
+    return deadline;
+}
+
+EventLoop::PauseHandle::PauseHandle(EventLoop& event_loop, JS::Object const& global, HighResolutionTime::DOMHighResTimeStamp time_before_pause)
+    : event_loop(event_loop)
+    , global(global)
+    , time_before_pause(time_before_pause)
+{
+}
+
+EventLoop::PauseHandle::~PauseHandle()
+{
+    event_loop->unpause({}, *global, time_before_pause);
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#pause
+EventLoop::PauseHandle EventLoop::pause()
+{
+    m_execution_paused = true;
+
+    // 1. Let global be the current global object.
+    auto& global = current_global_object();
+
+    // 2. Let timeBeforePause be the current high resolution time given global.
+    auto time_before_pause = HighResolutionTime::current_high_resolution_time(global);
+
+    // 3. If necessary, update the rendering or user interface of any Document or navigable to reflect the current state.
+    if (!m_running_rendering_task)
+        update_the_rendering();
+
+    // 4. Wait until the condition goal is met. While a user agent has a paused task, the corresponding event loop must
+    //    not run further tasks, and any script in the currently running task must block. User agents should remain
+    //    responsive to user input while paused, however, albeit in a reduced capacity since the event loop will not be
+    //    doing anything.
+
+    return PauseHandle { *this, global, time_before_pause };
+}
+
+void EventLoop::unpause(Badge<PauseHandle>, JS::Object const& global, HighResolutionTime::DOMHighResTimeStamp time_before_pause)
+{
+    m_execution_paused = false;
+
+    // FIXME: 5. Record pause duration given the duration from timeBeforePause to the current high resolution time given global.
+    [[maybe_unused]] auto pause_duration = HighResolutionTime::current_high_resolution_time(global) - time_before_pause;
+}
+
+}
+
+FILE: Libraries/LibWeb/HTML/EventLoop/EventLoop.h
+/*
+ * Copyright (c) 2021, Andreas Kling <andreas@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Function.h>
+#include <AK/Noncopyable.h>
+#include <AK/Queue.h>
+#include <LibCore/Forward.h>
+#include <LibGC/Ptr.h>
+#include <LibGC/Weak.h>
+#include <LibJS/Forward.h>
+#include <LibWeb/Export.h>
+#include <LibWeb/HTML/EventLoop/TaskQueue.h>
+#include <LibWeb/HighResolutionTime/DOMHighResTimeStamp.h>
+
+namespace Web::HTML {
+
+class WEB_API EventLoop : public JS::Cell {
+    GC_CELL(EventLoop, JS::Cell);
+    GC_DECLARE_ALLOCATOR(EventLoop);
+
+    struct PauseHandle {
+        PauseHandle(EventLoop&, JS::Object const& global, HighResolutionTime::DOMHighResTimeStamp);
+        ~PauseHandle();
+
+        AK_MAKE_NONCOPYABLE(PauseHandle);
+        AK_MAKE_NONMOVABLE(PauseHandle);
+
+        GC::Ref<EventLoop> event_loop;
+        GC::Ref<JS::Object const> global;
+        HighResolutionTime::DOMHighResTimeStamp const time_before_pause;
+    };
+
+public:
+    enum class Type {
+        // https://html.spec.whatwg.org/multipage/webappapis.html#window-event-loop
+        Window,
+        // https://html.spec.whatwg.org/multipage/webappapis.html#worker-event-loop
+        Worker,
+        // https://html.spec.whatwg.org/multipage/webappapis.html#worklet-event-loop
+        Worklet,
+    };
+
+    virtual ~EventLoop() override;
+
+    Type type() const { return m_type; }
+
+    void run_upon_reaching_step_1(GC::Ref<GC::Function<void()>> task) { m_reached_step_1_tasks.append(task); }
+
+    TaskQueue& task_queue() { return *m_task_queue; }
+    TaskQueue const& task_queue() const { return *m_task_queue; }
+
+    bool microtask_queue_empty() const { return m_microtask_queue.is_empty(); }
+    void enqueue_microtask(GC::Ref<HTML::Task> task) { m_microtask_queue.enqueue(task); }
+    GC::Ref<HTML::Task> dequeue_microtask() { return m_microtask_queue.dequeue(); }
+
+    void spin_until(GC::Ref<GC::Function<bool()>> goal_condition);
+    void process();
+    void queue_task_to_update_the_rendering();
+
+    // https://html.spec.whatwg.org/multipage/browsing-the-web.html#termination-nesting-level
+    size_t termination_nesting_level() const { return m_termination_nesting_level; }
+    void increment_termination_nesting_level() { ++m_termination_nesting_level; }
+    void decrement_termination_nesting_level() { --m_termination_nesting_level; }
+
+    Task const* currently_running_task() const { return m_currently_running_task; }
+
+    void schedule();
+
+    void perform_a_microtask_checkpoint();
+
+    void register_document(Badge<DOM::Document>, DOM::Document&);
+    void unregister_document(Badge<DOM::Document>, DOM::Document&);
+    void document_navigable_did_change(Badge<DOM::Document>);
+
+    [[nodiscard]] Vector<GC::Root<DOM::Document>> documents_in_this_event_loop_matching(Function<bool(DOM::Document&)> callback) const;
+
+    Vector<GC::Root<HTML::Window>> same_loop_windows() const;
+
+    void push_onto_backup_incumbent_realm_stack(GC::Ref<EnvironmentSettingsObject>);
+    void pop_backup_incumbent_realm_stack();
+    EnvironmentSettingsObject& top_of_backup_incumbent_realm_stack();
+    bool is_backup_incumbent_realm_stack_empty() const { return m_backup_incumbent_realm_stack.is_empty(); }
+
+    void register_environment_settings_object(Badge<EnvironmentSettingsObject>, EnvironmentSettingsObject&);
+    void unregister_environment_settings_object(Badge<EnvironmentSettingsObject>, EnvironmentSettingsObject&);
+
+    double compute_deadline() const;
+
+    [[nodiscard]] PauseHandle pause();
+    void unpause(Badge<PauseHandle>, JS::Object const& global, HighResolutionTime::DOMHighResTimeStamp);
+    bool execution_paused() const { return m_execution_paused; }
+
+    bool running_rendering_task() const { return m_running_rendering_task; }
+
+private:
+    explicit EventLoop(Type);
+
+    virtual void visit_edges(Visitor&) override;
+
+    void process_input_events() const;
+    void update_the_rendering();
+
+    Type m_type { Type::Window };
+
+    Vector<GC::Ref<GC::Function<void()>>> m_reached_step_1_tasks;
+
+    GC::Ptr<TaskQueue> m_task_queue;
+    Queue<GC::Ref<HTML::Task>> m_microtask_queue;
+
+    // https://html.spec.whatwg.org/multipage/webappapis.html#currently-running-task
+    GC::Ptr<Task> m_currently_running_task { nullptr };
+
+    // https://html.spec.whatwg.org/multipage/webappapis.html#last-render-opportunity-time
+    double m_last_render_opportunity_time { 0 };
+    // https://html.spec.whatwg.org/multipage/webappapis.html#last-idle-period-start-time
+    double m_last_idle_period_start_time { 0 };
+
+    GC::Ptr<Platform::Timer> m_system_event_loop_timer;
+
+    // https://html.spec.whatwg.org/multipage/webappapis.html#performing-a-microtask-checkpoint
+    bool m_performing_a_microtask_checkpoint { false };
+
+    mutable Vector<GC::Weak<DOM::Document>> m_documents;
+    mutable bool m_documents_sort_dirty { false };
+    void ensure_documents_sorted() const;
+
+    // Used to implement step 4 of "perform a microtask checkpoint".
+    // NOTE: These are weak references! ESO registers and unregisters itself from the event loop manually.
+    Vector<RawPtr<EnvironmentSettingsObject>> m_related_environment_settings_objects;
+
+    // https://html.spec.whatwg.org/multipage/webappapis.html#backup-incumbent-settings-object-stack
+    Vector<GC::Ref<EnvironmentSettingsObject>> m_backup_incumbent_realm_stack;
+
+    // https://html.spec.whatwg.org/multipage/browsing-the-web.html#termination-nesting-level
+    size_t m_termination_nesting_level { 0 };
+
+    bool m_execution_paused { false };
+
+    bool m_running_rendering_task { false };
+
+    GC::Ptr<GC::Function<void()>> m_rendering_task_function;
+};
+
+WEB_API EventLoop& main_thread_event_loop();
+WEB_API void run_when_event_loop_reaches_step_1(GC::Ref<GC::Function<void()>> steps);
+WEB_API TaskID queue_a_task(HTML::Task::Source, GC::Ptr<EventLoop>, GC::Ptr<DOM::Document>, GC::Ref<GC::Function<void()>> steps);
+WEB_API TaskID queue_global_task(HTML::Task::Source, JS::Object&, GC::Ref<GC::Function<void()>> steps);
+WEB_API void queue_a_microtask(DOM::Document const*, GC::Ref<GC::Function<void()>> steps);
+void perform_a_microtask_checkpoint();
+
+}
+
+FILE: Libraries/LibWeb/HTML/EventLoop/Task.cpp
+/*
+ * Copyright (c) 2021-2024, Andreas Kling <andreas@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/IDAllocator.h>
+#include <AK/NeverDestroyed.h>
+#include <LibWeb/DOM/Document.h>
+#include <LibWeb/HTML/EventLoop/Task.h>
+
+namespace Web::HTML {
+
+GC_DEFINE_ALLOCATOR(Task);
+
+static IDAllocator& unique_task_source_allocator()
+{
+    static NeverDestroyed<IDAllocator> allocator { static_cast<int>(Task::Source::UniqueTaskSourceStart) };
+    return *allocator;
+}
+
+[[nodiscard]] static TaskID allocate_task_id()
+{
+    static u64 next_task_id = 1;
+    return next_task_id++;
+}
+
+GC::Ref<Task> Task::create(JS::VM& vm, Source source, GC::Ptr<DOM::Document const> document, GC::Ref<GC::Function<void()>> steps)
+{
+    return vm.heap().allocate<Task>(source, document, move(steps));
+}
+
+Task::Task(Source source, GC::Ptr<DOM::Document const> document, GC::Ref<GC::Function<void()>> steps)
+    : m_id(allocate_task_id())
+    , m_source(source)
+    , m_steps(steps)
+    , m_document(document)
+{
+}
+
+Task::~Task() = default;
+
+void Task::visit_edges(Visitor& visitor)
+{
+    Base::visit_edges(visitor);
+    visitor.visit(m_steps);
+    visitor.visit(m_document);
+}
+
+void Task::execute()
+{
+    m_steps->function()();
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#concept-task-runnable
+bool Task::is_runnable() const
+{
+    // A task is runnable if its document is either null or fully active.
+    return !m_document || m_document->is_fully_active();
+}
+
+bool Task::is_permanently_unrunnable() const
+{
+    return m_document && m_document->has_been_destroyed();
+}
+
+DOM::Document const* Task::document() const
+{
+    return m_document.ptr();
+}
+
+UniqueTaskSource::UniqueTaskSource()
+    : source(static_cast<Task::Source>(unique_task_source_allocator().allocate()))
+{
+}
+
+UniqueTaskSource::~UniqueTaskSource()
+{
+    unique_task_source_allocator().deallocate(static_cast<int>(source));
+}
+
+NonnullRefPtr<ParallelQueue> ParallelQueue::create()
+{
+    return adopt_ref(*new (nothrow) ParallelQueue);
+}
+
+TaskID ParallelQueue::enqueue(GC::Ref<GC::Function<void()>> algorithm)
+{
+    auto& event_loop = HTML::main_thread_event_loop();
+    auto task = HTML::Task::create(event_loop.vm(), m_task_source.source, nullptr, algorithm);
+    event_loop.task_queue().add(task);
+    return task->id();
+}
+
+}
+
+FILE: Libraries/LibWeb/HTML/EventLoop/Task.h
+/*
+ * Copyright (c) 2021-2024, Andreas Kling <andreas@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/DistinctNumeric.h>
+#include <AK/IntrusiveList.h>
+#include <AK/RefCounted.h>
+#include <LibGC/CellAllocator.h>
+#include <LibJS/Heap/Cell.h>
+#include <LibWeb/Export.h>
+#include <LibWeb/Forward.h>
+
+namespace Web::HTML {
+
+struct UniqueTaskSource;
+
+AK_TYPEDEF_DISTINCT_NUMERIC_GENERAL(u64, TaskID, Comparison);
+
+class Task final : public JS::Cell {
+    GC_CELL(Task, JS::Cell);
+    GC_DECLARE_ALLOCATOR(Task);
+
+public:
+    // https://html.spec.whatwg.org/multipage/webappapis.html#generic-task-sources
+    enum class Source {
+        Unspecified,
+        DOMManipulation,
+        UserInteraction,
+        Networking,
+        HistoryTraversal,
+        IdleTask,
+        PostedMessage,
+        Microtask,
+        TimerTask,
+        JavaScriptEngine,
+
+        // https://w3c.github.io/geolocation/#dfn-geolocation-task-source
+        Geolocation,
+
+        // https://html.spec.whatwg.org/multipage/imagebitmap-and-animations.html#bitmap-task-source
+        BitmapTask,
+
+        // https://html.spec.whatwg.org/multipage/webappapis.html#navigation-and-traversal-task-source
+        NavigationAndTraversal,
+
+        // https://w3c.github.io/FileAPI/#fileReadingTaskSource
+        FileReading,
+
+        // https://www.w3.org/TR/intersection-observer/#intersectionobserver-task-source
+        IntersectionObserver,
+
+        // https://w3c.github.io/performance-timeline/#dfn-performance-timeline-task-source
+        PerformanceTimeline,
+
+        // https://html.spec.whatwg.org/multipage/canvas.html#canvas-blob-serialisation-task-source
+        CanvasBlobSerializationTask,
+
+        // https://w3c.github.io/clipboard-apis/#clipboard-task-source
+        Clipboard,
+
+        // https://w3c.github.io/permissions/#permissions-task-source
+        Permissions,
+
+        // https://drafts.csswg.org/css-font-loading/#task-source
+        FontLoading,
+
+        // https://html.spec.whatwg.org/multipage/server-sent-events.html#remote-event-task-source
+        RemoteEvent,
+
+        // https://html.spec.whatwg.org/multipage/webappapis.html#rendering-task-source
+        Rendering,
+
+        // https://w3c.github.io/IndexedDB/#database-access-task-source
+        DatabaseAccess,
+
+        // https://websockets.spec.whatwg.org/#websocket-task-source
+        WebSocket,
+
+        // https://w3c.github.io/media-capabilities/#media-capabilities-task-source
+        MediaCapabilities,
+
+        // https://w3c.github.io/gamepad/#dfn-gamepad-task-source
+        Gamepad,
+
+        // https://registry.khronos.org/webgl/specs/latest/1.0/#5.15
+        WebGL,
+
+        // https://www.w3.org/TR/webcrypto-2/#dfn-crypto-task-source
+        Crypto,
+
+        // https://w3c.github.io/web-locks/#web-locks-tasks-source
+        WebLocks,
+
+        // https://storage.spec.whatwg.org/#task-source
+        Storage,
+
+        // !!! IMPORTANT: Keep this field last!
+        // This serves as the base value of all unique task sources.
+        // Some elements, such as the HTMLMediaElement, must have a unique task source per instance.
+        UniqueTaskSourceStart
+    };
+
+    static GC::Ref<Task> create(JS::VM&, Source, GC::Ptr<DOM::Document const>, GC::Ref<GC::Function<void()>> steps);
+
+    virtual ~Task() override;
+
+    [[nodiscard]] TaskID id() const { return m_id; }
+    Source source() const { return m_source; }
+    void execute();
+
+    DOM::Document const* document() const;
+
+    bool is_runnable() const;
+    bool is_permanently_unrunnable() const;
+
+private:
+    Task(Source, GC::Ptr<DOM::Document const>, GC::Ref<GC::Function<void()>> steps);
+
+    virtual void visit_edges(Visitor&) override;
+
+    TaskID m_id {};
+    Source m_source { Source::Unspecified };
+    GC::Ref<GC::Function<void()>> m_steps;
+    GC::Ptr<DOM::Document const> m_document;
+
+    IntrusiveListNode<Task> m_task_queue_node;
+
+public:
+    using Queue = IntrusiveList<&Task::m_task_queue_node>;
+};
+
+struct WEB_API UniqueTaskSource {
+    UniqueTaskSource();
+    ~UniqueTaskSource();
+
+    Task::Source const source;
+};
+
+class WEB_API ParallelQueue : public RefCounted<ParallelQueue> {
+public:
+    static NonnullRefPtr<ParallelQueue> create();
+    TaskID enqueue(GC::Ref<GC::Function<void()>>);
+
+private:
+    UniqueTaskSource m_task_source;
+};
+
+}
+
+FILE: Libraries/LibWeb/HTML/EventLoop/TaskQueue.cpp
+/*
+ * Copyright (c) 2021-2025, Andreas Kling <andreas@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <LibGC/RootVector.h>
+#include <LibWeb/DOM/Document.h>
+#include <LibWeb/HTML/EventLoop/EventLoop.h>
+#include <LibWeb/HTML/EventLoop/TaskQueue.h>
+
+namespace Web::HTML {
+
+GC_DEFINE_ALLOCATOR(TaskQueue);
+
+TaskQueue::TaskQueue(HTML::EventLoop& event_loop)
+    : m_event_loop(event_loop)
+{
+}
+
+TaskQueue::~TaskQueue() = default;
+
+void TaskQueue::visit_edges(Visitor& visitor)
+{
+    Base::visit_edges(visitor);
+    visitor.visit(m_event_loop);
+    for (auto& task : m_tasks)
+        visitor.visit(task);
+    for (auto& task : m_idle_tasks)
+        visitor.visit(task);
+    visitor.visit(m_last_added_task);
+}
+
+void TaskQueue::add(GC::Ref<Task> task)
+{
+    // AD-HOC: Don't enqueue tasks for temporary (inert) documents used for fragment parsing.
+    // FIXME: There's ongoing spec work to remove such documents: https://github.com/whatwg/html/pull/11970
+    if (task->document() && task->document()->is_temporary_document_for_fragment_parsing())
+        return;
+
+    m_last_added_task = task.ptr();
+    if (task->source() == Task::Source::IdleTask)
+        m_idle_tasks.append(*task);
+    else
+        m_tasks.append(*task);
+    m_event_loop->schedule();
+}
+
+GC::Ptr<Task> TaskQueue::dequeue()
+{
+    auto take_task = [&](auto& tasks) -> GC::Ptr<Task> {
+        if (tasks.is_empty())
+            return {};
+        auto* task = tasks.take_first();
+        if (m_last_added_task == task)
+            m_last_added_task = {};
+        return task;
+    };
+
+    if (auto task = take_task(m_tasks))
+        return task;
+    return take_task(m_idle_tasks);
+}
+
+GC::Ptr<Task> TaskQueue::take_first_runnable()
+{
+    if (m_event_loop->execution_paused())
+        return nullptr;
+
+    for (auto it = m_tasks.begin(); it != m_tasks.end();) {
+        auto& task = *it;
+
+        if (m_event_loop->running_rendering_task() && task.source() == Task::Source::Rendering) {
+            ++it;
+            continue;
+        }
+
+        if (task.is_runnable()) {
+            if (m_last_added_task == &task)
+                m_last_added_task = {};
+            it.erase();
+            return &task;
+        }
+
+        if (task.is_permanently_unrunnable()) {
+            if (m_last_added_task == &task)
+                m_last_added_task = {};
+            it.erase();
+            continue;
+        }
+
+        ++it;
+    }
+
+    for (auto it = m_idle_tasks.begin(); it != m_idle_tasks.end();) {
+        auto& task = *it;
+
+        if (task.is_runnable()) {
+            if (m_last_added_task == &task)
+                m_last_added_task = {};
+            it.erase();
+            return &task;
+        }
+
+        if (task.is_permanently_unrunnable()) {
+            if (m_last_added_task == &task)
+                m_last_added_task = {};
+            it.erase();
+            continue;
+        }
+
+        ++it;
+    }
+    return nullptr;
+}
+
+bool TaskQueue::has_runnable_tasks() const
+{
+    if (m_event_loop->execution_paused())
+        return false;
+
+    for (auto& task : m_tasks) {
+        if (m_event_loop->running_rendering_task() && task.source() == Task::Source::Rendering)
+            continue;
+        if (task.is_runnable())
+            return true;
+    }
+
+    for (auto& task : m_idle_tasks) {
+        if (task.is_runnable())
+            return true;
+    }
+    return false;
+}
+
+void TaskQueue::remove_tasks_matching(Function<bool(HTML::Task const&)> filter)
+{
+    auto remove_matching_tasks = [&](auto& tasks) {
+        for (auto it = tasks.begin(); it != tasks.end();) {
+            auto& task = *it;
+            if (!filter(task)) {
+                ++it;
+                continue;
+            }
+            if (m_last_added_task == &task)
+                m_last_added_task = {};
+            it.erase();
+        }
+    };
+    remove_matching_tasks(m_tasks);
+    remove_matching_tasks(m_idle_tasks);
+}
+
+GC::Ptr<Task> TaskQueue::take_first_runnable_matching(Function<bool(HTML::Task const&)> filter)
+{
+    for (auto it = m_tasks.begin(); it != m_tasks.end();) {
+        auto& task = *it;
+
+        if (task.is_runnable() && filter(task)) {
+            if (m_last_added_task == &task)
+                m_last_added_task = {};
+            it.erase();
+            return &task;
+        }
+
+        if (task.is_permanently_unrunnable()) {
+            if (m_last_added_task == &task)
+                m_last_added_task = {};
+            it.erase();
+            continue;
+        }
+
+        ++it;
+    }
+
+    for (auto it = m_idle_tasks.begin(); it != m_idle_tasks.end();) {
+        auto& task = *it;
+
+        if (task.is_runnable() && filter(task)) {
+            if (m_last_added_task == &task)
+                m_last_added_task = {};
+            it.erase();
+            return &task;
+        }
+
+        if (task.is_permanently_unrunnable()) {
+            if (m_last_added_task == &task)
+                m_last_added_task = {};
+            it.erase();
+            continue;
+        }
+
+        ++it;
+    }
+
+    return nullptr;
+}
+
+Task const* TaskQueue::last_added_task() const
+{
+    return m_last_added_task.ptr();
+}
+
+bool TaskQueue::has_rendering_tasks() const
+{
+    for (auto const& task : m_tasks) {
+        if (task.source() == Task::Source::Rendering)
+            return true;
+    }
+    return false;
+}
+
+}
+
+FILE: Libraries/LibWeb/HTML/EventLoop/TaskQueue.h
+/*
+ * Copyright (c) 2021-2024, Andreas Kling <andreas@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <LibJS/Heap/Cell.h>
+#include <LibWeb/HTML/EventLoop/Task.h>
+
+namespace Web::HTML {
+
+class TaskQueue : public JS::Cell {
+    GC_CELL(TaskQueue, JS::Cell);
+    GC_DECLARE_ALLOCATOR(TaskQueue);
+
+public:
+    explicit TaskQueue(HTML::EventLoop&);
+    virtual ~TaskQueue() override;
+
+    bool is_empty() const { return m_tasks.is_empty() && m_idle_tasks.is_empty(); }
+
+    bool has_runnable_tasks() const;
+    bool has_rendering_tasks() const;
+
+    void add(GC::Ref<HTML::Task>);
+    GC::Ptr<HTML::Task> take_first_runnable();
+
+    void enqueue(GC::Ref<HTML::Task> task) { add(task); }
+    GC::Ptr<HTML::Task> dequeue();
+
+    void remove_tasks_matching(Function<bool(HTML::Task const&)>);
+    GC::Ptr<Task> take_first_runnable_matching(Function<bool(HTML::Task const&)>);
+
+    Task const* last_added_task() const;
+
+private:
+    virtual void visit_edges(Visitor&) override;
+
+    GC::Ref<HTML::EventLoop> m_event_loop;
+
+    Task::Queue m_tasks;
+    Task::Queue m_idle_tasks;
+    GC::Ptr<HTML::Task const> m_last_added_task;
+};
+
+}
+
+FILE: Libraries/LibWeb/HTML/EventNames.cpp
+/*
+ * Copyright (c) 2020, the SerenityOS developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <LibWeb/HTML/EventNames.h>
+
+namespace Web::HTML::EventNames {
+
+#define __ENUMERATE_HTML_EVENT(name) \
+    Utf16FlyString const& name = *new Utf16FlyString(#name##_utf16_fly_string);
+ENUMERATE_HTML_EVENTS
+#undef __ENUMERATE_HTML_EVENT
+
+}
+
+FILE: Libraries/LibWeb/HTML/EventNames.h
+/*
+ * Copyright (c) 2020, the SerenityOS developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Utf16FlyString.h>
+#include <LibWeb/Export.h>
+
+namespace Web::HTML::EventNames {
+
+#define ENUMERATE_HTML_EVENTS                        \
+    __ENUMERATE_HTML_EVENT(abort)                    \
+    __ENUMERATE_HTML_EVENT(addtrack)                 \
+    __ENUMERATE_HTML_EVENT(afterprint)               \
+    __ENUMERATE_HTML_EVENT(animationcancel)          \
+    __ENUMERATE_HTML_EVENT(animationend)             \
+    __ENUMERATE_HTML_EVENT(animationiteration)       \
+    __ENUMERATE_HTML_EVENT(animationstart)           \
+    __ENUMERATE_HTML_EVENT(audioend)                 \
+    __ENUMERATE_HTML_EVENT(audioprocess)             \
+    __ENUMERATE_HTML_EVENT(audiostart)               \
+    __ENUMERATE_HTML_EVENT(begin)                    \
+    __ENUMERATE_HTML_EVENT(beforeinput)              \
+    __ENUMERATE_HTML_EVENT(beforematch)              \
+    __ENUMERATE_HTML_EVENT(beforeprint)              \
+    __ENUMERATE_HTML_EVENT(beforetoggle)             \
+    __ENUMERATE_HTML_EVENT(beforeunload)             \
+    __ENUMERATE_HTML_EVENT(blocked)                  \
+    __ENUMERATE_HTML_EVENT(blur)                     \
+    __ENUMERATE_HTML_EVENT(boundary)                 \
+    __ENUMERATE_HTML_EVENT(cancel)                   \
+    __ENUMERATE_HTML_EVENT(canplay)                  \
+    __ENUMERATE_HTML_EVENT(canplaythrough)           \
+    __ENUMERATE_HTML_EVENT(change)                   \
+    __ENUMERATE_HTML_EVENT(click)                    \
+    __ENUMERATE_HTML_EVENT(close)                    \
+    __ENUMERATE_HTML_EVENT(command)                  \
+    __ENUMERATE_HTML_EVENT(complete)                 \
+    __ENUMERATE_HTML_EVENT(connect)                  \
+    __ENUMERATE_HTML_EVENT(contextlost)              \
+    __ENUMERATE_HTML_EVENT(contextmenu)              \
+    __ENUMERATE_HTML_EVENT(contextrestored)          \
+    __ENUMERATE_HTML_EVENT(controllerchange)         \
+    __ENUMERATE_HTML_EVENT(copy)                     \
+    __ENUMERATE_HTML_EVENT(cuechange)                \
+    __ENUMERATE_HTML_EVENT(currententrychange)       \
+    __ENUMERATE_HTML_EVENT(cut)                      \
+    __ENUMERATE_HTML_EVENT(devicechange)             \
+    __ENUMERATE_HTML_EVENT(disconnect)               \
+    __ENUMERATE_HTML_EVENT(dispose)                  \
+    __ENUMERATE_HTML_EVENT(DOMContentLoaded)         \
+    __ENUMERATE_HTML_EVENT(drag)                     \
+    __ENUMERATE_HTML_EVENT(dragend)                  \
+    __ENUMERATE_HTML_EVENT(dragenter)                \
+    __ENUMERATE_HTML_EVENT(dragleave)                \
+    __ENUMERATE_HTML_EVENT(dragover)                 \
+    __ENUMERATE_HTML_EVENT(dragstart)                \
+    __ENUMERATE_HTML_EVENT(drop)                     \
+    __ENUMERATE_HTML_EVENT(durationchange)           \
+    __ENUMERATE_HTML_EVENT(emptied)                  \
+    __ENUMERATE_HTML_EVENT(end)                      \
+    __ENUMERATE_HTML_EVENT(ended)                    \
+    __ENUMERATE_HTML_EVENT(enter)                    \
+    __ENUMERATE_HTML_EVENT(error)                    \
+    __ENUMERATE_HTML_EVENT(exit)                     \
+    __ENUMERATE_HTML_EVENT(finish)                   \
+    __ENUMERATE_HTML_EVENT(focus)                    \
+    __ENUMERATE_HTML_EVENT(focusin)                  \
+    __ENUMERATE_HTML_EVENT(focusout)                 \
+    __ENUMERATE_HTML_EVENT(formdata)                 \
+    __ENUMERATE_HTML_EVENT(fullscreenchange)         \
+    __ENUMERATE_HTML_EVENT(fullscreenerror)          \
+    __ENUMERATE_HTML_EVENT(hashchange)               \
+    __ENUMERATE_HTML_EVENT(input)                    \
+    __ENUMERATE_HTML_EVENT(invalid)                  \
+    __ENUMERATE_HTML_EVENT(languagechange)           \
+    __ENUMERATE_HTML_EVENT(load)                     \
+    __ENUMERATE_HTML_EVENT(loaded)                   \
+    __ENUMERATE_HTML_EVENT(loadeddata)               \
+    __ENUMERATE_HTML_EVENT(loadedmetadata)           \
+    __ENUMERATE_HTML_EVENT(loadend)                  \
+    __ENUMERATE_HTML_EVENT(loading)                  \
+    __ENUMERATE_HTML_EVENT(loadingdone)              \
+    __ENUMERATE_HTML_EVENT(loadingerror)             \
+    __ENUMERATE_HTML_EVENT(loadstart)                \
+    __ENUMERATE_HTML_EVENT(mark)                     \
+    __ENUMERATE_HTML_EVENT(message)                  \
+    __ENUMERATE_HTML_EVENT(messageerror)             \
+    __ENUMERATE_HTML_EVENT(navigate)                 \
+    __ENUMERATE_HTML_EVENT(navigateerror)            \
+    __ENUMERATE_HTML_EVENT(navigatesuccess)          \
+    __ENUMERATE_HTML_EVENT(nomatch)                  \
+    __ENUMERATE_HTML_EVENT(offline)                  \
+    __ENUMERATE_HTML_EVENT(online)                   \
+    __ENUMERATE_HTML_EVENT(open)                     \
+    __ENUMERATE_HTML_EVENT(pagehide)                 \
+    __ENUMERATE_HTML_EVENT(pagereveal)               \
+    __ENUMERATE_HTML_EVENT(pageshow)                 \
+    __ENUMERATE_HTML_EVENT(pageswap)                 \
+    __ENUMERATE_HTML_EVENT(paste)                    \
+    __ENUMERATE_HTML_EVENT(pause)                    \
+    __ENUMERATE_HTML_EVENT(play)                     \
+    __ENUMERATE_HTML_EVENT(playing)                  \
+    __ENUMERATE_HTML_EVENT(popstate)                 \
+    __ENUMERATE_HTML_EVENT(progress)                 \
+    __ENUMERATE_HTML_EVENT(ratechange)               \
+    __ENUMERATE_HTML_EVENT(readystatechange)         \
+    __ENUMERATE_HTML_EVENT(rejectionhandled)         \
+    __ENUMERATE_HTML_EVENT(remove)                   \
+    __ENUMERATE_HTML_EVENT(removetrack)              \
+    __ENUMERATE_HTML_EVENT(repeat)                   \
+    __ENUMERATE_HTML_EVENT(reset)                    \
+    __ENUMERATE_HTML_EVENT(resize)                   \
+    __ENUMERATE_HTML_EVENT(result)                   \
+    __ENUMERATE_HTML_EVENT(resume)                   \
+    __ENUMERATE_HTML_EVENT(scroll)                   \
+    __ENUMERATE_HTML_EVENT(scrollend)                \
+    __ENUMERATE_HTML_EVENT(securitypolicyviolation)  \
+    __ENUMERATE_HTML_EVENT(seeked)                   \
+    __ENUMERATE_HTML_EVENT(seeking)                  \
+    __ENUMERATE_HTML_EVENT(select)                   \
+    __ENUMERATE_HTML_EVENT(selectionchange)          \
+    __ENUMERATE_HTML_EVENT(slotchange)               \
+    __ENUMERATE_HTML_EVENT(soundend)                 \
+    __ENUMERATE_HTML_EVENT(soundstart)               \
+    __ENUMERATE_HTML_EVENT(speechend)                \
+    __ENUMERATE_HTML_EVENT(speechstart)              \
+    __ENUMERATE_HTML_EVENT(stalled)                  \
+    __ENUMERATE_HTML_EVENT(start)                    \
+    __ENUMERATE_HTML_EVENT(statechange)              \
+    __ENUMERATE_HTML_EVENT(storage)                  \
+    __ENUMERATE_HTML_EVENT(submit)                   \
+    __ENUMERATE_HTML_EVENT(success)                  \
+    __ENUMERATE_HTML_EVENT(suspend)                  \
+    __ENUMERATE_HTML_EVENT(timeupdate)               \
+    __ENUMERATE_HTML_EVENT(toggle)                   \
+    __ENUMERATE_HTML_EVENT(transitioncancel)         \
+    __ENUMERATE_HTML_EVENT(transitionend)            \
+    __ENUMERATE_HTML_EVENT(transitionrun)            \
+    __ENUMERATE_HTML_EVENT(transitionstart)          \
+    __ENUMERATE_HTML_EVENT(unhandledrejection)       \
+    __ENUMERATE_HTML_EVENT(unload)                   \
+    __ENUMERATE_HTML_EVENT(upgradeneeded)            \
+    __ENUMERATE_HTML_EVENT(versionchange)            \
+    __ENUMERATE_HTML_EVENT(visibilitychange)         \
+    __ENUMERATE_HTML_EVENT(voiceschanged)            \
+    __ENUMERATE_HTML_EVENT(volumechange)             \
+    __ENUMERATE_HTML_EVENT(waiting)                  \
+    __ENUMERATE_HTML_EVENT(webkitAnimationEnd)       \
+    __ENUMERATE_HTML_EVENT(webkitAnimationIteration) \
+    __ENUMERATE_HTML_EVENT(webkitAnimationStart)     \
+    __ENUMERATE_HTML_EVENT(webkitTransitionEnd)
+
+#define __ENUMERATE_HTML_EVENT(name) extern WEB_API Utf16FlyString const& name;
+ENUMERATE_HTML_EVENTS
+#undef __ENUMERATE_HTML_EVENT
+
+}
+
+FILE: Libraries/LibWeb/HTML/EventSource.cpp
+/*
+ * Copyright (c) 2024, Tim Flynn <trflynn89@serenityos.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/ScopeGuard.h>
+#include <AK/Utf16String.h>
+#include <LibCore/EventLoop.h>
+#include <LibGC/Heap.h>
+#include <LibJS/Runtime/Realm.h>
+#include <LibJS/Runtime/VM.h>
+#include <LibWeb/Bindings/EventSource.h>
+#include <LibWeb/Bindings/Intrinsics.h>
+#include <LibWeb/Bindings/MessageEvent.h>
+#include <LibWeb/DOM/Event.h>
+#include <LibWeb/Fetch/Fetching/Fetching.h>
+#include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
+#include <LibWeb/Fetch/Infrastructure/FetchController.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/MIME.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
+#include <LibWeb/HTML/CORSSettingAttribute.h>
+#include <LibWeb/HTML/EventLoop/EventLoop.h>
+#include <LibWeb/HTML/EventNames.h>
+#include <LibWeb/HTML/EventSource.h>
+#include <LibWeb/HTML/MessageEvent.h>
+#include <LibWeb/HTML/MessagePort.h>
+#include <LibWeb/HTML/PotentialCORSRequest.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
+
+namespace Web::HTML {
+
+GC_DEFINE_ALLOCATOR(EventSource);
+
+template<typename Callback>
+static void for_each_line(Utf16View string, Callback&& callback)
+{
+    size_t substart = 0;
+    bool last_ch_was_cr = false;
+
+    for (size_t i = 0; i < string.length_in_code_units(); ++i) {
+        auto ch = string.code_unit_at(i);
+        bool split_view = false;
+
+        switch (ch) {
+        case '\n':
+            if (last_ch_was_cr)
+                substart = i + 1;
+            else
+                split_view = true;
+
+            last_ch_was_cr = false;
+            break;
+
+        case '\r':
+            split_view = true;
+            last_ch_was_cr = true;
+            break;
+
+        default:
+            last_ch_was_cr = false;
+            break;
+        }
+
+        if (split_view) {
+            callback(string.substring_view(substart, i - substart));
+            substart = i + 1;
+        }
+    }
+
+    if (auto tail_length = string.length_in_code_units() - substart; tail_length != 0)
         callback(string.substring_view(substart, tail_length));
 }
 
@@ -1321,6 +3036,8 @@ FILE: Libraries/LibWeb/HTML/FormAssociatedElement.cpp
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/DOM/Position.h>
 #include <LibWeb/DOM/SelectionchangeEventDispatching.h>
+#include <LibWeb/Editing/EditCommand.h>
+#include <LibWeb/Editing/EditingHistory.h>
 #include <LibWeb/HTML/CustomElements/CustomElementReactionNames.h>
 #include <LibWeb/HTML/Focus.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
@@ -2369,6 +4086,11 @@ void FormAssociatedTextControlElement::set_the_selection_range(Optional<WebIDL::
             });
         }
 
+        // NB: A selection change ends typing coalescence in the editing history, unless it was
+        //     made by the recorded edit itself or by history application.
+        if (auto history = html_element.document().editing_history_if_exists())
+            history->selection_changed();
+
         selection_was_changed(source);
     }
 }
@@ -2392,7 +4114,34 @@ void FormAssociatedTextControlElement::handle_insert(Utf16FlyString const& input
 
     auto selection_start = this->selection_start();
     auto selection_end = this->selection_end();
-    MUST(set_range_text(data_for_insertion, selection_start, selection_end, Bindings::SelectionMode::End));
+
+    // Record the edit on the document's editing history so the user can undo it. Pastes never
+    // coalesce with typing, like in the editing host path.
+    auto& html_element = text_control_to_html_element();
+    auto category = input_type == UIEvents::InputTypes::insertFromPaste
+        ? Editing::UndoStep::Category::Other
+        : Editing::UndoStep::Category::Insertion;
+    auto history = html_element.document().editing_history();
+    history->begin_recording(html_element, category);
+    auto old_value = relevant_value();
+    auto clamped_start = min(selection_start, old_value.length_in_code_units());
+    auto clamped_end = min(selection_end, old_value.length_in_code_units());
+    auto removed_data = Utf16String::from_utf16(old_value.substring_view(clamped_start, clamped_end - clamped_start));
+
+    {
+        Editing::EditingHistory::ProxyMutationScope proxy_scope { html_element };
+        MUST(set_range_text(data_for_insertion, selection_start, selection_end, Bindings::SelectionMode::End));
+    }
+
+    if (auto step = history->undo_step_being_recorded(); step) {
+        if (removed_data.utf16_view() != data_for_insertion) {
+            step->add_command(html_element.heap().allocate<Editing::ReplaceDataCommand>(
+                *text_node, clamped_start, removed_data, Utf16String::from_utf16(data_for_insertion)));
+        }
+        if (input_type == UIEvents::InputTypes::insertLineBreak || input_type == UIEvents::InputTypes::insertParagraph)
+            step->set_closes_after_next_merge();
+    }
+    history->end_recording();
 
     text_node->invalidate_style(DOM::StyleInvalidationReason::EditingInsertion);
 
@@ -2425,7 +4174,32 @@ void FormAssociatedTextControlElement::handle_delete(Utf16FlyString const& input
         }
     }
 
-    MUST(set_range_text({}, selection_start, selection_end, Bindings::SelectionMode::End));
+    // Record the edit on the document's editing history so the user can undo it. Backward and
+    // forward deletion runs coalesce separately, and cuts never coalesce, like in the editing
+    // host path.
+    auto& html_element = text_control_to_html_element();
+    auto category = Editing::UndoStep::Category::Other;
+    if (input_type == UIEvents::InputTypes::deleteContentBackward)
+        category = Editing::UndoStep::Category::BackwardDeletion;
+    else if (input_type == UIEvents::InputTypes::deleteContentForward)
+        category = Editing::UndoStep::Category::ForwardDeletion;
+    auto history = html_element.document().editing_history();
+    history->begin_recording(html_element, category);
+    auto old_value = relevant_value();
+    auto clamped_start = min(selection_start, old_value.length_in_code_units());
+    auto clamped_end = min(selection_end, old_value.length_in_code_units());
+    auto removed_data = Utf16String::from_utf16(old_value.substring_view(clamped_start, clamped_end - clamped_start));
+
+    {
+        Editing::EditingHistory::ProxyMutationScope proxy_scope { html_element };
+        MUST(set_range_text({}, selection_start, selection_end, Bindings::SelectionMode::End));
+    }
+
+    if (auto step = history->undo_step_being_recorded(); step && !removed_data.is_empty()) {
+        step->add_command(html_element.heap().allocate<Editing::ReplaceDataCommand>(
+            *text_node, clamped_start, removed_data, Utf16String {}));
+    }
+    history->end_recording();
 
     text_node->invalidate_style(DOM::StyleInvalidationReason::EditingDeletion);
     did_edit_text_node(input_type, {});
@@ -2455,6 +4229,10 @@ void FormAssociatedTextControlElement::move_selection_end_to(size_t offset, Text
         m_selection_start = offset;
     m_selection_end = offset;
     m_selection_end_affinity = affinity;
+
+    // NB: Caret movement ends typing coalescence in the editing history.
+    if (auto history = text_control_to_html_element().document().editing_history_if_exists())
+        history->selection_changed();
 }
 
 void FormAssociatedTextControlElement::scroll_cursor_into_view()
@@ -2743,7 +4521,7 @@ FILE: Libraries/LibWeb/HTML/FormAssociatedElement.h
 namespace Web::HTML {
 
 // https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#selection-direction
-enum class SelectionDirection {
+enum class SelectionDirection : u8 {
     Forward,
     Backward,
     None,
@@ -39882,6 +41660,7 @@ FILE: Libraries/LibWeb/HTML/LocalNavigable.cpp
 #include <LibWeb/DOM/Position.h>
 #include <LibWeb/DOM/Range.h>
 #include <LibWeb/DOM/Text.h>
+#include <LibWeb/Editing/EditingHistory.h>
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
@@ -43929,6 +45708,24 @@ void LocalNavigable::paste(Utf16View text)
     m_event_handler.handle_paste(text);
 }
 
+void LocalNavigable::undo()
+{
+    auto document = active_document();
+    if (!document)
+        return;
+
+    (void)Editing::perform_history_action(*document, Editing::HistoryAction::Undo);
+}
+
+void LocalNavigable::redo()
+{
+    auto document = active_document();
+    if (!document)
+        return;
+
+    (void)Editing::perform_history_action(*document, Editing::HistoryAction::Redo);
+}
+
 void LocalNavigable::set_marked_text_from_input_method(Utf16View text)
 {
     // Platform input methods call this on each composition update, with the current marked/preedit text. LibWeb owns
@@ -44667,6 +46464,8 @@ public:
     Utf16String cut_selected_text() const;
     void select_all();
     void paste(Utf16View);
+    void undo();
+    void redo();
     void set_marked_text_from_input_method(Utf16View text);
     void commit_text_from_input_method(Utf16View text, i32 replacement_start = 0, i32 replacement_length = 0);
     void unmark_text_from_input_method();
@@ -155294,6 +157093,7 @@ FILE: Libraries/LibWeb/Page/EventHandler.cpp
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/Range.h>
 #include <LibWeb/DOM/Text.h>
+#include <LibWeb/Editing/EditingHistory.h>
 #include <LibWeb/Editing/Internal/Algorithms.h>
 #include <LibWeb/GraphemeEdgeTracker.h>
 #include <LibWeb/HTML/CloseWatcherManager.h>
@@ -156407,6 +158207,17 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
             return perform_cut_action();
         if (key == UIEvents::KeyCode::Key_V)
             return perform_paste_action();
+        if (key == UIEvents::KeyCode::Key_Z)
+            return Editing::perform_history_action(*document, Editing::HistoryAction::Undo);
+#if !defined(AK_OS_MACOS)
+        // INTEROP: Chromium redoes on Ctrl+Y on Windows and Linux; on macOS Cmd+Y is not a redo shortcut.
+        if (key == UIEvents::KeyCode::Key_Y)
+            return Editing::perform_history_action(*document, Editing::HistoryAction::Redo);
+#endif
+    }
+    if ((modifiers & UIEvents::Mod_PlatformCtrl) != 0 && (modifiers & UIEvents::Mod_Shift) != 0 && (modifiers & UIEvents::Mod_Alt) == 0
+        && key == UIEvents::KeyCode::Key_Z) {
+        return Editing::perform_history_action(*document, Editing::HistoryAction::Redo);
     }
 
     if (auto* target = document->active_input_events_target()) {
@@ -161062,6 +162873,7 @@ public:
     virtual HTML::CrossProcessId allocate_navigable_id() { return allocate_cross_process_id(); }
     virtual void request_frame() = 0;
     virtual void page_did_change_title(Utf16String const&) { }
+    virtual void page_did_update_editing_history_state(bool, bool) { }
     virtual void page_did_change_url(URL::URL const&) { }
     virtual void page_did_request_refresh() { }
     virtual void page_did_request_resize_window(Gfx::IntSize) { }
@@ -195228,6 +197040,7 @@ FILE: Libraries/LibWeb/Selection/Selection.cpp
 #include <LibWeb/DOM/Position.h>
 #include <LibWeb/DOM/Range.h>
 #include <LibWeb/DOM/Text.h>
+#include <LibWeb/Editing/EditingHistory.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/Layout/Box.h>
 #include <LibWeb/Painting/Paintable.h>
@@ -195800,6 +197613,13 @@ void Selection::set_range(GC::Ptr<DOM::Range> range)
     if (((old_range == nullptr) != (range == nullptr)) || (old_range && *old_range != *range)) {
         m_document->reset_command_state_overrides();
         m_document->reset_command_value_overrides();
+    }
+
+    // NB: Removing the selection ends typing coalescence in the editing history; changes to an associated range are
+    //     handled in Range::update_associated_selection().
+    if (!range) {
+        if (auto history = m_document->editing_history_if_exists())
+            history->selection_changed();
     }
 
     // https://developer.mozilla.org/en-US/docs/Web/API/Selection#behavior_of_selection_api_in_terms_of_editing_host_focus_changes
@@ -232997,6 +234817,8 @@ namespace Web::UIEvents::InputTypes {
     __ENUMERATE_INPUT_TYPE(deleteByCut)           \
     __ENUMERATE_INPUT_TYPE(deleteContentBackward) \
     __ENUMERATE_INPUT_TYPE(deleteContentForward)  \
+    __ENUMERATE_INPUT_TYPE(historyRedo)           \
+    __ENUMERATE_INPUT_TYPE(historyUndo)           \
     __ENUMERATE_INPUT_TYPE(insertFromPaste)       \
     __ENUMERATE_INPUT_TYPE(insertLineBreak)       \
     __ENUMERATE_INPUT_TYPE(insertParagraph)       \
@@ -283931,6 +285753,15 @@ void Application::initialize_actions()
             view->reload();
     });
 
+    m_undo_action = Action::create("Undo"sv, ActionID::Undo, [this]() {
+        if (auto view = active_web_view(); view.has_value())
+            view->undo();
+    });
+    m_redo_action = Action::create("Redo"sv, ActionID::Redo, [this]() {
+        if (auto view = active_web_view(); view.has_value())
+            view->redo();
+    });
+    update_editing_history_actions();
     m_copy_selection_action = Action::create("Copy"sv, ActionID::CopySelection, [this]() {
         if (auto view = active_web_view(); view.has_value()) {
             if (auto text = view->selected_text(); !text.is_empty())
@@ -284609,6 +286440,13 @@ void Application::inspect_indexed_database_objects(DevTools::TabDescription cons
     }
 
     view->inspect_indexed_database_objects(host, move(names), move(options), move(on_complete));
+}
+
+void Application::update_editing_history_actions()
+{
+    auto view = active_web_view();
+    m_undo_action->set_enabled(view.has_value() && view->can_undo());
+    m_redo_action->set_enabled(view.has_value() && view->can_redo());
 }
 
 void Application::delete_indexed_database(DevTools::TabDescription const& description, String const& host, String const& name, OnIndexedDBInspectionComplete on_complete) const
@@ -285427,6 +287265,12 @@ public:
 
     Action& reload_action() { return *m_reload_action; }
     Action& copy_selection_action() { return *m_copy_selection_action; }
+    Action& undo_action() { return *m_undo_action; }
+    Action& redo_action() { return *m_redo_action; }
+
+    // Reflects the active view's undo/redo availability in the shared actions; call when the
+    // active view changes.
+    void update_editing_history_actions();
     Action& cut_selection_action() { return *m_cut_selection_action; }
     Action& paste_action() { return *m_paste_action; }
     Action& select_all_action() { return *m_select_all_action; }
@@ -285640,6 +287484,8 @@ private:
 
     RefPtr<Action> m_reload_action;
     RefPtr<Action> m_copy_selection_action;
+    RefPtr<Action> m_undo_action;
+    RefPtr<Action> m_redo_action;
     RefPtr<Action> m_cut_selection_action;
     RefPtr<Action> m_paste_action;
     RefPtr<Action> m_select_all_action;
@@ -295978,6 +297824,8 @@ enum class ActionID {
     ViewHistory,
     ClearBrowsingData,
 
+    Undo,
+    Redo,
     CopySelection,
     CutSelection,
     Paste,
@@ -304281,6 +306129,23 @@ void ViewImplementation::select_all()
     client().async_select_all(page_id());
 }
 
+void ViewImplementation::undo()
+{
+    client().async_undo(page_id());
+}
+
+void ViewImplementation::set_editing_history_state(Badge<WebContentClient>, bool can_undo, bool can_redo)
+{
+    m_can_undo = can_undo;
+    m_can_redo = can_redo;
+    Application::the().update_editing_history_actions();
+}
+
+void ViewImplementation::redo()
+{
+    client().async_redo(page_id());
+}
+
 void ViewImplementation::find_in_page(Utf16String const& query, CaseSensitivity case_sensitivity)
 {
     client().async_find_in_page(page_id(), query, case_sensitivity);
@@ -306476,6 +308341,11 @@ public:
     Optional<DictionaryLookup> selected_text_for_dictionary_lookup();
     bool look_up_selected_text_at(Gfx::IntPoint widget_position);
     void select_all();
+    void undo();
+    void redo();
+    void set_editing_history_state(Badge<WebContentClient>, bool can_undo, bool can_redo);
+    bool can_undo() const { return m_can_undo; }
+    bool can_redo() const { return m_can_redo; }
     void find_in_page(Utf16String const& query, CaseSensitivity = CaseSensitivity::CaseInsensitive);
     void find_in_page_next_match();
     void find_in_page_previous_match();
@@ -306898,6 +308768,9 @@ protected:
     bool m_should_suppress_history_for_next_load { false };
     HistoryVisitTransition m_history_visit_transition_for_current_load { HistoryVisitTransition::Link };
     HistoryVisitTransition m_history_visit_transition_for_next_load { HistoryVisitTransition::Link };
+
+    bool m_can_undo { false };
+    bool m_can_redo { false };
     bool m_is_loading { false };
     bool m_is_waiting_for_navigation_start { false };
     Optional<Utf16String> m_loading_navigation_id;
@@ -307606,6 +309479,7 @@ void WebContentClient::did_start_loading(u64 page_id, Optional<Utf16String> navi
         view->set_url({}, url);
         view->set_title({}, Utf16String::from_utf8(url.serialize()));
         view->set_favicon({}, {});
+        view->set_editing_history_state({}, false, false);
 
         if (view->on_load_start)
             view->on_load_start();
@@ -307806,6 +309680,12 @@ void WebContentClient::did_request_cursor_change(u64 page_id, Gfx::Cursor cursor
         if (view->on_cursor_change)
             view->on_cursor_change(cursor);
     }
+}
+
+void WebContentClient::did_update_editing_history_state(u64 page_id, bool can_undo, bool can_redo)
+{
+    if (auto view = view_for_page_id(page_id); view.has_value())
+        view->set_editing_history_state({}, can_undo, can_redo);
 }
 
 void WebContentClient::did_change_title(u64 page_id, Utf16String title)
@@ -309065,6 +310945,7 @@ private:
     virtual void did_request_refresh(u64 page_id) override;
     virtual void did_request_cursor_change(u64 page_id, Gfx::Cursor) override;
     virtual void did_change_title(u64 page_id, Utf16String) override;
+    virtual void did_update_editing_history_state(u64 page_id, bool can_undo, bool can_redo) override;
     virtual void did_change_url(u64 page_id, URL::URL) override;
     virtual void did_request_tooltip_override(u64 page_id, Gfx::IntPoint, ByteString) override;
     virtual void did_stop_tooltip_override(u64 page_id) override;
@@ -364533,6 +366414,20 @@ void ConnectionFromClient::select_all(u64 page_id)
         page->page().focused_navigable().select_all();
 }
 
+void ConnectionFromClient::undo(u64 page_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().focused_navigable().undo();
+    update_input_method_state(page_id);
+}
+
+void ConnectionFromClient::redo(u64 page_id)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->page().focused_navigable().redo();
+    update_input_method_state(page_id);
+}
+
 void ConnectionFromClient::find_in_page(u64 page_id, Utf16String query, CaseSensitivity case_sensitivity)
 {
     auto page = this->page(page_id);
@@ -365186,6 +367081,8 @@ private:
     virtual Messages::WebContentServer::SelectWordForDictionaryLookupResponse select_word_for_dictionary_lookup(u64 page_id, Web::DevicePixelPoint position) override;
     virtual Messages::WebContentServer::CutSelectedTextResponse cut_selected_text(u64 page_id) override;
     virtual void select_all(u64 page_id) override;
+    virtual void undo(u64 page_id) override;
+    virtual void redo(u64 page_id) override;
 
     virtual void find_in_page(u64 page_id, Utf16String query, CaseSensitivity) override;
     virtual void find_in_page_next_match(u64 page_id) override;
@@ -366436,6 +368333,11 @@ void PageClient::page_did_request_cursor_change(Gfx::Cursor const& cursor)
 void PageClient::page_did_change_title(Utf16String const& title)
 {
     client().async_did_change_title(m_id, title);
+}
+
+void PageClient::page_did_update_editing_history_state(bool can_undo, bool can_redo)
+{
+    client().async_did_update_editing_history_state(m_id, can_undo, can_redo);
 }
 
 void PageClient::page_did_change_url(URL::URL const& url)
@@ -367735,6 +369637,7 @@ private:
     virtual void request_frame() override;
     virtual void page_did_request_cursor_change(Gfx::Cursor const&) override;
     virtual void page_did_change_title(Utf16String const&) override;
+    virtual void page_did_update_editing_history_state(bool can_undo, bool can_redo) override;
     virtual void page_did_change_url(URL::URL const&) override;
     virtual void page_did_request_refresh() override;
     virtual void page_did_request_resize_window(Gfx::IntSize) override;
@@ -368117,6 +370020,7 @@ endpoint WebContentClient
     did_request_refresh(u64 page_id) =|
     did_request_cursor_change(u64 page_id, Gfx::Cursor cursor) =|
     did_change_title(u64 page_id, Utf16String title) =|
+    did_update_editing_history_state(u64 page_id, bool can_undo, bool can_redo) =|
     did_change_url(u64 page_id, URL::URL url) =|
     did_request_tooltip_override(u64 page_id, Gfx::IntPoint position, ByteString title) =|
     did_stop_tooltip_override(u64 page_id) =|
@@ -368570,6 +370474,8 @@ endpoint WebContentServer
     select_word_for_dictionary_lookup(u64 page_id, Web::DevicePixelPoint position) => (bool selected)
     cut_selected_text(u64 page_id) => (ByteString selection)
     select_all(u64 page_id) =|
+    undo(u64 page_id) =|
+    redo(u64 page_id) =|
     paste(u64 page_id, Utf16String text) =|
     set_marked_text_from_input_method(u64 page_id, Utf16String text) =|
     commit_text_from_input_method(u64 page_id, Utf16String text, i32 replacement_start, i32 replacement_length) =|
@@ -552027,6 +553933,22 @@ FILE: Tests/LibWeb/Crash/DOM/block-in-inline-removal-crash.html
     })();
 </script>
 
+FILE: Tests/LibWeb/Crash/DOM/clone-srcdoc-document-base-uri.html
+<!DOCTYPE html>
+<html class="test-wait">
+<body>
+<script>
+    const iframe = document.createElement("iframe");
+    iframe.srcdoc = "<p></p>";
+    iframe.onload = () => {
+        iframe.contentDocument.cloneNode().baseURI;
+        document.documentElement.classList.remove("test-wait");
+    };
+    document.body.appendChild(iframe);
+</script>
+</body>
+</html>
+
 FILE: Tests/LibWeb/Crash/DOM/document-constructor-no-origin.html
 <!DOCTYPE html>
 <script>
@@ -626675,2966 +628597,3 @@ FILE: Tests/LibWeb/Ref/expected/positioned-elements-in-scroll-container-ref.html
 FILE: Tests/LibWeb/Ref/expected/positioned-grid-item-alpha-background-ref.html
 <!doctype html>
 <style>
-.grid { display: grid; width: 200px; height: 200px; background: white; }
-.card { background-color: #ff000033; }
-</style>
-<div class="grid"><div class="card"></div></div>
-
-FILE: Tests/LibWeb/Ref/expected/positioned-svg-root-alpha-background-ref.html
-<!doctype html>
-<style>
-.container { background: white; width: 200px; height: 200px; }
-svg { width: 200px; height: 200px; background-color: #ff000033; }
-</style>
-<div class="container"><svg></svg></div>
-
-FILE: Tests/LibWeb/Ref/expected/range-not-assiciated-with-selection-should-not-affect-it-ref.html
-<!DOCTYPE html>
-<html>
-    <body>
-        <p id="text">This is a simple sentence used to test range and selection rectangles.</p>
-        <script>
-            const textNode = document.getElementById("text").firstChild;
-
-            const sel = window.getSelection();
-            sel.removeAllRanges();
-
-            const selRange = document.createRange();
-            selRange.setStart(textNode, 5);
-            selRange.setEnd(textNode, 16);
-            sel.addRange(selRange);
-        </script>
-    </body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/render-order-floating-replaced-ref.html
-<!DOCTYPE html>
-<html>
-  <head>
-    <style>
-.row > div {
-  height: 64px;
-  float: left;
-}
-
-.row { clear: both; }
-.row > :nth-child(1) { width: 32px; }
-.row > :nth-child(2) { width: 64px; }
-.red { background-color: red; }
-.green { background-color: green; }
-    </style>
-  </head>
-  <body>
-    <div class="row">
-      <div class="red"></div>
-      <div class="green"></div>
-    </div>
-    <div class="row">
-      <div class="green"></div>
-      <div class="red"></div>
-    </div>
-  </body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/required-optional-pseudoclass-ref.html
-<!DOCTYPE html>
-
-<style>
-    input.required {
-        border: 2px solid red;
-    }
-
-    input.optional {
-        border: 2px solid blue;
-    }
-
-    input.required + span {
-        color: green;
-    }
-
-    div > input.required {
-        border: 2px dashed red;
-    }
-
-    section input.optional {
-        border: 2px dashed blue;
-    }
-
-    input.required ~ label {
-        color: orange;
-    }
-
-    form.has-required {
-        border: 2px solid purple;
-    }
-</style>
-
-<input type="text" class="required" placeholder="Should be red"><span>Should be green</span>
-<input type="text" class="optional" placeholder="Should be blue">
-
-<div>
-    <input type="text" class="required" placeholder="Should be dashed red">
-</div>
-
-<section>
-    <div>
-        <input type="text" class="optional" placeholder="Should be dashed blue">
-    </div>
-</section>
-
-<p>Other content</p>
-<label>Should be orange</label>
-
-<form class="has-required">
-    <span>Purple border</span>
-    <input id="make-me-required" class="required" type="text" placeholder="Should be red">
-</form>
-<form>
-    <span>No border</span>
-    <input id="make-me-optional" class="optional" type="text" placeholder="Should be blue">
-</form>
-
-FILE: Tests/LibWeb/Ref/expected/resize-stacking-order-ref.html
-<!DOCTYPE html>
-<style>
-    .overlay {
-        position: fixed;
-        top: 0;
-        left: 0;
-        width: 80px;
-        height: 80px;
-        background: red;
-    }
-</style>
-<div class="overlay"></div>
-
-FILE: Tests/LibWeb/Ref/expected/resolve-paint-only-properties-after-layout-ref.html
-<!DOCTYPE html>
-<style>
-    #box {
-        width: 100px;
-        height: 100px;
-        background-color: red;
-        border-radius: 50px;
-    }
-</style>
-<div id="box">hello</div>
-
-FILE: Tests/LibWeb/Ref/expected/scroll-iframe-ref.html
-<!DOCTYPE html>
-<body style="border: 1px solid black; width: fit-content">
-<div style="width: 200px; height: 200px; background-color: blue"></div>    
-</body>
-
-FILE: Tests/LibWeb/Ref/expected/scroll-using-mousewheel-event-ref.html
-<!DOCTYPE html>
-<style>
-.item {
-    width: 100px;
-    height: 100px;
-    box-sizing: border-box;
-    border: 1px solid black;
-}
-</style>
-<div class="item">2</div>
-<div class="item">3</div>
-<div class="item">4</div>
-
-FILE: Tests/LibWeb/Ref/expected/scrollable-box-with-nested-stacking-context-ref.html
-<!DOCTYPE html>
-<style>
-    * {
-        scrollbar-width: none;
-    }
-
-    #container {
-        width: 300px;
-        height: 500px;
-        overflow: auto;
-        position: relative;
-        border: 2px solid black;
-    }
-
-    .content {
-        background-color: lightblue;
-        height: 100%;
-    }
-
-    .box {
-        background-color: magenta;
-        width: 100px;
-        height: 50px;
-        position: absolute;
-        top: 0px;
-        right: 50px;
-    }
-</style>
-<div id="container">
-    <div class="content">
-        <div class="box"></div>
-    </div>
-</div>
-
-FILE: Tests/LibWeb/Ref/expected/scrollable-contains-box-with-gradient-background-ref.html
-<!DOCTYPE html>
-<style type="text/css">
-    * {
-        scrollbar-width: none;
-    }
-
-    .box {
-        width: 180px;
-        height: 64px;
-        background: linear-gradient(rgb(109, 152, 204), rgb(138, 100, 229));
-        border-radius: 100px;
-    }
-
-    .scrollable {
-        width: 200px;
-        height: 200px;
-        overflow: scroll;
-        border: 10px solid orchid;
-    }
-</style>
-<div class="scrollable">
-    <div class="box"></div>
-</div>
-
-FILE: Tests/LibWeb/Ref/expected/scrollable-contains-boxes-with-hidden-overflow-1-ref.html
-<!DOCTYPE html>
-<style>
-    * {
-        scrollbar-width: none;
-    }
-    html {
-        background: white;
-    }
-    body {
-        position: absolute;
-        inset: 0px;
-        display: flex;
-        background: pink;
-    }
-    #outer {
-        overflow-x: hidden;
-        overflow-y: scroll;
-        background: orange;
-        margin-top: 100px;
-    }
-    #inner {
-        height: 1000px;
-        background: magenta;
-    }
-    .item {
-        overflow: hidden;
-        background: yellow;
-    }
-    .wrapper {
-        box-sizing: border-box;
-        border: 1px solid black;
-        background: lime;
-        height: 50px;
-        width: 200px;
-        display: flex;
-        justify-content: center;
-        align-items: center;
-    }
-</style><body><div id="outer"><div id="inner">
-<div class="item"><div class="wrapper">11</div></div>
-<div class="item"><div class="wrapper">12</div></div>
-<div class="item"><div class="wrapper">13</div></div>
-<div class="item"><div class="wrapper">14</div></div>
-<div class="item"><div class="wrapper">15</div></div>
-<div class="item"><div class="wrapper">16</div></div>
-<div class="item"><div class="wrapper">17</div></div>
-<div class="item"><div class="wrapper">18</div></div>
-<div class="item"><div class="wrapper">19</div></div>
-<div class="item"><div class="wrapper">20</div></div>
-<div class="item"><div class="wrapper">21</div></div>
-<div class="item"><div class="wrapper">22</div></div>
-<div class="item"><div class="wrapper">23</div></div>
-<div class="item"><div class="wrapper">24</div></div>
-<div class="item"><div class="wrapper">25</div></div>
-<div class="item"><div class="wrapper">26</div></div>
-<div class="item"><div class="wrapper">27</div></div>
-<div class="item"><div class="wrapper">28</div></div>
-<div class="item"><div class="wrapper">29</div></div>
-<div class="item"><div class="wrapper">30</div></div>
-<div class="item"><div class="wrapper">31</div></div>
-<div class="item"><div class="wrapper">32</div></div>
-<div class="item"><div class="wrapper">33</div></div>
-<div class="item"><div class="wrapper">34</div></div>
-<div class="item"><div class="wrapper">35</div></div>
-<div class="item"><div class="wrapper">36</div></div>
-<div class="item"><div class="wrapper">37</div></div>
-<div class="item"><div class="wrapper">38</div></div>
-<div class="item"><div class="wrapper">39</div></div>
-<div class="item"><div class="wrapper">40</div></div>
-<div class="item"><div class="wrapper">41</div></div>
-<div class="item"><div class="wrapper">42</div></div>
-<div class="item"><div class="wrapper">43</div></div>
-<div class="item"><div class="wrapper">44</div></div>
-<div class="item"><div class="wrapper">45</div></div>
-<div class="item"><div class="wrapper">46</div></div>
-<div class="item"><div class="wrapper">47</div></div>
-<div class="item"><div class="wrapper">48</div></div>
-<div class="item"><div class="wrapper">49</div></div>
-<div class="item"><div class="wrapper">50</div></div>
-
-FILE: Tests/LibWeb/Ref/expected/scrollable-contains-boxes-with-hidden-overflow-2-ref.html
-<!DOCTYPE html><style>
-    * {
-        scrollbar-width: none;
-    }
-    html {
-        background: white;
-    }
-    body {
-        position: absolute;
-        inset: 0px;
-        display: flex;
-        background: pink;
-    }
-    #outer {
-        margin-top: 100px;
-        overflow-x: hidden;
-        overflow-y: scroll;
-        background: orange;
-    }
-    #inner {
-        height: 1000px;
-        background: magenta;
-    }
-    .item {
-        box-sizing: border-box;
-        border: 1px solid black;
-        width: 200px;
-        height: 50px;
-        overflow: hidden;
-        background: lime;
-    }
-</style><body><div id="outer"><div id="inner">
-<div class="item">11</div>
-<div class="item">12</div>
-<div class="item">13</div>
-<div class="item">14</div>
-<div class="item">15</div>
-<div class="item">16</div>
-<div class="item">17</div>
-<div class="item">18</div>
-<div class="item">19</div>
-<div class="item">20</div>
-<div class="item">21</div>
-<div class="item">22</div>
-<div class="item">23</div>
-<div class="item">24</div>
-<div class="item">25</div>
-<div class="item">26</div>
-<div class="item">27</div>
-<div class="item">28</div>
-<div class="item">29</div>
-
-FILE: Tests/LibWeb/Ref/expected/scrollable-contains-boxes-with-hidden-overflow-and-opacity-ref.html
-<!DOCTYPE html>
-<style>
-    * {
-        scrollbar-width: none;
-    }
-    html {
-        background: white;
-    }
-    body {
-        position: absolute;
-        inset: 0px;
-        display: flex;
-        background: pink;
-    }
-    #outer {
-        overflow: hidden;
-        background: orange;
-        margin-top: 100px;
-    }
-    #inner {
-        height: 1000px;
-        background: yellow;
-    }
-    .item {
-        box-sizing: border-box;
-        border: 1px solid black;
-        background: lime;
-        height: 50px;
-        width: 200px;
-        display: flex;
-        justify-content: center;
-        align-items: center;
-        opacity: 0.5;
-    }
-</style><body><div id="outer"><div id="inner">
-<div class="item">11</div>
-<div class="item">12</div>
-<div class="item">13</div>
-<div class="item">14</div>
-<div class="item">15</div>
-<div class="item">16</div>
-<div class="item">17</div>
-<div class="item">18</div>
-<div class="item">19</div>
-<div class="item">20</div>
-<div class="item">21</div>
-<div class="item">22</div>
-<div class="item">23</div>
-<div class="item">24</div>
-<div class="item">25</div>
-<div class="item">26</div>
-<div class="item">27</div>
-<div class="item">28</div>
-<div class="item">29</div>
-<div class="item">30</div>
-
-FILE: Tests/LibWeb/Ref/expected/scrollable-contains-iframe-ref.html
-<!DOCTYPE html>
-<style>
-    * {
-        scrollbar-width: none;
-    }
-
-    #scrollable {
-        width: 80%;
-        height: 300px;
-        border: 1px solid #000;
-        overflow: scroll;
-    }
-
-    iframe {
-        width: 300px;
-        height: 300px;
-    }
-</style>
-<div id="scrollable">
-    <iframe srcdoc="iframe nested into scrollable"></iframe>
-</div>
-
-FILE: Tests/LibWeb/Ref/expected/scrollable-contains-rotated-boxes-ref.html
-<!DOCTYPE html>
-<head>
-    <style>
-        body {
-            margin: 0;
-            padding: 0;
-            height: 1000px;
-        }
-        #scroll-container {
-            width: 300px;
-            height: 300px;
-            overflow-y: scroll;
-            background-color: #fff;
-        }
-        .rotated-box {
-            width: 100px;
-            height: 100px;
-            margin: 10px;
-            background-color: #3498db;
-            overflow: hidden;
-        }
-        .nested-box {
-            width: 200px;
-            height: 200px;
-            background-color: crimson;
-        }
-    </style>
-</head>
-<body>
-    <div id="scroll-container">
-        <div class="rotated-box"><div class="nested-box"></div></div>
-        <div class="rotated-box"><div class="nested-box"></div></div>
-        <div class="rotated-box"><div class="nested-box"></div></div>
-        <div class="rotated-box"><div class="nested-box"></div></div>
-        <div class="rotated-box"><div class="nested-box"></div></div>
-        <div class="rotated-box"><div class="nested-box"></div></div>
-        <div class="rotated-box"><div class="nested-box"></div></div>
-    </div>
-</body>
-<script>
-    const scrollContainer = document.getElementById("scroll-container");
-    scrollContainer.scrollTop = 100;
-</script>
-
-FILE: Tests/LibWeb/Ref/expected/scrollable-contains-table-ref.html
-<!DOCTYPE html>
-<head>
-    <style>
-        * {
-            scrollbar-width: none;
-        }
-        #scrollable-div {
-            width: 300px;
-            height: 300px;
-            overflow: auto;
-            border: 1px solid #000;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-        }
-        th,
-        td {
-            padding: 0;
-            margin: 0;
-            height: 50px;
-            box-sizing: content-box;
-            border: 1px solid #000;
-        }
-    </style>
-</head>
-<body>
-    <div id="scrollable-div">
-        <table>
-            <tbody>
-                <tr>
-                    <td>Row 2, Cell 1</td>
-                    <td>Row 2, Cell 2</td>
-                    <td>Row 2, Cell 3</td>
-                    <td>Row 2, Cell 4</td>
-                </tr>
-                <tr>
-                    <td>Row 3, Cell 1</td>
-                    <td>Row 3, Cell 2</td>
-                    <td>Row 3, Cell 3</td>
-                    <td>Row 3, Cell 4</td>
-                </tr>
-                <tr>
-                    <td>Row 4, Cell 1</td>
-                    <td>Row 4, Cell 2</td>
-                    <td>Row 4, Cell 3</td>
-                    <td>Row 4, Cell 4</td>
-                </tr>
-                <tr>
-                    <td>Row 5, Cell 1</td>
-                    <td>Row 5, Cell 2</td>
-                    <td>Row 5, Cell 3</td>
-                    <td>Row 5, Cell 4</td>
-                </tr>
-                <tr>
-                    <td>Row 6, Cell 1</td>
-                    <td>Row 6, Cell 2</td>
-                    <td>Row 6, Cell 3</td>
-                    <td>Row 6, Cell 4</td>
-                </tr>
-                <tr>
-                    <td>Row 7, Cell 1</td>
-                    <td>Row 7, Cell 2</td>
-                    <td>Row 7, Cell 3</td>
-                    <td>Row 7, Cell 4</td>
-                </tr>
-                <tr>
-                    <td>Row 8, Cell 1</td>
-                    <td>Row 8, Cell 2</td>
-                    <td>Row 8, Cell 3</td>
-                    <td>Row 8, Cell 4</td>
-                </tr>
-                <tr>
-                    <td>Row 9, Cell 1</td>
-                    <td>Row 9, Cell 2</td>
-                    <td>Row 9, Cell 3</td>
-                    <td>Row 9, Cell 4</td>
-                </tr>
-            </tbody>
-        </table>
-    </div>
-</body>
-
-FILE: Tests/LibWeb/Ref/expected/scrollable-content-inside-fixed-position-box-ref.html
-<!DOCTYPE html>
-<style>
-    * {
-        scrollbar-width: none;
-    }
-
-    body {
-        margin: 0;
-        padding: 0;
-        height: 2000px;
-    }
-
-    .abspos-element {
-        position: absolute;
-        top: 20px;
-        left: 20px;
-        width: 250px;
-        height: 300px;
-        padding: 10px;
-        background-color: #f1f1f1;
-        border: 1px solid #ccc;
-        overflow-y: auto;
-    }
-
-    .abspos-element .box {
-        margin-bottom: 10px;
-        padding: 10px;
-        color: white;
-        text-align: center;
-        font-weight: bold;
-        border-radius: 5px;
-    }
-
-    .box1 {
-        background-color: #ff5733;
-        height: 100px;
-    }
-
-    .box2 {
-        background-color: #33c1ff;
-        height: 150px;
-    }
-
-    .box3 {
-        background-color: #75ff33;
-        height: 120px;
-    }
-
-    .box4 {
-        background-color: #ff33e6;
-        height: 80px;
-    }
-
-    .box5 {
-        background-color: #ffd633;
-        height: 140px;
-    }
-</style>
-<div class="abspos-element">
-    <h2>Fixed Element</h2>
-    <div class="box box1">Box 1</div>
-    <div class="box box2">Box 2</div>
-    <div class="box box3">Box 3</div>
-    <div class="box box4">Box 4</div>
-    <div class="box box5">Box 5</div>
-</div>
-
-FILE: Tests/LibWeb/Ref/expected/scrollable-overflow-viewport-bug.html
-<!DOCTYPE html>
-<!-- This page intentionally left blank -->
-
-FILE: Tests/LibWeb/Ref/expected/scrollable-pseudo-element-ref.html
-<!DOCTYPE html>
-<style>
-/* Wrapper clips the scrollbar area */
-.wrapper {
-    width: 85px;
-    height: 60px;
-    overflow: hidden;
-}
-
-.scrollable {
-    display: block;
-    white-space: pre-wrap;
-    width: 100px;
-    height: 60px;
-    overflow: scroll;
-    background: lightblue;
-}
-</style>
-<div class="wrapper">
-    <div class="scrollable">Line 1
-Line 2
-Line 3
-Line 4
-Line 5
-Line 6
-Line 7
-Line 8</div>
-</div>
-<script>
-    // Scroll to the same position as the test (40px)
-    document.querySelector('.scrollable').scrollTop = 40;
-</script>
-
-FILE: Tests/LibWeb/Ref/expected/scrolled-svg-path-with-transform.html
-<!doctype html>
-<style>
-html {
-    scrollbar-width: none;
-}
-body {
-    margin: 0px;
-    height: 5000px;
-    transform: translate(0, -100px);
-}
-.rotate {
-    transform: rotate(180deg);
-    outline: 1px solid black;
-}
-</style><body style="overflow: auto"><svg class="rotate"><path d="M22 13.5H6.3l5.5 7.5H8.3l-6.5-9 6.5-9h3.5l-5.5 7.5H22v3z">
-FILE: Tests/LibWeb/Ref/expected/scrolled-text-with-clipped-corners-ref.html
-<!DOCTYPE html>
-<style>
-    * {
-        scrollbar-width: none;
-    }
-
-    #container {
-        width: 300px;
-        height: 300px;
-        border-radius: 50%;
-        overflow: hidden;
-    }
-
-    #text-container {
-        overflow: scroll;
-        width: 300px;
-        height: 300px;
-        font-size: 40px;
-    }
-</style>
-<div id="container">
-    <div id="text-container">
-        Lorem ipsum dolor sit amet, consectetur adipiscing elit. Ut ultrices neque eu nisi facilisis
-        viverra. Integer lacinia, lacus vel condimentum suscipit, lacus felis porta nulla, eget
-        lacinia sem neque ut neque. In sagittis, eros vel interdum porta, quam ex rhoncus lectus,
-        vitae suscipit risus orci sit amet velit. Praesent imperdiet condimentum rutrum. Cras vitae
-        nisl sapien. Curabitur ligula diam, tincidunt congue tincidunt nec, sodales nec orci.
-        Vestibulum tincidunt non elit in vehicula. Etiam malesuada neque eu porta rhoncus. Curabitur
-        vel nunc finibus ligula posuere venenatis.
-    </div>
-</div>
-<script>
-    const scrollContainer = document.getElementById("text-container");
-    scrollContainer.scrollTop = 300;
-</script>
-
-FILE: Tests/LibWeb/Ref/expected/select-chevron-color-ref.html
-<!DOCTYPE html>
-The arrow in this select should be green:<br>
-<!-- using a button here since it should have the same default styles as a select -->
-<button style="color: green;">
-  <div style="display: flex; align-items: center; height: 100%; position: relative;">
-    <div style="flex: 1; margin-inline-end: 20px;"></div>
-    <div style="position: absolute; inset-inline-end: 0; top: calc(50% - 8px); width: 16px; height: 16px; display: block;">
-      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-        <path fill="currentcolor" d="M7.41,8.58L12,13.17L16.59,8.58L18,10L12,16L6,10L7.41,8.58Z"></path>
-      </svg>
-    </div>
-  </div>
-</button>
-FILE: Tests/LibWeb/Ref/expected/select-line-height-ignored-ref.html
-<!DOCTYPE html>
-<select>
-    <option>Test</option>
-</select>
-
-FILE: Tests/LibWeb/Ref/expected/select-option-use-label.html
-<!doctype html>
-<select>
-  <option>label</option>
-</select>
-
-FILE: Tests/LibWeb/Ref/expected/selection-background-ref.html
-<!DOCTYPE html>
-<style>
-p {
-    font-size: 20px;
-    line-height: 1.5;
-    margin: 10px 0;
-}
-
-.selected {
-    background-color: red;
-}
-</style>
-
-<div>
-<p><span>P</span><span class="selected">artial start</span></p>
-<p><span class="selected">Full selection</span></p>
-<p><span class="selected">Partial en</span><span>d</span></p>
-</div>
-
-FILE: Tests/LibWeb/Ref/expected/selection-color-ref.html
-<!DOCTYPE html>
-<style>
-p {
-    font-size: 20px;
-    line-height: 1.5;
-    margin: 10px 0;
-}
-
-.selected {
-    color: green;
-}
-.transparent-selected {
-    color: transparent;
-}
-</style>
-
-<div>
-<p><span>P</span><span class="selected">artial start</span></p>
-<p><span class="selected">Full selection</span></p>
-<p><span class="selected">Partial end</span></p>
-<p class="transparent-selected">Invisible when selected</p>
-</div>
-
-FILE: Tests/LibWeb/Ref/expected/selection-default-color-scheme-ref.html
-<!DOCTYPE html>
-<style>
-p {
-    font-size: 20px;
-    line-height: 1.5;
-    margin: 10px 0;
-}
-.selected-light {
-    background: rgba(101, 2, 0, 0.8);
-    color: black;
-}
-.selected-dark {
-    background: rgba(61, 174, 233, 0.5);
-    color: black;
-}
-</style>
-
-<p><span class="selected-light">Light scheme</span><br><span class="selected-dark">Dark scheme</span></p>
-
-FILE: Tests/LibWeb/Ref/expected/selection-default-forced-dark-color-scheme-ref.html
-<!DOCTYPE html>
-<style>
-p {
-    font-size: 20px;
-    line-height: 1.5;
-    margin: 10px 0;
-}
-.selected {
-    background: rgba(61, 174, 233, 0.5);
-    color: black;
-}
-</style>
-
-<p><span class="selected">Forced dark scheme</span></p>
-
-FILE: Tests/LibWeb/Ref/expected/selection-default-link-ref.html
-<!DOCTYPE html>
-<style>
-td {
-    font-size: 20px;
-    line-height: 1.5;
-}
-.selected {
-    background: rgba(101, 2, 0, 0.8);
-    color: #000000;
-    text-decoration: none;
-}
-</style>
-
-<table><tr><td><span class="selected">Default link selection</span></td></tr></table>
-
-FILE: Tests/LibWeb/Ref/expected/selection-default-meta-dark-color-scheme-ref.html
-<!DOCTYPE html>
-<meta name="color-scheme" content="dark">
-<style>
-p {
-    font-size: 20px;
-    line-height: 1.5;
-    margin: 10px 0;
-}
-.selected {
-    background: rgba(61, 174, 233, 0.5);
-    color: rgb(235, 235, 235);
-}
-</style>
-
-<p><span class="selected">Meta dark scheme</span></p>
-
-FILE: Tests/LibWeb/Ref/expected/selection-default-normal-forced-dark-color-scheme-ref.html
-<!DOCTYPE html>
-<style>
-p {
-    font-size: 20px;
-    line-height: 1.5;
-    margin: 10px 0;
-}
-.selected {
-    background: rgba(101, 2, 0, 0.8);
-    color: black;
-}
-</style>
-
-<p><span class="selected">Normal color scheme</span></p>
-
-FILE: Tests/LibWeb/Ref/expected/selection-in-inline-element-ref.html
-<!DOCTYPE html>
-<style>
-p {
-    font-size: 20px;
-    line-height: 1.5;
-    margin: 10px 0;
-}
-
-.selected {
-    background-color: red;
-}
-</style>
-
-<p><span class="selected">Hello World</span></p>
-
-FILE: Tests/LibWeb/Ref/expected/selection-input-ref.html
-<!DOCTYPE html>
-<style>
-input {
-    font-size: 20px;
-    width: 200px;
-    outline: none;
-}
-
-input::selection {
-    background-color: red;
-}
-</style>
-
-<input value="Selected text">
-<script>
-document.querySelector("input").focus();
-document.querySelector("input").select();
-</script>
-
-FILE: Tests/LibWeb/Ref/expected/selection-styling-ref.html
-<!DOCTYPE html>
-<style>
-p {
-    font-size: 20px;
-    line-height: 1.5;
-    margin: 10px 0;
-}
-
-.selected-bg {
-    background-color: red;
-}
-.selected-color {
-    color: green;
-}
-.selected-both {
-    background-color: blue;
-    color: yellow;
-}
-</style>
-
-<div>
-<p><span class="selected-bg">Background only</span></p>
-<p><span class="selected-color">Color only</span></p>
-<p><span class="selected-both">Both</span></p>
-</div>
-
-FILE: Tests/LibWeb/Ref/expected/selection-text-decoration-ref.html
-<!DOCTYPE html>
-<style>
-p {
-    font-size: 20px;
-    margin: 20px;
-}
-
-#underline {
-    text-decoration: underline red;
-}
-
-#line-through mark {
-    background-color: yellow;
-    text-decoration: line-through blue;
-}
-</style>
-
-<p id="underline">Underline decoration</p>
-<p id="line-through"><mark>Line-through decoration</mark></p>
-
-FILE: Tests/LibWeb/Ref/expected/selection-text-shadow-ref.html
-<!DOCTYPE html>
-<style>
-p {
-    font-size: 20px;
-    margin: 20px;
-    text-shadow: 3px 3px 0 red;
-}
-
-mark {
-    background-color: yellow;
-}
-</style>
-
-<p>Selected text</p>
-<p><mark>With background</mark></p>
-
-FILE: Tests/LibWeb/Ref/expected/selection-with-custom-image-background-ref.html
-<!DOCTYPE html>
-<style>
-.image {
-    display: inline-block;
-    width: 50px;
-    height: 50px;
-    background-color: red;
-}
-</style>
-<span class="image"></span>
-
-FILE: Tests/LibWeb/Ref/expected/selection-with-image-ref.html
-<!DOCTYPE html>
-<style>
-img { width: 50px; height: 50px; vertical-align: middle; }
-.selected { background: rgba(101, 2, 0, 0.8); color: black; }
-.img-wrapper {
-    display: inline-block;
-    position: relative;
-    vertical-align: middle;
-}
-.img-wrapper .overlay {
-    position: absolute;
-    inset: 0;
-    background: rgba(101, 2, 0, 0.8);
-}
-</style>
-<p><span class="selected">before image </span><span class="img-wrapper"><img src="../data/smiley.png"><span class="overlay"></span></span><span class="selected"> after image</span></p>
-
-FILE: Tests/LibWeb/Ref/expected/separate-borders-ref.html
-<!DOCTYPE html>
-<style type="text/css">
-    td {
-        border: 5px solid blue;
-        padding: 20px;
-    }
-
-    table {
-        border: 5px solid black;
-        border-collapse: separate;
-    }
-</style>
-<table>
-    <tr>
-        <td>A</td>
-    </tr>
-</table>
-
-FILE: Tests/LibWeb/Ref/expected/simple-svg-mask-ref.html
-<!DOCTYPE html>
-<svg width="120" viewBox="-10 -10 120 120">
-  <rect x="-10" y="-10" width="120" height="120" fill="blue" />
-  <rect x="50" y="10" width="40" height="80" fill="red"  />
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/slotted-through-nested-slots-ref.html
-<!DOCTYPE html>
-<style>
-  * { margin: 0; padding: 0; }
-</style>
-<p>Test passes if you see a green box below.</p>
-<div style="width: 100px; height: 100px; background: green; color: green;">FAIL</div>
-
-FILE: Tests/LibWeb/Ref/expected/space-glyph-width-ref.html
-<!DOCTYPE html>
-<html>
-<head>
-    <style>
-        .text {
-            font-size: 100px;
-        }
-    </style>
-</head>
-<body>
-    <div class="text">A B</div>
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/square-ref.html
-<!DOCTYPE html>
-<style>
-    .box {
-        width: 100px;
-        height: 100px;
-        background-color: pink;
-    }
-</style><div class="box"></div>
-
-FILE: Tests/LibWeb/Ref/expected/sticky-box-with-percentage-insets-ref.html
-<!DOCTYPE html>
-<style>
-    * {
-        scrollbar-width: 0;
-    }
-    html,
-    body {
-        margin: 0;
-    }
-    .sticky {
-        position: absolute;
-        top: 50%;
-        left: 0;
-        right: 0;
-        background-color: cyan;
-        border-top: 20px solid magenta;
-        padding: 0.5em;
-    }
-    #scrollable {
-        width: 300px;
-        height: 200px;
-        overflow: auto;
-        position: relative;
-        border: 1px solid black;
-    }
-</style>
-<div id="scrollable">
-    <div style="height: 10000px"><div class="sticky">I'm sticky</div></div>
-</div>
-
-FILE: Tests/LibWeb/Ref/expected/sticky-overflow-scroll-ref.html
-<!DOCTYPE html>
-<style>
-    body { margin: 0; }
-    .green {
-        width: 100px;
-        height: 100px;
-        background: green;
-    }
-</style>
-<div class="green"></div>
-
-FILE: Tests/LibWeb/Ref/expected/sticky-positioned-box-with-border-ref.html
-<!DOCTYPE html>
-<style>
-    * {
-        scrollbar-width: none;
-    }
-    html,
-    body {
-        margin: 0;
-    }
-    .sticky {
-        position: relative;
-        top: 0;
-        left: 0;
-        right: 0;
-        background-color: cyan;
-        border-top: 20px solid magenta;
-        padding: 0.5em;
-    }
-    #scrollable {
-        width: 300px;
-        height: 200px;
-        overflow: auto;
-        position: relative;
-        border: 1px solid black;
-    }
-</style>
-<div id="scrollable">
-    <div style="height: 10000px"><div class="sticky">I'm sticky</div></div>
-</div>
-
-FILE: Tests/LibWeb/Ref/expected/stop-color-non-trivial-ref.html
-<!DOCTYPE html>
-<html>
-    <svg viewBox="0 0 10 10">
-        <defs>
-            <linearGradient id="myGradient">
-                <stop offset="0" stop-color="#FF0000" />
-                <stop offset="100%" stop-color="#00FF00" />
-            </linearGradient>
-        </defs>
-        <circle cx="5" cy="5" r="4" fill="url('#myGradient')" />
-    </svg>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/stroke-dasharray-none-application-ref.html
-<!doctype html>
-<html>
-    <svg>
-        <style>
-            line {
-                stroke: black;
-            }
-        </style>
-        <line id="line" style="stroke-dasharray: none" x1="0" y1="1" x2="30" y2="1"></line>
-    </svg>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/svg-as-img-with-script-ref.html
-<!DOCTYPE html>
-<style>svg { display: block; }</style>
-<p>SVG scripts must not execute when loaded as an image.</p>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
-  <rect width="100" height="100" fill="green"/>
-</svg>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
-  <rect width="100" height="100" fill="green"/>
-</svg>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
-  <rect width="50" height="100" fill="green"/>
-  <rect x="50" width="50" height="100" fill="green"/>
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg-block-in-inline-ref.html
-<!DOCTYPE html>
-<style>
-    body { margin: 0 }
-</style>
-<div style="width: 100px; height: 100px; background: green"></div>
-
-FILE: Tests/LibWeb/Ref/expected/svg-clipPathUnits.html
-<!DOCTYPE html>
-<svg width="200" viewBox="0 0 100 100">
-  <clipPath id="myClip1" clipPathUnits="userSpaceOnUse">
-    <circle cx="50" cy="50" r="35" />
-  </clipPath>
-
-  <clipPath id="myClip2" clipPathUnits="objectBoundingBox">
-    <circle cx=".5" cy=".5" r=".35" />
-  </clipPath>
-
-  <!-- Some reference rect to materialized to clip path -->
-  <rect id="r1" x="0" y="0" width="45" height="45" />
-  <rect id="r2" x="0" y="55" width="45" height="45" />
-  <rect id="r3" x="55" y="55" width="45" height="45" />
-  <rect id="r4" x="55" y="0" width="45" height="45" />
-
-  <!-- The first 3 rect are clipped with userSpaceOnUse units -->
-  <use clip-path="url(#myClip1)" href="#r1" fill="red" />
-  <use clip-path="url(#myClip1)" href="#r2" fill="red" />
-  <use clip-path="url(#myClip1)" href="#r3" fill="red" />
-
-  <!-- The last rect is clipped with objectBoundingBox units -->
-  <use clip-path="url(#myClip2)" href="#r4" fill="red" />
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg-display-attr.html
-<!DOCTYPE html>
-<svg width="120" viewBox="0 0 100 100">
-	<circle cx="25" cy="25" fill="blue" r="25" />
-    <g><circle cx="75" cy="25" fill="red" r="25" /></g>
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg-fecolormatrix-huerotate-ref.html
-<!DOCTYPE html>
-<html>
-<body style="margin:0; background:white">
-  <svg width="200" height="200" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
-    <!-- hueRotate(90deg) of #cc3366 -> approx #665F00 -->
-    <rect x="10" y="10" width="180" height="180" fill="#665F00"/>
-  </svg>
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/svg-fecolormatrix-luminance-to-alpha-ref.html
-<!DOCTYPE html>
-<html>
-<body style="margin:0; background:white">
-  <svg width="200" height="200" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
-    <!-- luminanceToAlpha of red (alpha=0.2126) over white -> approx #C9C9C9 -->
-    <rect x="10" y="10" width="180" height="180" fill="#C9C9C9"/>
-  </svg>
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/svg-fecolormatrix-matrix-identity-ref.html
-<!DOCTYPE html>
-<html>
-<body style="margin:0; background:white">
-  <svg width="200" height="200" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
-    <rect x="10" y="10" width="180" height="180" fill="#336699"/>
-  </svg>
-  <!-- Identity matrix should be a no-op. -->
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/svg-fecolormatrix-matrix-invert-ref.html
-<!DOCTYPE html>
-<html>
-<body style="margin:0; background:white">
-  <svg width="200" height="200" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
-    <!-- Inverted #336699 -> #CC9966 -->
-    <rect x="10" y="10" width="180" height="180" fill="#CC9966"/>
-  </svg>
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/svg-fecolormatrix-saturate-ref.html
-<!DOCTYPE html>
-<html>
-<body style="margin:0; background:white">
-  <svg width="200" height="200" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
-    <!-- Approximate saturate(2) of #6d98cc -> #479DFF -->
-    <rect x="10" y="10" width="180" height="180" fill="#479DFF"/>
-  </svg>
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/svg-file-matches-html-file.html
-<!DOCTYPE html>
-<style>
-  * {
-    margin: 0;
-  }
-</style>
-<svg xmlns="http://www.w3.org/2000/svg">
-  <defs>
-    <g id="10">
-      <rect width="50" height="50" fill="#555555"></rect>
-    </g>
-  </defs>
-  <use href="#10" x="25" y="25"></use>
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg-foreignobject-mask-rounded-shape-ref.html
-<!DOCTYPE html>
-<style>
-    body {
-        margin: 0;
-        background: red;
-    }
-
-    .wrapper {
-        position: relative;
-        width: 40px;
-        height: 40px;
-    }
-
-    .shifted-svg {
-        position: absolute;
-        inset-inline-start: -4px;
-        top: -4px;
-    }
-</style>
-<div class="wrapper">
-    <svg class="shifted-svg" width="48" height="48" viewBox="-4 -4 48 48" overflow="visible">
-        <path fill="green" d="M0 12C0 5.37258 5.37258 0 12 0H28C34.6274 0 40 5.37258 40 12V28C40 34.6274 34.6274 40 28 40H12C5.37258 40 0 34.6274 0 28V12Z" />
-    </svg>
-</div>
-
-FILE: Tests/LibWeb/Ref/expected/svg-foreignobject-replaced-background-in-paint-contained-svg-ref.html
-<!DOCTYPE html>
-<style>
-    body {
-        margin: 0;
-        background: red;
-    }
-
-    .expected {
-        position: absolute;
-        left: 10px;
-        top: 10px;
-        width: 80px;
-        height: 80px;
-        background: linear-gradient(135deg, green, blue);
-    }
-</style>
-<div class="expected"></div>
-
-FILE: Tests/LibWeb/Ref/expected/svg-gradient-in-defs-removed-repaint-ref.html
-<!DOCTYPE html>
-<svg width="100" height="100">
-    <rect width="100" height="100" fill="url(#g)"/>
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg-image-clipped-to-viewport-ref.html
-<!DOCTYPE html>
-<style>
-  body { margin: 0; background: white; }
-  div { width: 100px; height: 100px; background: green; }
-</style>
-<div></div>
-
-FILE: Tests/LibWeb/Ref/expected/svg-image-in-iframe-ref.html
-<!DOCTYPE html>
-<iframe srcdoc="<svg xmlns='http://www.w3.org/2000/svg'><rect width='150' height='100' fill='green' /></svg>"></iframe>
-
-FILE: Tests/LibWeb/Ref/expected/svg-image-positioning-ref.html
-<!DOCTYPE html>
-<svg width="300" height="300">
-    <rect x="0" y="0" width="250" height="250" fill="red" />
-    <rect width="150" height="100" fill="green" />
-</svg>
-<svg width="300" height="300">
-    <rect x="0" y="0" width="250" height="250" fill="red" />
-    <rect width="150" height="100" fill="green" />
-</svg>
-<svg width="300" height="300">
-    <rect x="0" y="0" width="250" height="250" fill="red" />
-</svg>
-<svg width="300" height="300">
-    <rect x="0" y="0" width="250" height="250" fill="red" />
-</svg>
-<svg width="300" height="300">
-    <rect x="0" y="0" width="250" height="250" fill="red" />
-    <rect width="150" height="100" fill="green" />
-</svg>
-<svg width="300" height="300">
-    <rect x="0" y="0" width="250" height="250" fill="red" />
-    <rect width="150" height="100" fill="green" />
-</svg>
-<svg width="300" height="300">
-    <rect x="0" y="0" width="250" height="250" fill="red" />
-    <rect width="250" height="167" fill="green" />
-</svg>
-<svg width="300" height="300">
-    <rect x="0" y="0" width="250" height="250" fill="red" />
-    <rect width="300" height="250" fill="green" />
-</svg>
-<svg width="300" height="300">
-    <rect x="0" y="0" width="250" height="250" fill="red" />
-    <rect x="50" width="150" height="100" fill="green" />
-</svg>
-<svg width="300" height="300">
-    <rect x="0" y="0" width="250" height="250" fill="red" />
-    <rect y="50" width="150" height="100" fill="green" />
-</svg>
-<svg width="300" height="300">
-    <rect x="0" y="0" width="250" height="250" fill="red" />
-    <rect x="50" y="50" width="150" height="100" fill="green" />
-</svg>
-<svg width="300" height="300">
-    <rect x="0" y="0" width="250" height="250" fill="red" />
-    <rect x="-50" y="-50" width="150" height="100" fill="green" />
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg-image-transform-ref.html
-<!DOCTYPE html>
-<style>
-    body { margin: 0 }
-</style>
-<!-- translate -->
-<svg width="200" height="200">
-    <rect x="25" y="50" width="150" height="100" fill="green" />
-</svg>
-<!-- scale -->
-<svg width="200" height="200">
-    <rect x="0" y="0" width="75" height="50" fill="green" />
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg-inside-scroll-container-ref.html
-<!DOCTYPE html>
-<style>
-    svg {
-        display: block;
-    }
-</style>
-<svg width="100" height="100">
-    <rect width="100" height="100" fill="green" />
-</svg>
-<svg width="100" height="100">
-    <rect width="100" height="100" fill="green" />
-</svg>
-<svg width="100" height="100">
-    <rect width="100" height="100" fill="green" />
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg-invalid-number-arguments-ref.html
-<!DOCTYPE html>
-<svg viewBox="0 0 10 10" width="100" height="100">
-    <line x1="0" y1="0" x2="10" y2="0" stroke="black" />
-</svg>
-<svg viewBox="0 0 10 10" width="100" height="100">
-    <line x1="0" y1="0" x2="10" y2="0" stroke="black" />
-</svg>
-<svg viewBox="0 0 10 10" width="100" height="100">
-    <line x1="0" y1="0" x2="10" y2="0" stroke="black" />
-</svg>
-<svg viewBox="0 0 10 10" width="100" height="100">
-    <line x1="0" y1="0" x2="10" y2="0" stroke="black" />
-</svg>
-<svg viewBox="0 0 10 10" width="100" height="100">
-    <line x1="0" y1="0" x2="10" y2="0" stroke="black" />
-</svg>
-<svg viewBox="0 0 10 10" width="100" height="100">
-    <line x1="0" y1="0" x2="10" y2="0" stroke="black" />
-</svg>
-<svg viewBox="0 0 10 10" width="100" height="100">
-    <line x1="0" y1="0" x2="10" y2="0" stroke="black" />
-</svg>
-<svg viewBox="0 0 10 10" width="100" height="100">
-    <line x1="0" y1="0" x2="10" y2="0" stroke="black" />
-</svg>
-<svg viewBox="0 0 10 10" width="100" height="100">
-    <line x1="0" y1="0" x2="10" y2="0" stroke="black" />
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg-line-dynamic-attribute-update-ref.html
-<!DOCTYPE html>
-<svg width="200" height="200">
-    <line x1="10" y1="10" x2="190" y2="190" stroke="black" stroke-width="2"/>
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg-nested-viewport-positioning-ref.html
-<!DOCTYPE html>
-<svg xmlns="http://www.w3.org/2000/svg" width="300" height="200" viewBox="0 0 256 256">
-    <rect x="0" y="0" width="256" height="256" fill="lime" />
-    <circle cx="128" cy="128" r="32" fill="blue" />
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg-non-local-clip-path-display-none-ref.html
-<!doctype html>
-<svg>
-</svg>
-<svg>
-  <rect fill="red" width="100" height="100">
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg-overflow-hidden-ref.html
-<!DOCTYPE html>
-<style>
-    svg { 
-        height: 200px;
-    }
-</style>
-<svg class="visible" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg"><rect x="0" y="0" width="50" height="100" fill="green"></rect></svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg-overflow-visible-ref.html
-<!DOCTYPE html>
-<style>
-    svg { 
-        height: 200px;
-    }
-</style>
-<svg class="visible" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg"><rect x="0" y="0" width="50" height="200" fill="green"></rect></svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg-paint-server-hidden-inherited-style-update-ref.html
-<!DOCTYPE html>
-<style>
-    body {
-        margin: 0;
-    }
-
-    svg {
-        display: block;
-    }
-</style>
-<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
-    <rect width="100" height="100" fill="green" />
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg-path-dynamic-attribute-update-ref.html
-<!DOCTYPE html>
-<svg width="200" height="200">
-    <path d="M 10 10 L 190 190" stroke="black" stroke-width="2" fill="none"/>
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg-path-incomplete-args-ref.html
-<!DOCTYPE html>
-<div>
-    <svg width="800" height="100">
-        <text x="0" y="50" font-size="1em">This should be drawn</text>
-    </svg>
-</div>
-<div>
-    <svg width="100" height="100">
-        <g stroke="black">
-            <path d="M 0 50 A 30 20, 0, 0 0, 90 50" />    
-            <path stroke-width="5" d="M 50 0 V 50" />            
-        </g>
-    </svg>
-</div>
-<div><svg width="100" height="100"></svg></div>
-<div><svg width="100" height="100"></svg></div>
-<div><svg width="100" height="100"></svg></div>
-<div><svg width="100" height="100"></svg></div>
-<div><svg width="100" height="100"></svg></div>
-<div><svg width="100" height="100"></svg></div>
-<div><svg width="100" height="100"></svg></div>
-<div><svg width="100" height="100"></svg></div>
-<div><svg width="100" height="100"></svg></div>
-<div><svg width="100" height="100"></svg></div>
-<div><svg width="100" height="100"></svg></div>
-<div><svg width="100" height="100"></svg></div>
-<div><svg width="100" height="100"></svg></div>
-<div><svg width="100" height="100"></svg></div>
-<div><svg width="100" height="100"></svg></div>
-<div><svg width="100" height="100"></svg></div>
-
-FILE: Tests/LibWeb/Ref/expected/svg-polygon-dynamic-attribute-update-ref.html
-<!DOCTYPE html>
-<svg width="200" height="200">
-    <polygon points="10,10 190,10 190,190 10,190" fill="black"/>
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg-polygon-with-incomplete-points-ref.html
-<!DOCTYPE html>
-<svg viewBox="0 0 10 10" width="100" height="100"></svg>
-<svg viewBox="0 0 10 10" width="100" height="100"></svg>
-<svg viewBox="0 0 10 10" width="100" height="100"></svg>
-<svg viewBox="0 0 10 10" width="100" height="100"></svg>
-<svg viewBox="0 0 10 10" width="100" height="100"></svg>
-<svg viewBox="0 0 10 10" width="100" height="100">
-    <polygon points="0,0 0,10 10,10" />
-</svg>
-<svg viewBox="0 0 10 10" width="100" height="100">
-    <polygon points="0,0 0,10 10,10" />
-</svg>
-<svg viewBox="0 0 10 10" width="100" height="100">
-    <polygon points="0,0 0,10 10,10" />
-</svg>
-<svg viewBox="0 0 10 10" width="100" height="100">
-    <polygon points="0,0 0,10 10,10 10,0" />
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg-polyline-dynamic-attribute-update-ref.html
-<!DOCTYPE html>
-<svg width="200" height="200">
-    <polyline points="10,10 100,190 190,10" stroke="black" stroke-width="2" fill="none"/>
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg-relayout-preserves-fixed-foreignobject-ref.html
-<!DOCTYPE html>
-<style>
-    body {
-        margin: 0;
-        background: green;
-    }
-</style>
-
-FILE: Tests/LibWeb/Ref/expected/svg-restore-after-filter.html
-<!DOCTYPE html>
-<svg width="10" height="10">
-  <rect width="10" height="10" fill="white"/>
-</svg>
-<span>This should be visible.</span>
-
-FILE: Tests/LibWeb/Ref/expected/svg-symbol-ref.html
-<!DOCTYPE html>
-<svg><symbol fill="green" id="dot" width="500" height="500" viewBox="0 0 2 10">
-<circle cx="1" cy="1" r="1"/>
-<circle fill="blue" cx="1.5" cy="1" r="1"/>
-</symbol>
-<use href="#dot"/>
-
-FILE: Tests/LibWeb/Ref/expected/svg-textPath-startOffset-ref.html
-<!DOCTYPE html>
-<svg width="300" height="100" viewBox="0 0 300 100" xmlns="http://www.w3.org/2000/svg">
-    <defs>
-        <path id="line" d="M 150 50 h 100"/>
-    </defs>
-    <text font-family="sans-serif" font-size="20">
-        <textPath href="#line">Test</textPath>
-    </text>
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg-textPath-text-anchor-ref.html
-<!DOCTYPE html>
-<style>
-@font-face {
-    font-family: Ahem;
-    src: url("../data/fonts/Ahem.ttf");
-}
-</style>
-<svg width="320" height="120" viewBox="0 0 320 120" xmlns="http://www.w3.org/2000/svg">
-    <defs>
-        <path id="middle-line" d="M 160 40 h 200"/>
-        <path id="end-line" d="M 220 90 h 200"/>
-    </defs>
-    <text font-family="Ahem" font-size="20">
-        <textPath href="#middle-line">XXXX</textPath>
-    </text>
-    <text font-family="Ahem" font-size="20">
-        <textPath href="#end-line">XXXX</textPath>
-    </text>
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg-transform-rotate-with-opacity.html
-<!DOCTYPE html>
-<style>
-    body {
-        margin: 0;
-        background-color: black;
-    }
-    .wrapper {
-        align-items: center;
-        background: #0000;
-        color: #f0f6fc;
-    }
-</style>
-<div class="wrapper">
-    <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" style="opacity: 0.5;">
-        <g transform="rotate(90, 8, 8)">
-            <path d="M6.22 3.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L9.94 8 6.22 4.28a.75.75 0 0 1 0-1.06Z"></path>
-        </g>
-    </svg>
-</div>
-
-FILE: Tests/LibWeb/Ref/expected/svg-url-in-shadow-root-ref.html
-<!DOCTYPE html>
-<body>
-    <div></div>
-</body>
-<style>
-    div {
-        width: 100px;
-        height: 100px;
-        background: crimson;
-    }
-</style>
-
-FILE: Tests/LibWeb/Ref/expected/svg-use-defined-earlier.html
-<!doctype html>
-<svg style="display: none">
-  <symbol id="earlier-reference">
-    <rect x="0" y="0" width="64" height="64" fill="green" />
-  </symbol>
-</svg>
-<div>
-  <svg width="100" height="100">
-    <use xlink:href="#earlier-reference"></use>
-  </svg>
-</div>
-
-FILE: Tests/LibWeb/Ref/expected/svg-use-forward-reference-in-decoded-svg-ref.html
-<!DOCTYPE html>
-<style>
-    body { margin: 0; }
-    svg { display: block; }
-</style>
-<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-    <rect x="2" y="2" width="20" height="20" fill="green"/>
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg-with-css-transform.html
-<!DOCTYPE html>
-<style>
-  svg {
-    position: absolute;
-    top: 50px;
-    left: 50px;
-  }
-</style>
-
-<svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg" width="100" height="100">
-  <rect width="100" height="100" />
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg/blend-filter-ref.html
-<!DOCTYPE html>
-<svg width="500" height="500" xmlns="http://www.w3.org/2000/svg">
-    <rect x="0" y="0" width="100" height="100" fill="green"/>
-    <rect x="25" y="25" width="50" height="50" fill="black" />
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg/composite-filter-ref.html
-<!DOCTYPE html>
-<svg width="110" height="110" xmlns="http://www.w3.org/2000/svg">
-    <rect x="10" y="10" width="100" height="100" fill="green" />
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg/custom-namespaced-attributes-ref.svg
-<?xml version="1.0" encoding="UTF-8" standalone="no"?>
-<svg:svg
-    width="200"
-    height="200"
-    xmlns:svg="http://www.w3.org/2000/svg"
->
-     <svg:circle cx="100" cy="100" r="50" fill="#ff0000"/>
-</svg:svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg/drop-shadow-ref.html
-<!DOCTYPE html>
-<svg width="200" height="200" xmlns="http://www.w3.org/2000/svg">
-    <rect x="30" y="30" width="100" height="100" fill="green" />
-    <rect x="10" y="10" width="100" height="100" fill="red" />
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg/ellipse-percentage-size-ref.html
-<!DOCTYPE html>
-<svg width="100" height="60">
-    <ellipse cx="50" cy="30" rx="50" ry="30" fill="green" />
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg/filter-primitive-scale-with-viewbox-ref.html
-<!DOCTYPE html>
-<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
-    <filter id="offset" x="-50%" y="-50%" width="200%" height="200%">
-        <feOffset dx="20" dy="20" />
-    </filter>
-    <rect x="10" y="10" width="40" height="40" fill="blue" filter="url(#offset)" />
-</svg>
-<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
-    <filter id="blur" x="-50%" y="-50%" width="200%" height="200%">
-        <feGaussianBlur stdDeviation="4" />
-    </filter>
-    <rect x="20" y="20" width="60" height="60" fill="green" filter="url(#blur)" />
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg/gradient-in-shadow-dom-ref.html
-<!DOCTYPE html>
-<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
-  <rect width="100" height="100" fill="green"/>
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg/image-percentage-size-ref.html
-<!DOCTYPE html>
-<svg width="100" height="100">
-    <rect width="100" height="100" fill="green"></rect>
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg/image-xlink-href-ref.html
-<!DOCTYPE html>
-<svg>
-    <rect width="100" height="100" fill="green"></rect>
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg/mask-filter-alpha-ref.html
-<!DOCTYPE html>
-<style>
-    body {
-        margin: 0;
-    }
-</style>
-<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
-    <rect width="100" height="100" fill="rgb(88, 101, 242)"></rect>
-    <rect x="25" y="25" width="50" height="50" fill="white"></rect>
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg/mask-filter-alpha-use-ref.html
-<!DOCTYPE html>
-<style>
-    body {
-        margin: 0;
-    }
-</style>
-<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
-    <rect width="100" height="100" fill="rgb(88, 101, 242)"></rect>
-    <rect x="25" y="25" width="50" height="50" fill="white"></rect>
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg/min-max-size-constraints-ref.html
-<!DOCTYPE html>
-<style>
-div {
-  border: solid 2px red;
-  background: green;
-  width: 25px;
-  height: 25px;
-  margin-bottom: 50px;
-}
-</style>
-All green squares should exactly fill their corresponding red border.
-<div></div>
-<div></div>
-<div></div>
-<div></div>
-
-<div></div>
-<div></div>
-<div></div>
-<div></div>
-
-FILE: Tests/LibWeb/Ref/expected/svg/natural-size-from-font-relative-svg-attributes-ref.html
-<!doctype html>
-<style>
-  div {
-    position: absolute;
-    top: 0;
-    width: 100px;
-    height: 100px;
-    background: green;
-  }
-</style>
-<div style="left: 0"></div>
-<div style="left: 100px"></div>
-
-FILE: Tests/LibWeb/Ref/expected/svg/offset-merge-filters-ref.html
-<!DOCTYPE html>
-<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
-    <rect x="0" y="0" width="100" height="100" fill="blue" />
-    <circle cx="50" cy="50" r="30" fill="rgba(255,0,0,0.5)" />
-    <circle cx="70" cy="60" r="30" fill="rgba(255,0,0,0.5)" />
-</svg>
-FILE: Tests/LibWeb/Ref/expected/svg/paint-order-ref.html
-<!DOCTYPE html>
-<!-- Based on https://wpt.live/svg/painting/reftests/paint-order-001.svg with markers removed -->
-<svg id="svg-root" width="100%" height="100%" viewBox="0 0 480 360" xmlns="http://www.w3.org/2000/svg">
-    <defs>
-        <rect id="rectangle" width="2" height="2" style="fill:blue" />
-        <path id="path" d="m -25,-25 0,50 50,0 0,-50 z"/>
-    </defs>
-    <g font-size="16" style="fill:lavender;stroke:green;stroke-width:5px">
-        <g href="#path" transform="translate(30,30)">
-            <use href="#path" />
-        </g>
-        <g href="#path" transform="translate(150,30)">
-            <use href="#path" />
-        </g>
-        <g href="#path" transform="translate(30, 150)">
-            <use href="#path" />
-        </g>
-        <g href="#path" transform="translate(150,150)">
-            <use href="#path" />
-        </g>
-        <g href="#path" transform="translate(30,270)">
-            <use href="#path" />
-            <use href="#path" style="stroke:none" />
-        </g>
-        <g href="#path" transform="translate(150,270)">
-            <use href="#path"  />
-            <use href="#path" style="stroke:none" />
-        </g>
-    </g>
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg/svg-as-image-fallback-viewbox-from-font-relative-attributes-ref.html
-<!DOCTYPE html>
-<style>
-    div {
-        width: 100px;
-        height: 100px;
-        background: green;
-    }
-</style>
-<div></div>
-
-FILE: Tests/LibWeb/Ref/expected/svg/switch-ref.html
-<!DOCTYPE html>
-<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200">
-    <circle cx="50" cy="50" r="40" fill="green" />
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg/translate-relative-to-viewbox-ref.html
-<!DOCTYPE html>
-<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewbox="0 0 1000 1000">
-    <circle cx="100" cy="250" r="25" fill="blue" />
-    <rect x="500" y="700" width="100" height="100" fill="blue"></rect>
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg/use-element-geometry-properties-ref.html
-<!DOCTYPE html>
-<svg width="100" height="100">
-    <rect width="100" height="100" fill="green"></rect>
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg/use-href-resolves-after-fragment-parsing-ref.html
-<!DOCTYPE html>
-<svg width="100" height="100" style="display: block"><rect width="100" height="100" fill="green"/></svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg/use-in-mask-ref.html
-<!DOCTYPE html>
-<style>
-    body {
-        margin: 0;
-    }
-</style>
-<svg width="100" height="100" viewBox="0 0 100 100">
-    <rect width="100" height="100" fill="rgb(88, 101, 242)"></rect>
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg/use-percentage-offset-ref.html
-<!DOCTYPE html>
-<svg width="200" height="200">
-    <rect x="100" y="100" width="100" height="100" fill="green" />
-</svg>
-
-FILE: Tests/LibWeb/Ref/expected/svg/zero-area-mask-ref.html
-<!DOCTYPE html>
-This should be visible.
-<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" style="width: 0px"></svg>
-
-FILE: Tests/LibWeb/Ref/expected/table-collapse-ignored-in-cells-ref.html
-<!DOCTYPE html>
-<head>
-<style>
-.collapse { border-collapse: collapse; }
-.separate { border-collapse: separate; }
-.border { border: 5px solid black; }
-.border-left { border-left: 5px solid blue; }
-</style>
-</head>
-<body>
-  <table class="collapse border">
-    <td class="border-left">aaaaaaa</td>
-  </table>
-  <table class="separate border-left">
-    <td class="border">aaaaaaa</td>
-  </table>
-</body>
-
-FILE: Tests/LibWeb/Ref/expected/table-margin-auto-inside-flex-item-ref.html
-<!DOCTYPE html>
-<style>
-    * { margin: 0; padding: 0; }
-    .flex { display: flex; flex-direction: column; }
-    .centering { min-width: 400px; margin: 0 auto; }
-    .block { width: 100%; background: green; }
-</style>
-<div class="flex">
-    <div class="centering">
-        <div class="block">content</div>
-    </div>
-</div>
-
-FILE: Tests/LibWeb/Ref/expected/tables-width-z-index-ref.html
-<!DOCTYPE html>
-<style>
-div {
-  background-color: green;
-  position: fixed;
-  width: 100px;
-  height: 100px;
-}
-.offset-0 { top: 10px; }
-.offset-1 { top: 120px; }
-.offset-2 { top: 230px; }
-.offset-3 { top: 340px; }
-.offset-4 { top: 450px; }
-.offset-5 { top: 560px; }
-.offset-6 { top: 670px; }
-.offset-7 { top: 780px; }
-</style>
-
-<div class="offset-0"></div>
-<div class="offset-1"></div>
-<div class="offset-2"></div>
-<div class="offset-3"></div>
-<div class="offset-4"></div>
-<div class="offset-5"></div>
-<div class="offset-6"></div>
-<div class="offset-7"></div>
-
-FILE: Tests/LibWeb/Ref/expected/text-decoration-in-anonymous-wrapper-ref.html
-<!doctype html>
-<style type="text/css">
-    .strike {
-        text-decoration-line: line-through;
-        text-decoration-color: red;
-        text-decoration-thickness: 4px;
-        text-decoration-style: dotted;
-    }
-</style><div class="strike">strike
-
-FILE: Tests/LibWeb/Ref/expected/text-div.html
-<!doctype html>
-<div>Well, hello friends!</div>
-
-FILE: Tests/LibWeb/Ref/expected/text-overflow-ellipsis-with-trailing-whitespace-ref.html
-<!DOCTYPE html>
-<span>abc</span>
-
-FILE: Tests/LibWeb/Ref/expected/text-overflow.html
-<!doctype html>
-<meta charset="utf-8">
-<style>
-  @font-face {
-    font-family: "Lato";
-    src: url("../../Assets/Lato-Bold.ttf");
-  }
-  div {
-    font: 16px/1 Lato;
-    overflow: hidden;
-    white-space: nowrap;
-    width: 75px;
-  }
-</style>
-<div>This text gets clipped</div>
-<div>This text…</div>
-<div style="width: 0px">Invisible</div>
-<div style="width: 5px">a</div>
-<div>This text…</div>
-<div><a href="#">This text…</a></div>
-<div><b>Bold</b> the…</div>
-<div><span style="float: left">F</span>Text af…</div>
-
-FILE: Tests/LibWeb/Ref/expected/text-shadow-color-on-color-font-glyph-ref.html
-<!DOCTYPE html>
-<meta charset="utf-8">
-<title>text-shadow uses the shadow color, not the glyph colors, for color-font glyphs</title>
-<style>
-    @font-face {
-        font-family: "COLRTest";
-        src: url("../data/fonts/COLR-palettes-test-font.ttf") format("truetype");
-    }
-    .glyph {
-        position: absolute;
-        margin: 0;
-        font: 100px "COLRTest";
-    }
-</style>
-<div class="glyph" style="left: 90px; top: 90px; filter: brightness(0);">A</div>
-<div class="glyph" style="left: 50px; top: 50px;">A</div>
-
-FILE: Tests/LibWeb/Ref/expected/textnode-segmenter-invalidation.html
-<!DOCTYPE html><textarea>a
-b</textarea>
-
-FILE: Tests/LibWeb/Ref/expected/top-layer-dialog-close-removes-boxes-ref.html
-<!DOCTYPE html>
-<style>
-    div {
-        width: 100px;
-        height: 100px;
-        background: green;
-    }
-</style>
-<div></div>
-
-FILE: Tests/LibWeb/Ref/expected/top-layer-dialog-reshown-same-task-ref.html
-<!DOCTYPE html>
-<style>
-    #backdrop {
-        position: fixed;
-        inset: 0;
-        background: red;
-    }
-    #dialog {
-        position: fixed;
-        left: 0;
-        top: 0;
-        width: 100px;
-        height: 100px;
-        background: green;
-    }
-</style>
-<div id="backdrop"></div>
-<div id="dialog"></div>
-
-FILE: Tests/LibWeb/Ref/expected/top-layer-element-inside-display-none-subtree-ref.html
-<!DOCTYPE html>
-<style>
-    div {
-        width: 100px;
-        height: 100px;
-        background: green;
-    }
-</style>
-<div></div>
-
-FILE: Tests/LibWeb/Ref/expected/top-layer-element-revealed-with-ancestor-keeps-paint-order-ref.html
-<!DOCTYPE html>
-<style>
-    div {
-        position: fixed;
-        top: 0;
-        height: 100px;
-    }
-    #left {
-        left: 0;
-        width: 100px;
-        background: green;
-    }
-    #right {
-        left: 100px;
-        width: 100px;
-        background: blue;
-    }
-</style>
-<div id="left"></div>
-<div id="right"></div>
-
-FILE: Tests/LibWeb/Ref/expected/top-layer-nested-member-is-viewport-sibling-ref.html
-<!DOCTYPE html>
-<style>
-    div {
-        position: fixed;
-        top: 0;
-        width: 100px;
-        height: 100px;
-    }
-    #outer-substitute {
-        left: 200px;
-        background: green;
-        opacity: 0.5;
-    }
-    #inner-substitute {
-        left: 0;
-        background: blue;
-    }
-</style>
-<div id="outer-substitute"></div>
-<div id="inner-substitute"></div>
-
-FILE: Tests/LibWeb/Ref/expected/top-layer-reshown-element-moves-to-top-ref.html
-<!DOCTYPE html>
-<style>
-    div {
-        position: fixed;
-        left: 0;
-        top: 0;
-        width: 100px;
-        height: 100px;
-        background: red;
-    }
-</style>
-<div></div>
-
-FILE: Tests/LibWeb/Ref/expected/top-layer-revealed-element-keeps-paint-order-ref.html
-<!DOCTYPE html>
-<style>
-    div {
-        position: fixed;
-        left: 0;
-        top: 0;
-        width: 100px;
-        height: 100px;
-        background: green;
-    }
-</style>
-<div></div>
-
-FILE: Tests/LibWeb/Ref/expected/top-layer-slot-popover-hidden-removes-slotted-boxes-ref.html
-<!DOCTYPE html>
-<div style="width: 100px; height: 100px; background: green;"></div>
-
-FILE: Tests/LibWeb/Ref/expected/trailing-whitespace-trim-with-letter-spacing-ref.html
-<!DOCTYPE html>
-<style>
-  * { margin: 0; padding: 0; }
-  .flex { display: flex; flex-direction: row; gap: 0.5rem; width: auto; }
-  p { letter-spacing: -0.03em; }
-</style>
-<p>Test passes if text does not wrap in either case below.</p>
-<div style="width: 900px; display: flex; justify-content: center; padding-inline: 6rem;">
-  <div class="flex">
-    <p>Protect your device against accidents for up to 4 years with Microsoft Complete.</p>
-    <span>Learn more</span>
-  </div>
-</div>
-
-FILE: Tests/LibWeb/Ref/expected/transform-2d-translate-ref.html
-<!DOCTYPE html>
-<style>
-* {
-    outline: 1px solid black;
-}
-div {
-    height: 100px;
-    background: pink;
-    transform: translate(0, -50%);
-}
-</style><body><div id="box">
-
-FILE: Tests/LibWeb/Ref/expected/transform-and-opacity-ref.html
-<!DOCTYPE html>
-<style>
-#outer {
-    position: relative;
-}
-#inner {
-    top: 100px;
-    left: 100px;
-    width: 100px;
-    height: 100px;
-    opacity: 0.5;
-    position: relative;
-    background-color: green;
-}
-</style>
-<div id="outer">
-  <div id="inner"></div>
-</div>
-FILE: Tests/LibWeb/Ref/expected/transform-box-ref.html
-<!DOCTYPE html>
-<style>
-.a {
-    border: 20px solid crimson;
-    transform: translateY(0px);
-}
-.b {
-    border: 20px solid crimson;
-    transform: translateY(40px);
-}
-</style>
-<div class="a"></div>
-<div class="b"></div>
-
-FILE: Tests/LibWeb/Ref/expected/transform-calc-length-percentage-ref.html
-<!doctype html><style>
-    * { outline: 1px solid black; }
-    html { background: white; }
-    body {
-        background: pink;
-        padding: 32px;
-        width: 200px;
-    }
-    div {
-        background: orange;
-        transform: translate(-26px, -25px);
-        width: 50px;
-        height: 50px;
-    }
-</style><body><div>
-
-FILE: Tests/LibWeb/Ref/expected/typed-om-display-none-ref.html
-<!DOCTYPE html>
-<style>
-    body {
-        margin: 0;
-    }
-
-    div {
-        width: 100px;
-        height: 100px;
-        background: green;
-    }
-</style>
-<div></div>
-
-FILE: Tests/LibWeb/Ref/expected/unicode-range-ref.html
-<!DOCTYPE html>
-<html>
-<head>
-    <style>
-        @font-face {
-            font-family: 'HashFont';
-            src: url('../../Assets/HashSans.woff');
-        }
-
-        .hash-font {
-          font-family: 'HashFont';
-        }
-
-        .text {
-          font-size: 100px;
-          font-family: "SerenitySans";
-        }
-    </style>
-</head>
-<body>
-    <div class="text"><span class="hash-font">A</span>B</div>
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/web-animation-details-content-pseudo-element-ref.html
-<!doctype html>
-<style>
-    details::details-content {
-        background-color: green;
-        width: 100px;
-        height: 100px;
-    }
-</style>
-<details open>
-    <summary></summary>
-    <div></div>
-</details>
-
-FILE: Tests/LibWeb/Ref/expected/webkit-box-shadow.html
-<!DOCTYPE html>
-<div style="width: 50px; height: 50px; box-shadow: 10px 5px 5px red"></div>
-
-FILE: Tests/LibWeb/Ref/expected/webkit-text-fill-color.html
-<!DOCTYPE html>
-<p style="color: lime; text-decoration: underline black;">Well, hello friends!</p>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/common/reftest-wait.js
-/**
- * Remove the `reftest-wait` class on the document element.
- * The reftest runner will wait with taking a screenshot while
- * this class is present.
- *
- * See https://web-platform-tests.org/writing-tests/reftests.html#controlling-when-comparison-occurs
- */
-function takeScreenshot() {
-    document.documentElement.classList.remove("reftest-wait");
-}
-
-/**
- * Call `takeScreenshot()` after a delay of at least |timeout| milliseconds.
- * @param {number} timeout - milliseconds
- */
-function takeScreenshotDelayed(timeout) {
-    setTimeout(function () {
-        takeScreenshot();
-    }, timeout);
-}
-
-/**
- * Ensure that a precondition is met before waiting for a screenshot.
- * @param {bool} condition - Fail the test if this evaluates to false
- * @param {string} msg - Error message to write to the screenshot
- */
-function failIfNot(condition, msg) {
-    const fail = () => {
-        (document.body || document.documentElement).textContent = `Precondition Failed: ${msg}`;
-        takeScreenshot();
-    };
-    if (!condition) {
-        if (document.readyState == "interactive") {
-            fail();
-        } else {
-            document.addEventListener("DOMContentLoaded", fail, false);
-        }
-    }
-}
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/common/reftest-wait.js.headers
-Content-Type: text/javascript; charset=utf-8
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/common/rendering-utils.js
-"use strict";
-
-/**
- * Waits until we have at least one frame rendered, regardless of the engine.
- *
- * @returns {Promise}
- */
-function waitForAtLeastOneFrame() {
-    return new Promise(resolve => {
-        // Different web engines work slightly different on this area but waiting
-        // for two requestAnimationFrames() to happen, one after another, should be
-        // sufficient to ensure at least one frame has been generated anywhere.
-        window.requestAnimationFrame(() => {
-            window.requestAnimationFrame(() => {
-                resolve();
-            });
-        });
-    });
-}
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/contenteditable/synthetic-height-ref.html
-<!doctype html>
-<title>CSS test reference</title>
-<style>
-  div { background: green; border: 1px solid; }
-</style>
-<div><br></div>
-<div><br></div>
-<div><br></div>
-<div><br></div>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/compositing/background-blending/reference/background-blend-mode-gradient-image-ref.html
-<!DOCTYPE html>
-<html>
-	<head>
-		<meta charset="utf-8">
-		<title>CSS Reftest Reference</title>
-		<link rel="author" title="Mirela Budăeș" href="mailto:mbudaes@adobe.com">
-		<style>
-			div {
-				margin: 5px;
-				width: 130px;
-				height: 130px;
-				background: black;/*rgb(0,0,0);*/
-				display: block;
-				float: left;
-			}
-		</style>
-	</head>
-	<body>
-		<p>Test passes if there is no red square on the screen. <br>
-		You should see a black square.</p>
-		<div></div>
-	</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/compositing/mix-blend-mode/reference/green-square.html
-<!DOCTYPE html>
-<html>
-    <head>
-        <meta charset="utf-8">
-        <title>CSS Reftest Reference</title>
-        <link rel="author" title="Mirela Budăeș" href="mailto:mbudaes@adobe.com">
-        <link rel="author" title="Mihai Tica" href="mailto:mitica@adobe.com">
-        <style type="text/css">
-            div {
-                background: #0F0;
-                width: 100px;
-                height: 100px;
-            }
-        </style>
-    </head>
-    <body>
-        <p>Test passes if you can see a green square on the screen.</p>
-        <div></div>
-    </body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/compositing/mix-blend-mode/reference/mix-blend-mode-svg-ref.html
-<!DOCTYPE html>
-<html>
-    <head>
-        <title>CSS Test: SVG element is blended.</title>
-        <link rel="author" title="Mihai Tica" href="mailto:mitica@adobe.com">
-        <style type="text/css">
-            div {
-                width: 100px;
-                height: 100px;
-                background: #0F0;
-            }
-        </style>
-    </head>
-    <body>
-        <p>Test passes if you can see a green box.</p>
-        <div></div>
-    </body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-align/reference/baseline-of-scrollable-1-ref.html
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <title>
-    CSS Reference Case
-  </title>
-  <link rel="author" title="Daniel Holbert" href="mailto:dholbert@mozilla.com">
-  <link rel="author" title="Mozilla" href="https://www.mozilla.org">
-  <link rel="help" href="https://drafts.csswg.org/css-align/#baseline-export">
-  <style>
-    .container {
-      /* In this reference case, we leave 'overflow' at its initial value. */
-      height: 50px;
-      width: 100px;
-      border-style: solid;
-      border-width: 2px 3px 4px 5px;
-      padding: 4px 5px 7px 8px;
-      margin: 1px 2px 3px 4px;
-    }
-    .inline-block {
-      display: inline-block;
-    }
-    .inline-flex {
-      display: inline-flex;
-    }
-    .inline-grid {
-      display: inline-grid;
-    }
-</style>
-</head>
-<body>
-  Test passes if the a/b text aligns with the bottom margin-edge of the "block"
-  rect and baseline-aligns with the "flex" and "grid" text.
-  <br><br>
-
-  <!-- Note: for this first "inline-block" case, we take the inner text out of
-       flow, to force the inline-block to synthesize its baseline from its
-       margin box.  (This is how the corresponding piece of the testcase is
-       supposed to render). -->
-  a
-  <div class="container inline-block">
-    <div style="position: absolute">block</div>
-  </div>
-  b
-  <br>
-
-  a
-  <div class="container inline-flex">flex</div>
-  b
-  <br>
-
-  a
-  <div class="container inline-grid">grid</div>
-  b
-
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-anchor-position/anchor-position-top-layer-ref.html
-<!DOCTYPE html>
-<title>Tests anchor positioning with top-layer elements</title>
-
-<style>
-body {
-  margin: 0;
-  height: 300vh;
-}
-
-#anchor {
-  position: fixed;
-  top: 200px;
-  left: 200px;
-  width: 100px;
-  height: 100px;
-  background: orange;
-}
-
-#target {
-  position: fixed;
-  top: 200px;
-  left: 300px;
-  width: 100px;
-  height: 100px;
-  background: lime;
-}
-</style>
-
-<div id="anchor"></div>
-<div id="target"></div>
-
-<script>
-document.scrollingElement.scrollTop = 100;
-</script>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-anchor-position/anchor-scroll-composited-scrolling-paint-001-ref.html
-<!DOCTYPE html>
-<link rel="help" href="https://bugzilla.mozilla.org/show_bug.cgi?id=1999954">
-<style>
-.abs-cb {
-  width: 100px;
-  height: 100px;
-  position: relative;
-}
-
-.anchor {
-  anchor-name: --a;
-  width: 50px;
-  height: 50px;
-  background: blue;
-}
-
-.chain {
-  width: 25px;
-  height: 25px;
-  background: pink;
-  position: absolute;
-  left: 50px;
-  top: 50px;
-}
-
-.positioned {
-  width: 25px;
-  height: 25px;
-  background: yellow;
-  position: absolute;
-  left: 75px;
-  top: 75px;
-}
-</style>
-<div class=abs-cb>
-  <div class=anchor></div>
-  <div class=chain></div>
-  <div class=positioned></div>
-</div>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-anchor-position/anchor-scroll-scrollable-anchor-ref.html
-<!DOCTYPE html>
-<style>
-#scroll-container {
-  width: 400px;
-  height: 400px;
-  overflow: scroll;
-}
-
-#scroll-contents {
-  width: 1000px;
-  height: 1000px;
-  position: relative;
-}
-
-#anchor {
-  anchor-name: --anchor;
-  height: 100px;
-  width: 100px;
-  overflow: scroll;
-}
-
-#anchored {
-  background: green;
-  width: 100px;
-  height: 100px;
-}
-</style>
-
-<div id="scroll-container">
-  <div id="scroll-contents">
-    <div style="height: 400px"></div>
-    <div id="anchored"></div>
-    <div id="anchor">
-      <div style="height: 500px"></div>
-    </div>
-  </div>
-</div>
-
-<script>
-document.getElementById('scroll-container').scrollTop = 300;
-document.getElementById('anchor').scrollTop = 300;
-</script>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-anchor-position/position-area-anchor-002-ref.html
-<!DOCTYPE html>
-<html class=reftest-wait>
-<title>anchor() resolution in position-area</title>
-<style>
-.abs-cb {
-  width: 180px;
-  height: 180px;
-  position: relative;
-  border: 5px solid;
-}
-
-.scroller {
-  width: 100%;
-  height: 100%;
-  overflow: scroll;
-}
-
-.anchor {
-  width: 60px;
-  height: 60px;
-  margin-left: 60px;
-  background: pink;
-}
-
-.filler {
-  width: 1px;
-  height: 180px;
-}
-
-.positioned {
-  width: 30px;
-  height: 30px;
-  background: purple;
-  position: absolute;
-}
-
-.tl {
-  right: 120px;
-  bottom: 120px;
-}
-
-.tr {
-  left: 120px;
-  bottom: 120px;
-}
-
-.bl {
-  right: 120px;
-  top: 120px;
-}
-
-.br {
-  left: 120px;
-  top: 120px;
-}
-</style>
-<div class=abs-cb>
-  <div id=s class=scroller>
-    <div class=filler></div>
-    <div class=anchor></div>
-    <div class=filler></div>
-    <div class="positioned tl dn"></div>
-    <div class="positioned tr dn"></div>
-    <div class="positioned bl dn"></div>
-    <div class="positioned br dn"></div>
-  </div>
-</div>
-<script>
-s.scrollTop = 120;
-document.documentElement.classList.remove('reftest-wait');
-</script>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-anchor-position/position-visibility-no-overflow-scroll-ref.html
-<!DOCTYPE html>
-<style>
-  #scroll-container {
-    overflow: hidden scroll;
-    scrollbar-width: none;
-    width: 400px;
-    height: 150px;
-  }
-
-  .anchor {
-    width: 100px;
-    height: 100px;
-    background: orange;
-    display: inline-block;
-  }
-
-  .target {
-    width: 100px;
-    height: 100px;
-  }
-</style>
-
-<div id="scroll-container">
-  <div class="anchor">anchor1</div>
-  <div class="anchor" style="position: relative; top: 100px">anchor2</div>
-  <div id="target1" class="target" style="background: green">target1</div>
-  <div style="height: 200px"></div>
-</div>
-<script>
-document.getElementById('scroll-container').scrollTop = 50;
-</script>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-anchor-position/reference/anchor-in-css-min-max-function-ref.html
-<!DOCTYPE html>
-
-<style>
-.container {
-  display: grid;
-  grid-template-columns: repeat(3, 100px);
-  gap: 10px;
-}
-
-.box {
-  width: 100px;
-  height: 100px;
-}
-
-.green {
-  background-color: green;
-}
-</style>
-
-<p>The test passes if there are three green boxes with no red.</p>
-
-<div class="container">
-  <div class="box green"></div>
-  <div class="box green"></div>
-  <div class="box green"></div>
-</div>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-anchor-position/reference/anchor-scroll-chained-001-ref.html
-<!DOCTYPE html>
-<style>
-body {
-  margin: 0;
-}
-
-div {
-  width: 100px;
-  height: 100px;
-}
-
-#scroller {
-  overflow: scroll;
-}
-
-#anchor {
-  height: 20px;
-  background: orange;
-}
-
-#anchored1 {
-  position: absolute;
-  top: 50px;
-  left: 0;
-  background: green;
-}
-
-#anchored2 {
-  position: absolute;
-  top: 150px;
-  left: 0;
-  background: lime;
-}
-
-</style>
-
-<div id="scroller">
-  <div style="height: 230px"></div>
-  <div id="anchor"></div>
-  <div style="height: 230px"></div>
-</div>
-<div id="anchored1"></div>
-<div id="anchored2"></div>
-
-<script>
-scroller.scrollTop = 200;
-</script>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-anchor-position/reference/anchor-scroll-chained-003-ref.html
-<!DOCTYPE html>
-<style>
-body {
-  margin: 0;
-}
-
-div {
-  width: 100px;
-  height: 100px;
-}
-
-#scroller1 {
-  width: 200px;
-  height: 200px;
-  position: relative;
-}
-
-#scroller1,#scroller2 {
-  overflow: scroll;
-  scrollbar-width: none;
-}
-
-#anchor {
-  height: 20px;
-  background: orange;
-}
-
-#anchored1 {
-  position: absolute;
-  top: 70px;
-  background: green;
-  z-index: 1;
-}
-
-#anchored2 {
-  position: absolute;
-  top: 170px;
-  background: lime;
-}
-
-</style>
-
-<div id="anchored2"></div>
-<div id="anchored1"></div>
-<div id="scroller1">
-  <div style="height: 100px"></div>
-  <div id="scroller2">
-    <div style="height: 230px"></div>
-    <div id="anchor"></div>
-    <div style="height: 230px"></div>
-  </div>
-  <div style="height: 100px"></div>
-</div>
-
-<script>
-scroller1.scrollTop = 80;
-scroller2.scrollTop = 200;
-</script>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-anchor-position/reference/anchor-scroll-composited-scrolling-006-ref.html
-<!DOCTYPE html>
-<style>
-body {
-  margin: 0;
-}
-#scroller {
-  width: 200px;
-  height: 100px;
-  overflow: scroll;
-  will-change: scroll-position;
-}
-#spacer {
-  height: 400px;
-}
-#anchor {
-  width: 100px;
-  height: 100px;
-  anchor-name: --a;
-}
-#overlap {
-  position: absolute;
-  width: 100px;
-  height: 100px;
-  top: 150px;
-  left: 0;
-  z-index: 100;
-  background: green;
-}
-</style>
-
-<div id="overlap"></div>
-<div id="scroller">
-  <div id="spacer"></div>
-  <div id="anchor"></div>
-</div>
-
-<script>
-scroller.scrollTop = 150;
-</script>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-anchor-position/reference/anchor-scroll-fixedpos-003-ref.html
-<!DOCTYPE html>
-
-<style>
-  body {
-    margin: 0;
-  }
-
-  div {
-    width: 100px;
-    height: 100px;
-    font-size: 16px;
-    background: green;
-    color: white;
-  }
-
-  #anchor {
-    margin-top: 105vh;
-    background: orange;
-  }
-
-  #anchored {
-    position: absolute;
