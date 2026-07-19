@@ -106115,7 +106115,7 @@ public:
         Yes,
     };
 
-    static constexpr size_t default_cage_size = 64ull * GiB;
+    static constexpr size_t default_cage_size = 4ull * TiB;
     static_assert(is_power_of_two(default_cage_size));
     static constexpr size_t cage_offset_mask = default_cage_size - 1;
     static constexpr size_t invalid_offset = NumericLimits<size_t>::max();
@@ -370587,7 +370587,7 @@ void MemoryBuffer::update_storage_offset()
     m_storage_offset = GC::PrimitiveStorage::the().offset(m_handle);
 }
 
-ErrorOr<void> MemoryBuffer::try_reserve(size_t capacity)
+ErrorOr<void> MemoryBuffer::try_reserve(size_t capacity, size_t guard_size)
 {
     if (m_handle.is_valid()) {
         if (capacity <= m_reserved_capacity)
@@ -370598,7 +370598,7 @@ ErrorOr<void> MemoryBuffer::try_reserve(size_t capacity)
         return {};
     }
 
-    m_handle = TRY(GC::PrimitiveStorage::the().try_reserve(0, capacity, GC::PrimitiveStorage::ZeroFillNewBytes::Yes));
+    m_handle = TRY(GC::PrimitiveStorage::the().try_reserve(0, capacity, GC::PrimitiveStorage::ZeroFillNewBytes::Yes, guard_size));
     m_reserved_capacity = capacity;
     update_storage_offset();
     return {};
@@ -370789,18 +370789,20 @@ static ErrorOr<size_t> initial_memory_reservation_size(MemoryType const& type)
     if (initial_size > maximum_size)
         return Error::from_errno(ENOMEM);
 
+    // memory32 storage must never move: compiled code caches its base address for unchecked
+    // accesses, so the backing allocation has to be able to grow to the maximum in place.
+    if (type.limits().address_type() == AddressType::I32)
+        return maximum_size;
+
     if (type.limits().max().has_value())
         return maximum_size;
 
-    if (type.limits().address_type() != AddressType::I32)
-        return initial_size;
-
-    return min(max(initial_size, static_cast<size_t>(Constants::wasm32_default_memory_reservation_size)), maximum_size);
+    return initial_size;
 }
 
 static size_t grown_memory_reservation_size(size_t current_capacity, size_t required_size, size_t maximum_size)
 {
-    auto new_capacity = max(current_capacity, static_cast<size_t>(Constants::wasm32_default_memory_reservation_size));
+    auto new_capacity = max(current_capacity, static_cast<size_t>(Constants::default_memory_reservation_size));
     while (new_capacity < required_size) {
         if (new_capacity > maximum_size / 2) {
             new_capacity = maximum_size;
@@ -370816,7 +370818,10 @@ ErrorOr<MemoryInstance> MemoryInstance::create(MemoryType const& type)
     MemoryInstance instance { type };
 
     auto reserved_capacity = TRY(initial_memory_reservation_size(type));
-    TRY(instance.m_data.try_reserve(reserved_capacity));
+    size_t guard_size = 0;
+    if (type.limits().address_type() == AddressType::I32)
+        guard_size = Constants::wasm32_guarded_reservation_size - reserved_capacity;
+    TRY(instance.m_data.try_reserve(reserved_capacity, guard_size));
 
     auto initial_size = TRY(size_from_page_count(type.limits().min()));
     if (!instance.grow(initial_size, GrowType::No))
@@ -372221,7 +372226,7 @@ public:
     MemoryBuffer(MemoryBuffer const&) = delete;
     MemoryBuffer& operator=(MemoryBuffer const&) = delete;
 
-    ErrorOr<void> try_reserve(size_t capacity);
+    ErrorOr<void> try_reserve(size_t capacity, size_t guard_size = 0);
     ErrorOr<void> try_resize(size_t new_size);
     ErrorOr<void> try_resize(size_t new_size, size_t reserved_capacity);
 
@@ -372255,7 +372260,6 @@ public:
     void move_data(size_t destination_offset, size_t source_offset, size_t count);
     bool contains_virtual_address(void const* address) const;
 
-    static constexpr size_t size_offset() { return __builtin_offsetof(MemoryBuffer, m_size); }
     static constexpr size_t storage_offset_offset() { return __builtin_offsetof(MemoryBuffer, m_storage_offset); }
 
 private:
@@ -389089,7 +389093,11 @@ static constexpr u64 wasm32_max_pages = 1ull << 16;
 //        the currently supported address width until 64-bit memory accesses are
 //        implemented there.
 static constexpr u64 wasm64_max_pages = wasm32_max_pages;
-static constexpr auto wasm32_default_memory_reservation_size = 16 * MiB;
+static constexpr auto default_memory_reservation_size = 16 * MiB;
+// Compiled memory32 accesses to the default memory are unchecked: every memory32 memory reserves
+// the whole span such an access can reach - base (u32) plus memarg offset (u32) plus one page
+// for the access width - and anything past the committed size page-faults into a wasm trap.
+static constexpr u64 wasm32_guarded_reservation_size = (2 * (wasm32_max_pages * page_size)) + page_size;
 
 // Implementation-defined limits
 // These are not concretely defined by the spec, so the values are only defined by us.
@@ -389210,7 +389218,7 @@ struct BatchInput {
 // any rebuild that changes those will simply miss the cache rather than try to
 // execute incompatible bytes.
 constexpr u64 cache_blob_magic = 0x4354494A4D534157ULL; // "WASMJITC" little-endian
-constexpr u32 cache_blob_format_version = 8;
+constexpr u32 cache_blob_format_version = 9;
 
 struct CacheBlobHeader {
     u64 magic;
@@ -389280,12 +389288,10 @@ static u64 compute_layout_hash(RuntimeHelpers const& h)
     hash = fnv1a(hash, h.locals_base_offset);
     hash = fnv1a(hash, h.default_memory_offset);
     hash = fnv1a(hash, h.memory_instance_data_offset);
-    hash = fnv1a(hash, h.memory_buffer_size_offset);
     hash = fnv1a(hash, h.memory_buffer_storage_offset_offset);
     hash = fnv1a(hash, h.compiled_call_result_scratch_offset);
     hash = fnv1a(hash, h.value_stack_base_offset);
     hash = fnv1a(hash, h.value_stack_top_offset);
-    hash = fnv1a(hash, h.primitive_storage_cage_offset_mask);
     return hash;
 }
 
@@ -390077,13 +390083,11 @@ static RuntimeHelpers make_runtime_helpers()
         .memory_copy = bit_cast<uintptr_t>(&wasm_cl_memory_copy),
         .memory_fill = bit_cast<uintptr_t>(&wasm_cl_memory_fill),
         .primitive_storage_cage_base = bit_cast<uintptr_t>(&js_primitive_storage_cage_base),
-        .primitive_storage_cage_offset_mask = GC::PrimitiveStorage::cage_offset_mask,
         .regs_offset = static_cast<u32>(offsetof(Configuration, regs)),
         .value_size = static_cast<u32>(sizeof(Value)),
         .locals_base_offset = static_cast<u32>(Configuration::locals_base_offset()),
         .default_memory_offset = static_cast<u32>(Configuration::default_memory_offset()),
         .memory_instance_data_offset = static_cast<u32>(MemoryInstance::data_offset()),
-        .memory_buffer_size_offset = static_cast<u32>(MemoryBuffer::size_offset()),
         .memory_buffer_storage_offset_offset = static_cast<u32>(MemoryBuffer::storage_offset_offset()),
         .compiled_call_result_scratch_offset = static_cast<u32>(Configuration::compiled_call_result_scratch_offset()),
         .value_stack_base_offset = static_cast<u32>(Configuration::value_stack_base_offset()),
@@ -395575,7 +395579,6 @@ impl CraneliftCompiler {
 
         let epilogue_block = builder.create_block();
         let trap_block = builder.create_block();
-        let memory_oob_block = builder.create_block();
 
         // Build helper call signatures. We import them as indirect calls via function pointers.
         macro_rules! sig {
@@ -395671,13 +395674,13 @@ impl CraneliftCompiler {
         let locals_base_offset = helpers.locals_base_offset as i32;
         let default_memory_offset = helpers.default_memory_offset as i32;
         let memory_instance_data_offset = helpers.memory_instance_data_offset as i32;
-        let memory_buffer_size_offset = helpers.memory_buffer_size_offset as i32;
         let memory_buffer_storage_offset_offset = helpers.memory_buffer_storage_offset_offset as i32;
-        let primitive_storage_cage_offset_mask = helpers.primitive_storage_cage_offset_mask as i64;
         let compiled_call_result_scratch_offset = helpers.compiled_call_result_scratch_offset as i32;
         let value_stack_base_offset = helpers.value_stack_base_offset as i32;
         let value_stack_top_offset = helpers.value_stack_top_offset as i32;
-        let wasm_memory_flags = MemFlags::new().with_notrap();
+        // Accesses to the default memory are unchecked and may fault; the fault handler turns
+        // faults inside a memory's guarded reservation into wasm traps.
+        let wasm_memory_flags = MemFlags::new();
         let interp_var = Variable::from_u32(8);
         builder.declare_var(interp_var, ptr_type);
         builder.def_var(interp_var, interpreter_val);
@@ -395691,12 +395694,8 @@ impl CraneliftCompiler {
                 .ins()
                 .load(ptr_type, MemFlags::trusted(), configuration_val, locals_base_offset);
         builder.def_var(locals_base_var, initial_locals_base);
-        let default_memory_size_var = Variable::from_u32(11);
-        builder.declare_var(default_memory_size_var, types::I64);
-        let default_memory_storage_offset_var = Variable::from_u32(12);
-        builder.declare_var(default_memory_storage_offset_var, types::I64);
-        let primitive_storage_cage_base_var = Variable::from_u32(13);
-        builder.declare_var(primitive_storage_cage_base_var, ptr_type);
+        let default_memory_base_var = Variable::from_u32(11);
+        builder.declare_var(default_memory_base_var, ptr_type);
 
         let uses_default_memory = insns.iter().any(|insn| {
             let mem_idx = insn.imm3 & 0x7fff_ffff;
@@ -395729,34 +395728,31 @@ impl CraneliftCompiler {
                     | op::SYNTHETIC_I64_STORELOCAL
             ) && mem_idx == 0
         });
+        // The base address is stable for the whole call: memory32 storage reserves its maximum
+        // (plus guard) up front, so growing commits in place and never moves the allocation.
         if uses_default_memory {
             let default_memory =
                 builder
                     .ins()
                     .load(ptr_type, MemFlags::trusted(), configuration_val, default_memory_offset);
-            let memory_buffer_offset = memory_instance_data_offset;
-            let memory_size = builder.ins().load(
-                types::I64,
-                MemFlags::trusted(),
-                default_memory,
-                memory_buffer_offset + memory_buffer_size_offset,
-            );
-            builder.def_var(default_memory_size_var, memory_size);
             let storage_offset = builder.ins().load(
                 types::I64,
                 MemFlags::trusted(),
                 default_memory,
-                memory_buffer_offset + memory_buffer_storage_offset_offset,
+                memory_instance_data_offset + memory_buffer_storage_offset_offset,
             );
-            builder.def_var(default_memory_storage_offset_var, storage_offset);
+            let storage_offset = if ptr_type == types::I64 {
+                storage_offset
+            } else {
+                builder.ins().ireduce(ptr_type, storage_offset)
+            };
             let cage_base_storage = builder.ins().func_addr(ptr_type, h_primitive_storage_cage_base);
             let cage_base = builder.ins().load(ptr_type, MemFlags::trusted(), cage_base_storage, 0);
-            builder.def_var(primitive_storage_cage_base_var, cage_base);
+            let memory_base = builder.ins().iadd(cage_base, storage_offset);
+            builder.def_var(default_memory_base_var, memory_base);
         } else {
-            let zero = builder.ins().iconst(types::I64, 0);
-            builder.def_var(default_memory_size_var, zero);
-            builder.def_var(default_memory_storage_offset_var, zero);
-            builder.def_var(primitive_storage_cage_base_var, zero);
+            let zero = builder.ins().iconst(ptr_type, 0);
+            builder.def_var(default_memory_base_var, zero);
         }
 
         let mut control_stack: Vec<ControlFrame> = Vec::new();
@@ -395773,7 +395769,7 @@ impl CraneliftCompiler {
         let mut is_unreachable = false;
         let mut dirty_regs = [false; REG_COUNT];
         let mut stack_vars: Vec<Variable> = Vec::with_capacity(max_stack_depth);
-        const VSTACK_VAR_BASE: u32 = 14;
+        const VSTACK_VAR_BASE: u32 = 12;
 
         for i in 0..max_stack_depth {
             let var = Variable::from_u32(VSTACK_VAR_BASE + i as u32);
@@ -396438,31 +396434,6 @@ impl CraneliftCompiler {
             }};
         }
 
-        macro_rules! refresh_default_memory_cache {
-            ($builder:expr) => {{
-                if uses_default_memory {
-                    let cfg = $builder.use_var(config_var);
-                    let memory = $builder
-                        .ins()
-                        .load(ptr_type, MemFlags::trusted(), cfg, default_memory_offset);
-                    let memory_buffer_offset = memory_instance_data_offset;
-                    let memory_size = $builder.ins().load(
-                        types::I64,
-                        MemFlags::trusted(),
-                        memory,
-                        memory_buffer_offset + memory_buffer_size_offset,
-                    );
-                    $builder.def_var(default_memory_size_var, memory_size);
-                    let storage_offset = $builder.ins().load(
-                        types::I64,
-                        MemFlags::trusted(),
-                        memory,
-                        memory_buffer_offset + memory_buffer_storage_offset_offset,
-                    );
-                    $builder.def_var(default_memory_storage_offset_var, storage_offset);
-                }
-            }};
-        }
         // Call + trap-check macro for helper calls that do not consume caller register state.
         // The callee gets arguments explicitly (register immediates, stack, or call record), and the caller's virtual registers stay live in SSA across the call.
         macro_rules! do_call_and_check {
@@ -396480,7 +396451,6 @@ impl CraneliftCompiler {
                     .ins()
                     .load(ptr_type, MemFlags::trusted(), _cfg_for_lb, locals_base_offset);
                 $builder.def_var(locals_base_var, new_lb);
-                refresh_default_memory_cache!($builder);
             }};
         }
         macro_rules! set_trap {
@@ -396504,44 +396474,17 @@ impl CraneliftCompiler {
                     .call_indirect(set_trap_sig, st_ptr, &[interp, msg_ptr, msg_len]);
             }};
         }
+        // No bounds checks: the memory reserves the full base (u32) + offset (u32) span, so any
+        // out-of-bounds access faults on an uncommitted page and unwinds as a wasm trap.
         macro_rules! inline_default_memory_address {
-            ($builder:expr, $addr:expr, $access_size:expr) => {{
-                let memory_size = $builder.use_var(default_memory_size_var);
-
-                let addr_too_large = $builder
-                    .ins()
-                    .icmp(IntCC::UnsignedGreaterThan, $addr, memory_size);
-                let addr_in_bounds = $builder.create_block();
-                $builder
-                    .ins()
-                    .brif(addr_too_large, memory_oob_block, &[], addr_in_bounds, &[]);
-                $builder.switch_to_block(addr_in_bounds);
-                $builder.seal_block(addr_in_bounds);
-
-                let remaining = $builder.ins().isub(memory_size, $addr);
-                let access_too_large = $builder
-                    .ins()
-                    .icmp_imm(IntCC::UnsignedLessThan, remaining, $access_size);
-                let access_in_bounds = $builder.create_block();
-                $builder
-                    .ins()
-                    .brif(access_too_large, memory_oob_block, &[], access_in_bounds, &[]);
-                $builder.switch_to_block(access_in_bounds);
-                $builder.seal_block(access_in_bounds);
-
-                let storage_offset = $builder.use_var(default_memory_storage_offset_var);
-                let unmasked_caged_offset = $builder.ins().iadd(storage_offset, $addr);
-                let cage_offset_mask = $builder
-                    .ins()
-                    .iconst(types::I64, primitive_storage_cage_offset_mask);
-                let caged_offset = $builder.ins().band(unmasked_caged_offset, cage_offset_mask);
-                let cage_base = $builder.use_var(primitive_storage_cage_base_var);
-                let caged_offset = if ptr_type == types::I64 {
-                    caged_offset
+            ($builder:expr, $addr:expr) => {{
+                let memory_base = $builder.use_var(default_memory_base_var);
+                let addr_offset = if ptr_type == types::I64 {
+                    $addr
                 } else {
-                    $builder.ins().ireduce(ptr_type, caged_offset)
+                    $builder.ins().ireduce(ptr_type, $addr)
                 };
-                $builder.ins().iadd(cage_base, caged_offset)
+                $builder.ins().iadd(memory_base, addr_offset)
             }};
         }
 
@@ -397472,14 +397415,7 @@ impl CraneliftCompiler {
 
                     let mem_idx = insn.imm3 & 0x7fff_ffff;
                     if mem_idx == 0 {
-                        let access_size = match opc {
-                            op::I32_LOAD8_S | op::I32_LOAD8_U | op::I64_LOAD8_S | op::I64_LOAD8_U => 1,
-                            op::I32_LOAD16_S | op::I32_LOAD16_U | op::I64_LOAD16_S | op::I64_LOAD16_U => 2,
-                            op::I32_LOAD | op::F32_LOAD | op::I64_LOAD32_S | op::I64_LOAD32_U => 4,
-                            op::I64_LOAD | op::F64_LOAD => 8,
-                            _ => unreachable!(),
-                        };
-                        let address = inline_default_memory_address!(builder, addr, access_size);
+                        let address = inline_default_memory_address!(builder, addr);
                         if opc == op::F64_LOAD {
                             let result = builder.ins().load(types::F64, wasm_memory_flags, address, 0);
                             write_dst_f64!(builder, insn.destination, result);
@@ -397587,7 +397523,7 @@ impl CraneliftCompiler {
                             op::I64_STORE | op::F64_STORE => 8,
                             _ => unreachable!(),
                         };
-                        let address = inline_default_memory_address!(builder, addr, access_size);
+                        let address = inline_default_memory_address!(builder, addr);
                         let value = if is_f32_inline {
                             val
                         } else {
@@ -397649,9 +397585,6 @@ impl CraneliftCompiler {
                     let result = builder.inst_results(call)[0];
                     let result = builder.ins().sextend(types::I64, result);
                     write_dst!(builder, insn.destination, result);
-                    if insn.imm1 == 0 {
-                        refresh_default_memory_cache!(builder);
-                    }
                 }
 
                 op::MEMORY_COPY => {
@@ -397895,8 +397828,7 @@ impl CraneliftCompiler {
 
                     let mem_idx = insn.imm3 & 0x7fff_ffff;
                     if mem_idx == 0 {
-                        let access_size = if opc == op::SYNTHETIC_I32_STORELOCAL { 4 } else { 8 };
-                        let address = inline_default_memory_address!(builder, addr, access_size);
+                        let address = inline_default_memory_address!(builder, addr);
                         let value = if opc == op::SYNTHETIC_I32_STORELOCAL {
                             builder.ins().ireduce(types::I32, val)
                         } else {
@@ -397968,14 +397900,9 @@ impl CraneliftCompiler {
             builder.seal_block(body_start);
         }
 
-        builder.switch_to_block(memory_oob_block);
-        builder.seal_block(memory_oob_block);
-        set_trap!(builder, "Memory access out of bounds");
-        builder.ins().jump(trap_block, &[]);
-
         builder.switch_to_block(trap_block);
         builder.seal_block(trap_block);
-        // The helper or the inline trap block already set the trap for us.
+        // The helper already set the trap for us.
         let trap_ret = builder.ins().iconst(types::I64, outcome_return_value as i64);
         builder.ins().return_(&[trap_ret]);
 
@@ -398230,14 +398157,11 @@ pub struct RuntimeHelpers {
     // Address of the process-global primitive storage cage base.
     pub primitive_storage_cage_base: usize,
 
-    pub primitive_storage_cage_offset_mask: usize,
-
     pub regs_offset: u32,
     pub value_size: u32,
     pub locals_base_offset: u32,
     pub default_memory_offset: u32,
     pub memory_instance_data_offset: u32,
-    pub memory_buffer_size_offset: u32,
     pub memory_buffer_storage_offset_offset: u32,
     pub compiled_call_result_scratch_offset: u32,
     pub value_stack_base_offset: u32,
@@ -658895,3 +658819,82 @@ void EventLoop::spin_until(GC::Ref<GC::Function<bool()>> goal_condition)
     perform_a_microtask_checkpoint();
 
     // 6. In parallel:
+    //    1. Wait until the condition goal is met.
+    //    2. Queue a task on task source to:
+    //       1. Replace the JavaScript execution context stack with old stack.
+    //       2. Perform any steps that appear after this spin the event loop instance in the original algorithm.
+    //       NOTE: This is achieved by returning from the function.
+
+    Platform::EventLoopPlugin::the().spin_until(GC::create_function(heap(), [this, goal_condition] {
+        if (goal_condition->function()())
+            return true;
+        if (m_task_queue->has_runnable_tasks()) {
+            schedule();
+            // FIXME: Remove the platform event loop plugin so that this doesn't look out of place
+            Core::EventLoop::current().wake();
+        }
+        return goal_condition->function()();
+    }));
+
+    vm.restore_execution_context_stack();
+
+    // 7. Stop task, allowing whatever algorithm that invoked it to resume.
+    // NOTE: This is achieved by returning from the function.
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#event-loop-processing-model
+void EventLoop::process()
+{
+    // 1. Let oldestTask and taskStartTime be null.
+    GC::Ptr<Task> oldest_task;
+    [[maybe_unused]] double task_start_time = 0;
+
+    // Some algorithms request that steps or states only occur once the event loop has reached step 1.
+    // Invoke a set of tasks that these algorithms request us to in order to achieve this.
+    auto reached_step_1_tasks = move(m_reached_step_1_tasks);
+    for (auto& reached_step_1_task : reached_step_1_tasks)
+        reached_step_1_task->function()();
+
+    // 2. If the event loop has a task queue with at least one runnable task, then:
+    if (m_task_queue->has_runnable_tasks()) {
+        // 1. Let taskQueue be one such task queue, chosen in an implementation-defined manner.
+        auto task_queue = m_task_queue;
+
+        // 2. Set taskStartTime to the unsafe shared current time.
+        task_start_time = HighResolutionTime::unsafe_shared_current_time();
+
+        // 3. Set oldestTask to the first runnable task in taskQueue, and remove it from taskQueue.
+        oldest_task = task_queue->take_first_runnable();
+
+        // FIXME: 4. If oldestTask's document is not null, then record task start time given taskStartTime and oldestTask's document.
+
+        // 5. Set the event loop's currently running task to oldestTask.
+        m_currently_running_task = oldest_task.ptr();
+
+        // 6. Perform oldestTask's steps.
+        oldest_task->execute();
+
+        // 7. Set the event loop's currently running task back to null.
+        m_currently_running_task = nullptr;
+
+        // 8. Perform a microtask checkpoint.
+        perform_a_microtask_checkpoint();
+    }
+
+    // 3. Let taskEndTime be the unsafe shared current time. [HRT]
+    [[maybe_unused]] auto task_end_time = HighResolutionTime::unsafe_shared_current_time();
+
+    // 4. If oldestTask is not null, then:
+    if (oldest_task) {
+        // FIXME: 1. Let top-level browsing contexts be an empty set.
+        // FIXME: 2. For each environment settings object settings of oldestTask's script evaluation environment settings object set:
+        // FIXME: 2.1. Let global be settings's global object.
+        // FIXME: 2.2. If global is not a Window object, then continue.
+        // FIXME: 2.3. If global's browsing context is null, then continue.
+        // FIXME: 2.4. Let tlbc be global's browsing context's top-level browsing context.
+        // FIXME: 2.5. If tlbc is not null, then append it to top-level browsing contexts.
+        // FIXME: 3. Report long tasks, passing in taskStartTime, taskEndTime, top-level browsing contexts, and oldestTask.
+        // FIXME: 4. If oldestTask's document is not null, then record task end time given taskEndTime and oldestTask's document.
+    }
+
+    // 5. If this is a window event loop that has no runnable task in this event loop's task queues, then:
