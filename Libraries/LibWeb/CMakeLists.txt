@@ -399,10 +399,30 @@ set(SOURCES
     Dump.cpp
     Editing/CommandNames.cpp
     Editing/Commands.cpp
+    Editing/ClipboardSanitizer.cpp
+    Editing/ClipboardSerializer.cpp
     Editing/EditCommand.cpp
     Editing/EditingHistory.cpp
     Editing/ExecCommand.cpp
+    Editing/InlineInsertion.cpp
+    Editing/InsertedContent.cpp
+    Editing/InsertedNodes.cpp
+    Editing/ReplacementEndpoints.cpp
+    Editing/InterchangeWhitespace.cpp
+    Editing/LegacyFontStyle.cpp
     Editing/Internal/Algorithms.cpp
+    Editing/MutationTrackedRange.cpp
+    Editing/ParagraphIntegration.cpp
+    Editing/ParagraphOperations.cpp
+    Editing/ParagraphTransfer.cpp
+    Editing/ReplacementFragment.cpp
+    Editing/ReplacementRangeCleanup.cpp
+    Editing/ReplacementStyleCleanup.cpp
+    Editing/StyledMarkupAccumulator.cpp
+    Editing/StyledMarkupSelection.cpp
+    Editing/StyledMarkupSerializer.cpp
+    Editing/VisiblePosition.cpp
+    Editing/ReplaceSelection.cpp
     Encoding/TextDecoder.cpp
     Encoding/TextDecoderCommon.cpp
     Encoding/TextDecoderStream.cpp
@@ -914,7 +934,7 @@ set(SOURCES
     Painting/ResolvedCSSFilter.cpp
     Painting/ResizeHandle.cpp
     Painting/Scrollbar.cpp
-    Painting/ScrollFrame.cpp
+    Painting/ScrollNodeState.cpp
     Painting/ScrollState.cpp
     Painting/ShadowPainting.cpp
     Painting/StackingContext.cpp
@@ -953,6 +973,7 @@ set(SOURCES
     ResourceTiming/PerformanceResourceTiming.cpp
     SecureContexts/AbstractOperations.cpp
     Selection/Selection.cpp
+    Selection/CaretNavigation.cpp
     Selection/SelectionModifier.cpp
     ServiceWorker/Cache.cpp
     ServiceWorker/CacheStorage.cpp
