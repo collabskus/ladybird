@@ -55,6 +55,7 @@
 #include <LibWeb/CSS/CSSStyleSheet.h>
 #include <LibWeb/CSS/CSSTransition.h>
 #include <LibWeb/CSS/ComputedProperties.h>
+#include <LibWeb/CSS/CustomPropertyRegistration.h>
 #include <LibWeb/CSS/FontComputer.h>
 #include <LibWeb/CSS/FontFaceSet.h>
 #include <LibWeb/CSS/Invalidation/MediaQueryInvalidator.h>
@@ -9548,17 +9549,6 @@ Optional<CSS::CustomPropertyRegistration const&> Document::get_registered_custom
 
     // Otherwise there is no registration, and the custom property is not a registered custom property.
     return {};
-}
-
-NonnullRefPtr<CSS::StyleValue const> Document::custom_property_initial_value(Utf16FlyString const& name) const
-{
-    auto maybe_custom_property = get_registered_custom_property(name);
-    if (maybe_custom_property.has_value())
-        return CSS::compute_registered_custom_property_initial_value(*this, maybe_custom_property.value());
-
-    // For non-registered properties, the initial value is the guaranteed-invalid value.
-    // See: https://drafts.csswg.org/css-variables/#propdef-
-    return CSS::GuaranteedInvalidStyleValue::create();
 }
 
 void Document::did_change_custom_property_registrations()
