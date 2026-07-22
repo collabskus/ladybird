@@ -294,13 +294,14 @@ void ConnectionFromClient::load_url(u64 page_id, URL::URL url, Web::Bindings::Na
 
 void ConnectionFromClient::load_url_with_document_resource(u64 page_id, URL::URL url,
     Web::HTML::DocumentResource document_resource,
-    Web::Bindings::NavigationHistoryBehavior history_handling)
+    Web::Bindings::NavigationHistoryBehavior history_handling,
+    Optional<Web::HTML::NavigationSourceSnapshot> source_snapshot)
 {
     auto page = this->page(page_id);
     if (!page.has_value())
         return;
 
-    page->page().load(url, move(document_resource), history_handling);
+    page->page().load(url, move(document_resource), history_handling, move(source_snapshot));
 }
 
 void ConnectionFromClient::load_html(u64 page_id, ByteString html)
@@ -2365,6 +2366,18 @@ void ConnectionFromClient::set_browsing_behavior(u64 page_id, WebView::BrowsingB
 void ConnectionFromClient::set_enable_global_privacy_control(u64, bool enable)
 {
     Web::ResourceLoader::the().set_enable_global_privacy_control(enable);
+}
+
+void ConnectionFromClient::set_geolocation_emulated_position(u64 page_id, WebView::GeolocationPositionData position, Optional<u16> error_code)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->set_geolocation_emulated_position(position, error_code);
+}
+
+void ConnectionFromClient::geolocation_position_response(u64 page_id, u64 request_id, WebView::GeolocationPositionData position, Optional<u16> error_code)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->geolocation_position_response(request_id, position, error_code);
 }
 
 void ConnectionFromClient::set_has_focus(u64 page_id, bool has_focus)

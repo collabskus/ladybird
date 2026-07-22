@@ -43,11 +43,14 @@
 #include <LibWeb/DOM/RequestFullscreenError.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
+#include <LibWeb/Geolocation/GeolocationCoordinates.h>
+#include <LibWeb/Geolocation/GeolocationPositionError.h>
 #include <LibWeb/HTML/ActivateTab.h>
 #include <LibWeb/HTML/AudioPlayState.h>
 #include <LibWeb/HTML/ColorPickerUpdateState.h>
 #include <LibWeb/HTML/CrossProcessId.h>
 #include <LibWeb/HTML/FileFilter.h>
+#include <LibWeb/HTML/NavigationSourceSnapshot.h>
 #include <LibWeb/HTML/POSTResource.h>
 #include <LibWeb/HTML/ReplicatedNavigableState.h>
 #include <LibWeb/HTML/Scripting/ScriptRegistry.h>
@@ -114,7 +117,8 @@ public:
 
     void load(URL::URL const&, Bindings::NavigationHistoryBehavior = Bindings::NavigationHistoryBehavior::Auto);
     void load(URL::URL const&, HTML::DocumentResource,
-        Bindings::NavigationHistoryBehavior = Bindings::NavigationHistoryBehavior::Auto);
+        Bindings::NavigationHistoryBehavior = Bindings::NavigationHistoryBehavior::Auto,
+        Optional<HTML::NavigationSourceSnapshot> = {});
 
     void load_html(StringView);
     void load_html(StringView, URL::URL const&);
@@ -232,6 +236,16 @@ public:
     using ClipboardRequest = GC::Ref<GC::Function<void(Vector<Clipboard::SystemClipboardItem>)>>;
     void request_clipboard_entries(ClipboardRequest);
     void retrieved_clipboard_entries(u64 request_id, Vector<Clipboard::SystemClipboardItem>);
+
+    using GeolocationPositionResult = Variant<Geolocation::CoordinatesData, Geolocation::GeolocationPositionError::ErrorCode>;
+    using GeolocationPositionCallback = GC::Ref<GC::Function<void(GeolocationPositionResult)>>;
+    enum class GeolocationRequestType : u8 {
+        OneShot,
+        Watch,
+    };
+    u64 request_geolocation_position(GeolocationPositionCallback, GeolocationRequestType = GeolocationRequestType::OneShot);
+    void cancel_geolocation_position_request(u64 request_id);
+    void receive_geolocation_position(u64 request_id, GeolocationPositionResult);
 
     enum class PendingNonBlockingDialog {
         None,
@@ -379,6 +393,14 @@ private:
     HashMap<u64, ClipboardRequest> m_pending_clipboard_requests;
     u64 m_next_clipboard_request_id { 0 };
 
+    struct PendingGeolocationRequest {
+        GeolocationPositionCallback callback;
+        GeolocationRequestType type;
+    };
+    HashMap<u64, PendingGeolocationRequest> m_pending_geolocation_requests;
+    u64 m_next_geolocation_request_id { 0 };
+    Optional<u64> m_active_geolocation_request_id;
+
     Vector<UniqueNodeID> m_media_elements;
     Vector<UniqueNodeID> m_canvas_elements;
     Optional<UniqueNodeID> m_media_context_menu_element_id;
@@ -462,8 +484,8 @@ public:
     {
         return NavigationProcessDecision::Local;
     }
-    virtual void request_new_process_for_navigation(URL::URL const&, HTML::DocumentResource, Bindings::NavigationHistoryBehavior) { }
-    virtual void request_new_process_for_child_frame_navigation(HTML::CrossProcessId, URL::URL const&, HTML::DocumentResource, Bindings::NavigationHistoryBehavior) { }
+    virtual void request_new_process_for_navigation(URL::URL const&, HTML::DocumentResource, Bindings::NavigationHistoryBehavior, Optional<HTML::NavigationSourceSnapshot> const&) { }
+    virtual void request_new_process_for_child_frame_navigation(HTML::CrossProcessId, URL::URL const&, HTML::DocumentResource, Bindings::NavigationHistoryBehavior, Optional<HTML::NavigationSourceSnapshot> const&) { }
     virtual void page_did_create_child_frame(HTML::CrossProcessId, HTML::CrossProcessId, HTML::ReplicatedNavigableState const&) { }
     virtual void page_did_update_child_frame_viewport(HTML::CrossProcessId, CSSPixelRect) { }
     virtual void page_did_commit_child_frame_navigation(HTML::CrossProcessId, HTML::ReplicatedNavigableState const&) { }
@@ -606,6 +628,10 @@ public:
     virtual void page_did_request_color_picker([[maybe_unused]] Color current_color) { }
     virtual void page_did_request_file_picker([[maybe_unused]] HTML::FileFilter const& accepted_file_types, Web::HTML::AllowMultipleFiles) { }
     virtual void page_did_request_select_dropdown([[maybe_unused]] Web::CSSPixelPoint content_position, [[maybe_unused]] Web::CSSPixels minimum_width, [[maybe_unused]] Vector<Web::HTML::SelectItem> items) { }
+    virtual void page_did_request_geolocation_position([[maybe_unused]] u64 request_id) { }
+    virtual void page_did_cancel_geolocation_position_request([[maybe_unused]] u64 request_id) { }
+    virtual void page_did_start_geolocation_position_watch([[maybe_unused]] u64 request_id) { }
+    virtual void page_did_stop_geolocation_position_watch([[maybe_unused]] u64 request_id) { }
 
     virtual void page_did_finish_test([[maybe_unused]] Utf16String const& text) { }
     virtual void page_did_set_test_timeout([[maybe_unused]] double milliseconds) { }

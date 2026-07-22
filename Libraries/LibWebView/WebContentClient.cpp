@@ -487,10 +487,10 @@ void WebContentClient::did_present_bitmap(u64 page_id, Gfx::IntRect rect, Gfx::I
     }
 }
 
-void WebContentClient::did_request_new_process_for_navigation(u64 page_id, URL::URL url, Web::HTML::DocumentResource document_resource, Web::Bindings::NavigationHistoryBehavior history_handling)
+void WebContentClient::did_request_new_process_for_navigation(u64 page_id, URL::URL url, Web::HTML::DocumentResource document_resource, Web::Bindings::NavigationHistoryBehavior history_handling, Optional<Web::HTML::NavigationSourceSnapshot> source_snapshot)
 {
     if (auto view = view_for_page_id(page_id); view.has_value())
-        view->create_new_process_for_cross_site_navigation(url, move(document_resource), history_handling);
+        view->create_new_process_for_cross_site_navigation(url, move(document_resource), history_handling, move(source_snapshot));
 }
 
 Messages::WebContentClient::DecideNavigationProcessResponse WebContentClient::decide_navigation_process(u64 page_id, Optional<Web::HTML::CrossProcessId> frame_id, URL::URL current_url, URL::URL target_url, Web::NavigationTarget target)
@@ -498,7 +498,7 @@ Messages::WebContentClient::DecideNavigationProcessResponse WebContentClient::de
     return SiteIsolationManager::the().decide_navigation_process(*this, page_id, move(frame_id), move(current_url), move(target_url), target);
 }
 
-void WebContentClient::did_request_new_process_for_child_frame_navigation(u64 page_id, Web::HTML::CrossProcessId frame_id, URL::URL url, Web::HTML::DocumentResource document_resource, Web::Bindings::NavigationHistoryBehavior history_handling)
+void WebContentClient::did_request_new_process_for_child_frame_navigation(u64 page_id, Web::HTML::CrossProcessId frame_id, URL::URL url, Web::HTML::DocumentResource document_resource, Web::Bindings::NavigationHistoryBehavior history_handling, Optional<Web::HTML::NavigationSourceSnapshot> source_snapshot)
 {
     auto child_frame = this->child_frame(page_id, frame_id);
     if (!child_frame.has_value())
@@ -527,7 +527,7 @@ void WebContentClient::did_request_new_process_for_child_frame_navigation(u64 pa
             Web::ViewportIsFullscreen::No);
     }
     remote_client->async_set_system_visibility_state(remote_page_id, Web::HTML::VisibilityState::Visible);
-    remote_client->async_load_url_with_document_resource(remote_page_id, url, move(document_resource), history_handling);
+    remote_client->async_load_url_with_document_resource(remote_page_id, url, move(document_resource), history_handling, move(source_snapshot));
 
     SiteIsolationManager::the().transition_child_frame_to_remote(*this, page_id, frame_id, move(remote_client), remote_page_id);
 }
@@ -1769,6 +1769,38 @@ void WebContentClient::did_request_color_picker(u64 page_id, Color current_color
     if (auto view = view_for_page_id(page_id); view.has_value()) {
         if (view->on_request_color_picker)
             view->on_request_color_picker(current_color);
+    }
+}
+
+void WebContentClient::did_request_geolocation_position(u64 page_id, u64 request_id)
+{
+    if (auto view = view_for_page_id(page_id); view.has_value()) {
+        if (view->on_request_geolocation_position)
+            view->on_request_geolocation_position(request_id);
+    }
+}
+
+void WebContentClient::did_cancel_geolocation_position_request(u64 page_id, u64 request_id)
+{
+    if (auto view = view_for_page_id(page_id); view.has_value()) {
+        if (view->on_cancel_geolocation_position_request)
+            view->on_cancel_geolocation_position_request(request_id);
+    }
+}
+
+void WebContentClient::did_start_geolocation_position_watch(u64 page_id, u64 request_id)
+{
+    if (auto view = view_for_page_id(page_id); view.has_value()) {
+        if (view->on_start_geolocation_position_watch)
+            view->on_start_geolocation_position_watch(request_id);
+    }
+}
+
+void WebContentClient::did_stop_geolocation_position_watch(u64 page_id, u64 request_id)
+{
+    if (auto view = view_for_page_id(page_id); view.has_value()) {
+        if (view->on_stop_geolocation_position_watch)
+            view->on_stop_geolocation_position_watch(request_id);
     }
 }
 

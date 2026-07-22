@@ -34,6 +34,7 @@
 #include <LibWeb/Platform/Timer.h>
 #include <LibWebView/DOMNodeProperties.h>
 #include <LibWebView/Forward.h>
+#include <LibWebView/Geolocation.h>
 #include <LibWebView/PageInfo.h>
 #include <WebContent/Forward.h>
 #include <WebContent/WebContentClientEndpoint.h>
@@ -88,7 +89,8 @@ private:
     virtual void update_screen_rects(u64 page_id, Vector<Web::DevicePixelRect>, u32) override;
     virtual void load_url(u64 page_id, URL::URL, Web::Bindings::NavigationHistoryBehavior) override;
     virtual void load_url_with_document_resource(u64 page_id, URL::URL,
-        Web::HTML::DocumentResource, Web::Bindings::NavigationHistoryBehavior) override;
+        Web::HTML::DocumentResource, Web::Bindings::NavigationHistoryBehavior,
+        Optional<Web::HTML::NavigationSourceSnapshot>) override;
     virtual void load_html(u64 page_id, ByteString) override;
     virtual void load_html_with_url(u64 page_id, ByteString, URL::URL) override;
     virtual void reload(u64 page_id) override;
@@ -164,6 +166,8 @@ private:
     virtual void set_preferred_languages(u64 page_id, Vector<String>) override;
     virtual void set_browsing_behavior(u64 page_id, WebView::BrowsingBehavior) override;
     virtual void set_enable_global_privacy_control(u64 page_id, bool) override;
+    virtual void set_geolocation_emulated_position(u64 page_id, WebView::GeolocationPositionData, Optional<u16> error_code) override;
+    virtual void geolocation_position_response(u64 page_id, u64 request_id, WebView::GeolocationPositionData, Optional<u16> error_code) override;
     virtual void set_has_focus(u64 page_id, bool) override;
     virtual void set_is_scripting_enabled(u64 page_id, bool) override;
     virtual void set_zoom_level(u64 page_id, double zoom_level) override;
