@@ -73970,7 +73970,9 @@ FILE: Libraries/LibCore/System.cpp
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Atomic.h>
 #include <AK/ByteString.h>
+#include <AK/Random.h>
 #include <AK/ScopeGuard.h>
 #include <AK/StdLibExtras.h>
 #include <AK/Vector.h>
@@ -74157,25 +74159,27 @@ ErrorOr<int> anon_create([[maybe_unused]] size_t size, [[maybe_unused]] int opti
 #elif defined(SHM_ANON)
     fd = shm_open(SHM_ANON, O_RDWR | O_CREAT | options, 0600);
 #elif defined(AK_OS_BSD_GENERIC) || defined(AK_OS_HAIKU)
-    static size_t shared_memory_id = 0;
-
-    auto name = ByteString::formatted("/shm-{}-{}", getpid(), shared_memory_id++);
+    // Create the shared memory object under an unpredictable, single-use name, and unlink it immediately — so only the
+    // returned fd keeps it alive. Use O_EXCL to ensure that if the name already exists, the open fails.
+    static Atomic<u32> shared_memory_id = 0;
+    auto name = ByteString::formatted("/shm-{:016x}-{:08x}", get_random<u64>(), shared_memory_id++);
     // Passing O_CLOEXEC to shm_open in the oflag argument isn't POSIX-compliant and is known to be rejected
     // in macOS 26.4+. So we filter it out here, and instead set FD_CLOEXEC via fcntl after opening.
-    fd = shm_open(name.characters(), O_RDWR | O_CREAT | (options & ~O_CLOEXEC), 0600);
+    fd = shm_open(name.characters(), O_RDWR | O_CREAT | O_EXCL | (options & ~O_CLOEXEC), 0600);
 
-    if (shm_unlink(name.characters()) == -1) {
-        auto saved_errno = errno;
-        if (fd >= 0)
-            TRY(close(fd));
-        return Error::from_errno(saved_errno);
-    }
-
-    if (fd >= 0 && (options & O_CLOEXEC)) {
-        if (::fcntl(fd, F_SETFD, FD_CLOEXEC) == -1) {
+    if (fd >= 0) {
+        if (shm_unlink(name.characters()) == -1) {
             auto saved_errno = errno;
             TRY(close(fd));
             return Error::from_errno(saved_errno);
+        }
+
+        if (options & O_CLOEXEC) {
+            if (::fcntl(fd, F_SETFD, FD_CLOEXEC) == -1) {
+                auto saved_errno = errno;
+                TRY(close(fd));
+                return Error::from_errno(saved_errno);
+            }
         }
     }
 #endif
@@ -315888,6 +315892,8 @@ FILE: Libraries/LibMedia/Containers/Matroska/Reader.cpp
 
 namespace Media::Matroska {
 
+static constexpr size_t MAX_SEEK_HEADS_TO_PARSE = 8;
+
 DecoderErrorOr<Reader> Reader::from_stream(NonnullRefPtr<MediaStreamCursor> const& stream_cursor)
 {
     Reader reader;
@@ -316043,7 +316049,7 @@ DecoderErrorOr<void> Reader::parse_initial_data(Streamer& streamer)
     return {};
 }
 
-static DecoderErrorOr<void> parse_seek_head(Streamer& streamer, size_t base_position, HashMap<u32, size_t>& table)
+DecoderErrorOr<void> Reader::parse_seek_head(Streamer& streamer, HashTable<size_t>& parsed_seek_heads)
 {
     TRY(Reader::parse_master_element(streamer, "SeekHead"sv, [&](u64 seek_head_child_id) -> DecoderErrorOr<ElementIterationDecision> {
         if (seek_head_child_id == SEEK_ELEMENT_ID) {
@@ -316073,21 +316079,57 @@ static DecoderErrorOr<void> parse_seek_head(Streamer& streamer, size_t base_posi
             if (seek_id.value() > NumericLimits<u32>::max())
                 return DecoderError::corrupted("Seek entry's element ID is too large"sv);
 
-            dbgln_if(MATROSKA_TRACE_DEBUG, "Seek entry found with ID {:#010x} and position {} offset from SeekHead at {}", seek_id.value(), seek_position.value(), base_position);
-            // FIXME: SeekHead can reference another SeekHead, we should recursively parse all SeekHeads.
+            auto element_position = m_segment_contents_position + seek_position.value();
+            dbgln_if(MATROSKA_TRACE_DEBUG, "Seek entry found with ID {:#010x} and position {} offset from Segment contents at {}", seek_id.value(), seek_position.value(), m_segment_contents_position);
 
-            if (table.contains(seek_id.value())) {
-                dbgln_if(MATROSKA_DEBUG, "Warning: Duplicate seek entry with ID {:#010x} at position {}", seek_id.value(), seek_position.value());
+            if (seek_id.value() == SEEK_HEAD_ELEMENT_ID) {
+                auto position_after_seek_entry = streamer.position();
+                TRY(parse_seek_head_at_position(streamer, element_position, parsed_seek_heads));
+                TRY(streamer.seek_to_position(position_after_seek_entry));
                 return ElementIterationDecision::Continue;
             }
 
-            DECODER_TRY_ALLOC(table.try_set(seek_id.release_value(), base_position + seek_position.release_value()));
+            auto insertion_result = DECODER_TRY_ALLOC(m_seek_entries.try_set(static_cast<u32>(seek_id.value()), element_position, AK::HashSetExistingEntryBehavior::Keep));
+            if (insertion_result == AK::HashSetResult::KeptExistingEntry)
+                dbgln_if(MATROSKA_DEBUG, "Duplicate seek entry with ID {:#010x} at position {}", seek_id.value(), seek_position.value());
         } else {
             dbgln_if(MATROSKA_TRACE_DEBUG, "Unknown SeekHead child element ID {:#010x}", seek_head_child_id);
         }
 
         return ElementIterationDecision::Continue;
     }));
+    return {};
+}
+
+DecoderErrorOr<void> Reader::parse_seek_head_at_position(Streamer& streamer, size_t seek_head_position, HashTable<size_t>& parsed_seek_heads)
+{
+    if (parsed_seek_heads.contains(seek_head_position))
+        return {};
+
+    if (parsed_seek_heads.size() >= MAX_SEEK_HEADS_TO_PARSE) {
+        dbgln_if(MATROSKA_DEBUG, "SeekHead chain is longer than {}, ignoring SeekHead at position {}", MAX_SEEK_HEADS_TO_PARSE, seek_head_position);
+        return {};
+    }
+
+    DECODER_TRY_ALLOC(parsed_seek_heads.try_set(seek_head_position));
+
+    auto seek_result = streamer.seek_to_position(seek_head_position);
+    if (seek_result.is_error())
+        return {};
+
+    auto element_id = streamer.read_element_id();
+    if (element_id.is_error())
+        return {};
+    if (element_id.value() != SEEK_HEAD_ELEMENT_ID)
+        return {};
+
+    auto parse_result = parse_seek_head(streamer, parsed_seek_heads);
+    if (parse_result.is_error()) {
+        if (parse_result.error().category() == DecoderErrorCategory::Memory)
+            return parse_result.release_error();
+        return {};
+    }
+
     return {};
 }
 
@@ -316117,8 +316159,9 @@ DecoderErrorOr<Optional<size_t>> Reader::find_first_top_level_element_with_id(St
 
         if (found_element_id == SEEK_HEAD_ELEMENT_ID) {
             dbgln_if(MATROSKA_TRACE_DEBUG, "Found SeekHead, parsing it into the lookup table.");
-            m_seek_entries.clear();
-            TRY(parse_seek_head(streamer, found_element_position, m_seek_entries));
+            HashTable<size_t> parsed_seek_heads;
+            DECODER_TRY_ALLOC(parsed_seek_heads.try_set(found_element_position));
+            TRY(parse_seek_head(streamer, parsed_seek_heads));
             m_last_top_level_element_position = 0;
             if (m_seek_entries.contains(element_id)) {
                 dbgln_if(MATROSKA_TRACE_DEBUG, "SeekHead hit!");
@@ -317112,6 +317155,7 @@ FILE: Libraries/LibMedia/Containers/Matroska/Reader.h
 
 #pragma once
 
+#include <AK/HashTable.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/Optional.h>
@@ -317173,6 +317217,8 @@ private:
     DecoderErrorOr<void> parse_initial_data(Streamer&);
 
     DecoderErrorOr<Optional<size_t>> find_first_top_level_element_with_id(Streamer&, StringView element_name, u32 element_id);
+    DecoderErrorOr<void> parse_seek_head(Streamer&, HashTable<size_t>& parsed_seek_heads);
+    DecoderErrorOr<void> parse_seek_head_at_position(Streamer&, size_t seek_head_position, HashTable<size_t>& parsed_seek_heads);
 
     DecoderErrorOr<void> parse_segment_information(Streamer&);
 
@@ -420665,6 +420711,7 @@ set(SOURCES
     Compositor/AsyncScrollTree.cpp
     Compositor/AsyncScrollingState.cpp
     Compositor/CompositorHost.cpp
+    Compositor/SmoothScrollAnimation.cpp
     Compositor/Types.cpp
     Compression/CompressionStream.cpp
     Compression/DecompressionStream.cpp
@@ -423025,6 +423072,16 @@ AsyncScrollEnqueueResult CompositorContextHandle::async_scroll_by(UniqueNodeID e
     return m_host.async_scroll_by(m_context_id, expected_document_id, position, delta_in_device_pixels, viewport_rect, operation_tracking);
 }
 
+AsyncScrollEnqueueResult CompositorContextHandle::smooth_scroll_to(AsyncScrollNodeStableID stable_node_id, Gfx::FloatPoint offset_in_device_pixels, Gfx::IntRect viewport_rect, double device_pixels_per_css_pixel)
+{
+    return m_host.smooth_scroll_to(m_context_id, stable_node_id, offset_in_device_pixels, viewport_rect, device_pixels_per_css_pixel);
+}
+
+void CompositorContextHandle::cancel_smooth_scroll(AsyncScrollNodeStableID stable_node_id)
+{
+    m_host.cancel_smooth_scroll(m_context_id, stable_node_id);
+}
+
 PendingAsyncScrollUpdates CompositorContextHandle::take_pending_async_scroll_updates()
 {
     return m_host.take_pending_async_scroll_updates(m_context_id);
@@ -423119,6 +423176,8 @@ public:
     void invalidate_wheel_event_listener_state(u64 generation);
     AsyncScrollEnqueueResult async_scroll_by(UniqueNodeID expected_document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_device_pixels,
         Gfx::IntRect viewport_rect, AsyncScrollOperationTracking = AsyncScrollOperationTracking::No);
+    AsyncScrollEnqueueResult smooth_scroll_to(AsyncScrollNodeStableID, Gfx::FloatPoint offset_in_device_pixels, Gfx::IntRect viewport_rect, double device_pixels_per_css_pixel);
+    void cancel_smooth_scroll(AsyncScrollNodeStableID);
     PendingAsyncScrollUpdates take_pending_async_scroll_updates();
     void viewport_size_updated(Gfx::IntSize, WindowResizingInProgress);
     void present_frame(Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect);
@@ -423162,6 +423221,8 @@ public:
     virtual AsyncScrollEnqueueResult async_scroll_by(CompositorContextId, UniqueNodeID expected_document_id, Gfx::FloatPoint position,
         Gfx::FloatPoint delta_in_device_pixels, Gfx::IntRect viewport_rect, AsyncScrollOperationTracking)
         = 0;
+    virtual AsyncScrollEnqueueResult smooth_scroll_to(CompositorContextId, AsyncScrollNodeStableID, Gfx::FloatPoint offset_in_device_pixels, Gfx::IntRect viewport_rect, double device_pixels_per_css_pixel) = 0;
+    virtual void cancel_smooth_scroll(CompositorContextId, AsyncScrollNodeStableID) = 0;
     virtual PendingAsyncScrollUpdates take_pending_async_scroll_updates(CompositorContextId) = 0;
     virtual void viewport_size_updated(CompositorContextId, Gfx::IntSize, WindowResizingInProgress) = 0;
     virtual void present_frame(CompositorContextId, Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect) = 0;
@@ -423175,6 +423236,94 @@ protected:
 
 private:
     NonnullRefPtr<Painting::Canvas2DCommandStream> m_canvas_2d_stream;
+};
+
+}
+
+FILE: Libraries/LibWeb/Compositor/SmoothScrollAnimation.cpp
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/Math.h>
+#include <AK/StdLibExtras.h>
+#include <LibWeb/CSS/EasingFunction.h>
+#include <LibWeb/Compositor/SmoothScrollAnimation.h>
+
+namespace Web::Compositor {
+
+static constexpr double scroll_speed_in_pixels_per_second = 1000.0;
+static constexpr double maximum_scroll_duration_in_seconds = 0.2;
+
+SmoothScrollAnimation::SmoothScrollAnimation(Gfx::FloatPoint start_offset, Gfx::FloatPoint destination_offset, double pixels_per_css_pixel)
+    : m_start_offset(start_offset)
+    , m_destination_offset(destination_offset)
+{
+    VERIFY(pixels_per_css_pixel > 0);
+    auto horizontal_distance = static_cast<double>(destination_offset.x() - start_offset.x()) / pixels_per_css_pixel;
+    auto vertical_distance = static_cast<double>(destination_offset.y() - start_offset.y()) / pixels_per_css_pixel;
+    auto distance = AK::sqrt(horizontal_distance * horizontal_distance + vertical_distance * vertical_distance);
+    auto duration_in_seconds = min(distance / scroll_speed_in_pixels_per_second, maximum_scroll_duration_in_seconds);
+    m_duration = AK::Duration::from_seconds_f64(duration_in_seconds);
+}
+
+SmoothScrollAnimation::Sample SmoothScrollAnimation::sample(AK::Duration elapsed) const
+{
+    if (m_duration.is_zero() || elapsed >= m_duration)
+        return { m_destination_offset, true };
+
+    auto progress = clamp(elapsed.to_seconds_f64() / m_duration.to_seconds_f64(), 0.0, 1.0);
+
+    // https://drafts.csswg.org/cssom-view/#smooth-scroll
+    // A smooth scroll follows a user-agent-defined timing function. Match the
+    // ease-in-out curve used by WebKit for programmatic smooth scrolling.
+    static CSS::CubicBezierEasingFunction const easing_function { 0.42, 0, 0.58, 1, {} };
+    auto eased_progress = easing_function.evaluate_at(progress, false);
+
+    return {
+        {
+            static_cast<float>(m_start_offset.x() + (m_destination_offset.x() - m_start_offset.x()) * eased_progress),
+            static_cast<float>(m_start_offset.y() + (m_destination_offset.y() - m_start_offset.y()) * eased_progress),
+        },
+        false,
+    };
+}
+
+}
+
+FILE: Libraries/LibWeb/Compositor/SmoothScrollAnimation.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Time.h>
+#include <LibGfx/Point.h>
+#include <LibWeb/Export.h>
+
+namespace Web::Compositor {
+
+class WEB_API SmoothScrollAnimation {
+public:
+    struct Sample {
+        Gfx::FloatPoint offset;
+        bool complete { false };
+    };
+
+    SmoothScrollAnimation(Gfx::FloatPoint start_offset, Gfx::FloatPoint destination_offset, double pixels_per_css_pixel);
+
+    AK::Duration duration() const { return m_duration; }
+    Sample sample(AK::Duration elapsed) const;
+
+private:
+    Gfx::FloatPoint m_start_offset;
+    Gfx::FloatPoint m_destination_offset;
+    AK::Duration m_duration;
 };
 
 }
@@ -606283,10 +606432,10 @@ void Element::set_scroll_left(double x)
     // FIXME: or the element has no overflow.
 
     // 11. Scroll the element to x,scrollTop, with the scroll behavior being "auto".
-    // FIXME: Implement this in terms of calling "scroll the element".
     auto scroll_offset = paintable_box()->scroll_offset();
     scroll_offset.set_x(CSSPixels::nearest_value_for(x));
-    paintable_box()->set_scroll_offset(scroll_offset);
+    if (auto navigable = document.navigable())
+        navigable->perform_a_scroll_of_an_element(*this, scroll_offset, Bindings::ScrollBehavior::Auto);
 }
 
 void Element::set_scroll_top(double y)
@@ -606340,10 +606489,10 @@ void Element::set_scroll_top(double y)
     // FIXME: or the element has no overflow.
 
     // 11. Scroll the element to scrollLeft,y, with the scroll behavior being "auto".
-    // FIXME: Implement this in terms of calling "scroll the element".
     auto scroll_offset = paintable_box()->scroll_offset();
     scroll_offset.set_y(CSSPixels::nearest_value_for(y));
-    paintable_box()->set_scroll_offset(scroll_offset);
+    if (auto navigable = document.navigable())
+        navigable->perform_a_scroll_of_an_element(*this, scroll_offset, Bindings::ScrollBehavior::Auto);
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-element-scrollwidth
@@ -607004,7 +607153,8 @@ static CSSPixelPoint determine_the_scroll_into_view_position(Element& target, Bi
 // https://drafts.csswg.org/cssom-view-1/#scroll-a-target-into-view
 static GC::Ref<WebIDL::Promise> scroll_an_element_into_view(Element& target, Bindings::ScrollBehavior behavior, Bindings::ScrollLogicalPosition block, Bindings::ScrollLogicalPosition inline_, GC::Ptr<Element> container)
 {
-    // FIXME: 1. Let ancestorPromises be an empty set of Promises.
+    // 1. Let ancestorPromises be an empty set of Promises.
+    GC::RootVector<GC::Ref<WebIDL::Promise>> ancestor_promises;
 
     // 2. For each ancestor element or viewport that establishes a scrolling box scrolling box, in order of innermost
     //    to outermost scrolling box, run these substeps:
@@ -607025,7 +607175,6 @@ static GC::Ref<WebIDL::Promise> scroll_an_element_into_view(Element& target, Bin
         // 2. Let position be the scroll position resulting from running the steps to determine the scroll-into-view
         //    position of target with behavior as the scroll behavior, block as the block flow position, inline as the
         //    inline base direction position and scrolling box as the scrolling box.
-        // FIXME: Pass in behavior.
         auto position = determine_the_scroll_into_view_position(target, block, inline_, scrolling_box);
 
         // 3. If position is not the same as scrolling box’s current scroll position, or scrolling box has an ongoing
@@ -607034,20 +607183,19 @@ static GC::Ref<WebIDL::Promise> scroll_an_element_into_view(Element& target, Bin
         if (true) {
             // -> If scrolling box is associated with an element
             if (auto* element = as_if<Element>(scrolling_box)) {
-                // FIXME: Perform a scroll of the element’s scrolling box to position, with the element as the associated element and behavior as the scroll behavior.
-                element->paintable_box()->set_scroll_offset(position);
+                if (auto navigable = element->document().navigable())
+                    ancestor_promises.append(navigable->perform_a_scroll_of_an_element(*element, position, behavior));
             }
             // -> If scrolling box is associated with a viewport
             else if (scrolling_box.is_document()) {
                 // 1. Let document be the viewport’s associated Document.
                 auto& document = static_cast<Document&>(scrolling_box);
 
-                // FIXME: 2. Let root element be document’s root element, if there is one, or null otherwise.
-                // FIXME: 3. Perform a scroll of the viewport to position, with root element as the associated element and behavior as the scroll behavior.
-                //           Add the Promise returned from this step in the set ancestorPromises.
-                (void)behavior;
-
-                document.navigable()->perform_a_scroll_of_the_viewport(position);
+                // 2. Let root element be document’s root element, if there is one, or null otherwise.
+                // 3. Perform a scroll of the viewport to position, with root element as the associated element and behavior as the scroll behavior.
+                //    Add the Promise returned from this step in the set ancestorPromises.
+                if (auto navigable = document.navigable())
+                    ancestor_promises.append(navigable->perform_a_scroll_of_the_viewport(position, behavior));
             }
         }
 
@@ -607060,13 +607208,20 @@ static GC::Ref<WebIDL::Promise> scroll_an_element_into_view(Element& target, Bin
     }
 
     // 3. Let scrollPromise be a new Promise.
-    auto scroll_promise = WebIDL::create_promise(target.realm());
+    auto& realm = target.realm();
+    auto scroll_promise = WebIDL::create_promise(realm);
 
     // 4. Return scrollPromise, and run the remaining steps in parallel.
     // 5. Resolve scrollPromise when all Promises in ancestorPromises have settled.
-    // FIXME: Actually wait for those promises.
-    WebIDL::resolve_promise(target.realm(), scroll_promise);
-
+    auto resolve_scroll_promise = [&realm, scroll_promise] {
+        HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+        WebIDL::resolve_promise(realm, scroll_promise);
+    };
+    HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
+    WebIDL::wait_for_all(
+        realm, ancestor_promises,
+        [resolve_scroll_promise](auto const&) { resolve_scroll_promise(); },
+        [resolve_scroll_promise](JS::Value) { resolve_scroll_promise(); });
     return scroll_promise;
 }
 
@@ -607823,8 +607978,22 @@ GC::Ref<WebIDL::Promise> Element::scroll(double x, double y)
     //     3. Normalize non-finite values for x and y.
     //     4. Let the left dictionary member of options have the value x.
     //     5. Let the top dictionary member of options have the value y.
-    x = HTML::normalize_non_finite_values(x);
-    y = HTML::normalize_non_finite_values(y);
+    Bindings::ScrollToOptions options;
+    options.left = HTML::normalize_non_finite_values(x);
+    options.top = HTML::normalize_non_finite_values(y);
+    return scroll(options);
+}
+
+// https://drafts.csswg.org/cssom-view/#dom-element-scroll
+GC::Ref<WebIDL::Promise> Element::scroll(Bindings::ScrollToOptions options)
+{
+    // 1. If invoked with one argument, follow these substeps:
+    //     1. Let options be the argument.
+    //     2. Normalize non-finite values for left and top dictionary members of options, if present.
+    //     3. Let x be the value of the left dictionary member of options, if present, or the element’s current scroll position on the x axis otherwise.
+    //     4. Let y be the value of the top dictionary member of options, if present, or the element’s current scroll position on the y axis otherwise.
+    auto x = options.left.has_value() ? HTML::normalize_non_finite_values(options.left.value()) : scroll_left();
+    auto y = options.top.has_value() ? HTML::normalize_non_finite_values(options.top.value()) : scroll_top();
 
     // 3. Let document be the element’s node document.
     auto& document = this->document();
@@ -607846,29 +608015,25 @@ GC::Ref<WebIDL::Promise> Element::scroll(double x, double y)
     if (document.document_element() == this && document.in_quirks_mode())
         return WebIDL::create_resolved_promise(realm(), JS::js_undefined());
 
-    // OPTIMIZATION: Scrolling an unscrolled element to (0, 0) is a no-op as long
-    //               as the element is not eligible to be the Document.scrollingElement.
-    if (x == 0
-        && y == 0
-        && scroll_offset({}).is_zero()
-        && this != document.body()
-        && this != document.document_element()) {
-        return WebIDL::create_resolved_promise(realm(), JS::js_undefined());
-    }
-
     // NB: Ensure that layout is up-to-date before looking at metrics.
     document.update_layout(UpdateLayoutReason::ElementScroll);
 
     // 8. If the element is the root element, return the Promise returned by scroll() on window after the method is
     //    invoked with scrollX on window as first argument and y as second argument, and abort the remaining steps.
-    if (document.document_element() == this)
-        return window->scroll(window->scroll_x(), y);
+    if (document.document_element() == this) {
+        options.left = window->scroll_x();
+        options.top = y;
+        return window->scroll(options);
+    }
 
     // 9. If the element is the body element, document is in quirks mode, and the element is not potentially
     //    scrollable, return the Promise returned by scroll() on window after the method is invoked with options as the
     //    only argument, and abort the remaining steps.
-    if (document.body() == this && document.in_quirks_mode() && !is_potentially_scrollable())
-        return window->scroll(x, y);
+    if (document.body() == this && document.in_quirks_mode() && !is_potentially_scrollable()) {
+        options.left = x;
+        options.top = y;
+        return window->scroll(options);
+    }
 
     // 10. If the element does not have any associated box, the element has no associated scrolling box, or the element
     //     has no overflow, return a resolved Promise and abort the remaining steps.
@@ -607878,29 +608043,16 @@ GC::Ref<WebIDL::Promise> Element::scroll(double x, double y)
 
     // 11. Scroll the element to x,y, with the scroll behavior being the value of the behavior dictionary member of
     //     options. Let scrollPromise be the Promise returned from this step.
-    // FIXME: Implement this in terms of calling "scroll the element".
     auto scroll_offset = paintable_box()->scroll_offset();
     scroll_offset.set_x(CSSPixels::nearest_value_for(x));
     scroll_offset.set_y(CSSPixels::nearest_value_for(y));
-    paintable_box()->set_scroll_offset(scroll_offset);
-    auto scroll_promise = WebIDL::create_resolved_promise(realm(), JS::js_undefined());
+    auto navigable = document.navigable();
+    if (!navigable)
+        return WebIDL::create_resolved_promise(realm(), JS::js_undefined());
+    auto scroll_promise = navigable->perform_a_scroll_of_an_element(*this, scroll_offset, options.behavior);
 
     // 12. Return scrollPromise.
     return scroll_promise;
-}
-
-// https://drafts.csswg.org/cssom-view/#dom-element-scroll
-GC::Ref<WebIDL::Promise> Element::scroll(Bindings::ScrollToOptions options)
-{
-    // 1. If invoked with one argument, follow these substeps:
-    //     1. Let options be the argument.
-    //     2. Normalize non-finite values for left and top dictionary members of options, if present.
-    //     3. Let x be the value of the left dictionary member of options, if present, or the element’s current scroll position on the x axis otherwise.
-    //     4. Let y be the value of the top dictionary member of options, if present, or the element’s current scroll position on the y axis otherwise.
-    // NOTE: remaining steps performed by Element::scroll(double x, double y)
-    auto x = options.left.has_value() ? HTML::normalize_non_finite_values(options.left.value()) : scroll_left();
-    auto y = options.top.has_value() ? HTML::normalize_non_finite_values(options.top.value()) : scroll_top();
-    return scroll(x, y);
 }
 
 // https://drafts.csswg.org/cssom-view/#dom-element-scrollby
@@ -658717,316 +658869,3 @@ class SVGPolylineElement;
 class SVGRectElement;
 class SVGScriptElement;
 class SVGSVGElement;
-class SVGSwitchElement;
-class SVGSymbolElement;
-class SVGTitleElement;
-class SVGTransformList;
-class SVGViewElement;
-
-}
-
-namespace Web::UIEvents {
-
-class CompositionEvent;
-class InputEvent;
-class KeyboardEvent;
-class MouseEvent;
-class PointerEvent;
-class TextEvent;
-class UIEvent;
-
-}
-
-namespace Web::URLPattern {
-
-class URLPattern;
-
-}
-
-namespace Web::DOMURL {
-
-class DOMURL;
-class URLSearchParams;
-class URLSearchParamsIterator;
-
-}
-
-namespace Web::UserTiming {
-
-class PerformanceMark;
-class PerformanceMeasure;
-
-}
-
-namespace Web::ViewTransition {
-
-class ViewTransition;
-
-}
-
-namespace Web::WebAssembly {
-
-class Global;
-class Instance;
-class Memory;
-class Module;
-class Table;
-class WebAssemblyModule;
-
-}
-
-namespace Web::WebAudio {
-
-class AudioBuffer;
-class AudioBufferSourceNode;
-class AudioContext;
-class AudioDestinationNode;
-class AudioListener;
-class AudioNode;
-class AudioParam;
-class AudioScheduledSourceNode;
-class BaseAudioContext;
-class BiquadFilterNode;
-class ControlMessageQueue;
-class DynamicsCompressorNode;
-class GainNode;
-class OfflineAudioCompletionEvent;
-class OfflineAudioContext;
-class OscillatorNode;
-class PannerNode;
-class PeriodicWave;
-
-enum class AudioContextState;
-
-}
-
-namespace Web::WebGL {
-
-class RemoteWebGLTransport;
-class WebGLContextProxy;
-class WebGL2RenderingContext;
-class WebGLActiveInfo;
-class WebGLBuffer;
-class WebGLContextEvent;
-class WebGLFramebuffer;
-class WebGLObject;
-class WebGLProgram;
-class WebGLQuery;
-class WebGLRenderbuffer;
-class WebGLRenderingContext;
-class WebGLRenderingContextBase;
-class WebGLSampler;
-class WebGLShader;
-class WebGLShaderPrecisionFormat;
-class WebGLSync;
-class WebGLTexture;
-class WebGLTransformFeedback;
-class WebGLUniformLocation;
-class WebGLVertexArrayObject;
-class ANGLEInstancedArrays;
-class EXTBlendMinMax;
-class EXTColorBufferFloat;
-class EXTRenderSnorm;
-class EXTTextureFilterAnisotropic;
-class EXTTextureNorm16;
-class OESElementIndexUint;
-class OESStandardDerivatives;
-class OESVertexArrayObject;
-class WebGLCompressedTextureS3tc;
-class WebGLCompressedTextureS3tcSrgb;
-class WebGLDrawBuffers;
-class WebGLVertexArrayObjectOES;
-
-}
-
-namespace Web::WebIDL {
-
-class ArrayBufferView;
-class BufferSource;
-class CallbackType;
-class DOMException;
-class ObservableArray;
-
-template<typename ValueType>
-class ExceptionOr;
-
-using Promise = JS::PromiseCapability;
-
-}
-
-namespace Web::WebDriver {
-
-struct ActionObject;
-struct InputState;
-
-}
-
-namespace Web::WebLocks {
-
-class Lock;
-class LockData;
-class LockManager;
-class LockRequest;
-class NavigatorLocks;
-
-}
-
-namespace Web::WebSockets {
-
-class WebSocket;
-
-}
-
-namespace Web::WebVTT {
-
-class VTTCue;
-class VTTRegion;
-
-}
-
-namespace Web::WebXR {
-
-class XRLayer;
-class XRRenderState;
-class XRSession;
-class XRSessionEvent;
-class XRSystem;
-class XRWebGLLayer;
-
-}
-
-namespace Web::XHR {
-
-class FormData;
-class FormDataIterator;
-class ProgressEvent;
-class XMLHttpRequest;
-class XMLHttpRequestEventTarget;
-class XMLHttpRequestUpload;
-
-struct FormDataEntry;
-
-}
-
-namespace Web::TrustedTypes {
-
-class TrustedHTML;
-class TrustedScript;
-class TrustedScriptURL;
-class TrustedTypePolicy;
-class TrustedTypePolicyFactory;
-
-}
-
-namespace Web::XPath {
-
-class XPathEvaluator;
-class XPathExpression;
-class XPathNSResolver;
-class XPathResult;
-
-}
-
-FILE: Libraries/LibWeb/Fullscreen/DocumentExtensions.idl
-// https://fullscreen.spec.whatwg.org/#ref-for-document
-partial interface Document {
-    [LegacyLenientSetter] readonly attribute boolean fullscreenEnabled;
-    [LegacyLenientSetter, Unscopable] readonly attribute boolean fullscreen; // historical
-
-    Promise<undefined> exitFullscreen();
-
-    attribute EventHandler onfullscreenchange;
-    attribute EventHandler onfullscreenerror;
-};
-
-FILE: Libraries/LibWeb/Fullscreen/DocumentOrShadowRootExtensions.idl
-// https://fullscreen.spec.whatwg.org/#ref-for-documentorshadowroot
-partial interface mixin DocumentOrShadowRoot {
-    [LegacyLenientSetter, ImplementedAs=fullscreen_element_for_bindings] readonly attribute Element? fullscreenElement;
-};
-
-FILE: Libraries/LibWeb/Fullscreen/ElementExtensions.idl
-// https://fullscreen.spec.whatwg.org/#ref-for-element
-partial interface Element {
-    Promise<undefined> requestFullscreen();
-
-    attribute EventHandler onfullscreenchange;
-    attribute EventHandler onfullscreenerror;
-};
-
-FILE: Libraries/LibWeb/Gamepad/EventNames.cpp
-/*
- * Copyright (c) 2025, Luke Wilde <luke@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibWeb/Gamepad/EventNames.h>
-
-namespace Web::Gamepad::EventNames {
-
-#define __ENUMERATE_GAMEPAD_EVENT(name) \
-    Utf16FlyString const& name = *new Utf16FlyString(#name##_utf16_fly_string);
-ENUMERATE_GAMEPAD_EVENTS
-#undef __ENUMERATE_GAMEPAD_EVENT
-
-}
-
-FILE: Libraries/LibWeb/Gamepad/EventNames.h
-/*
- * Copyright (c) 2025, Luke Wilde <luke@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/Utf16FlyString.h>
-
-namespace Web::Gamepad::EventNames {
-
-#define ENUMERATE_GAMEPAD_EVENTS                \
-    __ENUMERATE_GAMEPAD_EVENT(gamepadconnected) \
-    __ENUMERATE_GAMEPAD_EVENT(gamepaddisconnected)
-
-#define __ENUMERATE_GAMEPAD_EVENT(name) extern Utf16FlyString const& name;
-ENUMERATE_GAMEPAD_EVENTS
-#undef __ENUMERATE_GAMEPAD_EVENT
-
-}
-
-FILE: Libraries/LibWeb/Gamepad/Gamepad.cpp
-/*
- * Copyright (c) 2025, Jelle Raaijmakers <jelle@ladybird.org>
- * Copyright (c) 2025, Luke Wilde <luke@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/DOM/Document.h>
-#include <LibWeb/Gamepad/EventNames.h>
-#include <LibWeb/Gamepad/Gamepad.h>
-#include <LibWeb/Gamepad/GamepadButton.h>
-#include <LibWeb/Gamepad/GamepadEvent.h>
-#include <LibWeb/Gamepad/GamepadHapticActuator.h>
-#include <LibWeb/HTML/Navigator.h>
-#include <LibWeb/HTML/Scripting/Environments.h>
-#include <LibWeb/HTML/Window.h>
-#include <LibWeb/HighResolutionTime/TimeOrigin.h>
-
-#include <SDL3/SDL_gamepad.h>
-
-namespace Web::Gamepad {
-
-GC_DEFINE_ALLOCATOR(Gamepad);
-
-// https://w3c.github.io/gamepad/#dfn-standard-gamepad
-// Type     Index   Location
-// Button   0       Bottom button in right cluster
-//          1       Right button in right cluster
-//          2       Left button in right cluster
-//          3       Top button in right cluster
-//          4       Top left front button
-//          5       Top right front button
-//          6       Bottom left front button
