@@ -76,6 +76,7 @@
 #include <LibWeb/CSS/SystemColor.h>
 #include <LibWeb/CSS/TransitionEvent.h>
 #include <LibWeb/CSS/VisualViewport.h>
+#include <LibWeb/ComputedValuesRustFFI.h>
 #include <LibWeb/ContentSecurityPolicy/Directives/Directive.h>
 #include <LibWeb/ContentSecurityPolicy/Policy.h>
 #include <LibWeb/ContentSecurityPolicy/PolicyList.h>
@@ -577,6 +578,8 @@ Document::Document(JS::Realm& realm, URL::URL const& url)
     , m_style_invalidator(realm.heap().allocate<CSS::Invalidation::StyleInvalidator>())
     , m_style_scope(*this)
 {
+    m_rust_custom_property_registry = CSS::ComputedValuesFFI::rust_custom_property_registry_create();
+
     m_legacy_platform_object_flags = PlatformObject::LegacyPlatformObjectFlags {
         .supports_named_properties = true,
         .has_legacy_override_built_ins_interface_extended_attribute = true,
@@ -663,6 +666,7 @@ void Document::record_full_style_invalidation() const
 
 void Document::finalize()
 {
+    CSS::ComputedValuesFFI::rust_custom_property_registry_destroy(m_rust_custom_property_registry);
     Base::finalize();
     HTML::main_thread_event_loop().unregister_document({}, *this);
 }
@@ -1082,6 +1086,36 @@ WebIDL::ExceptionOr<Document*> Document::open(Optional<Utf16String> const&, Opti
     // 15. Set document to no-quirks mode.
     set_quirks_mode(QuirksMode::No);
 
+    // INTEROP: The HTML Standard says the document open steps do not affect whether a Document is ready for post-load
+    //          tasks. Blink and WebKit reset their corresponding frame load-completion state, while Gecko marks the
+    //          document loader as opened but not loaded. Reset our load gating flag for the replacement contents too.
+    set_ready_for_post_load_tasks(false);
+
+    // INTEROP: The HTML Standard does not reset the page showing flag in the document open steps. Browsers allow a
+    //          completed Document to be reopened and complete loading again, so mark the replaced contents as no longer
+    //          showing without firing pagehide or otherwise unloading the Document.
+    set_page_showing(false);
+
+    // INTEROP: Cancel completion of the parser that document.open() is about to replace.
+    if (m_html_parser_end_state) {
+        m_html_parser_end_state->cancel();
+        m_html_parser_end_state = nullptr;
+    }
+
+    // INTEROP: The HTML Standard leaves discarding pending scripts unspecified. Blink and WebKit discard their
+    //          parser script runner's pending parsing-blocking and deferred scripts when replacing the parser, and
+    //          Gecko cancels pending parser script loads when terminating the parser. Stop discarded scripts from
+    //          delaying the replacement document's load event before removing them from the parser's queues.
+    if (m_pending_parsing_blocking_script)
+        m_pending_parsing_blocking_script->stop_delaying_document_load_event({});
+    if (m_pending_parsing_blocking_svg_script)
+        m_pending_parsing_blocking_svg_script->stop_delaying_document_load_event({});
+    for (auto& script : m_scripts_to_execute_when_parsing_has_finished)
+        script->stop_delaying_document_load_event({});
+    m_pending_parsing_blocking_script = nullptr;
+    m_pending_parsing_blocking_svg_script = nullptr;
+    m_scripts_to_execute_when_parsing_has_finished.clear();
+
     // 16. Create an HTML parser whose allow declarative shadow roots is document's allow declarative shadow roots, and
     //     associate it with document. This is a script-created parser (meaning that it can be closed by the document.open()
     //     and document.close() methods, and that the tokenizer will wait for an explicit call to document.close() before
@@ -1125,33 +1159,36 @@ WebIDL::ExceptionOr<void> Document::close()
         return WebIDL::InvalidStateError::create(realm(), "throw-on-dynamic-markup-insertion-counter greater than zero."_utf16);
 
     // 3. If there is no script-created parser associated with the document, then return.
-    if (!m_parser || !m_parser->is_script_created())
+    if (!m_parser || !m_parser->is_script_created() || m_parser->tokenizer().is_input_stream_closed())
         return {};
 
-    // 4. Insert an explicit "EOF" character at the end of the parser's input stream.
-    m_parser->tokenizer().insert_eof();
-
     auto parser = m_parser;
-    auto finish_script_created_parser = [parser] {
-        parser->tokenizer().undefine_insertion_point();
-        parser->pop_all_open_elements();
 
-        // AD-HOC: This ensures that a load event is fired if the node navigable's container is an iframe.
-        parser->document().completely_finish_loading();
+    // 4. Insert an explicit "EOF" character at the end of the parser's input stream.
+    parser->tokenizer().insert_eof();
+
+    auto finish_script_created_parser = [parser] {
+        HTML::HTMLParser::the_end(parser->document(), parser);
     };
 
     // 5. If there is a pending parsing-blocking script, then return.
     if (has_pending_parsing_blocking_script()) {
-        m_parser->set_post_parse_action(move(finish_script_created_parser));
+        parser->set_post_parse_action(move(finish_script_created_parser));
         return {};
     }
 
     // 6. Run the tokenizer, processing resulting tokens as they are emitted, and stopping when the tokenizer reaches the explicit "EOF" character or spins the event loop.
-    m_parser->run();
+    parser->run();
+
+    // INTEROP: Running the tokenizer can invoke author code which calls document.open(), replacing the parser.
+    //          Blink, WebKit, and Gecko detach or terminate the old parser in this case, so do not attach its
+    //          completion callback to the replacement parser.
+    if (m_parser != parser)
+        return {};
 
     // run() may have paused on a blocking script (e.g. from document.write inside an inline script).
     if (has_pending_parsing_blocking_script()) {
-        m_parser->set_post_parse_action(move(finish_script_created_parser));
+        parser->set_post_parse_action(move(finish_script_created_parser));
         return {};
     }
 
@@ -4034,6 +4071,7 @@ void Document::dispatch_events_for_animation_if_necessary(GC::Ref<Animations::An
             pseudo_element.has_value()) {
             event_init.pseudo_element = pseudo_element.release_value();
         }
+        event_init.animation = css_animation;
 
         auto timeline = animation->timeline();
 
@@ -4362,8 +4400,8 @@ void Document::completely_finish_loading()
         });
     }
 
-    // AD-HOC: Script-created parsers (iframe document.open/write/close) don't reach set_ready_for_post_load_tasks, so
-    //         the parent's load-event-delay phase wouldn't otherwise be re-evaluated when this iframe finishes loading.
+    // AD-HOC: Finishing a child document can unblock its parent's load-event-delay phase, so wake the parent parser end
+    //         state after queueing the container's load event.
     container->document().schedule_html_parser_end_check();
 }
 
@@ -4824,6 +4862,7 @@ bool Document::allow_focus() const
 
 void Document::set_parser(Badge<HTML::HTMLParser>, HTML::HTMLParser& parser)
 {
+    ++m_parser_generation;
     m_parser = parser;
 }
 
@@ -9573,11 +9612,48 @@ Optional<CSS::CustomPropertyRegistration const&> Document::get_registered_custom
 void Document::did_change_custom_property_registrations()
 {
     ++m_custom_property_registration_generation;
+    sync_custom_property_registrations_to_rust();
 
     // Custom property registration changes can alter inheritance and initial values even when no selector matching
     // changes. Registrations only move when a stylesheet containing an @property rule is added/removed or when
     // CSS.registerProperty() is called, so a full document restyle is cheap enough in practice.
     invalidate_style(DOM::StyleInvalidationReason::CustomPropertyRegistrationChange);
+}
+
+void Document::sync_custom_property_registrations_to_rust()
+{
+    HashMap<Utf16FlyString, CSS::CustomPropertyRegistration const*> effective_registrations;
+    effective_registrations.ensure_capacity(m_registered_property_set.size() + m_cached_registered_properties_from_css_property_rules.size());
+    for (auto const& [name, registration] : m_cached_registered_properties_from_css_property_rules)
+        effective_registrations.set(name, &registration);
+    for (auto const& [name, registration] : m_registered_property_set)
+        effective_registrations.set(name, &registration);
+
+    Vector<String> names;
+    Vector<Optional<String>> initial_values;
+    Vector<CSS::ComputedValuesFFI::FfiCustomPropertyRegistration> registrations;
+    names.ensure_capacity(effective_registrations.size());
+    initial_values.ensure_capacity(effective_registrations.size());
+    registrations.ensure_capacity(effective_registrations.size());
+    for (auto const& [name, registration] : effective_registrations) {
+        names.unchecked_append(MUST(name.view().to_utf8()));
+        initial_values.unchecked_append(registration->initial_value
+                ? Optional<String> { registration->initial_value->to_string(CSS::SerializationMode::Normal) }
+                : Optional<String> {});
+        auto const& name_utf8 = names.last();
+        auto const& initial_value = initial_values.last();
+        registrations.unchecked_append({
+            .name = name_utf8.bytes().data(),
+            .name_length = name_utf8.bytes().size(),
+            .syntax_is_universal = registration->syntax->type() == CSS::Parser::SyntaxNode::NodeType::Universal,
+            .inherits = registration->inherit,
+            .has_initial_value = initial_value.has_value(),
+            .initial_value = initial_value.has_value() ? initial_value->bytes().data() : nullptr,
+            .initial_value_length = initial_value.has_value() ? initial_value->bytes().size() : 0,
+        });
+    }
+    CSS::ComputedValuesFFI::rust_custom_property_registry_update(
+        m_rust_custom_property_registry, registrations.data(), registrations.size());
 }
 
 void Document::build_registered_properties_cache()
@@ -9598,10 +9674,10 @@ void Document::build_registered_properties_cache()
         });
     });
 
-    if (cached_registered_properties_from_css_property_rules != m_cached_registered_properties_from_css_property_rules)
-        did_change_custom_property_registrations();
-
+    auto registrations_changed = cached_registered_properties_from_css_property_rules != m_cached_registered_properties_from_css_property_rules;
     m_cached_registered_properties_from_css_property_rules = move(cached_registered_properties_from_css_property_rules);
+    if (registrations_changed)
+        did_change_custom_property_registrations();
 }
 
 void Document::ensure_cookie_version_index(URL::URL const& new_url, URL::URL const& old_url)

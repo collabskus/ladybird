@@ -705,6 +705,7 @@ public:
     void set_parser(Badge<HTML::HTMLParser>, HTML::HTMLParser&);
     void detach_parser();
     GC::Ptr<HTML::HTMLParser> parser() const { return m_parser; }
+    u64 parser_generation() const { return m_parser_generation; }
 
     void set_temporary_document_for_fragment_parsing(Badge<HTML::HTMLParser>);
     [[nodiscard]] bool is_temporary_document_for_fragment_parsing() const { return m_temporary_document_for_fragment_parsing; }
@@ -1288,6 +1289,7 @@ public:
     HashMap<Utf16FlyString, CSS::CustomPropertyRegistration>& registered_property_set();
     Optional<CSS::CustomPropertyRegistration const&> get_registered_custom_property(Utf16FlyString const& name) const;
     size_t custom_property_registration_generation() const { return m_custom_property_registration_generation; }
+    void const* rust_custom_property_registry() const { return m_rust_custom_property_registry; }
     void did_change_custom_property_registrations();
 
     CSS::StyleScope const& style_scope() const { return m_style_scope; }
@@ -1385,6 +1387,7 @@ private:
     void run_csp_initialization() const;
 
     void build_registered_properties_cache();
+    void sync_custom_property_registrations_to_rust();
     void build_counter_style_cache();
 
     void ensure_cookie_version_index(URL::URL const& new_url, URL::URL const& old_url = {});
@@ -1433,6 +1436,7 @@ private:
     Optional<Vector<Utf16FlyString>> m_supported_color_schemes;
 
     GC::Ptr<HTML::HTMLParser> m_parser;
+    u64 m_parser_generation { 0 };
     bool m_active_parser_was_aborted { false };
 
     bool m_has_been_destroyed { false };
@@ -1831,6 +1835,7 @@ private:
     HashMap<Utf16FlyString, CSS::CustomPropertyRegistration> m_cached_registered_properties_from_css_property_rules;
     bool m_needs_registered_properties_cache_update { true };
     size_t m_custom_property_registration_generation { 0 };
+    void* m_rust_custom_property_registry { nullptr };
 
     CSS::StyleScope m_style_scope;
 
