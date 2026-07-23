@@ -1131,21 +1131,14 @@ Paintable::ScrollHandled Paintable::set_scroll_offset(CSSPixelPoint offset)
     //           the element’s eventual snap target in the block axis as newBlockTarget and the element’s eventual snap
     //           target in the inline axis as newInlineTarget.
 
-    GC::Ptr<DOM::EventTarget> event_target;
-    if (auto pseudo_element = node.generated_for_pseudo_element(); pseudo_element.has_value())
-        event_target = node.pseudo_element_generator();
-    else
-        event_target = dom_node();
-
+    auto event_target = scroll_event_target();
     if (!event_target)
         return ScrollHandled::Yes;
 
     // 3. If (element, "scroll") is already in doc’s pending scroll events, abort these steps.
-    if (document.pending_scroll_events().contains_slow(DOM::Document::PendingScrollEvent { *event_target, HTML::EventNames::scroll }))
-        return ScrollHandled::Yes;
-
     // 4. Append (element, "scroll") to doc’s pending scroll events.
-    document.pending_scroll_events().append({ *event_target, HTML::EventNames::scroll });
+    if (!document.append_pending_scroll_event({ *event_target, HTML::EventNames::scroll }))
+        return ScrollHandled::Yes;
 
     set_needs_repaint(InvalidateDisplayList::No);
     return ScrollHandled::Yes;
@@ -1153,7 +1146,32 @@ Paintable::ScrollHandled Paintable::set_scroll_offset(CSSPixelPoint offset)
 
 Paintable::ScrollHandled Paintable::scroll_by(double delta_x, double delta_y)
 {
-    return set_scroll_offset(scroll_offset().translated(CSSPixels::nearest_value_for(delta_x), CSSPixels::nearest_value_for(delta_y)));
+    return set_scroll_offset_from_user_input(scroll_offset().translated(CSSPixels::nearest_value_for(delta_x), CSSPixels::nearest_value_for(delta_y)));
+}
+
+Paintable::ScrollHandled Paintable::set_scroll_offset_from_user_input(CSSPixelPoint offset)
+{
+    auto scroll_handled = set_scroll_offset(offset);
+    auto navigable = document().navigable();
+    if (!navigable)
+        return scroll_handled;
+
+    if (scroll_handled == ScrollHandled::Yes) {
+        if (auto event_target = scroll_event_target())
+            navigable->queue_scrollend_event_after_user_scroll(*event_target);
+    } else {
+        // User input keeps the scroll gesture in progress even when it does not move the scrolling box.
+        navigable->defer_user_scroll_settlement();
+    }
+    return scroll_handled;
+}
+
+GC::Ptr<DOM::EventTarget> Paintable::scroll_event_target()
+{
+    auto& node = layout_node();
+    if (node.generated_for_pseudo_element().has_value())
+        return node.pseudo_element_generator();
+    return dom_node();
 }
 
 void Paintable::scroll_into_view(CSSPixelRect rect)
@@ -2642,8 +2660,7 @@ bool Paintable::handle_mousewheel(Badge<EventHandler>, CSSPixelPoint, unsigned, 
     if (wheel_delta_x == 0 && wheel_delta_y == 0)
         return false;
 
-    auto scroll_handled = scroll_by(wheel_delta_x, wheel_delta_y);
-    return scroll_handled == ScrollHandled::Yes;
+    return scroll_by(wheel_delta_x, wheel_delta_y) == ScrollHandled::Yes;
 }
 
 bool Paintable::resizer_contains(CSSPixelPoint adjusted_position, ChromeMetrics const& metrics) const
