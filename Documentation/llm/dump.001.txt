@@ -422091,6 +422091,7 @@ set(SOURCES
     Layout/VideoBox.cpp
     Layout/Viewport.cpp
     Loader/ContentBlocker.cpp
+    Loader/DownloadFilename.cpp
     Loader/FileRequest.cpp
     Loader/GeneratedPagesLoader.cpp
     Loader/ProxyMappings.cpp
@@ -532922,6 +532923,7 @@ FILE: Libraries/LibWeb/CSS/Properties.json
     "initial": "add"
   },
   "mask-image": {
+    "affects-accumulated-visual-contexts": true,
     "animation-type": "discrete",
     "inherited": false,
     "affects-layout": false,
@@ -533007,6 +533009,7 @@ FILE: Libraries/LibWeb/CSS/Properties.json
     "percentages-resolve-to": "length"
   },
   "mask-type": {
+    "affects-accumulated-visual-contexts": true,
     "animation-type": "discrete",
     "inherited": false,
     "affects-layout": false,
@@ -565120,6 +565123,8 @@ static bool accumulated_visual_context_change_requires_repaint(CSS::PropertyID p
     case CSS::PropertyID::BackgroundAttachment:
     case CSS::PropertyID::Clip:
     case CSS::PropertyID::ClipPath:
+    case CSS::PropertyID::MaskImage:
+    case CSS::PropertyID::MaskType:
     case CSS::PropertyID::MixBlendMode:
     case CSS::PropertyID::Perspective:
         return true;
@@ -601773,6 +601778,16 @@ Utf16String Document::dump_display_list()
                 if (nesting_change > 0)
                     indent += nesting_change;
             });
+
+            auto mask_context_indices = list.mask_display_lists().keys();
+            insertion_sort(mask_context_indices);
+            for (auto context_index : mask_context_indices) {
+                builder.append_repeated(' ', base_indent * 2);
+                builder.appendff("MaskDisplayList for context {}:\n", context_index.value());
+                auto display_list_id = list.mask_display_list_id(context_index).release_value();
+                auto& mask_display_list = resource_storage.display_list(display_list_id);
+                dump_commands(mask_display_list, base_indent + 1);
+            }
         };
 
     dump_commands(*display_list, 0);
@@ -606702,6 +606717,11 @@ FILE: Libraries/LibWeb/DOM/Element.cpp
 #include <LibWeb/DOM/SelectorQuery.h>
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOM/Text.h>
+#include <LibWeb/Fetch/Fetching/Fetching.h>
+#include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
+#include <LibWeb/Fetch/Infrastructure/FetchController.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/Geometry/DOMRect.h>
 #include <LibWeb/Geometry/DOMRectList.h>
 #include <LibWeb/HTML/BrowsingContext.h>
@@ -606739,6 +606759,7 @@ FILE: Libraries/LibWeb/DOM/Element.cpp
 #include <LibWeb/HTML/HTMLUListElement.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
+#include <LibWeb/HTML/Navigation.h>
 #include <LibWeb/HTML/Numbers.h>
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
@@ -607086,6 +607107,106 @@ void Element::follow_the_hyperlink(Optional<Utf16String> hyperlink_suffix, HTML:
         : URL::Parser::basic_parse(url_string);
     VERIFY(url.has_value());
     MUST(target_navigable->navigate({ .url = url.release_value(), .source_document = document(), .referrer_policy = referrer_policy, .user_involvement = user_involvement }));
+}
+
+// https://html.spec.whatwg.org/multipage/links.html#downloading-hyperlinks
+void Element::download_the_hyperlink(Optional<Utf16String> hyperlink_suffix, HTML::UserNavigationInvolvement user_involvement)
+{
+    // 1. If subject cannot navigate, then return.
+    if (cannot_navigate())
+        return;
+
+    // 2. If subject's node document's active sandboxing flag set has the sandboxed downloads browsing context flag
+    //    set, then return.
+    if (has_flag(document().active_sandboxing_flag_set(), HTML::SandboxingFlagSet::SandboxedDownloads))
+        return;
+
+    // 3. Let urlString be the result of encoding-parsing-and-serializing a URL given subject's href attribute
+    //    value, relative to subject's node document.
+    auto url_record = document().encoding_parse_url(get_attribute_value_view(HTML::AttributeNames::href).value_or({}));
+
+    // 4. If urlString is failure, then return.
+    if (!url_record.has_value())
+        return;
+
+    auto url = url_record.release_value();
+
+    // 5. If hyperlinkSuffix is non-null, then append it to urlString.
+    if (hyperlink_suffix.has_value()) {
+        auto url_string = url.serialize();
+        Utf16StringBuilder url_string_builder;
+        url_string_builder.append_ascii(url_string.bytes_as_string_view());
+        url_string_builder.append(hyperlink_suffix->utf16_view());
+        auto url_string_with_suffix = url_string_builder.to_string();
+        auto url_with_suffix = URL::Parser::basic_parse(url_string_with_suffix.utf16_view());
+        VERIFY(url_with_suffix.has_value());
+        url = url_with_suffix.release_value();
+    }
+
+    // NB: The download attribute is read once here, before any script can run, so the proposed filename used when
+    //     getting the suggested filename reflects its value at the time the download was initiated.
+    auto download_attribute = attribute(HTML::AttributeNames::download);
+
+    // 6. If userInvolvement is not "browser UI":
+    if (user_involvement != HTML::UserNavigationInvolvement::BrowserUI) {
+        // 1. Assert: subject has a download attribute.
+        VERIFY(download_attribute.has_value());
+
+        // 2. Let navigation be subject's relevant global object's navigation API.
+        auto navigation = as<HTML::Window>(HTML::relevant_global_object(*this)).navigation();
+
+        // 3. Let filename be the value of subject's download attribute.
+        auto filename = download_attribute.value();
+
+        // 4. Let continue be the result of firing a download request navigate event at navigation with
+        //    destinationURL set to urlString, userInvolvement set to userInvolvement, sourceElement set to
+        //    subject, and filename set to filename.
+        auto continue_ = navigation->fire_a_download_request_navigate_event(url, user_involvement, this, move(filename));
+
+        // 5. If continue is false, then return.
+        if (!continue_)
+            return;
+
+        // 6. Inform the navigation API about aborting navigation given subject's node navigable.
+        if (auto navigable = document().navigable())
+            navigable->inform_the_navigation_api_about_aborting_navigation();
+    }
+
+    // NB: Firing the navigate event above runs script, which may have detached this element's document from its
+    //     navigable.
+    auto navigable = document().navigable();
+    if (!navigable)
+        return;
+
+    auto proposed_filename = download_attribute.map([](auto const& filename) {
+        return filename.utf16_view().to_utf8_but_should_be_ported_to_utf16().to_byte_string();
+    });
+
+    // 7. Run these steps in parallel:
+    //    1. Optionally, the user agent may abort these steps, if it believes doing so would safeguard the user
+    //       from a potentially hostile download.
+    //    2. Let request be a new request whose URL is urlString, client is entry settings object, initiator is
+    //       "download", destination is the empty string, and whose synchronous flag and use-URL-credentials flag
+    //       are set.
+    // AD-HOC: The entry settings object may be empty when a hyperlink is activated by the user, so the node
+    //         document's relevant settings object is used as the request client instead.
+    auto request = Fetch::Infrastructure::Request::create(vm());
+    request->set_url(url);
+    request->set_client(&document().relevant_settings_object());
+    request->set_initiator(Fetch::Infrastructure::Request::Initiator::Download);
+    request->set_use_url_credentials(true);
+    // NB: The synchronous flag is not set; the response is instead processed asynchronously on the main thread.
+
+    //    3. Let response be the result of fetching request.
+    //    4. Handle as a download response with subject's node navigable and null.
+    auto controller_holder = Fetch::Infrastructure::FetchControllerHolder::create(vm());
+    Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input {};
+    fetch_algorithms_input.process_response = [navigable = GC::Ref { *navigable }, url, proposed_filename = move(proposed_filename), interface_origin = document().origin(), controller_holder](GC::Ref<Fetch::Infrastructure::Response> response) {
+        if (response->is_network_error())
+            return;
+        navigable->handle_as_a_download(response->unsafe_response(), url, controller_holder->controller(), proposed_filename, interface_origin);
+    };
+    controller_holder->set_controller(Fetch::Fetching::fetch(realm(), request, Fetch::Infrastructure::FetchAlgorithms::create(vm(), move(fetch_algorithms_input))));
 }
 
 // https://dom.spec.whatwg.org/#dom-element-getattributenode
@@ -612239,6 +612360,7 @@ public:
     bool cannot_navigate() const;
 
     void follow_the_hyperlink(Optional<Utf16String> hyperlink_suffix, HTML::UserNavigationInvolvement = HTML::UserNavigationInvolvement::None);
+    void download_the_hyperlink(Optional<Utf16String> hyperlink_suffix, HTML::UserNavigationInvolvement = HTML::UserNavigationInvolvement::None);
 
     Optional<Utf16String> lang() const;
     Optional<Utf16View> lang_view() const;
@@ -658119,144 +658241,3 @@ Response::Response(JS::Realm& realm, GC::Ref<Infrastructure::Response> response)
 {
 }
 
-Response::~Response() = default;
-
-void Response::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(Response);
-    Base::initialize(realm);
-}
-
-void Response::visit_edges(Cell::Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-    visitor.visit(m_response);
-    visitor.visit(m_headers);
-}
-
-// https://fetch.spec.whatwg.org/#concept-body-mime-type
-// https://fetch.spec.whatwg.org/#ref-for-concept-header-extract-mime-type%E2%91%A7
-Optional<MimeSniff::MimeType> Response::mime_type_impl() const
-{
-    // Objects including the Body interface mixin need to define an associated MIME type algorithm which takes no arguments and returns failure or a MIME type.
-    // A Response object’s MIME type is to return the result of extracting a MIME type from its response’s header list.
-    return Infrastructure::extract_mime_type(m_response->header_list());
-}
-
-// https://fetch.spec.whatwg.org/#concept-body-body
-// https://fetch.spec.whatwg.org/#ref-for-concept-body-body%E2%91%A8
-GC::Ptr<Infrastructure::Body const> Response::body_impl() const
-{
-    // Objects including the Body interface mixin have an associated body (null or a body).
-    // A Response object’s body is its response’s body.
-    return m_response->body() ? m_response->body() : nullptr;
-}
-
-// https://fetch.spec.whatwg.org/#concept-body-body
-// https://fetch.spec.whatwg.org/#ref-for-concept-body-body%E2%91%A8
-GC::Ptr<Infrastructure::Body> Response::body_impl()
-{
-    // Objects including the Body interface mixin have an associated body (null or a body).
-    // A Response object’s body is its response’s body.
-    return m_response->body() ? m_response->body() : nullptr;
-}
-
-// https://fetch.spec.whatwg.org/#response-create
-GC::Ref<Response> Response::create(JS::Realm& realm, GC::Ref<Infrastructure::Response> response, Headers::Guard guard)
-{
-    // 1. Let responseObject be a new Response object with realm.
-    // 2. Set responseObject’s response to response.
-    auto response_object = realm.create<Response>(realm, response);
-
-    // 3. Set responseObject’s headers to a new Headers object with realm, whose headers list is response’s headers list and guard is guard.
-    response_object->m_headers = realm.create<Headers>(realm, response->header_list());
-    response_object->m_headers->set_guard(guard);
-
-    // 4. Return responseObject.
-    return response_object;
-}
-
-// https://httpwg.org/specs/rfc9112.html#status.line
-static bool is_valid_status_text(String const& status_text)
-{
-    // A status text is valid if it is either the empty string or matches the reason-phrase token production.
-    // reason-phrase  = 1*( HTAB / SP / VCHAR / obs-text )
-    // VCHAR          = %x21-7E
-    // obs-text       = %x80-FF
-    return all_of(status_text.code_points(), [](auto c) {
-        return c == '\t' || c == ' ' || (c >= 0x21 && c <= 0x7E) || (c >= 0x80 && c <= 0xFF);
-    });
-}
-
-// https://fetch.spec.whatwg.org/#initialize-a-response
-WebIDL::ExceptionOr<void> Response::initialize_response(Bindings::ResponseInit const& init, Optional<Infrastructure::BodyWithType> const& body)
-{
-    // 1. If init["status"] is not in the range 200 to 599, inclusive, then throw a RangeError.
-    if (init.status < 200 || init.status > 599)
-        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::RangeError, "Status must be in range 200-599"_utf16 };
-
-    // 2. If init["statusText"] is not the empty string and does not match the reason-phrase token production, then throw a TypeError.
-    if (!is_valid_status_text(init.status_text))
-        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Invalid statusText: does not match the reason-phrase token production"_utf16 };
-
-    // 3. Set response’s response’s status to init["status"].
-    m_response->set_status(init.status);
-
-    // 4. Set response’s response’s status message to init["statusText"].
-    m_response->set_status_message(init.status_text.to_byte_string());
-
-    // 5. If init["headers"] exists, then fill response’s headers with init["headers"].
-    if (init.headers.has_value())
-        TRY(m_headers->fill(*init.headers));
-
-    // 6. If body was given, then:
-    if (body.has_value()) {
-        // 1. If response’s status is a null body status, then throw a TypeError.
-        if (Infrastructure::is_null_body_status(m_response->status()))
-            return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Response with null body status cannot have a body"_utf16 };
-
-        // 2. Set response’s body to body’s body.
-        m_response->set_body(body->body);
-
-        // 3. If body’s type is non-null and response’s header list does not contain `Content-Type`, then append (`Content-Type`, body’s type) to response’s header list.
-        if (body->type.has_value() && !m_response->header_list()->contains("Content-Type"sv))
-            m_response->header_list()->append(HTTP::Header::isomorphic_encode("Content-Type"sv, *body->type));
-    }
-
-    return {};
-}
-
-// https://fetch.spec.whatwg.org/#dom-response
-WebIDL::ExceptionOr<GC::Ref<Response>> Response::construct_impl(JS::Realm& realm, NullableBodyInit const& body, Bindings::ResponseInit const& init)
-{
-    auto& vm = realm.vm();
-
-    // Referred to as 'this' in the spec.
-    auto response_object = realm.create<Response>(realm, Infrastructure::Response::create(vm));
-
-    // 1. Set this’s response to a new response.
-    // NOTE: This is done at the beginning as the 'this' value Response object
-    //       cannot exist with a null Infrastructure::Response.
-
-    // 2. Set this’s headers to a new Headers object with this’s relevant Realm, whose header list is this’s response’s header list and guard is "response".
-    response_object->m_headers = realm.create<Headers>(realm, response_object->response()->header_list());
-    response_object->m_headers->set_guard(Headers::Guard::Response);
-
-    // 3. Let bodyWithType be null.
-    Optional<Infrastructure::BodyWithType> body_with_type;
-
-    // 4. If body is non-null, then set bodyWithType to the result of extracting body.
-    if (!body.has<Empty>())
-        body_with_type = TRY(extract_body(realm, body.downcast<BodyInit>()));
-
-    // 5. Perform initialize a response given this, init, and bodyWithType.
-    TRY(response_object->initialize_response(init, body_with_type));
-
-    return response_object;
-}
-
-// https://fetch.spec.whatwg.org/#dom-response-error
-GC::Ref<Response> Response::error(JS::VM& vm)
-{
-    // The static error() method steps are to return the result of creating a Response object, given a new network error, "immutable", and this’s relevant Realm.
-    // FIXME: How can we reliably get 'this', i.e. the object the function was called on, in IDL-defined functions?
