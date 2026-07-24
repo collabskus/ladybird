@@ -15546,8 +15546,10 @@ static int initialize_console_settings()
         return 0;
     }
 
-    // Set the output code page to UTF-8 to support Emoji and other Unicode characters
-    (void)SetConsoleOutputCP(CP_UTF8);
+    // Switch the output code page to UTF-8 to support Emoji and other Unicode characters. The shared helper
+    // saves the console's original code page so windows_shutdown() can restore it; this static initializer
+    // runs before windows_init(), so the save must happen here.
+    use_utf8_console_output();
 
     return 0;
 }
@@ -47192,14 +47194,35 @@ inline void override_crt_invalid_parameter_handler()
     _set_invalid_parameter_handler(invalid_parameter_handler);
 }
 
+inline UINT& saved_console_output_code_page()
+{
+    static UINT code_page = 0;
+    return code_page;
+}
+
+inline void use_utf8_console_output()
+{
+    // All Ladybird output is UTF-8; make consoles interpret it as such. The code page is a property of the console
+    // itself and outlives this process, so the original one is restored in windows_shutdown(). Save it only once:
+    // this runs both from AK/Format.cpp's static initializer and from windows_init(), and a later run would
+    // overwrite the saved value with the already-switched CP_UTF8.
+    if (saved_console_output_code_page() == 0)
+        saved_console_output_code_page() = GetConsoleOutputCP();
+    if (saved_console_output_code_page() != 0)
+        SetConsoleOutputCP(CP_UTF8);
+}
+
 inline void windows_init()
 {
     initiate_wsa();
     override_crt_invalid_parameter_handler();
+    use_utf8_console_output();
 }
 
 inline void windows_shutdown()
 {
+    if (saved_console_output_code_page() != 0 && saved_console_output_code_page() != CP_UTF8)
+        SetConsoleOutputCP(saved_console_output_code_page());
     terminate_wsa();
 }
 #endif
@@ -48226,6 +48249,13 @@ FILE: Base/res/ladybird/about-pages/downloads.html
             const sizeFormatter = new Intl.NumberFormat([], {
                 maximumFractionDigits: 1,
             });
+            const sizeUnits = [
+                { divisor: 1, suffix: "B" },
+                { divisor: 1024, suffix: "KiB" },
+                { divisor: 1024 ** 2, suffix: "MiB" },
+                { divisor: 1024 ** 3, suffix: "GiB" },
+                { divisor: 1024 ** 4, suffix: "TiB" },
+            ];
 
             let downloads = [];
             const downloadRows = new Map();
@@ -48241,18 +48271,11 @@ FILE: Base/res/ladybird/about-pages/downloads.html
                 return `${count} ${count === 1 ? singular : plural}`;
             }
 
-            function formatSize(size) {
-                if (size < 1024) return `${size} B`;
-
-                const units = ["KiB", "MiB", "GiB", "TiB"];
-                let value = size / 1024;
-                let unitIndex = 0;
-                while (value >= 1024 && unitIndex < units.length - 1) {
-                    value /= 1024;
-                    unitIndex++;
+            function unitForDownloadSize(size) {
+                for (let i = sizeUnits.length - 1; i > 0; --i) {
+                    if (size >= sizeUnits[i].divisor) return sizeUnits[i];
                 }
-
-                return `${sizeFormatter.format(value)} ${units[unitIndex]}`;
+                return sizeUnits[0];
             }
 
             function statusLabel(download) {
@@ -48265,9 +48288,13 @@ FILE: Base/res/ladybird/about-pages/downloads.html
             function detailLabel(download) {
                 if (download.status === "canceled") return "Partial file removed.";
                 if (download.status === "failed") return download.error || "The download failed.";
-                if (download.totalSize !== null && download.totalSize !== undefined)
-                    return `${formatSize(download.downloadedSize)} of ${formatSize(download.totalSize)}`;
-                return formatSize(download.downloadedSize);
+                if (download.status !== "completed" && download.totalSize > 0) {
+                    const unit = unitForDownloadSize(download.totalSize);
+                    return `${sizeFormatter.format(download.downloadedSize / unit.divisor)}/${sizeFormatter.format(download.totalSize / unit.divisor)} ${unit.suffix}`;
+                }
+
+                const unit = unitForDownloadSize(download.downloadedSize);
+                return `${sizeFormatter.format(download.downloadedSize / unit.divisor)} ${unit.suffix}`;
             }
 
             function createActionButton(className, textContent, message, downloadId) {
@@ -67020,8 +67047,14 @@ size_t EventLoopImplementationWindows::pump(PumpMode pump_mode)
                     Optional<NonnullOwnPtr<EventLoopProcess>> owned_process = s_processes.with_locked([&](auto& processes) {
                         return processes.take(process_id);
                     });
-                    if (owned_process.has_value())
-                        owned_process.release_value()->exit_handler(process_id);
+                    if (owned_process.has_value()) {
+                        // Run the handler from the event queue rather than inline: it may unregister notifiers whose
+                        // completion packets were dequeued into this very batch and are not yet re-associated, which
+                        // would fail the packet cancellation (and leave dangling pointers in the batch).
+                        deferred_invoke([process = owned_process.release_value(), process_id] {
+                            process->exit_handler(process_id);
+                        });
+                    }
                 }
                 continue;
             }
@@ -67054,15 +67087,22 @@ void EventLoopImplementationWindows::wake()
 
 static int notifier_type_to_network_event(NotificationType type)
 {
-    switch (type) {
-    case NotificationType::Read:
-        return FD_READ | FD_CLOSE | FD_ACCEPT;
-    case NotificationType::Write:
-        return FD_WRITE;
-    default:
+    // NotificationType is a bitmask (e.g. HangUp | Error), so translate each set bit.
+    int events = 0;
+    if (has_flag(type, NotificationType::Read))
+        events |= FD_READ | FD_CLOSE | FD_ACCEPT;
+    if (has_flag(type, NotificationType::Write))
+        events |= FD_WRITE | FD_CONNECT;
+    // WSAEventSelect has no separate error event; socket errors surface as FD_CLOSE.
+    if (has_flag(type, NotificationType::HangUp) || has_flag(type, NotificationType::Error))
+        events |= FD_CLOSE;
+
+    if (!events) {
         dbgln("This notification type is not implemented: {}", (int)type);
         VERIFY_NOT_REACHED();
     }
+
+    return events;
 }
 
 void EventLoopManagerWindows::register_notifier(Notifier& notifier)
@@ -74906,6 +74946,20 @@ ErrorOr<bool> isatty(int fd)
     return rc == 1;
 }
 
+ErrorOr<TerminalSize> terminal_size(int fd)
+{
+    struct winsize ws {};
+    if (::ioctl(fd, TIOCGWINSZ, &ws) < 0)
+        return Error::from_syscall("ioctl"sv, errno);
+    return TerminalSize { ws.ws_col, ws.ws_row };
+}
+
+ErrorOr<void> enable_ansi_escape_sequence_processing(int)
+{
+    // POSIX terminals interpret escape sequences natively.
+    return {};
+}
+
 ErrorOr<void> link(StringView old_path, StringView new_path)
 {
     ByteString old_path_string = old_path;
@@ -75521,6 +75575,18 @@ ErrorOr<AddressInfoVector> getaddrinfo(char const* nodename, char const* servnam
 CORE_API ErrorOr<ByteString> getcwd();
 CORE_API ErrorOr<void> chdir(StringView path);
 CORE_API ErrorOr<bool> isatty(int fd);
+
+struct TerminalSize {
+    size_t columns { 0 };
+    size_t rows { 0 };
+};
+
+// Queries the size of the terminal the given fd refers to.
+CORE_API ErrorOr<TerminalSize> terminal_size(int fd);
+
+// Makes the terminal the given fd refers to interpret ANSI escape sequences. This is a no-op on POSIX, where
+// terminals interpret escape sequences natively; on Windows it must be called before writing them to a console.
+CORE_API ErrorOr<void> enable_ansi_escape_sequence_processing(int fd);
 CORE_API unsigned hardware_concurrency();
 CORE_API u64 physical_memory_bytes();
 CORE_API ErrorOr<ByteString> current_executable_path();
@@ -75900,7 +75966,31 @@ ErrorOr<Array<int, 2>> pipe2(int flags)
 
 ErrorOr<bool> isatty(int handle)
 {
-    return GetFileType(to_handle(handle)) == FILE_TYPE_CHAR;
+    // GetFileType() cannot answer this: it reports FILE_TYPE_CHAR for every character device, including NUL.
+    // Only real consoles have a console mode.
+    DWORD mode = 0;
+    return GetConsoleMode(to_handle(handle), &mode) != 0;
+}
+
+ErrorOr<TerminalSize> terminal_size(int fd)
+{
+    CONSOLE_SCREEN_BUFFER_INFO info {};
+    if (!GetConsoleScreenBufferInfo(to_handle(fd), &info))
+        return Error::from_windows_error();
+    return TerminalSize {
+        static_cast<size_t>(info.srWindow.Right - info.srWindow.Left + 1),
+        static_cast<size_t>(info.srWindow.Bottom - info.srWindow.Top + 1),
+    };
+}
+
+ErrorOr<void> enable_ansi_escape_sequence_processing(int fd)
+{
+    DWORD mode = 0;
+    if (!GetConsoleMode(to_handle(fd), &mode))
+        return Error::from_windows_error();
+    if (!SetConsoleMode(to_handle(fd), mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
+        return Error::from_windows_error();
+    return {};
 }
 
 ErrorOr<int> socket(int domain, int type, int protocol)
@@ -111160,7 +111250,7 @@ if (APPLE)
 endif()
 
 if (HAS_DIRECTX)
-    list(APPEND SOURCES Direct3DContext.cpp)
+    list(APPEND SOURCES D3DSharedTexture.cpp Direct3DContext.cpp)
 endif()
 
 if (HAS_VULKAN)
@@ -114254,6 +114344,124 @@ ErrorOr<Gfx::ImageCursor> decode(Decoder&);
 
 }
 
+FILE: Libraries/LibGfx/D3DSharedTexture.cpp
+/*
+ * Copyright (c) 2026, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <LibGfx/D3DSharedTexture.h>
+#include <LibGfx/Direct3DContext.h>
+
+#ifdef USE_DIRECTX
+
+#    include <AK/Windows.h>
+#    include <d3d12.h>
+
+#    include <wrl/client.h>
+
+namespace Gfx {
+
+using Microsoft::WRL::ComPtr;
+
+D3DSharedTexture::D3DSharedTexture(ID3D12Resource* resource, IPC::File shared_handle, IntSize size)
+    : m_resource(resource)
+    , m_shared_handle(move(shared_handle))
+    , m_size(size)
+{
+}
+
+D3DSharedTexture::~D3DSharedTexture()
+{
+    m_resource->Release();
+}
+
+ErrorOr<NonnullRefPtr<D3DSharedTexture>> D3DSharedTexture::create(Direct3DContext& context, IntSize size)
+{
+    VERIFY(!size.is_empty());
+
+    D3D12_HEAP_PROPERTIES heap_properties {};
+    heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC resource_description {};
+    resource_description.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    resource_description.Width = size.width();
+    resource_description.Height = size.height();
+    resource_description.DepthOrArraySize = 1;
+    resource_description.MipLevels = 1;
+    resource_description.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    resource_description.SampleDesc.Count = 1;
+    resource_description.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    // ALLOW_SIMULTANEOUS_ACCESS is required for the UI process to open this resource on a D3D11 device.
+    resource_description.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+
+    ComPtr<ID3D12Resource> resource;
+    auto hr = context.device()->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_SHARED, &resource_description,
+        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&resource));
+    if (FAILED(hr))
+        return Error::from_windows_error(hr);
+
+    HANDLE shared_handle = nullptr;
+    hr = context.device()->CreateSharedHandle(resource.Get(), nullptr, GENERIC_ALL, nullptr, &shared_handle);
+    if (FAILED(hr))
+        return Error::from_windows_error(hr);
+
+    return adopt_ref(*new D3DSharedTexture(resource.Detach(), IPC::File::adopt_fd(to_fd(shared_handle)), size));
+}
+
+}
+
+#endif
+
+FILE: Libraries/LibGfx/D3DSharedTexture.h
+/*
+ * Copyright (c) 2026, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#ifdef USE_DIRECTX
+
+#    include <AK/AtomicRefCounted.h>
+#    include <AK/Error.h>
+#    include <AK/NonnullRefPtr.h>
+#    include <LibGfx/Size.h>
+#    include <LibIPC/File.h>
+
+struct ID3D12Resource;
+
+namespace Gfx {
+
+class Direct3DContext;
+
+// A DXGI_FORMAT_R8G8B8A8_UNORM render-target texture allocated on a shared heap so its NT handle
+// can be duplicated into another process and opened there (e.g. by the UI process via
+// ID3D11Device1::OpenSharedResource1).
+class D3DSharedTexture final : public AtomicRefCounted<D3DSharedTexture> {
+public:
+    static ErrorOr<NonnullRefPtr<D3DSharedTexture>> create(Direct3DContext&, IntSize);
+    ~D3DSharedTexture();
+
+    ID3D12Resource* resource() const { return m_resource; }
+    IntSize size() const { return m_size; }
+
+    ErrorOr<IPC::File> clone_handle() const { return IPC::File::clone_fd(m_shared_handle.fd()); }
+
+private:
+    D3DSharedTexture(ID3D12Resource*, IPC::File shared_handle, IntSize);
+
+    ID3D12Resource* m_resource { nullptr };
+    IPC::File m_shared_handle;
+    IntSize m_size;
+};
+
+}
+
+#endif
+
 FILE: Libraries/LibGfx/DecodedImageFrame.cpp
 /*
  * Copyright (c) 2026, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
@@ -114384,6 +114592,7 @@ FILE: Libraries/LibGfx/Direct3DContext.cpp
 #ifdef USE_DIRECTX
 
 #    include <AK/Windows.h>
+#    include <LibCore/Environment.h>
 #    include <d3d12.h>
 #    include <dxgi1_4.h>
 
@@ -114393,6 +114602,11 @@ FILE: Libraries/LibGfx/Direct3DContext.cpp
 namespace Gfx {
 
 using namespace Microsoft::WRL;
+
+static u64 pack_adapter_luid(LUID luid)
+{
+    return (static_cast<u64>(static_cast<u32>(luid.HighPart)) << 32) | static_cast<u32>(luid.LowPart);
+}
 
 struct Direct3DContext::Impl {
     Impl(ComPtr<IDXGIAdapter1> adapter, ComPtr<ID3D12Device> device, ComPtr<ID3D12CommandQueue> queue)
@@ -114427,6 +114641,11 @@ ID3D12Device* Direct3DContext::device() const
 ID3D12CommandQueue* Direct3DContext::queue() const
 {
     return m_impl->queue.Get();
+}
+
+u64 Direct3DContext::adapter_luid() const
+{
+    return pack_adapter_luid(m_impl->device->GetAdapterLuid());
 }
 
 static ErrorOr<ComPtr<IDXGIAdapter1>> get_hardware_adapter(IDXGIFactory4& factory)
@@ -114472,6 +114691,33 @@ ErrorOr<NonnullRefPtr<Direct3DContext>> create_direct3d_context()
     return adopt_ref(*new Direct3DContext(make<Direct3DContext::Impl>(move(adapter), move(device), move(queue))));
 }
 
+Optional<u64> default_dxgi_adapter_luid()
+{
+    // The result cannot change within a process lifetime, so compute it once.
+    static Optional<u64> const cached_adapter_luid = []() -> Optional<u64> {
+        ComPtr<IDXGIFactory4> factory;
+        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
+            return {};
+
+        UINT adapter_index = 0;
+        if (auto adapter_index_override = Core::Environment::get("QT_D3D_ADAPTER_INDEX"sv); adapter_index_override.has_value()) {
+            if (auto value = adapter_index_override->to_number<UINT>(); value.has_value())
+                adapter_index = *value;
+        }
+
+        ComPtr<IDXGIAdapter1> adapter;
+        if (FAILED(factory->EnumAdapters1(adapter_index, &adapter)))
+            return {};
+
+        DXGI_ADAPTER_DESC1 description {};
+        if (FAILED(adapter->GetDesc1(&description)))
+            return {};
+
+        return pack_adapter_luid(description.AdapterLuid);
+    }();
+    return cached_adapter_luid;
+}
+
 }
 
 #endif
@@ -114490,6 +114736,7 @@ FILE: Libraries/LibGfx/Direct3DContext.h
 #    include <AK/Error.h>
 #    include <AK/NonnullOwnPtr.h>
 #    include <AK/NonnullRefPtr.h>
+#    include <AK/Optional.h>
 #    include <AK/RefCounted.h>
 
 struct ID3D12CommandQueue;
@@ -114505,6 +114752,7 @@ public:
     IDXGIAdapter1* adapter() const;
     ID3D12Device* device() const;
     ID3D12CommandQueue* queue() const;
+    u64 adapter_luid() const;
 
 private:
     struct Impl;
@@ -114517,6 +114765,11 @@ private:
 };
 
 ErrorOr<NonnullRefPtr<Direct3DContext>> create_direct3d_context();
+
+// LUID of the adapter that Qt's D3D11 backend will pick in the UI process (the first enumerated
+// adapter unless overridden by QT_D3D_ADAPTER_INDEX). Used to check that a texture shared by the
+// Compositor process can be opened by the UI process.
+Optional<u64> default_dxgi_adapter_luid();
 
 }
 
@@ -116112,6 +116365,9 @@ public:
     void for_each_typeface_with_family_name(FlyString const& family_name, Function<void(Typeface const&)>);
     [[nodiscard]] StringView system_font_provider_name() const;
 
+    void set_force_freetype_rasterization(bool force) { m_force_freetype_rasterization = force; }
+    [[nodiscard]] bool force_freetype_rasterization() const { return m_force_freetype_rasterization; }
+
     static ErrorOr<Vector<String>> font_directories();
 
 private:
@@ -116119,6 +116375,7 @@ private:
     ~FontDatabase() = default;
 
     OwnPtr<SystemFontProvider> m_system_font_provider;
+    bool m_force_freetype_rasterization { false };
 
     struct CodePointFallbackEntry {
         FlyString family_name;
@@ -117122,6 +117379,7 @@ FILE: Libraries/LibGfx/Font/TypefaceSkia.cpp
 #if defined(AK_OS_ANDROID)
 #    include <ports/SkFontMgr_android.h>
 #elif defined(AK_OS_WINDOWS)
+#    include <ports/SkFontMgr_empty.h>
 #    include <ports/SkTypeface_win.h>
 #else
 #    include <ports/SkFontMgr_fontconfig.h>
@@ -117190,7 +117448,10 @@ static SkFontMgr& font_manager()
 #if defined(AK_OS_ANDROID)
         font_manager = SkFontMgr_New_Android(nullptr);
 #elif defined(AK_OS_WINDOWS)
-        font_manager = SkFontMgr_New_DirectWrite();
+        if (Gfx::FontDatabase::the().force_freetype_rasterization())
+            font_manager = SkFontMgr_New_Custom_Empty();
+        else
+            font_manager = SkFontMgr_New_DirectWrite();
 #else
         if (!font_manager) {
             font_manager = SkFontMgr_New_FontConfig(nullptr, SkFontScanner_Make_FreeType());
@@ -125748,6 +126009,11 @@ FILE: Libraries/LibGfx/PaintingSurface.cpp
 #    include <LibGfx/VulkanImage.h>
 #    include <gpu/ganesh/vk/GrVkBackendSurface.h>
 #    include <gpu/ganesh/vk/GrVkTypes.h>
+#elif defined(USE_DIRECTX)
+#    include <AK/Windows.h>
+#    include <LibGfx/D3DSharedTexture.h>
+#    include <gpu/ganesh/d3d/GrD3DBackendSurface.h>
+#    include <gpu/ganesh/d3d/GrD3DTypes.h>
 #endif
 
 namespace Gfx {
@@ -125759,7 +126025,7 @@ struct PaintingSurface::Impl {
     RefPtr<Bitmap> bitmap;
 };
 
-#if defined(AK_OS_MACOS) || defined(USE_VULKAN_DMABUF_IMAGES)
+#if defined(AK_OS_MACOS) || defined(USE_VULKAN_DMABUF_IMAGES) || defined(USE_DIRECTX)
 static GrSurfaceOrigin origin_to_sk_origin(PaintingSurface::Origin origin)
 {
     switch (origin) {
@@ -125814,6 +126080,32 @@ NonnullRefPtr<PaintingSurface> PaintingSurface::create_from_vkimage(NonnullRefPt
     vulkan_image->ref();
     sk_sp<SkSurface> surface = SkSurfaces::WrapBackendRenderTarget(context->sk_context(), rt, origin_to_sk_origin(origin), vk_format_to_sk_color_type(vulkan_image->info.format),
         SkColorSpace::MakeSRGB(), nullptr, release_vulkan_image, vulkan_image.ptr());
+    return adopt_ref(*new PaintingSurface(make<Impl>(context, size, surface, nullptr)));
+}
+#endif
+
+#ifdef USE_DIRECTX
+static void release_d3d_texture(void* context)
+{
+    auto* texture = static_cast<D3DSharedTexture*>(context);
+    texture->unref();
+}
+
+ErrorOr<NonnullRefPtr<PaintingSurface>> PaintingSurface::create_from_d3d_texture(NonnullRefPtr<SkiaBackendContext> context, NonnullRefPtr<D3DSharedTexture> texture, Origin origin)
+{
+    auto size = texture->size();
+    GrD3DTextureResourceInfo info(nullptr, nullptr, D3D12_RESOURCE_STATE_COMMON, DXGI_FORMAT_R8G8B8A8_UNORM,
+        /* sampleCount */ 1, /* levelCount */ 1, /* sampleQualityLevel */ 0);
+    // NOTE: The positional resource argument of GrD3DTextureResourceInfo would adopt our reference, so attach it with retain() instead.
+    info.fResource.retain(texture->resource());
+    auto render_target = GrBackendRenderTargets::MakeD3D(size.width(), size.height(), info);
+    // Note, we're implicitly giving Skia a reference to the texture. It will eventually be released by the callback function,
+    // which is guaranteed to be invoked even if wrapping fails.
+    texture->ref();
+    sk_sp<SkSurface> surface = SkSurfaces::WrapBackendRenderTarget(context->sk_context(), render_target, origin_to_sk_origin(origin),
+        kRGBA_8888_SkColorType, SkColorSpace::MakeSRGB(), nullptr, release_d3d_texture, texture.ptr());
+    if (!surface)
+        return Error::from_string_literal("Failed to wrap shared Direct3D texture in a Skia surface");
     return adopt_ref(*new PaintingSurface(make<Impl>(context, size, surface, nullptr)));
 }
 #endif
@@ -125993,6 +126285,16 @@ struct VulkanImage;
 }
 #endif
 
+#ifdef USE_DIRECTX
+#    include <AK/Error.h>
+
+namespace Gfx {
+
+class D3DSharedTexture;
+
+}
+#endif
+
 #ifdef AK_OS_MACOS
 #    include <LibGfx/MetalContext.h>
 #endif
@@ -126022,6 +126324,10 @@ public:
 
 #ifdef USE_VULKAN_DMABUF_IMAGES
     static NonnullRefPtr<PaintingSurface> create_from_vkimage(NonnullRefPtr<SkiaBackendContext> context, NonnullRefPtr<VulkanImage> vulkan_image, Origin origin);
+#endif
+
+#ifdef USE_DIRECTX
+    static ErrorOr<NonnullRefPtr<PaintingSurface>> create_from_d3d_texture(NonnullRefPtr<SkiaBackendContext>, NonnullRefPtr<D3DSharedTexture>, Origin = Origin::TopLeft);
 #endif
 
     NonnullRefPtr<Bitmap> snapshot_bitmap() const;
@@ -129072,6 +129378,9 @@ FILE: Libraries/LibGfx/SharedImage.cpp
 #ifdef USE_VULKAN_DMABUF_IMAGES
 #    include <LibGfx/VulkanImage.h>
 #endif
+#ifdef USE_DIRECTX
+#    include <LibGfx/D3DSharedTexture.h>
+#endif
 
 #ifdef AK_OS_MACOS
 static Core::MachPort copy_send_right(Core::MachPort const& port)
@@ -129100,6 +129409,11 @@ SharedImage::SharedImage(LinuxDmaBufHandle&& dmabuf)
 {
 }
 
+SharedImage::SharedImage(WindowsD3DHandle&& d3d_handle)
+    : m_data(move(d3d_handle))
+{
+}
+
 #    ifdef USE_VULKAN_DMABUF_IMAGES
 static constexpr auto shared_image_bitmap_format = BitmapFormat::BGRA8888;
 static constexpr auto shared_image_alpha_type = AlphaType::Premultiplied;
@@ -129125,6 +129439,21 @@ LinuxDmaBufHandle duplicate_linux_dmabuf_handle(VulkanImage const& vulkan_image)
     };
 }
 #    endif
+
+#    ifdef USE_DIRECTX
+SharedImage duplicate_shared_image(D3DSharedTexture const& texture)
+{
+    return SharedImage { duplicate_windows_d3d_handle(texture) };
+}
+
+WindowsD3DHandle duplicate_windows_d3d_handle(D3DSharedTexture const& texture)
+{
+    return WindowsD3DHandle {
+        .size = texture.size(),
+        .file = MUST(texture.clone_handle()),
+    };
+}
+#    endif
 #endif
 
 }
@@ -129135,6 +129464,7 @@ namespace IPC {
 enum class SharedImageBackingType : u8 {
     ShareableBitmap,
     LinuxDmaBuf,
+    WindowsD3DTexture,
 };
 
 template<>
@@ -129163,6 +129493,23 @@ ErrorOr<Gfx::LinuxDmaBufHandle> decode(Decoder& decoder)
         .file = TRY(decoder.decode<IPC::File>()),
     };
 }
+
+template<>
+ErrorOr<void> encode(Encoder& encoder, Gfx::WindowsD3DHandle const& d3d_handle)
+{
+    TRY(encoder.encode(d3d_handle.size));
+    TRY(encoder.encode(TRY(IPC::File::clone_fd(d3d_handle.file.fd()))));
+    return {};
+}
+
+template<>
+ErrorOr<Gfx::WindowsD3DHandle> decode(Decoder& decoder)
+{
+    return Gfx::WindowsD3DHandle {
+        .size = TRY(decoder.decode<Gfx::IntSize>()),
+        .file = TRY(decoder.decode<IPC::File>()),
+    };
+}
 #endif
 
 template<>
@@ -129180,6 +129527,11 @@ ErrorOr<void> encode(Encoder& encoder, Gfx::SharedImage const& shared_image)
         [&](Gfx::LinuxDmaBufHandle const& dmabuf) -> ErrorOr<void> {
             TRY(encoder.encode(SharedImageBackingType::LinuxDmaBuf));
             TRY(encoder.encode(dmabuf));
+            return {};
+        },
+        [&](Gfx::WindowsD3DHandle const& d3d_handle) -> ErrorOr<void> {
+            TRY(encoder.encode(SharedImageBackingType::WindowsD3DTexture));
+            TRY(encoder.encode(d3d_handle));
             return {};
         });
 #endif
@@ -129199,6 +129551,8 @@ ErrorOr<Gfx::SharedImage> decode(Decoder& decoder)
         return Gfx::SharedImage { TRY(decoder.decode<Gfx::ShareableBitmap>()) };
     case SharedImageBackingType::LinuxDmaBuf:
         return Gfx::SharedImage { TRY(decoder.decode<Gfx::LinuxDmaBufHandle>()) };
+    case SharedImageBackingType::WindowsD3DTexture:
+        return Gfx::SharedImage { TRY(decoder.decode<Gfx::WindowsD3DHandle>()) };
     default:
         VERIFY_NOT_REACHED();
     }
@@ -129243,12 +129597,24 @@ struct LinuxDmaBufHandle {
     u64 modifier;
     IPC::File file;
 };
+
+// NOTE: The texture behind the handle is always DXGI_FORMAT_R8G8B8A8_UNORM with premultiplied alpha.
+struct WindowsD3DHandle {
+    IntSize size;
+    IPC::File file;
+};
 #endif
 
 #ifdef USE_VULKAN_DMABUF_IMAGES
 struct VulkanImage;
 SharedImage duplicate_shared_image(VulkanImage const&);
 LinuxDmaBufHandle duplicate_linux_dmabuf_handle(VulkanImage const&);
+#endif
+
+#ifdef USE_DIRECTX
+class D3DSharedTexture;
+SharedImage duplicate_shared_image(D3DSharedTexture const&);
+WindowsD3DHandle duplicate_windows_d3d_handle(D3DSharedTexture const&);
 #endif
 
 class SharedImage {
@@ -129264,13 +129630,14 @@ public:
 #else
     explicit SharedImage(ShareableBitmap);
     explicit SharedImage(LinuxDmaBufHandle&&);
+    explicit SharedImage(WindowsD3DHandle&&);
 #endif
 
 private:
 #ifdef AK_OS_MACOS
     Core::MachPort m_port;
 #else
-    Variant<ShareableBitmap, LinuxDmaBufHandle> m_data;
+    Variant<ShareableBitmap, LinuxDmaBufHandle, WindowsD3DHandle> m_data;
 #endif
 
     friend class SharedImageBuffer;
@@ -129292,6 +129659,12 @@ ErrorOr<void> encode(Encoder&, Gfx::LinuxDmaBufHandle const&);
 
 template<>
 ErrorOr<Gfx::LinuxDmaBufHandle> decode(Decoder&);
+
+template<>
+ErrorOr<void> encode(Encoder&, Gfx::WindowsD3DHandle const&);
+
+template<>
+ErrorOr<Gfx::WindowsD3DHandle> decode(Decoder&);
 #endif
 
 template<>
@@ -129368,6 +129741,13 @@ SharedImageBuffer::SharedImageBuffer(NonnullRefPtr<Bitmap> bitmap, LinuxDmaBufHa
 {
 }
 #    endif
+
+#    ifdef USE_DIRECTX
+SharedImageBuffer::SharedImageBuffer(WindowsD3DHandle&& d3d_handle)
+    : m_windows_d3d_handle(move(d3d_handle))
+{
+}
+#    endif
 #endif
 
 SharedImageBuffer SharedImageBuffer::create(IntSize size)
@@ -129400,6 +129780,16 @@ SharedImageBuffer SharedImageBuffer::import_from_shared_image(SharedImage shared
             (void)dmabuf;
             VERIFY_NOT_REACHED();
 #    endif
+        },
+        [](WindowsD3DHandle& d3d_handle) -> SharedImageBuffer {
+#    ifdef USE_DIRECTX
+            // NOTE: D3D12 default-heap textures cannot be mapped for CPU access, so unlike the
+            //       other backing types this buffer has no bitmap view of the pixels.
+            return SharedImageBuffer(move(d3d_handle));
+#    else
+            (void)d3d_handle;
+            VERIFY_NOT_REACHED();
+#    endif
         });
 #endif
 }
@@ -129415,7 +129805,7 @@ SharedImage SharedImageBuffer::export_shared_image() const
 #ifdef AK_OS_MACOS
     return SharedImage { m_iosurface_handle.create_mach_port() };
 #else
-    return SharedImage { ShareableBitmap { m_bitmap, ShareableBitmap::ConstructWithKnownGoodBitmap } };
+    return SharedImage { ShareableBitmap { bitmap(), ShareableBitmap::ConstructWithKnownGoodBitmap } };
 #endif
 }
 
@@ -129455,12 +129845,19 @@ public:
 
     SharedImage export_shared_image() const;
 
-    NonnullRefPtr<Bitmap> bitmap() const { return m_bitmap; }
+    NonnullRefPtr<Bitmap> bitmap() const
+    {
+        VERIFY(m_bitmap);
+        return *m_bitmap;
+    }
+    RefPtr<Bitmap> bitmap_if_present() const { return m_bitmap; }
 
 #ifdef AK_OS_MACOS
     Core::IOSurfaceHandle const& iosurface_handle() const { return m_iosurface_handle; }
 #elif defined(USE_VULKAN_DMABUF_IMAGES)
     LinuxDmaBufHandle const* linux_dmabuf_handle() const { return m_linux_dmabuf_handle.has_value() ? &m_linux_dmabuf_handle.value() : nullptr; }
+#elif defined(USE_DIRECTX)
+    WindowsD3DHandle const* windows_d3d_handle() const { return m_windows_d3d_handle.has_value() ? &m_windows_d3d_handle.value() : nullptr; }
 #endif
 
 private:
@@ -129473,8 +129870,12 @@ private:
     SharedImageBuffer(NonnullRefPtr<Bitmap>, LinuxDmaBufHandle&&);
     Optional<LinuxDmaBufHandle> m_linux_dmabuf_handle;
 #    endif
+#    ifdef USE_DIRECTX
+    explicit SharedImageBuffer(WindowsD3DHandle&&);
+    Optional<WindowsD3DHandle> m_windows_d3d_handle;
+#    endif
 #endif
-    NonnullRefPtr<Bitmap> m_bitmap;
+    RefPtr<Bitmap> m_bitmap;
 };
 
 }
@@ -129954,6 +130355,8 @@ public:
 
     MetalContext& metal_context() override { VERIFY_NOT_REACHED(); }
 
+    Direct3DContext& direct3d_context() override { return m_direct3d_context; }
+
 private:
     sk_sp<GrDirectContext> m_context;
     NonnullRefPtr<Direct3DContext> m_direct3d_context;
@@ -130179,6 +130582,7 @@ public:
 
     virtual MetalContext& metal_context() = 0;
     virtual VulkanContext const& vulkan_context() = 0;
+    virtual Direct3DContext& direct3d_context() { VERIFY_NOT_REACHED(); }
 
 protected:
     virtual void flush_and_submit_impl(SkSurface*) = 0;
@@ -142747,7 +143151,7 @@ ErrorOr<void> MessageBuffer::transfer_message(Transport& transport)
     VERIFY(m_data.size() <= MAX_MESSAGE_PAYLOAD_SIZE);
     VERIFY(m_attachments.size() <= MAX_MESSAGE_FD_COUNT);
 
-    transport.post_message(take_data(), m_attachments);
+    TRY(transport.post_message(take_data(), m_attachments));
     return {};
 }
 
@@ -143897,13 +144301,14 @@ void TransportMachPort::wait_until_readable()
         m_incoming_cv.wait();
 }
 
-void TransportMachPort::post_message(MessageDataType bytes, Vector<Attachment>& attachments)
+ErrorOr<void> TransportMachPort::post_message(MessageDataType bytes, Vector<Attachment>& attachments)
 {
     {
         Sync::MutexLocker locker(m_send_mutex);
         m_pending_send_messages.append(PendingMessage { move(bytes), move(attachments) });
     }
     wake_io_thread();
+    return {};
 }
 
 TransportMachPort::ShouldShutdown TransportMachPort::read_as_many_messages_as_possible_without_blocking(Function<void(Message&&)>&& callback)
@@ -144006,7 +144411,7 @@ public:
 
     void wait_until_readable();
 
-    void post_message(MessageDataType, Vector<Attachment>& attachments);
+    ErrorOr<void> post_message(MessageDataType, Vector<Attachment>& attachments);
 
     enum class ShouldShutdown {
         No,
@@ -144418,7 +144823,7 @@ static constexpr size_t MAX_UNPROCESSED_BUFFER_SIZE = 128 * MiB;
 // Maximum number of accumulated unprocessed file descriptors before we disconnect the peer
 static constexpr size_t MAX_UNPROCESSED_FDS = 512;
 
-void TransportSocket::post_message(MessageDataType bytes_to_write, Vector<Attachment>& attachments)
+ErrorOr<void> TransportSocket::post_message(MessageDataType bytes_to_write, Vector<Attachment>& attachments)
 {
     auto num_fds_to_transfer = attachments.size();
 
@@ -144442,6 +144847,7 @@ void TransportSocket::post_message(MessageDataType bytes_to_write, Vector<Attach
 
     m_send_queue->enqueue_message(header, move(bytes_to_write), move(raw_fds));
     wake_io_thread();
+    return {};
 }
 
 ErrorOr<void> TransportSocket::send_message(Core::LocalSocket& socket, ReadonlyBytes& bytes_to_write, Vector<int>& unowned_fds)
@@ -144773,7 +145179,7 @@ public:
 
     void wait_until_readable();
 
-    void post_message(MessageDataType, Vector<Attachment>& attachments);
+    ErrorOr<void> post_message(MessageDataType, Vector<Attachment>& attachments);
 
     enum class ShouldShutdown {
         No,
@@ -145032,17 +145438,17 @@ Attachment TransportSocketWindows::deserialize_attachment(ReadonlyBytes& seriali
     VERIFY_NOT_REACHED();
 }
 
-void TransportSocketWindows::post_message(MessageDataType bytes, Vector<Attachment>& attachments)
+ErrorOr<void> TransportSocketWindows::post_message(MessageDataType bytes, Vector<Attachment>& attachments)
 {
     VERIFY(bytes.size() <= MAX_MESSAGE_PAYLOAD_SIZE);
     VERIFY(attachments.size() <= MAX_MESSAGE_FD_COUNT);
 
     auto attachment_count = attachments.size();
-    auto serialized_attachments = MUST(serialize_attachments(attachments));
+    auto serialized_attachments = TRY(serialize_attachments(attachments));
     VERIFY(serialized_attachments.size() <= MAX_ATTACHMENT_DATA_SIZE);
 
     Vector<u8> message_buffer;
-    MUST(message_buffer.try_resize(sizeof(MessageHeader) + serialized_attachments.size() + bytes.size()));
+    TRY(message_buffer.try_resize(sizeof(MessageHeader) + serialized_attachments.size() + bytes.size()));
 
     MessageHeader header {
         .payload_size = static_cast<u32>(bytes.size()),
@@ -145059,7 +145465,8 @@ void TransportSocketWindows::post_message(MessageDataType bytes, Vector<Attachme
     if (!bytes.is_empty())
         memcpy(payload_storage, bytes.data(), bytes.size());
 
-    MUST(transfer(message_buffer.span()));
+    TRY(transfer(message_buffer.span()));
+    return {};
 }
 
 ErrorOr<void> TransportSocketWindows::transfer(ReadonlyBytes bytes_to_write)
@@ -145237,7 +145644,7 @@ public:
 
     void wait_until_readable();
 
-    void post_message(MessageDataType, Vector<Attachment>& attachments);
+    ErrorOr<void> post_message(MessageDataType, Vector<Attachment>& attachments);
 
     enum class ShouldShutdown {
         No,
@@ -344333,34 +344740,39 @@ FILE: Libraries/LibTest/LiveDisplay.h
 #include <AK/StringBuilder.h>
 #include <AK/StringView.h>
 #include <AK/Types.h>
+#include <LibCore/System.h>
 
 #include <fcntl.h>
 #include <stdio.h>
 
-#if !defined(AK_OS_WINDOWS)
-#    include <sys/ioctl.h>
+#if defined(AK_OS_WINDOWS)
+#    include <io.h>
+#else
 #    include <unistd.h>
 #endif
 
 namespace Test {
 
-inline bool stdout_is_tty()
+// Returns the given stdio stream's fd in the form Core::System expects. (The CRT's fileno() namespace differs
+// from the native handle namespace on Windows, so fileno() alone is not usable with Core::System there.)
+inline int system_fd_for_stream(FILE* stream)
 {
 #if defined(AK_OS_WINDOWS)
-    return false;
+    return to_fd(reinterpret_cast<void*>(_get_osfhandle(fileno(stream))));
 #else
-    return isatty(STDOUT_FILENO);
+    return fileno(stream);
 #endif
+}
+
+inline bool stdout_is_tty()
+{
+    return Core::System::isatty(system_fd_for_stream(stdout)).value_or(false);
 }
 
 inline size_t query_terminal_width(int fd, size_t fallback = 80)
 {
-#if !defined(AK_OS_WINDOWS)
-    struct winsize ws;
-    if (ioctl(fd, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
-        return ws.ws_col;
-#endif
-    (void)fd;
+    if (auto size = Core::System::terminal_size(fd); !size.is_error() && size.value().columns > 0)
+        return size.value().columns;
     return fallback;
 }
 
@@ -344493,23 +344905,20 @@ public:
 
     bool begin(Options options)
     {
-#if defined(AK_OS_WINDOWS)
-        (void)options;
-        return false;
-#else
         if (m_active)
             return false;
 
         m_reserved_lines = options.reserved_lines;
         m_log_file_path = move(options.log_file_path);
 
+        // NOTE: This deliberately uses stdio-level fds (fileno() et al), which also exist on Windows as CRT fds.
         if (!m_log_file_path.is_empty()) {
             int log_fd = ::open(m_log_file_path.characters(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
             if (log_fd < 0)
                 return false;
 
-            m_saved_stdout_fd = dup(STDOUT_FILENO);
-            m_saved_stderr_fd = dup(STDERR_FILENO);
+            m_saved_stdout_fd = dup(fileno(stdout));
+            m_saved_stderr_fd = dup(fileno(stderr));
             if (m_saved_stdout_fd < 0 || m_saved_stderr_fd < 0) {
                 close(log_fd);
                 return false;
@@ -344517,8 +344926,8 @@ public:
 
             (void)fflush(stdout);
             (void)fflush(stderr);
-            (void)dup2(log_fd, STDOUT_FILENO);
-            (void)dup2(log_fd, STDERR_FILENO);
+            (void)dup2(log_fd, fileno(stdout));
+            (void)dup2(log_fd, fileno(stderr));
             close(log_fd);
 
             int display_fd = dup(m_saved_stdout_fd);
@@ -344534,6 +344943,7 @@ public:
             m_output = stdout;
         }
 
+        (void)Core::System::enable_ansi_escape_sequence_processing(system_fd_for_stream(m_output));
         refresh_terminal_width();
 
         for (size_t i = 0; i < m_reserved_lines; ++i)
@@ -344542,12 +344952,10 @@ public:
 
         m_active = true;
         return true;
-#endif
     }
 
     void end()
     {
-#if !defined(AK_OS_WINDOWS)
         if (!m_active)
             return;
 
@@ -344562,12 +344970,12 @@ public:
             (void)fflush(stdout);
             (void)fflush(stderr);
             if (m_saved_stdout_fd >= 0) {
-                (void)dup2(m_saved_stdout_fd, STDOUT_FILENO);
+                (void)dup2(m_saved_stdout_fd, fileno(stdout));
                 close(m_saved_stdout_fd);
                 m_saved_stdout_fd = -1;
             }
             if (m_saved_stderr_fd >= 0) {
-                (void)dup2(m_saved_stderr_fd, STDERR_FILENO);
+                (void)dup2(m_saved_stderr_fd, fileno(stderr));
                 close(m_saved_stderr_fd);
                 m_saved_stderr_fd = -1;
             }
@@ -344577,7 +344985,6 @@ public:
             m_output = nullptr;
         }
         m_active = false;
-#endif
     }
 
     bool is_active() const { return m_active; }
@@ -344590,12 +344997,7 @@ public:
 
     void refresh_terminal_width()
     {
-#if !defined(AK_OS_WINDOWS)
-        int fd = m_output ? fileno(m_output) : STDOUT_FILENO;
-#else
-        int fd = 0; // Not actually used.
-#endif
-        m_terminal_width = query_terminal_width(fd);
+        m_terminal_width = query_terminal_width(system_fd_for_stream(m_output ? m_output : stdout));
     }
 
     // Erase the reserved display area, leaving the cursor at the top of it.
@@ -344614,6 +345016,9 @@ public:
     {
         if (!m_active || !m_output)
             return;
+
+        // Track terminal resizes; unlike POSIX (SIGWINCH), Windows has no resize notification to hook instead.
+        refresh_terminal_width();
 
         StringBuilder builder;
         for (size_t i = 0; i < m_reserved_lines; ++i)
@@ -344689,9 +345094,7 @@ private:
     size_t m_terminal_width { 80 };
     FILE* m_output { nullptr };
     int m_saved_stdout_fd { -1 };
-#if !defined(AK_OS_WINDOWS)
     int m_saved_stderr_fd { -1 };
-#endif
     ByteString m_log_file_path;
 };
 
@@ -407357,6 +407760,17 @@ AnimationUpdateContext::~AnimationUpdateContext()
             auto& element = static_cast<DOM::Element&>(node);
             if (!element.computed_values())
                 return TraversalDecision::SkipChildrenAndContinue;
+            // NB: A styled element can inherit from an unstyled one in the flat tree: per css-shadow-1, a slotted
+            //     element inherits from the slot it's assigned to rather than its light tree parent
+            //     (https://drafts.csswg.org/css-shadow-1/#slots-in-shadow-tree), and that slot may not have computed
+            //     values yet (e.g. a freshly attached shadow tree that hasn't been through a style update).
+            //     Inherited style can't be recomputed against an unstyled parent, so leave the element to the
+            //     regular style pass, which always styles slots before their assigned slottables.
+            if (auto inheritance_parent = DOM::AbstractElement { element }.element_to_inherit_style_from();
+                inheritance_parent.has_value() && !inheritance_parent->computed_values()) {
+                element.set_needs_style_update(true);
+                return TraversalDecision::SkipChildrenAndContinue;
+            }
             auto element_invalidation = element.recompute_inherited_style();
             if (element_invalidation.is_none())
                 return TraversalDecision::SkipChildrenAndContinue;
@@ -536383,7 +536797,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     generate_ffi_header(
         selector_config,
-        &[manifest_dir.join("src/selector_engine.rs")],
+        &[
+            manifest_dir.join("src/selector_engine.rs"),
+            manifest_dir.join("src/ffi_support.rs"),
+        ],
         &out_dir,
         &ffi_out_dir,
         Path::new("SelectorRustFFI.h"),
@@ -536429,6 +536846,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/computed_values.rs"),
             manifest_dir.join("src/property_metadata.rs"),
             manifest_dir.join("src/style_compute.rs"),
+            manifest_dir.join("src/display.rs"),
             manifest_dir.join("src/css_pixels.rs"),
             manifest_dir.join("src/cascaded_properties.rs"),
             manifest_dir.join("src/custom_properties.rs"),
@@ -541721,6 +542139,20 @@ mod tests {
     }
 }
 
+FILE: Libraries/LibWeb/CSS/Rust/src/css_enums.rs
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+//! Generated CSS keyword and enum vocabulary, shared by the crate's modules. The constants are
+//! generated by build.rs from the same JSON files as the C++ enums, so the numeric values cannot
+//! drift between the two sides.
+
+include!(concat!(env!("OUT_DIR"), "/keywords_generated.rs"));
+include!(concat!(env!("OUT_DIR"), "/css_enums_generated.rs"));
+
 FILE: Libraries/LibWeb/CSS/Rust/src/css_pixels.rs
 /*
  * Copyright (c) 2026-present, the Ladybird developers.
@@ -544049,6 +544481,349 @@ pub unsafe extern "C" fn rust_custom_property_store_get(
     })
 }
 
+FILE: Libraries/LibWeb/CSS/Rust/src/display.rs
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+//! The CSS `display` value and its predicates, mirroring `Web::CSS::Display`.
+
+use crate::css_enums::{display_box, display_inside, display_internal, display_outside};
+
+/// Mirror of the CSS Display value; the C++ tagged union crosses as explicit
+/// fields, with the unused fields zeroed so equality is field-wise. `tag` uses
+/// the same discriminants as Display::Type.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct FfiDisplay {
+    /// 0 = outside-and-inside, 1 = internal, 2 = box.
+    pub tag: u8,
+    pub outside: u8,
+    pub inside: u8,
+    pub list_item: bool,
+    pub internal: u8,
+    pub box_value: u8,
+}
+
+pub const DISPLAY_TAG_OUTSIDE_AND_INSIDE: u8 = 0;
+pub const DISPLAY_TAG_INTERNAL: u8 = 1;
+pub const DISPLAY_TAG_BOX: u8 = 2;
+
+impl FfiDisplay {
+    pub fn from_raw(raw: u32) -> Self {
+        let [tag, first, second, third] = raw.to_le_bytes();
+        match tag {
+            DISPLAY_TAG_OUTSIDE_AND_INSIDE => Self::outside_and_inside(first, second, third != 0),
+            DISPLAY_TAG_INTERNAL => Self::internal(first),
+            DISPLAY_TAG_BOX => Self {
+                tag,
+                outside: 0,
+                inside: 0,
+                list_item: false,
+                internal: 0,
+                box_value: first,
+            },
+            _ => unreachable!("invalid display tag"),
+        }
+    }
+
+    pub fn outside_and_inside(outside: u8, inside: u8, list_item: bool) -> Self {
+        Self {
+            tag: DISPLAY_TAG_OUTSIDE_AND_INSIDE,
+            outside,
+            inside,
+            list_item,
+            internal: 0,
+            box_value: 0,
+        }
+    }
+
+    pub fn internal(internal: u8) -> Self {
+        Self {
+            tag: DISPLAY_TAG_INTERNAL,
+            outside: 0,
+            inside: 0,
+            list_item: false,
+            internal,
+            box_value: 0,
+        }
+    }
+
+    pub fn block() -> Self {
+        Self::outside_and_inside(display_outside::BLOCK, display_inside::FLOW, false)
+    }
+
+    pub fn inline() -> Self {
+        Self::outside_and_inside(display_outside::INLINE, display_inside::FLOW, false)
+    }
+
+    pub fn inline_block() -> Self {
+        Self::outside_and_inside(display_outside::INLINE, display_inside::FLOW_ROOT, false)
+    }
+
+    pub fn flow_root() -> Self {
+        Self::outside_and_inside(display_outside::BLOCK, display_inside::FLOW_ROOT, false)
+    }
+
+    pub fn table() -> Self {
+        Self::outside_and_inside(display_outside::BLOCK, display_inside::TABLE, false)
+    }
+
+    pub fn inline_table() -> Self {
+        Self::outside_and_inside(display_outside::INLINE, display_inside::TABLE, false)
+    }
+
+    pub fn encoded(&self) -> u32 {
+        let (first, second, third) = match self.tag {
+            DISPLAY_TAG_OUTSIDE_AND_INSIDE => (self.outside, self.inside, self.list_item as u8),
+            DISPLAY_TAG_INTERNAL => (self.internal, 0, 0),
+            DISPLAY_TAG_BOX => (self.box_value, 0, 0),
+            _ => unreachable!("invalid display tag"),
+        };
+        self.tag as u32 | (first as u32) << 8 | (second as u32) << 16 | (third as u32) << 24
+    }
+
+    pub fn none() -> Self {
+        Self {
+            tag: DISPLAY_TAG_BOX,
+            outside: 0,
+            inside: 0,
+            list_item: false,
+            internal: 0,
+            box_value: display_box::NONE,
+        }
+    }
+
+    pub fn contents() -> Self {
+        Self {
+            tag: DISPLAY_TAG_BOX,
+            outside: 0,
+            inside: 0,
+            list_item: false,
+            internal: 0,
+            box_value: display_box::CONTENTS,
+        }
+    }
+
+    pub fn is_outside_and_inside(&self) -> bool {
+        self.tag == DISPLAY_TAG_OUTSIDE_AND_INSIDE
+    }
+
+    pub fn is_internal(&self) -> bool {
+        self.tag == DISPLAY_TAG_INTERNAL
+    }
+
+    pub fn is_none(&self) -> bool {
+        self.tag == DISPLAY_TAG_BOX && self.box_value == display_box::NONE
+    }
+
+    pub fn is_contents(&self) -> bool {
+        self.tag == DISPLAY_TAG_BOX && self.box_value == display_box::CONTENTS
+    }
+
+    pub fn is_block_outside(&self) -> bool {
+        self.is_outside_and_inside() && self.outside == display_outside::BLOCK
+    }
+
+    pub fn is_inline_outside(&self) -> bool {
+        self.is_outside_and_inside() && self.outside == display_outside::INLINE
+    }
+
+    pub fn is_inline_block(&self) -> bool {
+        self.is_inline_outside() && self.is_flow_root_inside()
+    }
+
+    pub fn is_list_item(&self) -> bool {
+        self.is_outside_and_inside() && self.list_item
+    }
+
+    pub fn is_flow_inside(&self) -> bool {
+        self.is_outside_and_inside() && self.inside == display_inside::FLOW
+    }
+
+    pub fn is_flow_root_inside(&self) -> bool {
+        self.is_outside_and_inside() && self.inside == display_inside::FLOW_ROOT
+    }
+
+    pub fn is_table_inside(&self) -> bool {
+        self.is_outside_and_inside() && self.inside == display_inside::TABLE
+    }
+
+    pub fn is_flex_inside(&self) -> bool {
+        self.is_outside_and_inside() && self.inside == display_inside::FLEX
+    }
+
+    pub fn is_grid_inside(&self) -> bool {
+        self.is_outside_and_inside() && self.inside == display_inside::GRID
+    }
+
+    pub fn is_ruby_inside(&self) -> bool {
+        self.is_outside_and_inside() && self.inside == display_inside::RUBY
+    }
+
+    pub fn is_math_inside(&self) -> bool {
+        self.is_outside_and_inside() && self.inside == display_inside::MATH
+    }
+
+    pub fn is_table_row(&self) -> bool {
+        self.is_internal() && self.internal == display_internal::TABLE_ROW
+    }
+
+    pub fn is_table_cell(&self) -> bool {
+        self.is_internal() && self.internal == display_internal::TABLE_CELL
+    }
+
+    pub fn is_table_column(&self) -> bool {
+        self.is_internal() && self.internal == display_internal::TABLE_COLUMN
+    }
+
+    pub fn is_table_column_group(&self) -> bool {
+        self.is_internal() && self.internal == display_internal::TABLE_COLUMN_GROUP
+    }
+
+    pub fn is_table_row_group(&self) -> bool {
+        self.is_internal() && self.internal == display_internal::TABLE_ROW_GROUP
+    }
+
+    pub fn is_table_header_group(&self) -> bool {
+        self.is_internal() && self.internal == display_internal::TABLE_HEADER_GROUP
+    }
+
+    pub fn is_table_footer_group(&self) -> bool {
+        self.is_internal() && self.internal == display_internal::TABLE_FOOTER_GROUP
+    }
+
+    pub fn is_table_caption(&self) -> bool {
+        self.is_internal() && self.internal == display_internal::TABLE_CAPTION
+    }
+
+    // https://drafts.csswg.org/css-display-3/#internal-table-element
+    pub fn is_internal_table(&self) -> bool {
+        self.is_internal()
+            && (self.internal == display_internal::TABLE_ROW_GROUP
+                || self.internal == display_internal::TABLE_HEADER_GROUP
+                || self.internal == display_internal::TABLE_FOOTER_GROUP
+                || self.internal == display_internal::TABLE_ROW
+                || self.internal == display_internal::TABLE_CELL
+                || self.internal == display_internal::TABLE_COLUMN_GROUP
+                || self.internal == display_internal::TABLE_COLUMN)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_raw_value_decodes_for_box_type_transformation() {
+        let inline_flex = FfiDisplay::from_raw(u32::from_ne_bytes([
+            DISPLAY_TAG_OUTSIDE_AND_INSIDE,
+            display_outside::INLINE,
+            display_inside::FLEX,
+            0,
+        ]));
+        assert!(inline_flex.is_inline_outside());
+        assert!(inline_flex.is_flex_inside());
+
+        let none = FfiDisplay::from_raw(u32::from_ne_bytes([DISPLAY_TAG_BOX, display_box::NONE, 0, 0]));
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn display_encodes_for_adjustment_store() {
+        let list_item = FfiDisplay::outside_and_inside(display_outside::BLOCK, display_inside::FLOW, true);
+        assert_eq!(
+            list_item.encoded(),
+            DISPLAY_TAG_OUTSIDE_AND_INSIDE as u32
+                | (display_outside::BLOCK as u32) << 8
+                | (display_inside::FLOW as u32) << 16
+                | 1 << 24
+        );
+
+        assert_eq!(
+            FfiDisplay::internal(display_internal::TABLE_ROW).encoded(),
+            DISPLAY_TAG_INTERNAL as u32 | (display_internal::TABLE_ROW as u32) << 8
+        );
+        assert_eq!(
+            FfiDisplay::none().encoded(),
+            DISPLAY_TAG_BOX as u32 | (display_box::NONE as u32) << 8
+        );
+    }
+
+    #[test]
+    fn encoding_round_trips() {
+        let values = [
+            FfiDisplay::block(),
+            FfiDisplay::inline(),
+            FfiDisplay::inline_block(),
+            FfiDisplay::flow_root(),
+            FfiDisplay::table(),
+            FfiDisplay::inline_table(),
+            FfiDisplay::none(),
+            FfiDisplay::contents(),
+            FfiDisplay::outside_and_inside(display_outside::BLOCK, display_inside::FLOW, true),
+            FfiDisplay::internal(display_internal::TABLE_CELL),
+        ];
+        for value in values {
+            assert!(FfiDisplay::from_raw(value.encoded()) == value);
+        }
+    }
+
+    #[test]
+    fn internal_table_predicates_match_each_internal_value() {
+        let row = FfiDisplay::internal(display_internal::TABLE_ROW);
+        assert!(row.is_table_row() && row.is_internal_table() && !row.is_table_cell());
+
+        let cell = FfiDisplay::internal(display_internal::TABLE_CELL);
+        assert!(cell.is_table_cell() && cell.is_internal_table());
+
+        let column = FfiDisplay::internal(display_internal::TABLE_COLUMN);
+        assert!(column.is_table_column() && column.is_internal_table());
+
+        let column_group = FfiDisplay::internal(display_internal::TABLE_COLUMN_GROUP);
+        assert!(column_group.is_table_column_group() && column_group.is_internal_table());
+
+        let row_group = FfiDisplay::internal(display_internal::TABLE_ROW_GROUP);
+        assert!(row_group.is_table_row_group() && row_group.is_internal_table());
+
+        let header_group = FfiDisplay::internal(display_internal::TABLE_HEADER_GROUP);
+        assert!(header_group.is_table_header_group() && header_group.is_internal_table());
+
+        let footer_group = FfiDisplay::internal(display_internal::TABLE_FOOTER_GROUP);
+        assert!(footer_group.is_table_footer_group() && footer_group.is_internal_table());
+
+        // table-caption is internal but not an internal table element.
+        let caption = FfiDisplay::internal(display_internal::TABLE_CAPTION);
+        assert!(caption.is_table_caption() && !caption.is_internal_table());
+    }
+
+    #[test]
+    fn outside_and_inside_predicates() {
+        let table = FfiDisplay::table();
+        assert!(table.is_table_inside() && table.is_block_outside() && !table.is_internal());
+
+        let inline_table = FfiDisplay::inline_table();
+        assert!(inline_table.is_table_inside() && inline_table.is_inline_outside());
+
+        let list_item = FfiDisplay::outside_and_inside(display_outside::BLOCK, display_inside::FLOW, true);
+        assert!(list_item.is_list_item() && list_item.is_flow_inside());
+        assert!(!FfiDisplay::block().is_list_item());
+
+        assert!(FfiDisplay::block().is_flow_inside());
+        assert!(FfiDisplay::flow_root().is_flow_root_inside());
+        assert!(FfiDisplay::inline_block().is_inline_block());
+
+        let ruby = FfiDisplay::outside_and_inside(display_outside::INLINE, display_inside::RUBY, false);
+        assert!(ruby.is_ruby_inside());
+
+        // Box-tag values answer no outside/inside predicate.
+        assert!(!FfiDisplay::none().is_flow_inside());
+        assert!(!FfiDisplay::none().is_block_outside());
+    }
+}
+
 FILE: Libraries/LibWeb/CSS/Rust/src/ffi_stats.rs
 /*
  * Copyright (c) 2026-present, the Ladybird developers.
@@ -544169,6 +544944,101 @@ pub extern "C" fn rust_style_ffi_note_style_value_created() {
     bump(FfiOp::StyleValueCreateEntry);
 }
 
+FILE: Libraries/LibWeb/CSS/Rust/src/ffi_support.rs
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+//! Shared plumbing for the C++/Rust FFI boundary: retained C++ object pointers, the call-scope
+//! lifetime marker that pins borrowed DOM data, and borrowed DOM string views.
+
+use std::ffi::c_void;
+use std::marker::PhantomData;
+use std::ptr::NonNull;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RetainedCxxPointer(Option<NonNull<c_void>>);
+
+impl RetainedCxxPointer {
+    pub(crate) fn new(pointer: *const c_void) -> Self {
+        Self(NonNull::new(pointer.cast_mut()))
+    }
+
+    pub(crate) fn as_ptr(self) -> *const c_void {
+        self.0.map_or(std::ptr::null(), |pointer| pointer.as_ptr().cast_const())
+    }
+}
+
+/// Zero-sized marker whose borrow scopes every pointer C++ lends to Rust for the duration of one
+/// synchronous FFI call. Types holding `PhantomData<&'a FfiCallScope>` cannot outlive the call.
+pub(crate) struct FfiCallScope;
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FfiDomStringView {
+    pub data: *const c_void,
+    pub length: usize,
+    pub is_ascii: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DomStringView<'a> {
+    view: FfiDomStringView,
+    marker: PhantomData<&'a FfiCallScope>,
+}
+
+impl DomStringView<'_> {
+    /// The caller vouches that `view` borrows storage which stays valid for the current FFI call;
+    /// the lifetime parameter ties the wrapper to that call scope.
+    pub(crate) fn new(view: FfiDomStringView) -> Self {
+        Self {
+            view,
+            marker: PhantomData,
+        }
+    }
+
+    pub(crate) fn len(self) -> usize {
+        self.view.length
+    }
+
+    pub(crate) fn code_unit_at(self, index: usize) -> u16 {
+        assert!(index < self.len());
+        assert!(!self.view.data.is_null());
+        if self.view.is_ascii {
+            // SAFETY: C++ guarantees that an ASCII view points at `length` bytes.
+            return u16::from(unsafe { *(self.view.data.cast::<u8>().add(index)) });
+        }
+        // SAFETY: C++ guarantees that a UTF-16 view points at `length` aligned code units.
+        unsafe { *(self.view.data.cast::<u16>().add(index)) }
+    }
+}
+
+pub(crate) fn ascii_lowercase(code_unit: u16) -> u16 {
+    if (u16::from(b'A')..=u16::from(b'Z')).contains(&code_unit) {
+        code_unit + u16::from(b'a' - b'A')
+    } else {
+        code_unit
+    }
+}
+
+pub(crate) fn utf16_equals_ignoring_ascii_case(first: DomStringView<'_>, second: &[u16]) -> bool {
+    first.len() == second.len()
+        && second
+            .iter()
+            .enumerate()
+            .all(|(index, &second)| ascii_lowercase(first.code_unit_at(index)) == ascii_lowercase(second))
+}
+
+pub(crate) fn utf16_equals(first: DomStringView<'_>, second: &[u16]) -> bool {
+    first.len() == second.len()
+        && second
+            .iter()
+            .enumerate()
+            .all(|(index, &second)| first.code_unit_at(index) == second)
+}
+
 FILE: Libraries/LibWeb/CSS/Rust/src/lib.rs
 /*
  * Copyright (c) 2026-present, the Ladybird developers.
@@ -544183,10 +545053,13 @@ mod rust_allocator;
 pub mod calc;
 pub mod cascaded_properties;
 pub mod computed_values;
+pub mod css_enums;
 pub mod css_pixels;
 mod css_tokenizer;
 pub mod custom_properties;
+pub mod display;
 pub mod ffi_stats;
+pub mod ffi_support;
 pub mod property_metadata;
 mod selector_engine;
 pub mod style_compute;
@@ -544356,11 +545229,14 @@ use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::ops::DerefMut;
-use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::abort_on_panic;
+use crate::ffi_support::{
+    DomStringView, FfiCallScope, FfiDomStringView, RetainedCxxPointer, ascii_lowercase, utf16_equals,
+    utf16_equals_ignoring_ascii_case,
+};
 
 static NEXT_SELECTOR_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -544368,19 +545244,6 @@ pub type SelectorString = Box<[u16]>;
 /// A selector list owns references to selectors that have already been compiled. `Rc` allows
 /// functional pseudo-classes to share those selectors with the C++ selector tree that owns them.
 pub type SelectorList = Box<[Rc<CompiledSelector>]>;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct RetainedCxxPointer(Option<NonNull<c_void>>);
-
-impl RetainedCxxPointer {
-    fn new(pointer: *const c_void) -> Self {
-        Self(NonNull::new(pointer.cast_mut()))
-    }
-
-    fn as_ptr(self) -> *const c_void {
-        self.0.map_or(std::ptr::null(), |pointer| pointer.as_ptr().cast_const())
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -545966,11 +546829,8 @@ impl FfiElement {
         crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
         // SAFETY: The handle identifies a live DOM element. C++ returns its current ID with
         // backing storage owned by the element for this matching call.
-        DomStringView {
-            // SAFETY: C++ guarantees that the returned string view remains valid for matching.
-            view: unsafe { selector_ffi_element_id_value(self.pointer) },
-            marker: PhantomData,
-        }
+        // SAFETY: C++ guarantees that the returned string view remains valid for matching.
+        DomStringView::new(unsafe { selector_ffi_element_id_value(self.pointer) })
     }
 
     fn id_and_class_names_are_case_insensitive(self) -> bool {
@@ -546052,10 +546912,7 @@ impl FfiElement {
         // SAFETY: The handle identifies a live DOM element. C++ returns its current language with
         // backing storage owned by the element for this matching call.
         let view = unsafe { selector_ffi_element_language(self.pointer) };
-        (view.length != 0).then_some(DomStringView {
-            view,
-            marker: PhantomData,
-        })
+        (view.length != 0).then_some(DomStringView::new(view))
     }
 
     fn is_focused(self) -> bool {
@@ -546242,22 +547099,16 @@ impl FfiElement {
         crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
         // SAFETY: The handle identifies a live DOM element. C++ returns a string view borrowed
         // from its current local name for this matching call.
-        DomStringView {
-            // SAFETY: C++ guarantees that the returned string view remains valid for matching.
-            view: unsafe { selector_ffi_element_local_name(self.pointer) },
-            marker: PhantomData,
-        }
+        // SAFETY: C++ guarantees that the returned string view remains valid for matching.
+        DomStringView::new(unsafe { selector_ffi_element_local_name(self.pointer) })
     }
 
     unsafe fn class_name<'a>(self, index: usize) -> DomStringView<'a> {
         crate::ffi_stats::bump(crate::ffi_stats::FfiOp::SelectorDomReadCallback);
         // SAFETY: The handle identifies a live DOM element and `index` identifies one of its
         // current classes. C++ returns a view borrowed for this matching call.
-        DomStringView {
-            // SAFETY: The caller guarantees that `index` is within the current class list.
-            view: unsafe { selector_ffi_element_class_name(self.pointer, index) },
-            marker: PhantomData,
-        }
+        // SAFETY: The caller guarantees that `index` is within the current class list.
+        DomStringView::new(unsafe { selector_ffi_element_class_name(self.pointer, index) })
     }
 
     fn attribute_count(self) -> usize {
@@ -546320,14 +547171,6 @@ pub struct FfiInternedStringList {
 
 #[derive(Clone, Copy)]
 #[repr(C)]
-pub struct FfiDomStringView {
-    pub data: *const c_void,
-    pub length: usize,
-    pub is_ascii: bool,
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
 pub struct FfiDomAttribute {
     pub local_name: usize,
     pub namespace_: usize,
@@ -546351,33 +547194,7 @@ impl<'a> DomAttribute<'a> {
     }
 
     fn value(self) -> DomStringView<'a> {
-        DomStringView {
-            view: self.attribute.value,
-            marker: PhantomData,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct DomStringView<'a> {
-    view: FfiDomStringView,
-    marker: PhantomData<&'a FfiCallScope>,
-}
-
-impl DomStringView<'_> {
-    fn len(self) -> usize {
-        self.view.length
-    }
-
-    fn code_unit_at(self, index: usize) -> u16 {
-        assert!(index < self.len());
-        assert!(!self.view.data.is_null());
-        if self.view.is_ascii {
-            // SAFETY: C++ guarantees that an ASCII view points at `length` bytes.
-            return u16::from(unsafe { *(self.view.data.cast::<u8>().add(index)) });
-        }
-        // SAFETY: C++ guarantees that a UTF-16 view points at `length` aligned code units.
-        unsafe { *(self.view.data.cast::<u16>().add(index)) }
+        DomStringView::new(self.attribute.value)
     }
 }
 
@@ -546586,30 +547403,6 @@ fn ffi_string_view(string: &[u16]) -> FfiStringView {
         data: string.as_ptr(),
         length: string.len(),
     }
-}
-
-fn ascii_lowercase(code_unit: u16) -> u16 {
-    if (u16::from(b'A')..=u16::from(b'Z')).contains(&code_unit) {
-        code_unit + u16::from(b'a' - b'A')
-    } else {
-        code_unit
-    }
-}
-
-fn utf16_equals_ignoring_ascii_case(first: DomStringView<'_>, second: &[u16]) -> bool {
-    first.len() == second.len()
-        && second
-            .iter()
-            .enumerate()
-            .all(|(index, &second)| ascii_lowercase(first.code_unit_at(index)) == ascii_lowercase(second))
-}
-
-fn utf16_equals(first: DomStringView<'_>, second: &[u16]) -> bool {
-    first.len() == second.len()
-        && second
-            .iter()
-            .enumerate()
-            .all(|(index, &second)| first.code_unit_at(index) == second)
 }
 
 struct SelectorSubtags<'a> {
@@ -546924,8 +547717,6 @@ fn is_ascii_case_insensitive_html_attribute(name: &[u16]) -> bool {
     ];
     NAMES.iter().any(|candidate| utf16_equals_ascii(name, candidate))
 }
-
-struct FfiCallScope;
 
 struct FfiDom<'a> {
     context: *mut c_void,
@@ -548371,14 +549162,15 @@ use std::sync::OnceLock;
 use crate::abort_on_panic;
 use crate::cascaded_properties::CascadedPropertyStore;
 use crate::css_pixels::CssPixels;
+use crate::display::FfiDisplay;
 use crate::property_metadata::longhands_for_shorthand;
 use crate::property_metadata::property_is_inherited;
 use crate::property_metadata::property_is_shorthand;
 use crate::style_value::StyleValueData;
 
+pub use crate::css_enums::*;
+
 include!(concat!(env!("OUT_DIR"), "/length_units_generated.rs"));
-include!(concat!(env!("OUT_DIR"), "/keywords_generated.rs"));
-include!(concat!(env!("OUT_DIR"), "/css_enums_generated.rs"));
 
 /// The font metrics needed for font-relative length resolution, as unrounded
 /// CSS pixel values.
@@ -551401,143 +552193,6 @@ pub unsafe extern "C" fn rust_for_each_property_expanding_shorthands(
     abort_on_panic(|| expand_shorthands(unsafe { &*callbacks }, property_id, shell, data));
 }
 
-/// Mirror of the CSS Display value; the C++ tagged union crosses as explicit
-/// fields, with the unused fields zeroed so equality is field-wise. `tag` uses
-/// the same discriminants as Display::Type.
-#[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct FfiDisplay {
-    /// 0 = outside-and-inside, 1 = internal, 2 = box.
-    pub tag: u8,
-    pub outside: u8,
-    pub inside: u8,
-    pub list_item: bool,
-    pub internal: u8,
-    pub box_value: u8,
-}
-
-const DISPLAY_TAG_OUTSIDE_AND_INSIDE: u8 = 0;
-const DISPLAY_TAG_INTERNAL: u8 = 1;
-const DISPLAY_TAG_BOX: u8 = 2;
-
-impl FfiDisplay {
-    fn from_raw(raw: u32) -> Self {
-        let [tag, first, second, third] = raw.to_ne_bytes();
-        match tag {
-            DISPLAY_TAG_OUTSIDE_AND_INSIDE => Self::outside_and_inside(first, second, third != 0),
-            DISPLAY_TAG_INTERNAL => Self::internal(first),
-            DISPLAY_TAG_BOX => Self {
-                tag,
-                outside: 0,
-                inside: 0,
-                list_item: false,
-                internal: 0,
-                box_value: first,
-            },
-            _ => unreachable!("invalid display tag"),
-        }
-    }
-
-    fn outside_and_inside(outside: u8, inside: u8, list_item: bool) -> Self {
-        Self {
-            tag: DISPLAY_TAG_OUTSIDE_AND_INSIDE,
-            outside,
-            inside,
-            list_item,
-            internal: 0,
-            box_value: 0,
-        }
-    }
-
-    fn internal(internal: u8) -> Self {
-        Self {
-            tag: DISPLAY_TAG_INTERNAL,
-            outside: 0,
-            inside: 0,
-            list_item: false,
-            internal,
-            box_value: 0,
-        }
-    }
-
-    fn block() -> Self {
-        Self::outside_and_inside(display_outside::BLOCK, display_inside::FLOW, false)
-    }
-
-    fn inline() -> Self {
-        Self::outside_and_inside(display_outside::INLINE, display_inside::FLOW, false)
-    }
-
-    fn inline_block() -> Self {
-        Self::outside_and_inside(display_outside::INLINE, display_inside::FLOW_ROOT, false)
-    }
-
-    fn flow_root() -> Self {
-        Self::outside_and_inside(display_outside::BLOCK, display_inside::FLOW_ROOT, false)
-    }
-
-    fn encoded(&self) -> u32 {
-        let (first, second, third) = match self.tag {
-            DISPLAY_TAG_OUTSIDE_AND_INSIDE => (self.outside, self.inside, self.list_item as u8),
-            DISPLAY_TAG_INTERNAL => (self.internal, 0, 0),
-            DISPLAY_TAG_BOX => (self.box_value, 0, 0),
-            _ => unreachable!("invalid display tag"),
-        };
-        self.tag as u32 | (first as u32) << 8 | (second as u32) << 16 | (third as u32) << 24
-    }
-
-    fn none() -> Self {
-        Self {
-            tag: DISPLAY_TAG_BOX,
-            outside: 0,
-            inside: 0,
-            list_item: false,
-            internal: 0,
-            box_value: display_box::NONE,
-        }
-    }
-
-    fn is_outside_and_inside(&self) -> bool {
-        self.tag == DISPLAY_TAG_OUTSIDE_AND_INSIDE
-    }
-
-    fn is_internal(&self) -> bool {
-        self.tag == DISPLAY_TAG_INTERNAL
-    }
-
-    fn is_none(&self) -> bool {
-        self.tag == DISPLAY_TAG_BOX && self.box_value == display_box::NONE
-    }
-
-    fn is_contents(&self) -> bool {
-        self.tag == DISPLAY_TAG_BOX && self.box_value == display_box::CONTENTS
-    }
-
-    fn is_block_outside(&self) -> bool {
-        self.is_outside_and_inside() && self.outside == display_outside::BLOCK
-    }
-
-    fn is_inline_outside(&self) -> bool {
-        self.is_outside_and_inside() && self.outside == display_outside::INLINE
-    }
-
-    fn is_math_inside(&self) -> bool {
-        self.is_outside_and_inside() && self.inside == display_inside::MATH
-    }
-
-    fn is_inline_block(&self) -> bool {
-        self.is_inline_outside() && self.inside == display_inside::FLOW_ROOT
-    }
-
-    fn is_grid_inside(&self) -> bool {
-        self.is_outside_and_inside() && self.inside == display_inside::GRID
-    }
-
-    fn is_flex_inside(&self) -> bool {
-        self.is_outside_and_inside() && self.inside == display_inside::FLEX
-    }
-}
-
 /// The element facts the box type transformation needs, marshalled by the C++
 /// side. The parent display is the first non-`display: contents` ancestor's.
 #[repr(C)]
@@ -552085,42 +552740,6 @@ mod tests {
         assert!(!result.inherited);
     }
 
-    #[test]
-    fn display_raw_value_decodes_for_box_type_transformation() {
-        let inline_flex = FfiDisplay::from_raw(u32::from_ne_bytes([
-            DISPLAY_TAG_OUTSIDE_AND_INSIDE,
-            display_outside::INLINE,
-            display_inside::FLEX,
-            0,
-        ]));
-        assert!(inline_flex.is_inline_outside());
-        assert!(inline_flex.is_flex_inside());
-
-        let none = FfiDisplay::from_raw(u32::from_ne_bytes([DISPLAY_TAG_BOX, display_box::NONE, 0, 0]));
-        assert!(none.is_none());
-    }
-
-    #[test]
-    fn display_encodes_for_adjustment_store() {
-        let list_item = FfiDisplay::outside_and_inside(display_outside::BLOCK, display_inside::FLOW, true);
-        assert_eq!(
-            list_item.encoded(),
-            DISPLAY_TAG_OUTSIDE_AND_INSIDE as u32
-                | (display_outside::BLOCK as u32) << 8
-                | (display_inside::FLOW as u32) << 16
-                | 1 << 24
-        );
-
-        assert_eq!(
-            FfiDisplay::internal(display_internal::TABLE_ROW).encoded(),
-            DISPLAY_TAG_INTERNAL as u32 | (display_internal::TABLE_ROW as u32) << 8
-        );
-        assert_eq!(
-            FfiDisplay::none().encoded(),
-            DISPLAY_TAG_BOX as u32 | (display_box::NONE as u32) << 8
-        );
-    }
-
     fn element_adjustment_input() -> FfiBoxTypeTransformationInput {
         FfiBoxTypeTransformationInput {
             display: FfiDisplay::inline(),
@@ -552151,15 +552770,7 @@ mod tests {
     fn element_styles_adjust_from_marshaled_facts() {
         let mut input = element_adjustment_input();
         input.disallow_display_contents = true;
-        let contents = FfiDisplay {
-            tag: DISPLAY_TAG_BOX,
-            outside: 0,
-            inside: 0,
-            list_item: false,
-            internal: 0,
-            box_value: display_box::CONTENTS,
-        };
-        let adjustment = adjust_element_style(&input, contents, keyword::LEFT);
+        let adjustment = adjust_element_style(&input, FfiDisplay::contents(), keyword::LEFT);
         assert!(adjustment.changed_display);
         assert!(adjustment.display.is_none());
 
@@ -589791,8 +590402,22 @@ void VisualViewport::scroll_by(CSSPixelPoint delta)
     if (delta.is_zero())
         return;
     m_offset += delta;
+    did_scroll();
     update_accumulated_visual_context();
     m_document->set_needs_repaint(Badge<CSS::VisualViewport> {}, InvalidateDisplayList::No);
+}
+
+// https://drafts.csswg.org/cssom-view-1/#scrolling-events
+void VisualViewport::did_scroll()
+{
+    // Whenever a visual viewport gets scrolled (whether in response to user interaction or by an API), the user agent
+    // must run these steps:
+
+    // 1. Let vv be the VisualViewport object that was scrolled.
+    // 2. Let doc be vv's associated document.
+    // 3. If (vv, "scroll") is already in doc's pending scroll events, abort these steps.
+    // 4. Append (vv, "scroll") to doc's pending scroll events.
+    m_document->append_pending_scroll_event({ *this, HTML::EventNames::scroll });
 }
 
 Gfx::AffineTransform VisualViewport::transform() const
@@ -589822,7 +590447,10 @@ void VisualViewport::zoom(CSSPixelPoint position, double scale_delta)
     new_offset = { clamp(new_offset.x(), 0.0f, max_x_offset), clamp(new_offset.y(), 0.0f, max_y_offset) };
 
     m_scale = new_scale;
+    auto old_offset = m_offset;
     m_offset = (new_offset / m_scale).to_type<CSSPixels>();
+    if (m_offset != old_offset)
+        did_scroll();
     update_accumulated_visual_context();
     m_document->set_needs_repaint(Badge<CSS::VisualViewport> {}, InvalidateDisplayList::No);
 }
@@ -589836,7 +590464,13 @@ CSSPixelPoint VisualViewport::map_to_layout_viewport(CSSPixelPoint position) con
 void VisualViewport::reset()
 {
     m_scale = 1.0;
+    auto old_offset = m_offset;
     m_offset = { 0, 0 };
+    if (m_offset != old_offset) {
+        did_scroll();
+        // Resetting performs an instant scroll, so its scrollend event is queued immediately.
+        m_document->append_pending_scroll_event({ *this, HTML::EventNames::scrollend });
+    }
     update_accumulated_visual_context();
     m_document->set_needs_repaint(Badge<CSS::VisualViewport> {}, InvalidateDisplayList::No);
 }
@@ -589912,6 +590546,7 @@ private:
     virtual void initialize(JS::Realm&) override;
     virtual void visit_edges(Cell::Visitor&) override;
 
+    void did_scroll();
     void update_accumulated_visual_context();
 
     GC::Ref<DOM::Document> m_document;
@@ -592913,6 +593548,13 @@ void Document::reset_style_invalidation_counters() const
     m_style_invalidations_since_last_counter_dump = 0;
 }
 
+void Document::record_layout_tree_build(u64 rebuilt_subtree_root_count, bool escaped_rebuild_roots)
+{
+    ++m_layout_tree_build_stats.builds;
+    m_layout_tree_build_stats.last_build_rebuilt_subtree_roots = rebuilt_subtree_root_count;
+    m_layout_tree_build_stats.last_build_escaped_rebuild_roots = escaped_rebuild_roots;
+}
+
 void Document::record_style_invalidation() const
 {
     ++m_style_invalidation_counters.style_invalidations;
@@ -594283,6 +594925,7 @@ Document::PartialRelayoutResult Document::try_partial_relayout(HashTable<WeakPtr
         auto tree_build_timer = Core::ElapsedTimer::start_new(Core::TimerType::Precise);
         Layout::TreeBuilder tree_builder;
         m_layout_root = as<Layout::Viewport>(*tree_builder.build(*this));
+        record_layout_tree_build(tree_builder.rebuilt_subtree_roots().size(), tree_builder.layout_tree_update_escaped_rebuild_roots());
         needs_layout_tree_rebuild = false;
         layout_tree_was_built_in_partial_branch = true;
         pending_updates_escaped_during_partial_build = m_partial_relayout_invalidation.escapes()
@@ -594450,6 +595093,7 @@ void Document::update_layout(UpdateLayoutReason reason)
         if (needs_layout_tree_rebuild) {
             Layout::TreeBuilder tree_builder;
             m_layout_root = as<Layout::Viewport>(*tree_builder.build(*this));
+            record_layout_tree_build(tree_builder.rebuilt_subtree_roots().size(), tree_builder.layout_tree_update_escaped_rebuild_roots());
 
             // NB: Called during layout update.
             if (document_element && document_element->unsafe_layout_node())
@@ -596971,6 +597615,14 @@ void Document::run_the_resize_steps()
             visual_viewport.dispatch_event(visual_viewport_resize_event);
         }
     }
+}
+
+bool Document::append_pending_scroll_event(PendingScrollEvent event)
+{
+    if (m_pending_scroll_events.contains_slow(event))
+        return false;
+    m_pending_scroll_events.append(move(event));
+    return true;
 }
 
 // https://drafts.csswg.org/cssom-view-1/#document-run-the-scroll-steps
@@ -601157,8 +601809,11 @@ RefPtr<Painting::DisplayList> Document::record_display_list(HTML::PaintConfig co
         display_list_recorder.fill_rect(bitmap_rect, CSS::SystemColor::canvas(color_scheme));
 
     auto background_color = this->background_color();
-    if (navigable()->is_top_level_traversable())
-        page().client().page_did_change_background_color(canvas_background_color());
+    if (navigable()->is_top_level_traversable()) {
+        auto canvas_background_color = this->canvas_background_color();
+        display_list->set_surface_clear_color(canvas_background_color);
+        page().client().page_did_change_background_color(canvas_background_color);
+    }
 
     display_list_recorder.fill_rect(bitmap_rect, background_color);
 
@@ -602321,6 +602976,7 @@ enum class InvalidateLayoutTreeReason {
     X(ElementSetScrollTop)                   \
     X(EventHandlerDispatchChromeWidgetEvent) \
     X(EventHandlerHandleDragAndDrop)         \
+    X(EventHandlerHandleKeyDown)             \
     X(EventHandlerHandleMouseDown)           \
     X(EventHandlerHandleMouseMove)           \
     X(EventHandlerHandleMouseUp)             \
@@ -603011,6 +603667,7 @@ public:
         Utf16FlyString event_type;
         bool operator==(PendingScrollEvent const&) const = default;
     };
+    bool append_pending_scroll_event(PendingScrollEvent);
     Vector<PendingScrollEvent>& pending_scroll_events() { return m_pending_scroll_events; }
 
     // https://html.spec.whatwg.org/multipage/document-lifecycle.html#completely-loaded
@@ -603257,6 +603914,16 @@ public:
     void record_style_invalidation() const;
     void record_full_style_invalidation() const;
     static void set_style_invalidation_counter_dump_interval(Optional<u64>);
+
+    // Confinement report of the most recent layout tree build, for tests observing whether a
+    // partial rebuild stayed inside its rebuilt subtrees.
+    struct LayoutTreeBuildStats {
+        u64 builds { 0 };
+        u64 last_build_rebuilt_subtree_roots { 0 };
+        bool last_build_escaped_rebuild_roots { false };
+    };
+    LayoutTreeBuildStats const& layout_tree_build_stats() const { return m_layout_tree_build_stats; }
+    void record_layout_tree_build(u64 rebuilt_subtree_root_count, bool escaped_rebuild_roots);
 
     void set_needs_accumulated_visual_contexts_update(bool);
     bool needs_accumulated_visual_contexts_update() const { return m_needs_accumulated_visual_contexts_update; }
@@ -603930,6 +604597,7 @@ private:
     Optional<CSSPixelRect> m_caret_hit_test_debug_rect;
 
     mutable StyleInvalidationCounters m_style_invalidation_counters;
+    LayoutTreeBuildStats m_layout_tree_build_stats;
     mutable u64 m_style_invalidations_since_last_counter_dump { 0 };
 
     mutable GC::Ptr<WebIDL::ObservableArray> m_adopted_style_sheets;
@@ -612171,6 +612839,11 @@ GC::Ref<WebIDL::Promise> Element::request_pointer_lock(Optional<Bindings::Pointe
 // If a pseudo-element is specified, this will return the element itself.
 // Otherwise, if this element is slotted somewhere, it will return the slot.
 // Otherwise, it will return the parent or shadow host element of this element.
+//
+// The slot case is specified in https://drafts.csswg.org/css-shadow-1/#slots-in-shadow-tree:
+// NOTE: A non-obvious result of assigning elements to slots is that they inherit from the slot they're assigned to.
+//       Their original light tree parent, and any deeper slots that their slot gets assigned to, don't affect
+//       inheritance.
 GC::Ptr<Element const> Element::element_to_inherit_style_from(Optional<CSS::PseudoElement> pseudo_element) const
 {
     if (pseudo_element.has_value())
@@ -657601,643 +658274,3 @@ WebIDL::ExceptionOr<GC::Ref<Request>> Request::construct_impl(JS::Realm& realm, 
     request->set_origin(input_request->origin());
 
     // referrer
-    //     request’s referrer.
-    request->set_referrer(input_request->referrer());
-
-    // referrer policy
-    //     request’s referrer policy.
-    request->set_referrer_policy(input_request->referrer_policy());
-
-    // mode
-    //     request’s mode.
-    request->set_mode(input_request->mode());
-
-    // credentials mode
-    //     request’s credentials mode.
-    request->set_credentials_mode(input_request->credentials_mode());
-
-    // cache mode
-    //     request’s cache mode.
-    request->set_cache_mode(input_request->cache_mode());
-
-    // redirect mode
-    //     request’s redirect mode.
-    request->set_redirect_mode(input_request->redirect_mode());
-
-    // integrity metadata
-    //     request’s integrity metadata.
-    request->set_integrity_metadata(input_request->integrity_metadata());
-
-    // keepalive
-    //     request’s keepalive.
-    request->set_keepalive(input_request->keepalive());
-
-    // reload-navigation flag
-    //     request’s reload-navigation flag.
-    request->set_reload_navigation(input_request->reload_navigation());
-
-    // history-navigation flag
-    //     request’s history-navigation flag.
-    request->set_history_navigation(input_request->history_navigation());
-
-    // URL list
-    //     A clone of request’s URL list.
-    request->set_url_list(input_request->url_list());
-
-    // initiator type
-    //     "fetch".
-    request->set_initiator_type(Infrastructure::Request::InitiatorType::Fetch);
-
-    // 13. If init is not empty, then:
-    if (!is_empty(init)) {
-        // 1. If request’s mode is "navigate", then set it to "same-origin".
-        if (request->mode() == Infrastructure::Request::Mode::Navigate)
-            request->set_mode(Infrastructure::Request::Mode::SameOrigin);
-
-        // 2. Unset request’s reload-navigation flag.
-        request->set_reload_navigation(false);
-
-        // 3. Unset request’s history-navigation flag.
-        request->set_history_navigation(false);
-
-        // 4. Set request’s origin to "client".
-        request->set_origin(Infrastructure::Request::Origin::Client);
-
-        // 5. Set request’s referrer to "client".
-        request->set_referrer(Infrastructure::Request::Referrer::Client);
-
-        // 6. Set request’s referrer policy to the empty string.
-        request->set_referrer_policy({});
-
-        // 7. Set request’s URL to request’s current URL.
-        request->set_url(request->current_url());
-
-        // 8. Set request’s URL list to « request’s URL ».
-        // NOTE: This is done implicitly by assigning the initial URL above.
-    }
-
-    // 14. If init["referrer"] exists, then:
-    if (init.referrer.has_value()) {
-        // 1. Let referrer be init["referrer"].
-        auto const& referrer = *init.referrer;
-
-        // 2. If referrer is the empty string, then set request’s referrer to "no-referrer".
-        if (referrer.is_empty()) {
-            request->set_referrer(Infrastructure::Request::Referrer::NoReferrer);
-        }
-        // 3. Otherwise:
-        else {
-            // 1. Let parsedReferrer be the result of parsing referrer with baseURL.
-            auto parsed_referrer = DOMURL::parse(referrer.utf16_view(), base_url);
-
-            // 2. If parsedReferrer is failure, then throw a TypeError.
-            if (!parsed_referrer.has_value())
-                return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Referrer must be a valid URL"_utf16 };
-
-            // 3. If one of the following is true
-            // - parsedReferrer’s scheme is "about" and path is the string "client"
-            // - parsedReferrer’s origin is not same origin with origin
-            // then set request’s referrer to "client".
-            auto parsed_referrer_origin = parsed_referrer->origin();
-            if ((parsed_referrer->scheme() == "about"sv && parsed_referrer->paths().size() == 1 && parsed_referrer->paths()[0] == "client"sv)
-                || !parsed_referrer_origin.is_same_origin(origin)) {
-                request->set_referrer(Infrastructure::Request::Referrer::Client);
-            }
-            // 4. Otherwise, set request’s referrer to parsedReferrer.
-            else {
-                request->set_referrer(parsed_referrer.release_value());
-            }
-        }
-    }
-
-    // 15. If init["referrerPolicy"] exists, then set request’s referrer policy to it.
-    if (init.referrer_policy.has_value())
-        request->set_referrer_policy(from_bindings_enum(*init.referrer_policy));
-
-    // 16. Let mode be init["mode"] if it exists, and fallbackMode otherwise.
-    auto mode = init.mode.has_value()
-        ? from_bindings_enum(*init.mode)
-        : fallback_mode;
-
-    // 17. If mode is "navigate", then throw a TypeError.
-    if (mode == Infrastructure::Request::Mode::Navigate)
-        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Mode must not be 'navigate'"_utf16 };
-
-    // 18. If mode is non-null, set request’s mode to mode.
-    if (mode.has_value())
-        request->set_mode(*mode);
-
-    // 19. If init["credentials"] exists, then set request’s credentials mode to it.
-    if (init.credentials.has_value())
-        request->set_credentials_mode(from_bindings_enum(*init.credentials));
-
-    // 20. If init["cache"] exists, then set request’s cache mode to it.
-    if (init.cache.has_value())
-        request->set_cache_mode(from_bindings_enum(*init.cache));
-
-    // 21. If request’s cache mode is "only-if-cached" and request’s mode is not "same-origin", then throw a TypeError.
-    if (request->cache_mode() == HTTP::CacheMode::OnlyIfCached && request->mode() != Infrastructure::Request::Mode::SameOrigin)
-        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Mode must be 'same-origin' when cache mode is 'only-if-cached'"_utf16 };
-
-    // 22. If init["redirect"] exists, then set request’s redirect mode to it.
-    if (init.redirect.has_value())
-        request->set_redirect_mode(from_bindings_enum(*init.redirect));
-
-    // 23. If init["integrity"] exists, then set request’s integrity metadata to it.
-    if (init.integrity.has_value())
-        request->set_integrity_metadata(*init.integrity);
-
-    // 24. If init["keepalive"] exists, then set request’s keepalive to it.
-    if (init.keepalive.has_value())
-        request->set_keepalive(*init.keepalive);
-
-    // 25. If init["method"] exists, then:
-    if (init.method.has_value()) {
-        // 1. Let method be init["method"].
-        auto method = *init.method;
-
-        // 2. If method is not a method or method is a forbidden method, then throw a TypeError.
-        if (!HTTP::is_method(method))
-            return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Method has invalid value"_utf16 };
-        if (HTTP::is_forbidden_method(method))
-            return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Method must not be one of CONNECT, TRACE, or TRACK"_utf16 };
-
-        // 3. Normalize method.
-        auto normalized_method = HTTP::normalize_method(method);
-
-        // 4. Set request’s method to method.
-        request->set_method(move(normalized_method));
-    }
-
-    // 26. If init["signal"] exists, then set signal to it.
-    if (init.signal.has_value())
-        input_signal = init.signal->ptr();
-
-    // 27. If init["priority"] exists, then:
-    if (init.priority.has_value())
-        request->set_priority(from_bindings_enum(*init.priority));
-
-    // 28. Set this’s request to request.
-    // NOTE: This is done at the beginning as the 'this' value Request object
-    //       cannot exist with a null Infrastructure::Request.
-
-    // 29. Let signals be « signal » if signal is non-null; otherwise « ».
-    auto& this_relevant_realm = HTML::relevant_realm(*request_object);
-    GC::RootVector<GC::Ref<DOM::AbortSignal>> signals;
-    if (input_signal != nullptr)
-        signals.append(*input_signal);
-
-    // 30. Set this’s signal to the result of creating a dependent abort signal from signals, using AbortSignal and this’s relevant realm.
-    request_object->m_signal = TRY(DOM::AbortSignal::create_dependent_abort_signal(this_relevant_realm, signals));
-
-    // 31. Set this’s headers to a new Headers object with this’s relevant Realm, whose header list is request’s header list and guard is "request".
-    request_object->m_headers = realm.create<Headers>(realm, request->header_list());
-    request_object->m_headers->set_guard(Headers::Guard::Request);
-
-    // 32. If this’s request’s mode is "no-cors", then:
-    if (request_object->request()->mode() == Infrastructure::Request::Mode::NoCORS) {
-        // 1. If this’s request’s method is not a CORS-safelisted method, then throw a TypeError.
-        if (!HTTP::is_cors_safelisted_method(request_object->request()->method()))
-            return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Method must be one of GET, HEAD, or POST"_utf16 };
-
-        // 2. Set this’s headers’s guard to "request-no-cors".
-        request_object->headers()->set_guard(Headers::Guard::RequestNoCORS);
-    }
-
-    // 33. If init is not empty, then:
-    if (!is_empty(init)) {
-        // 1. Let headers be a copy of this’s headers and its associated header list.
-        // 2. If init["headers"] exists, then set headers to init["headers"].
-        auto headers = [&]() -> Variant<HeadersInit, NonnullRefPtr<HTTP::HeaderList>> {
-            if (init.headers.has_value())
-                return init.headers.value();
-            return HTTP::HeaderList::create(request_object->headers()->header_list()->headers());
-        }();
-
-        // 3. Empty this’s headers’s header list.
-        request_object->headers()->header_list()->clear();
-
-        TRY(headers.visit(
-            // 4. If headers is a Headers object, then for each header of its header list, append header to this’s headers.
-            [&](NonnullRefPtr<HTTP::HeaderList> const& headers) -> WebIDL::ExceptionOr<void> {
-                for (auto const& header : *headers)
-                    TRY(request_object->headers()->append(HTTP::Header::isomorphic_encode(header.name, header.value)));
-                return {};
-            },
-            // 5. Otherwise, fill this’s headers with headers.
-            [&](HeadersInit const& headers) -> WebIDL::ExceptionOr<void> {
-                TRY(request_object->headers()->fill(headers));
-                return {};
-            }));
-    }
-
-    // 34. Let inputBody be input’s request’s body if input is a Request object; otherwise null.
-    Optional<Infrastructure::Request::BodyType const&> input_body;
-    if (input.has<GC::Ref<Request>>())
-        input_body = input.get<GC::Ref<Request>>()->request()->body();
-
-    // 35. If either init["body"] exists and is non-null or inputBody is non-null, and request’s method is `GET` or `HEAD`, then throw a TypeError.
-    if (((init.body.has_value() && !init.body->has<Empty>()) || (input_body.has_value() && !input_body.value().has<Empty>())) && request->method().is_one_of("GET"sv, "HEAD"sv))
-        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Method must not be GET or HEAD when body is provided"_utf16 };
-
-    // 36. Let initBody be null.
-    Optional<Infrastructure::Request::BodyType> init_body;
-
-    // 37. If init["body"] exists and is non-null, then:
-    if (init.body.has_value() && !init.body->has<Empty>()) {
-        // 1. Let bodyWithType be the result of extracting init["body"], with keepalive set to request's keepalive.
-        auto body_with_type = TRY(extract_body(realm, init.body->downcast<BodyInit>(), request->keepalive()));
-
-        // 2. Set initBody to bodyWithType’s body.
-        init_body = body_with_type.body;
-
-        // 3. Let type be bodyWithType’s type.
-        auto const& type = body_with_type.type;
-
-        // 4. If type is non-null and this’s headers’s header list does not contain `Content-Type`, then append (`Content-Type`, type) to this’s headers.
-        if (type.has_value() && !request_object->headers()->header_list()->contains("Content-Type"sv))
-            TRY(request_object->headers()->append(HTTP::Header::isomorphic_encode("Content-Type"sv, *type)));
-    }
-
-    // 38. Let inputOrInitBody be initBody if it is non-null; otherwise inputBody.
-    auto input_or_init_body = init_body.value_or<Optional<Infrastructure::Request::BodyType const&>>(input_body);
-
-    // 39. If inputOrInitBody is non-null and inputOrInitBody’s source is null, then:
-    // FIXME: The spec doesn't check if inputOrInitBody is a body before accessing source.
-    if (input_or_init_body.has_value() && input_or_init_body->has<GC::Ref<Infrastructure::Body>>() && input_or_init_body->get<GC::Ref<Infrastructure::Body>>()->source().has<Empty>()) {
-        // 1. If initBody is non-null and init["duplex"] does not exist, then throw a TypeError.
-        if (init_body.has_value() && !init.duplex.has_value())
-            return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Body without source requires 'duplex' value to be set"_utf16 };
-
-        // 2. If this’s request’s mode is neither "same-origin" nor "cors", then throw a TypeError.
-        if (request_object->request()->mode() != Infrastructure::Request::Mode::SameOrigin && request_object->request()->mode() != Infrastructure::Request::Mode::CORS)
-            return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Request mode must be 'same-origin' or 'cors'"_utf16 };
-
-        // 3. Set this’s request’s use-CORS-preflight flag.
-        request_object->request()->set_use_cors_preflight(true);
-    }
-
-    // 40. Let finalBody be inputOrInitBody.
-    auto const& final_body = input_or_init_body;
-
-    // 41. If initBody is null and inputBody is non-null, then:
-    if (!init_body.has_value() && input_body.has_value()) {
-        // 2. If input is unusable, then throw a TypeError.
-        if (input.has<GC::Ref<Request>>() && input.get<GC::Ref<Request>>()->is_unusable())
-            return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Request is unusable"_utf16 };
-
-        // FIXME: 2. Set finalBody to the result of creating a proxy for inputBody.
-    }
-
-    // 42. Set this’s request’s body to finalBody.
-    if (final_body.has_value())
-        request_object->request()->set_body(*final_body);
-
-    return GC::Ref { *request_object };
-}
-
-// https://fetch.spec.whatwg.org/#dom-request-method
-String Request::method() const
-{
-    // The method getter steps are to return this’s request’s method.
-    return MUST(String::from_byte_string(m_request->method()));
-}
-
-// https://fetch.spec.whatwg.org/#dom-request-url
-Utf16String Request::url() const
-{
-    // The url getter steps are to return this’s request’s URL, serialized.
-    auto serialized_url = m_request->url().serialize();
-    return Utf16String::from_ascii_without_validation(serialized_url.bytes());
-}
-
-// https://fetch.spec.whatwg.org/#dom-request-headers
-GC::Ref<Headers> Request::headers() const
-{
-    // The headers getter steps are to return this’s headers.
-    return *m_headers;
-}
-
-// https://fetch.spec.whatwg.org/#dom-request-destination
-Bindings::RequestDestination Request::destination() const
-{
-    // The destination getter are to return this’s request’s destination.
-    return to_bindings_enum(m_request->destination());
-}
-
-// https://fetch.spec.whatwg.org/#dom-request-referrer
-Utf16String Request::referrer() const
-{
-    return m_request->referrer().visit(
-        [&](Infrastructure::Request::Referrer const& referrer) {
-            switch (referrer) {
-            // 1. If this’s request’s referrer is "no-referrer", then return the empty string.
-            case Infrastructure::Request::Referrer::NoReferrer:
-                return Utf16String {};
-            // 2. If this’s request’s referrer is "client", then return "about:client".
-            case Infrastructure::Request::Referrer::Client:
-                return "about:client"_utf16;
-            default:
-                VERIFY_NOT_REACHED();
-            }
-        },
-        [&](URL::URL const& url) {
-            // 3. Return this’s request’s referrer, serialized.
-            auto serialized_url = url.serialize();
-            return Utf16String::from_ascii_without_validation(serialized_url.bytes());
-        });
-}
-
-// https://fetch.spec.whatwg.org/#dom-request-referrerpolicy
-Bindings::ReferrerPolicy Request::referrer_policy() const
-{
-    // The referrerPolicy getter steps are to return this’s request’s referrer policy.
-    return to_bindings_enum(m_request->referrer_policy());
-}
-
-// https://fetch.spec.whatwg.org/#dom-request-mode
-Bindings::RequestMode Request::mode() const
-{
-    // The mode getter steps are to return this’s request’s mode.
-    return to_bindings_enum(m_request->mode());
-}
-
-// https://fetch.spec.whatwg.org/#dom-request-credentials
-Bindings::RequestCredentials Request::credentials() const
-{
-    // The credentials getter steps are to return this’s request’s credentials mode.
-    return to_bindings_enum(m_request->credentials_mode());
-}
-
-// https://fetch.spec.whatwg.org/#dom-request-cache
-Bindings::RequestCache Request::cache() const
-{
-    // The cache getter steps are to return this’s request’s cache mode.
-    return to_bindings_enum(m_request->cache_mode());
-}
-
-// https://fetch.spec.whatwg.org/#dom-request-redirect
-Bindings::RequestRedirect Request::redirect() const
-{
-    // The redirect getter steps are to return this’s request’s redirect mode.
-    return to_bindings_enum(m_request->redirect_mode());
-}
-
-// https://fetch.spec.whatwg.org/#dom-request-integrity
-Utf16String Request::integrity() const
-{
-    // The integrity getter steps are to return this’s request’s integrity metadata.
-    return m_request->integrity_metadata();
-}
-
-// https://fetch.spec.whatwg.org/#dom-request-keepalive
-bool Request::keepalive() const
-{
-    // The keepalive getter steps are to return this’s request’s keepalive.
-    return m_request->keepalive();
-}
-
-// https://fetch.spec.whatwg.org/#dom-request-isreloadnavigation
-bool Request::is_reload_navigation() const
-{
-    // The isReloadNavigation getter steps are to return true if this’s request’s reload-navigation flag is set; otherwise false.
-    return m_request->reload_navigation();
-}
-
-// https://fetch.spec.whatwg.org/#dom-request-ishistorynavigation
-bool Request::is_history_navigation() const
-{
-    // The isHistoryNavigation getter steps are to return true if this’s request’s history-navigation flag is set; otherwise false.
-    return m_request->history_navigation();
-}
-
-// https://fetch.spec.whatwg.org/#dom-request-signal
-GC::Ref<DOM::AbortSignal> Request::signal() const
-{
-    // The signal getter steps are to return this’s signal.
-    return *m_signal;
-}
-
-// https://fetch.spec.whatwg.org/#dom-request-duplex
-Bindings::RequestDuplex Request::duplex() const
-{
-    // The duplex getter steps are to return "half".
-    return Bindings::RequestDuplex::Half;
-}
-
-// https://fetch.spec.whatwg.org/#dom-request-clone
-WebIDL::ExceptionOr<GC::Ref<Request>> Request::clone() const
-{
-    auto& realm = this->realm();
-
-    // 1. If this is unusable, then throw a TypeError.
-    if (is_unusable())
-        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Request is unusable"_utf16 };
-
-    // 2. Let clonedRequest be the result of cloning this’s request.
-    auto cloned_request = m_request->clone(realm);
-
-    // 3. Assert: this’s signal is non-null.
-    VERIFY(m_signal);
-
-    // 4. Let clonedSignal be the result of creating a dependent abort signal from « this’s signal », using AbortSignal and this’s relevant realm.
-    auto& relevant_realm = HTML::relevant_realm(*this);
-    auto cloned_signal = TRY(DOM::AbortSignal::create_dependent_abort_signal(relevant_realm, { { *m_signal } }));
-
-    // 5. Let clonedRequestObject be the result of creating a Request object, given clonedRequest, this’s headers’s guard, clonedSignal and this’s relevant realm.
-    auto cloned_request_object = Request::create(relevant_realm, cloned_request, m_headers->guard(), cloned_signal);
-
-    // 6. Return clonedRequestObject.
-    return cloned_request_object;
-}
-
-}
-
-FILE: Libraries/LibWeb/Fetch/Request.h
-/*
- * Copyright (c) 2022-2023, Linus Groh <linusg@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/Forward.h>
-#include <AK/Utf16String.h>
-#include <LibGC/Ptr.h>
-#include <LibJS/Forward.h>
-#include <LibWeb/Bindings/PlatformObject.h>
-#include <LibWeb/Bindings/Request.h>
-#include <LibWeb/Fetch/Body.h>
-#include <LibWeb/Fetch/BodyInit.h>
-#include <LibWeb/Fetch/Headers.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
-#include <LibWeb/Forward.h>
-
-namespace Web::Fetch {
-
-// https://fetch.spec.whatwg.org/#requestinfo
-using RequestInfo = Variant<GC::Ref<Request>, Utf16String>;
-
-// https://fetch.spec.whatwg.org/#request
-class Request final
-    : public Bindings::PlatformObject
-    , public BodyMixin {
-    WEB_PLATFORM_OBJECT(Request, Bindings::PlatformObject);
-    GC_DECLARE_ALLOCATOR(Request);
-
-public:
-    [[nodiscard]] static GC::Ref<Request> create(JS::Realm&, GC::Ref<Infrastructure::Request>, Headers::Guard, GC::Ref<DOM::AbortSignal>);
-    static WebIDL::ExceptionOr<GC::Ref<Request>> construct_impl(JS::Realm&, RequestInfo const& input, Bindings::RequestInit const& init = {});
-
-    virtual ~Request() override;
-
-    // ^BodyMixin
-    virtual Optional<MimeSniff::MimeType> mime_type_impl() const override;
-    virtual GC::Ptr<Infrastructure::Body> body_impl() override;
-    virtual GC::Ptr<Infrastructure::Body const> body_impl() const override;
-    virtual Bindings::PlatformObject& as_platform_object() override { return *this; }
-    virtual Bindings::PlatformObject const& as_platform_object() const override { return *this; }
-
-    [[nodiscard]] GC::Ref<Infrastructure::Request> request() const { return m_request; }
-
-    // JS API functions
-    [[nodiscard]] String method() const;
-    [[nodiscard]] Utf16String url() const;
-    [[nodiscard]] GC::Ref<Headers> headers() const;
-    [[nodiscard]] Bindings::RequestDestination destination() const;
-    [[nodiscard]] Utf16String referrer() const;
-    [[nodiscard]] Bindings::ReferrerPolicy referrer_policy() const;
-    [[nodiscard]] Bindings::RequestMode mode() const;
-    [[nodiscard]] Bindings::RequestCredentials credentials() const;
-    [[nodiscard]] Bindings::RequestCache cache() const;
-    [[nodiscard]] Bindings::RequestRedirect redirect() const;
-    [[nodiscard]] Utf16String integrity() const;
-    [[nodiscard]] bool keepalive() const;
-    [[nodiscard]] bool is_reload_navigation() const;
-    [[nodiscard]] bool is_history_navigation() const;
-    [[nodiscard]] GC::Ref<DOM::AbortSignal> signal() const;
-    [[nodiscard]] Bindings::RequestDuplex duplex() const;
-    [[nodiscard]] WebIDL::ExceptionOr<GC::Ref<Request>> clone() const;
-
-private:
-    Request(JS::Realm&, GC::Ref<Infrastructure::Request>);
-
-    virtual void initialize(JS::Realm&) override;
-    virtual void visit_edges(Cell::Visitor&) override;
-
-    // https://fetch.spec.whatwg.org/#concept-request-request
-    // A Request object has an associated request (a request).
-    GC::Ref<Infrastructure::Request> m_request;
-
-    // https://fetch.spec.whatwg.org/#request-headers
-    // A Request object also has an associated headers (null or a Headers object), initially null.
-    GC::Ptr<Headers> m_headers;
-
-    // https://fetch.spec.whatwg.org/#request-signal
-    // A Request object has an associated signal (null or an AbortSignal object), initially null.
-    GC::Ptr<DOM::AbortSignal> m_signal;
-};
-
-}
-
-FILE: Libraries/LibWeb/Fetch/Request.idl
-typedef (Request or Utf16USVString) RequestInfo;
-
-// https://fetch.spec.whatwg.org/#request
-[Exposed=(Window,Worker)]
-interface Request {
-    constructor(RequestInfo input, optional RequestInit init = {});
-
-    readonly attribute ByteString method;
-    readonly attribute Utf16USVString url;
-    [SameObject] readonly attribute Headers headers;
-
-    readonly attribute RequestDestination destination;
-    readonly attribute Utf16USVString referrer;
-    readonly attribute ReferrerPolicy referrerPolicy;
-    readonly attribute RequestMode mode;
-    readonly attribute RequestCredentials credentials;
-    readonly attribute RequestCache cache;
-    readonly attribute RequestRedirect redirect;
-    readonly attribute Utf16DOMString integrity;
-    readonly attribute boolean keepalive;
-    readonly attribute boolean isReloadNavigation;
-    readonly attribute boolean isHistoryNavigation;
-    readonly attribute AbortSignal signal;
-    readonly attribute RequestDuplex duplex;
-
-    [NewObject] Request clone();
-};
-Request includes Body;
-
-dictionary RequestInit {
-    ByteString method;
-    HeadersInit headers;
-    BodyInit? body;
-    Utf16USVString referrer;
-    ReferrerPolicy referrerPolicy;
-    RequestMode mode;
-    RequestCredentials credentials;
-    RequestCache cache;
-    RequestRedirect redirect;
-    Utf16DOMString integrity;
-    boolean keepalive;
-    AbortSignal? signal;
-    RequestDuplex duplex;
-    RequestPriority priority;
-    any window; // can only be set to null
-};
-
-enum RequestDestination { "", "audio", "audioworklet", "document", "embed", "font", "frame", "iframe", "image", "json", "manifest", "object", "paintworklet", "report", "script", "sharedworker", "style",  "track", "video", "worker", "xslt" };
-enum RequestMode { "navigate", "same-origin", "no-cors", "cors" };
-enum RequestCredentials { "omit", "same-origin", "include" };
-enum RequestCache { "default", "no-store", "reload", "no-cache", "force-cache", "only-if-cached" };
-enum RequestRedirect { "follow", "error", "manual" };
-enum RequestDuplex { "half" };
-enum RequestPriority { "high", "low", "auto" };
-
-// https://w3c.github.io/webappsec-referrer-policy/#enumdef-referrerpolicy
-enum ReferrerPolicy {
-    "",
-    "no-referrer",
-    "no-referrer-when-downgrade",
-    "same-origin",
-    "origin",
-    "strict-origin",
-    "origin-when-cross-origin",
-    "strict-origin-when-cross-origin",
-    "unsafe-url"
-};
-
-FILE: Libraries/LibWeb/Fetch/Response.cpp
-/*
- * Copyright (c) 2022-2023, Linus Groh <linusg@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibJS/Runtime/Completion.h>
-#include <LibWeb/Bindings/Intrinsics.h>
-#include <LibWeb/Bindings/MainThreadVM.h>
-#include <LibWeb/Bindings/Response.h>
-#include <LibWeb/DOMURL/DOMURL.h>
-#include <LibWeb/Fetch/Enums.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/MIME.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/Statuses.h>
-#include <LibWeb/Fetch/Response.h>
-#include <LibWeb/HTML/Scripting/Environments.h>
-#include <LibWeb/Infra/JSON.h>
-
-namespace Web::Fetch {
-
-GC_DEFINE_ALLOCATOR(Response);
-
-Response::Response(JS::Realm& realm, GC::Ref<Infrastructure::Response> response)
-    : PlatformObject(realm)
-    , m_response(response)
-{
-}
-
