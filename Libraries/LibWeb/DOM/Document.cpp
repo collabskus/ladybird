@@ -188,6 +188,7 @@
 #include <LibWeb/Infra/Strings.h>
 #include <LibWeb/IntersectionObserver/IntersectionObserver.h>
 #include <LibWeb/Layout/BlockFormattingContext.h>
+#include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/SVGFormattingContext.h>
 #include <LibWeb/Layout/SVGSVGBox.h>
 #include <LibWeb/Layout/ScrollableOverflow.h>
@@ -618,6 +619,15 @@ Document::Document(JS::Realm& realm, URL::URL const& url)
 }
 
 Document::~Document() = default;
+
+Layout::NodeArena& Document::layout_node_arena()
+{
+    // Created on first layout node so documents that never build a layout tree (e.g. temporary
+    // fragment-parsing documents) skip the Rust arena round-trip entirely.
+    if (!m_layout_node_arena)
+        m_layout_node_arena = make_ref_counted<Layout::NodeArena>();
+    return *m_layout_node_arena;
+}
 
 void Document::set_temporary_document_for_fragment_parsing(Badge<HTML::HTMLParser>)
 {
@@ -2005,7 +2015,6 @@ Document::PartialRelayoutResult Document::try_partial_relayout(HashTable<WeakPtr
         || registered_partial_relayout_roots.is_empty()
         || m_layout_root->needs_layout_update()
         || !m_query_containers_needing_container_query_evaluation_after_layout.is_empty()
-        || layout_node_indices_outgrew_dense_range()
         || should_collect_devtools_layout_data
         || any_anchor_names_are_registered())
         return PartialRelayoutResult::NotEligible;
@@ -2207,11 +2216,7 @@ void Document::update_layout(UpdateLayoutReason reason)
             });
         }
 
-        u32 layout_index_counter = 0;
         m_layout_root->for_each_in_inclusive_subtree([&](auto& layout_node) {
-            if (auto* node_with_style = as_if<Layout::NodeWithStyle>(layout_node))
-                node_with_style->set_layout_index(layout_index_counter++);
-
             recompute_containing_block_and_derive_abspos_escape_flags(layout_node);
 
             return TraversalDecision::Continue;
@@ -2221,10 +2226,7 @@ void Document::update_layout(UpdateLayoutReason reason)
         // on, so pending changes that escaped classification are accounted for from here on.
         m_partial_relayout_invalidation.clear_escape(PartialRelayoutEscapeClearReason::FullLayoutPass);
 
-        reset_layout_node_index_counter(layout_index_counter);
-
         Layout::LayoutState layout_state;
-        layout_state.ensure_capacity(layout_index_counter);
         layout_state.set_should_collect_devtools_layout_data(should_collect_devtools_layout_data);
 
         {
