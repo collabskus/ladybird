@@ -7,6 +7,7 @@
 #include <AK/Array.h>
 #include <AK/Atomic.h>
 #include <AK/Debug.h>
+#include <AK/GenericShorthands.h>
 #include <AK/HashMap.h>
 #include <AK/Math.h>
 #include <AK/NeverDestroyed.h>
@@ -17,7 +18,7 @@
 #include <LibGfx/Font/Font.h>
 #include <LibGfx/Path.h>
 #include <LibGfx/TextLayout.h>
-#include <LibUnicode/Bidi.h>
+#include <LibUnicode/CharacterTypes.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/Display.h>
 #include <LibWeb/CSS/GridTrackPlacement.h>
@@ -59,6 +60,7 @@
 #include <LibWeb/Layout/ListItemBox.h>
 #include <LibWeb/Layout/ListItemMarkerBox.h>
 #include <LibWeb/Layout/Node.h>
+#include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/SVGClipBox.h>
 #include <LibWeb/Layout/SVGGeometryBox.h>
 #include <LibWeb/Layout/SVGImageBox.h>
@@ -91,11 +93,6 @@ static Atomic<size_t> s_outstanding_calc_handles;
 static Atomic<size_t> s_outstanding_grid_name_handles;
 static Atomic<size_t> s_outstanding_anchor_name_handles;
 static Atomic<size_t> s_outstanding_svg_path_handles;
-
-struct TextFactsSnapshotArena {
-    Vector<u16> text;
-    Vector<RustFFI::FfiTextChunk> chunks;
-};
 
 static constexpr size_t style_field_encoding_width(RustFFI::FfiStyleFieldEncoding encoding)
 {
@@ -130,6 +127,8 @@ static_assert(to_underlying(CSS::StyleGroupIndex::Count) == RustFFI::STYLE_GROUP
     F(TextJustify, CSS::ComputedValues::InheritedTextValues, text_justify, offsetof(CSS::ComputedValues::InheritedTextValues, text_justify), U8)                                              \
     F(WhiteSpaceCollapse, CSS::ComputedValues::InheritedTextValues, white_space_collapse, offsetof(CSS::ComputedValues::InheritedTextValues, white_space_collapse), U8)                       \
     F(TextWrapMode, CSS::ComputedValues::InheritedTextValues, text_wrap_mode, offsetof(CSS::ComputedValues::InheritedTextValues, text_wrap_mode), U8)                                         \
+    F(WordBreak, CSS::ComputedValues::InheritedTextValues, word_break, offsetof(CSS::ComputedValues::InheritedTextValues, word_break), U8)                                                    \
+    F(FontVariantEmoji, CSS::ComputedValues::FontValues, font_variant_emoji, offsetof(CSS::ComputedValues::FontValues, font_variant_emoji), U8)                                               \
     F(LineHeight, CSS::ComputedValues::FontValues, line_height.used_value, offsetof(CSS::ComputedValues::FontValues, line_height) + offsetof(CSS::LineHeightData, used_value), CssPixels)     \
     F(FontSize, CSS::ComputedValues::FontValues, font_size, offsetof(CSS::ComputedValues::FontValues, font_size), CssPixels)                                                                  \
     F(BoxSizing, CSS::ComputedValues::BoxValues, box_sizing, offsetof(CSS::ComputedValues::BoxValues, box_sizing), U8)                                                                        \
@@ -212,6 +211,7 @@ static RustFFI::FfiSizeValue size_value_with_kind(RustFFI::FfiSizeKind kind)
         .calc_is_bridge_retained = false,
         .contains_percentage = false,
         .contains_anchor_function = false,
+        .fit_content_has_argument = false,
     };
 }
 
@@ -233,6 +233,7 @@ static RustFFI::FfiSizeValue retain_calculated(CSS::CalculatedStyleValue const& 
         .calc_is_bridge_retained = true,
         .contains_percentage = contains_percentage,
         .contains_anchor_function = calculated.contains_anchor_function(),
+        .fit_content_has_argument = false,
     };
 }
 
@@ -688,6 +689,7 @@ RustFFI::FfiSizeValue build_style_size_value(CSS::LengthPercentage const& value)
             .calc_is_bridge_retained = false,
             .contains_percentage = false,
             .contains_anchor_function = false,
+            .fit_content_has_argument = false,
         };
     }
     if (value.is_percentage()) {
@@ -699,6 +701,7 @@ RustFFI::FfiSizeValue build_style_size_value(CSS::LengthPercentage const& value)
             .calc_is_bridge_retained = false,
             .contains_percentage = true,
             .contains_anchor_function = false,
+            .fit_content_has_argument = false,
         };
     }
     return retain_calculated(*value.calculated(), value.contains_percentage());
@@ -728,6 +731,7 @@ RustFFI::FfiSizeValue build_style_size_value(CSS::Size const& value)
             .calc_is_bridge_retained = false,
             .contains_percentage = false,
             .contains_anchor_function = false,
+            .fit_content_has_argument = false,
         };
     case CSS::Size::Type::Percentage:
         return {
@@ -738,6 +742,7 @@ RustFFI::FfiSizeValue build_style_size_value(CSS::Size const& value)
             .calc_is_bridge_retained = false,
             .contains_percentage = true,
             .contains_anchor_function = false,
+            .fit_content_has_argument = false,
         };
     case CSS::Size::Type::MinContent:
         return size_value_with_kind(RustFFI::FfiSizeKind::MinContent);
@@ -748,6 +753,7 @@ RustFFI::FfiSizeValue build_style_size_value(CSS::Size const& value)
         if (value.fit_content_available_space().has_value()) {
             result = build_style_size_value(*value.fit_content_available_space());
             result.kind = to_underlying(RustFFI::FfiSizeKind::FitContent);
+            result.fit_content_has_argument = true;
         }
         return result;
     }
@@ -1162,6 +1168,7 @@ void LayoutRustBridge::run_root_layout(Box& viewport, NodeWithStyleAndBoxModelMe
     };
 
     viewport.document().invalidate_stacking_context_tree();
+    viewport.document().layout_node_arena().sync_enrolled_text_node_content();
     auto callbacks = formatting_context_callbacks();
     auto sink = commit_sink();
     RustFFI::rust_layout_run_root_layout(
@@ -1184,7 +1191,8 @@ void LayoutRustBridge::compute_subtree_layout(Box& root, Painting::Paintable& pa
     };
 
     root.document().invalidate_stacking_context_tree();
-    auto callbacks = formatting_context_callbacks(&root);
+    root.document().layout_node_arena().sync_enrolled_text_node_content();
+    auto callbacks = formatting_context_callbacks();
     auto sink = commit_sink();
     RustFFI::rust_layout_compute_subtree_layout(
         Node::slot_id(&root),
@@ -1204,7 +1212,8 @@ void LayoutRustBridge::replay_saved_abspos_layout(Box& box, Painting::Paintable&
     };
 
     box.document().invalidate_stacking_context_tree();
-    auto callbacks = formatting_context_callbacks(&box);
+    box.document().layout_node_arena().sync_enrolled_text_node_content();
+    auto callbacks = formatting_context_callbacks();
     auto sink = commit_sink();
     RustFFI::rust_layout_replay_saved_abspos_layout(Node::slot_id(&box), &paintable_to_replace, &callbacks, &sink);
     VERIFY(!m_line_commit_context);
@@ -1668,7 +1677,7 @@ static bool can_skip_is_anonymous_text_run(Box& box)
     return false;
 }
 
-RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks(Node const* subtree_root)
+RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks()
 {
     static_assert(to_underlying(Painting::Paintable::ConflictingElementKind::Cell) == 0);
     static_assert(to_underlying(Painting::Paintable::ConflictingElementKind::Row) == 1);
@@ -1731,49 +1740,12 @@ RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks(Nod
     static_assert(offsetof(RustFFI::FfiDrawGlyph, glyph_id) == offsetof(Gfx::DrawGlyph, glyph_id));
     static_assert(offsetof(RustFFI::FfiDrawGlyph, should_paint) == offsetof(Gfx::DrawGlyph, should_paint));
 
-    size_t node_data_displacement = Node::node_data_displacement(*m_commit_root);
-
-    auto verify_node_data_displacement = [&](Node const& node) {
-        auto* data = *reinterpret_cast<RustFFI::NodeData* const*>(reinterpret_cast<u8 const*>(&node) + node_data_displacement);
-        VERIFY(data);
-        VERIFY(data->shell == const_cast<Node*>(&node));
-    };
-    verify_node_data_displacement(*m_commit_root);
-
-    // The displacement is one process-wide constant because every layout node
-    // derives from Node through a single non-virtual inheritance chain. Sample
-    // distinct vtables rather than class_name(), which not every subclass
-    // overrides, to catch that chain ever growing an offset-shifting base.
-    Array<void const*, 4> sampled_vtables {};
-    size_t sampled_vtable_count = 0;
-    m_commit_root->root().for_each_in_inclusive_subtree([&](Node const& node) {
-        auto const* vtable = *reinterpret_cast<void const* const*>(&node);
-        for (size_t index = 0; index < sampled_vtable_count; ++index) {
-            if (sampled_vtables[index] == vtable)
-                return TraversalDecision::Continue;
-        }
-        verify_node_data_displacement(node);
-        sampled_vtables[sampled_vtable_count++] = vtable;
-        if (sampled_vtable_count < sampled_vtables.size())
-            return TraversalDecision::Continue;
-        return TraversalDecision::Break;
-    });
-    if (subtree_root)
-        verify_node_data_displacement(*subtree_root);
-
     return {
         .context = this,
         .arena = m_commit_root->arena_handle(),
-        .node_data_displacement = node_data_displacement,
         .initial_containing_block_inline_size = m_commit_root->document().viewport_rect().width().raw_value(),
         .document_in_quirks_mode = m_commit_root->document().in_quirks_mode(),
-        .static_position_containing_block = [](void*, void* node) -> void* {
-            return const_cast<Box*>(static_cast<Box const*>(node)->static_position_containing_block());
-        },
-        .dom_node_is_inclusive_ancestor = [](void*, void* ancestor, void* node) {
-            auto const* ancestor_dom_node = static_cast<Node const*>(ancestor)->dom_node();
-            auto const* dom_node = static_cast<Node const*>(node)->dom_node();
-            return ancestor_dom_node && dom_node && ancestor_dom_node->is_inclusive_ancestor_of(*dom_node); },
+        .static_position_containing_block = [](void*, void* node) { return Node::slot_id(static_cast<Box const*>(node)->static_position_containing_block()); },
         .needs_inset_resolution = [](void*, void* node) {
             auto const& styled_node = *static_cast<NodeWithStyleAndBoxModelMetrics const*>(node);
             if (styled_node.computed_values().position() == CSS::Positioning::Relative)
@@ -1836,7 +1808,7 @@ RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks(Nod
             RustFFI::FfiListItemFacts facts {};
             auto const& layout_node = *static_cast<Node const*>(node);
             if (auto const* list_item_box = as_if<ListItemBox>(layout_node)) {
-                facts.marker = list_item_box->marker() ? const_cast<ListItemMarkerBox*>(list_item_box->marker()) : nullptr;
+                facts.marker = Node::slot_id(list_item_box->marker());
                 if (auto const* element = as_if<DOM::Element>(layout_node.dom_node())) {
                     if (auto const computed_values = element->computed_values(CSS::PseudoElement::Marker))
                         facts.has_css_marker_content = computed_values->content().has_value();
@@ -1867,55 +1839,10 @@ RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks(Nod
                 facts.marker_list_style_position = static_cast<u8>(to_underlying(marker->list_style_position()));
             }
             return facts; },
-        .build_text_facts = [](void*, void* node, bool should_wrap_lines, bool should_respect_linebreaks, bool unidirectional_ltr, RustFFI::FfiTextNodeFacts* out) {
-            VERIFY(out);
-            auto const* text_node = as_if<TextNode>(*static_cast<Node const*>(node));
-            if (!text_node)
-                return false;
-
-            auto text_direction_mode = unidirectional_ltr
-                ? TextNode::TextDirectionMode::UnidirectionalLeftToRight
-                : TextNode::TextDirectionMode::PerCodePoint;
-            auto const& chunk_list = text_node->chunks_for_layout(should_wrap_lines, should_respect_linebreaks, text_direction_mode);
-            auto arena = make<TextFactsSnapshotArena>();
-            auto const text = text_node->text_for_rendering().utf16_view();
-            arena->text.ensure_capacity(text.length_in_code_units());
-            for (size_t index = 0; index < text.length_in_code_units(); ++index)
-                arena->text.unchecked_append(text.code_unit_at(index));
-            arena->chunks.ensure_capacity(chunk_list.chunks.size());
-            for (auto const& chunk : chunk_list.chunks) {
-                arena->chunks.unchecked_append({
-                    .start = chunk.start,
-                    .length = chunk.length,
-                    .font = chunk.font.ptr(),
-                    .has_breaking_newline = chunk.has_breaking_newline,
-                    .has_breaking_tab = chunk.has_breaking_tab,
-                    .is_all_whitespace = chunk.is_all_whitespace,
-                    .can_break_after = chunk.can_break_after,
-                    .text_type = static_cast<u8>(to_underlying(chunk.text_type)),
-                });
-            }
-
-            auto* owner = arena.leak_ptr();
-            *out = {
-                .text_utf16 = owner->text.data(),
-                .text_length_in_code_units = owner->text.size(),
-                .chunks = owner->chunks.data(),
-                .chunk_count = owner->chunks.size(),
-                .should_collapse_whitespace = chunk_list.should_collapse_whitespace,
-                .is_generated_for_pseudo_element = text_node->is_generated_for_pseudo_element(),
-                .is_empty_editable = is_empty_editable_text_node(*text_node),
-                .has_dom_node = static_cast<Node const&>(*text_node).dom_node() != nullptr,
-                .retained = owner,
-            };
-            return true; },
-        .release_text_facts = [](void*, void* retained) {
-            VERIFY(retained);
-            delete static_cast<TextFactsSnapshotArena*>(retained); },
-        .text_may_require_bidi_processing = [](void*, void* node) {
+        .text_node_is_empty_editable = [](void*, void* node) {
             auto const* text_node = as_if<TextNode>(*static_cast<Node const*>(node));
             VERIFY(text_node);
-            return Unicode::may_require_bidi_processing(text_node->text_for_rendering()); },
+            return is_empty_editable_text_node(*text_node); },
         .document_cursor_is_on_node = [](void*, void* node) {
             auto const* dom_node = static_cast<Node const*>(node)->dom_node();
             if (!dom_node)
@@ -2003,16 +1930,14 @@ RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks(Nod
                 .width = bounding_box.width(),
                 .height = bounding_box.height(),
             }; },
-        .anchor_lookup = [](void*, void* node, size_t anchor_name, void* const* eligible_anchor_boxes, size_t eligible_anchor_box_count, void** out_anchor_box) {
-            VERIFY(out_anchor_box);
-            *out_anchor_box = nullptr;
+        .anchor_lookup = [](void*, void* node, size_t anchor_name, void* const* eligible_anchor_boxes, size_t eligible_anchor_box_count) {
             auto const& box = *static_cast<Box const*>(node);
             auto abstract_element = abstract_element_for_abspos_box(box);
             if (!abstract_element.has_value())
-                return false;
+                return RustFFI::NodeSlotId_INVALID;
             auto const* containing_block = box.containing_block();
             if (!containing_block)
-                return false;
+                return RustFFI::NodeSlotId_INVALID;
             Function<bool(DOM::Element&)> is_acceptable_anchor_element = [&](DOM::Element& candidate) {
                 auto const* anchor_box = as_if<Box>(candidate.unsafe_layout_node());
                 if (!anchor_box || anchor_box == &box)
@@ -2037,12 +1962,11 @@ RustFFI::FfiLayoutFcCallbacks LayoutRustBridge::formatting_context_callbacks(Nod
                 abstract_element->element(),
                 is_acceptable_anchor_element);
             if (!anchor_element)
-                return false;
-            auto* anchor_box = as_if<Box>(anchor_element->unsafe_layout_node());
+                return RustFFI::NodeSlotId_INVALID;
+            auto const* anchor_box = as_if<Box>(anchor_element->unsafe_layout_node());
             if (!anchor_box)
-                return false;
-            *out_anchor_box = anchor_box;
-            return true; },
+                return RustFFI::NodeSlotId_INVALID;
+            return Node::slot_id(anchor_box); },
         .build_anchor_function_facts = [](void*, void const* shell) {
             auto value = CSS::StyleValue::adopt_rust_style_value_data(
                 CSS::StyleValueFFI::rust_style_value_retain(
@@ -2267,6 +2191,7 @@ static RustFFI::FfiResidualStyleValues decode_residual_style(RustFFI::FfiStylePa
     auto const& font = font_values.font_list->font_for_code_point(' ');
     auto const& metrics = font.pixel_metrics();
     result.first_available_font = &font;
+    result.font_cascade_list = font_values.font_list.ptr();
     result.font_ascent = metrics.ascent;
     result.font_descent = metrics.descent;
     result.font_x_height = metrics.x_height;
@@ -2324,4 +2249,37 @@ extern "C" WEB_API void ladybird_layout_release_anchor_name_handle(size_t raw)
     VERIFY(Web::Layout::s_outstanding_anchor_name_handles.load() > 0);
     --Web::Layout::s_outstanding_anchor_name_handles;
     Utf16FlyString::unref_raw(raw);
+}
+
+extern "C" WEB_API u8 ladybird_layout_text_type_for_code_point(u32 code_point)
+{
+    return static_cast<u8>(to_underlying(Web::Layout::text_type_for_code_point(code_point)));
+}
+
+extern "C" WEB_API bool ladybird_layout_code_point_has_break_all_line_break_class(u32 code_point)
+{
+    return first_is_one_of(Unicode::line_break_class(code_point),
+        Unicode::LineBreakClass::Alphabetic,
+        Unicode::LineBreakClass::Numeric,
+        Unicode::LineBreakClass::ComplexContext,
+        Unicode::LineBreakClass::Ideographic);
+}
+
+extern "C" WEB_API bool ladybird_layout_code_point_has_keep_all_line_break_class(u32 code_point)
+{
+    return first_is_one_of(Unicode::line_break_class(code_point),
+        Unicode::LineBreakClass::Alphabetic,
+        Unicode::LineBreakClass::Numeric,
+        Unicode::LineBreakClass::Ambiguous,
+        Unicode::LineBreakClass::Ideographic);
+}
+
+extern "C" WEB_API bool ladybird_layout_code_point_has_combining_mark_line_break_class(u32 code_point)
+{
+    return Unicode::line_break_class(code_point) == Unicode::LineBreakClass::CombiningMark;
+}
+
+extern "C" WEB_API bool ladybird_layout_code_point_has_emoji_property(u32 code_point)
+{
+    return Unicode::code_point_has_emoji_property(code_point);
 }

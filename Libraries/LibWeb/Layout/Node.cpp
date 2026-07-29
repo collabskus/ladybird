@@ -209,11 +209,6 @@ RustFFI::NodeSlotId Node::slot_id(Node const* node)
     return node ? node->m_slot : RustFFI::NodeSlotId_INVALID;
 }
 
-size_t Node::node_data_displacement(Node const& node)
-{
-    return reinterpret_cast<u8 const*>(&node.m_data) - reinterpret_cast<u8 const*>(&node);
-}
-
 void Node::set_node_kind(RustFFI::NodeKind kind)
 {
     m_data->kind = kind;
@@ -1079,6 +1074,11 @@ void NodeWithStyle::set_computed_values(NonnullRefPtr<CSS::ComputedValues const>
 {
     m_computed_values = move(computed_values);
     mirror_computed_values_to_node_data();
+
+    for (auto* child = first_child_ptr(); child; child = child->next_sibling_ptr()) {
+        if (auto* text_child = as_if<TextNode>(*child))
+            text_child->enroll_for_arena_text_content_sync();
+    }
 }
 
 void NodeWithStyle::mirror_computed_values_to_node_data()
