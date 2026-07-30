@@ -57194,9 +57194,12 @@ command line flag. A banner will be displayed in Ladybird with the port on which
 port may be changed by providing a port to the command line flag, e.g. `--devtools=6001`. To disable DevTools, use the
 menu item (which will now be titled "Disable DevTools"), or close the banner.
 
-Once DevTools is enabled, in Firefox, navigate to `about:debugging` and select the "Setup" tab. In the "Network Location"
-form, enter the DevTools server address. In the above example, this will be `localhost:6000`. You will only have to
-enter this information once:
+Once DevTools is enabled, you may use the "Open Client" button on the banner to open a Firefox DevTools client window to
+inspect the current tab. Only one such window may be open at a time.
+
+Alternatively, in Firefox, navigate to `about:debugging` and select the "Setup" tab. In the "Network Location" form,
+enter the DevTools server address. In the above example with `--devtools=6001`, this will be `localhost:6001`. You will
+only have to enter this information once:
 
 <img src="Images/devtools_setup.png" alt="DevTools setup" width="675px" />
 
@@ -68107,6 +68110,7 @@ public:
         KeepOnExec = 32,
         Nonblocking = 64,
         DontCreate = 128,
+        NoFollow = 256,
     };
 
     enum class ShouldCloseFileDescriptor {
@@ -68244,6 +68248,8 @@ int File::open_mode_to_options(OpenMode mode)
         flags |= O_CLOEXEC;
     if (has_flag(mode, OpenMode::Nonblocking))
         flags |= O_NONBLOCK;
+    if (has_flag(mode, OpenMode::NoFollow))
+        flags |= O_NOFOLLOW;
 
     // Some open modes, like `ReadWrite` imply the ability to create the file if it doesn't exist.
     // Certain applications may not want this privilege, and for compatibility reasons, this is
@@ -68766,14 +68772,17 @@ ErrorOr<void> File::open_path(StringView filename, mode_t)
     bool should_truncate = has_flag(m_mode, OpenMode::Truncate);
     if (!has_flag(m_mode, OpenMode::ReadWrite) && has_flag(m_mode, OpenMode::Write) && !has_any_flag(m_mode, OpenMode::Append | OpenMode::MustBeNew))
         should_truncate = true;
+    bool const no_follow = has_flag(m_mode, OpenMode::NoFollow);
 
+    // When NoFollow is requested, defer truncation until after checking whether the
+    // opened handle refers to a reparse point.
     DWORD creation_disposition;
     if (has_flag(m_mode, OpenMode::MustBeNew) && may_create)
         creation_disposition = CREATE_NEW;
     else if (may_create)
-        creation_disposition = should_truncate ? CREATE_ALWAYS : OPEN_ALWAYS;
+        creation_disposition = should_truncate && !no_follow ? CREATE_ALWAYS : OPEN_ALWAYS;
     else
-        creation_disposition = should_truncate ? TRUNCATE_EXISTING : OPEN_EXISTING;
+        creation_disposition = should_truncate && !no_follow ? TRUNCATE_EXISTING : OPEN_EXISTING;
 
     SECURITY_ATTRIBUTES security_attributes = {};
     security_attributes.nLength = sizeof(security_attributes);
@@ -68783,18 +68792,39 @@ ErrorOr<void> File::open_path(StringView filename, mode_t)
 
     // Share as permissively as POSIX opens do. FILE_FLAG_BACKUP_SEMANTICS allows opening
     // directories, which Core::Directory and the file:// directory listing depend on.
+    DWORD flags_and_attributes = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS;
+    if (no_follow)
+        flags_and_attributes |= FILE_FLAG_OPEN_REPARSE_POINT;
+
     HANDLE handle = CreateFileW(
         wide_filename.data(),
         desired_access,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         &security_attributes,
         creation_disposition,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
+        flags_and_attributes,
         nullptr);
     if (handle == INVALID_HANDLE_VALUE)
         return open_error_from_windows_error();
 
     m_fd = to_fd(handle);
+
+    if (no_follow) {
+        BY_HANDLE_FILE_INFORMATION file_information = {};
+        if (!GetFileInformationByHandle(handle, &file_information)) {
+            auto error = Error::from_windows_error();
+            close();
+            return error;
+        }
+        if (file_information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+            close();
+            return Error::from_string_literal("Core::File: Refusing to follow a symbolic link");
+        }
+
+        if (should_truncate)
+            TRY(truncate(0));
+    }
+
     return {};
 }
 
@@ -89896,7 +89926,7 @@ void DeviceActor::handle_message(Message const& message)
         value.set("version"sv, browser_version);
         value.set("appbuildid"sv, build_id);
         value.set("platformbuildid"sv, build_id);
-        value.set("platformversion"sv, "139.0"sv);
+        value.set("platformversion"sv, "152.0"sv);
         value.set("useragent"sv, Web::default_user_agent);
         value.set("os"sv, platform_name);
         value.set("arch"sv, arch);
@@ -93482,16 +93512,30 @@ void RootActor::handle_message(Message const& message)
         if (!browser_id.has_value())
             return;
 
-        for (auto const& actor : devtools().actor_registry()) {
-            auto const* tab_actor = as_if<TabActor>(*actor.value);
-            if (!tab_actor)
-                continue;
-            if (tab_actor->description().id != *browser_id)
-                continue;
+        TabActor const* tab_actor = nullptr;
 
-            response.set("tab"sv, tab_actor->serialize_description());
-            break;
+        for (auto const& actor : devtools().actor_registry()) {
+            auto const* candidate = as_if<TabActor>(*actor.value);
+
+            if (candidate && candidate->description().id == *browser_id) {
+                tab_actor = candidate;
+                break;
+            }
         }
+
+        // The tab might not have been registered yet if the client did not request the tab list on this connection,
+        // e.g. when a toolbox connects directly to a tab known from a previous connection.
+        if (!tab_actor) {
+            for (auto& tab_description : devtools().delegate().tab_list()) {
+                if (tab_description.id == *browser_id) {
+                    tab_actor = &devtools().register_actor<TabActor>(move(tab_description));
+                    break;
+                }
+            }
+        }
+
+        if (tab_actor)
+            response.set("tab"sv, tab_actor->serialize_description());
 
         send_response(message, move(response));
         return;
@@ -96777,12 +96821,13 @@ set(SOURCES
     Actors/WatcherActor.cpp
     Connection.cpp
     DevToolsServer.cpp
+    FirefoxClient.cpp
     IndexedDBSerialization.cpp
     StorageHelpers.cpp
 )
 
 ladybird_lib(LibDevTools devtools EXPLICIT_SYMBOL_EXPORT)
-target_link_libraries(LibDevTools PRIVATE LibCore LibHTTP LibWeb LibURL)
+target_link_libraries(LibDevTools PRIVATE LibCore LibFileSystem LibHTTP LibWeb LibURL)
 
 FILE: Libraries/LibDevTools/Connection.cpp
 /*
@@ -97188,6 +97233,7 @@ public:
 
     virtual void did_connect_devtools_client(TabDescription const&) const { }
     virtual void did_disconnect_devtools_client(TabDescription const&) const { }
+    virtual void did_close_devtools_connection() { }
 };
 
 }
@@ -97211,6 +97257,7 @@ FILE: Libraries/LibDevTools/DevToolsServer.cpp
 #include <LibDevTools/Actors/ProcessActor.h>
 #include <LibDevTools/Actors/TabActor.h>
 #include <LibDevTools/Connection.h>
+#include <LibDevTools/DevToolsDelegate.h>
 #include <LibDevTools/DevToolsServer.h>
 
 namespace DevTools {
@@ -97282,10 +97329,13 @@ void DevToolsServer::unregister_actor(String const& name)
 
 ErrorOr<void> DevToolsServer::on_new_client()
 {
+    // The client must be accepted even when one is already active; a pending connection left in the listen backlog
+    // would cause the accept notifier to fire in a busy loop.
+    auto client = TRY(m_server->accept());
+
     if (m_connection)
         return Error::from_string_literal("Only one active DevTools connection is currently allowed");
 
-    auto client = TRY(m_server->accept());
     auto buffered_socket = TRY(Core::BufferedTCPSocket::create(move(client)));
 
     m_connection = Connection::create(move(buffered_socket));
@@ -97347,6 +97397,8 @@ void DevToolsServer::close_connection()
         weak_self->m_connection = nullptr;
         weak_self->m_actor_registry.clear();
         weak_self->m_root_actor = nullptr;
+
+        weak_self->m_delegate.did_close_devtools_connection();
     });
 }
 
@@ -97382,6 +97434,7 @@ public:
     ~DevToolsServer();
 
     RefPtr<Connection>& connection() { return m_connection; }
+    bool has_active_connection() const { return m_connection; }
     DevToolsDelegate const& delegate() const { return m_delegate; }
     ActorRegistry const& actor_registry() const { return m_actor_registry; }
     Optional<u16> local_port() const;
@@ -97430,6 +97483,394 @@ private:
 
 }
 
+FILE: Libraries/LibDevTools/FirefoxClient.cpp
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/Array.h>
+#include <AK/ByteString.h>
+#include <AK/LexicalPath.h>
+#include <AK/NeverDestroyed.h>
+#include <LibCore/ConfigFile.h>
+#include <LibCore/Directory.h>
+#include <LibCore/Environment.h>
+#include <LibCore/File.h>
+#include <LibCore/StandardPaths.h>
+#include <LibCore/System.h>
+#include <LibDevTools/FirefoxClient.h>
+#include <LibFileSystem/FileSystem.h>
+
+#if !defined(AK_OS_WINDOWS)
+#    include <unistd.h>
+#endif
+
+namespace DevTools {
+
+#if defined(AK_OS_LINUX)
+static constexpr auto PROFILE_NAME = "LadybirdDevTools"sv;
+#endif
+
+static constexpr auto PROFILE_PREFS = R"~~~(
+user_pref("app.update.auto", false);
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("browser.sessionstore.resume_from_crash", false);
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.startup.couldRestoreSession.count", -1);
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("browser.tabs.inTitlebar", 0);
+user_pref("browser.warnOnQuit", false);
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("devtools.aboutdebugging.network-locations", "[]");
+user_pref("devtools.chrome.enabled", true);
+user_pref("devtools.debugger.prompt-connection", false);
+user_pref("devtools.debugger.remote-enabled", true);
+user_pref("termsofuse.bypassNotification", true);
+user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);
+user_pref("toolkit.startup.max_resumed_crashes", -1);
+)~~~"sv;
+
+static constexpr auto USER_CHROME_CSS = R"~~~(
+#nav-bar,
+#PersonalToolbar,
+#TabsToolbar {
+    visibility: collapse !important;
+}
+)~~~"sv;
+
+static LexicalPath const& profile_directory()
+{
+    static NeverDestroyed<LexicalPath> path = LexicalPath::join(Core::StandardPaths::user_data_directory(), "Ladybird"sv, "DevTools"sv, "firefox-profile"sv);
+    return *path;
+}
+
+static ErrorOr<void> prepare_firefox_profile(LexicalPath const& profile)
+{
+    auto open_regular_file = [](Core::Directory const& directory, StringView filename) -> ErrorOr<NonnullOwnPtr<Core::File>> {
+        auto file = TRY(directory.open(filename, Core::File::OpenMode::ReadWrite | Core::File::OpenMode::NoFollow));
+        if (!S_ISREG(TRY(file->stat()).st_mode))
+            return Error::from_errno(EINVAL);
+
+        TRY(file->truncate(0));
+        return file;
+    };
+
+    // Below we go out of our way to avoid following symbolic links in any existing profile. So entries such as
+    // "user.js" cannot redirect writes outside the profile.
+    auto profile_directory = TRY(Core::Directory::create(profile, Core::Directory::CreateDirectories::Yes));
+
+    auto prefs = TRY(open_regular_file(profile_directory, "user.js"sv));
+    TRY(prefs->write_until_depleted(PROFILE_PREFS.bytes()));
+
+    auto chrome = profile.append("chrome"sv);
+    TRY(Core::Directory::create(chrome, Core::Directory::CreateDirectories::Yes));
+
+    auto chrome_file = TRY(profile_directory.open("chrome"sv, Core::File::OpenMode::Read | Core::File::OpenMode::NoFollow));
+    if (!S_ISDIR(TRY(chrome_file->stat()).st_mode))
+        return Error::from_errno(ENOTDIR);
+    auto chrome_directory = TRY(Core::Directory::adopt_fd(chrome_file->leak_fd(), move(chrome)));
+
+    auto user_chrome = TRY(open_regular_file(chrome_directory, "userChrome.css"sv));
+    TRY(user_chrome->write_until_depleted(USER_CHROME_CSS.bytes()));
+
+    return {};
+}
+
+struct FirefoxInstallation {
+    LexicalPath executable;
+    Vector<ByteString> arguments;
+    Optional<LexicalPath> profiles_ini;
+};
+
+#if defined(AK_OS_LINUX)
+static bool flatpak_firefox_is_installed(LexicalPath const& flatpak)
+{
+    auto process = Core::Process::spawn({
+        .name = "find-firefox-flatpak"sv,
+        .executable = flatpak.string(),
+        .die_with_parent = true,
+        .arguments = {
+            "info"sv,
+            "org.mozilla.firefox"sv,
+        },
+        .file_actions = {
+            Core::FileAction::OpenFile { "/dev/null", Core::File::OpenMode::Write, STDOUT_FILENO },
+            Core::FileAction::OpenFile { "/dev/null", Core::File::OpenMode::Write, STDERR_FILENO },
+        },
+    });
+    if (process.is_error())
+        return false;
+
+    auto exit_code = process.value().wait_for_termination();
+    return !exit_code.is_error() && exit_code.value() == 0;
+}
+
+static ErrorOr<Optional<LexicalPath>> find_firefox_profile(LexicalPath const& profiles_ini, StringView profile_name)
+{
+    auto profiles = TRY(Core::ConfigFile::open(profiles_ini.string()));
+
+    for (auto const& group : profiles->groups()) {
+        if (!group.starts_with("Profile"sv) || profiles->read_entry(group, "Name"sv) != profile_name)
+            continue;
+
+        auto path = profiles->read_entry(group, "Path"sv);
+        if (path.is_empty())
+            continue;
+
+        if (!profiles->read_bool_entry(group, "IsRelative"sv))
+            return LexicalPath { move(path) };
+
+        return LexicalPath::join(profiles_ini.dirname(), path);
+    }
+
+    return OptionalNone {};
+}
+
+static ErrorOr<LexicalPath> ensure_confined_firefox_profile(FirefoxInstallation const& installation)
+{
+    VERIFY(installation.profiles_ini.has_value());
+
+    auto profile = TRY(find_firefox_profile(*installation.profiles_ini, PROFILE_NAME));
+    if (!profile.has_value()) {
+        auto arguments = installation.arguments;
+        arguments.append("--createprofile"sv);
+        arguments.append(PROFILE_NAME);
+
+        auto process = TRY(Core::Process::spawn({
+            .name = "create-devtools-profile"sv,
+            .executable = installation.executable.string(),
+            .die_with_parent = true,
+            .arguments = arguments,
+        }));
+        if (TRY(process.wait_for_termination()) != 0)
+            return Error::from_string_literal("Firefox failed to create the Ladybird DevTools profile");
+
+        profile = TRY(find_firefox_profile(*installation.profiles_ini, PROFILE_NAME));
+        if (!profile.has_value())
+            return Error::from_string_literal("Firefox did not register the Ladybird DevTools profile");
+    }
+
+    auto profiles_directory = LexicalPath { installation.profiles_ini->dirname() };
+    if (!profile->is_child_of(profiles_directory))
+        return Error::from_string_literal("The Ladybird DevTools profile is outside the Firefox sandbox");
+
+    return profile.release_value();
+}
+#endif
+
+static Optional<FirefoxInstallation> firefox_installation_from_binary(StringView candidate)
+{
+    if (!FileSystem::is_regular_file(candidate))
+        return {};
+#if !defined(AK_OS_WINDOWS)
+    if (Core::System::access(candidate, X_OK).is_error())
+        return {};
+#endif
+
+    auto canonical_path = FileSystem::real_path(candidate);
+    if (canonical_path.is_error())
+        return {};
+
+#if defined(AK_OS_LINUX)
+    auto executable = LexicalPath { canonical_path.value() };
+    if (executable.basename() == "flatpak"sv) {
+        if (!flatpak_firefox_is_installed(executable))
+            return {};
+
+        return FirefoxInstallation {
+            .executable = move(executable),
+            .arguments = {
+                "run"sv,
+                "--env=MOZ_GTK_TITLEBAR_DECORATION=system"sv,
+                "org.mozilla.firefox"sv,
+            },
+            .profiles_ini = LexicalPath::join(Core::StandardPaths::home_directory(), ".var"sv, "app"sv, "org.mozilla.firefox"sv, ".mozilla"sv, "firefox"sv, "profiles.ini"sv),
+        };
+    }
+
+    if (canonical_path.value() == "/usr/bin/snap"sv) {
+        return FirefoxInstallation {
+            .executable = LexicalPath { candidate },
+            .arguments = {},
+            .profiles_ini = LexicalPath::join(Core::StandardPaths::home_directory(), "snap"sv, "firefox"sv, "common"sv, ".mozilla"sv, "firefox"sv, "profiles.ini"sv),
+        };
+    }
+
+    if (candidate.starts_with("/snap/"sv) || canonical_path.value().starts_with("/snap/"sv))
+        return {};
+    if (candidate.starts_with("/var/lib/flatpak/"sv) || canonical_path.value().starts_with("/var/lib/flatpak/"sv))
+        return {};
+    if (candidate.contains("/.var/app/org.mozilla.firefox/"sv) || canonical_path.value().contains("/.var/app/org.mozilla.firefox/"sv))
+        return {};
+#endif
+
+    return FirefoxInstallation {
+        .executable = LexicalPath { canonical_path.release_value() },
+        .arguments = {},
+        .profiles_ini = {},
+    };
+}
+
+static Optional<FirefoxInstallation> find_firefox_in_path()
+{
+    static constexpr auto EXECUTABLE_NAMES = to_array<StringView>({
+        "firefox"sv,
+#if defined(AK_OS_LINUX)
+        "flatpak"sv,
+#endif
+    });
+
+    auto search_path = Core::Environment::get("PATH"sv).value_or(DEFAULT_PATH_SV);
+
+    for (auto executable_name : EXECUTABLE_NAMES) {
+        for (auto directory : search_path.split_view(':')) {
+            auto candidate = LexicalPath::join(directory, executable_name);
+
+            if (auto installation = firefox_installation_from_binary(candidate.string()); installation.has_value())
+                return installation;
+        }
+    }
+
+    return {};
+}
+
+static Optional<FirefoxInstallation> find_firefox_installation()
+{
+#if defined(AK_OS_MACOS)
+    static constexpr auto APPLICATION_NAME = "Firefox.app"sv;
+
+    auto candidate = LexicalPath::join("/Applications"sv, APPLICATION_NAME, "Contents"sv, "MacOS"sv, "firefox"sv);
+    if (auto installation = firefox_installation_from_binary(candidate.string()); installation.has_value())
+        return installation;
+
+    return find_firefox_in_path();
+#else
+    return find_firefox_in_path();
+#endif
+}
+
+NonnullOwnPtr<FirefoxClient> FirefoxClient::create()
+{
+    return adopt_own(*new FirefoxClient());
+}
+
+FirefoxClient::~FirefoxClient()
+{
+    if (is_running())
+        (void)Core::Process::terminate_process(m_process->pid(), Core::Process::TerminationMode::Graceful);
+}
+
+bool FirefoxClient::is_running() const
+{
+#if defined(AK_OS_WINDOWS)
+    // FIXME: Implement actual live-process detection for this PID on Windows.
+    return m_process.has_value();
+#else
+    return m_process.has_value() && !Core::System::kill(m_process->pid(), 0).is_error();
+#endif
+}
+
+ErrorOr<void> FirefoxClient::ensure_running(u16 port, u64 tab_id)
+{
+    if (is_running())
+        return {};
+
+    auto installation = find_firefox_installation();
+    if (!installation.has_value())
+        return Error::from_string_literal("No Firefox installation was found");
+
+    auto arguments = installation->arguments;
+    arguments.append("-no-remote"sv);
+#if defined(AK_OS_MACOS)
+    arguments.append("-foreground"sv);
+#endif
+
+#if defined(AK_OS_LINUX)
+    if (installation->profiles_ini.has_value()) {
+        auto profile = TRY(ensure_confined_firefox_profile(*installation));
+        TRY(prepare_firefox_profile(profile));
+
+        arguments.append("-P"sv);
+        arguments.append(PROFILE_NAME);
+    } else
+#endif
+    {
+        TRY(prepare_firefox_profile(profile_directory()));
+
+        arguments.append("-profile"sv);
+        arguments.append(profile_directory().string());
+    }
+
+    arguments.extend({
+        "--width"sv,
+        "1280"sv,
+        "--height"sv,
+        "850"sv,
+        ByteString::formatted("about:devtools-toolbox?type=tab&id={}&host=localhost&port={}", tab_id, port),
+    });
+
+    auto executable = installation->executable.string();
+    bool search_for_executable_in_path = false;
+
+#if defined(AK_OS_LINUX)
+    if (installation->executable.basename() != "flatpak"sv) {
+        arguments.prepend({
+            "MOZ_GTK_TITLEBAR_DECORATION=system"sv,
+            move(executable),
+        });
+        executable = "env";
+        search_for_executable_in_path = true;
+    }
+#endif
+
+    m_process = TRY(Core::Process::spawn({
+        .name = "devtools-client"sv,
+        .executable = move(executable),
+        .search_for_executable_in_path = search_for_executable_in_path,
+        .die_with_parent = true,
+        .arguments = arguments,
+    }));
+
+    return {};
+}
+
+}
+
+FILE: Libraries/LibDevTools/FirefoxClient.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Error.h>
+#include <AK/NonnullOwnPtr.h>
+#include <AK/Optional.h>
+#include <LibCore/Process.h>
+#include <LibDevTools/Forward.h>
+
+namespace DevTools {
+
+class DEVTOOLS_API FirefoxClient {
+public:
+    static NonnullOwnPtr<FirefoxClient> create();
+    ~FirefoxClient();
+
+    ErrorOr<void> ensure_running(u16 port, u64 tab_id);
+    bool is_running() const;
+
+private:
+    FirefoxClient() = default;
+
+    Optional<Core::Process> m_process;
+};
+
+}
+
 FILE: Libraries/LibDevTools/Forward.h
 /*
  * Copyright (c) 2025, Tim Flynn <trflynn89@ladybird.org>
@@ -97443,10 +97884,10 @@ FILE: Libraries/LibDevTools/Forward.h
 
 namespace DevTools {
 
-class Actor;
 class AccessibilityActor;
 class AccessibilityNodeActor;
 class AccessibilityWalkerActor;
+class Actor;
 class Connection;
 class ConsoleActor;
 class CookiesActor;
@@ -97454,6 +97895,7 @@ class CSSPropertiesActor;
 class DeviceActor;
 class DevToolsDelegate;
 class DevToolsServer;
+class FirefoxClient;
 class FrameActor;
 class HighlighterActor;
 class IndexedDBActor;
@@ -97468,9 +97910,9 @@ class PreferenceActor;
 class ProcessActor;
 class RootActor;
 class SourceActor;
+class StorageActor;
 class StyleRuleActor;
 class StyleSheetsActor;
-class StorageActor;
 class TabActor;
 class TargetConfigurationActor;
 class ThreadActor;
@@ -112056,6 +112498,7 @@ FILE: Libraries/LibGfx/Color.cpp
 #include <AK/Assertions.h>
 #include <AK/ByteString.h>
 #include <AK/CharacterTypes.h>
+#include <AK/Math.h>
 #include <AK/Optional.h>
 #include <AK/StringConversions.h>
 #include <AK/Utf16String.h>
@@ -112070,6 +112513,18 @@ FILE: Libraries/LibGfx/Color.cpp
 namespace Gfx {
 
 namespace {
+
+static auto const g_linearized_srgb_components = [] {
+    Array<double, 256> components;
+    for (size_t i = 0; i < components.size(); ++i) {
+        auto srgb_component = i / 255.0;
+        if (srgb_component <= 0.04045)
+            components[i] = srgb_component / 12.92;
+        else
+            components[i] = AK::pow((srgb_component + 0.055) / 1.055, 2.4);
+    }
+    return components;
+}();
 
 char nth_digit(u32 value, u8 digit)
 {
@@ -112150,15 +112605,9 @@ double Color::relative_luminance() const
     //   * GsRGB = G8bit/255
     //   * BsRGB = B8bit/255
     // The "^" character is the exponentiation operator. (Formula taken from [SRGB].)
-    auto linearized_srgb_component = [](u8 component) {
-        auto srgb_component = component / 255.0;
-        if (srgb_component <= 0.04045)
-            return srgb_component / 12.92;
-        return AK::pow((srgb_component + 0.055) / 1.055, 2.4);
-    };
-    return 0.2126 * linearized_srgb_component(red())
-        + 0.7152 * linearized_srgb_component(green())
-        + 0.0722 * linearized_srgb_component(blue());
+    return 0.2126 * g_linearized_srgb_components[red()]
+        + 0.7152 * g_linearized_srgb_components[green()]
+        + 0.0722 * g_linearized_srgb_components[blue()];
 }
 
 // https://w3c.github.io/wcag/guidelines/22/#dfn-contrast-ratio
@@ -517327,10 +517776,10 @@ CSSPixels ComputedProperties::line_height(FontComputer const& font_computer) con
     VERIFY_NOT_REACHED();
 }
 
-LineHeightData ComputedProperties::line_height_data(FontComputer const& font_computer) const
+LineHeightData ComputedProperties::line_height_data() const
 {
     auto const& value = property(PropertyID::LineHeight);
-    LineHeightData data { .used_value = line_height(font_computer) };
+    LineHeightData data;
 
     if (value.is_keyword() && value.to_keyword() == Keyword::Normal) {
         data.computed_value = LineHeightData::Normal {};
@@ -519851,7 +520300,7 @@ public:
     int math_depth() const;
     [[nodiscard]] static CSSPixels normal_line_height(Gfx::FontPixelMetrics const&);
     [[nodiscard]] CSSPixels line_height(FontComputer const&) const;
-    [[nodiscard]] LineHeightData line_height_data(FontComputer const&) const;
+    [[nodiscard]] LineHeightData line_height_data() const;
     [[nodiscard]] CSSPixels font_size() const;
     double font_weight() const;
     Percentage font_width() const;
@@ -520002,10 +520451,39 @@ FILE: Libraries/LibWeb/CSS/ComputedValues.cpp
 
 namespace Web::CSS {
 
+static constexpr bool style_group_payload_is_rust_native(ComputedValuesFFI::StyleGroupLifecycle lifecycle)
+{
+    switch (lifecycle) {
+    case ComputedValuesFFI::StyleGroupLifecycle::Cpp:
+    case ComputedValuesFFI::StyleGroupLifecycle::CppWithBorderFacts:
+    case ComputedValuesFFI::StyleGroupLifecycle::CppWithInheritedTextFacts:
+    case ComputedValuesFFI::StyleGroupLifecycle::CppWithFontFacts:
+        return false;
+    case ComputedValuesFFI::StyleGroupLifecycle::InheritedTable:
+    case ComputedValuesFFI::StyleGroupLifecycle::InheritedBox:
+    case ComputedValuesFFI::StyleGroupLifecycle::Sizing:
+    case ComputedValuesFFI::StyleGroupLifecycle::Alignment:
+    case ComputedValuesFFI::StyleGroupLifecycle::SVGReset:
+    case ComputedValuesFFI::StyleGroupLifecycle::Surround:
+    case ComputedValuesFFI::StyleGroupLifecycle::Box:
+        return true;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+template<typename T>
+static consteval ComputedValuesFFI::StyleGroupLifecycle style_group_lifecycle_of()
+{
+    if constexpr (requires { T::style_group_lifecycle; })
+        return T::style_group_lifecycle;
+    else
+        return ComputedValuesFFI::StyleGroupLifecycle::Cpp;
+}
+
 template<typename T>
 static consteval ComputedValuesFFI::StyleGroupVTable make_style_group_vtable()
 {
-    if constexpr (requires { T::style_group_lifecycle; }) {
+    if constexpr (style_group_payload_is_rust_native(style_group_lifecycle_of<T>())) {
         return {
             .lifecycle = T::style_group_lifecycle,
             .size = sizeof(T),
@@ -520017,7 +520495,7 @@ static consteval ComputedValuesFFI::StyleGroupVTable make_style_group_vtable()
         };
     }
     return {
-        .lifecycle = ComputedValuesFFI::StyleGroupLifecycle::Cpp,
+        .lifecycle = style_group_lifecycle_of<T>(),
         .size = sizeof(T),
         .align = alignof(T),
         .default_construct = [](void* payload) {
@@ -520060,8 +520538,6 @@ static constexpr Array text_reset_group_properties {
     PropertyID::TextDecorationThickness,
     PropertyID::TextDecorationStyle,
     PropertyID::TextDecorationColor,
-    PropertyID::TextOverflow,
-    PropertyID::UnicodeBidi,
     PropertyID::WhiteSpaceTrim,
 };
 
@@ -520124,13 +520600,10 @@ static constexpr Array misc_reset_group_properties {
     PropertyID::Appearance,
     PropertyID::OutlineStyle,
     PropertyID::ObjectFit,
-    PropertyID::ColumnCount,
-    PropertyID::ColumnWidth,
     PropertyID::ColumnHeight,
     PropertyID::OutlineColor,
     PropertyID::OutlineOffset,
     PropertyID::OutlineWidth,
-    PropertyID::TableLayout,
     PropertyID::UserSelect,
     PropertyID::ObjectPosition,
     PropertyID::ViewTransitionName,
@@ -520240,7 +520713,6 @@ static constexpr Array grid_group_properties {
     PropertyID::GridAutoRows,
     PropertyID::GridTemplateColumns,
     PropertyID::GridTemplateRows,
-    PropertyID::GridAutoFlow,
     PropertyID::GridColumnEnd,
     PropertyID::GridColumnStart,
     PropertyID::GridRowEnd,
@@ -520405,8 +520877,6 @@ static void register_style_group_field_descriptors()
     add(text_reset, PropertyID::TextDecorationThickness, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::Auto), nullptr);
     add(text_reset, PropertyID::TextDecorationStyle, offsetof(TextReset, text_decoration_style), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_text_decoration_style>());
     add(text_reset, PropertyID::TextDecorationColor, offsetof(TextReset, text_decoration_color), GROUP_FIELD_COLOR, 0, nullptr);
-    add(text_reset, PropertyID::TextOverflow, offsetof(TextReset, text_overflow), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_text_overflow>());
-    add(text_reset, PropertyID::UnicodeBidi, offsetof(TextReset, unicode_bidi), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_unicode_bidi>());
     add(text_reset, PropertyID::WhiteSpaceTrim, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::None), nullptr);
 
     using Effects = ComputedValues::EffectsValues;
@@ -520432,13 +520902,10 @@ static void register_style_group_field_descriptors()
     add(misc_reset, PropertyID::Appearance, offsetof(MiscReset, computed_appearance), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_appearance>());
     add(misc_reset, PropertyID::OutlineStyle, offsetof(MiscReset, outline_style), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_outline_style>());
     add(misc_reset, PropertyID::ObjectFit, offsetof(MiscReset, object_fit), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_object_fit>());
-    add(misc_reset, PropertyID::ColumnCount, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::Auto), nullptr);
-    add(misc_reset, PropertyID::ColumnWidth, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::Auto), nullptr);
     add(misc_reset, PropertyID::ColumnHeight, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::Auto), nullptr);
     add(misc_reset, PropertyID::OutlineColor, offsetof(MiscReset, outline_color), GROUP_FIELD_COLOR_OR_KEYWORD, to_underlying(Keyword::Auto), nullptr);
     add(misc_reset, PropertyID::OutlineOffset, 0, GROUP_FIELD_REQUIRE_PX, 0, nullptr, 0);
     add(misc_reset, PropertyID::OutlineWidth, offsetof(MiscReset, outline_width), GROUP_FIELD_CSS_PIXELS_NON_NEGATIVE, 0, nullptr);
-    add(misc_reset, PropertyID::TableLayout, offsetof(MiscReset, table_layout), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_table_layout>());
     add(misc_reset, PropertyID::UserSelect, offsetof(MiscReset, user_select), GROUP_FIELD_ENUM_KEYWORD, 0, &keyword_code_table<keyword_to_user_select>());
     add(misc_reset, PropertyID::ObjectPosition, 0, GROUP_FIELD_REQUIRE_INITIAL_VALUE, 0, nullptr);
     add(misc_reset, PropertyID::ViewTransitionName, 0, GROUP_FIELD_REQUIRE_KEYWORD, to_underlying(Keyword::None), nullptr);
@@ -520632,6 +521099,54 @@ static_assert(sizeof(Size) == sizeof(ComputedValuesFFI::ComputedSize));
 static_assert(alignof(Size) == alignof(ComputedValuesFFI::ComputedSize));
 static_assert(sizeof(RustStyleValueHandle) == sizeof(StyleValueFFI::StyleValueData const*));
 static_assert(alignof(RustStyleValueHandle) == alignof(StyleValueFFI::StyleValueData const*));
+
+// The border group keeps its C++ lifecycle, but its four leading BorderData
+// members double as the Rust BorderLayoutFacts prefix that layout reads as
+// typed fields.
+static_assert(sizeof(Gfx::Color) == sizeof(u32));
+static_assert(sizeof(LineStyle) == sizeof(u8));
+static_assert(sizeof(BorderData) == sizeof(ComputedValuesFFI::ComputedBorderSide));
+static_assert(offsetof(BorderData, color) == offsetof(ComputedValuesFFI::ComputedBorderSide, color));
+static_assert(offsetof(BorderData, line_style) == offsetof(ComputedValuesFFI::ComputedBorderSide, line_style));
+static_assert(offsetof(BorderData, width) == offsetof(ComputedValuesFFI::ComputedBorderSide, width));
+static_assert(offsetof(ComputedValues::BorderValues, border_left) == offsetof(ComputedValuesFFI::BorderLayoutFacts, border_left));
+static_assert(offsetof(ComputedValues::BorderValues, border_top) == offsetof(ComputedValuesFFI::BorderLayoutFacts, border_top));
+static_assert(offsetof(ComputedValues::BorderValues, border_right) == offsetof(ComputedValuesFFI::BorderLayoutFacts, border_right));
+static_assert(offsetof(ComputedValues::BorderValues, border_bottom) == offsetof(ComputedValuesFFI::BorderLayoutFacts, border_bottom));
+static_assert(sizeof(ComputedValuesFFI::BorderLayoutFacts) <= offsetof(ComputedValues::BorderValues, border_left_color_style_value));
+
+// The inherited-text group keeps its C++ lifecycle, but its leading members
+// double as the Rust InheritedTextLayoutFacts prefix that layout reads as
+// typed fields.
+static_assert(sizeof(TextIndentData) == sizeof(ComputedValuesFFI::ComputedTextIndent));
+static_assert(offsetof(TextIndentData, length_percentage) == offsetof(ComputedValuesFFI::ComputedTextIndent, length_percentage));
+static_assert(offsetof(TextIndentData, each_line) == offsetof(ComputedValuesFFI::ComputedTextIndent, each_line));
+static_assert(offsetof(TextIndentData, hanging) == offsetof(ComputedValuesFFI::ComputedTextIndent, hanging));
+static_assert(offsetof(ComputedValues::InheritedTextValues, text_align) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, text_align));
+static_assert(offsetof(ComputedValues::InheritedTextValues, text_justify) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, text_justify));
+static_assert(offsetof(ComputedValues::InheritedTextValues, white_space_collapse) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, white_space_collapse));
+static_assert(offsetof(ComputedValues::InheritedTextValues, text_wrap_mode) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, text_wrap_mode));
+static_assert(offsetof(ComputedValues::InheritedTextValues, word_break) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, word_break));
+static_assert(offsetof(ComputedValues::InheritedTextValues, tab_size_is_number) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, tab_size_is_number));
+static_assert(offsetof(ComputedValues::InheritedTextValues, letter_spacing) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, letter_spacing));
+static_assert(offsetof(ComputedValues::InheritedTextValues, word_spacing) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, word_spacing));
+static_assert(offsetof(ComputedValues::InheritedTextValues, tab_size_length) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, tab_size_length));
+static_assert(offsetof(ComputedValues::InheritedTextValues, tab_size_number) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, tab_size_number));
+static_assert(offsetof(ComputedValues::InheritedTextValues, text_indent) == offsetof(ComputedValuesFFI::InheritedTextLayoutFacts, text_indent));
+static_assert(sizeof(ComputedValuesFFI::InheritedTextLayoutFacts) <= offsetof(ComputedValues::InheritedTextValues, color));
+
+// The font group keeps its C++ lifecycle, but its leading members double as
+// the Rust FontLayoutFacts prefix that layout reads as typed fields.
+static_assert(sizeof(RefPtr<Gfx::FontCascadeList const>) == sizeof(void const*));
+static_assert(offsetof(ComputedValues::FontValues, font_size) == offsetof(ComputedValuesFFI::FontLayoutFacts, font_size));
+static_assert(offsetof(ComputedValues::FontValues, line_height_used) == offsetof(ComputedValuesFFI::FontLayoutFacts, line_height_used));
+static_assert(offsetof(ComputedValues::FontValues, font_variant_emoji) == offsetof(ComputedValuesFFI::FontLayoutFacts, font_variant_emoji));
+static_assert(offsetof(ComputedValues::FontValues, font_ascent) == offsetof(ComputedValuesFFI::FontLayoutFacts, font_ascent));
+static_assert(offsetof(ComputedValues::FontValues, font_descent) == offsetof(ComputedValuesFFI::FontLayoutFacts, font_descent));
+static_assert(offsetof(ComputedValues::FontValues, font_x_height) == offsetof(ComputedValuesFFI::FontLayoutFacts, font_x_height));
+static_assert(offsetof(ComputedValues::FontValues, first_available_font) == offsetof(ComputedValuesFFI::FontLayoutFacts, first_available_font));
+static_assert(offsetof(ComputedValues::FontValues, font_list) == offsetof(ComputedValuesFFI::FontLayoutFacts, font_cascade_list));
+static_assert(sizeof(ComputedValuesFFI::FontLayoutFacts) <= offsetof(ComputedValues::FontValues, font_families));
 
 void const* style_group_default_payload(size_t group_index)
 {
@@ -520896,6 +521411,28 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
     if (anchor_adopted)
         computed_values.adopt_anchor_group(const_cast<void*>(anchor_payload));
 
+    // https://drafts.csswg.org/css-anchor-position-1/#position-anchor
+    auto const& position_anchor_value = computed_style.property(PropertyID::PositionAnchor);
+    PositionAnchor position_anchor;
+    if (position_anchor_value.is_custom_ident()) {
+        position_anchor.type = PositionAnchor::Type::Name;
+        position_anchor.name = position_anchor_value.as_custom_ident().custom_ident();
+    } else {
+        switch (position_anchor_value.to_keyword()) {
+        case Keyword::Normal:
+            position_anchor.type = PositionAnchor::Type::Normal;
+            break;
+        case Keyword::None:
+            position_anchor.type = PositionAnchor::Type::None;
+            break;
+        case Keyword::Auto:
+            position_anchor.type = PositionAnchor::Type::Auto;
+            break;
+        default:
+            VERIFY_NOT_REACHED();
+        }
+    }
+
     auto* surround_payload = ComputedValuesFFI::rust_build_surround_group(
         SurroundValues::style_group_index,
         computed_style.property(PropertyID::Top).rust_style_value_data(),
@@ -520910,6 +521447,7 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
         computed_style.property(PropertyID::PaddingRight).rust_style_value_data(),
         computed_style.property(PropertyID::PaddingBottom).rust_style_value_data(),
         computed_style.property(PropertyID::PaddingLeft).rust_style_value_data(),
+        position_anchor.name.has_value() ? position_anchor.name->to_raw_leaked() : 0,
         inherit_parent ? static_cast<void const*>(inherit_parent->m_noninherited.surround.operator->()) : nullptr);
     VERIFY(surround_payload);
     computed_values.adopt_surround_group(const_cast<void*>(surround_payload));
@@ -520917,6 +521455,10 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
     auto containment = computed_style.contain();
     auto container_type = computed_style.container_type();
     auto z_index = computed_style.z_index();
+    Optional<int> column_count;
+    if (auto const& column_count_value = computed_style.property(PropertyID::ColumnCount); column_count_value.to_keyword() != Keyword::Auto)
+        column_count = int_from_style_value(NonnullRefPtr<StyleValue const> { column_count_value });
+    auto const grid_auto_flow = computed_style.grid_auto_flow();
     ComputedValuesFFI::BoxValues box_group_values {
         .display = to_ffi_display(computed_style.display()),
         .display_before_box_type_transformation = to_ffi_display(computed_style.display_before_box_type_transformation()),
@@ -520927,6 +521469,14 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
         .overflow_y = static_cast<u8>(to_underlying(computed_style.overflow_y())),
         .box_sizing = static_cast<u8>(to_underlying(computed_style.box_sizing())),
         .resize = static_cast<u8>(to_underlying(computed_style.resize())),
+        .text_overflow = static_cast<u8>(to_underlying(computed_style.text_overflow())),
+        .unicode_bidi = static_cast<u8>(to_underlying(computed_style.unicode_bidi())),
+        .table_layout = static_cast<u8>(to_underlying(computed_style.table_layout())),
+        .grid_auto_flow_row = grid_auto_flow.row,
+        .grid_auto_flow_dense = grid_auto_flow.dense,
+        .column_width = to_ffi_computed_size(computed_style.size_value(PropertyID::ColumnWidth)),
+        .column_count_has_value = column_count.has_value(),
+        .column_count = column_count.value_or(0),
         .has_z_index = z_index.has_value(),
         .z_index = z_index.value_or(0),
         .vertical_align = to_ffi_vertical_align(computed_style.vertical_align()),
@@ -521102,7 +521652,7 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
     computed_values.set_font_style({ font_style.font_style(), move(font_style_angle) });
     computed_values.set_font_optical_sizing(computed_style.font_optical_sizing());
     computed_values.set_font_feature_data(computed_style.font_feature_data());
-    computed_values.set_line_height(computed_style.line_height_data(document.font_computer()));
+    computed_values.set_line_height(computed_style.line_height_data(), computed_style.line_height(document.font_computer()));
     computed_values.set_font_variant_emoji(computed_style.font_variant_emoji());
 
     Array<ComputedValuesFFI::FfiGroupValueEntry, animation_group_properties.size()> animation_group_values;
@@ -521547,27 +522097,6 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
     if (!misc_reset_adopted)
         computed_values.set_computed_appearance(keyword_to_appearance(computed_style.property(PropertyID::Appearance).to_keyword()).release_value());
 
-    // https://drafts.csswg.org/css-anchor-position-1/#position-anchor
-    auto const& position_anchor_value = computed_style.property(CSS::PropertyID::PositionAnchor);
-    CSS::PositionAnchor position_anchor;
-    if (position_anchor_value.is_custom_ident()) {
-        position_anchor.type = CSS::PositionAnchor::Type::Name;
-        position_anchor.name = position_anchor_value.as_custom_ident().custom_ident();
-    } else {
-        switch (position_anchor_value.to_keyword()) {
-        case CSS::Keyword::Normal:
-            position_anchor.type = CSS::PositionAnchor::Type::Normal;
-            break;
-        case CSS::Keyword::None:
-            position_anchor.type = CSS::PositionAnchor::Type::None;
-            break;
-        case CSS::Keyword::Auto:
-            position_anchor.type = CSS::PositionAnchor::Type::Auto;
-            break;
-        default:
-            VERIFY_NOT_REACHED();
-        }
-    }
     if (!anchor_adopted)
         computed_values.set_position_anchor(move(position_anchor));
 
@@ -521765,7 +522294,6 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
         computed_values.set_text_align(computed_style.text_align());
     if (!inherited_text_adopted)
         computed_values.set_text_justify(computed_style.text_justify());
-    computed_values.set_text_overflow(computed_style.text_overflow());
     auto const& text_underline_offset_value = computed_style.property(CSS::PropertyID::TextUnderlineOffset);
     CSS::TextUnderlineOffset text_underline_offset;
     text_underline_offset.used_value = computed_style.text_underline_offset();
@@ -522029,8 +522557,6 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
         computed_values.set_grid_row_start(computed_style.grid_row_start());
     if (!grid_adopted)
         computed_values.set_grid_template_areas(computed_style.grid_template_areas());
-    if (!grid_adopted)
-        computed_values.set_grid_auto_flow(computed_style.grid_auto_flow());
 
     if (!inherited_svg_adopted)
         computed_values.set_fill(computed_style.fill(color_resolution_context));
@@ -522119,14 +522645,9 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
     if (!inherited_svg_adopted)
         computed_values.set_dominant_baseline(computed_style.dominant_baseline());
 
-    if (auto const& column_count = computed_style.property(CSS::PropertyID::ColumnCount); !misc_reset_adopted && column_count.to_keyword() != Keyword::Auto)
-        computed_values.set_column_count(CSS::ColumnCount::make_integer(int_from_style_value(NonnullRefPtr<StyleValue const> { column_count })));
-
     if (!misc_reset_adopted)
         computed_values.set_column_span(computed_style.column_span());
 
-    if (!misc_reset_adopted)
-        computed_values.set_column_width(computed_style.size_value(CSS::PropertyID::ColumnWidth));
     if (!misc_reset_adopted)
         computed_values.set_column_height(computed_style.size_value(CSS::PropertyID::ColumnHeight));
 
@@ -522135,9 +522656,6 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
 
     if (!inherited_table_adopted)
         computed_values.set_empty_cells(computed_style.empty_cells());
-
-    if (!misc_reset_adopted)
-        computed_values.set_table_layout(computed_style.table_layout());
 
     if (!misc_reset_adopted)
         computed_values.set_touch_action(computed_style.touch_action());
@@ -522166,7 +522684,6 @@ NonnullRefPtr<ComputedValues const> ComputedValues::create(ComputedProperties co
         computed_values.set_object_position(computed_style.object_position());
     if (!inherited_box_adopted)
         computed_values.set_direction(computed_style.direction());
-    computed_values.set_unicode_bidi(computed_style.unicode_bidi());
     if (!misc_reset_adopted)
         computed_values.set_scroll_behavior(CSS::keyword_to_scroll_behavior(computed_style.property(CSS::PropertyID::ScrollBehavior).to_keyword()).release_value());
     if (!inherited_ui_adopted)
@@ -522608,7 +523125,6 @@ public:
     static FontVariantEmoji font_variant_emoji() { return FontVariantEmoji::Normal; }
     static CSSPixels word_spacing() { return 0; }
     static CSSPixels letter_spacing() { return 0; }
-    static Variant<CSSPixels, double> tab_size() { return 8; }
     static TextAlign text_align() { return TextAlign::Start; }
     static TextJustify text_justify() { return TextJustify::Auto; }
     static Positioning position() { return Positioning::Static; }
@@ -522622,7 +523138,6 @@ public:
     static TextDecorationSkipInk text_decoration_skip_ink() { return TextDecorationSkipInk::Auto; }
     static TextDecorationStyle text_decoration_style() { return TextDecorationStyle::Solid; }
     static TextTransform text_transform() { return TextTransform::None; }
-    static TextOverflow text_overflow() { return TextOverflow::Clip; }
     static TextIndentData text_indent() { return { Length::make_px(0) }; }
     static TextWrapMode text_wrap_mode() { return TextWrapMode::Wrap; }
     static TextWrapStyle text_wrap_style() { return TextWrapStyle::Auto; }
@@ -522693,11 +523208,8 @@ public:
     static GridTrackPlacement grid_column_start() { return GridTrackPlacement::make_auto(); }
     static GridTrackPlacement grid_row_end() { return GridTrackPlacement::make_auto(); }
     static GridTrackPlacement grid_row_start() { return GridTrackPlacement::make_auto(); }
-    static GridAutoFlow grid_auto_flow() { return GridAutoFlow {}; }
-    static ColumnCount column_count() { return ColumnCount::make_auto(); }
     static Variant<LengthPercentage, NormalGap> column_gap() { return NormalGap {}; }
     static ColumnSpan column_span() { return ColumnSpan::None; }
-    static Size column_width() { return Size::make_auto(); }
     static Size column_height() { return Size::make_auto(); }
     static Variant<LengthPercentage, NormalGap> row_gap() { return NormalGap {}; }
     static BorderCollapse border_collapse() { return BorderCollapse::Separate; }
@@ -522709,13 +523221,11 @@ public:
     static CSSPixels outline_offset() { return 0; }
     static OutlineStyle outline_style() { return OutlineStyle::None; }
     static CSSPixels outline_width() { return 3; }
-    static TableLayout table_layout() { return TableLayout::Auto; }
     static QuotesData quotes() { return QuotesData { .type = QuotesData::Type::Auto }; }
     static TransformBox transform_box() { return TransformBox::ViewBox; }
     static TransformStyle transform_style() { return TransformStyle::Flat; }
     static Direction direction() { return Direction::Ltr; }
     static Optional<BaselineMetric> dominant_baseline() { return {}; }
-    static UnicodeBidi unicode_bidi() { return UnicodeBidi::Normal; }
     static WritingMode writing_mode() { return WritingMode::HorizontalTb; }
     static UserSelect user_select() { return UserSelect::Auto; }
     static Isolation isolation() { return Isolation::Auto; }
@@ -523124,7 +523634,6 @@ struct LineHeightData {
     };
 
     Variant<Normal, double, Length> computed_value { Normal {} };
-    CSSPixels used_value { InitialValues::line_height() };
 
     bool operator==(LineHeightData const&) const = default;
 };
@@ -523271,6 +523780,13 @@ inline ComputedValuesFFI::ComputedVerticalAlign to_ffi_vertical_align(Variant<Ve
         return { .is_keyword = true, .keyword = to_underlying(value.get<VerticalAlign>()), .value = { nullptr } };
     auto retained = value.get<LengthPercentage>();
     return { .is_keyword = false, .keyword = 0, .value = { retained.leak_data() } };
+}
+
+// The returned raw struct carries the by-value Size's retained reference for
+// a Rust-owned payload to assume ownership of.
+inline ComputedValuesFFI::ComputedSize to_ffi_computed_size(Size size)
+{
+    return { .kind = size.kind, .value = { exchange(size.value.pointer, nullptr) } };
 }
 
 // Each returned raw carries one leaked reference for a Rust-owned fly string
@@ -523429,7 +523945,12 @@ public:
             return {};
         return m_noninherited.box->z_index;
     }
-    Variant<CSSPixels, double> tab_size() const { return m_inherited.text->tab_size; }
+    Variant<CSSPixels, double> tab_size() const
+    {
+        if (m_inherited.text->tab_size_is_number)
+            return m_inherited.text->tab_size_number;
+        return m_inherited.text->tab_size_length;
+    }
     TextAlign text_align() const { return m_inherited.text->text_align; }
     TextJustify text_justify() const { return m_inherited.text->text_justify; }
     TextIndentData const& text_indent() const { return m_inherited.text->text_indent; }
@@ -523444,7 +523965,7 @@ public:
     TextDecorationStyle text_decoration_style() const { return m_noninherited.text_reset->text_decoration_style; }
     Color text_decoration_color() const { return m_noninherited.text_reset->text_decoration_color; }
     TextTransform text_transform() const { return m_inherited.text->text_transform; }
-    TextOverflow text_overflow() const { return m_noninherited.text_reset->text_overflow; }
+    TextOverflow text_overflow() const { return static_cast<TextOverflow>(m_noninherited.box->text_overflow); }
     Vector<ShadowData> const& text_shadow() const { return m_inherited.text->text_shadow; }
     Positioning position() const { return static_cast<Positioning>(m_noninherited.box->position); }
     PositionAnchor const& position_anchor_value() const { return m_noninherited.anchor->position_anchor; }
@@ -523524,17 +524045,25 @@ public:
     }
     GridTrackSizeList const& grid_auto_columns() const { return m_noninherited.grid->grid_auto_columns; }
     GridTrackSizeList const& grid_auto_rows() const { return m_noninherited.grid->grid_auto_rows; }
-    GridAutoFlow const& grid_auto_flow() const { return m_noninherited.grid->grid_auto_flow; }
+    GridAutoFlow grid_auto_flow() const
+    {
+        return { .row = m_noninherited.box->grid_auto_flow_row, .dense = m_noninherited.box->grid_auto_flow_dense };
+    }
     GridTrackSizeList const& grid_template_columns() const { return m_noninherited.grid->grid_template_columns; }
     GridTrackSizeList const& grid_template_rows() const { return m_noninherited.grid->grid_template_rows; }
     GridTrackPlacement const& grid_column_end() const { return m_noninherited.grid->grid_column_end; }
     GridTrackPlacement const& grid_column_start() const { return m_noninherited.grid->grid_column_start; }
     GridTrackPlacement const& grid_row_end() const { return m_noninherited.grid->grid_row_end; }
     GridTrackPlacement const& grid_row_start() const { return m_noninherited.grid->grid_row_start; }
-    ColumnCount column_count() const { return m_noninherited.misc->column_count; }
+    ColumnCount column_count() const
+    {
+        if (!m_noninherited.box->column_count_has_value)
+            return ColumnCount::make_auto();
+        return ColumnCount::make_integer(m_noninherited.box->column_count);
+    }
     Variant<LengthPercentage, NormalGap> column_gap() const { return gap(m_noninherited.alignment->column_gap); }
     ColumnSpan const& column_span() const { return m_noninherited.misc->column_span; }
-    Size const& column_width() const { return m_noninherited.misc->column_width; }
+    Size const& column_width() const { return Size::view(m_noninherited.box->column_width); }
     Size const& column_height() const { return m_noninherited.misc->column_height; }
     Variant<LengthPercentage, NormalGap> row_gap() const { return gap(m_noninherited.alignment->row_gap); }
     BorderCollapse border_collapse() const { return static_cast<BorderCollapse>(m_inherited.table->border_collapse); }
@@ -523544,7 +524073,7 @@ public:
     Position object_position() const { return m_noninherited.misc->object_position; }
     Direction direction() const { return static_cast<Direction>(m_inherited.box->direction); }
     Optional<BaselineMetric> dominant_baseline() const { return m_inherited.svg->dominant_baseline; }
-    UnicodeBidi unicode_bidi() const { return m_noninherited.text_reset->unicode_bidi; }
+    UnicodeBidi unicode_bidi() const { return static_cast<UnicodeBidi>(m_noninherited.box->unicode_bidi); }
     WritingMode writing_mode() const { return static_cast<WritingMode>(m_inherited.box->writing_mode); }
 
     bool inline_axis_is_reverse() const
@@ -523741,7 +524270,7 @@ public:
     FontFeatureData const& font_feature_data() const { return m_inherited.font->font_feature_data; }
     Optional<Utf16FlyString> font_language_override() const { return m_inherited.font->font_language_override; }
     HashMap<Utf16FlyString, double> font_variation_settings() const { return m_inherited.font->font_variation_settings; }
-    CSSPixels line_height() const { return m_inherited.font->line_height.used_value; }
+    CSSPixels line_height() const { return m_inherited.font->line_height_used; }
     LineHeightData const& line_height_data() const { return m_inherited.font->line_height; }
 
     Color outline_color() const { return m_noninherited.misc->outline_color; }
@@ -523750,7 +524279,7 @@ public:
     OutlineStyle outline_style() const { return m_noninherited.misc->outline_style; }
     CSSPixels outline_width() const { return m_noninherited.misc->outline_width; }
 
-    TableLayout table_layout() const { return m_noninherited.misc->table_layout; }
+    TableLayout table_layout() const { return static_cast<TableLayout>(m_noninherited.box->table_layout); }
 
     QuotesData quotes() const { return m_inherited.list->quotes; }
 
@@ -523874,29 +524403,37 @@ public:
         bool operator==(InheritedSVGValues const&) const = default;
     };
 
+    // The group's payload lifecycle stays in C++, but the members up to and
+    // including text_indent mirror the Rust InheritedTextLayoutFacts prefix,
+    // pinned by static asserts in ComputedValues.cpp, so layout reads them as
+    // typed fields. The computed tab-size is stored as an explicit
+    // length-or-number triple because a Variant has no FFI-stable layout.
     struct InheritedTextValues {
         static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::InheritedTextValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::CppWithInheritedTextFacts;
+        TextAlign text_align { InitialValues::text_align() };
+        TextJustify text_justify { InitialValues::text_justify() };
+        WhiteSpaceCollapse white_space_collapse { InitialValues::white_space_collapse() };
+        TextWrapMode text_wrap_mode { InitialValues::text_wrap_mode() };
+        WordBreak word_break { InitialValues::word_break() };
+        bool tab_size_is_number { true };
+        CSSPixels letter_spacing { InitialValues::letter_spacing() };
+        CSSPixels word_spacing { InitialValues::word_spacing() };
+        CSSPixels tab_size_length { 0 };
+        double tab_size_number { 8 };
+        TextIndentData text_indent { InitialValues::text_indent() };
         Color color { InitialValues::color() };
         RustStyleValueHandle color_style_value;
         Color webkit_text_fill_color { InitialValues::color() };
         bool webkit_text_fill_color_is_current_color { true };
         Vector<ShadowData> text_shadow;
-        TextAlign text_align { InitialValues::text_align() };
-        TextJustify text_justify { InitialValues::text_justify() };
         TextTransform text_transform { InitialValues::text_transform() };
-        TextWrapMode text_wrap_mode { InitialValues::text_wrap_mode() };
         TextWrapStyle text_wrap_style { InitialValues::text_wrap_style() };
         TextDecorationSkipInk text_decoration_skip_ink { InitialValues::text_decoration_skip_ink() };
         TextUnderlinePosition text_underline_position { InitialValues::text_underline_position() };
         TextUnderlineOffset text_underline_offset;
-        TextIndentData text_indent { InitialValues::text_indent() };
-        Variant<CSSPixels, double> tab_size { InitialValues::tab_size() };
-        WhiteSpaceCollapse white_space_collapse { InitialValues::white_space_collapse() };
-        WordBreak word_break { InitialValues::word_break() };
         OverflowWrap overflow_wrap { InitialValues::overflow_wrap() };
-        CSSPixels word_spacing { InitialValues::word_spacing() };
         RustStyleValueHandle word_spacing_style_value;
-        CSSPixels letter_spacing { InitialValues::letter_spacing() };
         RustStyleValueHandle letter_spacing_style_value;
         u64 orphans { InitialValues::orphans() };
         u64 widows { InitialValues::widows() };
@@ -523923,9 +524460,23 @@ public:
 
     // NB: FontValues has no defaulted equality operator because HashMap does not
     //     support equality; the setters compare field-by-field instead.
+    //
+    // The group's payload lifecycle stays in C++, but the members up to and
+    // including font_list mirror the Rust FontLayoutFacts prefix, pinned by
+    // static asserts in ComputedValues.cpp, so layout reads them as typed
+    // fields. The metrics and first_available_font are derived copies that
+    // set_font_list keeps in sync with font_list; the derived pointers
+    // borrow objects font_list keeps alive.
     struct FontValues {
         static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::FontValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::CppWithFontFacts;
         CSSPixels font_size { InitialValues::font_size() };
+        CSSPixels line_height_used { InitialValues::line_height() };
+        FontVariantEmoji font_variant_emoji { InitialValues::font_variant_emoji() };
+        float font_ascent { 0 };
+        float font_descent { 0 };
+        float font_x_height { 0 };
+        Gfx::Font const* first_available_font { nullptr };
         RefPtr<Gfx::FontCascadeList const> font_list {};
         Vector<ComputedFontFamily> font_families { GenericFontFamily::Serif };
         double font_weight { InitialValues::font_weight() };
@@ -523936,7 +524487,6 @@ public:
         Optional<Utf16FlyString> font_language_override;
         HashMap<Utf16FlyString, double> font_variation_settings;
         LineHeightData line_height;
-        FontVariantEmoji font_variant_emoji { InitialValues::font_variant_emoji() };
         MathShift math_shift { InitialValues::math_shift() };
         MathStyle math_style { InitialValues::math_style() };
         int math_depth { InitialValues::math_depth() };
@@ -524023,7 +524573,6 @@ public:
         GridTrackSizeList grid_auto_rows;
         GridTrackSizeList grid_template_columns;
         GridTrackSizeList grid_template_rows;
-        GridAutoFlow grid_auto_flow { InitialValues::grid_auto_flow() };
         GridTrackPlacement grid_column_end { InitialValues::grid_column_end() };
         GridTrackPlacement grid_column_start { InitialValues::grid_column_start() };
         GridTrackPlacement grid_row_end { InitialValues::grid_row_end() };
@@ -524087,8 +524636,6 @@ public:
         TextDecorationThickness text_decoration_thickness { TextDecorationThickness::Auto {} };
         TextDecorationStyle text_decoration_style { InitialValues::text_decoration_style() };
         Color text_decoration_color { InitialValues::color() };
-        TextOverflow text_overflow { InitialValues::text_overflow() };
-        UnicodeBidi unicode_bidi { InitialValues::unicode_bidi() };
         WhiteSpaceTrimData white_space_trim;
 
         bool operator==(TextResetValues const&) const = default;
@@ -524132,8 +524679,13 @@ public:
         bool operator==(BackgroundValues const&) const = default;
     };
 
+    // The group's payload lifecycle stays in C++, but the four BorderData
+    // members lead the struct and mirror the Rust BorderLayoutFacts prefix,
+    // pinned by static asserts in ComputedValues.cpp, so layout reads border
+    // widths and line styles as typed fields.
     struct BorderValues {
         static constexpr size_t style_group_index = to_underlying(StyleGroupIndex::BorderValues);
+        static constexpr auto style_group_lifecycle = ComputedValuesFFI::StyleGroupLifecycle::CppWithBorderFacts;
         BorderData border_left;
         BorderData border_top;
         BorderData border_right;
@@ -524200,13 +524752,10 @@ public:
         Appearance computed_appearance { Appearance::None };
         OutlineStyle outline_style { InitialValues::outline_style() };
         ObjectFit object_fit { InitialValues::object_fit() };
-        ColumnCount column_count { InitialValues::column_count() };
-        Size column_width { InitialValues::column_width() };
         Size column_height { InitialValues::column_height() };
         Color outline_color { InitialValues::outline_color() };
         CSSPixels outline_width { InitialValues::outline_width() };
         CSSPixels outline_offset { InitialValues::outline_offset() };
-        TableLayout table_layout { InitialValues::table_layout() };
         UserSelect user_select { InitialValues::user_select() };
         Position object_position { InitialValues::object_position() };
         Optional<Utf16FlyString> view_transition_name;
@@ -524259,6 +524808,7 @@ public:
                 && right_anchor_inset.pointer == other.right_anchor_inset.pointer
                 && bottom_anchor_inset.pointer == other.bottom_anchor_inset.pointer
                 && left_anchor_inset.pointer == other.left_anchor_inset.pointer
+                && position_anchor_name.raw == other.position_anchor_name.raw
                 && box_equal(margin, other.margin)
                 && box_equal(padding, other.padding);
         }
@@ -524462,7 +525012,14 @@ public:
         //     so pointer comparison would defeat sharing of the font group.
         if (m_values.m_inherited.font->font_list && m_values.m_inherited.font->font_list->equals(*font_list))
             return;
-        m_values.m_inherited.font.access().font_list = move(font_list);
+        auto& font = m_values.m_inherited.font.access();
+        auto const& first_available_font = font_list->font_for_code_point(' ');
+        auto const metrics = first_available_font.pixel_metrics();
+        font.first_available_font = &first_available_font;
+        font.font_ascent = metrics.ascent;
+        font.font_descent = metrics.descent;
+        font.font_x_height = metrics.x_height;
+        font.font_list = move(font_list);
     }
     void set_font_families(Vector<ComputedFontFamily> value)
     {
@@ -524529,11 +525086,14 @@ public:
             return;
         m_values.m_inherited.font.access().font_variation_settings = move(value);
     }
-    void set_line_height(LineHeightData line_height)
+    void set_line_height(LineHeightData line_height, CSSPixels used_value)
     {
-        if (m_values.m_inherited.font->line_height == line_height)
+        auto const& font = *m_values.m_inherited.font;
+        if (font.line_height == line_height && font.line_height_used == used_value)
             return;
-        m_values.m_inherited.font.access().line_height = move(line_height);
+        auto& mutable_font = m_values.m_inherited.font.access();
+        mutable_font.line_height_used = used_value;
+        mutable_font.line_height = move(line_height);
     }
     void set_border_spacing_horizontal(CSSPixels border_spacing_horizontal)
     {
@@ -524697,9 +525257,16 @@ public:
     }
     void set_tab_size(Variant<CSSPixels, double> value)
     {
-        if (m_values.m_inherited.text->tab_size == value)
+        bool const is_number = value.has<double>();
+        CSSPixels const length = is_number ? CSSPixels(0) : value.get<CSSPixels>();
+        double const number = is_number ? value.get<double>() : 0;
+        auto const& text = *m_values.m_inherited.text;
+        if (text.tab_size_is_number == is_number && text.tab_size_length == length && text.tab_size_number == number)
             return;
-        m_values.m_inherited.text.access().tab_size = move(value);
+        auto& mutable_text = m_values.m_inherited.text.access();
+        mutable_text.tab_size_is_number = is_number;
+        mutable_text.tab_size_length = length;
+        mutable_text.tab_size_number = number;
     }
     void set_text_align(TextAlign text_align)
     {
@@ -524773,12 +525340,6 @@ public:
             return;
         m_values.m_inherited.text.access().text_wrap_style = value;
     }
-    void set_text_overflow(TextOverflow value)
-    {
-        if (m_values.m_noninherited.text_reset->text_overflow == value)
-            return;
-        m_values.m_noninherited.text_reset.access().text_overflow = value;
-    }
     void set_text_underline_offset(TextUnderlineOffset value)
     {
         if (m_values.m_inherited.text->text_underline_offset == value)
@@ -524805,10 +525366,23 @@ public:
             return;
         m_values.m_noninherited.box.access().position = to_underlying(position);
     }
+    // The surround payload carries a synchronized copy of the position-anchor
+    // name for the layout engine's anchor lookup; the zero raw means no name.
     void set_position_anchor(PositionAnchor value)
     {
         if (m_values.m_noninherited.anchor->position_anchor == value)
             return;
+        auto const current_name_raw = m_values.m_noninherited.surround->position_anchor_name.raw;
+        bool const surround_name_already_matches = value.name.has_value()
+            ? current_name_raw != 0 && Utf16FlyString::from_raw(current_name_raw) == *value.name
+            : current_name_raw == 0;
+        if (!surround_name_already_matches) {
+            auto& position_anchor_name = m_values.m_noninherited.surround.access().position_anchor_name;
+            if (position_anchor_name.raw)
+                Utf16FlyString::unref_raw(exchange(position_anchor_name.raw, 0));
+            if (value.name.has_value())
+                position_anchor_name.raw = value.name->to_raw_leaked();
+        }
         m_values.m_noninherited.anchor.access().position_anchor = move(value);
     }
     void set_position_area(PositionAreaData value)
@@ -525417,23 +525991,11 @@ public:
             return;
         m_values.m_noninherited.grid.access().grid_row_start = move(value);
     }
-    void set_column_count(ColumnCount value)
-    {
-        if (m_values.m_noninherited.misc->column_count == value)
-            return;
-        m_values.m_noninherited.misc.access().column_count = value;
-    }
     void set_column_span(ColumnSpan column_span)
     {
         if (m_values.m_noninherited.misc->column_span == column_span)
             return;
         m_values.m_noninherited.misc.access().column_span = column_span;
-    }
-    void set_column_width(Size column_width)
-    {
-        if (m_values.m_noninherited.misc->column_width == column_width)
-            return;
-        m_values.m_noninherited.misc.access().column_width = column_width;
     }
     void set_column_height(Size column_height)
     {
@@ -525458,18 +526020,6 @@ public:
         if (m_values.m_noninherited.grid->grid_template_areas == grid_template_areas)
             return;
         m_values.m_noninherited.grid.access().grid_template_areas = move(grid_template_areas);
-    }
-    void set_grid_auto_flow(GridAutoFlow grid_auto_flow)
-    {
-        if (m_values.m_noninherited.grid->grid_auto_flow == grid_auto_flow)
-            return;
-        m_values.m_noninherited.grid.access().grid_auto_flow = grid_auto_flow;
-    }
-    void set_table_layout(TableLayout value)
-    {
-        if (m_values.m_noninherited.misc->table_layout == value)
-            return;
-        m_values.m_noninherited.misc.access().table_layout = value;
     }
     void set_quotes(QuotesData value)
     {
@@ -525500,12 +526050,6 @@ public:
         if (m_values.m_inherited.svg->dominant_baseline == value)
             return;
         m_values.m_inherited.svg.access().dominant_baseline = value;
-    }
-    void set_unicode_bidi(UnicodeBidi value)
-    {
-        if (m_values.m_noninherited.text_reset->unicode_bidi == value)
-            return;
-        m_values.m_noninherited.text_reset.access().unicode_bidi = value;
     }
     void set_writing_mode(WritingMode value)
     {
@@ -669320,610 +669864,3 @@ static GC::Ref<NodeList> create_node_list(JS::Realm& realm, Vector<GC::RawPtr<El
     return StaticNodeList::create(realm, move(nodes));
 }
 
-// https://dom.spec.whatwg.org/#scope-match-a-selectors-string
-// This implements step 3, "match a selector against a tree" with the parsed selectors.
-GC::Ref<NodeList> SelectorQuery::query_all(ParentNode& root) const
-{
-    auto& document = root.document();
-
-    if (m_is_result_cacheable) {
-        if (auto const* cached_elements = document.query_selector_result_cache().get(document, root, *this))
-            return create_node_list(root.realm(), *cached_elements);
-    }
-
-    Vector<GC::RawPtr<Element>> elements;
-    // FIXME: This should be shadow-including. https://drafts.csswg.org/selectors-4/#match-a-selector-against-a-tree
-    root.for_each_in_subtree_of_type<Element>([&](auto& element) {
-        for (auto const& selector : m_selectors) {
-            SelectorMatching::MatchContext context;
-            if (SelectorMatching::matches(selector, element, nullptr, context, root)) {
-                elements.append(element);
-                break;
-            }
-        }
-        return TraversalDecision::Continue;
-    });
-
-    auto node_list = create_node_list(root.realm(), elements);
-    if (m_is_result_cacheable)
-        document.query_selector_result_cache().set(document, root, *this, move(elements));
-    return node_list;
-}
-
-void QuerySelectorResultCache::clear_if_dom_tree_changed(Document const& document)
-{
-    if (m_dom_tree_version == document.dom_tree_version())
-        return;
-    m_entries.clear();
-    m_dom_tree_version = document.dom_tree_version();
-}
-
-Vector<GC::RawPtr<Element>> const* QuerySelectorResultCache::get(Document const& document, ParentNode const& root, SelectorQuery const& query)
-{
-    clear_if_dom_tree_changed(document);
-
-    auto it = m_entries.find(Key { &root, &query });
-    if (it == m_entries.end())
-        return nullptr;
-
-    auto const& entry = it->value;
-    if (entry.root.ptr() != &root
-        || (query.depends_on_character_data() && entry.character_data_version != document.character_data_version())) {
-        m_entries.remove(it);
-        return nullptr;
-    }
-
-    return &entry.elements;
-}
-
-void QuerySelectorResultCache::set(Document const& document, ParentNode const& root, SelectorQuery const& query, Vector<GC::RawPtr<Element>> elements)
-{
-    static constexpr size_t MAX_QUERY_SELECTOR_RESULT_CACHE_SIZE = 64;
-
-    clear_if_dom_tree_changed(document);
-
-    if (m_entries.size() >= MAX_QUERY_SELECTOR_RESULT_CACHE_SIZE)
-        m_entries.remove(m_entries.begin());
-
-    m_entries.set(Key { &root, &query }, Entry { root, query, document.character_data_version(), move(elements) });
-}
-
-void QuerySelectorResultCache::visit_edges(GC::Cell::Visitor&)
-{
-    // Entries intentionally contain only weak or raw GC pointers, so the cache does not keep query roots or matched
-    // elements alive.
-    (void)m_entries;
-}
-
-}
-
-FILE: Libraries/LibWeb/DOM/SelectorQuery.h
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/HashMap.h>
-#include <AK/RefCounted.h>
-#include <LibGC/Cell.h>
-#include <LibGC/Ptr.h>
-#include <LibGC/Weak.h>
-#include <LibWeb/CSS/Selector.h>
-#include <LibWeb/Forward.h>
-
-namespace Web::DOM {
-
-// A selectors string parsed for use by querySelector(All), matches() and closest().
-// Documents cache these per selector string, so one SelectorQuery may be reused by many queries.
-class SelectorQuery : public RefCounted<SelectorQuery> {
-public:
-    static NonnullRefPtr<SelectorQuery> create(CSS::SelectorList&& selectors)
-    {
-        return adopt_ref(*new SelectorQuery(move(selectors)));
-    }
-
-    CSS::SelectorList const& selectors() const { return m_selectors; }
-
-    bool is_result_cacheable() const { return m_is_result_cacheable; }
-    bool depends_on_character_data() const { return m_depends_on_character_data; }
-
-    GC::Ptr<Element> query_first(ParentNode&) const;
-    GC::Ref<NodeList> query_all(ParentNode&) const;
-
-private:
-    explicit SelectorQuery(CSS::SelectorList&&);
-
-    CSS::SelectorList m_selectors;
-
-    // Whether matching can only change when the document's dom_tree_version (plus character_data_version, see below)
-    // changes. Queries with selectors that depend on other state (:hover, :checked, :target, etc) are not cacheable.
-    bool m_is_result_cacheable { false };
-
-    // Whether matching also depends on character data (only :empty), so cached results must additionally be
-    // validated against the document's character_data_version.
-    bool m_depends_on_character_data { false };
-};
-
-// Caches querySelectorAll element lists per (query root, selector query) so that repeated queries against an
-// unchanged document can skip the subtree walk. Entries are validated lazily against the document's mutation
-// version counters, so no notification on DOM mutation is needed: the whole cache is emptied on first use after
-// dom_tree_version has changed.
-class QuerySelectorResultCache {
-    AK_MAKE_NONCOPYABLE(QuerySelectorResultCache);
-    AK_MAKE_NONMOVABLE(QuerySelectorResultCache);
-
-public:
-    QuerySelectorResultCache() = default;
-
-    Vector<GC::RawPtr<Element>> const* get(Document const&, ParentNode const& root, SelectorQuery const&);
-    void set(Document const&, ParentNode const& root, SelectorQuery const&, Vector<GC::RawPtr<Element>>);
-    void visit_edges(GC::Cell::Visitor&);
-
-private:
-    void clear_if_dom_tree_changed(Document const&);
-
-    struct Key {
-        GC::RawPtr<ParentNode const> root;
-        SelectorQuery const* query { nullptr };
-        bool operator==(Key const&) const = default;
-    };
-
-    struct KeyTraits : public DefaultTraits<Key> {
-        static unsigned hash(Key const& key) { return pair_int_hash(ptr_hash(key.root.ptr()), ptr_hash(key.query)); }
-    };
-
-    struct Entry {
-        // Weak so the cache never keeps a disconnected query root alive, and so that a dead root can never be
-        // confused with a new node allocated at the same address.
-        GC::Weak<ParentNode> root;
-
-        // Keeps the query alive (and its address unique) even if the document's selector query cache evicts it.
-        NonnullRefPtr<SelectorQuery const> query;
-
-        u64 character_data_version { 0 };
-
-        // Raw pointers are safe here: the elements were descendants of root when cached, and with dom_tree_version
-        // unchanged no node in this document has been inserted or removed since, so they are still descendants of
-        // root and kept alive by it. Entries are only used after validating the version and that root is alive.
-        Vector<GC::RawPtr<Element>> elements;
-    };
-
-    u64 m_dom_tree_version { 0 };
-    HashMap<Key, Entry, KeyTraits> m_entries;
-};
-
-}
-
-FILE: Libraries/LibWeb/DOM/ShadowRoot.cpp
-/*
- * Copyright (c) 2020, the SerenityOS developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibWeb/Bindings/ShadowRoot.h>
-#include <LibWeb/CSS/CSSStyleSheet.h>
-#include <LibWeb/CSS/StyleSheetList.h>
-#include <LibWeb/DOM/AdoptedStyleSheets.h>
-#include <LibWeb/DOM/Document.h>
-#include <LibWeb/DOM/DocumentOrShadowRoot.h>
-#include <LibWeb/DOM/Event.h>
-#include <LibWeb/DOM/ShadowRoot.h>
-#include <LibWeb/DOM/SlotRegistry.h>
-#include <LibWeb/DOM/Utils.h>
-#include <LibWeb/HTML/AttributeNames.h>
-#include <LibWeb/HTML/CustomElements/CustomElementRegistry.h>
-#include <LibWeb/HTML/HTMLSlotElement.h>
-#include <LibWeb/HTML/HTMLTemplateElement.h>
-#include <LibWeb/HTML/Parser/HTMLParser.h>
-#include <LibWeb/HTML/XMLSerializer.h>
-#include <LibWeb/Layout/BlockContainer.h>
-#include <LibWeb/TrustedTypes/RequireTrustedTypesForDirective.h>
-#include <LibWeb/TrustedTypes/TrustedTypePolicy.h>
-
-namespace Web::DOM {
-
-GC_DEFINE_ALLOCATOR(ShadowRoot);
-
-ShadowRoot::ShadowRoot(Document& document, Element& host, Bindings::ShadowRootMode mode)
-    : DocumentFragment(document)
-    , m_mode(mode)
-    , m_style_scope(*this)
-{
-    document.register_shadow_root({}, *this);
-    set_host(&host);
-}
-
-void ShadowRoot::finalize()
-{
-    Base::finalize();
-    document().unregister_shadow_root({}, *this);
-}
-
-void ShadowRoot::adopted_from(Document& old_document)
-{
-    Base::adopted_from(old_document);
-
-    // The document tracks its shadow roots for document-wide walks (media invalidation, user style changes,
-    // tree-scoped name lookups), so adoption has to move this shadow root to the new document's list.
-    old_document.unregister_shadow_root({}, *this);
-    document().register_shadow_root({}, *this);
-
-    m_style_scope.node_was_adopted_from(old_document);
-}
-
-// https://fullscreen.spec.whatwg.org/#dom-document-fullscreenelement
-GC::Ptr<Element> ShadowRoot::fullscreen_element_for_bindings() const
-{
-    // 1. If this is a shadow root and its host is not connected, then return null.
-    if (!host() || !host()->is_connected())
-        return nullptr;
-
-    // 2. Let candidate be the result of retargeting fullscreen element against this.
-    // NB: ShadowRoot does not have it's own top layer. But the algorithm says to get the fullscreen element from the
-    //     top layer, so it's grabbed from this' document.
-    auto* candidate = retarget(document().fullscreen_element(), const_cast<ShadowRoot*>(this));
-    if (!candidate)
-        return nullptr;
-
-    // 3. If candidate and this are in the same tree, then return candidate.
-    if (auto* retargeted_element = as<Element>(candidate); &retargeted_element->root() == &root())
-        return retargeted_element;
-
-    // 4. Return null.
-    return nullptr;
-}
-
-void ShadowRoot::initialize(JS::Realm& realm)
-{
-    WEB_SET_PROTOTYPE_FOR_INTERFACE(ShadowRoot);
-    Base::initialize(realm);
-}
-
-// https://dom.spec.whatwg.org/#dom-shadowroot-onslotchange
-void ShadowRoot::set_onslotchange(WebIDL::CallbackType* event_handler)
-{
-    set_event_handler_attribute(HTML::EventNames::slotchange, event_handler);
-}
-
-// https://dom.spec.whatwg.org/#dom-shadowroot-onslotchange
-WebIDL::CallbackType* ShadowRoot::onslotchange()
-{
-    return event_handler_attribute(HTML::EventNames::slotchange);
-}
-
-// https://dom.spec.whatwg.org/#ref-for-get-the-parent%E2%91%A6
-EventTarget* ShadowRoot::get_parent(Event const& event)
-{
-    if (!event.composed()) {
-        auto& events_first_invocation_target = as<Node>(*event.path().first().invocation_target);
-        if (&events_first_invocation_target.root() == this)
-            return nullptr;
-    }
-
-    return host();
-}
-
-// https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-shadowroot-innerhtml
-WebIDL::ExceptionOr<TrustedTypes::TrustedHTMLOrString> ShadowRoot::inner_html() const
-{
-    return TRY(serialize_fragment(HTML::RequireWellFormed::Yes));
-}
-
-// https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-shadowroot-innerhtml
-WebIDL::ExceptionOr<void> ShadowRoot::set_inner_html(TrustedTypes::TrustedHTMLOrString const& value)
-{
-    // 1. Let compliantString be the result of invoking the Get Trusted Type compliant string algorithm with
-    //    TrustedHTML, this's relevant global object, the given value, "ShadowRoot innerHTML", and "script".
-    auto const compliant_string = TRY(TrustedTypes::get_trusted_type_compliant_string(
-        TrustedTypes::TrustedTypeName::TrustedHTML,
-        HTML::relevant_global_object(*this),
-        value,
-        TrustedTypes::InjectionSink::ShadowRoot_innerHTML,
-        TrustedTypes::Script.view()));
-
-    // 2. Let fragment be the result of invoking the fragment parsing algorithm steps with this and compliantString.
-    auto fragment = TRY(HTML::HTMLParser::parse_html_fragment(GC::Ref<DocumentFragment> { *this }, compliant_string.utf16_view()));
-
-    // 3. Replace all with fragment within this.
-    this->replace_all(fragment);
-
-    // NOTE: We don't invalidate style & layout for <template> elements since they don't affect rendering.
-    if (!is<HTML::HTMLTemplateElement>(*this)) {
-        this->set_needs_style_update(true);
-
-        if (this->is_connected()) {
-            // NOTE: Since the DOM has changed, we have to rebuild this shadow root's layout subtree.
-            this->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::ShadowRootSetInnerHTML);
-        }
-    }
-
-    set_needs_style_update(true);
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-gethtml
-WebIDL::ExceptionOr<Utf16String> ShadowRoot::get_html(Bindings::GetHTMLOptions const& options) const
-{
-    // ShadowRoot's getHTML(options) method steps are to return the result
-    // of HTML fragment serialization algorithm with this,
-    // options["serializableShadowRoots"], and options["shadowRoots"].
-    return HTML::HTMLParser::serialize_html_fragment(
-        *this,
-        options.serializable_shadow_roots ? HTML::HTMLParser::SerializableShadowRoots::Yes : HTML::HTMLParser::SerializableShadowRoots::No,
-        options.shadow_roots);
-}
-
-// https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-shadowroot-sethtmlunsafe
-WebIDL::ExceptionOr<void> ShadowRoot::set_html_unsafe(TrustedTypes::TrustedHTMLOrString const& html)
-{
-    // 1. Let compliantHTML be the result of invoking the Get Trusted Type compliant string algorithm with
-    //    TrustedHTML, this's relevant global object, html, "ShadowRoot setHTMLUnsafe", and "script".
-    auto const compliant_html = TRY(TrustedTypes::get_trusted_type_compliant_string(
-        TrustedTypes::TrustedTypeName::TrustedHTML,
-        HTML::relevant_global_object(*this),
-        html,
-        TrustedTypes::InjectionSink::ShadowRoot_setHTMLUnsafe,
-        TrustedTypes::Script.view()));
-
-    // 2. Unsafely set HTML given this, this's shadow host, and compliantHTML.
-    TRY(unsafely_set_html(GC::Ref<DocumentFragment> { *this }, compliant_html.utf16_view()));
-
-    return {};
-}
-
-GC::Ptr<Element> ShadowRoot::active_element()
-{
-    return calculate_active_element(*this);
-}
-
-CSS::StyleSheetList& ShadowRoot::style_sheets()
-{
-    if (!m_style_sheets)
-        m_style_sheets = CSS::StyleSheetList::create(*this);
-    return *m_style_sheets;
-}
-
-CSS::StyleSheetList const& ShadowRoot::style_sheets() const
-{
-    return const_cast<ShadowRoot*>(this)->style_sheets();
-}
-
-void ShadowRoot::visit_edges(Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-    m_style_scope.visit_edges(visitor);
-    visitor.visit(m_style_sheets);
-    visitor.visit(m_adopted_style_sheets);
-    m_anchor_name_map.visit_edges(visitor);
-    for (auto const& [key, elements] : m_part_element_map) {
-        for (auto const& element : elements)
-            element.visit(visitor);
-    }
-    visitor.visit(m_custom_element_registry);
-}
-
-GC::Ref<WebIDL::ObservableArray> ShadowRoot::adopted_style_sheets() const
-{
-    if (!m_adopted_style_sheets)
-        m_adopted_style_sheets = create_adopted_style_sheets_list(const_cast<ShadowRoot&>(*this));
-    return *m_adopted_style_sheets;
-}
-
-WebIDL::ExceptionOr<void> ShadowRoot::set_adopted_style_sheets(JS::Value new_value)
-{
-    if (!m_adopted_style_sheets)
-        m_adopted_style_sheets = create_adopted_style_sheets_list(*this);
-
-    m_adopted_style_sheets->clear();
-    auto iterator_record = TRY(get_iterator(vm(), new_value, JS::IteratorHint::Sync));
-    while (true) {
-        auto next = TRY(iterator_step_value(vm(), iterator_record));
-        if (!next.has_value())
-            break;
-        TRY(m_adopted_style_sheets->append(*next));
-    }
-
-    return {};
-}
-
-void ShadowRoot::for_each_css_style_sheet(Function<void(CSS::CSSStyleSheet&)>&& callback) const
-{
-    for (auto& style_sheet : style_sheets().sheets())
-        callback(*style_sheet);
-
-    if (m_adopted_style_sheets) {
-        m_adopted_style_sheets->for_each<CSS::CSSStyleSheet>([&](auto& style_sheet) {
-            callback(style_sheet);
-        });
-    }
-}
-
-void ShadowRoot::for_each_active_css_style_sheet(Function<void(CSS::CSSStyleSheet&)> const& callback) const
-{
-    for (auto& style_sheet : style_sheets().sheets()) {
-        if (!style_sheet->disabled())
-            callback(*style_sheet);
-    }
-
-    if (m_adopted_style_sheets) {
-        m_adopted_style_sheets->for_each<CSS::CSSStyleSheet>([&](auto& style_sheet) {
-            if (!style_sheet.disabled())
-                callback(style_sheet);
-        });
-    }
-}
-
-WebIDL::ExceptionOr<Vector<GC::Ref<Animations::Animation>>> ShadowRoot::get_animations()
-{
-    document().update_style();
-    return calculate_get_animations(*this);
-}
-
-ElementByIdMap& ShadowRoot::element_by_id() const
-{
-    if (!m_element_by_id)
-        m_element_by_id = make<ElementByIdMap>();
-    return *m_element_by_id;
-}
-
-void ShadowRoot::register_slot(HTML::HTMLSlotElement& slot)
-{
-    if (!m_slot_registry)
-        m_slot_registry = make<SlotRegistry>();
-    m_slot_registry->add(slot);
-}
-
-void ShadowRoot::unregister_slot(HTML::HTMLSlotElement& slot)
-{
-    if (m_slot_registry)
-        m_slot_registry->remove(slot);
-}
-
-GC::Ptr<HTML::HTMLSlotElement> ShadowRoot::first_slot_with_name(Utf16View name) const
-{
-    if (!m_slot_registry)
-        return nullptr;
-    return m_slot_registry->first_slot_with_name(name);
-}
-
-// https://drafts.csswg.org/css-shadow-1/#shadow-root-part-element-map
-ShadowRoot::PartElementMap const& ShadowRoot::part_element_map() const
-{
-    // FIXME: dom_tree_version() is crude and invalidates more than necessary.
-    //        Come up with a smarter way of invalidating this if it turns out to be slow.
-    if (m_dom_tree_version_when_calculated_part_element_map < document().dom_tree_version()) {
-        const_cast<ShadowRoot*>(this)->calculate_part_element_map();
-        m_dom_tree_version_when_calculated_part_element_map = document().dom_tree_version();
-    }
-    return m_part_element_map;
-}
-
-// https://drafts.csswg.org/css-shadow-1/#exportparts
-// Parse the exportparts attribute into a list of (inner_name, outer_name) pairs.
-template<typename Callback>
-static void for_each_exported_part(Element const& element, Callback callback)
-{
-    auto exportparts = element.get_attribute(HTML::AttributeNames::exportparts);
-    if (!exportparts.has_value())
-        return;
-
-    exportparts->for_each_split_view(u',', SplitBehavior::Nothing, [&](Utf16View mapping) {
-        auto trimmed = mapping.trim_ascii_whitespace();
-        if (trimmed.is_empty())
-            return IterationDecision::Continue;
-
-        Vector<Utf16View, 2> parts;
-        trimmed.for_each_split_view(u':', SplitBehavior::KeepEmpty, [&](Utf16View part) {
-            parts.append(part);
-            return IterationDecision::Continue;
-        });
-        if (parts.size() == 1) {
-            auto name = parts[0].trim_ascii_whitespace();
-            callback(name, name);
-        } else if (parts.size() == 2) {
-            callback(parts[0].trim_ascii_whitespace(), parts[1].trim_ascii_whitespace());
-        }
-
-        return IterationDecision::Continue;
-    });
-}
-
-// https://drafts.csswg.org/css-shadow-1/#calculate-the-part-element-map
-void ShadowRoot::calculate_part_element_map()
-{
-    // To calculate the part element map of a shadow root, outerRoot:
-
-    m_part_element_map.clear();
-
-    // 1. For each descendant el within outerRoot:
-    for_each_in_subtree_of_type<Element>([this](Element const& element) {
-        // 1. For each name in el’s part name list, append el to outerRoot’s part element map[name].
-        for (auto const& name : element.part_names())
-            m_part_element_map.ensure(name).set({ const_cast<Element&>(element), {} });
-
-        // 2. If el is a shadow host itself then let innerRoot be its shadow root.
-        if (element.is_shadow_host()) {
-            auto inner_root = element.shadow_root();
-
-            // 3. Calculate innerRoot’s part element map.
-            auto const& inner_map = inner_root->part_element_map();
-
-            // 4. For each innerName/outerName in el’s forwarded part name list:
-            for_each_exported_part(element, [&](Utf16View inner_name_view, Utf16View outer_name_view) {
-                // 1. If innerName is an ident:
-                if (auto it = inner_map.find(inner_name_view); it != inner_map.end()) {
-                    // 1. Let innerParts be innerRoot’s part element map[innerName]
-                    // 2. Append the elements in innerParts to outerRoot’s part element map[outerName]
-                    if (inner_name_view == outer_name_view) {
-                        for (auto const& abstract_el : it->value)
-                            m_part_element_map.ensure(it->key).set(abstract_el);
-                    } else {
-                        auto outer_name = Utf16FlyString::from_utf16(outer_name_view);
-                        for (auto const& abstract_el : it->value)
-                            m_part_element_map.ensure(outer_name).set(abstract_el);
-                    }
-                }
-                // FIXME: 2. If innerName is a pseudo-element name, append innerRoot’s
-                //        pseudo-element(s) with that name to outerRoot’s part element map[outerName].
-            });
-        }
-
-        return TraversalDecision::Continue;
-    });
-}
-
-// https://dom.spec.whatwg.org/#dom-documentorshadowroot-customelementregistry
-GC::Ptr<HTML::CustomElementRegistry> ShadowRoot::custom_element_registry() const
-{
-    // 1. If this is a document, then return this’s custom element registry.
-    // NB: Impossible.
-
-    // 2. Assert: this is a ShadowRoot node.
-    // 3. Return this’s custom element registry.
-    return m_custom_element_registry;
-}
-
-}
-
-FILE: Libraries/LibWeb/DOM/ShadowRoot.h
-/*
- * Copyright (c) 2020, the SerenityOS developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/Utf16FlyString.h>
-#include <AK/Utf16View.h>
-#include <LibWeb/Bindings/ShadowRoot.h>
-#include <LibWeb/CSS/StyleScope.h>
-#include <LibWeb/DOM/AnchorNameMap.h>
-#include <LibWeb/DOM/DocumentFragment.h>
-#include <LibWeb/DOM/ElementByIdMap.h>
-#include <LibWeb/DOM/SlotRegistry.h>
-#include <LibWeb/Export.h>
-#include <LibWeb/WebIDL/ObservableArray.h>
-
-namespace Web::DOM {
-
-class WEB_API ShadowRoot final : public DocumentFragment {
-    WEB_PLATFORM_OBJECT(ShadowRoot, DocumentFragment);
-    GC_DECLARE_ALLOCATOR(ShadowRoot);
-
-public:
-    static constexpr bool OVERRIDES_FINALIZE = true;
-
-    Bindings::ShadowRootMode mode() const { return m_mode; }
-
-    Bindings::SlotAssignmentMode slot_assignment() const { return m_slot_assignment; }
-    void set_slot_assignment(Bindings::SlotAssignmentMode slot_assignment) { m_slot_assignment = slot_assignment; }
-
-    bool delegates_focus() const { return m_delegates_focus; }
-    void set_delegates_focus(bool delegates_focus) { m_delegates_focus = delegates_focus; }
-
-    [[nodiscard]] bool declarative() const { return m_declarative; }
