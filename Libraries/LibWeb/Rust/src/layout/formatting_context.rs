@@ -2888,18 +2888,20 @@ impl FfiLayoutFcCallbacks {
         let payloads = self
             .arena()
             .style_payloads(node)
-            .expect("styled node payloads must be mirrored to the arena before layout");
-        // SAFETY: The document arena outlives the layout pass, and the mirror
-        // is only rewritten between passes: set_computed_values verifies no
-        // pass is running and no layout node is created mid-pass.
+            .expect("styled node must publish its style container before layout");
+        // SAFETY: The node's ComputedValues keep the style container alive
+        // for the pass, and the container is only replaced between passes:
+        // set_computed_values verifies no pass is running and no layout node
+        // is created mid-pass.
         unsafe { &*std::ptr::from_ref(payloads) }
     }
 
     pub(crate) fn style_reader_if_styled(&self, node: Node) -> Option<StyleReader<'static>> {
         let payloads = self.arena().style_payloads(node)?;
-        // SAFETY: The document arena outlives the layout pass, and the mirror
-        // is only rewritten between passes: set_computed_values verifies no
-        // pass is running and no layout node is created mid-pass.
+        // SAFETY: The node's ComputedValues keep the style container alive
+        // for the pass, and the container is only replaced between passes:
+        // set_computed_values verifies no pass is running and no layout node
+        // is created mid-pass.
         Some(StyleReader::new(unsafe { &*std::ptr::from_ref(payloads) }))
     }
 
@@ -3084,7 +3086,10 @@ pub(crate) fn formatting_context_type_created_by_node_data(
         return None;
     }
     if crate::layout::has_flag(data, NodeFlag::IsReplacedElement)
-        && style.is_some_and(|style| style.table_display_before() != FfiTableDisplay::Other)
+        && style.is_some_and(|style| {
+            let display = style.display_before_box_type_transformation();
+            display.is_table_inside() || display.is_internal_table() || display.is_table_caption()
+        })
     {
         return Some(if crate::layout::kind_is_block_container(data.kind) {
             FfiFormattingContextType::Block
@@ -3096,8 +3101,7 @@ pub(crate) fn formatting_context_type_created_by_node_data(
     if display.is_some_and(|display| display.is_flex_inside()) {
         return Some(FfiFormattingContextType::Flex);
     }
-    let table_display = display.map_or(FfiTableDisplay::Other, crate::layout::table_display_of);
-    if table_display == FfiTableDisplay::TableRoot {
+    if display.is_some_and(|display| display.is_table_inside()) {
         return Some(FfiFormattingContextType::Table);
     }
     if display.is_some_and(|display| display.is_grid_inside()) {
@@ -3109,15 +3113,14 @@ pub(crate) fn formatting_context_type_created_by_node_data(
         return Some(FfiFormattingContextType::Block);
     }
     if crate::layout::has_flag(data, NodeFlag::ChildrenAreInline)
-        || matches!(
-            table_display,
-            FfiTableDisplay::TableColumn
-                | FfiTableDisplay::TableColumnGroup
-                | FfiTableDisplay::TableRow
-                | FfiTableDisplay::TableRowGroup
-                | FfiTableDisplay::TableHeaderGroup
-                | FfiTableDisplay::TableFooterGroup
-        )
+        || display.is_some_and(|display| {
+            display.is_table_column()
+                || display.is_table_column_group()
+                || display.is_table_row()
+                || display.is_table_row_group()
+                || display.is_table_header_group()
+                || display.is_table_footer_group()
+        })
     {
         return None;
     }
