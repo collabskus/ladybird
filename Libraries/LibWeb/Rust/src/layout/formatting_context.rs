@@ -86,16 +86,6 @@ pub struct FfiResolvedAnchorInsets {
     pub left: CssPixels,
 }
 
-/// One node's resolved anchor() insets, reported to C++ in a batch after the
-/// pass commits so the computed-values writeback never runs while layout can
-/// still read style.
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct FfiDeferredResolvedAnchorInsets {
-    pub node: *mut c_void,
-    pub resolved: FfiResolvedAnchorInsets,
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct LineFragmentFacts {
     layout_node: Node,
@@ -485,10 +475,10 @@ impl<'pass> SizingContext<'pass> {
             content_inline_size,
             self.facts(node).preferred_aspect_ratio().unwrap(),
             style.box_sizing_for_aspect_ratio() == box_sizing::BORDER_BOX,
-            style.border_left_width + used.padding_left.get(),
-            style.border_right_width + used.padding_right.get(),
-            style.border_top_width + used.padding_top.get(),
-            style.border_bottom_width + used.padding_bottom.get(),
+            style.border_left_width() + used.padding_left.get(),
+            style.border_right_width() + used.padding_right.get(),
+            style.border_top_width() + used.padding_top.get(),
+            style.border_bottom_width() + used.padding_bottom.get(),
         )
     }
 
@@ -499,10 +489,10 @@ impl<'pass> SizingContext<'pass> {
             content_block_size,
             self.facts(node).preferred_aspect_ratio().unwrap(),
             style.box_sizing_for_aspect_ratio() == box_sizing::BORDER_BOX,
-            style.border_left_width + used.padding_left.get(),
-            style.border_right_width + used.padding_right.get(),
-            style.border_top_width + used.padding_top.get(),
-            style.border_bottom_width + used.padding_bottom.get(),
+            style.border_left_width() + used.padding_left.get(),
+            style.border_right_width() + used.padding_right.get(),
+            style.border_top_width() + used.padding_top.get(),
+            style.border_bottom_width() + used.padding_bottom.get(),
         )
     }
 
@@ -1932,7 +1922,7 @@ impl<'pass> SizingContext<'pass> {
         // Flex/grid-inside buttons are their own flex/grid container and get no anonymous content wrapper,
         // so there is nothing to make definite for centering.
         let style = self.style(node);
-        if style.display.is_flex_inside() || style.display.is_grid_inside() {
+        if style.display().is_flex_inside() || style.display().is_grid_inside() {
             return;
         }
         // With auto height and no min-height the content box already exactly wraps the content, so there is
@@ -2048,8 +2038,8 @@ impl<'pass> SizingContext<'pass> {
         let table_constraints = table_wrapper_constraints;
         let table_used = Self::create_measurement_used_values(&measurement, table_box, table_constraints);
         let table_style = self.style(table_box);
-        table_used.border_left.set(table_style.border_left_width);
-        table_used.border_right.set(table_style.border_right_width);
+        table_used.border_left.set(table_style.border_left_width());
+        table_used.border_right.set(table_style.border_right_width());
         table_used
             .padding_left
             .set(table_style.padding_left().to_px(containing_block_inline_size));
@@ -2229,13 +2219,13 @@ impl<'pass> SizingContext<'pass> {
         }
         let value = preferred_size.to_px(basis);
         let style = self.style(node);
-        if style.box_sizing == box_sizing::BORDER_BOX {
+        if style.box_sizing() == box_sizing::BORDER_BOX {
             let used = self.used(node);
             return subtract_border_box_adjustment(
                 value,
-                style.border_left_width,
+                style.border_left_width(),
                 used.padding_left.get(),
-                style.border_right_width,
+                style.border_right_width(),
                 used.padding_right.get(),
             );
         }
@@ -2302,13 +2292,13 @@ impl<'pass> SizingContext<'pass> {
         }
         let value = preferred_size.to_px(basis);
         let style = self.style(node);
-        if style.box_sizing == box_sizing::BORDER_BOX {
+        if style.box_sizing() == box_sizing::BORDER_BOX {
             let used = self.used(node);
             return subtract_border_box_adjustment(
                 value,
-                style.border_top_width,
+                style.border_top_width(),
                 used.padding_top.get(),
-                style.border_bottom_width,
+                style.border_bottom_width(),
                 used.padding_bottom.get(),
             );
         }
@@ -2436,7 +2426,7 @@ pub(crate) fn box_baseline(
             }
             vertical_align::TEXT_TOP => {
                 // TextTop: Align the top of the box with the top of the parent's content area (see 10.6.1).
-                return style.font_size;
+                return style.font_size();
             }
             vertical_align::TEXT_BOTTOM => {
                 // TextBottom: Align the bottom of the box with the bottom of the parent's content area (see 10.6.1).
@@ -2471,7 +2461,7 @@ pub(crate) fn box_baseline(
     // baseline sets always derive from content; so do flex and grid containers, which are not block containers.
     // FIXME: Per CSS Align, a scroll container's content-derived baseline position should be clamped to its border
     //        edge.
-    let has_visible_overflow = style.overflow_x == overflow::VISIBLE && style.overflow_y == overflow::VISIBLE;
+    let has_visible_overflow = style.overflow_x() == overflow::VISIBLE && style.overflow_y() == overflow::VISIBLE;
     let derive_baseline_from_content =
         baseline_set == BaselineSet::First || is_flex_or_grid_container || has_visible_overflow;
 
@@ -2835,7 +2825,6 @@ impl OwnedFlexLayoutData {
     }
 }
 
-pub type FfiBuildStylePayloadsCallback = unsafe extern "C" fn(*mut c_void, *const c_void) -> crate::layout::FfiStylePayloads;
 pub type FfiBuildTableBoxFactsCallback = unsafe extern "C" fn(*mut c_void, *mut c_void) -> FfiTableBoxFacts;
 
 #[derive(Clone, Copy)]
@@ -2850,7 +2839,6 @@ pub struct FfiLayoutFcCallbacks {
     pub report_unexpected_fragmented_inline: unsafe extern "C" fn(*mut c_void, *mut c_void),
     pub release_calc_handle: crate::layout::FfiReleaseCalcHandleCallback,
     pub release_anchor_name_handle: crate::layout::FfiReleaseAnchorNameHandleCallback,
-    pub build_style_payloads: FfiBuildStylePayloadsCallback,
     pub build_replaced_content_facts: unsafe extern "C" fn(*mut c_void, *mut c_void) -> crate::layout::FfiReplacedContentFacts,
     pub build_list_item_facts: unsafe extern "C" fn(*mut c_void, *mut c_void) -> crate::layout::FfiListItemFacts,
     pub text_node_is_empty_editable: unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool,
@@ -2870,8 +2858,6 @@ pub struct FfiLayoutFcCallbacks {
     pub anchor_lookup: unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *const *mut c_void, usize) -> NodeSlotId,
     pub build_anchor_function_facts: unsafe extern "C" fn(*mut c_void, *const c_void) -> FfiAnchorFunctionFacts,
     pub anchor_function_fallback: unsafe extern "C" fn(*mut c_void, *const c_void) -> FfiAnchorFallbackFacts,
-    pub record_deferred_resolved_anchor_insets:
-        unsafe extern "C" fn(*mut c_void, *const FfiDeferredResolvedAnchorInsets, usize),
     pub set_default_scroll_shift: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, bool, bool),
 }
 
@@ -2896,6 +2882,25 @@ impl FfiLayoutFcCallbacks {
         // SAFETY: The document arena outlives the layout pass, and text
         // content is only mutated between passes.
         unsafe { &*std::ptr::from_ref(content) }
+    }
+
+    pub(crate) fn style_payloads(&self, node: Node) -> &'static crate::layout::FfiStylePayloads {
+        let payloads = self
+            .arena()
+            .style_payloads(node)
+            .expect("styled node payloads must be mirrored to the arena before layout");
+        // SAFETY: The document arena outlives the layout pass, and the mirror
+        // is only rewritten between passes: set_computed_values verifies no
+        // pass is running and no layout node is created mid-pass.
+        unsafe { &*std::ptr::from_ref(payloads) }
+    }
+
+    pub(crate) fn style_reader_if_styled(&self, node: Node) -> Option<StyleReader<'static>> {
+        let payloads = self.arena().style_payloads(node)?;
+        // SAFETY: The document arena outlives the layout pass, and the mirror
+        // is only rewritten between passes: set_computed_values verifies no
+        // pass is running and no layout node is created mid-pass.
+        Some(StyleReader::new(unsafe { &*std::ptr::from_ref(payloads) }))
     }
 
     pub(crate) fn can_skip_is_anonymous_text_run(&self, node: Node) -> bool {
@@ -3061,7 +3066,8 @@ impl std::ops::DerefMut for FormattingContextInstance<'_> {
 
 pub(crate) fn formatting_context_type_created_by_node_data(
     data: &NodeData,
-    parent_data: Option<&NodeData>,
+    style: Option<StyleReader<'_>>,
+    parent_style: Option<StyleReader<'_>>,
 ) -> Option<FfiFormattingContextType> {
     if data.kind == crate::layout::node_data::NodeKind::SVGSVGBox {
         return Some(FfiFormattingContextType::Svg);
@@ -3078,7 +3084,7 @@ pub(crate) fn formatting_context_type_created_by_node_data(
         return None;
     }
     if crate::layout::has_flag(data, NodeFlag::IsReplacedElement)
-        && data.table_display_before != crate::layout::node_data::FfiTableDisplay::Other
+        && style.is_some_and(|style| style.table_display_before() != FfiTableDisplay::Other)
     {
         return Some(if crate::layout::kind_is_block_container(data.kind) {
             FfiFormattingContextType::Block
@@ -3086,41 +3092,47 @@ pub(crate) fn formatting_context_type_created_by_node_data(
             FfiFormattingContextType::InternalReplaced
         });
     }
-    if crate::layout::has_display_flag(data, crate::layout::node_data::NodeDisplayFlag::FlexInside) {
+    let display = style.map(|style| style.display());
+    if display.is_some_and(|display| display.is_flex_inside()) {
         return Some(FfiFormattingContextType::Flex);
     }
-    if data.table_display == crate::layout::node_data::FfiTableDisplay::TableRoot {
+    let table_display = display.map_or(FfiTableDisplay::Other, crate::layout::table_display_of);
+    if table_display == FfiTableDisplay::TableRoot {
         return Some(FfiFormattingContextType::Table);
     }
-    if crate::layout::has_display_flag(data, crate::layout::node_data::NodeDisplayFlag::GridInside) {
+    if display.is_some_and(|display| display.is_grid_inside()) {
         return Some(FfiFormattingContextType::Grid);
     }
-    if crate::layout::has_display_flag(data, crate::layout::node_data::NodeDisplayFlag::MathInside)
-        || crate::layout::node_creates_block_formatting_context(data, parent_data)
+    if display.is_some_and(|display| display.is_math_inside())
+        || crate::layout::node_creates_block_formatting_context(data, style, parent_style)
     {
         return Some(FfiFormattingContextType::Block);
     }
     if crate::layout::has_flag(data, NodeFlag::ChildrenAreInline)
         || matches!(
-            data.table_display,
-            crate::layout::node_data::FfiTableDisplay::TableColumn
-                | crate::layout::node_data::FfiTableDisplay::TableColumnGroup
-                | crate::layout::node_data::FfiTableDisplay::TableRow
-                | crate::layout::node_data::FfiTableDisplay::TableRowGroup
-                | crate::layout::node_data::FfiTableDisplay::TableHeaderGroup
-                | crate::layout::node_data::FfiTableDisplay::TableFooterGroup
+            table_display,
+            FfiTableDisplay::TableColumn
+                | FfiTableDisplay::TableColumnGroup
+                | FfiTableDisplay::TableRow
+                | FfiTableDisplay::TableRowGroup
+                | FfiTableDisplay::TableHeaderGroup
+                | FfiTableDisplay::TableFooterGroup
         )
     {
         return None;
     }
-    if !crate::layout::has_display_flag(data, crate::layout::node_data::NodeDisplayFlag::FlowInside) {
+    if !display.is_some_and(|display| display.is_flow_inside()) {
         return Some(FfiFormattingContextType::InternalDummy);
     }
     None
 }
 
 pub(crate) fn formatting_context_type_created_by_box(facts: NodeFacts<'_>) -> Option<FfiFormattingContextType> {
-    formatting_context_type_created_by_node_data(facts.data(), facts.parent_data())
+    formatting_context_type_created_by_node_data(
+        facts.data(),
+        facts.style_reader_if_styled(),
+        facts.parent_style_reader_if_styled(),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -3138,9 +3150,12 @@ pub extern "C" fn rust_layout_formatting_context_type_for_box(facts: FfiFormatti
         let arena = unsafe { LayoutNodeArena::from_handle(facts.arena) };
         // SAFETY: The caller supplies the live box's arena slot.
         let data = unsafe { &*arena.data(facts.node) };
-        // SAFETY: Parent links resolve within the same live arena.
-        let parent_data = (!data.parent.is_invalid()).then(|| unsafe { &*arena.data(data.parent) });
-        formatting_context_type_created_by_node_data(data, parent_data)
+        let style = arena.style_payloads(facts.node).map(StyleReader::new);
+        let parent_style = (!data.parent.is_invalid())
+            .then(|| arena.style_payloads(data.parent))
+            .flatten()
+            .map(StyleReader::new);
+        formatting_context_type_created_by_node_data(data, style, parent_style)
             .map(|type_| type_ as u8)
             .unwrap_or(NO_FORMATTING_CONTEXT)
     })

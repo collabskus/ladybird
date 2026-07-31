@@ -424,6 +424,23 @@ impl<'pass> NodeFacts<'pass> {
         self.state.style_facts(self.callbacks, self.node)
     }
 
+    fn style_reader_if_styled(&self) -> Option<StyleReader<'pass>> {
+        self.callbacks.style_reader_if_styled(self.node)
+    }
+
+    fn parent_style_reader_if_styled(&self) -> Option<StyleReader<'pass>> {
+        let parent = self.data().parent;
+        if parent.is_invalid() {
+            return None;
+        }
+        self.callbacks.style_reader_if_styled(parent)
+    }
+
+    fn table_display(&self) -> FfiTableDisplay {
+        self.style_reader_if_styled()
+            .map_or(FfiTableDisplay::Other, |style| style.table_display())
+    }
+
     fn replaced_content(&self) -> crate::layout::FfiReplacedContentFacts {
         self.state.replaced_content_facts(self.callbacks, self.node)
     }
@@ -458,24 +475,29 @@ impl<'pass> NodeFacts<'pass> {
     }
 
     pub(crate) fn is_floating(&self) -> bool {
-        crate::layout::has_display_flag(self.data(), NodeDisplayFlag::Floating)
+        self.style_reader_if_styled().is_some_and(|style| style.is_floating())
     }
 
     pub(crate) fn is_absolutely_positioned(&self) -> bool {
-        crate::layout::has_display_flag(self.data(), NodeDisplayFlag::AbsolutelyPositioned)
+        self.style_reader_if_styled()
+            .is_some_and(|style| style.is_absolutely_positioned())
     }
 
     pub(crate) fn is_inline(&self) -> bool {
-        let data = self.data();
-        crate::layout::kind_is_text(data.kind) || crate::layout::has_display_flag(data, NodeDisplayFlag::InlineOutside)
+        crate::layout::kind_is_text(self.data().kind)
+            || self
+                .style_reader_if_styled()
+                .is_some_and(|style| style.display().is_inline_outside())
     }
 
     pub(crate) fn is_atomic_inline(&self) -> bool {
         let data = self.data();
         crate::layout::has_flag(data, NodeFlag::IsReplacedElement)
             || data.kind == NodeKind::ListItemMarkerBox
-            || (crate::layout::has_display_flag(data, NodeDisplayFlag::InlineOutside)
-                && !crate::layout::has_display_flag(data, NodeDisplayFlag::FlowInside))
+            || self.style_reader_if_styled().is_some_and(|style| {
+                let display = style.display();
+                display.is_inline_outside() && !display.is_flow_inside()
+            })
     }
 
     pub(crate) fn has_box_model_metrics(&self) -> bool {
@@ -494,8 +516,10 @@ impl<'pass> NodeFacts<'pass> {
         let data = self.data();
         data.kind == NodeKind::InlineNode
             || (data.kind == NodeKind::ListItemBox
-                && crate::layout::has_display_flag(data, NodeDisplayFlag::InlineOutside)
-                && crate::layout::has_display_flag(data, NodeDisplayFlag::FlowInside))
+                && self.style_reader_if_styled().is_some_and(|style| {
+                    let display = style.display();
+                    display.is_inline_outside() && display.is_flow_inside()
+                }))
     }
 
     pub(crate) fn is_inline_flow_interrupting_block(&self) -> bool {
@@ -506,18 +530,23 @@ impl<'pass> NodeFacts<'pass> {
         let Some(parent) = self.parent_data() else {
             return false;
         };
-        if !crate::layout::has_display_flag(parent, NodeDisplayFlag::InlineOutside)
-            || !crate::layout::has_display_flag(parent, NodeDisplayFlag::FlowInside)
-        {
+        let parent_is_inline_flow = self.parent_style_reader_if_styled().is_some_and(|style| {
+            let display = style.display();
+            display.is_inline_outside() && display.is_flow_inside()
+        });
+        if !parent_is_inline_flow {
             return false;
         }
-        if crate::layout::has_display_flag(data, NodeDisplayFlag::InlineOutside) || crate::layout::node_is_out_of_flow(data) {
+        let style = self.style_reader_if_styled();
+        if style.is_some_and(|style| style.display().is_inline_outside())
+            || crate::layout::node_is_out_of_flow(data, style)
+        {
             return false;
         }
         if self.display().is_contents() {
             return false;
         }
-        if !matches!(data.table_display, FfiTableDisplay::Other | FfiTableDisplay::TableRoot) {
+        if !matches!(self.table_display(), FfiTableDisplay::Other | FfiTableDisplay::TableRoot) {
             return false;
         }
         if parent.kind == NodeKind::SVGForeignObjectBox {
@@ -554,17 +583,18 @@ impl<'pass> NodeFacts<'pass> {
     }
 
     pub(crate) fn display_before_box_type_transformation_is_block_outside(&self) -> bool {
-        crate::layout::has_display_flag(self.data(), NodeDisplayFlag::BlockOutsideBeforeBoxTypeTransformation)
+        self.style_reader_if_styled()
+            .is_some_and(|style| style.display_before_box_type_transformation().is_block_outside())
     }
 
     pub(crate) fn inline_axis_is_reverse(&self) -> bool {
         let style = self.style();
-        match style.writing_mode {
+        match style.writing_mode() {
             writing_mode::HORIZONTAL_TB
             | writing_mode::VERTICAL_RL
             | writing_mode::VERTICAL_LR
-            | writing_mode::SIDEWAYS_RL => style.direction == 1,
-            writing_mode::SIDEWAYS_LR => style.direction == 0,
+            | writing_mode::SIDEWAYS_RL => style.direction() == 1,
+            writing_mode::SIDEWAYS_LR => style.direction() == 0,
             _ => unreachable!("invalid writing mode"),
         }
     }
@@ -590,12 +620,18 @@ impl<'pass> NodeFacts<'pass> {
     }
 
     pub(crate) fn has_replaced_element_table_display_adjustment(&self) -> bool {
-        let data = self.data();
-        crate::layout::has_flag(data, NodeFlag::IsReplacedElement) && data.table_display_before != FfiTableDisplay::Other
+        crate::layout::has_flag(self.data(), NodeFlag::IsReplacedElement)
+            && self
+                .style_reader_if_styled()
+                .is_some_and(|style| style.table_display_before() != FfiTableDisplay::Other)
     }
 
     pub(crate) fn creates_block_formatting_context(&self) -> bool {
-        crate::layout::node_creates_block_formatting_context(self.data(), self.parent_data())
+        crate::layout::node_creates_block_formatting_context(
+            self.data(),
+            self.style_reader_if_styled(),
+            self.parent_style_reader_if_styled(),
+        )
     }
 
     pub(crate) fn is_grid_item(&self) -> bool {
@@ -633,7 +669,9 @@ impl<'pass> NodeFacts<'pass> {
         let mut child = data.first_child;
         while !child.is_invalid() {
             let child_data = self.callbacks.node_data(child);
-            if child_data.kind == NodeKind::LegendBox && !crate::layout::node_is_out_of_flow(child_data) {
+            if child_data.kind == NodeKind::LegendBox
+                && !crate::layout::node_is_out_of_flow(child_data, self.callbacks.style_reader_if_styled(child))
+            {
                 return child;
             }
             child = child_data.next_sibling;
@@ -699,7 +737,7 @@ impl<'pass> NodeFacts<'pass> {
 
     fn node_has_size_containment(&self) -> bool {
         if !matches!(
-            self.data().table_display,
+            self.table_display(),
             FfiTableDisplay::Other | FfiTableDisplay::TableCaption
         ) {
             return false;
@@ -723,11 +761,8 @@ impl<'pass> NodeFacts<'pass> {
                 });
             }
         }
-        let denominator = style.css_preferred_aspect_ratio_denominator();
-        (denominator != crate::layout::CssPixels::default()).then(|| PixelFraction {
-            numerator: style.css_preferred_aspect_ratio_numerator(),
-            denominator,
-        })
+        let (numerator, denominator) = style.css_preferred_aspect_ratio();
+        (denominator != crate::layout::CssPixels::default()).then_some(PixelFraction { numerator, denominator })
     }
 
     pub(crate) fn has_default_preferred_width(&self) -> bool {
@@ -757,15 +792,15 @@ impl<'pass> NodeFacts<'pass> {
         let style = self.style();
         let overflow_value_makes_box_a_scroll_container =
             |overflow: u8| matches!(overflow, overflow::AUTO | overflow::HIDDEN | overflow::SCROLL);
-        overflow_value_makes_box_a_scroll_container(style.overflow_x)
-            || overflow_value_makes_box_a_scroll_container(style.overflow_y)
+        overflow_value_makes_box_a_scroll_container(style.overflow_x())
+            || overflow_value_makes_box_a_scroll_container(style.overflow_y())
     }
 
     pub(crate) fn display(&self) -> crate::layout::FfiDisplay {
         if self.data().style.is_null() {
             return crate::layout::FfiDisplay::block();
         }
-        self.state.style_facts(self.callbacks, self.node).display
+        self.state.style_facts(self.callbacks, self.node).display()
     }
 
     pub(crate) fn is_svg_box(&self) -> bool {
@@ -777,7 +812,7 @@ impl<'pass> NodeFacts<'pass> {
     }
 
     pub(crate) fn is_table_box(&self) -> bool {
-        self.data().table_display == FfiTableDisplay::TableRoot
+        self.table_display() == FfiTableDisplay::TableRoot
     }
 
     pub(crate) fn is_table_wrapper(&self) -> bool {
@@ -785,35 +820,35 @@ impl<'pass> NodeFacts<'pass> {
     }
 
     pub(crate) fn is_table_row_group(&self) -> bool {
-        self.data().table_display == FfiTableDisplay::TableRowGroup
+        self.table_display() == FfiTableDisplay::TableRowGroup
     }
 
     pub(crate) fn is_table_header_group(&self) -> bool {
-        self.data().table_display == FfiTableDisplay::TableHeaderGroup
+        self.table_display() == FfiTableDisplay::TableHeaderGroup
     }
 
     pub(crate) fn is_table_footer_group(&self) -> bool {
-        self.data().table_display == FfiTableDisplay::TableFooterGroup
+        self.table_display() == FfiTableDisplay::TableFooterGroup
     }
 
     pub(crate) fn is_table_row(&self) -> bool {
-        self.data().table_display == FfiTableDisplay::TableRow
+        self.table_display() == FfiTableDisplay::TableRow
     }
 
     pub(crate) fn is_table_cell(&self) -> bool {
-        self.data().table_display == FfiTableDisplay::TableCell
+        self.table_display() == FfiTableDisplay::TableCell
     }
 
     pub(crate) fn is_table_column_group(&self) -> bool {
-        self.data().table_display == FfiTableDisplay::TableColumnGroup
+        self.table_display() == FfiTableDisplay::TableColumnGroup
     }
 
     pub(crate) fn is_table_column(&self) -> bool {
-        self.data().table_display == FfiTableDisplay::TableColumn
+        self.table_display() == FfiTableDisplay::TableColumn
     }
 
     pub(crate) fn is_table_caption(&self) -> bool {
-        self.data().table_display == FfiTableDisplay::TableCaption
+        self.table_display() == FfiTableDisplay::TableCaption
     }
 
     pub(crate) fn is_viewport(&self) -> bool {
@@ -842,11 +877,7 @@ pub(crate) struct LayoutState {
     contained_abspos_children: PagedStore<RefCell<VecDeque<PendingAbsposChild>>>,
     abspos_layout_pass_queue_in_completion_order: RefCell<VecDeque<Node>>,
     abspos_layout_pass_is_active: Cell<bool>,
-    /// Resolved anchor() insets awaiting the post-commit computed-values
-    /// writeback, one merged entry per node so a node resolved twice keeps
-    /// its final values and gets a single writeback.
-    deferred_resolved_anchor_insets: RefCell<Vec<crate::layout::FfiDeferredResolvedAnchorInsets>>,
-    style_decode_values: PagedStore<StyleDecodeValues>,
+    anchor_inset_store: AnchorInsetStore,
     replaced_content_facts: PagedStore<crate::layout::FfiReplacedContentFacts>,
     list_item_facts: PagedStore<crate::layout::FfiListItemFacts>,
     table_facts: PagedStore<FfiTableBoxFacts>,
@@ -901,8 +932,7 @@ impl LayoutState {
             contained_abspos_children: PagedStore::default(),
             abspos_layout_pass_queue_in_completion_order: RefCell::new(VecDeque::new()),
             abspos_layout_pass_is_active: Cell::new(false),
-            deferred_resolved_anchor_insets: RefCell::new(Vec::new()),
-            style_decode_values: PagedStore::default(),
+            anchor_inset_store: AnchorInsetStore::default(),
             replaced_content_facts: PagedStore::default(),
             list_item_facts: PagedStore::default(),
             table_facts: PagedStore::default(),
@@ -991,7 +1021,7 @@ impl LayoutState {
         let adjust_for_box_sizing = |unadjusted: crate::layout::CssPixels, computed_size: crate::layout::FfiSizeValue, axis: Axis| {
             // box-sizing: content-box and automatic sizes need no
             // adjustment.
-            if style.box_sizing == box_sizing::CONTENT_BOX || computed_size.is_auto() {
+            if style.box_sizing() == box_sizing::CONTENT_BOX || computed_size.is_auto() {
                 return unadjusted;
             }
 
@@ -1001,15 +1031,15 @@ impl LayoutState {
             let inline_basis = percentage_basis_inline_size.unwrap_or_default();
             let border_and_padding = match axis {
                 Axis::Inline => {
-                    style.border_left_width
+                    style.border_left_width()
                         + style.padding_left().to_px(inline_basis)
-                        + style.border_right_width
+                        + style.border_right_width()
                         + style.padding_right().to_px(inline_basis)
                 }
                 Axis::Block => {
-                    style.border_top_width
+                    style.border_top_width()
                         + style.padding_top().to_px(inline_basis)
-                        + style.border_bottom_width
+                        + style.border_bottom_width()
                         + style.padding_bottom().to_px(inline_basis)
                 }
             };
@@ -1196,21 +1226,11 @@ impl LayoutState {
         callbacks: &FfiLayoutFcCallbacks,
         node: Node,
     ) -> StyleValues<'pass> {
-        let slot_index = callbacks.slot_index(node);
-        let cache = if let Some(cache) = self.style_decode_values.get(slot_index) {
-            cache
-        } else {
-            let data = callbacks.node_data(node);
-            assert!(!data.style.is_null());
-            // SAFETY: NodeData retains the node's immutable ComputedValues for
-            // the synchronous layout pass.
-            let payloads = unsafe { (callbacks.build_style_payloads)(callbacks.context, data.style) };
-            self.style_decode_values.allocate(
-                slot_index,
-                StyleDecodeValues::new(payloads, callbacks.release_calc_handle),
-            )
-        };
-        StyleValues::new(cache)
+        StyleValues::new(
+            StyleReader::new(callbacks.style_payloads(node)),
+            &self.anchor_inset_store,
+            callbacks.slot_index(node),
+        )
     }
 
     pub(crate) fn replace_resolved_anchor_insets(
@@ -1220,17 +1240,13 @@ impl LayoutState {
         resolved: crate::layout::FfiResolvedAnchorInsets,
     ) {
         let slot_index = callbacks.slot_index(node);
-        let cache = self
-            .style_decode_values
-            .get(slot_index)
-            .expect("missing style decode cache");
         let replace = |field: SizeField, is_auto: bool, value: crate::layout::CssPixels| {
             let value = if is_auto {
                 crate::layout::FfiSizeValue::auto_value()
             } else {
                 crate::layout::FfiSizeValue::px_value(value)
             };
-            cache.replace_size(field, value);
+            self.anchor_inset_store.set_override(slot_index, field, value);
         };
         if resolved.resolves_top {
             replace(SizeField::InsetTop, resolved.top_is_auto, resolved.top);
@@ -1243,54 +1259,6 @@ impl LayoutState {
         }
         if resolved.resolves_left {
             replace(SizeField::InsetLeft, resolved.left_is_auto, resolved.left);
-        }
-    }
-
-    pub(crate) fn defer_resolved_anchor_insets(
-        &self,
-        callbacks: &FfiLayoutFcCallbacks,
-        node: Node,
-        resolved: crate::layout::FfiResolvedAnchorInsets,
-    ) {
-        let node_shell = callbacks.shell(node);
-        let mut deferred = self.deferred_resolved_anchor_insets.borrow_mut();
-        let Some(entry) = deferred.iter_mut().find(|entry| entry.node == node_shell) else {
-            deferred.push(crate::layout::FfiDeferredResolvedAnchorInsets {
-                node: node_shell,
-                resolved,
-            });
-            return;
-        };
-        let earlier = &mut entry.resolved;
-        if resolved.resolves_top {
-            (earlier.resolves_top, earlier.top_is_auto, earlier.top) = (true, resolved.top_is_auto, resolved.top);
-        }
-        if resolved.resolves_right {
-            (earlier.resolves_right, earlier.right_is_auto, earlier.right) =
-                (true, resolved.right_is_auto, resolved.right);
-        }
-        if resolved.resolves_bottom {
-            (earlier.resolves_bottom, earlier.bottom_is_auto, earlier.bottom) =
-                (true, resolved.bottom_is_auto, resolved.bottom);
-        }
-        if resolved.resolves_left {
-            (earlier.resolves_left, earlier.left_is_auto, earlier.left) = (true, resolved.left_is_auto, resolved.left);
-        }
-    }
-
-    /// Hands the deferred resolved-anchor-inset batch to C++ once the pass
-    /// has committed, so the computed-values writeback runs only after layout
-    /// is done reading style. Passes that never commit drop their deferrals
-    /// with the state, exactly as their writebacks never happened before.
-    fn report_deferred_resolved_anchor_insets(&self, callbacks: &FfiLayoutFcCallbacks) {
-        let deferred = self.deferred_resolved_anchor_insets.borrow();
-        if deferred.is_empty() {
-            return;
-        }
-        // SAFETY: The entries stay alive for this synchronous call, and the
-        // C++ side only records them for application after the pass returns.
-        unsafe {
-            (callbacks.record_deferred_resolved_anchor_insets)(callbacks.context, deferred.as_ptr(), deferred.len());
         }
     }
 
@@ -1377,9 +1345,9 @@ impl LayoutState {
             should_wrap_lines,
             should_respect_linebreaks,
             unidirectional_ltr,
-            white_space_collapse: parent_style.white_space_collapse,
-            word_break: parent_style.word_break,
-            font_variant_emoji: parent_style.font_variant_emoji,
+            white_space_collapse: parent_style.white_space_collapse(),
+            word_break: parent_style.word_break(),
+            font_variant_emoji: parent_style.font_variant_emoji(),
             font_cascade_list: parent_style.font_cascade_list(),
         };
         let text = &callbacks.text_content(node).text;
@@ -1785,7 +1753,6 @@ impl LayoutState {
         unsafe {
             (sink.finish_commit)(sink.context);
         }
-        self.report_deferred_resolved_anchor_insets(callbacks);
     }
 }
 

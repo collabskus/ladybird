@@ -987,10 +987,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     tree_builder_config.namespaces = Some(vec!["Web".to_string(), "Layout".to_string(), "RustFFI".to_string()]);
     tree_builder_config.export.include = vec![
         "FfiNodeKindFacts".to_string(),
-        "FfiTableDisplay".to_string(),
+        "FfiStylePayloads".to_string(),
         "NodeAllocation".to_string(),
         "NodeData".to_string(),
-        "NodeDisplayFlag".to_string(),
         "NodeFlag".to_string(),
         "NodeKind".to_string(),
         "NodeSlotId".to_string(),
