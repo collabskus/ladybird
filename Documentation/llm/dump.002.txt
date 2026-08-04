@@ -106435,6 +106435,7 @@ struct ChangingNavigableContinuationState : public JS::Cell {
     GC::Ptr<LocalNavigable> navigable;
     bool update_only = false;
 
+    GC::Ptr<DOM::Document> pending_document;
     GC::Ptr<PopulateSessionHistoryEntryDocumentOutput> population_output;
     GC::Ptr<DOM::Document> resolved_document;
     Optional<URL::Origin> old_origin;
@@ -106444,6 +106445,7 @@ struct ChangingNavigableContinuationState : public JS::Cell {
         Base::visit_edges(visitor);
         visitor.visit(displayed_document);
         visitor.visit(navigable);
+        visitor.visit(pending_document);
         visitor.visit(population_output);
         visitor.visit(resolved_document);
     }
@@ -106593,7 +106595,6 @@ private:
     void complete();
     void finish_without_applying();
     void complete_change_job_without_applying(GC::Ptr<LocalNavigable>);
-    bool changing_navigable_is_still_current(GC::Ptr<LocalNavigable>, Optional<UniqueNodeID> expected_active_document_id) const;
     void clear_ongoing_traversal_for_changing_navigable(GC::Ptr<LocalNavigable>);
     void clear_ongoing_traversals_for_changing_navigables();
 
@@ -106664,6 +106665,20 @@ void ApplyHistoryStepState::start()
         if (!target_entry)
             continue;
 
+        // https://html.spec.whatwg.org/multipage/browsing-the-web.html#update-for-navigable-creation/destruction
+        // AD-HOC: Unconditionally populating a document here could unload and re-navigate a frame because an unrelated
+        //         navigable was created or destroyed — which no other engine does. So we skip such applying-the-target-
+        //         entry-would-cross-documents navigables here. A navigable still showing the initial about:blank
+        //         Document is the exception — activating its populated document is this update's job.
+        //         https://github.com/whatwg/html/issues/12724
+        if (!m_navigation_type.has_value()) {
+            bool would_cross_documents = target_entry->document_state()->document_id() != navigable->active_document_id()
+                || target_entry->document_state()->reload_pending();
+            auto active_document = navigable->active_document();
+            if (would_cross_documents && !(active_document && active_document->is_initial_about_blank()))
+                continue;
+        }
+
         // https://html.spec.whatwg.org/multipage/nav-history-apis.html#fire-a-traverse-navigate-event
         // NB: Same-document traversals are synchronous in browser engines, but the specification routes them through
         //     the traversal queue. If a later cross-document navigation has already claimed the navigable by the time
@@ -106687,237 +106702,271 @@ void ApplyHistoryStepState::start()
 
     // 12. For each navigable of changingNavigables, queue a global task on the navigation and traversal task source.
     for (auto& navigable : m_changing_navigables) {
-        // AD-HOC: If the navigable has been destroyed, or has no active window, skip it.
-        //         We must increment completed_change_jobs here rather than relying on the queued
-        //         task, because Document::destroy() removes tasks associated with a document from
-        //         the task queue, which can cause those tasks to never run.
-        if (navigable->has_been_destroyed() || !navigable->active_window()) {
-            complete_change_job_without_applying(navigable);
-            continue;
-        }
-        auto expected_target_entry = navigable->current_session_history_entry();
-        queue_apply_history_step_task(*navigable, navigable->active_document(), GC::create_function(heap(), [this, navigable, expected_target_entry] {
-            // NOTE: This check is not in the spec but we should not continue navigation if navigable has been destroyed.
-            if (navigable->has_been_destroyed() || !navigable->active_window() || !navigable->active_document()) {
-                complete_change_job_without_applying(navigable);
-                return;
-            }
-
-            // 1. Let displayedEntry be navigable's active session history entry.
-            auto displayed_entry = navigable->active_session_history_entry();
-
-            // 2. Let targetEntry be navigable's current session history entry.
-            auto target_entry = navigable->current_session_history_entry();
-            if (!target_entry || target_entry != expected_target_entry) {
-                // AD-HOC: The HTML Standard expects the session history traversal queue to serialize this task with
-                //         later navigations. Our web-compatible deferral of navigations that arrive during traversal
-                //         can let a newer navigation replace the current entry before this task runs. Treat this state
-                //         as stale instead of applying its old target step after the newer navigation.
-                finish_without_applying();
-                return;
-            }
-
-            auto displayed_step = displayed_entry ? displayed_entry->step_value() : Optional<int> {};
-            auto target_step = target_entry ? target_entry->step_value() : Optional<int> {};
-            if (!target_step.has_value()) {
-                // NB: Child navigables created during a busy top-level navigation can still have a pending initial
-                //     session history entry. The spec's step-based history algorithms operate on used history steps,
-                //     so a pending child entry must not block or crash the top-level apply-history step. The queued
-                //     child creation/destruction history step will reconcile the child once it has a concrete step.
-                complete_change_job_without_applying(navigable);
-                return;
-            }
-
-            // 3. Let changingNavigableContinuation be a changing navigable continuation state with:
-            auto changing_navigable_continuation = heap().allocate<ChangingNavigableContinuationState>();
-            changing_navigable_continuation->displayed_document = navigable->active_document();
-            changing_navigable_continuation->displayed_document_id = navigable->active_document_id();
-            changing_navigable_continuation->target_entry = target_entry;
-            changing_navigable_continuation->navigable = navigable;
-            changing_navigable_continuation->update_only = false;
-            changing_navigable_continuation->population_output = nullptr;
-
-            // 4. If displayedEntry is targetEntry and targetEntry's document state's reload pending is false, then:
-            // AD-HOC: A synchronous same-document navigation has already updated the active entry by this point.
-            //         A later queued reload can additionally set reload pending on an already-active target entry
-            //         before that synchronous step is applied. The reload step owns that population work.
-            bool is_update_only = displayed_entry == target_entry && !target_entry->document_state()->reload_pending();
-            if (m_synchronous_navigation == LocalTraversableNavigable::SynchronousNavigation::Yes)
-                is_update_only = !target_entry->document_state()->reload_pending() || displayed_entry == target_entry;
-            if (is_update_only) {
-                // 1. Set changingNavigableContinuation's update-only to true.
-                changing_navigable_continuation->update_only = true;
-                changing_navigable_continuation->resolved_document = navigable->active_document();
-
-                // 2. Enqueue changingNavigableContinuation on changingNavigableContinuations.
-                did_receive_continuation(changing_navigable_continuation);
-
-                // 3. Abort these steps.
-                return;
-            }
-
-            // 5. Switch on navigationType:
-            if (m_navigation_type.has_value()) {
-                switch (m_navigation_type.value()) {
-                case Bindings::NavigationType::Reload:
-                    // - "reload": Assert: targetEntry's document state's reload pending is true.
-                    VERIFY(target_entry->document_state()->reload_pending());
+        auto target_entry = navigable->current_session_history_entry();
+        VERIFY(target_entry);
+        m_traversable->run_changing_navigable_history_step_job(
+            {
+                .navigable = navigable,
+                .target_entry = target_entry.release_nonnull(),
+                .source_snapshot_params = m_source_snapshot_params,
+                .user_involvement = m_user_involvement,
+                .navigation_type = m_navigation_type,
+                .synchronous_navigation = m_synchronous_navigation,
+                .navigation_api_abort_behavior = m_navigation_api_abort_behavior,
+                .pending_document = m_pending_document,
+            },
+            GC::create_function(heap(), [this, navigable](LocalTraversableNavigable::ChangingNavigableHistoryStepJobResult result) {
+                switch (result.disposition) {
+                case LocalTraversableNavigable::ChangingNavigableHistoryStepJobDisposition::Ready:
+                    VERIFY(result.continuation);
+                    did_receive_continuation(*result.continuation);
                     break;
-                case Bindings::NavigationType::Traverse:
-                    // - "traverse": Assert: targetEntry's document state's ever populated is true.
-                    VERIFY(target_entry->document_state()->ever_populated());
+                case LocalTraversableNavigable::ChangingNavigableHistoryStepJobDisposition::Skipped:
+                    complete_change_job_without_applying(navigable);
                     break;
-                case Bindings::NavigationType::Replace:
-                    // FIXME: Add ever populated check
-                    // - "replace": Assert: targetEntry's step is displayedEntry's step and targetEntry's document state's ever populated is false.
-                    if (displayed_step.has_value() && *target_step != *displayed_step) {
-                        // AD-HOC: A queued replace can become stale if a later navigation commits before this task
-                        //         runs — advancing the displayed step past the replace target. Let the later navigation
-                        //         win — rather than asserting the steps still match.
-                        finish_without_applying();
-                        return;
-                    }
-                    if (displayed_step.has_value())
-                        VERIFY(target_entry->step() == displayed_entry->step());
-                    break;
-                case Bindings::NavigationType::Push:
-                    // FIXME: Add ever populated check, and fix the bug where top level traversable's step is not updated when a child navigable navigates
-                    // - "push": Assert: targetEntry's step is displayedEntry's step + 1 and targetEntry's document state's ever populated is false.
-                    if (displayed_step.has_value() && *target_step <= *displayed_step) {
-                        // AD-HOC: A queued push can become stale if a later navigation commits before this task runs.
-                        //         Browser engines let the later navigation win; do the same and avoid moving the
-                        //         traversable's current step back to this push target during completion.
-                        finish_without_applying();
-                        return;
-                    }
-                    VERIFY(target_entry != displayed_entry);
+                case LocalTraversableNavigable::ChangingNavigableHistoryStepJobDisposition::Stale:
+                    finish_without_applying();
                     break;
                 }
-            }
-
-            // 6. Let oldOrigin be targetEntry's document state's origin.
-            auto old_origin = target_entry->document_state()->origin();
-
-            // 7. If all of the following are true:
-            //   * navigable is not traversable;
-            //   * targetEntry is not navigable's current session history entry; and
-            //   * oldOrigin is the same as navigable's current session history entry's document state's origin,
-            // then:
-            if (!navigable->is_traversable()
-                && target_entry != navigable->current_session_history_entry()
-                && old_origin == navigable->current_session_history_entry()->document_state()->origin()) {
-                // 1. Let navigation be navigable's active window's navigation API.
-                auto navigation = m_traversable->active_window()->navigation();
-
-                // 2. Fire a traverse navigate event at navigation given targetEntry and userInvolvement.
-                navigation->fire_a_traverse_navigate_event(*target_entry, m_user_involvement);
-            }
-
-            auto after_document_populated = GC::create_function(heap(), [this, old_origin, changing_navigable_continuation, target_entry, navigable](GC::Ptr<PopulateSessionHistoryEntryDocumentOutput> output) mutable {
-                changing_navigable_continuation->population_output = output;
-                changing_navigable_continuation->old_origin = old_origin;
-
-                // Compute the resolved document: pending_document (from finalize path),
-                // population output (from traversal path), or active document (same-document).
-                GC::Ptr<DOM::Document> resolved_document;
-                if (m_pending_document)
-                    resolved_document = m_pending_document;
-                else if (output && output->document)
-                    resolved_document = output->document;
-                else
-                    resolved_document = navigable->active_document();
-                changing_navigable_continuation->resolved_document = resolved_document;
-
-                // 1. If targetEntry's document is null, then set changingNavigableContinuation's update-only to true.
-                bool has_fresh_document = m_pending_document || (output && output->document);
-                if (!has_fresh_document && target_entry->document_state()->document_id() != navigable->active_document_id())
-                    changing_navigable_continuation->update_only = true;
-
-                // 2. If targetEntry's document's origin is not oldOrigin, then set targetEntry's classic history API state to StructuredSerializeForStorage(null).
-                // 3. If all of the following are true:
-                //     - navigable's parent is null;
-                //     - targetEntry's document's browsing context is not an auxiliary browsing context whose opener browsing context is non-null; and
-                //     - targetEntry's document's origin is not oldOrigin,
-                //    then set targetEntry's document state's navigable target name to the empty string.
-                // NOTE: Steps 2-3 are deferred to after_potential_unload to avoid exposing mutations during unload.
-
-                // 4. Enqueue changingNavigableContinuation on changingNavigableContinuations.
-                did_receive_continuation(changing_navigable_continuation);
-            });
-
-            // 8. If targetEntry's document is null, or targetEntry's document state's reload pending is true, then:
-            bool needs_population = !m_pending_document
-                && (target_entry->document_state()->document_id() != navigable->active_document_id()
-                    || target_entry->document_state()->reload_pending());
-            if (needs_population) {
-                if (target_entry->document_state()->reload_pending() && navigable->is_top_level_traversable())
-                    navigable->page().client().page_did_start_loading({}, target_entry->url(), Empty {}, false);
-
-                // FIXME: 1. Let navTimingType be "back_forward" if targetEntry's document is null; otherwise "reload".
-
-                // 2. Let targetSnapshotParams be the result of snapshotting target snapshot params given navigable.
-                auto target_snapshot_params = navigable->snapshot_target_snapshot_params();
-
-                // 3. Let potentiallyTargetSpecificSourceSnapshotParams be sourceSnapshotParams.
-                auto potentially_target_specific_source_snapshot_params = m_source_snapshot_params;
-
-                // 4. If potentiallyTargetSpecificSourceSnapshotParams is null, then set it to the result of snapshotting source snapshot params given navigable's active document.
-                if (!potentially_target_specific_source_snapshot_params)
-                    potentially_target_specific_source_snapshot_params = navigable->active_document()->snapshot_source_snapshot_params();
-
-                // 5. Set targetEntry's document state's reload pending to false.
-                target_entry->document_state()->set_reload_pending(false);
-                m_traversable->page().client().page_did_set_session_history_entry_document_state_reload_pending(
-                    navigable->id(), target_entry->navigation_api_key(), false);
-
-                // 6. Let allowPOST be targetEntry's document state's reload pending.
-                auto allow_POST = target_entry->document_state()->reload_pending();
-
-                // https://github.com/whatwg/html/issues/9869
-                // Population runs in a deferred task, during which sync navigations can mutate
-                // the live entry. Snapshot the input fields now so population reads stable values.
-                auto input_url = target_entry->url();
-                auto input_document_resource = target_entry->document_state()->resource();
-                auto input_request_referrer = target_entry->document_state()->request_referrer();
-                auto input_request_referrer_policy = target_entry->document_state()->request_referrer_policy();
-                auto input_initiator_origin = target_entry->document_state()->initiator_origin();
-                auto input_origin = target_entry->document_state()->origin();
-                auto input_history_policy_container = target_entry->document_state()->history_policy_container();
-                auto input_about_base_url = target_entry->document_state()->about_base_url();
-                auto input_navigable_target_name = target_entry->document_state()->navigable_target_name();
-                auto input_ever_populated = target_entry->document_state()->ever_populated();
-
-                // 7. In parallel, attempt to populate the history entry's document for targetEntry, given navigable, potentiallyTargetSpecificSourceSnapshotParams,
-                //    targetSnapshotParams, userInvolvement, with allowPOST set to allowPOST and completionSteps set to
-                //    queue a global task on the navigation and traversal task source given navigable's active window to
-                //    run afterDocumentPopulated.
-                Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(heap(), [input_url = move(input_url), input_document_resource = move(input_document_resource), input_request_referrer = move(input_request_referrer), input_request_referrer_policy, input_initiator_origin = move(input_initiator_origin), input_origin = move(input_origin), input_history_policy_container = move(input_history_policy_container), input_about_base_url = move(input_about_base_url), input_navigable_target_name = move(input_navigable_target_name), input_ever_populated, potentially_target_specific_source_snapshot_params, target_snapshot_params, this, allow_POST, navigable, after_document_populated, user_involvement = m_user_involvement] {
-                    navigable->populate_session_history_entry_document(
-                        move(input_url), move(input_document_resource), move(input_request_referrer),
-                        input_request_referrer_policy, move(input_initiator_origin), {}, move(input_origin),
-                        input_history_policy_container, move(input_about_base_url), move(input_navigable_target_name),
-                        false, input_ever_populated,
-                        *potentially_target_specific_source_snapshot_params, target_snapshot_params,
-                        user_involvement, {}, LocalNavigable::NullOrError {},
-                        ContentSecurityPolicy::Directives::Directive::NavigationType::Other, allow_POST,
-                        GC::create_function(this->heap(), [this, after_document_populated, navigable](GC::Ptr<PopulateSessionHistoryEntryDocumentOutput> output) {
-                            VERIFY(m_traversable->active_window());
-                            // AD-HOC: Queue through the apply-history helper so child completion tasks survive frame
-                            //         removal/deactivation. The continuation revalidates the navigable before applying.
-                            queue_apply_history_step_task(*navigable, navigable->active_document(), GC::create_function(heap(), [after_document_populated, output]() {
-                                after_document_populated->function()(output);
-                            }));
-                        }));
-                }));
-            }
-            // Otherwise, run afterDocumentPopulated immediately.
-            else {
-                after_document_populated->function()(nullptr);
-            }
-        }));
+            }));
     }
 
     try_advance();
+}
+
+void LocalTraversableNavigable::run_changing_navigable_history_step_job(ChangingNavigableHistoryStepJob job, GC::Ref<OnChangingNavigableHistoryStepJobComplete> on_complete)
+{
+    auto navigable = job.navigable;
+
+    // AD-HOC: If the navigable has been destroyed, or has no active window, skip it.
+    //         Complete the job here rather than relying on the queued task, because Document::destroy() removes tasks
+    //         associated with a document from the task queue, which can cause those tasks to never run.
+    if (navigable->has_been_destroyed() || !navigable->active_window()) {
+        on_complete->function()({ ChangingNavigableHistoryStepJobDisposition::Skipped, nullptr });
+        return;
+    }
+    queue_apply_history_step_task(navigable, navigable->active_document(), GC::create_function(heap(), [this, job = move(job), on_complete] {
+        auto navigable = job.navigable;
+
+        // NOTE: This check is not in the spec but we should not continue navigation if navigable has been destroyed.
+        if (navigable->has_been_destroyed() || !navigable->active_window() || !navigable->active_document()) {
+            on_complete->function()({ ChangingNavigableHistoryStepJobDisposition::Skipped, nullptr });
+            return;
+        }
+
+        // 1. Let displayedEntry be navigable's active session history entry.
+        auto displayed_entry = navigable->active_session_history_entry();
+
+        // 2. Let targetEntry be navigable's current session history entry.
+        auto target_entry = navigable->current_session_history_entry();
+        if (!target_entry || target_entry != job.target_entry) {
+            // AD-HOC: The HTML Standard expects the session history traversal queue to serialize this task with
+            //         later navigations. Our web-compatible deferral of navigations that arrive during traversal
+            //         can let a newer navigation replace the current entry before this task runs. Treat this state
+            //         as stale instead of applying its old target step after the newer navigation.
+            on_complete->function()({ ChangingNavigableHistoryStepJobDisposition::Stale, nullptr });
+            return;
+        }
+
+        auto displayed_step = displayed_entry ? displayed_entry->step_value() : Optional<int> {};
+        auto target_step = target_entry ? target_entry->step_value() : Optional<int> {};
+        if (!target_step.has_value()) {
+            // NB: Child navigables created during a busy top-level navigation can still have a pending initial
+            //     session history entry. The spec's step-based history algorithms operate on used history steps,
+            //     so a pending child entry must not block or crash the top-level apply-history step. The queued
+            //     child creation/destruction history step will reconcile the child once it has a concrete step.
+            on_complete->function()({ ChangingNavigableHistoryStepJobDisposition::Skipped, nullptr });
+            return;
+        }
+
+        // 3. Let changingNavigableContinuation be a changing navigable continuation state with:
+        auto changing_navigable_continuation = heap().allocate<ChangingNavigableContinuationState>();
+        changing_navigable_continuation->displayed_document = navigable->active_document();
+        changing_navigable_continuation->displayed_document_id = navigable->active_document_id();
+        changing_navigable_continuation->target_entry = target_entry;
+        changing_navigable_continuation->navigable = navigable;
+        changing_navigable_continuation->update_only = false;
+        changing_navigable_continuation->pending_document = job.pending_document;
+        changing_navigable_continuation->population_output = nullptr;
+
+        // 4. If displayedEntry is targetEntry and targetEntry's document state's reload pending is false, then:
+        // AD-HOC: A synchronous same-document navigation has already updated the active entry by this point.
+        //         A later queued reload can additionally set reload pending on an already-active target entry
+        //         before that synchronous step is applied. The reload step owns that population work.
+        bool is_update_only = displayed_entry == target_entry && !target_entry->document_state()->reload_pending();
+        if (job.synchronous_navigation == SynchronousNavigation::Yes)
+            is_update_only = !target_entry->document_state()->reload_pending() || displayed_entry == target_entry;
+        if (is_update_only) {
+            // 1. Set changingNavigableContinuation's update-only to true.
+            changing_navigable_continuation->update_only = true;
+            changing_navigable_continuation->resolved_document = navigable->active_document();
+
+            // 2. Enqueue changingNavigableContinuation on changingNavigableContinuations.
+            on_complete->function()({ ChangingNavigableHistoryStepJobDisposition::Ready, changing_navigable_continuation });
+
+            // 3. Abort these steps.
+            return;
+        }
+
+        // 5. Switch on navigationType:
+        if (job.navigation_type.has_value()) {
+            switch (job.navigation_type.value()) {
+            case Bindings::NavigationType::Reload:
+                // - "reload": Assert: targetEntry's document state's reload pending is true.
+                VERIFY(target_entry->document_state()->reload_pending());
+                break;
+            case Bindings::NavigationType::Traverse:
+                // - "traverse": Assert: targetEntry's document state's ever populated is true.
+                VERIFY(target_entry->document_state()->ever_populated());
+                break;
+            case Bindings::NavigationType::Replace:
+                // FIXME: Add ever populated check
+                // - "replace": Assert: targetEntry's step is displayedEntry's step and targetEntry's document state's ever populated is false.
+                if (displayed_step.has_value() && *target_step != *displayed_step) {
+                    // AD-HOC: A queued replace can become stale if a later navigation commits before this task
+                    //         runs — advancing the displayed step past the replace target. Let the later navigation
+                    //         win — rather than asserting the steps still match.
+                    on_complete->function()({ ChangingNavigableHistoryStepJobDisposition::Stale, nullptr });
+                    return;
+                }
+                if (displayed_step.has_value())
+                    VERIFY(target_entry->step() == displayed_entry->step());
+                break;
+            case Bindings::NavigationType::Push:
+                // FIXME: Add ever populated check, and fix the bug where top level traversable's step is not updated when a child navigable navigates
+                // - "push": Assert: targetEntry's step is displayedEntry's step + 1 and targetEntry's document state's ever populated is false.
+                if (displayed_step.has_value() && *target_step <= *displayed_step) {
+                    // AD-HOC: A queued push can become stale if a later navigation commits before this task runs.
+                    //         Browser engines let the later navigation win; do the same and avoid moving the
+                    //         traversable's current step back to this push target during completion.
+                    on_complete->function()({ ChangingNavigableHistoryStepJobDisposition::Stale, nullptr });
+                    return;
+                }
+                VERIFY(target_entry != displayed_entry);
+                break;
+            }
+        }
+
+        // 6. Let oldOrigin be targetEntry's document state's origin.
+        auto old_origin = target_entry->document_state()->origin();
+
+        // 7. If all of the following are true:
+        //   * navigable is not traversable;
+        //   * targetEntry is not navigable's current session history entry; and
+        //   * oldOrigin is the same as navigable's current session history entry's document state's origin,
+        // then:
+        if (!navigable->is_traversable()
+            && target_entry != navigable->current_session_history_entry()
+            && old_origin == navigable->current_session_history_entry()->document_state()->origin()) {
+            // 1. Let navigation be navigable's active window's navigation API.
+            auto navigation = navigable->active_window()->navigation();
+
+            // 2. Fire a traverse navigate event at navigation given targetEntry and userInvolvement.
+            navigation->fire_a_traverse_navigate_event(*target_entry, job.user_involvement);
+        }
+
+        auto after_document_populated = GC::create_function(heap(), [old_origin, changing_navigable_continuation, target_entry, navigable, on_complete](GC::Ptr<PopulateSessionHistoryEntryDocumentOutput> output) mutable {
+            changing_navigable_continuation->population_output = output;
+            changing_navigable_continuation->old_origin = old_origin;
+
+            // Compute the resolved document: pending document (from the finalize path),
+            // population output (from traversal path), or active document (same-document).
+            GC::Ptr<DOM::Document> resolved_document;
+            if (changing_navigable_continuation->pending_document)
+                resolved_document = changing_navigable_continuation->pending_document;
+            else if (output && output->document)
+                resolved_document = output->document;
+            else
+                resolved_document = navigable->active_document();
+            changing_navigable_continuation->resolved_document = resolved_document;
+
+            // 1. If targetEntry's document is null, then set changingNavigableContinuation's update-only to true.
+            bool has_fresh_document = changing_navigable_continuation->pending_document || (output && output->document);
+            if (!has_fresh_document && target_entry->document_state()->document_id() != navigable->active_document_id())
+                changing_navigable_continuation->update_only = true;
+
+            // 2. If targetEntry's document's origin is not oldOrigin, then set targetEntry's classic history API state to StructuredSerializeForStorage(null).
+            // 3. If all of the following are true:
+            //     - navigable's parent is null;
+            //     - targetEntry's document's browsing context is not an auxiliary browsing context whose opener browsing context is non-null; and
+            //     - targetEntry's document's origin is not oldOrigin,
+            //    then set targetEntry's document state's navigable target name to the empty string.
+            // NOTE: Steps 2-3 are deferred to after_potential_unload to avoid exposing mutations during unload.
+
+            // 4. Enqueue changingNavigableContinuation on changingNavigableContinuations.
+            on_complete->function()({ ChangingNavigableHistoryStepJobDisposition::Ready, changing_navigable_continuation });
+        });
+
+        // 8. If targetEntry's document is null, or targetEntry's document state's reload pending is true, then:
+        bool needs_population = !changing_navigable_continuation->pending_document
+            && (target_entry->document_state()->document_id() != navigable->active_document_id()
+                || target_entry->document_state()->reload_pending());
+        if (needs_population) {
+            if (target_entry->document_state()->reload_pending() && navigable->is_top_level_traversable())
+                navigable->page().client().page_did_start_loading({}, target_entry->url(), Empty {}, false);
+
+            // FIXME: 1. Let navTimingType be "back_forward" if targetEntry's document is null; otherwise "reload".
+
+            // 2. Let targetSnapshotParams be the result of snapshotting target snapshot params given navigable.
+            auto target_snapshot_params = navigable->snapshot_target_snapshot_params();
+
+            // 3. Let potentiallyTargetSpecificSourceSnapshotParams be sourceSnapshotParams.
+            auto potentially_target_specific_source_snapshot_params = job.source_snapshot_params;
+
+            // 4. If potentiallyTargetSpecificSourceSnapshotParams is null, then set it to the result of snapshotting source snapshot params given navigable's active document.
+            if (!potentially_target_specific_source_snapshot_params)
+                potentially_target_specific_source_snapshot_params = navigable->active_document()->snapshot_source_snapshot_params();
+
+            // 5. Set targetEntry's document state's reload pending to false.
+            target_entry->document_state()->set_reload_pending(false);
+            page().client().page_did_set_session_history_entry_document_state_reload_pending(
+                navigable->id(), target_entry->navigation_api_key(), false);
+
+            // 6. Let allowPOST be targetEntry's document state's reload pending.
+            auto allow_POST = target_entry->document_state()->reload_pending();
+
+            // https://github.com/whatwg/html/issues/9869
+            // Population runs in a deferred task, during which sync navigations can mutate
+            // the live entry. Snapshot the input fields now so population reads stable values.
+            auto input_url = target_entry->url();
+            auto input_document_resource = target_entry->document_state()->resource();
+            auto input_request_referrer = target_entry->document_state()->request_referrer();
+            auto input_request_referrer_policy = target_entry->document_state()->request_referrer_policy();
+            auto input_initiator_origin = target_entry->document_state()->initiator_origin();
+            auto input_origin = target_entry->document_state()->origin();
+            auto input_history_policy_container = target_entry->document_state()->history_policy_container();
+            auto input_about_base_url = target_entry->document_state()->about_base_url();
+            auto input_navigable_target_name = target_entry->document_state()->navigable_target_name();
+            auto input_ever_populated = target_entry->document_state()->ever_populated();
+
+            // 7. In parallel, attempt to populate the history entry's document for targetEntry, given navigable, potentiallyTargetSpecificSourceSnapshotParams,
+            //    targetSnapshotParams, userInvolvement, with allowPOST set to allowPOST and completionSteps set to
+            //    queue a global task on the navigation and traversal task source given navigable's active window to
+            //    run afterDocumentPopulated.
+            Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(heap(), [input_url = move(input_url), input_document_resource = move(input_document_resource), input_request_referrer = move(input_request_referrer), input_request_referrer_policy, input_initiator_origin = move(input_initiator_origin), input_origin = move(input_origin), input_history_policy_container = move(input_history_policy_container), input_about_base_url = move(input_about_base_url), input_navigable_target_name = move(input_navigable_target_name), input_ever_populated, potentially_target_specific_source_snapshot_params, target_snapshot_params, this, allow_POST, navigable, after_document_populated, user_involvement = job.user_involvement] {
+                navigable->populate_session_history_entry_document(
+                    move(input_url), move(input_document_resource), move(input_request_referrer),
+                    input_request_referrer_policy, move(input_initiator_origin), {}, move(input_origin),
+                    input_history_policy_container, move(input_about_base_url), move(input_navigable_target_name),
+                    false, input_ever_populated,
+                    *potentially_target_specific_source_snapshot_params, target_snapshot_params,
+                    user_involvement, {}, LocalNavigable::NullOrError {},
+                    ContentSecurityPolicy::Directives::Directive::NavigationType::Other, allow_POST,
+                    GC::create_function(this->heap(), [this, after_document_populated, navigable](GC::Ptr<PopulateSessionHistoryEntryDocumentOutput> output) {
+                        VERIFY(active_window());
+                        // AD-HOC: Queue through the apply-history helper so child completion tasks survive frame
+                        //         removal/deactivation. The continuation revalidates the navigable before applying.
+                        queue_apply_history_step_task(*navigable, navigable->active_document(), GC::create_function(heap(), [after_document_populated, output]() {
+                            after_document_populated->function()(output);
+                        }));
+                    }));
+            }));
+        }
+        // Otherwise, run afterDocumentPopulated immediately.
+        else {
+            after_document_populated->function()(nullptr);
+        }
+    }));
 }
 
 void ApplyHistoryStepState::process_continuations()
@@ -106973,147 +107022,201 @@ void ApplyHistoryStepState::process_continuations()
 
         auto continuation = m_continuations[m_continuation_index++];
 
-        // 4. Let displayedDocument be changingNavigableContinuation's displayed document.
-        auto displayed_document = continuation->displayed_document;
-
-        // 5. Let targetEntry be changingNavigableContinuation's target entry.
-        auto population_output = continuation->population_output;
-        auto old_origin = continuation->old_origin;
-
-        // 6. Let navigable be changingNavigableContinuation's navigable.
-        auto navigable = continuation->navigable;
-
-        // AD-HOC: We should not continue navigation if navigable has been destroyed.
-        if (navigable->has_been_destroyed()) {
-            signal_progress();
-            continue;
-        }
-        // AD-HOC: The displayed document may have been destroyed during the nested step execution above.
-        if (!displayed_document->navigable()) {
-            signal_progress();
-            continue;
-        }
-
         m_target_step = m_traversable->get_the_used_step(m_step);
 
         // 7. Let (scriptHistoryLength, scriptHistoryIndex) be the result of getting the history object length and index given traversable and targetStep.
         auto history_object_length_and_index = m_traversable->get_the_history_object_length_and_index(m_target_step);
-        auto script_history_length = history_object_length_and_index.script_history_length;
-        auto script_history_index = history_object_length_and_index.script_history_index;
 
         // 8. Append navigable to navigablesThatMustWaitBeforeHandlingSyncNavigation.
-        m_navigables_that_must_wait_before_handling_sync_navigation.set(*navigable);
+        m_navigables_that_must_wait_before_handling_sync_navigation.set(*continuation->navigable);
 
         // 9. Let entriesForNavigationAPI be the result of getting session history entries for the navigation API given navigable and targetStep.
-        auto entries_for_navigation_api = m_traversable->get_session_history_entries_for_the_navigation_api(*navigable, m_target_step);
+        auto entries_for_navigation_api = m_traversable->get_session_history_entries_for_the_navigation_api(*continuation->navigable, m_target_step);
 
-        // NOTE: Steps 10 and 11 come after step 12.
+        m_traversable->apply_changing_navigable_history_step_continuation(
+            {
+                .continuation = continuation,
+                .history_object_length_and_index = history_object_length_and_index,
+                .entries_for_navigation_api = move(entries_for_navigation_api),
+                .navigation_type = m_navigation_type,
+                .navigation_api_abort_behavior = m_navigation_api_abort_behavior,
+                .user_involvement = m_user_involvement,
+            },
+            GC::create_function(heap(), [this] {
+                signal_progress();
+            }));
+    }
+}
 
-        // 12. In both cases, let afterPotentialUnloads be the following steps:
-        bool const update_only = continuation->update_only;
-        RefPtr<SessionHistoryEntry> const target_entry = continuation->target_entry;
-        auto const displayed_document_id = continuation->displayed_document_id;
-        auto after_potential_unload = GC::create_function(heap(), [this, navigable, update_only, target_entry, continuation, population_output, old_origin, displayed_document_id, script_history_length, script_history_index, entries_for_navigation_api = move(entries_for_navigation_api), navigation_type = m_navigation_type] {
-            if (update_only || continuation->resolved_document.ptr() == continuation->displayed_document.ptr()) {
-                // AD-HOC: Child navigable same-document/update-only tasks are queued without an associated Document so
-                //         they can survive the old active Document being deactivated. That also lets them run after the
-                //         child frame was destroyed or after a newer navigation claimed the frame. Browser engines let
-                //         the newer frame state win, so skip this stale continuation in that case.
-                if (!changing_navigable_is_still_current(navigable, displayed_document_id)) {
-                    complete_change_job_without_applying(navigable);
-                    return;
-                }
+static bool changing_navigable_is_still_current(GC::Ptr<LocalNavigable> navigable, Optional<UniqueNodeID> expected_active_document_id)
+{
+    if (!navigable || navigable->has_been_destroyed() || !navigable->active_window())
+        return false;
+
+    auto active_document = navigable->active_document();
+    if (!active_document || active_document->has_been_destroyed())
+        return false;
+
+    if (navigable->active_document_id() != expected_active_document_id)
+        return false;
+
+    return navigable->ongoing_navigation().has<Empty>();
+}
+
+static void clear_ongoing_history_traversal(GC::Ptr<LocalNavigable> navigable, LocalNavigable::NavigationAPIAbortBehavior navigation_api_abort_behavior)
+{
+    if (!navigable || navigable->has_been_destroyed())
+        return;
+
+    if (!navigable->ongoing_navigation().has<LocalNavigable::Traversal>())
+        return;
+
+    // AD-HOC: The HTML Standard's traversal queue normally reaches one of the per-navigable "Set the ongoing
+    //         navigation for navigable to null" steps before this state completes. Our stale-task exits deliberately
+    //         skip the rest of the history step so newer navigations win like they do in Chromium, WebKit, and Gecko,
+    //         but we still have to remove the traversal sentinel. Use the shared setter so pending navigations queued
+    //         behind this traversal are drained in one place.
+    navigable->set_ongoing_navigation({}, navigation_api_abort_behavior);
+}
+
+void LocalTraversableNavigable::apply_changing_navigable_history_step_continuation(ApplyChangingNavigableHistoryStepContinuation command, GC::Ref<GC::Function<void()>> on_complete)
+{
+    auto continuation = command.continuation;
+
+    // 4. Let displayedDocument be changingNavigableContinuation's displayed document.
+    auto displayed_document = continuation->displayed_document;
+
+    // 5. Let targetEntry be changingNavigableContinuation's target entry.
+    auto population_output = continuation->population_output;
+    auto old_origin = continuation->old_origin;
+
+    // 6. Let navigable be changingNavigableContinuation's navigable.
+    auto navigable = continuation->navigable;
+
+    // AD-HOC: We should not continue navigation if navigable has been destroyed.
+    if (navigable->has_been_destroyed()) {
+        on_complete->function()();
+        return;
+    }
+    // AD-HOC: The displayed document may have been destroyed during the nested step execution above.
+    if (!displayed_document->navigable()) {
+        on_complete->function()();
+        return;
+    }
+
+    // 7. Let (scriptHistoryLength, scriptHistoryIndex) be the result of getting the history object length and index given traversable and targetStep.
+    auto script_history_length = command.history_object_length_and_index.script_history_length;
+    auto script_history_index = command.history_object_length_and_index.script_history_index;
+
+    // 9. Let entriesForNavigationAPI be the result of getting session history entries for the navigation API given navigable and targetStep.
+
+    // NOTE: Steps 10 and 11 come after step 12.
+
+    // 12. In both cases, let afterPotentialUnloads be the following steps:
+    bool const update_only = continuation->update_only;
+    RefPtr<SessionHistoryEntry> const target_entry = continuation->target_entry;
+    auto const displayed_document_id = continuation->displayed_document_id;
+    auto after_potential_unload = GC::create_function(heap(), [this, navigable, update_only, target_entry, continuation, population_output, old_origin, displayed_document_id, script_history_length, script_history_index, entries_for_navigation_api = move(command.entries_for_navigation_api), navigation_type = command.navigation_type, navigation_api_abort_behavior = command.navigation_api_abort_behavior, on_complete] {
+        if (update_only || continuation->resolved_document.ptr() == continuation->displayed_document.ptr()) {
+            // AD-HOC: Child navigable same-document/update-only tasks are queued without an associated Document so
+            //         they can survive the old active Document being deactivated. That also lets them run after the
+            //         child frame was destroyed or after a newer navigation claimed the frame. Browser engines let
+            //         the newer frame state win, so skip this stale continuation in that case.
+            if (!changing_navigable_is_still_current(navigable, displayed_document_id)) {
+                clear_ongoing_history_traversal(navigable, navigation_api_abort_behavior);
+                on_complete->function()();
+                return;
             }
+        }
 
-            if (population_output)
-                population_output->apply_to(*target_entry);
+        if (population_output)
+            population_output->apply_to(*target_entry);
 
-            // Post-population adjustments — only run when a fresh document was produced
-            // (not for 204/205 no-document outcomes where resolved_document is the old active document).
-            bool has_fresh_document = m_pending_document || (population_output && population_output->document);
-            if (has_fresh_document) {
-                auto resolved_document = continuation->resolved_document;
-                // 2. If targetEntry's document's origin is not oldOrigin, then set targetEntry's classic history API state to StructuredSerializeForStorage(null).
-                if (resolved_document->origin() != old_origin) {
-                    auto& vm = navigable->vm();
-                    target_entry->set_classic_history_api_state(MUST(structured_serialize_for_storage(vm, JS::js_null())));
-                }
-
-                // 3. If all of the following are true:
-                //     - navigable's parent is null;
-                //     - targetEntry's document's browsing context is not an auxiliary browsing context whose opener browsing context is non-null; and
-                //     - targetEntry's document's origin is not oldOrigin,
-                //    then set targetEntry's document state's navigable target name to the empty string.
-                if (navigable->parent() == nullptr
-                    && !(resolved_document->browsing_context()->is_auxiliary() && resolved_document->browsing_context()->opener_browsing_context() != nullptr)
-                    && target_entry->document_state()->origin() != old_origin) {
-                    target_entry->document_state()->set_navigable_target_name(Utf16String {});
-                }
-            }
-
-            // 1. Let previousEntry be navigable's active session history entry.
-            auto previous_entry = navigable->active_session_history_entry();
-
-            // 2. If changingNavigableContinuation's update-only is false, then activate history entry targetEntry for navigable.
+        // Post-population adjustments — only run when a fresh document was produced
+        // (not for 204/205 no-document outcomes where resolved_document is the old active document).
+        bool has_fresh_document = continuation->pending_document || (population_output && population_output->document);
+        if (has_fresh_document) {
             auto resolved_document = continuation->resolved_document;
-            if (!update_only)
-                navigable->activate_history_entry(*target_entry, *resolved_document);
-
-            // 3. Let updateDocument be an algorithm step which performs update document for history step application given
-            //    targetEntry's document, targetEntry, changingNavigableContinuation's update-only, scriptHistoryLength,
-            //    scriptHistoryIndex, navigationType, entriesForNavigationAPI, and previousEntry.
-            auto update_document = [script_history_length, script_history_index, entries_for_navigation_api = move(entries_for_navigation_api), target_entry, update_only, navigation_type, previous_entry, resolved_document] {
-                resolved_document->update_for_history_step_application(*target_entry, update_only, script_history_length, script_history_index, navigation_type, entries_for_navigation_api, previous_entry, navigation_type.has_value());
-            };
-
-            // 4. If targetEntry's document is equal to displayedDocument, then perform updateDocument.
-            // NOTE: We compare against the pre-activation displayed_document_id (not the current
-            //       active entry) because activate_history_entry() has already updated the active entry above.
-            if (target_entry->document_state()->document_id() == displayed_document_id) {
-                update_document();
-            }
-            // AD-HOC: When the document already has its parser pre-loaded with in-memory data (currently set up
-            //         only for about:srcdoc), perform updateDocument synchronously instead of queueing it.
-            //         updateDocument calls Document::set_ready_to_run_scripts(), which kicks off the deferred
-            //         parser. Running it in the same task as activation guarantees the body element exists before
-            //         script in the parent navigable can observe the new document — matching Chrome and Firefox
-            //         behavior for srcdoc iframes.
-            else if (resolved_document->has_deferred_parser_start()) {
-                update_document();
-            }
-            // 5. Otherwise, queue a global task on the navigation and traversal task source given targetEntry's document's relevant global object to perform updateDocument
-            else {
-                queue_global_task(Task::Source::NavigationAndTraversal, relevant_global_object(*resolved_document), GC::create_function(heap(), move(update_document)));
+            // 2. If targetEntry's document's origin is not oldOrigin, then set targetEntry's classic history API state to StructuredSerializeForStorage(null).
+            if (resolved_document->origin() != old_origin) {
+                auto& vm = navigable->vm();
+                target_entry->set_classic_history_api_state(MUST(structured_serialize_for_storage(vm, JS::js_null())));
             }
 
-            // 6. Increment completedChangeJobs.
-            signal_progress();
-        });
-
-        // 10. If changingNavigableContinuation's update-only is true, or targetEntry's document is displayedDocument, then:
-        if (continuation->update_only || continuation->resolved_document.ptr() == displayed_document.ptr()) {
-            // 1. Set the ongoing navigation for navigable to null.
-            navigable->set_ongoing_navigation({}, m_navigation_api_abort_behavior);
-
-            // 2. Queue a global task on the navigation and traversal task source given navigable's active window to perform afterPotentialUnloads.
-            queue_apply_history_step_task(*navigable, navigable->active_document(), after_potential_unload);
+            // 3. If all of the following are true:
+            //     - navigable's parent is null;
+            //     - targetEntry's document's browsing context is not an auxiliary browsing context whose opener browsing context is non-null; and
+            //     - targetEntry's document's origin is not oldOrigin,
+            //    then set targetEntry's document state's navigable target name to the empty string.
+            if (navigable->parent() == nullptr
+                && !(resolved_document->browsing_context()->is_auxiliary() && resolved_document->browsing_context()->opener_browsing_context() != nullptr)
+                && target_entry->document_state()->origin() != old_origin) {
+                target_entry->document_state()->set_navigable_target_name(Utf16String {});
+            }
         }
-        // AD-HOC: During navigable creation, the initial about:blank document can be
-        //         replaced by the container's initial navigation while applying the
-        //         creation/destruction history step. That hook passes a null
-        //         navigationType per spec, and there is no outgoing document to unload.
-        else if (!m_navigation_type.has_value() && displayed_document->is_initial_about_blank()) {
-            navigable->set_ongoing_navigation({}, m_navigation_api_abort_behavior);
-            after_potential_unload->function()();
+
+        // 1. Let previousEntry be navigable's active session history entry.
+        auto previous_entry = navigable->active_session_history_entry();
+
+        // 2. If changingNavigableContinuation's update-only is false, then activate history entry targetEntry for navigable.
+        auto resolved_document = continuation->resolved_document;
+        if (!update_only)
+            navigable->activate_history_entry(*target_entry, *resolved_document);
+
+        // 3. Let updateDocument be an algorithm step which performs update document for history step application given
+        //    targetEntry's document, targetEntry, changingNavigableContinuation's update-only, scriptHistoryLength,
+        //    scriptHistoryIndex, navigationType, entriesForNavigationAPI, and previousEntry.
+        auto update_document = [script_history_length, script_history_index, entries_for_navigation_api = move(entries_for_navigation_api), target_entry, update_only, navigation_type, previous_entry, resolved_document] {
+            resolved_document->update_for_history_step_application(*target_entry, update_only, script_history_length, script_history_index, navigation_type, entries_for_navigation_api, previous_entry, navigation_type.has_value());
+        };
+
+        // 4. If targetEntry's document is equal to displayedDocument, then perform updateDocument.
+        // NOTE: We compare against the pre-activation displayed_document_id (not the current
+        //       active entry) because activate_history_entry() has already updated the active entry above.
+        if (target_entry->document_state()->document_id() == displayed_document_id) {
+            update_document();
         }
-        // 11. Otherwise:
+        // AD-HOC: When the document already has its parser pre-loaded with in-memory data (currently set up
+        //         only for about:srcdoc), perform updateDocument synchronously instead of queueing it.
+        //         updateDocument calls Document::set_ready_to_run_scripts(), which kicks off the deferred
+        //         parser. Running it in the same task as activation guarantees the body element exists before
+        //         script in the parent navigable can observe the new document — matching Chrome and Firefox
+        //         behavior for srcdoc iframes.
+        else if (resolved_document->has_deferred_parser_start()) {
+            update_document();
+        }
+        // 5. Otherwise, queue a global task on the navigation and traversal task source given targetEntry's document's relevant global object to perform updateDocument
         else {
-            // 1. Assert: navigationType is not null.
-            VERIFY(m_navigation_type.has_value());
-
-            // 2. Deactivate displayedDocument, given userInvolvement, targetEntry, navigationType, and afterPotentialUnloads.
-            deactivate_a_document_for_cross_document_navigation(*displayed_document, m_user_involvement, *target_entry, continuation->resolved_document, after_potential_unload);
+            queue_global_task(Task::Source::NavigationAndTraversal, relevant_global_object(*resolved_document), GC::create_function(heap(), move(update_document)));
         }
+
+        // 6. Increment completedChangeJobs.
+        on_complete->function()();
+    });
+
+    // 10. If changingNavigableContinuation's update-only is true, or targetEntry's document is displayedDocument, then:
+    if (continuation->update_only || continuation->resolved_document.ptr() == displayed_document.ptr()) {
+        // 1. Set the ongoing navigation for navigable to null.
+        navigable->set_ongoing_navigation({}, command.navigation_api_abort_behavior);
+
+        // 2. Queue a global task on the navigation and traversal task source given navigable's active window to perform afterPotentialUnloads.
+        queue_apply_history_step_task(*navigable, navigable->active_document(), after_potential_unload);
+    }
+    // AD-HOC: During navigable creation, the initial about:blank document can be
+    //         replaced by the container's initial navigation while applying the
+    //         creation/destruction history step. That hook passes a null
+    //         navigationType per spec, and there is no outgoing document to unload.
+    else if (!command.navigation_type.has_value() && displayed_document->is_initial_about_blank()) {
+        navigable->set_ongoing_navigation({}, command.navigation_api_abort_behavior);
+        after_potential_unload->function()();
+    }
+    // 11. Otherwise:
+    else {
+        // 1. Assert: navigationType is not null.
+        VERIFY(command.navigation_type.has_value());
+
+        // 2. Deactivate displayedDocument, given userInvolvement, targetEntry, navigationType, and afterPotentialUnloads.
+        deactivate_a_document_for_cross_document_navigation(*displayed_document, command.user_involvement, *target_entry, continuation->resolved_document, after_potential_unload);
     }
 }
 
@@ -107128,38 +107231,52 @@ void ApplyHistoryStepState::enter_waiting_for_non_changing_jobs()
 
     // 18. For each navigable of nonchangingNavigablesThatStillNeedUpdates, queue a global task on the navigation and traversal task source given navigable's active window to run the steps:
     for (auto& navigable : m_non_changing_navigables) {
-        // AD-HOC: This check is not in the spec but we should not continue navigation if navigable has been destroyed,
-        //         or if there's no active window.
-        if (navigable->has_been_destroyed() || !navigable->active_window()) {
-            ++m_completed_non_changing_jobs;
-            continue;
-        }
-        // AD-HOC: Queue with null document instead of using queue_global_task.
-        //         Tasks associated with a document are only runnable when fully active.
-        //         In the async state machine, documents can become non-fully-active between
-        //         queue time and execution, causing the task to be permanently stuck.
-        //         A null-document task is always runnable; we check validity inside.
-        queue_a_task(Task::Source::NavigationAndTraversal, nullptr, nullptr, GC::create_function(heap(), [this, navigable, script_history_length, script_history_index] {
-            if (navigable->has_been_destroyed() || !navigable->active_window() || !navigable->active_document()->is_fully_active()) {
+        m_traversable->update_nonchanging_navigable_history_step_state(
+            navigable,
+            {
+                .script_history_length = script_history_length,
+                .script_history_index = script_history_index,
+            },
+            GC::create_function(heap(), [this] {
                 signal_progress();
-                return;
-            }
-
-            // 1. Let document be navigable's active document.
-            auto document = navigable->active_document();
-
-            // 2. Set document's history object's index to scriptHistoryIndex.
-            document->history()->m_index = script_history_index;
-
-            // 3. Set document's history object's length to scriptHistoryLength.
-            document->history()->m_length = script_history_length;
-
-            // 4. Increment completedNonchangingJobs.
-            signal_progress();
-        }));
+            }));
     }
 
     try_advance();
+}
+
+void LocalTraversableNavigable::update_nonchanging_navigable_history_step_state(GC::Ref<LocalNavigable> navigable, HistoryObjectLengthAndIndex history_object_length_and_index, GC::Ref<GC::Function<void()>> on_complete)
+{
+    // AD-HOC: This check is not in the spec but we should not continue navigation if navigable has been destroyed,
+    //         or if there's no active window.
+    if (navigable->has_been_destroyed() || !navigable->active_window()) {
+        on_complete->function()();
+        return;
+    }
+
+    // AD-HOC: Queue with null document instead of using queue_global_task.
+    //         Tasks associated with a document are only runnable when fully active.
+    //         In the async state machine, documents can become non-fully-active between
+    //         queue time and execution, causing the task to be permanently stuck.
+    //         A null-document task is always runnable; we check validity inside.
+    queue_a_task(Task::Source::NavigationAndTraversal, nullptr, nullptr, GC::create_function(heap(), [navigable, history_object_length_and_index, on_complete] {
+        if (navigable->has_been_destroyed() || !navigable->active_window() || !navigable->active_document()->is_fully_active()) {
+            on_complete->function()();
+            return;
+        }
+
+        // 1. Let document be navigable's active document.
+        auto document = navigable->active_document();
+
+        // 2. Set document's history object's index to scriptHistoryIndex.
+        document->history()->m_index = history_object_length_and_index.script_history_index;
+
+        // 3. Set document's history object's length to scriptHistoryLength.
+        document->history()->m_length = history_object_length_and_index.script_history_length;
+
+        // 4. Increment completedNonchangingJobs.
+        on_complete->function()();
+    }));
 }
 
 LocalTraversableNavigable::SessionHistorySnapshot LocalTraversableNavigable::create_session_history_snapshot(SaveActiveEntryPersistedState save_active_entry_persisted_state)
@@ -107284,35 +107401,9 @@ void ApplyHistoryStepState::complete_change_job_without_applying(GC::Ptr<LocalNa
     signal_progress();
 }
 
-bool ApplyHistoryStepState::changing_navigable_is_still_current(GC::Ptr<LocalNavigable> navigable, Optional<UniqueNodeID> expected_active_document_id) const
-{
-    if (!navigable || navigable->has_been_destroyed() || !navigable->active_window())
-        return false;
-
-    auto active_document = navigable->active_document();
-    if (!active_document || active_document->has_been_destroyed())
-        return false;
-
-    if (navigable->active_document_id() != expected_active_document_id)
-        return false;
-
-    return navigable->ongoing_navigation().has<Empty>();
-}
-
 void ApplyHistoryStepState::clear_ongoing_traversal_for_changing_navigable(GC::Ptr<LocalNavigable> navigable)
 {
-    if (!navigable || navigable->has_been_destroyed())
-        return;
-
-    if (!navigable->ongoing_navigation().has<LocalNavigable::Traversal>())
-        return;
-
-    // AD-HOC: The HTML Standard's traversal queue normally reaches one of the per-navigable "Set the ongoing
-    //         navigation for navigable to null" steps before this state completes. Our stale-task exits deliberately
-    //         skip the rest of the history step so newer navigations win like they do in Chromium, WebKit, and Gecko,
-    //         but we still have to remove the traversal sentinel. Use the shared setter so pending navigations queued
-    //         behind this traversal are drained in one place.
-    navigable->set_ongoing_navigation({}, m_navigation_api_abort_behavior);
+    clear_ongoing_history_traversal(navigable, m_navigation_api_abort_behavior);
 }
 
 void ApplyHistoryStepState::clear_ongoing_traversals_for_changing_navigables()
@@ -108441,6 +108532,7 @@ FILE: Libraries/LibWeb/HTML/LocalTraversableNavigable.h
 namespace Web::HTML {
 
 class ApplyHistoryStepState;
+struct ChangingNavigableContinuationState;
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#traversable-navigable
 class WEB_API LocalTraversableNavigable final : public LocalNavigable {
@@ -108495,6 +108587,40 @@ public:
         Yes,
         No,
     };
+
+    struct ChangingNavigableHistoryStepJob {
+        GC::Ref<LocalNavigable> navigable;
+        NonnullRefPtr<SessionHistoryEntry> target_entry;
+        GC::Ptr<SourceSnapshotParams> source_snapshot_params;
+        UserNavigationInvolvement user_involvement;
+        Optional<Bindings::NavigationType> navigation_type;
+        SynchronousNavigation synchronous_navigation;
+        LocalNavigable::NavigationAPIAbortBehavior navigation_api_abort_behavior;
+        GC::Ptr<DOM::Document> pending_document;
+    };
+    enum class ChangingNavigableHistoryStepJobDisposition {
+        Ready,
+        Skipped,
+        Stale,
+    };
+    struct ChangingNavigableHistoryStepJobResult {
+        ChangingNavigableHistoryStepJobDisposition disposition;
+        GC::Ptr<ChangingNavigableContinuationState> continuation;
+    };
+    using OnChangingNavigableHistoryStepJobComplete = GC::Function<void(ChangingNavigableHistoryStepJobResult)>;
+    void run_changing_navigable_history_step_job(ChangingNavigableHistoryStepJob, GC::Ref<OnChangingNavigableHistoryStepJobComplete>);
+
+    struct ApplyChangingNavigableHistoryStepContinuation {
+        GC::Ref<ChangingNavigableContinuationState> continuation;
+        HistoryObjectLengthAndIndex history_object_length_and_index;
+        Vector<NonnullRefPtr<SessionHistoryEntry>> entries_for_navigation_api;
+        Optional<Bindings::NavigationType> navigation_type;
+        LocalNavigable::NavigationAPIAbortBehavior navigation_api_abort_behavior;
+        UserNavigationInvolvement user_involvement;
+    };
+    void apply_changing_navigable_history_step_continuation(ApplyChangingNavigableHistoryStepContinuation, GC::Ref<GC::Function<void()>> on_complete);
+    void update_nonchanging_navigable_history_step_state(GC::Ref<LocalNavigable>, HistoryObjectLengthAndIndex, GC::Ref<GC::Function<void()>> on_complete);
+
     [[nodiscard]] bool try_to_synchronously_commit_same_document_navigation(GC::Ref<LocalNavigable>, NonnullRefPtr<SessionHistoryEntry>, RefPtr<SessionHistoryEntry> entry_to_replace);
     void apply_the_push_or_replace_history_step(int step, HistoryHandlingBehavior history_handling, UserNavigationInvolvement, SynchronousNavigation, GC::Ptr<DOM::Document> pending_document, GC::Ptr<LocalNavigable> expected_ongoing_navigation_navigable, Optional<Utf16String> expected_ongoing_navigation_id, GC::Ref<OnApplyHistoryStepComplete> on_complete);
     void update_for_navigable_creation_or_destruction(GC::Ref<OnApplyHistoryStepComplete> on_complete);
@@ -264328,7 +264454,9 @@ impl AbsposEngine<'_> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BlockSizePass {
     BeforeInsideLayout,
-    AfterInsideLayout,
+    AfterInsideLayout {
+        automatic_content_block_size_of_inside_layout: Option<CssPixels>,
+    },
 }
 
 impl AbsposEngine<'_> {
@@ -264365,10 +264493,13 @@ impl AbsposEngine<'_> {
         pass: BlockSizePass,
     ) -> AutoPx {
         if self.facts(node).creates_block_formatting_context() {
-            if pass == BlockSizePass::BeforeInsideLayout {
+            let BlockSizePass::AfterInsideLayout {
+                automatic_content_block_size_of_inside_layout,
+            } = pass
+            else {
                 return None;
-            }
-            return Some(automatic_block_size_for_bfc_root(self.state, self.callbacks, node));
+            };
+            return Some(automatic_content_block_size_of_inside_layout.unwrap_or_default());
         }
         let inner = self
             .used(node)
@@ -264793,7 +264924,12 @@ impl<'pass> AbsposEngine<'pass> {
             .make_button_content_box_definite(node, LayoutMode::Normal, available_space, constraints, None);
     }
 
-    pub(crate) fn finalize_out_of_flow_root_after_inside_layout(&self, node: Node, inputs: AbsposLayoutInputs) {
+    pub(crate) fn finalize_out_of_flow_root_after_inside_layout(
+        &self,
+        node: Node,
+        inputs: AbsposLayoutInputs,
+        automatic_content_block_size_of_inside_layout: Option<CssPixels>,
+    ) {
         let (available_space, constraints) = out_of_flow_root_space(inputs);
         let containing_block_size = LogicalSize {
             inline_size: available_space.inline_size.to_px_or_zero(),
@@ -264806,7 +264942,9 @@ impl<'pass> AbsposEngine<'pass> {
                 available_space,
                 constraints,
                 inputs.static_position_rect,
-                BlockSizePass::AfterInsideLayout,
+                BlockSizePass::AfterInsideLayout {
+                    automatic_content_block_size_of_inside_layout,
+                },
             );
         }
 
@@ -265246,12 +265384,6 @@ pub(crate) struct FloatBand {
 struct FloatPlacement {
     block_start: CssPixels,
     offset_from_edge: CssPixels,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct CaptionLayoutResult {
-    pub(crate) margin_box_block_size: CssPixels,
-    pub(crate) pending_table_block_offset: CssPixels,
 }
 
 // https://www.w3.org/TR/css-display/#block-formatting-context
@@ -265859,6 +265991,7 @@ impl<'pass> BlockFormattingContext<'pass> {
                     self.used(node)
                         .available_inner_space_or_constraints_from(available_space),
                     constraints,
+                    None,
                 )
             },
         );
@@ -265914,8 +266047,8 @@ impl<'pass> BlockFormattingContext<'pass> {
     }
 
     fn intrusions_for_band_into_rect(&self, band: FloatBand, rect_in_root: BlockCssPixelRect) -> SpaceUsedByFloats {
-        // Deliberately read the root inline size at query time. It can still be stale
-        // while intrinsic sizing is in progress.
+        // Deliberately read the root inline size at query time. It can be stale while
+        // intrinsic sizing of this context's own root is in progress.
         let root_content_inline_size = self.used(self.root).content_inline_size.get();
         SpaceUsedByFloats {
             left: if band.left_intrusion == CssPixels::default() {
@@ -266705,17 +266838,11 @@ impl<'pass> BlockFormattingContext<'pass> {
 
         let is_table_formatting_context = independent_type == Some(FfiFormattingContextType::Table);
         let mut pending_position = None;
-        let mut table_box_content_offset_in_wrapper = None;
         if box_is_positioned_by_fieldset_layout {
             self.pending_legend_flow_position.set(Some(LogicalOffset {
                 inline_offset: content_inline_offset,
                 block_offset: content_block_offset,
             }));
-        } else if is_table_formatting_context {
-            table_box_content_offset_in_wrapper = Some(LogicalOffset {
-                inline_offset: content_inline_offset,
-                block_offset: content_block_offset,
-            });
         } else if !box_opens_top_margin_group {
             pending_position = Some(FfiCssPixelPoint {
                 x: content_inline_offset,
@@ -266786,29 +266913,14 @@ impl<'pass> BlockFormattingContext<'pass> {
                     } else {
                         None
                     },
-                    table_box_content_offset_in_wrapper,
+                    table_box_content_block_offset_in_wrapper: is_table_formatting_context
+                        .then_some(content_block_offset),
                     float_avoidance_inline_size,
                     ..RootSizingDirectives::default()
                 },
                 participation: ParticipationInParentFormattingContext::BlockLevel,
             };
-            let child_layout = self.layout_inside(run, node, inside_layout_input, true);
-            if let Some(stashed_offset) = table_box_content_offset_in_wrapper {
-                let block_offset = child_layout
-                    .as_ref()
-                    .and_then(|child_layout| child_layout.table_block_offset_in_wrapper)
-                    .unwrap_or(stashed_offset.block_offset);
-                pending_position = Some(FfiCssPixelPoint {
-                    x: stashed_offset.inline_offset,
-                    y: block_offset,
-                });
-            }
-            if container_facts.is_table_wrapper() && style.display().is_table_inside() {
-                let used = self.used_mut(node);
-                used.margin_left.set(used.margin_left.get().max(CssPixels::default()));
-                used.margin_right.set(used.margin_right.get().max(CssPixels::default()));
-            }
-            child_layout
+            self.layout_inside(run, node, inside_layout_input, true)
         } else {
             // This box participates in the current block container's flow.
             let space_available_for_children = if facts.is_anonymous() {
@@ -266932,18 +267044,12 @@ impl<'pass> BlockFormattingContext<'pass> {
         available_space_for_children: AvailableSpace,
     ) {
         assert!(!self.facts(block_container).children_are_inline());
+        debug_assert!(
+            !self.facts(block_container).is_table_wrapper(),
+            "table wrappers are laid out by layout_table_wrapper_children"
+        );
         let available_space = available_space_for_children;
-        // The table wrapper is invisible to percentage resolution: percentages on the table root
-        // resolve against the wrapper's containing block, so the wrapper's own constraints pass
-        // through to the table box unchanged.
-        let child_input = if self.facts(block_container).is_table_wrapper() {
-            LayoutInput {
-                available_space: available_space_for_children,
-                ..input
-            }
-        } else {
-            self.child_layout_input(block_container, input, available_space_for_children)
-        };
+        let child_input = self.child_layout_input(block_container, input, available_space_for_children);
         let mut bottom_of_lowest_margin_box = CssPixels::default();
         let saved = self
             .block_offset_of_current_block_container
@@ -266958,7 +267064,52 @@ impl<'pass> BlockFormattingContext<'pass> {
             );
         }
         self.block_offset_of_current_block_container.set(saved);
+        self.finish_block_level_children_layout(block_container, input, available_space, bottom_of_lowest_margin_box);
+    }
 
+    // Per https://www.w3.org/TR/CSS22/tables.html#model, caption boxes are block-level boxes laid
+    // out inside the table wrapper box together with the table box itself. Captions remain tree
+    // children of the table box, but they participate in the wrapper's block formatting context:
+    // top captions first, then the table box, then bottom captions, each flowing like any other
+    // block-level child.
+    fn layout_table_wrapper_children(
+        &self,
+        run: &FormattingContextRun<'pass>,
+        input: LayoutInput,
+        available_space_for_children: AvailableSpace,
+    ) {
+        let wrapper = self.root;
+        // The table wrapper is invisible to percentage resolution: percentages on the table root
+        // resolve against the wrapper's containing block, so the wrapper's own constraints pass
+        // through to the table box unchanged.
+        let table_box_input = LayoutInput {
+            available_space: available_space_for_children,
+            ..input
+        };
+        let caption_input = self.child_layout_input(wrapper, input, available_space_for_children);
+        let mut bottom_of_lowest_margin_box = CssPixels::default();
+        let saved = self
+            .block_offset_of_current_block_container
+            .replace(Some(CssPixels::default()));
+        for child in table_wrapper_flow_children(self.state, self.callbacks, wrapper) {
+            let child_input = if self.style(child).display().is_table_inside() {
+                table_box_input
+            } else {
+                caption_input
+            };
+            self.layout_block_level_box(run, child, wrapper, &mut bottom_of_lowest_margin_box, child_input);
+        }
+        self.block_offset_of_current_block_container.set(saved);
+        self.finish_block_level_children_layout(wrapper, input, available_space_for_children, bottom_of_lowest_margin_box);
+    }
+
+    fn finish_block_level_children_layout(
+        &self,
+        block_container: Node,
+        input: LayoutInput,
+        available_space: AvailableSpace,
+        bottom_of_lowest_margin_box: CssPixels,
+    ) {
         if self.layout_mode == LayoutMode::IntrinsicSizing && !self.used(block_container).has_definite_inline_size() {
             let mut inline_size = self.greatest_child_inline_size_including_floats(block_container);
             let style = self.style(block_container);
@@ -267167,7 +267318,9 @@ impl<'pass> BlockFormattingContext<'pass> {
             self.layout_fieldset_with_rendered_legend(run, self.root, root_input);
             return;
         }
-        if root_facts.children_are_inline() {
+        if root_facts.is_table_wrapper() {
+            self.layout_table_wrapper_children(run, root_input, available_space);
+        } else if root_facts.children_are_inline() {
             self.layout_inline_children(run, self.root, root_input, available_space);
         } else {
             self.layout_block_level_children(run, self.root, root_input, available_space);
@@ -267181,7 +267334,12 @@ impl<'pass> BlockFormattingContext<'pass> {
         // Assign collapsed margin left after children layout of formatting context to the last child box
         let collapsed_margin = self.margin_state.borrow().current_collapsed_margin();
         if collapsed_margin != CssPixels::default() {
-            for child in self.children(self.root).into_iter().rev() {
+            let flow_children_bottom_up = if root_facts.is_table_wrapper() {
+                table_wrapper_flow_children(self.state, self.callbacks, self.root)
+            } else {
+                self.children(self.root)
+            };
+            for child in flow_children_bottom_up.into_iter().rev() {
                 let facts = self.facts(child);
                 if facts.is_absolutely_positioned() || facts.is_floating() {
                     continue;
@@ -267225,94 +267383,6 @@ impl<'pass> BlockFormattingContext<'pass> {
                     y: content_block_offset,
                 },
             );
-        }
-    }
-
-    pub(crate) fn layout_table_caption(
-        &self,
-        run: &FormattingContextRun<'pass>,
-        table_box: Node,
-        caption: Node,
-        phase: CaptionPhase,
-        available_space: AvailableSpace,
-        constraints: ContainingBlockConstraints,
-    ) -> CaptionLayoutResult {
-        let mut caption_was_placed = false;
-        if formatting_context_type_created_by_box(self.facts(caption)).is_some() {
-            let mut inner_available_space = available_space;
-            let is_block_context =
-                formatting_context_type_created_by_box(self.facts(caption)) == Some(FfiFormattingContextType::Block);
-            let mut caption_offset = LogicalOffset::default();
-            if is_block_context {
-                let available_inline_size = available_space.inline_size.to_px_or_zero();
-                self.resolve_vertical_box_model_metrics(caption, available_inline_size);
-                self.compute_inline_size(caption, available_space, constraints, FfiCssPixelPoint::default());
-                inner_available_space = self
-                    .used(caption)
-                    .available_inner_space_or_constraints_from(available_space);
-                caption_offset.inline_offset = self.used(caption).border_box_left(false);
-                if phase == CaptionPhase::Bottom {
-                    caption_offset.block_offset = self.used(table_box).margin_box_block_size(false)
-                        + self.used(caption).margin_top.get()
-                        + self.used(caption).border_box_top(false);
-                }
-            }
-
-            let child_layout = self.layout_inside(
-                run,
-                caption,
-                LayoutInput {
-                    available_space: inner_available_space,
-                    containing_block_constraints: constraints,
-                    content_box_position_in_bfc_root: None,
-                    sizing: RootSizingDirectives::default(),
-                    participation: ParticipationInParentFormattingContext::Item,
-                },
-                true,
-            );
-            if is_block_context
-                && let Some(child_layout) = child_layout.as_ref()
-            {
-                if self
-                    .sizing()
-                    .should_treat_block_size_as_auto(caption, available_space, constraints)
-                {
-                    let content_block_size = if self.style(caption).has_size_containment() {
-                        CssPixels::default()
-                    } else {
-                        child_layout.automatic_content_block_size
-                    };
-                    self.used_mut(caption).set_content_block_size(content_block_size);
-                }
-                self.place_child(
-                    caption,
-                    FfiCssPixelPoint {
-                        x: caption_offset.inline_offset,
-                        y: caption_offset.block_offset,
-                    },
-                );
-                caption_was_placed = true;
-            }
-        }
-
-        if phase == CaptionPhase::Bottom && !caption_was_placed {
-            self.place_child(
-                caption,
-                FfiCssPixelPoint {
-                    x: self.used(caption).border_box_left(false),
-                    y: self.used(table_box).margin_box_block_size(false)
-                        + self.used(caption).margin_top.get()
-                        + self.used(caption).border_box_top(false),
-                },
-            );
-        }
-        CaptionLayoutResult {
-            margin_box_block_size: self.used(caption).margin_box_block_size(false),
-            pending_table_block_offset: if phase == CaptionPhase::Top {
-                self.used(caption).content_block_size.get() + self.used(caption).margin_box_bottom(false)
-            } else {
-                CssPixels::default()
-            },
         }
     }
 
@@ -267636,6 +267706,7 @@ impl<'pass> BlockFormattingContext<'pass> {
         node: Node,
         available_space: AvailableSpace,
         constraints: ContainingBlockConstraints,
+        automatic_content_block_size_of_completed_run: Option<CssPixels>,
     ) -> CssPixels {
         let facts = self.facts(node);
         let style = self.style(node);
@@ -267644,7 +267715,14 @@ impl<'pass> BlockFormattingContext<'pass> {
             || style.display().is_grid_inside()
             || style.display().is_table_inside()
         {
-            return independent_root_automatic_block_size(self.state, &self.callbacks, node, available_space, constraints);
+            return independent_root_automatic_block_size(
+                self.state,
+                &self.callbacks,
+                node,
+                available_space,
+                constraints,
+                automatic_content_block_size_of_completed_run,
+            );
         }
 
         // https://www.w3.org/TR/CSS22/visudet.html#normal-block
@@ -267856,6 +267934,44 @@ impl<'pass> BlockFormattingContext<'pass> {
     }
 }
 
+fn table_box_of_wrapper(state: &LayoutState, callbacks: FfiLayoutFcCallbacks, wrapper: Node) -> Node {
+    let mut child = callbacks.first_child(wrapper);
+    while !child.is_invalid() {
+        if state.node_facts(&callbacks, child).is_box()
+            && state.style_facts(&callbacks, child).display().is_table_inside()
+        {
+            return child;
+        }
+        child = callbacks.next_sibling(child);
+    }
+    unreachable!("a table wrapper contains its table box")
+}
+
+// Flow-ordered children of a table wrapper's block formatting context: top captions in document
+// order, then the table box, then bottom captions in document order. Captions are tree children
+// of the table box; absolutely positioned captions are out of flow and are registered by
+// register_table_abspos_descendants instead.
+pub(crate) fn table_wrapper_flow_children(state: &LayoutState, callbacks: FfiLayoutFcCallbacks, wrapper: Node) -> Vec<Node> {
+    let table_box = table_box_of_wrapper(state, callbacks, wrapper);
+    let mut flow_children = Vec::new();
+    let mut bottom_captions = Vec::new();
+    let mut child = callbacks.first_child(table_box);
+    while !child.is_invalid() {
+        let facts = state.node_facts(&callbacks, child);
+        if facts.is_box() && facts.is_table_caption() && !facts.is_absolutely_positioned() {
+            if state.style_facts(&callbacks, child).caption_side() == caption_side::TOP {
+                flow_children.push(child);
+            } else {
+                bottom_captions.push(child);
+            }
+        }
+        child = callbacks.next_sibling(child);
+    }
+    flow_children.push(table_box);
+    flow_children.extend(bottom_captions);
+    flow_children
+}
+
 // https://www.w3.org/TR/CSS22/visudet.html#root-height
 pub(crate) fn automatic_block_size_for_bfc_root(
     state: &LayoutState,
@@ -267863,6 +267979,11 @@ pub(crate) fn automatic_block_size_for_bfc_root(
     root: Node,
 ) -> CssPixels {
     let facts = state.node_facts(&callbacks, root);
+    // https://drafts.csswg.org/css-contain-2/#containment-size
+    // A size-contained box is sized as if it had no contents.
+    if facts.node_has_size_containment() {
+        return CssPixels::default();
+    }
     let used = state.used_values(&callbacks, root);
     let mut bottom = None;
     if facts.children_are_inline() {
@@ -267882,8 +268003,20 @@ pub(crate) fn automatic_block_size_for_bfc_root(
         // the top margin-edge of the topmost block-level child box
         // and the bottom margin-edge of the bottommost block-level child box.
         // NOTE: The top margin edge of the topmost block-level child box is the same as the top content edge of the root box.
-        let mut child = callbacks.first_child(root);
-        while !child.is_invalid() {
+        let flow_children = if facts.is_table_wrapper() {
+            // Captions flow in the wrapper's formatting context while remaining tree children of
+            // the table box, so the wrapper considers its flow children instead of tree children.
+            table_wrapper_flow_children(state, callbacks, root)
+        } else {
+            let mut children = Vec::new();
+            let mut child = callbacks.first_child(root);
+            while !child.is_invalid() {
+                children.push(child);
+                child = callbacks.next_sibling(child);
+            }
+            children
+        };
+        for child in flow_children {
             let child_facts = state.node_facts(&callbacks, child);
             if child_facts.is_box() && !child_facts.is_absolutely_positioned() && !child_facts.is_floating() {
                 let child_used = state.try_used_values(&callbacks, child);
@@ -267895,7 +268028,6 @@ pub(crate) fn automatic_block_size_for_bfc_root(
                     bottom = Some(bottom.map_or(child_bottom, |value: CssPixels| value.max(child_bottom)));
                 }
             }
-            child = callbacks.next_sibling(child);
         }
     }
     // In addition, if the element has any floating descendants
@@ -271859,7 +271991,6 @@ pub struct FfiBordersData {
 pub(crate) struct ChildLayoutResult {
     pub automatic_content_inline_size: CssPixels,
     pub automatic_content_block_size: CssPixels,
-    pub table_block_offset_in_wrapper: Option<CssPixels>,
 }
 
 pub(crate) enum ChildLayoutOutcome {
@@ -272373,10 +272504,11 @@ pub(crate) fn independent_root_automatic_block_size(
     node: Node,
     available_inner_space: AvailableSpace,
     constraints: ContainingBlockConstraints,
+    automatic_content_block_size_of_completed_run: Option<CssPixels>,
 ) -> CssPixels {
     let facts = state.node_facts(callbacks, node);
     if facts.creates_block_formatting_context() {
-        return automatic_block_size_for_bfc_root(state, *callbacks, node);
+        return automatic_content_block_size_of_completed_run.unwrap_or_default();
     }
     let style = state.style_facts(callbacks, node);
     if style.display().is_flex_inside() || style.display().is_grid_inside() || style.display().is_table_inside() {
@@ -272531,7 +272663,7 @@ fn size_skipped_independent_root(
         ParticipationInParentFormattingContext::AbsolutelyPositioned(abspos_inputs) => {
             let engine = AbsposEngine::new(run.state, run.callbacks);
             engine.dimension_out_of_flow_root(child, abspos_inputs);
-            engine.finalize_out_of_flow_root_after_inside_layout(child, abspos_inputs);
+            engine.finalize_out_of_flow_root_after_inside_layout(child, abspos_inputs, None);
         }
         ParticipationInParentFormattingContext::AtomicInline | ParticipationInParentFormattingContext::Item | ParticipationInParentFormattingContext::Root => {}
     }
@@ -272588,7 +272720,6 @@ fn run_formatting_context<'pass>(
                 let result = ChildLayoutResult {
                     automatic_content_inline_size: context.automatic_content_inline_size(),
                     automatic_content_block_size: context.automatic_content_block_size(),
-                    table_block_offset_in_wrapper: None,
                 };
                 context.place_floats_after_run();
                 result
@@ -272598,7 +272729,6 @@ fn run_formatting_context<'pass>(
                 ChildLayoutResult {
                     automatic_content_inline_size: context.automatic_content_inline_size(),
                     automatic_content_block_size: context.automatic_content_block_size(),
-                    table_block_offset_in_wrapper: None,
                 }
             }
             FormattingContextImplementation::Grid(context) => {
@@ -272606,18 +272736,13 @@ fn run_formatting_context<'pass>(
                 ChildLayoutResult {
                     automatic_content_inline_size: context.automatic_content_inline_size(),
                     automatic_content_block_size: context.automatic_content_block_size(),
-                    table_block_offset_in_wrapper: None,
                 }
             }
             FormattingContextImplementation::Table(context) => {
-                context.run(run, parent_block, body_input);
+                context.run(run, body_input);
                 ChildLayoutResult {
                     automatic_content_inline_size: context.automatic_content_inline_size(),
                     automatic_content_block_size: context.automatic_content_block_size,
-                    table_block_offset_in_wrapper: body_input
-                        .sizing
-                        .table_box_content_offset_in_wrapper
-                        .map(|_| context.pending_table_offset.block_offset),
                 }
             }
             FormattingContextImplementation::Svg(context) => {
@@ -272644,11 +272769,23 @@ fn run_formatting_context<'pass>(
             );
         }
         ParticipationInParentFormattingContext::AtomicInline => {
-            finalize_atomic_root_block_size(run, &input, cached_atomic_block_size, parent_block);
+            let automatic_content_block_size_of_completed_body_run = cached_atomic_block_size
+                .is_none()
+                .then_some(result.automatic_content_block_size);
+            finalize_atomic_root_block_size(
+                run,
+                &input,
+                cached_atomic_block_size,
+                automatic_content_block_size_of_completed_body_run,
+                parent_block,
+            );
         }
         ParticipationInParentFormattingContext::AbsolutelyPositioned(abspos_inputs) => {
-            AbsposEngine::new(run.state, run.callbacks)
-                .finalize_out_of_flow_root_after_inside_layout(run.box_, abspos_inputs);
+            AbsposEngine::new(run.state, run.callbacks).finalize_out_of_flow_root_after_inside_layout(
+                run.box_,
+                abspos_inputs,
+                Some(result.automatic_content_block_size),
+            );
         }
         ParticipationInParentFormattingContext::Item => {
             if input.sizing.adopt_automatic_content_block_size {
@@ -272692,7 +272829,8 @@ fn run_formatting_context<'pass>(
 fn finalize_atomic_root_block_size(
     run: &FormattingContextRun,
     input: &LayoutInput,
-    cached_block_size: Option<CssPixels>,
+    cached_intrinsic_measurement_block_size: Option<CssPixels>,
+    automatic_content_block_size_of_completed_body_run: Option<CssPixels>,
     parent_block: Option<&BlockFormattingContext>,
 ) {
     let node = run.box_;
@@ -272703,24 +272841,34 @@ fn finalize_atomic_root_block_size(
         return;
     }
     if sizing.should_treat_block_size_as_auto(node, available_space, constraints) {
-        sizing.resolve_used_block_size_if_treated_as_auto(node, available_space, constraints, cached_block_size, || {
-            let available_inner_space = run
-                .state
-                .used_values(&run.callbacks, node)
-                .available_inner_space_or_constraints_from(available_space);
-            match parent_block {
-                Some(parent) => {
-                    parent.compute_automatic_block_size_for_block_level_element(node, available_inner_space, constraints)
+        sizing.resolve_used_block_size_if_treated_as_auto(
+            node,
+            available_space,
+            constraints,
+            cached_intrinsic_measurement_block_size,
+            || {
+                let available_inner_space = run
+                    .state
+                    .used_values(&run.callbacks, node)
+                    .available_inner_space_or_constraints_from(available_space);
+                match parent_block {
+                    Some(parent) => parent.compute_automatic_block_size_for_block_level_element(
+                        node,
+                        available_inner_space,
+                        constraints,
+                        automatic_content_block_size_of_completed_body_run,
+                    ),
+                    None => independent_root_automatic_block_size(
+                        run.state,
+                        &run.callbacks,
+                        node,
+                        available_inner_space,
+                        constraints,
+                        automatic_content_block_size_of_completed_body_run,
+                    ),
                 }
-                None => independent_root_automatic_block_size(
-                    run.state,
-                    &run.callbacks,
-                    node,
-                    available_inner_space,
-                    constraints,
-                ),
-            }
-        });
+            },
+        );
     } else {
         sizing.resolve_used_block_size_if_not_treated_as_auto(node, available_space, constraints);
     }
@@ -273078,7 +273226,10 @@ pub(crate) struct RootSizingDirectives {
     pub(crate) forced_content_inline_size: Option<CssPixels>,
     pub(crate) forced_content_block_size: Option<CssPixels>,
     pub(crate) forced_min_border_box_block_size: Option<CssPixels>,
-    pub(crate) table_box_content_offset_in_wrapper: Option<LogicalOffset>,
+    // Input-only: the wrapper's BFC tells the table formatting context where the table box's
+    // content box sits in the wrapper, so rows and row groups (whose containing block is the
+    // wrapper) can be placed in wrapper coordinates.
+    pub(crate) table_box_content_block_offset_in_wrapper: Option<CssPixels>,
     pub(crate) adopt_automatic_content_block_size: bool,
     pub(crate) float_avoidance_inline_size: Option<CssPixels>,
 }
@@ -281885,7 +282036,7 @@ impl<'pass> NodeFacts<'pass> {
         crate::layout::node_has_auto_content_box_size(self.data())
     }
 
-    fn node_has_size_containment(&self) -> bool {
+    pub(crate) fn node_has_size_containment(&self) -> bool {
         let display = self.display();
         if display.is_table_inside() || display.is_internal_table() {
             return false;
@@ -284819,7 +284970,6 @@ fn layout_replaced_with_children(run: &FormattingContextRun, layout_input: Layou
     ChildLayoutResult {
         automatic_content_inline_size: content_inline_size,
         automatic_content_block_size: wrapper_layout.automatic_content_block_size,
-        table_block_offset_in_wrapper: None,
     }
 }
 
@@ -285974,6 +286124,7 @@ impl<'pass> SizingContext<'pass> {
                     self.used(node)
                         .available_inner_space_or_constraints_from(inline_definite_space),
                     constraints,
+                    None,
                 )
             });
         }
@@ -289206,13 +289357,6 @@ pub(crate) fn calculate_table_grid<T: TableTree>(tree: &T, table: Node) -> Table
 const BORDER_COLLAPSE_SEPARATE: u8 = 0;
 const TABLE_LAYOUT_FIXED: u8 = 1;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-pub(crate) enum CaptionPhase {
-    Top,
-    Bottom,
-}
-
 pub(crate) trait TableTree {
     fn first_child(&self, node: Node) -> Node;
     fn next_sibling(&self, node: Node) -> Node;
@@ -289248,7 +289392,7 @@ struct TableFormattingContext<'pass> {
     available_space: AvailableSpace,
     table_block_size: CssPixels,
     automatic_content_block_size: CssPixels,
-    pending_table_offset: crate::layout::LogicalOffset,
+    table_box_content_block_offset_in_wrapper: CssPixels,
     min_border_box_block_size_from_flex_item: Option<CssPixels>,
     needs_fixed_mode_row_measurement: bool,
     cells: Vec<TableCell>,
@@ -289306,7 +289450,7 @@ impl<'pass> TableFormattingContext<'pass> {
             available_space: AvailableSpace::default(),
             table_block_size: CssPixels::default(),
             automatic_content_block_size: CssPixels::default(),
-            pending_table_offset: crate::layout::LogicalOffset::default(),
+            table_box_content_block_offset_in_wrapper: CssPixels::default(),
             min_border_box_block_size_from_flex_item: None,
             needs_fixed_mode_row_measurement: false,
             cells: Vec::new(),
@@ -289515,9 +289659,6 @@ impl<'pass> TableFormattingContext<'pass> {
         }
         for cell in &self.cells {
             self.create_used_values(cell.box_, self.participant_constraints);
-        }
-        for caption in self.matching_children(self.table_box, |facts| facts.is_table_caption()) {
-            self.create_used_values(caption, self.participant_constraints);
         }
     }
 
@@ -290372,7 +290513,6 @@ impl<'pass> TableFormattingContext<'pass> {
     fn layout_inside_cell(
         &mut self,
         run: &FormattingContextRun<'pass>,
-        parent: Option<&BlockFormattingContext<'pass>>,
         cell: TableCell,
         input: AvailableSpace,
         adopt_automatic_content_block_size: bool,
@@ -290390,7 +290530,7 @@ impl<'pass> TableFormattingContext<'pass> {
         if let crate::layout::ChildLayoutOutcome::ReenterCurrent =
             crate::layout::layout_inside_child(run, None, None, cell.box_, self.layout_mode, layout_input, false)
         {
-            self.run(run, parent, layout_input);
+            self.run(run, layout_input);
         }
     }
 
@@ -290471,7 +290611,7 @@ impl<'pass> TableFormattingContext<'pass> {
         })
     }
 
-    fn compute_table_block_size(&mut self, run: &FormattingContextRun<'pass>, parent: Option<&BlockFormattingContext<'pass>>) {
+    fn compute_table_block_size(&mut self, run: &FormattingContextRun<'pass>) {
         // First pass of row block-size calculation:
         for row_index in 0..self.rows.len() {
             if self.rows[row_index].is_collapsed {
@@ -290537,7 +290677,7 @@ impl<'pass> TableFormattingContext<'pass> {
                     measured_baseline = Some(measured.first_baseline);
                 }
             } else {
-                self.layout_inside_cell(run, parent, cell, inner, true);
+                self.layout_inside_cell(run, cell, inner, true);
             }
             if self.needs_fixed_mode_row_measurement {
                 let min_size = style.min_height().to_px(participant_block_basis);
@@ -290650,7 +290790,7 @@ impl<'pass> TableFormattingContext<'pass> {
             let inner = used.available_inner_space_or_constraints_from(self.available_space);
             // The first pass only measured this cell in a throwaway state; this is its one and
             // only inside layout in the committing state.
-            self.layout_inside_cell(run, parent, cell, inner, false);
+            self.layout_inside_cell(run, cell, inner, false);
             let baseline = self.box_baseline(cell.box_);
             self.cells[cell_index].baseline = baseline;
             if !self.rows[cell.row_index].is_collapsed {
@@ -290722,7 +290862,7 @@ impl<'pass> TableFormattingContext<'pass> {
         let block_spacing = self.border_spacing_block();
         let inline_spacing = self.border_spacing_inline();
         let inline_offset = table_used.border_left.get() + table_used.padding_left.get() + inline_spacing;
-        let mut row_block_offset = self.pending_table_offset.block_offset + block_spacing;
+        let mut row_block_offset = self.table_box_content_block_offset_in_wrapper + block_spacing;
         for row_index in 0..self.rows.len() {
             let row = &self.rows[row_index];
             let inline_size = self
@@ -290743,7 +290883,7 @@ impl<'pass> TableFormattingContext<'pass> {
             }
         }
 
-        let mut group_block_offset = self.pending_table_offset.block_offset + block_spacing;
+        let mut group_block_offset = self.table_box_content_block_offset_in_wrapper + block_spacing;
         for group in self.matching_children(self.table_box, |facts| {
             facts.is_table_row_group() || facts.is_table_header_group() || facts.is_table_footer_group()
         }) {
@@ -290770,7 +290910,8 @@ impl<'pass> TableFormattingContext<'pass> {
                 };
         }
         let padding_top = table_used.padding_top.get();
-        let total = row_block_offset.max(group_block_offset) - self.pending_table_offset.block_offset - padding_top;
+        let total =
+            row_block_offset.max(group_block_offset) - self.table_box_content_block_offset_in_wrapper - padding_top;
         self.table_block_size = self.table_block_size.max(total);
     }
 
@@ -290889,61 +291030,15 @@ impl<'pass> TableFormattingContext<'pass> {
         }
     }
 
-    fn run_caption_layout(
-        &mut self,
-        run: &FormattingContextRun<'pass>,
-        parent: Option<&BlockFormattingContext<'pass>>,
-        phase: CaptionPhase,
-        available: AvailableSpace,
-    ) -> CssPixels {
-        let mut total = CssPixels::default();
-        for caption in self.matching_children(self.table_box, |facts| facts.is_table_caption()) {
-            if self.style_facts(caption).caption_side() != phase as u8 {
-                continue;
-            }
-            // Captions live inside the table wrapper, so their quirks percentage height basis derives
-            // from the wrapper, not from anything the table box inherited.
-            // The caption boxes are principal block-level boxes that retain their own content, padding, margin, and border areas,
-            // and are rendered as normal block boxes inside the table wrapper box, as described in https://www.w3.org/TR/CSS22/tables.html#model
-            let result = if let Some(parent) = parent {
-                parent.layout_table_caption(
-                    run,
-                    self.table_box,
-                    caption,
-                    phase,
-                    available,
-                    self.participant_constraints,
-                )
-            } else {
-                // Measurement-only table contexts may have no parent handle.
-                // Use the same BFC algorithms without attaching a persistent
-                // formatting-context instance.
-                BlockFormattingContext::new(self.state, self.table_box, self.layout_mode, self.callbacks)
-                    .layout_table_caption(
-                        run,
-                        self.table_box,
-                        caption,
-                        phase,
-                        available,
-                        self.participant_constraints,
-                    )
-            };
-            if phase == CaptionPhase::Top {
-                self.pending_table_offset.block_offset = result.pending_table_block_offset;
-            }
-            total += result.margin_box_block_size;
-        }
-        total
-    }
-
     fn compute_and_store_baselines(&self, node: Node) {
         crate::layout::compute_and_store_baselines(self.state, &self.callbacks, node, false);
     }
 
-    fn run(&mut self, run: &FormattingContextRun<'pass>, parent: Option<&BlockFormattingContext<'pass>>, input: LayoutInput) {
+    fn run(&mut self, run: &FormattingContextRun<'pass>, input: LayoutInput) {
         self.available_space = input.available_space;
         self.min_border_box_block_size_from_flex_item = input.sizing.forced_min_border_box_block_size;
-        self.pending_table_offset = input.sizing.table_box_content_offset_in_wrapper.unwrap_or_default();
+        self.table_box_content_block_offset_in_wrapper =
+            input.sizing.table_box_content_block_offset_in_wrapper.unwrap_or_default();
         self.run_until_inline_size_calculation(input, false);
         if matches!(
             self.available_space.inline_size,
@@ -290956,12 +291051,6 @@ impl<'pass> TableFormattingContext<'pass> {
         }
 
         let table_used = self.used_values(self.table_box);
-        let table_border_inline = table_used.border_box_inline_size(false);
-        let caption_available = AvailableSpace {
-            inline_size: AvailableSize::definite(table_border_inline.min(max_dimension_value())),
-            block_size: self.available_space.block_size,
-        };
-        let mut captions = self.run_caption_layout(run, parent, CaptionPhase::Top, caption_available);
         // The total inline-axis border spacing is defined for each table:
         // - For tables laid out in separated-borders mode containing at least one column, the inline-axis component of the computed value of the border-spacing property times one plus the number of columns in the table
         // - Otherwise, 0
@@ -290975,16 +291064,11 @@ impl<'pass> TableFormattingContext<'pass> {
         let fixed = self.use_fixed_mode_layout();
         // Distribute the inline size of the table among columns.
         distribute_inline_size(&mut self.columns, assignable, fixed);
-        self.compute_table_block_size(run, parent);
+        self.compute_table_block_size(run);
         self.distribute_block_size_to_rows();
         self.position_row_boxes();
         self.position_cell_boxes();
         table_used.set_content_block_size(self.table_block_size);
-        captions += self.run_caption_layout(run, parent, CaptionPhase::Bottom, caption_available);
-        // Table captions are positioned between the table margins and its borders (outside the grid box borders) as described in
-        // https://www.w3.org/TR/css-tables-3/#bounding-box-assignment
-        // A visual representation of this model can be found at https://www.w3.org/TR/css-tables-3/images/table_container.png
-        table_used.margin_bottom.set(table_used.margin_bottom.get() + captions);
         // Derive baselines for the table internals bottom-up (rows, then row groups, then the table box)
         // now that all offsets are final, so the table exports its baseline to outside consumers
         // (e.g. an inline-table participating in a line box).
@@ -645464,122 +645548,6 @@ describe("in strict mode primitive this values are not converted to objects", ()
 
         expect(array.toLocaleString()).toBe("boolean,boolean");
         expect(count).toBe(2);
-    });
-});
-
-FILE: Tests/LibJS/Runtime/this-value.js
-// Note the globalThisValue and globalObject do not need to be the same.
-const globalThisValue = this;
-const globalObject = (0, eval)("this");
-
-// These tests are done in global state to ensure that is possible
-const globalArrow = () => {
-    expect(this).toBe(globalThisValue);
-    return this;
-};
-
-function globalFunction() {
-    expect(this).toBe(globalObject);
-
-    expect(globalArrow()).toBe(globalThisValue);
-
-    const arrowInGlobalFunction = () => this;
-    expect(arrowInGlobalFunction()).toBe(globalObject);
-
-    return arrowInGlobalFunction;
-}
-
-expect(globalArrow()).toBe(globalThisValue);
-expect(globalFunction()()).toBe(globalObject);
-
-const arrowFromGlobalFunction = globalFunction();
-
-const customThisValue = {
-    isCustomThis: true,
-    variant: 0,
-};
-
-const otherCustomThisValue = {
-    isCustomThis: true,
-    variant: 1,
-};
-
-describe("describe with arrow function", () => {
-    expect(this).toBe(globalThisValue);
-
-    test("nested test with normal function should get global object", function () {
-        expect(this).toBe(globalObject);
-    });
-
-    test("nested test with arrow function should get same this value as enclosing function", () => {
-        expect(this).toBe(globalThisValue);
-    });
-});
-
-describe("describe with normal function", function () {
-    expect(this).toBe(globalObject);
-    test("nested test with normal function should get global object", function () {
-        expect(this).toBe(globalObject);
-    });
-
-    test("nested test with arrow function should get same this value as enclosing function", () => {
-        expect(this).toBe(globalObject);
-    });
-});
-
-describe("basic behavior", () => {
-    expect(this).toBe(globalThisValue);
-
-    expect(arrowFromGlobalFunction()).toBe(globalObject);
-
-    expect(customThisValue).not.toBe(otherCustomThisValue);
-
-    test("binding arrow function does not influence this value", () => {
-        const boundGlobalArrow = globalArrow.bind({ shouldNotBeHere: true });
-
-        expect(boundGlobalArrow()).toBe(globalThisValue);
-    });
-
-    function functionInArrow() {
-        expect(arrowFromGlobalFunction()).toBe(globalObject);
-        return this;
-    }
-
-    function functionWithArrow() {
-        expect(arrowFromGlobalFunction()).toBe(globalObject);
-        return () => {
-            expect(arrowFromGlobalFunction()).toBe(globalObject);
-            return this;
-        };
-    }
-
-    function strictFunction() {
-        "use strict";
-        return this;
-    }
-
-    test("functions get globalObject as this value", () => {
-        expect(functionInArrow()).toBe(globalObject);
-        expect(functionWithArrow()()).toBe(globalObject);
-    });
-
-    test("strict functions get undefined as this value", () => {
-        expect(strictFunction()).toBeUndefined();
-    });
-
-    test("bound function gets overwritten this value", () => {
-        const boundFunction = functionInArrow.bind(customThisValue);
-        expect(boundFunction()).toBe(customThisValue);
-
-        const boundFunctionWithArrow = functionWithArrow.bind(customThisValue);
-        expect(boundFunctionWithArrow()()).toBe(customThisValue);
-
-        // However we cannot bind the arrow function itself
-        const failingArrowBound = boundFunctionWithArrow().bind(otherCustomThisValue);
-        expect(failingArrowBound()).toBe(customThisValue);
-
-        const boundStrictFunction = strictFunction.bind(customThisValue);
-        expect(boundStrictFunction()).toBe(customThisValue);
     });
 });
 
