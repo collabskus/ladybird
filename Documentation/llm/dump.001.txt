@@ -147231,6 +147231,32 @@ private:
 
 }
 
+FILE: Libraries/LibJS/Breakpoint.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Optional.h>
+#include <AK/Types.h>
+#include <AK/Utf16String.h>
+
+namespace JS {
+
+using BreakpointID = u32;
+
+struct Breakpoint {
+    BreakpointID id { 0 };
+    Utf16String filename;
+    u32 line { 0 };
+    Optional<u32> column;
+};
+
+}
+
 FILE: Libraries/LibJS/Bytecode/BuiltinAbstractOperationsEnabled.h
 /*
  * Copyright (c) 2025, Luke Wilde <luke@ladybird.org>
@@ -148006,6 +148032,54 @@ SourceRange const& Executable::get_source_range(u32 program_counter)
     });
 }
 
+void Executable::add_debugger_breakpoint(u32 bytecode_offset, BreakpointID breakpoint_id)
+{
+    if (!m_debugger_breakpoint_sites)
+        m_debugger_breakpoint_sites = make<HashMap<u32, DebuggerBreakpointSite>>();
+
+    auto& site = m_debugger_breakpoint_sites->ensure(bytecode_offset);
+    if (!site.breakpoint_ids.contains_slow(breakpoint_id))
+        site.breakpoint_ids.append(breakpoint_id);
+}
+
+void Executable::remove_debugger_breakpoint(BreakpointID breakpoint_id)
+{
+    if (!m_debugger_breakpoint_sites)
+        return;
+
+    m_debugger_breakpoint_sites->remove_all_matching([&](auto&, auto& site) {
+        site.breakpoint_ids.remove_first_matching([&](auto id) {
+            return id == breakpoint_id;
+        });
+        return site.breakpoint_ids.is_empty();
+    });
+
+    if (m_debugger_breakpoint_sites->is_empty())
+        m_debugger_breakpoint_sites = nullptr;
+}
+
+void Executable::clear_debugger_breakpoints()
+{
+    m_debugger_breakpoint_sites = nullptr;
+}
+
+bool Executable::has_debugger_breakpoint_at(u32 bytecode_offset) const
+{
+    return m_debugger_breakpoint_sites && m_debugger_breakpoint_sites->contains(bytecode_offset);
+}
+
+bool Executable::has_debugger_breakpoint(BreakpointID breakpoint_id) const
+{
+    if (!m_debugger_breakpoint_sites)
+        return false;
+
+    for (auto const& entry : *m_debugger_breakpoint_sites) {
+        if (entry.value.breakpoint_ids.contains_slow(breakpoint_id))
+            return true;
+    }
+    return false;
+}
+
 }
 
 FILE: Libraries/LibJS/Bytecode/Executable.h
@@ -148017,6 +148091,7 @@ FILE: Libraries/LibJS/Bytecode/Executable.h
 
 #pragma once
 
+#include <AK/HashMap.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/Optional.h>
 #include <AK/OwnPtr.h>
@@ -148030,6 +148105,7 @@ FILE: Libraries/LibJS/Bytecode/Executable.h
 #include <LibGC/CellAllocator.h>
 #include <LibGC/Ptr.h>
 #include <LibGC/WeakContainer.h>
+#include <LibJS/Breakpoint.h>
 #include <LibJS/Bytecode/ClassBlueprint.h>
 #include <LibJS/Bytecode/IdentifierTable.h>
 #include <LibJS/Bytecode/Label.h>
@@ -148364,6 +148440,12 @@ public:
 
     [[nodiscard]] SourceRange const& get_source_range(u32 program_counter);
 
+    void add_debugger_breakpoint(u32 bytecode_offset, BreakpointID breakpoint_id);
+    void remove_debugger_breakpoint(BreakpointID breakpoint_id);
+    void clear_debugger_breakpoints();
+    [[nodiscard]] bool has_debugger_breakpoint_at(u32 bytecode_offset) const;
+    [[nodiscard]] bool has_debugger_breakpoint(BreakpointID breakpoint_id) const;
+
     void dump() const;
 
     virtual Cell const& owner_cell(Badge<GC::Heap>) const override { return *this; }
@@ -148373,6 +148455,10 @@ private:
     virtual void visit_edges(Visitor&) override;
     virtual size_t external_memory_size() const override;
 
+    struct DebuggerBreakpointSite {
+        Vector<BreakpointID> breakpoint_ids;
+    };
+    OwnPtr<HashMap<u32, DebuggerBreakpointSite>> m_debugger_breakpoint_sites;
     HashMap<u32, SourceRange> m_source_range_cache;
 };
 
@@ -149990,6 +150076,7 @@ set(SOURCES
     Contrib/Test262/GlobalObject.cpp
     Contrib/Test262/IsHTMLDDA.cpp
     CyclicModule.cpp
+    Debugger.cpp
     Heap/Cell.cpp
     Module.cpp
     ParserError.cpp
@@ -152989,6 +153076,231 @@ void continue_dynamic_import(GC::Ref<PromiseCapability>, ThrowCompletionOr<GC::R
 
 }
 
+FILE: Libraries/LibJS/Debugger.cpp
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/NumericLimits.h>
+#include <LibGC/Heap.h>
+#include <LibGC/WeakInlines.h>
+#include <LibJS/Bytecode/Executable.h>
+#include <LibJS/Debugger.h>
+
+namespace JS {
+
+Debugger::Debugger() = default;
+
+Debugger::~Debugger()
+{
+    clear_executable_breakpoints();
+}
+
+bool Debugger::pause_execution(Bytecode::Executable& executable, u32 bytecode_offset, PauseReason reason)
+{
+    // The pause callback is free to evaluate JavaScript, which may pause again. Only the outermost
+    // pause is reported; nested ones are ignored so that the callback can't deadlock against itself.
+    if (m_is_paused)
+        return false;
+
+    if (!m_pause_callback)
+        return false;
+
+    if (reason == PauseReason::Entry)
+        m_pause_on_next_bytecode_execution = false;
+    m_is_paused = true;
+    m_pause_callback({
+        .executable = executable,
+        .bytecode_offset = bytecode_offset,
+        .source_range = executable.source_range_at(bytecode_offset),
+        .reason = reason,
+    });
+    VERIFY(!m_is_paused);
+    return true;
+}
+
+void Debugger::continue_execution()
+{
+    VERIFY(m_is_paused);
+    m_is_paused = false;
+}
+
+bool Debugger::should_pause_on_next_bytecode_execution(Bytecode::Executable const& executable, u32 bytecode_offset)
+{
+    if (!m_pause_on_next_bytecode_execution)
+        return false;
+
+    if (auto source_range = executable.source_range_at(bytecode_offset); source_range.has_value() && source_range->start.line > 0)
+        return true;
+
+    for (auto const& entry : executable.source_map) {
+        if (entry.bytecode_offset > bytecode_offset && entry.line > 0)
+            return false;
+    }
+
+    return true;
+}
+
+ErrorOr<BreakpointID> Debugger::add_breakpoint(Utf16View filename, u32 line, Optional<u32> column)
+{
+    if (line == 0)
+        return AK::Error::from_string_literal("Breakpoint line must be greater than zero");
+
+    for (auto const& breakpoint : m_breakpoints) {
+        if (breakpoint.filename == filename && breakpoint.line == line && breakpoint.column == column)
+            return breakpoint.id;
+    }
+
+    if (m_next_breakpoint_id == NumericLimits<BreakpointID>::max())
+        return AK::Error::from_string_literal("Too many breakpoints");
+
+    m_breakpoints.empend(m_next_breakpoint_id++, Utf16String::from_utf16(filename), line, column);
+    auto const& breakpoint = m_breakpoints.last();
+    for (auto& executable : m_executables)
+        resolve_breakpoint_in_executable(breakpoint, executable);
+    return breakpoint.id;
+}
+
+bool Debugger::remove_breakpoint(BreakpointID breakpoint_id)
+{
+    auto did_remove = m_breakpoints.remove_first_matching([&](auto const& breakpoint) {
+        return breakpoint.id == breakpoint_id;
+    });
+    if (!did_remove)
+        return false;
+
+    for (auto& executable : m_executables)
+        executable.remove_debugger_breakpoint(breakpoint_id);
+    return true;
+}
+
+bool Debugger::is_breakpoint_resolved(BreakpointID breakpoint_id) const
+{
+    for (auto& executable : m_executables) {
+        if (executable.has_debugger_breakpoint(breakpoint_id))
+            return true;
+    }
+    return false;
+}
+
+void Debugger::register_executable(Bytecode::Executable& executable)
+{
+    if (m_executables.contains(executable))
+        return;
+
+    m_executables.set(executable);
+    for (auto const& breakpoint : m_breakpoints)
+        resolve_breakpoint_in_executable(breakpoint, executable);
+}
+
+void Debugger::resolve_breakpoint_in_executable(Breakpoint const& breakpoint, Bytecode::Executable& executable)
+{
+    if (executable.source_code->filename() != breakpoint.filename)
+        return;
+
+    Bytecode::SourceMapEntry const* matching_entry = nullptr;
+    for (auto const& entry : executable.source_map) {
+        if (entry.line == 0 || entry.line < breakpoint.line)
+            continue;
+        if (entry.line == breakpoint.line && breakpoint.column.has_value() && entry.column < *breakpoint.column)
+            continue;
+        if (!matching_entry || entry.line < matching_entry->line || (entry.line == matching_entry->line && entry.column < matching_entry->column))
+            matching_entry = &entry;
+    }
+
+    if (matching_entry)
+        executable.add_debugger_breakpoint(matching_entry->bytecode_offset, breakpoint.id);
+}
+
+void Debugger::clear_executable_breakpoints()
+{
+    for (auto& executable : m_executables)
+        executable.clear_debugger_breakpoints();
+}
+
+}
+
+FILE: Libraries/LibJS/Debugger.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Function.h>
+#include <AK/Utf16View.h>
+#include <AK/Vector.h>
+#include <LibGC/WeakHashSet.h>
+#include <LibJS/Breakpoint.h>
+#include <LibJS/Export.h>
+#include <LibJS/Forward.h>
+#include <LibJS/SourceRange.h>
+
+namespace JS {
+
+class JS_API Debugger {
+    AK_MAKE_NONCOPYABLE(Debugger);
+    AK_MAKE_NONMOVABLE(Debugger);
+
+public:
+    enum class PauseReason : u8 {
+        Entry,
+        Breakpoint,
+        DebuggerStatement,
+    };
+
+    struct PauseInfo {
+        GC::Ref<Bytecode::Executable> executable;
+        u32 bytecode_offset { 0 };
+        Optional<SourceRange> source_range;
+        PauseReason reason { PauseReason::Breakpoint };
+    };
+
+    Debugger();
+    ~Debugger();
+
+    // The callback must call continue_execution() before it returns. It may evaluate JavaScript,
+    // in which case any pause triggered by that evaluation is ignored.
+    void set_pause_callback(Function<void(PauseInfo const&)> callback) { m_pause_callback = move(callback); }
+
+    bool pause_execution(Bytecode::Executable&, u32 bytecode_offset, PauseReason);
+    void continue_execution();
+    bool is_paused() const { return m_is_paused; }
+
+    // Set before each instruction is executed, so that a `debugger` statement doesn't pause a
+    // second time when we've already paused at a breakpoint on that same instruction.
+    void set_did_pause_before_current_instruction(bool value) { m_did_pause_before_current_instruction = value; }
+    bool did_pause_before_current_instruction() const { return m_did_pause_before_current_instruction; }
+
+    void request_pause_on_next_bytecode_execution() { m_pause_on_next_bytecode_execution = true; }
+    bool should_pause_on_next_bytecode_execution(Bytecode::Executable const&, u32 bytecode_offset);
+
+    ErrorOr<BreakpointID> add_breakpoint(Utf16View filename, u32 line, Optional<u32> column = {});
+    bool remove_breakpoint(BreakpointID);
+    Vector<Breakpoint> const& breakpoints() const { return m_breakpoints; }
+    bool is_breakpoint_resolved(BreakpointID) const;
+
+    void register_executable(Bytecode::Executable&);
+
+private:
+    void resolve_breakpoint_in_executable(Breakpoint const&, Bytecode::Executable&);
+    void clear_executable_breakpoints();
+
+    Function<void(PauseInfo const&)> m_pause_callback;
+    GC::WeakHashSet<Bytecode::Executable> m_executables;
+    Vector<Breakpoint> m_breakpoints;
+    BreakpointID m_next_breakpoint_id { 1 };
+    bool m_is_paused { false };
+    bool m_pause_on_next_bytecode_execution { false };
+    bool m_did_pause_before_current_instruction { false };
+};
+
+}
+
 FILE: Libraries/LibJS/DecodedBytecodeCache.h
 /*
  * Copyright (c) 2026-present, the Ladybird developers.
@@ -154364,6 +154676,7 @@ define_known_layout_constants! {
     NullValue => "NULL_VALUE";
     ShiftedIsCellPattern => "SHIFTED_IS_CELL_PATTERN";
     VmRunningExecutionContext => "VM_RUNNING_EXECUTION_CONTEXT";
+    VmBreakpointController => "VM_BREAKPOINT_CONTROLLER";
     ExecutionContextExecutable => "EXECUTION_CONTEXT_EXECUTABLE";
     ExecutionContextProgramCounter => "EXECUTION_CONTEXT_PROGRAM_COUNTER";
     ExecutableBytecodeData => "EXECUTABLE_BYTECODE_DATA";
@@ -164964,6 +165277,7 @@ const EXECUTION_CONTEXT_EXECUTABLE = 80
 const EXECUTION_CONTEXT_PROGRAM_COUNTER = 56
 const SIZEOF_EXECUTION_CONTEXT = 120
 const VM_RUNNING_EXECUTION_CONTEXT = 15288
+const VM_BREAKPOINT_CONTROLLER = 16664
 const EXECUTABLE_BYTECODE_DATA = 104
 const INT32_TAG = 0x7FFA
 const BOOLEAN_TAG = 0x7FF9
@@ -185422,7 +185736,14 @@ fn generate_entry_point(out: &mut String, program: &Program, fmt: ObjectFormat) 
     w!(out, "    mov x20, x3              // vm = VM*");
     emit_ldr64(out, "x28", "x3", interp_ctx);
     w!(out, "    // x28 = exec_ctx");
+    let vm_breakpoint_controller = runtime[KnownLayoutConstant::VmBreakpointController];
+    emit_ldr64(out, "x9", "x3", vm_breakpoint_controller);
+    w!(out, "    cbz x9, .Lnormal_dispatch_table");
+    emit_symbol_addr(out, "x19", "asm_debug_dispatch_table", fmt);
+    w!(out, "    b .Ldispatch_table_ready");
+    w!(out, ".Lnormal_dispatch_table:");
     emit_symbol_addr(out, "x19", "asm_dispatch_table", fmt);
+    w!(out, ".Ldispatch_table_ready:");
     w!(out, "    // x19 = dispatch table");
     // Pin canonical NaN bits in d8 (callee-saved FP register).
     // Used by canonicalize_nan to avoid materializing the constant each time.
@@ -185448,6 +185769,24 @@ fn generate_entry_point(out: &mut String, program: &Program, fmt: ObjectFormat) 
 }
 
 fn generate_fallback_handler(out: &mut String, program: &Program, object_format: ObjectFormat) {
+    emit_handler_alignment(out, object_format);
+    w!(out, "asm_debugger_trampoline:");
+    w!(out, "    mov x0, x20");
+    w!(out, "    sub w1, w21, w26");
+    emit_sync_pc_to_execution_context(out, program);
+    w!(out, "    bl CSYM(asm_debugger_check_breakpoint)");
+    emit_state_reload(out, program);
+    // The reload may have picked up a different bytecode base, which would leave the absolute
+    // instruction pointer in x21 stale, so recompute it from the synced program counter.
+    let program_counter = runtime(program)[KnownLayoutConstant::ExecutionContextProgramCounter];
+    emit_ldr32(out, "w9", "x28", program_counter);
+    w!(out, "    add x21, x26, w9, uxtw");
+    w!(out, "    ldrb w9, [x21]");
+    emit_symbol_addr(out, "x10", "asm_dispatch_table", object_format);
+    w!(out, "    ldr x10, [x10, x9, lsl #3]");
+    w!(out, "    br x10");
+    w!(out);
+
     emit_handler_alignment(out, object_format);
     w!(out, "asm_handler_fallback:");
     // Set up args: x0=vm (x20), w1=pc (ip - pb), x2=instruction (ip)
@@ -185552,6 +185891,20 @@ fn emit_ldr64(out: &mut String, dst: &str, base: &str, offset: i64) {
         w!(out, "    ldur {dst}, [{base}, #{offset}]");
     } else {
         // Need to materialize offset in a scratch register
+        emit_mov_imm(out, registers::X9, offset);
+        w!(out, "    ldr {dst}, [{base}, x9]");
+    }
+}
+
+/// Emit an ldr (32-bit) from [base + offset].
+fn emit_ldr32(out: &mut String, dst: &str, base: &str, offset: i64) {
+    if offset == 0 {
+        w!(out, "    ldr {dst}, [{base}]");
+    } else if unsigned_memory_offset_fits(MemoryWidth::Word, offset) {
+        w!(out, "    ldr {dst}, [{base}, #{offset}]");
+    } else if (-256..=255).contains(&offset) {
+        w!(out, "    ldur {dst}, [{base}, #{offset}]");
+    } else {
         emit_mov_imm(out, registers::X9, offset);
         w!(out, "    ldr {dst}, [{base}, x9]");
     }
@@ -185751,6 +186104,7 @@ mod tests {
             runtime: crate::low_ir::RuntimeConstants::from_layout(
                 &crate::frontend::layout::LayoutConstants::from_values([
                     ("VM_RUNNING_EXECUTION_CONTEXT".into(), 8),
+                    ("VM_BREAKPOINT_CONTROLLER".into(), 16),
                     ("CANON_NAN_BITS".into(), 0x7ff8_0000_0000_0000u64 as i64),
                     ("INT32_TAG".into(), 0xfffau64 as i64),
                     ("BOOLEAN_TAG".into(), 0xfffbu64 as i64),
@@ -192612,6 +192966,12 @@ pub(crate) fn emit_dispatch_tables(out: &mut String, program: &MachineProgram) {
     }
     w!(out);
 
+    w!(out, "asm_debug_dispatch_table:");
+    for _ in 0..DISPATCH_TABLE_SIZE {
+        w!(out, "    .quad asm_debugger_trampoline");
+    }
+    w!(out);
+
     w!(out, ".globl CSYM(js_interpreter_handler_ranges)");
     w!(out, ".p2align 3");
     w!(out, "CSYM(js_interpreter_handler_ranges):");
@@ -194179,6 +194539,7 @@ impl MachineProgram {
             .chain(
                 [
                     VmRunningExecutionContext,
+                    VmBreakpointController,
                     ExecutionContextExecutable,
                     ExecutionContextProgramCounter,
                     ExecutableBytecodeData,
@@ -196408,12 +196769,37 @@ fn generate_entry_point(out: &mut String, program: &Program, abi: X86_64Abi) {
         "    movabs {int32_tag_shifted_register}, {int32_tag_shifted}  # INT32_TAG_SHIFTED"
     );
     w!(out, "    mov QWORD PTR {}, {vm}  # save VM*", vm_slot(abi));
-    w!(out, "    lea r12, [rip + asm_dispatch_table]  # dispatch table");
+    let vm_breakpoint_controller = runtime(program)[KnownLayoutConstant::VmBreakpointController];
+    w!(out, "    cmp QWORD PTR [{vm} + {vm_breakpoint_controller}], 0");
+    w!(out, "    lea r12, [rip + asm_dispatch_table]");
+    w!(out, "    je .Ldispatch_table_ready");
+    w!(out, "    lea r12, [rip + asm_debug_dispatch_table]");
+    w!(out, ".Ldispatch_table_ready:");
+    w!(out, "    # r12 = dispatch table");
     emit_dispatch(out);
     w!(out);
 }
 
 fn generate_fallback_handler(out: &mut String, program: &Program, abi: X86_64Abi) {
+    w!(out, ".p2align 4");
+    w!(out, "asm_debugger_trampoline:");
+    emit_sync_pc_to_execution_context(out, program);
+    emit_vm_pc_args(out, abi);
+    w!(out, "    call CSYM(asm_debugger_check_breakpoint)");
+    emit_state_reload(out, program, abi);
+    // The reload may have picked up a different execution context, so reload its program counter
+    // instead of dispatching from the value that r13 held across the C++ call.
+    let program_counter = runtime(program)[KnownLayoutConstant::ExecutionContextProgramCounter];
+    w!(
+        out,
+        "    mov r13d, DWORD PTR [rbx + {}]",
+        program_counter - values_offset(program)
+    );
+    w!(out, "    movzx eax, BYTE PTR [r14 + r13]");
+    w!(out, "    lea rcx, [rip + asm_dispatch_table]");
+    w!(out, "    jmp [rcx + rax * 8]");
+    w!(out);
+
     // The fallback handler calls into C++ for any unhandled instruction.
     // extern "C" i64 asm_fallback_handler(VM* vm, u32 pc, u8 const* instruction);
     // Returns >= 0: new pc to dispatch to. Returns < 0: exit.
@@ -199276,6 +199662,7 @@ asm_dispatch_table:
     .quad asm_handler_ThrowIfNullish
     .quad asm_handler_ThrowConstAssignment
     .quad asm_handler_Throw
+    .quad asm_handler_Debugger
     .quad asm_handler_Await
     .quad asm_handler_Yield
     .quad asm_handler_YieldIteratorResult
@@ -199460,7 +199847,264 @@ asm_dispatch_table:
     .quad asm_handler_fallback
     .quad asm_handler_fallback
     .quad asm_handler_fallback
-    .quad asm_handler_fallback
+
+asm_debug_dispatch_table:
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
 
 .globl CSYM(js_interpreter_handler_ranges)
 .p2align 3
@@ -199749,6 +200393,10 @@ CSYM(js_interpreter_handler_ranges):
     .quad asm_handler_Throw_hot_end
     .quad asm_handler_Throw_cold
     .quad asm_handler_Throw_cold_end
+    .quad asm_handler_Debugger
+    .quad asm_handler_Debugger_hot_end
+    .quad asm_handler_Debugger_cold
+    .quad asm_handler_Debugger_cold_end
     .quad asm_handler_Await
     .quad asm_handler_Await_hot_end
     .quad asm_handler_Await_cold
@@ -200485,10 +201133,6 @@ CSYM(js_interpreter_handler_ranges):
     .quad asm_handler_fallback_hot_end
     .quad asm_handler_fallback_cold
     .quad asm_handler_fallback_cold_end
-    .quad asm_handler_fallback
-    .quad asm_handler_fallback_hot_end
-    .quad asm_handler_fallback_cold
-    .quad asm_handler_fallback_cold_end
 
 .text
 
@@ -200524,8 +201168,15 @@ CSYM(js_interpreter):
     mov x20, x3              // vm = VM*
     ldr x28, [x3, #15288]
     // x28 = exec_ctx
+    ldr x9, [x3, #16664]
+    cbz x9, .Lnormal_dispatch_table
+    adrp x19, asm_debug_dispatch_table
+    add x19, x19, :lo12:asm_debug_dispatch_table
+    b .Ldispatch_table_ready
+.Lnormal_dispatch_table:
     adrp x19, asm_dispatch_table
     add x19, x19, :lo12:asm_dispatch_table
+.Ldispatch_table_ready:
     // x19 = dispatch table
     movz x9, #0x7ff8, lsl #48
     fmov d8, x9              // d8 = CANON_NAN_BITS
@@ -200538,6 +201189,24 @@ CSYM(js_interpreter):
     add x21, x26, w1, uxtw   // x21 = pb + entry_point
     ldrb w9, [x21]           // w9 = opcode byte
     ldr x10, [x19, x9, lsl #3]
+    br x10
+
+.p2align 4
+asm_debugger_trampoline:
+    mov x0, x20
+    sub w1, w21, w26
+    str w1, [x28, #56]
+    bl CSYM(asm_debugger_check_breakpoint)
+    ldr x28, [x20, #15288]
+    ldr x9, [x28, #80]
+    ldr x26, [x9, #104]
+    add x27, x28, #120
+    ldr w9, [x28, #56]
+    add x21, x26, w9, uxtw
+    ldrb w9, [x21]
+    adrp x10, asm_dispatch_table
+    add x10, x10, :lo12:asm_dispatch_table
+    ldr x10, [x10, x9, lsl #3]
     br x10
 
 .p2align 4
@@ -207267,6 +207936,26 @@ asm_handler_Throw_cold:
 asm_handler_Throw_cold_end:
 
 .p2align 4
+asm_handler_Debugger:
+    mov x0, x20
+    sub w1, w21, w26
+    str w1, [x28, #56]
+    mov x2, x21
+    bl CSYM(asm_slow_path_debugger)
+    tbnz x0, #63, .Lexit_veneer
+    ldr x28, [x20, #15288]
+    ldr x9, [x28, #80]
+    ldr x26, [x9, #104]
+    add x27, x28, #120
+    add x21, x26, w0, uxtw
+    ldrb w9, [x21]
+    ldr x10, [x19, x9, lsl #3]
+    br x10
+asm_handler_Debugger_hot_end:
+asm_handler_Debugger_cold:
+asm_handler_Debugger_cold_end:
+
+.p2align 4
 asm_handler_Await:
     mov x0, x20
     sub w1, w21, w26
@@ -211014,6 +211703,7 @@ asm_dispatch_table:
     .quad asm_handler_ThrowIfNullish
     .quad asm_handler_ThrowConstAssignment
     .quad asm_handler_Throw
+    .quad asm_handler_Debugger
     .quad asm_handler_Await
     .quad asm_handler_Yield
     .quad asm_handler_YieldIteratorResult
@@ -211198,7 +211888,264 @@ asm_dispatch_table:
     .quad asm_handler_fallback
     .quad asm_handler_fallback
     .quad asm_handler_fallback
-    .quad asm_handler_fallback
+
+asm_debug_dispatch_table:
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
+    .quad asm_debugger_trampoline
 
 .globl CSYM(js_interpreter_handler_ranges)
 .p2align 3
@@ -211487,6 +212434,10 @@ CSYM(js_interpreter_handler_ranges):
     .quad asm_handler_Throw_hot_end
     .quad asm_handler_Throw_cold
     .quad asm_handler_Throw_cold_end
+    .quad asm_handler_Debugger
+    .quad asm_handler_Debugger_hot_end
+    .quad asm_handler_Debugger_cold
+    .quad asm_handler_Debugger_cold_end
     .quad asm_handler_Await
     .quad asm_handler_Await_hot_end
     .quad asm_handler_Await_cold
@@ -212223,10 +213174,6 @@ CSYM(js_interpreter_handler_ranges):
     .quad asm_handler_fallback_hot_end
     .quad asm_handler_fallback_cold
     .quad asm_handler_fallback_cold_end
-    .quad asm_handler_fallback
-    .quad asm_handler_fallback_hot_end
-    .quad asm_handler_fallback_cold
-    .quad asm_handler_fallback_cold_end
 
 .text
 
@@ -212255,9 +213202,30 @@ CSYM(js_interpreter):
     mov rbx, rdx          # values
     movabs r15, 9221683186994511872  # INT32_TAG_SHIFTED
     mov QWORD PTR [rbp - 48], rcx  # save VM*
-    lea r12, [rip + asm_dispatch_table]  # dispatch table
+    cmp QWORD PTR [rcx + 16664], 0
+    lea r12, [rip + asm_dispatch_table]
+    je .Ldispatch_table_ready
+    lea r12, [rip + asm_debug_dispatch_table]
+.Ldispatch_table_ready:
+    # r12 = dispatch table
     movzx eax, BYTE PTR [r14 + r13]
     jmp [r12 + rax * 8]
+
+.p2align 4
+asm_debugger_trampoline:
+    mov DWORD PTR [rbx + -64], r13d
+    mov rdi, QWORD PTR [rbp - 48]
+    mov esi, r13d
+    call CSYM(asm_debugger_check_breakpoint)
+    mov rcx, QWORD PTR [rbp - 48]
+    mov rbx, QWORD PTR [rcx + 15288]
+    add rbx, 120
+    mov rcx, QWORD PTR [rbx + -40]
+    mov r14, QWORD PTR [rcx + 104]
+    mov r13d, DWORD PTR [rbx + -64]
+    movzx eax, BYTE PTR [r14 + r13]
+    lea rcx, [rip + asm_dispatch_table]
+    jmp [rcx + rax * 8]
 
 .p2align 4
 asm_handler_fallback:
@@ -219108,6 +220076,27 @@ asm_handler_Throw_cold:
 asm_handler_Throw_cold_end:
 
 .p2align 4
+asm_handler_Debugger:
+    mov DWORD PTR [rbx + -64], r13d
+    mov rdi, QWORD PTR [rbp - 48]
+    mov esi, r13d
+    lea rdx, [r14 + r13]
+    call CSYM(asm_slow_path_debugger)
+    test rax, rax
+    js .Lexit
+    mov rcx, QWORD PTR [rbp - 48]
+    mov rbx, QWORD PTR [rcx + 15288]
+    add rbx, 120
+    mov rcx, QWORD PTR [rbx + -40]
+    mov r14, QWORD PTR [rcx + 104]
+    mov r13d, eax
+    movzx eax, BYTE PTR [r14 + r13]
+    jmp [r12 + rax * 8]
+asm_handler_Debugger_hot_end:
+asm_handler_Debugger_cold:
+asm_handler_Debugger_cold_end:
+
+.p2align 4
 asm_handler_Await:
     mov DWORD PTR [rbx + -64], r13d
     mov rdi, QWORD PTR [rbp - 48]
@@ -223128,6 +224117,7 @@ const VM_INTERPRETER_STACK = 15344
 const VM_STACK_INFO = 15320
 const VM_EXECUTION_GENERATION = 16632
 const VM_PRIMITIVE_STORAGE_CAGE_BASE = 16640
+const VM_BREAKPOINT_CONTROLLER = 16664
 field VM.primitive_storage_cage_base u64 VM_PRIMITIVE_STORAGE_CAGE_BASE nonnull
 const VM_INTERPRETER_STACK_TOP = 15352
 const VM_INTERPRETER_STACK_LIMIT = 15360
@@ -223551,6 +224541,7 @@ class Completion;
 class Console;
 class ConsoleClient;
 class CyclicModule;
+class Debugger;
 class DeclarativeEnvironment;
 struct DisposeCapability;
 struct DisposableResource;
@@ -223978,6 +224969,7 @@ int main()
     EMIT_OFFSET(VM_STACK_INFO, VM, m_stack_info);
     EMIT_OFFSET(VM_EXECUTION_GENERATION, VM, m_execution_generation);
     EMIT_OFFSET(VM_PRIMITIVE_STORAGE_CAGE_BASE, VM, m_primitive_storage_cage_base);
+    EMIT_OFFSET(VM_BREAKPOINT_CONTROLLER, VM, m_debugger);
     outln("field VM.primitive_storage_cage_base u64 VM_PRIMITIVE_STORAGE_CAGE_BASE nonnull");
     outln("const VM_INTERPRETER_STACK_TOP = {}", offsetof(VM, m_interpreter_stack) + offsetof(InterpreterStack, m_top));
     outln("const VM_INTERPRETER_STACK_LIMIT = {}", offsetof(VM, m_interpreter_stack) + offsetof(InterpreterStack, m_limit));
@@ -224294,6 +225286,7 @@ FILE: Libraries/LibJS/Interpreter/Interpreter.cpp
 #include <LibJS/Bytecode/Instruction.h>
 #include <LibJS/Bytecode/Label.h>
 #include <LibJS/Bytecode/Op.h>
+#include <LibJS/Debugger.h>
 #include <LibJS/Runtime/AbstractOperations.h>
 #include <LibJS/Runtime/ClassConstruction.h>
 #include <LibJS/Runtime/DeclarativeEnvironment.h>
@@ -224576,6 +225569,9 @@ DeclarativeEnvironment& VM::global_declarative_environment()
 
 ThrowCompletionOr<Value> VM::run_executable(ExecutionContext& context, Executable& executable, u32 entry_point)
 {
+    if (auto* debugger = vm().debugger())
+        debugger->register_executable(executable);
+
     auto const is_outermost_bytecode_execution = m_run_executable_depth == 0;
     TemporaryChange restore_run_executable_depth { m_run_executable_depth, m_run_executable_depth + 1 };
 
@@ -226400,6 +227396,8 @@ handler Throw(
     src: Operand
 ) @terminator @cold = call_slow_path(throw);
 
+handler Debugger() @cold = call_slow_path(debugger);
+
 handler Await(
     continuation_label: BytecodeOffset,
     argument: Operand
@@ -228197,6 +229195,7 @@ FILE: Libraries/LibJS/Interpreter/SlowPaths.cpp
 #include <LibJS/Bytecode/Op.h>
 #include <LibJS/Bytecode/PropertyAccess.h>
 #include <LibJS/Bytecode/PropertyNameIterator.h>
+#include <LibJS/Debugger.h>
 #include <LibJS/Runtime/AbstractOperations.h>
 #include <LibJS/Runtime/Array.h>
 #include <LibJS/Runtime/AsyncFromSyncIteratorPrototype.h>
@@ -228746,6 +229745,7 @@ static i64 finish_binary_slow_path(VM& vm, u32 pc, Operand destination, ThrowCom
 extern "C" {
 
 // Forward declarations for all functions called from assembly.
+void asm_debugger_check_breakpoint(VM*, u32 pc);
 i64 asm_fallback_handler(VM*, u32 pc, u8 const* instruction);
 i64 asm_slow_path_jump_less_than_values(VM*, u32 pc, Value, Value, u32, u32);
 i64 asm_slow_path_jump_greater_than_values(VM*, u32 pc, Value, Value, u32, u32);
@@ -228895,6 +229895,7 @@ i64 asm_slow_path_throw(VM*, u32 pc, Op::Throw const*);
 i64 asm_slow_path_throw_if_tdz(VM*, u32 pc, Op::ThrowIfTDZ const*);
 i64 asm_slow_path_throw_if_not_object(VM*, u32 pc, Op::ThrowIfNotObject const*);
 i64 asm_slow_path_throw_if_nullish(VM*, u32 pc, Op::ThrowIfNullish const*);
+i64 asm_slow_path_debugger(VM*, u32 pc, Op::Debugger const*);
 i64 asm_slow_path_yield(VM*, u32 pc, Op::Yield const*);
 i64 asm_slow_path_yield_iterator_result(VM*, u32 pc, Op::YieldIteratorResult const*);
 i64 asm_slow_path_instance_of(VM*, u32 pc, Op::InstanceOf const*);
@@ -228920,6 +229921,30 @@ i64 asm_try_put_by_value_typed_array(VM*, u32 pc, Op::PutByValue const*);
 
 // ===== Fallback handler for invalid dispatch table entries =====
 // NB: Every bytecode opcode has a DSL handler, so this should never run.
+void asm_debugger_check_breakpoint(VM* vm, u32 pc)
+{
+    // NB: The dispatch table is chosen when entering the interpreter, so we keep getting called
+    //     for the rest of the frame even if the host detaches its debugger in the meantime.
+    auto* debugger = vm->debugger();
+    if (!debugger)
+        return;
+
+    auto& executable = vm->current_executable();
+    debugger->register_executable(executable);
+    auto reason = [&]() -> Optional<Debugger::PauseReason> {
+        if (debugger->should_pause_on_next_bytecode_execution(executable, pc))
+            return Debugger::PauseReason::Entry;
+        if (executable.has_debugger_breakpoint_at(pc))
+            return Debugger::PauseReason::Breakpoint;
+        return {};
+    }();
+
+    bool did_pause = false;
+    if (reason.has_value())
+        did_pause = debugger->pause_execution(executable, pc, *reason);
+    debugger->set_did_pause_before_current_instruction(did_pause);
+}
+
 i64 asm_fallback_handler(VM*, u32, u8 const*)
 {
     VERIFY_NOT_REACHED();
@@ -230981,6 +232006,14 @@ i64 asm_slow_path_throw_const_assignment(VM* vm, u32 pc, Op::ThrowConstAssignmen
 {
     auto completion = vm->throw_completion<TypeError>(ErrorType::InvalidAssignToConst);
     return handle_asm_exception(*vm, pc, completion.value());
+}
+
+i64 asm_slow_path_debugger(VM* vm, u32 pc, Op::Debugger const*)
+{
+    // NB: Don't pause twice if the debugger trampoline already paused before this instruction.
+    if (auto* debugger = vm->debugger(); debugger && !debugger->did_pause_before_current_instruction())
+        debugger->pause_execution(vm->current_executable(), pc, Debugger::PauseReason::DebuggerStatement);
+    return static_cast<i64>(pc + sizeof(Op::Debugger));
 }
 
 i64 asm_slow_path_yield(VM* vm, [[maybe_unused]] u32 pc, Op::Yield const* instruction)
@@ -324634,6 +325667,7 @@ FILE: Libraries/LibJS/Runtime/VM.cpp
 #include <LibGC/Heap.h>
 #include <LibGC/PrimitiveStorage.h>
 #include <LibJS/Bytecode/Executable.h>
+#include <LibJS/Debugger.h>
 #include <LibJS/Runtime/AbstractOperations.h>
 #include <LibJS/Runtime/Array.h>
 #include <LibJS/Runtime/ArrayBuffer.h>
@@ -324861,6 +325895,19 @@ VM::~VM()
 {
     --s_vm_count;
     VERIFY(s_vm_count == 0);
+}
+
+void VM::enable_debugging()
+{
+    if (!m_debugger)
+        m_debugger = make<Debugger>();
+}
+
+void VM::disable_debugging()
+{
+    if (m_debugger)
+        VERIFY(!m_debugger->is_paused());
+    m_debugger = nullptr;
 }
 
 SharedFunctionInstanceData* VM::active_shared_function_data()
@@ -325641,6 +326688,15 @@ public:
 
     [[nodiscard]] PropertyKey const& get_property_key(Bytecode::PropertyKeyTableIndex) const;
 
+    // NB: The interpreter picks its dispatch table when it starts running an outermost executable.
+    //     Enabling debugging therefore only takes effect for later interpreter invocations, not
+    //     code that is already running.
+    void enable_debugging();
+    void disable_debugging();
+    [[nodiscard]] bool debugging_enabled() const { return m_debugger; }
+    [[nodiscard]] Debugger* debugger() { return m_debugger; }
+    [[nodiscard]] Debugger const* debugger() const { return m_debugger; }
+
     enum class HandleExceptionResponse {
         ExitFromExecutable,
         ContinueInThisExecutable,
@@ -326076,6 +327132,7 @@ private:
     u32 m_module_execution_depth { 0 };
     u64 m_module_async_evaluation_count { 0 }; // [[ModuleAsyncEvaluationCount]]
 
+    OwnPtr<Debugger> m_debugger;
     OwnPtr<Agent> m_agent;
 
     bool m_dynamic_imports_allowed { false };
@@ -332105,7 +333162,7 @@ use crate::bytecode::validator::validate_bytecode;
 use crate::u32_from_usize;
 
 const MAGIC: &[u8; 8] = b"LBJSBC\0\0";
-const FORMAT_VERSION: u32 = 13;
+const FORMAT_VERSION: u32 = 14;
 const SOURCE_HASH_SIZE: usize = 32;
 const BYTECODE_ALIGNMENT: usize = 8;
 const COMPLETION_TYPE_VARIANT_COUNT: u32 = 6;
@@ -337247,7 +338304,10 @@ pub fn generate_statement(
 
     let result = match &statement.inner {
         StatementKind::Empty | StatementKind::Error | StatementKind::ErrorDeclaration => None,
-        StatementKind::Debugger => None,
+        StatementKind::Debugger => {
+            generator.emit(Instruction::Debugger {});
+            None
+        }
 
         // === ExpressionStatement ===
         StatementKind::Expression(expression) => generate_expression(expression, generator, None),
@@ -366122,6 +367182,7 @@ FILE: Libraries/LibJS/RustIntegration.cpp
 #include <LibJS/Bytecode/RegexTable.h>
 #include <LibJS/Bytecode/StringTable.h>
 #include <LibJS/Bytecode/Validator.h>
+#include <LibJS/Debugger.h>
 #include <LibJS/Runtime/BigInt.h>
 #include <LibJS/Runtime/Intrinsics.h>
 #include <LibJS/Runtime/NativeJavaScriptBackedFunction.h>
@@ -367561,6 +368622,9 @@ extern "C" void* rust_create_executable(
 #endif
         }
     }
+
+    if (auto* debugger = vm.debugger())
+        debugger->register_executable(*executable);
 
     return executable.ptr();
 }
@@ -371882,7 +372946,7 @@ FILE: Libraries/LibMedia/Audio/PlaybackStream.cpp
 
 namespace Audio {
 
-NonnullRefPtr<PlaybackStream::CreatePromise> PlaybackStream::create_platform_or_null(OutputState initial_output_state, u32 target_latency_ms, AudioDataRequestCallback platform_data_request_callback, AudioDataRequestCallback fallback_data_request_callback)
+NonnullRefPtr<PlaybackStream::CreatePromise> PlaybackStream::create_platform_or_null(OutputState initial_output_state, u32 target_latency_ms, [[maybe_unused]] AudioDataRequestCallback platform_data_request_callback, AudioDataRequestCallback fallback_data_request_callback)
 {
     auto promise = PlaybackStream::CreatePromise::construct();
 
@@ -646640,6 +647704,7 @@ enum class InvalidateLayoutTreeReason {
     X(ProcessScreenshot)                     \
     X(SVGGraphicsElementGetBBox)             \
     X(SVGLengthValue)                        \
+    X(SVGPathLength)                         \
     X(SourceSetNormalizeSourceDensities)     \
     X(ViewTransitionCapture)                 \
     X(WindowScroll)
@@ -669042,770 +670107,3 @@ WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> Range::extract()
     // 14. If originalStartNode is an inclusive ancestor of originalEndNode, then set newNode to originalStartNode and
     //     newOffset to originalStartOffset.
     if (original_start_node->is_inclusive_ancestor_of(original_end_node)) {
-        new_node = original_start_node;
-        new_offset = original_start_offset;
-    }
-    // 15. Otherwise:
-    else {
-        // 1. Let referenceNode be originalStartNode.
-        GC::Ptr<Node> reference_node = original_start_node;
-
-        // 2. While referenceNode’s parent is non-null and is not an inclusive ancestor of originalEndNode:
-        //    set referenceNode to its parent.
-        while (reference_node->parent_node() && !reference_node->parent_node()->is_inclusive_ancestor_of(original_end_node))
-            reference_node = reference_node->parent_node();
-
-        // 3. Set newNode to the parent of referenceNode, and newOffset to referenceNode’s index + 1.
-        new_node = reference_node->parent_node();
-        new_offset = reference_node->index() + 1;
-    }
-
-    // 16. Set range’s start and end to (newNode, newOffset).
-    TRY(set_start(*new_node, new_offset));
-    TRY(set_end(*new_node, new_offset));
-
-    // 17. If firstPartiallyContainedChild is a CharacterData node:
-    if (first_partially_contained_child && is<CharacterData>(*first_partially_contained_child)) {
-        // 1. Let clone be a clone of originalStartNode.
-        auto clone = TRY(original_start_node->clone_node());
-
-        // 2. Set the data of clone to the result of substringing data of originalStartNode with originalStartOffset
-        //    and originalStartNode’s length − originalStartOffset.
-        auto result = TRY(static_cast<CharacterData const&>(*original_start_node).substring_data(original_start_offset, original_start_node->length() - original_start_offset));
-        as<CharacterData>(*clone).set_data(move(result));
-
-        // 3. Append clone to fragment.
-        TRY(fragment->append_child(clone));
-
-        // 4. Replace data of originalStartNode with originalStartOffset, originalStartNode’s length −
-        //    originalStartOffset, and the empty string.
-        TRY(static_cast<CharacterData&>(*original_start_node).replace_data(original_start_offset, original_start_node->length() - original_start_offset, {}));
-    }
-    // 18. Otherwise, if firstPartiallyContainedChild is non-null:
-    else if (first_partially_contained_child) {
-        // 1. Let clone be a clone of firstPartiallyContainedChild.
-        auto clone = TRY(first_partially_contained_child->clone_node());
-
-        // 2. Append clone to fragment.
-        TRY(fragment->append_child(clone));
-
-        // 3. Let subrange be a new live range whose start is (originalStartNode, originalStartOffset) and whose end is
-        //    (firstPartiallyContainedChild, firstPartiallyContainedChild’s length).
-        auto subrange = Range::create(original_start_node, original_start_offset, *first_partially_contained_child, first_partially_contained_child->length());
-
-        // 4. Let subfragment be the result of extracting subrange.
-        auto subfragment = TRY(subrange->extract());
-
-        // 5. Append subfragment to clone.
-        TRY(clone->append_child(subfragment));
-    }
-
-    // 19. For each contained child of containedChildren: append contained child to fragment.
-    for (auto& contained_child : contained_children) {
-        TRY(fragment->append_child(contained_child));
-    }
-
-    // 20. If lastPartiallyContainedChild is a CharacterData node:
-    if (last_partially_contained_child && is<CharacterData>(*last_partially_contained_child)) {
-        // 1. Let clone be a clone of originalEndNode.
-        auto clone = TRY(original_end_node->clone_node());
-
-        // 2. Set clone’s data to the result of substringing data of originalEndNode with 0 and originalEndOffset.
-        auto result = TRY(static_cast<CharacterData const&>(*original_end_node).substring_data(0, original_end_offset));
-        as<CharacterData>(*clone).set_data(move(result));
-
-        // 3. Append clone to fragment.
-        TRY(fragment->append_child(clone));
-
-        // 4. Replace data of originalEndNode with 0, originalEndOffset, and the empty string.
-        TRY(as<CharacterData>(*original_end_node).replace_data(0, original_end_offset, {}));
-    }
-    // 21. Otherwise, if lastPartiallyContainedChild is non-null:
-    else if (last_partially_contained_child) {
-        // 1. Let clone be a clone of lastPartiallyContainedChild.
-        auto clone = TRY(last_partially_contained_child->clone_node());
-
-        // 2. Append clone to fragment.
-        TRY(fragment->append_child(clone));
-
-        // 3. Let subrange be a new live range whose start is (lastPartiallyContainedChild, 0) and whose end is
-        //    (originalEndNode, originalEndOffset).
-        auto subrange = Range::create(*last_partially_contained_child, 0, original_end_node, original_end_offset);
-
-        // 4. Let subfragment be the result of extracting subrange.
-        auto subfragment = TRY(subrange->extract());
-
-        // 5. Append subfragment to clone.
-        TRY(clone->append_child(subfragment));
-    }
-
-    // 22. Return fragment.
-    return fragment;
-}
-
-// https://dom.spec.whatwg.org/#contained
-bool Range::contains_node(GC::Ref<Node> node) const
-{
-    // A node node is contained in a live range range if node’s root is range’s root,
-    if (&node->root() != root().ptr())
-        return false;
-
-    // and (node, 0) is after range’s start,
-    if (position_of_boundary_point_relative_to_other_boundary_point({ node, 0 }, start()) != RelativeBoundaryPointPosition::After)
-        return false;
-
-    // and (node, node’s length) is before range’s end.
-    if (position_of_boundary_point_relative_to_other_boundary_point({ node, static_cast<WebIDL::UnsignedLong>(node->length()) }, end()) != RelativeBoundaryPointPosition::Before)
-        return false;
-
-    return true;
-}
-
-// https://dom.spec.whatwg.org/#partially-contained
-bool Range::partially_contains_node(GC::Ref<Node> node) const
-{
-    // A node is partially contained in a live range if it’s an inclusive ancestor of the live range’s start node but
-    // not its end node, or vice versa.
-    return node->is_inclusive_ancestor_of(m_start_container) != node->is_inclusive_ancestor_of(m_end_container);
-}
-
-// https://dom.spec.whatwg.org/#dom-range-insertnode
-WebIDL::ExceptionOr<void> Range::insert_node(GC::Ref<Node> node)
-{
-    return insert(node);
-}
-
-// https://dom.spec.whatwg.org/#concept-range-insert
-WebIDL::ExceptionOr<void> Range::insert(GC::Ref<Node> node)
-{
-    // 1. If range’s start node is a ProcessingInstruction or Comment node, is a Text node whose parent is null, or is node, then throw a "HierarchyRequestError" DOMException.
-    if ((is<ProcessingInstruction>(*m_start_container) || is<Comment>(*m_start_container))
-        || (is<Text>(*m_start_container) && !m_start_container->parent_node())
-        || m_start_container.ptr() == node.ptr()) {
-        return WebIDL::HierarchyRequestError::create(realm(), "Range has inappropriate start node for insertion"_utf16);
-    }
-
-    // 2. Let referenceNode be null.
-    GC::Ptr<Node> reference_node;
-
-    // 3. If range’s start node is a Text node, set referenceNode to that Text node.
-    if (is<Text>(*m_start_container)) {
-        reference_node = m_start_container;
-    }
-    // 4. Otherwise, set referenceNode to the child of start node whose index is start offset, and null if there is no such child.
-    else {
-        reference_node = m_start_container->child_at_index(m_start_offset);
-    }
-
-    // 5. Let parent be range’s start node if referenceNode is null, and referenceNode’s parent otherwise.
-    GC::Ptr<Node> parent;
-    if (!reference_node)
-        parent = m_start_container;
-    else
-        parent = reference_node->parent();
-
-    // 6. Ensure pre-insert validity given node, parent, referenceNode, and « ».
-    TRY(parent->ensure_pre_insert_validity(node->realm(), node, reference_node, Node::ChildrenToExclude::None));
-
-    // 7. If range’s start node is a Text node, set referenceNode to the result of splitting it with offset range’s start offset.
-    if (is<Text>(*m_start_container))
-        reference_node = TRY(static_cast<Text&>(*m_start_container).split_text(m_start_offset));
-
-    // 8. If node is referenceNode, set referenceNode to its next sibling.
-    if (node == reference_node)
-        reference_node = reference_node->next_sibling();
-
-    // 9. If node’s parent is non-null, then remove node.
-    if (node->parent())
-        node->remove();
-
-    // 10. Let newOffset be parent’s length if referenceNode is null, and referenceNode’s index otherwise.
-    size_t new_offset = 0;
-    if (!reference_node)
-        new_offset = parent->length();
-    else
-        new_offset = reference_node->index();
-
-    // 11. Increase newOffset by node’s length if node is a DocumentFragment node, and one otherwise.
-    if (is<DocumentFragment>(*node))
-        new_offset += node->length();
-    else
-        new_offset += 1;
-
-    // 12. Pre-insert node into parent before referenceNode.
-    (void)TRY(parent->pre_insert(node, reference_node));
-
-    // 13. If range is collapsed, then set range’s end to (parent, newOffset).
-    if (collapsed())
-        TRY(set_end(*parent, new_offset));
-
-    return {};
-}
-
-// https://dom.spec.whatwg.org/#dom-range-surroundcontents
-WebIDL::ExceptionOr<void> Range::surround_contents(GC::Ref<Node> new_parent)
-{
-    // 1. If a non-Text node is partially contained in this, then throw an "InvalidStateError" DOMException.
-    Node* start_non_text_node = start_container();
-    if (is<Text>(*start_non_text_node))
-        start_non_text_node = start_non_text_node->parent_node();
-    Node* end_non_text_node = end_container();
-    if (is<Text>(*end_non_text_node))
-        end_non_text_node = end_non_text_node->parent_node();
-    if (start_non_text_node != end_non_text_node)
-        return WebIDL::InvalidStateError::create(realm(), "Non-Text node is partially contained in range."_utf16);
-
-    // 2. If newParent is a Document, DocumentType, or DocumentFragment node, then throw an "InvalidNodeTypeError" DOMException.
-    if (is<Document>(*new_parent) || is<DocumentType>(*new_parent) || is<DocumentFragment>(*new_parent))
-        return WebIDL::InvalidNodeTypeError::create(realm(), "Invalid parent node type"_utf16);
-
-    // 3. Let fragment be the result of extracting this.
-    auto fragment = TRY(extract());
-
-    // 4. If newParent has children, then replace all with null within newParent.
-    if (new_parent->has_children())
-        new_parent->replace_all(nullptr);
-
-    // 5. Insert newParent into this.
-    TRY(insert(new_parent));
-
-    // 6. Append fragment to newParent.
-    (void)TRY(new_parent->append_child(fragment));
-
-    // 7. Select newParent within this.
-    return select(*new_parent);
-}
-
-// https://dom.spec.whatwg.org/#dom-range-clonecontents
-WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> Range::clone_contents()
-{
-    return clone_the_contents();
-}
-
-// https://dom.spec.whatwg.org/#concept-range-clone
-WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> Range::clone_the_contents()
-{
-    // 1. Let fragment be a new DocumentFragment node whose node document is range’s start node’s node document.
-    auto fragment = realm().create<DOM::DocumentFragment>(const_cast<Document&>(start_container()->document()));
-
-    // 2. If range is collapsed, then return fragment.
-    if (collapsed())
-        return fragment;
-
-    // 3. Let original start node, original start offset, original end node, and original end offset
-    //    be range’s start node, start offset, end node, and end offset, respectively.
-    GC::Ref<Node> original_start_node = m_start_container;
-    auto original_start_offset = m_start_offset;
-    GC::Ref<Node> original_end_node = m_end_container;
-    auto original_end_offset = m_end_offset;
-
-    // 4. If original start node is original end node and it is a CharacterData node, then:
-    if (original_start_node.ptr() == original_end_node.ptr() && is<CharacterData>(*original_start_node)) {
-        // 1. Let clone be a clone of original start node.
-        auto clone = TRY(original_start_node->clone_node());
-
-        // 2. Set the data of clone to the result of substringing data with node original start node,
-        //    offset original start offset, and count original end offset minus original start offset.
-        auto result = TRY(static_cast<CharacterData const&>(*original_start_node).substring_data(original_start_offset, original_end_offset - original_start_offset));
-        as<CharacterData>(*clone).set_data(move(result));
-
-        // 3. Append clone to fragment.
-        TRY(fragment->append_child(clone));
-
-        // 4. Return fragment.
-        return fragment;
-    }
-
-    // 5. Let common ancestor be original start node.
-    GC::Ref<Node> common_ancestor = original_start_node;
-
-    // 6. While common ancestor is not an inclusive ancestor of original end node, set common ancestor to its own parent.
-    while (!common_ancestor->is_inclusive_ancestor_of(original_end_node))
-        common_ancestor = *common_ancestor->parent_node();
-
-    // 7. Let first partially contained child be null.
-    GC::Ptr<Node> first_partially_contained_child;
-
-    // 8. If original start node is not an inclusive ancestor of original end node,
-    //    set first partially contained child to the first child of common ancestor that is partially contained in range.
-    if (!original_start_node->is_inclusive_ancestor_of(original_end_node)) {
-        for (auto* child = common_ancestor->first_child(); child; child = child->next_sibling()) {
-            if (partially_contains_node(*child)) {
-                first_partially_contained_child = child;
-                break;
-            }
-        }
-    }
-
-    // 9. Let last partially contained child be null.
-    GC::Ptr<Node> last_partially_contained_child;
-
-    // 10. If original end node is not an inclusive ancestor of original start node,
-    //     set last partially contained child to the last child of common ancestor that is partially contained in range.
-    if (!original_end_node->is_inclusive_ancestor_of(original_start_node)) {
-        for (auto* child = common_ancestor->last_child(); child; child = child->previous_sibling()) {
-            if (partially_contains_node(*child)) {
-                last_partially_contained_child = child;
-                break;
-            }
-        }
-    }
-
-    // 11. Let contained children be a list of all children of common ancestor that are contained in range, in tree order.
-    Vector<GC::Ref<Node>> contained_children;
-    for (Node* node = common_ancestor->first_child(); node; node = node->next_sibling()) {
-        if (contains_node(*node))
-            contained_children.append(*node);
-    }
-
-    // 12. If any member of contained children is a doctype, then throw a "HierarchyRequestError" DOMException.
-    for (auto const& child : contained_children) {
-        if (is<DocumentType>(*child))
-            return WebIDL::HierarchyRequestError::create(realm(), "Contained child is a DocumentType"_utf16);
-    }
-
-    // 13. If first partially contained child is a CharacterData node, then:
-    if (first_partially_contained_child && is<CharacterData>(*first_partially_contained_child)) {
-        // 1. Let clone be a clone of original start node.
-        auto clone = TRY(original_start_node->clone_node());
-
-        // 2. Set the data of clone to the result of substringing data with node original start node, offset original start offset,
-        //    and count original start node’s length minus original start offset.
-        auto result = TRY(static_cast<CharacterData const&>(*original_start_node).substring_data(original_start_offset, original_start_node->length() - original_start_offset));
-        as<CharacterData>(*clone).set_data(move(result));
-
-        // 3. Append clone to fragment.
-        TRY(fragment->append_child(clone));
-    }
-    // 14. Otherwise, if first partially contained child is not null:
-    else if (first_partially_contained_child) {
-        // 1. Let clone be a clone of first partially contained child.
-        auto clone = TRY(first_partially_contained_child->clone_node());
-
-        // 2. Append clone to fragment.
-        TRY(fragment->append_child(clone));
-
-        // 3. Let subrange be a new live range whose start is (original start node, original start offset) and whose end is (first partially contained child, first partially contained child’s length).
-        auto subrange = Range::create(original_start_node, original_start_offset, *first_partially_contained_child, first_partially_contained_child->length());
-
-        // 4. Let subfragment be the result of cloning the contents of subrange.
-        auto subfragment = TRY(subrange->clone_the_contents());
-
-        // 5. Append subfragment to clone.
-        TRY(clone->append_child(subfragment));
-    }
-
-    // 15. For each contained child in contained children.
-    for (auto& contained_child : contained_children) {
-        // 1. Let clone be a clone of contained child with the clone children flag set.
-        auto clone = TRY(contained_child->clone_node(nullptr, true));
-
-        // 2. Append clone to fragment.
-        TRY(fragment->append_child(move(clone)));
-    }
-
-    // 16. If last partially contained child is a CharacterData node, then:
-    if (last_partially_contained_child && is<CharacterData>(*last_partially_contained_child)) {
-        // 1. Let clone be a clone of original end node.
-        auto clone = TRY(original_end_node->clone_node());
-
-        // 2. Set the data of clone to the result of substringing data with node original end node, offset 0, and count original end offset.
-        auto result = TRY(static_cast<CharacterData const&>(*original_end_node).substring_data(0, original_end_offset));
-        as<CharacterData>(*clone).set_data(move(result));
-
-        // 3. Append clone to fragment.
-        TRY(fragment->append_child(clone));
-    }
-    // 17. Otherwise, if last partially contained child is not null:
-    else if (last_partially_contained_child) {
-        // 1. Let clone be a clone of last partially contained child.
-        auto clone = TRY(last_partially_contained_child->clone_node());
-
-        // 2. Append clone to fragment.
-        TRY(fragment->append_child(clone));
-
-        // 3. Let subrange be a new live range whose start is (last partially contained child, 0) and whose end is (original end node, original end offset).
-        auto subrange = Range::create(*last_partially_contained_child, 0, original_end_node, original_end_offset);
-
-        // 4. Let subfragment be the result of cloning the contents of subrange.
-        auto subfragment = TRY(subrange->clone_the_contents());
-
-        // 5. Append subfragment to clone.
-        TRY(clone->append_child(subfragment));
-    }
-
-    // 18. Return fragment.
-    return fragment;
-}
-
-// https://dom.spec.whatwg.org/#dom-range-deletecontents
-WebIDL::ExceptionOr<void> Range::delete_contents()
-{
-    // 1. If this is collapsed, then return.
-    if (collapsed())
-        return {};
-
-    // 2. Let originalStartNode, originalStartOffset, originalEndNode, and originalEndOffset be this’s start node,
-    //    start offset, end node, and end offset, respectively.
-    GC::Ref<Node> original_start_node = m_start_container;
-    auto original_start_offset = m_start_offset;
-    GC::Ref<Node> original_end_node = m_end_container;
-    auto original_end_offset = m_end_offset;
-
-    // 3. If originalStartNode is originalEndNode and it is a CharacterData node:
-    if (original_start_node.ptr() == original_end_node.ptr() && is<CharacterData>(*original_start_node)) {
-        // 1. Replace data of originalStartNode with originalStartOffset, originalEndOffset − originalStartOffset, and
-        //    the empty string.
-        TRY(static_cast<CharacterData&>(*original_start_node).replace_data(original_start_offset, original_end_offset - original_start_offset, {}));
-        // 2. Return.
-        return {};
-    }
-
-    // 4. Let nodesToRemove be a list of all the nodes that are contained in this, in tree order, omitting any node
-    //    whose parent is also contained in this.
-    GC::RootVector<Node*> nodes_to_remove;
-    for (GC::Ptr<Node> node = start_container(); node != end_container()->next_sibling(); node = node->next_in_pre_order()) {
-        if (contains_node(*node) && (!node->parent_node() || !contains_node(*node->parent_node())))
-            nodes_to_remove.append(node);
-    }
-
-    // 5. Let newNode and newOffset be null.
-    GC::Ptr<Node> new_node;
-    size_t new_offset = 0;
-
-    // 6. If originalStartNode is an inclusive ancestor of originalEndNode, then set newNode to originalStartNode and
-    //    newOffset to originalStartOffset.
-    if (original_start_node->is_inclusive_ancestor_of(original_end_node)) {
-        new_node = original_start_node;
-        new_offset = original_start_offset;
-    }
-    // 7. Otherwise
-    else {
-        // 1. Let referenceNode be originalStartNode.
-        auto reference_node = original_start_node;
-
-        // 2. While referenceNode’s parent is non-null and is not an inclusive ancestor of originalEndNode:
-        //    set referenceNode to its parent.
-        while (reference_node->parent_node() && !reference_node->parent_node()->is_inclusive_ancestor_of(original_end_node))
-            reference_node = *reference_node->parent_node();
-
-        // 3. Set newNode to referenceNode’s parent and newOffset to referenceNode’s index + 1.
-        new_node = reference_node->parent_node();
-        new_offset = reference_node->index() + 1;
-    }
-
-    // 8. Set this’s start and end to (newNode, newOffset).
-    TRY(set_start(*new_node, new_offset));
-    TRY(set_end(*new_node, new_offset));
-
-    // 9. If originalStartNode is a CharacterData node, then replace data of originalStartNode with
-    //    originalStartOffset, originalStartNode’s length − originalStartOffset, and the empty string.
-    if (is<CharacterData>(*original_start_node))
-        TRY(static_cast<CharacterData&>(*original_start_node).replace_data(original_start_offset, original_start_node->length() - original_start_offset, {}));
-
-    // 10. For each node of nodesToRemove, in tree order: remove node.
-    for (auto& node : nodes_to_remove)
-        node->remove();
-
-    // 11. If originalEndNode is a CharacterData node, then replace data of originalEndNode with 0, originalEndOffset,
-    //     and the empty string.
-    if (is<CharacterData>(*original_end_node))
-        TRY(static_cast<CharacterData&>(*original_end_node).replace_data(0, original_end_offset, {}));
-
-    return {};
-}
-
-// https://drafts.csswg.org/cssom-view/#dom-element-getclientrects
-// https://drafts.csswg.org/cssom-view/#extensions-to-the-range-interface
-GC::Ref<Geometry::DOMRectList> Range::get_client_rects()
-{
-    // 1. return an empty DOMRectList object if the range is not in the document
-    if (!start_container()->document().navigable())
-        return Geometry::DOMRectList::create(realm(), {});
-
-    start_container()->document().update_layout(DOM::UpdateLayoutReason::RangeGetClientRects);
-    Vector<GC::Root<Geometry::DOMRect>> rects;
-    // FIXME: take Range collapsed into consideration
-    // 2. Iterate the node included in Range
-    GC::Ptr<Node> start_node = start_container();
-    if (!is<DOM::Text>(*start_node)) {
-        auto next_after_subtree = [](Node& node) -> GC::Ptr<Node> {
-            for (auto* current = &node; current; current = current->parent_node()) {
-                if (auto* next = current->next_sibling())
-                    return next;
-            }
-            return nullptr;
-        };
-
-        auto* start_child = start_node->child_at_index(m_start_offset);
-        if (start_child) {
-            start_node = *start_child;
-        } else if (start_node->last_child()) {
-            start_node = next_after_subtree(*start_node);
-        } else {
-            start_node = start_node->next_in_pre_order();
-        }
-    }
-
-    GC::Ptr<Node> end_node = end_container();
-    if (!is<DOM::Text>(*end_node)) {
-        // end offset shouldn't be 0
-        if (m_end_offset == 0)
-            return Geometry::DOMRectList::create(realm(), {});
-        end_node = end_node->child_at_index(m_end_offset - 1);
-        if (!end_node)
-            return Geometry::DOMRectList::create(realm(), {});
-    }
-    for (GC::Ptr<Node> node = start_node; node && node != end_node->next_in_pre_order(); node = node->next_in_pre_order()) {
-        auto selection_state = Painting::Paintable::SelectionState::Full;
-        if (node == start_node && node == end_node) {
-            if (m_start_offset == m_end_offset)
-                selection_state = Painting::Paintable::SelectionState::None;
-            else
-                selection_state = Painting::Paintable::SelectionState::StartAndEnd;
-        } else if (node == start_node) {
-            selection_state = Painting::Paintable::SelectionState::Start;
-        } else if (node == end_node) {
-            selection_state = Painting::Paintable::SelectionState::End;
-        }
-
-        auto node_type = static_cast<NodeType>(node->node_type());
-        if (node_type == NodeType::ELEMENT_NODE) {
-            // 1. For each element selected by the range, whose parent is not selected by the range, include the border
-            // areas returned by invoking getClientRects() on the element.
-            if (contains_node(*node) && (!node->parent() || !contains_node(*node->parent()))) {
-                auto const& element = static_cast<DOM::Element const&>(*node);
-                auto const element_rects = element.get_client_rects();
-                for (auto& rect : element_rects) {
-                    rects.append(MUST(Geometry::DOMRect::construct_impl(realm(), static_cast<double>(rect.x()), static_cast<double>(rect.y()), static_cast<double>(rect.width()), static_cast<double>(rect.height()))));
-                }
-            }
-        } else if (node_type == NodeType::TEXT_NODE) {
-            // 2. For each Text node selected or partially selected by the range (including when the boundary-points
-            // are identical), include scaled DOMRect object (for the part that is selected, not the whole line box).
-            auto const& text = static_cast<DOM::Text const&>(*node);
-            if (selection_state == Painting::Paintable::SelectionState::None)
-                continue;
-
-            Layout::TextOffsetMapping mapping { text };
-            if (!mapping.primary()) {
-                dbgln("FIXME: Failed to get client rects for node {}", node->debug_description());
-                continue;
-            }
-            size_t filter_dom_start = 0;
-            size_t filter_dom_end = NumericLimits<size_t>::max();
-            switch (selection_state) {
-            case Painting::Paintable::SelectionState::Full:
-                break;
-            case Painting::Paintable::SelectionState::StartAndEnd:
-                filter_dom_start = start_offset();
-                filter_dom_end = end_offset();
-                break;
-            case Painting::Paintable::SelectionState::Start:
-                filter_dom_start = start_offset();
-                break;
-            case Painting::Paintable::SelectionState::End:
-                filter_dom_end = end_offset();
-                break;
-            case Painting::Paintable::SelectionState::None:
-                VERIFY_NOT_REACHED();
-            }
-            mapping.for_each_paintable_fragment_in_dom_range(filter_dom_start, filter_dom_end, [&](Painting::PaintableFragment const& fragment) {
-                auto rect = fragment.range_rect(selection_state, start_offset(), end_offset());
-                rects.append(Geometry::DOMRect::create(realm(), rect.to_type<float>()));
-            });
-        }
-    }
-    return Geometry::DOMRectList::create(realm(), move(rects));
-}
-
-// https://w3c.github.io/csswg-drafts/cssom-view/#dom-range-getboundingclientrect
-GC::Ref<Geometry::DOMRect> Range::get_bounding_client_rect()
-{
-    // 1. Let list be the result of invoking getClientRects() on element.
-    auto list = get_client_rects();
-
-    // 2. If the list is empty return a DOMRect object whose x, y, width and height members are zero.
-    if (list->length() == 0)
-        return Geometry::DOMRect::construct_impl(realm(), 0, 0, 0, 0).release_value_but_fixme_should_propagate_errors();
-
-    // 3. If all rectangles in list have zero width or height, return the first rectangle in list.
-    auto all_rectangle_has_zero_width_or_height = true;
-    for (auto i = 0u; i < list->length(); ++i) {
-        auto const& rect = list->item(i);
-        if (rect->width() != 0 && rect->height() != 0) {
-            all_rectangle_has_zero_width_or_height = false;
-            break;
-        }
-    }
-    if (all_rectangle_has_zero_width_or_height)
-        return GC::Ref { *const_cast<Geometry::DOMRect*>(list->item(0)) };
-
-    // 4. Otherwise, return a DOMRect object describing the smallest rectangle that includes all of the rectangles in
-    //    list of which the height or width is not zero.
-    auto const* first_rect = list->item(0);
-    auto bounding_rect = Gfx::Rect { first_rect->x(), first_rect->y(), first_rect->width(), first_rect->height() };
-    for (auto i = 1u; i < list->length(); ++i) {
-        auto const& rect = list->item(i);
-        if (rect->width() == 0 || rect->height() == 0)
-            continue;
-        bounding_rect.unite({ rect->x(), rect->y(), rect->width(), rect->height() });
-    }
-    return Geometry::DOMRect::create(realm(), bounding_rect.to_type<float>());
-}
-
-// https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-range-createcontextualfragment
-WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> Range::create_contextual_fragment(TrustedTypes::TrustedHTMLOrString const& string)
-{
-    return create_contextual_fragment(string, HTML::ParserScriptingMode::Fragment);
-}
-
-WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> Range::create_contextual_fragment(TrustedTypes::TrustedHTMLOrString const& string, HTML::ParserScriptingMode scripting_mode)
-{
-    // 1. Let compliantString be the result of invoking the Get Trusted Type compliant string algorithm with
-    //    TrustedHTML, this's relevant global object, string, "Range createContextualFragment", and "script".
-    auto const compliant_string = TRY(TrustedTypes::get_trusted_type_compliant_string(
-        TrustedTypes::TrustedTypeName::TrustedHTML,
-        HTML::relevant_global_object(*this),
-        string,
-        TrustedTypes::InjectionSink::Range_createContextualFragment,
-        TrustedTypes::Script.view()));
-
-    // 2. Let node be this's start node.
-    GC::Ref<Node> node = *start_container();
-
-    // 3. Let element be null.
-    GC::Ptr<Element> element = nullptr;
-
-    auto node_type = static_cast<NodeType>(node->node_type());
-    // 4. If node implements Element, set element to node.
-    if (node_type == NodeType::ELEMENT_NODE)
-        element = static_cast<DOM::Element&>(*node);
-    // 5. Otherwise, if node implements Text or Comment node, set element to node's parent element.
-    else if (first_is_one_of(node_type, NodeType::TEXT_NODE, NodeType::COMMENT_NODE))
-        element = node->parent_element();
-
-    // 6. If either element is null or all of the following are true:
-    //    - element's node document is an HTML document,
-    //    - element's local name is "html"; and
-    //    - element's namespace is the HTML namespace;
-    if (!element || is<HTML::HTMLHtmlElement>(*element)) {
-        // then set element to the result of creating an element given this's node document,
-        // "body", and the HTML namespace.
-        element = TRY(DOM::create_element(node->document(), HTML::TagNames::body, Namespace::HTML));
-    }
-
-    // 7. Return the result of invoking the fragment parsing algorithm steps with element, compliantString, and Fragment.
-    return Element::parse_fragment(GC::Ref { *element }, compliant_string.utf16_view(), scripting_mode);
-}
-
-}
-
-FILE: Libraries/LibWeb/DOM/Range.h
-/*
- * Copyright (c) 2020, the SerenityOS developers.
- * Copyright (c) 2022, Luke Wilde <lukew@serenityos.org>
- * Copyright (c) 2022-2023, Andreas Kling <andreas@ladybird.org>
- * Copyright (c) 2024-2025, Jelle Raaijmakers <jelle@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <LibWeb/DOM/AbstractRange.h>
-#include <LibWeb/DOM/Node.h>
-#include <LibWeb/Export.h>
-#include <LibWeb/Selection/Selection.h>
-#include <LibWeb/TrustedTypes/TrustedHTML.h>
-#include <LibWeb/WebIDL/Types.h>
-
-namespace Web::HTML {
-
-enum class ParserScriptingMode : u8;
-
-}
-
-namespace Web::DOM {
-
-enum class RelativeBoundaryPointPosition {
-    Equal,
-    Before,
-    After,
-};
-
-// https://dom.spec.whatwg.org/#concept-range-bp-position
-RelativeBoundaryPointPosition position_of_boundary_point_relative_to_other_boundary_point(BoundaryPoint a, BoundaryPoint b);
-
-class WEB_API Range final : public AbstractRange {
-    WEB_PLATFORM_OBJECT(Range, AbstractRange);
-    GC_DECLARE_ALLOCATOR(Range);
-
-public:
-    static constexpr bool OVERRIDES_FINALIZE = true;
-
-    [[nodiscard]] static GC::Ref<Range> create(Document&);
-    [[nodiscard]] static GC::Ref<Range> create(HTML::Window&);
-    [[nodiscard]] static GC::Ref<Range> create(GC::Ref<Node> start_container, WebIDL::UnsignedLong start_offset, GC::Ref<Node> end_container, WebIDL::UnsignedLong end_offset);
-    static WebIDL::ExceptionOr<GC::Ref<Range>> construct_impl(JS::Realm&);
-
-    virtual ~Range() override;
-
-    WebIDL::ExceptionOr<void> set_start(GC::Ref<Node> node, WebIDL::UnsignedLong offset);
-    WebIDL::ExceptionOr<void> set_end(GC::Ref<Node> node, WebIDL::UnsignedLong offset);
-    WebIDL::ExceptionOr<void> set_start_before(GC::Ref<Node> node);
-    WebIDL::ExceptionOr<void> set_start_after(GC::Ref<Node> node);
-    WebIDL::ExceptionOr<void> set_end_before(GC::Ref<Node> node);
-    WebIDL::ExceptionOr<void> set_end_after(GC::Ref<Node> node);
-    WebIDL::ExceptionOr<void> select_node(GC::Ref<Node> node);
-    void collapse(bool to_start);
-    WebIDL::ExceptionOr<void> select_node_contents(GC::Ref<Node>);
-
-    // https://dom.spec.whatwg.org/#dom-range-start_to_start
-    enum HowToCompareBoundaryPoints : WebIDL::UnsignedShort {
-        START_TO_START = 0,
-        START_TO_END = 1,
-        END_TO_END = 2,
-        END_TO_START = 3,
-    };
-
-    WebIDL::ExceptionOr<WebIDL::Short> compare_boundary_points(WebIDL::UnsignedShort how, Range const& source_range) const;
-
-    GC::Ref<Range> clone_range() const;
-
-    GC::Ref<Node> common_ancestor_container() const;
-
-    // https://dom.spec.whatwg.org/#dom-range-detach
-    void detach() const
-    {
-        // The detach() method steps are to do nothing.
-        // Note: Its functionality (disabling a Range object) was removed, but the method itself is preserved for compatibility.
-    }
-
-    bool intersects_node(GC::Ref<Node>) const;
-    WebIDL::ExceptionOr<bool> is_point_in_range(GC::Ref<Node>, WebIDL::UnsignedLong offset) const;
-    WebIDL::ExceptionOr<WebIDL::Short> compare_point(GC::Ref<Node>, WebIDL::UnsignedLong offset) const;
-
-    WebIDL::ExceptionOr<void> delete_contents();
-    WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> extract_contents();
-    WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> clone_contents();
-
-    WebIDL::ExceptionOr<void> insert_node(GC::Ref<Node>);
-    WebIDL::ExceptionOr<void> surround_contents(GC::Ref<Node> new_parent);
-
-    Utf16String to_string() const;
-
-    static HashTable<Range*>& live_ranges();
-
-    GC::Ref<Geometry::DOMRectList> get_client_rects();
-    GC::Ref<Geometry::DOMRect> get_bounding_client_rect();
-
-    bool contains_node(GC::Ref<Node>) const;
-
-    void set_associated_selection(Badge<Selection::Selection>, GC::Ptr<Selection::Selection>);
-
-    WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> create_contextual_fragment(TrustedTypes::TrustedHTMLOrString const& fragment);
-    WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> create_contextual_fragment(TrustedTypes::TrustedHTMLOrString const& fragment, HTML::ParserScriptingMode);
-
-    template<typename Callback>
-    void for_each_contained(Callback callback) const
