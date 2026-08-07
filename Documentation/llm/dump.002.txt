@@ -25059,9 +25059,10 @@ void fetch_response_handover(JS::Realm& realm, Infrastructure::FetchParams const
                 return;
 
             // 2. Set timingInfo’s end time to the relative high resolution time given unsafeEndTime and global.
-            // Spec Issue: Using relative time here is incorrect, as end time is converted to relative time by Resource Timing,
-            //             causing it to take a relative time of an already relative time, effectively make it always a negative
-            //             value approximately the value of the time origin.
+            // FIXME: Spec issue: Using relative time here is incorrect, as end time is converted to relative time by
+            //        Resource Timing, causing it to take a relative time of an already relative time, effectively make
+            //        it always a negative value approximately the value of the time origin.
+            //        https://github.com/whatwg/fetch/issues/1812
             timing_info->set_end_time(unsafe_end_time);
 
             // 3. Let cacheState be response’s cache state.
@@ -28774,6 +28775,17 @@ GC::Ref<FetchTimingInfo> create_opaque_timing_info(JS::VM& vm, FetchTimingInfo c
     auto new_timing_info = FetchTimingInfo::create(vm);
     new_timing_info->set_start_time(timing_info.start_time());
     new_timing_info->set_post_redirect_start_time(timing_info.start_time());
+
+    // FIXME: Spec issue: We invoke this factory due to a failed Timing-Allow-Origin check. In such cases, responseEnd
+    //        is not one the fields listed for protection:
+    //        https://w3c.github.io/resource-timing/#sec-cross-origin-resources
+    //
+    //        If we do not copy the end time here, startTime will be non-zero and responseEnd will be zero, resulting in
+    //        a negative duration. This is an observable difference from other engines.
+    //
+    //        https://github.com/whatwg/fetch/issues/1945
+    new_timing_info->set_end_time(timing_info.end_time());
+
     return new_timing_info;
 }
 
@@ -179248,6 +179260,7 @@ NodeWithStyle::NodeWithStyle(DOM::Document& document, DOM::Node* node, NonnullRe
 {
     set_flag(RustFFI::NodeFlag::HasStyle, true);
     set_flag(RustFFI::NodeFlag::IsBody, node && node == document.body());
+    set_flag(RustFFI::NodeFlag::HasAnchorNames, !m_computed_values->anchor_names().is_empty());
     publish_style_container_to_node_data();
     synchronize_table_span_data();
 }
@@ -179570,6 +179583,7 @@ void NodeWithStyle::set_computed_values(NonnullRefPtr<CSS::ComputedValues const>
 {
     VERIFY(!layout_pass_currently_running());
     m_computed_values = move(computed_values);
+    set_flag(RustFFI::NodeFlag::HasAnchorNames, !m_computed_values->anchor_names().is_empty());
     publish_style_container_to_node_data();
 
     for (auto* child = first_child_ptr(); child; child = child->next_sibling_ptr()) {
@@ -264222,14 +264236,11 @@ struct AnchorCalcCallbackContext<'pass> {
 
 impl AbsposEngine<'_> {
     fn anchor_lookup(&self, positioned_box: Node, anchor_name: usize) -> Option<Node> {
-        let eligible_anchor_boxes = self.state.used_value_nodes();
-        let eligible_anchor_shells = eligible_anchor_boxes
-            .iter()
-            .map(|&node| self.callbacks.shell(node))
-            .collect::<Vec<_>>();
+        let eligible_anchor_shells = self.state.anchor_candidate_shells();
         // SAFETY: The name handle is retained by either the style snapshot or
-        // the live anchor() shell. The eligible-node slice is borrowed only
-        // for this synchronous lookup.
+        // the live anchor() shell. The registry borrow is held only for this
+        // synchronous lookup, and the callback never re-enters layout code
+        // that could register another candidate.
         let anchor_box = unsafe {
             (self.callbacks.anchor_lookup)(
                 self.callbacks.context,
@@ -265638,7 +265649,13 @@ impl<'pass> AbsposEngine<'pass> {
         self.layout_element(run, node, inputs);
     }
 
-    fn compute_inset(&self, node: Node, containing_block_size: LogicalSize) {
+    fn compute_inset(
+        &self,
+        node: Node,
+        containing_block_size: LogicalSize,
+        formatting_context_root: Node,
+        treat_block_axis_percentage_insets_as_auto_beyond_root: bool,
+    ) {
         // Most boxes are neither relatively positioned nor carry anchor()
         // insets. Preserve the old C++ fast path without populating the
         // comprehensive Rust facts caches for those boxes.
@@ -265678,27 +265695,25 @@ impl<'pass> AbsposEngine<'pass> {
             containing_block_size.inline_size,
         );
 
-        let treat_percentage_as_auto = |value: InsetValue<'pass>| -> InsetValue<'pass> {
-            if !value.contains_percentage() {
-                return value;
-            }
-            let mut containing_block = self.callbacks.containing_block(node);
-            while !containing_block.is_invalid() {
-                let facts = self.facts(containing_block);
-                if !facts.is_anonymous() || facts.is_table_cell() {
-                    break;
-                }
-                containing_block = self.callbacks.containing_block(containing_block);
-            }
-            if !containing_block.is_invalid() && !self.used(containing_block).has_definite_block_size() {
+        let treat_block_axis_percentage_insets_as_auto = (style.inset_top().contains_percentage()
+            || style.inset_bottom().contains_percentage())
+            && !crate::layout::resolve_block_axis_percentage_inset_basis_is_definite(
+                self.state,
+                &self.callbacks,
+                self.callbacks.containing_block(node),
+                formatting_context_root,
+                treat_block_axis_percentage_insets_as_auto_beyond_root,
+            );
+        let block_axis_inset_value = |value: InsetValue<'pass>| -> InsetValue<'pass> {
+            if treat_block_axis_percentage_insets_as_auto && value.contains_percentage() {
                 InsetValue::auto_value()
             } else {
                 value
             }
         };
         let (top, bottom) = resolve_opposing(
-            treat_percentage_as_auto(style.inset_top()),
-            treat_percentage_as_auto(style.inset_bottom()),
+            block_axis_inset_value(style.inset_top()),
+            block_axis_inset_value(style.inset_bottom()),
             containing_block_size.block_size,
         );
         let used = self.used_mut(node);
@@ -265731,7 +265746,7 @@ pub(crate) fn run_abspos_layout_pass(
             continue;
         }
         let run =
-            crate::layout::FormattingContextRun::new(state, root, LayoutMode::Normal, callbacks, should_collect_devtools_layout_data);
+            crate::layout::FormattingContextRun::new(state, root, LayoutMode::Normal, callbacks, should_collect_devtools_layout_data, false);
         layout_contained_abspos_children(&run);
     }
     state.set_abspos_layout_pass_is_active(false);
@@ -265747,6 +265762,8 @@ pub(crate) fn compute_inset_native(
     node: Node,
     inline_size: CssPixels,
     block_size: CssPixels,
+    formatting_context_root: Node,
+    treat_block_axis_percentage_insets_as_auto_beyond_root: bool,
 ) {
     AbsposEngine::new(state, callbacks).compute_inset(
         node,
@@ -265754,6 +265771,8 @@ pub(crate) fn compute_inset_native(
             inline_size,
             block_size,
         },
+        formatting_context_root,
+        treat_block_axis_percentage_insets_as_auto_beyond_root,
     );
 }
 
@@ -266081,13 +266100,15 @@ impl<'pass> BlockFormattingContext<'pass> {
         self.derived_baselines_of_root_box.get()
     }
 
-    fn compute_inset(&self, node: Node, containing_block_size: LogicalSize) {
+    fn compute_inset(&self, run: &FormattingContextRun<'pass>, node: Node, containing_block_size: LogicalSize) {
         crate::layout::compute_inset_native(
             self.state,
             self.callbacks,
             node,
             containing_block_size.inline_size,
             containing_block_size.block_size,
+            self.root,
+            run.treat_block_axis_percentage_insets_as_auto_beyond_root,
         );
     }
 
@@ -267647,6 +267668,7 @@ impl<'pass> BlockFormattingContext<'pass> {
 
         let block_container_used = self.used(block_container);
         self.compute_inset(
+            run,
             node,
             LogicalSize {
                 inline_size: block_container_used.content_inline_size.get(),
@@ -268156,7 +268178,9 @@ impl<'pass> BlockFormattingContext<'pass> {
                 available_space,
                 containing_block_constraints: input.containing_block_constraints,
                 content_box_position_in_bfc_root: input.content_box_position_in_bfc_root,
-                sizing: RootSizingDirectives::default(),
+                sizing: RootSizingDirectives {
+                    ..RootSizingDirectives::default()
+                },
                 participation: ParticipationInParentFormattingContext::Float,
             },
             false,
@@ -268250,6 +268274,7 @@ impl<'pass> BlockFormattingContext<'pass> {
         }
         let block_container_used = self.used(block_container);
         self.compute_inset(
+            run,
             node,
             LogicalSize {
                 inline_size: block_container_used.content_inline_size.get(),
@@ -271116,6 +271141,8 @@ impl<'pass> FlexFormattingContext<'pass> {
             node,
             container_inline_size,
             container_block_size,
+            self.flex_container,
+            run.treat_block_axis_percentage_insets_as_auto_beyond_root,
         );
     }
 
@@ -272966,6 +272993,7 @@ pub(crate) struct FormattingContextRun<'pass> {
     pub(crate) layout_mode: LayoutMode,
     pub(crate) callbacks: FfiLayoutFcCallbacks,
     pub(crate) should_collect_devtools_layout_data: bool,
+    pub(crate) treat_block_axis_percentage_insets_as_auto_beyond_root: bool,
 }
 
 impl<'pass> FormattingContextRun<'pass> {
@@ -272975,6 +273003,7 @@ impl<'pass> FormattingContextRun<'pass> {
         layout_mode: LayoutMode,
         callbacks: FfiLayoutFcCallbacks,
         should_collect_devtools_layout_data: bool,
+        treat_block_axis_percentage_insets_as_auto_beyond_root: bool,
     ) -> Self {
         Self {
             state,
@@ -272982,6 +273011,7 @@ impl<'pass> FormattingContextRun<'pass> {
             layout_mode,
             callbacks,
             should_collect_devtools_layout_data,
+            treat_block_axis_percentage_insets_as_auto_beyond_root,
         }
     }
 }
@@ -273353,7 +273383,14 @@ fn run_formatting_context<'pass>(
     parent_block: Option<&BlockFormattingContext<'pass>>,
 ) -> ChildLayoutResult {
     assert!(!box_.is_invalid());
-    let run = FormattingContextRun::new(state, box_, layout_mode, callbacks, should_collect_devtools_layout_data);
+    let run = FormattingContextRun::new(
+        state,
+        box_,
+        layout_mode,
+        callbacks,
+        should_collect_devtools_layout_data,
+        input.sizing.treat_block_axis_percentage_insets_as_auto_beyond_root,
+    );
     let run = &run;
     let body_input = apply_root_sizing_directives(run, &input, parent_block);
 
@@ -273557,10 +273594,17 @@ pub(crate) fn layout_inside_child<'pass>(
     parent_grid: Option<&GridFormattingContext<'pass>>,
     child: Node,
     layout_mode: LayoutMode,
-    input: LayoutInput,
+    mut input: LayoutInput,
     force_independent_context_run: bool,
 ) -> ChildLayoutOutcome {
     let facts = run.state.node_facts(&run.callbacks, child);
+    if let Some((padding_top, padding_bottom)) = input.sizing.table_cell_intrinsic_block_padding {
+        debug_assert!(facts.is_table_cell());
+        debug_assert!(matches!(input.participation, ParticipationInParentFormattingContext::Item));
+        let used = run.state.used_values(&run.callbacks, child);
+        used.padding_top.set(used.padding_top.get() + padding_top);
+        used.padding_bottom.set(used.padding_bottom.get() + padding_bottom);
+    }
     let used = run.state.try_used_values(&run.callbacks, child);
     if !force_independent_context_run
         && layout_mode == LayoutMode::IntrinsicSizing
@@ -273593,6 +273637,14 @@ pub(crate) fn layout_inside_child<'pass>(
         }
         return ChildLayoutOutcome::ReenterCurrent;
     };
+    input.sizing.treat_block_axis_percentage_insets_as_auto_beyond_root =
+        treat_block_axis_percentage_insets_as_auto_beyond_anonymous_child_root(
+            run.state,
+            &run.callbacks,
+            child,
+            run.box_,
+            run.treat_block_axis_percentage_insets_as_auto_beyond_root,
+        );
     ChildLayoutOutcome::Created(run_formatting_context(
         run.state,
         child,
@@ -273624,6 +273676,47 @@ fn independent_formatting_context_type(
         "FIXME: An independent formatting context was requested from a Box that does not have a formatting context type. A dummy formatting context will be created instead."
     );
     FfiFormattingContextType::InternalDummy
+}
+
+pub(crate) fn resolve_block_axis_percentage_inset_basis_is_definite(
+    state: &LayoutState,
+    callbacks: &FfiLayoutFcCallbacks,
+    containing_block: Node,
+    formatting_context_root: Node,
+    treat_block_axis_percentage_insets_as_auto_beyond_root: bool,
+) -> bool {
+    let mut candidate = containing_block;
+    while !candidate.is_invalid() {
+        let facts = state.node_facts(callbacks, candidate);
+        if !facts.is_anonymous() || facts.is_table_cell() {
+            return state.used_values(callbacks, candidate).has_definite_block_size();
+        }
+        if candidate == formatting_context_root {
+            return !treat_block_axis_percentage_insets_as_auto_beyond_root;
+        }
+        candidate = callbacks.containing_block(candidate);
+    }
+    true
+}
+
+pub(crate) fn treat_block_axis_percentage_insets_as_auto_beyond_anonymous_child_root(
+    state: &LayoutState,
+    callbacks: &FfiLayoutFcCallbacks,
+    child_root: Node,
+    formatting_context_root: Node,
+    treat_block_axis_percentage_insets_as_auto_beyond_root: bool,
+) -> bool {
+    let child_root_facts = state.node_facts(callbacks, child_root);
+    if !child_root_facts.is_anonymous() || child_root_facts.is_table_cell() {
+        return false;
+    }
+    !resolve_block_axis_percentage_inset_basis_is_definite(
+        state,
+        callbacks,
+        callbacks.containing_block(child_root),
+        formatting_context_root,
+        treat_block_axis_percentage_insets_as_auto_beyond_root,
+    )
 }
 
 /// # Safety
@@ -273775,7 +273868,7 @@ pub unsafe extern "C" fn rust_layout_replay_saved_abspos_layout(
         let state_ref = &state;
         let containing_block = callbacks.containing_block(box_);
         assert!(!containing_block.is_invalid());
-        let run = crate::layout::FormattingContextRun::new(state_ref, containing_block, LayoutMode::Normal, callbacks, false);
+        let run = crate::layout::FormattingContextRun::new(state_ref, containing_block, LayoutMode::Normal, callbacks, false, false);
         AbsposEngine::new(state_ref, callbacks).replay(&run, box_);
         run_abspos_layout_pass(state_ref, callbacks, false);
         state.commit_replacing(box_, paintable_to_replace, &callbacks, sink);
@@ -273903,6 +273996,9 @@ pub(crate) struct RootSizingDirectives {
     pub(crate) forced_content_inline_size: Option<CssPixels>,
     pub(crate) forced_content_block_size: Option<CssPixels>,
     pub(crate) forced_min_border_box_block_size: Option<CssPixels>,
+    // Input-only: the table formatting context supplies the cell's intrinsic block padding
+    // (the vertical-alignment stretch) before laying out the cell's contents.
+    pub(crate) table_cell_intrinsic_block_padding: Option<(CssPixels, CssPixels)>,
     // Input-only: the wrapper's BFC tells the table formatting context where the table box's
     // content box sits in the wrapper, so rows and row groups (whose containing block is the
     // wrapper) can be placed in wrapper coordinates.
@@ -273910,6 +274006,7 @@ pub(crate) struct RootSizingDirectives {
     pub(crate) adopt_automatic_content_block_size: bool,
     pub(crate) float_avoidance_inline_size: Option<CssPixels>,
     pub(crate) outer_float_intrusion_before_list_item_children: SpaceUsedByFloats,
+    pub(crate) treat_block_axis_percentage_insets_as_auto_beyond_root: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -277415,6 +277512,8 @@ impl<'pass> GridFormattingContext<'pass> {
                 item.box_,
                 area.size.inline_size,
                 area.size.block_size,
+                self.grid_container,
+                run.treat_block_axis_percentage_insets_as_auto_beyond_root,
             );
         }
         self.derived_baselines_of_root_box =
@@ -279919,6 +280018,8 @@ impl<'context, 'pass> InlineFormattingContext<'context, 'pass> {
             node,
             used.content_inline_size.get(),
             used.content_block_size.get(),
+            self.run.box_,
+            self.run.treat_block_axis_percentage_insets_as_auto_beyond_root,
         );
     }
 
@@ -280331,9 +280432,17 @@ impl<'context, 'pass> InlineFormattingContext<'context, 'pass> {
         let (pieces, inline_containing_block_rect_candidates) = compute(self);
         self.line_data_mut().inline_box_pieces = pieces;
         for candidate in inline_containing_block_rect_candidates {
+            let relative_inset_chain = self.state.accumulated_relative_insets_from_inline_ancestor_chain(
+                &self.callbacks,
+                candidate.inline_containing_block,
+                self.containing_block,
+            );
+            let mut rect = candidate.rect;
+            rect.x += relative_inset_chain.offset_x;
+            rect.y += relative_inset_chain.offset_y;
             self.state
                 .used_values_rare_data_for_node_mut(&self.callbacks, candidate.inline_containing_block)
-                .inline_containing_block_first_last_rect = Some(candidate.rect);
+                .inline_containing_block_first_last_rect = Some(rect);
         }
     }
 }
@@ -282809,6 +282918,10 @@ impl<'pass> NodeFacts<'pass> {
         crate::layout::has_flag(self.data(), NodeFlag::Anonymous)
     }
 
+    pub(crate) fn has_anchor_names(&self) -> bool {
+        crate::layout::has_flag(self.data(), NodeFlag::HasAnchorNames)
+    }
+
     pub(crate) fn can_have_children(&self) -> bool {
         crate::layout::node_can_have_children(self.data())
     }
@@ -283093,6 +283206,7 @@ pub(crate) struct LayoutState {
     line_data: PagedStore<RefCell<LineData>>,
     used_values_rare_data: PagedStore<RefCell<UsedValuesRareData>>,
     inline_containing_blocks: RefCell<HashSet<Node>>,
+    anchor_candidate_shells: RefCell<Vec<*mut c_void>>,
     purpose: LayoutStatePurpose,
 }
 
@@ -283141,6 +283255,7 @@ impl LayoutState {
             line_data: PagedStore::default(),
             used_values_rare_data: PagedStore::default(),
             inline_containing_blocks: RefCell::new(HashSet::new()),
+            anchor_candidate_shells: RefCell::new(Vec::new()),
             purpose,
         }
     }
@@ -283317,7 +283432,9 @@ impl LayoutState {
         used.content_inline_size.set(content_inline_size.unwrap_or_default());
         used.content_block_size.set(content_block_size.unwrap_or_default());
 
-        self.used_values.allocate(slot_index, used)
+        let used = self.used_values.allocate(slot_index, used);
+        self.register_anchor_candidate_if_carries_anchor_names(callbacks, node);
+        used
     }
 
     pub(crate) fn populate_from_paintable(
@@ -283372,7 +283489,9 @@ impl LayoutState {
             self.used_values_rare_data_mut(slot_index).svg_viewport_size = Some(geometry.svg_viewport_size);
         }
 
-        Some(self.used_values.allocate(slot_index, used))
+        let used = self.used_values.allocate(slot_index, used);
+        self.register_anchor_candidate_if_carries_anchor_names(callbacks, node);
+        Some(used)
     }
 
     pub(crate) fn note_inline_containing_block(&self, inline_containing_block: Node) {
@@ -283391,10 +283510,15 @@ impl LayoutState {
         self.used_values_rare_data(slot_index)?.inline_containing_block_first_last_rect
     }
 
-    pub(crate) fn used_value_nodes(&self) -> Vec<Node> {
-        let mut nodes = Vec::new();
-        self.used_values.for_each(|used| nodes.push(used.node));
-        nodes
+    fn register_anchor_candidate_if_carries_anchor_names(&self, callbacks: &FfiLayoutFcCallbacks, node: Node) {
+        if !self.node_facts(callbacks, node).has_anchor_names() {
+            return;
+        }
+        self.anchor_candidate_shells.borrow_mut().push(callbacks.shell(node));
+    }
+
+    pub(crate) fn anchor_candidate_shells(&self) -> Ref<'_, Vec<*mut c_void>> {
+        self.anchor_candidate_shells.borrow()
     }
 
     pub(crate) fn set_box_is_grid_item(&self, callbacks: &FfiLayoutFcCallbacks, node: Node, is_grid_item: bool) {
@@ -285427,6 +285551,7 @@ pub enum NodeFlag {
     SavedAbsposAlignmentDerivesFromOwnComputedValues = 1 << 21,
     ProducesLineBoxFragmentWhenEmpty = 1 << 22,
     ListMarkerIsInside = 1 << 23,
+    HasAnchorNames = 1 << 24,
 }
 
 #[repr(C)]
@@ -287715,6 +287840,7 @@ impl<'pass> SizingContext<'pass> {
             table_box,
             LayoutMode::IntrinsicSizing,
             *measurement.callbacks(),
+            false,
             false,
         );
         let mut table = TableFormattingContext::new(&table_run);
@@ -290235,6 +290361,9 @@ struct TableFormattingContext<'pass> {
     min_border_box_block_size_from_flex_item: Option<CssPixels>,
     needs_fixed_mode_row_measurement: bool,
     cells: Vec<TableCell>,
+    cell_inside_layout_inputs: Vec<AvailableSpace>,
+    cell_pre_layout_content_block_sizes: Vec<CssPixels>,
+    deferred_cell_inside_layouts: Vec<bool>,
     columns: Vec<Column>,
     rows: Vec<Row>,
     derived_baselines_of_root_box: Cell<DerivedBaselines>,
@@ -290294,6 +290423,9 @@ impl<'pass> TableFormattingContext<'pass> {
             min_border_box_block_size_from_flex_item: None,
             needs_fixed_mode_row_measurement: false,
             cells: Vec::new(),
+            cell_inside_layout_inputs: Vec::new(),
+            cell_pre_layout_content_block_sizes: Vec::new(),
+            deferred_cell_inside_layouts: Vec::new(),
             columns: Vec::new(),
             rows: Vec::new(),
             derived_baselines_of_root_box: Cell::new(DerivedBaselines::default()),
@@ -291292,6 +291424,9 @@ impl<'pass> TableFormattingContext<'pass> {
         // Determine the number of rows/columns the table requires.
         let table_grid = calculate_table_grid(self, self.table_box);
         self.cells = table_grid.cells;
+        self.cell_inside_layout_inputs = vec![AvailableSpace::default(); self.cells.len()];
+        self.cell_pre_layout_content_block_sizes = vec![CssPixels::default(); self.cells.len()];
+        self.deferred_cell_inside_layouts = vec![false; self.cells.len()];
         self.rows = table_grid.rows;
         self.columns = vec![Column::default(); table_grid.column_count];
         for cell in &self.cells {
@@ -291357,6 +291492,7 @@ impl<'pass> TableFormattingContext<'pass> {
         cell: TableCell,
         input: AvailableSpace,
         adopt_automatic_content_block_size: bool,
+        intrinsic_block_padding: Option<(CssPixels, CssPixels)>,
     ) {
         let layout_input = LayoutInput {
             available_space: input,
@@ -291364,6 +291500,7 @@ impl<'pass> TableFormattingContext<'pass> {
             content_box_position_in_bfc_root: None,
             sizing: RootSizingDirectives {
                 adopt_automatic_content_block_size,
+                table_cell_intrinsic_block_padding: intrinsic_block_padding,
                 ..RootSizingDirectives::default()
             },
             participation: ParticipationInParentFormattingContext::Item,
@@ -291384,6 +291521,7 @@ impl<'pass> TableFormattingContext<'pass> {
         cell: TableCell,
         used: &UsedValues,
         inner: AvailableSpace,
+        adopt_automatic_content_block_size: bool,
     ) -> Option<MeasuredCellContent> {
         // The table formatting context owns the cell's outer geometry. Seed the inputs
         // needed to lay out its contents without copying placement or layout outputs.
@@ -291417,11 +291555,17 @@ impl<'pass> TableFormattingContext<'pass> {
         let result = measurement.run_with_layout_mode(
             cell.box_,
             self.layout_mode,
-            LayoutInput::new(inner, ContainingBlockConstraints::default(), ParticipationInParentFormattingContext::Item),
+            LayoutInput {
+                available_space: inner,
+                containing_block_constraints: ContainingBlockConstraints::default(),
+                content_box_position_in_bfc_root: None,
+                sizing: RootSizingDirectives {
+                    adopt_automatic_content_block_size,
+                    ..RootSizingDirectives::default()
+                },
+                participation: ParticipationInParentFormattingContext::Item,
+            },
         );
-        measurement
-            .root_used()
-            .set_content_block_size(result.automatic_content_block_size);
         Some(MeasuredCellContent {
             content_block_size: result.automatic_content_block_size,
             first_baseline: crate::layout::box_baseline(
@@ -291490,16 +291634,22 @@ impl<'pass> TableFormattingContext<'pass> {
 
             let outer_space = self.available_space;
             let inner = used.available_inner_space_or_constraints_from(outer_space);
+            self.cell_inside_layout_inputs[cell_index] = inner;
+            self.cell_pre_layout_content_block_sizes[cell_index] = used.content_block_size.get();
+            let defer_inside_layout = style.height().is_percentage()
+                || style.vertical_align_is_keyword()
+                || self.anonymous_cell_wraps_flex_or_grid(cell);
+            self.deferred_cell_inside_layouts[cell_index] = defer_inside_layout;
             let mut measured_baseline = None;
-            if style.height().is_percentage() {
-                // This cell's final inside layout happens in the second pass below; measure its
+            if defer_inside_layout {
+                // This cell's final inside layout happens once row heights are final; measure its
                 // content in a throwaway state instead of laying out the committing state twice.
-                if let Some(measured) = self.measure_cell(cell, used, inner) {
+                if let Some(measured) = self.measure_cell(cell, used, inner, true) {
                     used.set_content_block_size(measured.content_block_size);
                     measured_baseline = Some(measured.first_baseline);
                 }
             } else {
-                self.layout_inside_cell(run, cell, inner, true);
+                self.layout_inside_cell(run, cell, inner, true, None);
             }
             if self.needs_fixed_mode_row_measurement {
                 let min_size = style.min_height().to_px(participant_block_basis);
@@ -291598,6 +291748,7 @@ impl<'pass> TableFormattingContext<'pass> {
             let cell_size = style.height().to_px(self.table_block_size);
             let used = self.used_values(cell.box_);
             used.set_content_block_size(cell_size - used.border_box_top(collapsed) - used.border_box_bottom(collapsed));
+            self.cell_pre_layout_content_block_sizes[cell_index] = used.content_block_size.get();
             if !self.rows[cell.row_index].is_collapsed {
                 self.rows[cell.row_index].reference_block_size =
                     self.rows[cell.row_index].reference_block_size.max(cell_size);
@@ -291610,10 +291761,12 @@ impl<'pass> TableFormattingContext<'pass> {
                     + inline_spacing * (cell.column_span - 1),
             );
             let inner = used.available_inner_space_or_constraints_from(self.available_space);
-            // The first pass only measured this cell in a throwaway state; this is its one and
-            // only inside layout in the committing state.
-            self.layout_inside_cell(run, cell, inner, false);
-            let baseline = self.box_baseline(cell.box_);
+            self.cell_inside_layout_inputs[cell_index] = inner;
+            // The first pass measured this cell at its automatic block size; measure it again at
+            // the percentage-resolved size to preserve the baseline its final inside layout will use.
+            let baseline = self
+                .measure_cell(cell, used, inner, false)
+                .map_or_else(|| self.box_baseline(cell.box_), |measured| measured.first_baseline);
             self.cells[cell_index].baseline = baseline;
             if !self.rows[cell.row_index].is_collapsed {
                 let border_size = used.border_box_block_size(collapsed);
@@ -291737,6 +291890,81 @@ impl<'pass> TableFormattingContext<'pass> {
         self.table_block_size = self.table_block_size.max(total);
     }
 
+    fn layout_deferred_cells_inside(&mut self, run: &FormattingContextRun<'pass>) {
+        // Deferred cells get their one and only committing inside layout here, once row
+        // block sizes are final.
+        let collapsed = self.style_facts(self.table_box).border_collapse() != BORDER_COLLAPSE_SEPARATE;
+        for cell_index in 0..self.cells.len() {
+            if !self.deferred_cell_inside_layouts[cell_index] {
+                continue;
+            }
+            let cell = self.cells[cell_index];
+            let adopt_automatic_content_block_size = !self.style_facts(cell.box_).height().is_percentage();
+            let intrinsic_block_padding = self.cell_intrinsic_block_padding(cell, collapsed);
+            let used = self.used_values(cell.box_);
+            let measured_content_block_size = used.content_block_size.get();
+            // The first pass adopted the measured automatic block size so row sizing could read
+            // it; restore the pre-layout size so the cell's children resolve percentages against
+            // the same basis the measurement saw.
+            used.set_content_block_size(self.cell_pre_layout_content_block_sizes[cell_index]);
+            let inner = self.cell_inside_layout_inputs[cell_index];
+            self.layout_inside_cell(run, cell, inner, adopt_automatic_content_block_size, intrinsic_block_padding);
+            if adopt_automatic_content_block_size {
+                debug_assert_eq!(
+                    used.content_block_size.get(),
+                    measured_content_block_size,
+                    "measured and committed automatic block sizes diverged"
+                );
+            }
+        }
+    }
+
+    fn cell_intrinsic_block_padding(&mut self, cell: TableCell, collapsed: bool) -> Option<(CssPixels, CssPixels)> {
+        let row_size = self.compute_row_content_block_size(cell);
+        let used = self.used_values(cell.box_);
+        let style = self.style_facts(cell.box_);
+        // When a table cell is an anonymous wrapper around a flex or grid container (e.g., a <td> with display:flex is
+        // wrapped in an anonymous table-cell box per CSS Tables 3), the cell should be aligned to the top. This allows
+        // the flex/grid container to fill the cell and handle alignment of its children via its own properties.
+        if self.anonymous_cell_wraps_flex_or_grid(cell) {
+            return Some((CssPixels::default(), row_size - used.border_box_block_size(collapsed)));
+        }
+        if !style.vertical_align_is_keyword() {
+            return None;
+        }
+        // The following image shows various alignment lines of a row:
+        // https://www.w3.org/TR/css-tables-3/images/cell-align-explainer.png
+        // https://drafts.csswg.org/css2/#height-layout
+        // In the context of tables, values for vertical-align have the following meanings:
+        match style.vertical_align_keyword() {
+            vertical_align::MIDDLE => {
+                // The center of the cell is aligned with the center of the rows it spans.
+                let difference = row_size - used.border_box_block_size(collapsed);
+                Some((difference / 2, difference / 2))
+            }
+            vertical_align::TOP => {
+                // The top of the cell box is aligned with the top of the first row it spans.
+                Some((CssPixels::default(), row_size - used.border_box_block_size(collapsed)))
+            }
+            vertical_align::BOTTOM => {
+                // The bottom of the cell box is aligned with the bottom of the last row it spans.
+                Some((row_size - used.border_box_block_size(collapsed), CssPixels::default()))
+            }
+            vertical_align::SUB
+            | vertical_align::SUPER
+            | vertical_align::TEXT_BOTTOM
+            | vertical_align::TEXT_TOP
+            | vertical_align::BASELINE => {
+                // These values do not apply to cells; the cell is aligned at the baseline instead.
+
+                // The baseline of the cell is put at the same height as the baseline of the first of the rows it spans.
+                let padding_top = self.rows[cell.row_index].baseline - cell.baseline;
+                Some((padding_top, row_size - (used.border_box_block_size(collapsed) + padding_top)))
+            }
+            _ => panic!("invalid vertical-align keyword"),
+        }
+    }
+
     fn compute_row_content_block_size(&mut self, cell: TableCell) -> CssPixels {
         // The block size of a cell is the sum of all spanned rows, as described in
         // https://www.w3.org/TR/css-tables-3/#bounding-box-assignment
@@ -291767,7 +291995,7 @@ impl<'pass> TableFormattingContext<'pass> {
         span + self.border_spacing_block() * (cell.row_span - 1)
     }
 
-    fn anonymous_cell_wraps_flex_or_grid(&mut self, cell: TableCell) -> bool {
+    fn anonymous_cell_wraps_flex_or_grid(&self, cell: TableCell) -> bool {
         if !self.node_facts(cell.box_).is_anonymous() {
             return false;
         }
@@ -291791,53 +292019,6 @@ impl<'pass> TableFormattingContext<'pass> {
             let cell = self.cells[cell_index];
             let used = self.used_values(cell.box_);
             let row_used = self.used_values(self.rows[cell.row_index].box_);
-            let row_size = self.compute_row_content_block_size(cell);
-            let style = self.style_facts(cell.box_);
-            // When a table cell is an anonymous wrapper around a flex or grid container (e.g., a <td> with display:flex is
-            // wrapped in an anonymous table-cell box per CSS Tables 3), the cell should be aligned to the top. This allows
-            // the flex/grid container to fill the cell and handle alignment of its children via its own properties.
-            let anonymous_wrapper = self.anonymous_cell_wraps_flex_or_grid(cell);
-            if anonymous_wrapper {
-                used.padding_bottom
-                    .set(used.padding_bottom.get() + row_size - used.border_box_block_size(collapsed));
-            } else if style.vertical_align_is_keyword() {
-                // The following image shows various alignment lines of a row:
-                // https://www.w3.org/TR/css-tables-3/images/cell-align-explainer.png
-                // https://drafts.csswg.org/css2/#height-layout
-                // In the context of tables, values for vertical-align have the following meanings:
-                match style.vertical_align_keyword() {
-                    vertical_align::MIDDLE => {
-                        // The center of the cell is aligned with the center of the rows it spans.
-                        let difference = row_size - used.border_box_block_size(collapsed);
-                        used.padding_top.set(used.padding_top.get() + difference / 2);
-                        used.padding_bottom.set(used.padding_bottom.get() + difference / 2);
-                    }
-                    vertical_align::TOP => {
-                        // The top of the cell box is aligned with the top of the first row it spans.
-                        used.padding_bottom
-                            .set(used.padding_bottom.get() + row_size - used.border_box_block_size(collapsed));
-                    }
-                    vertical_align::BOTTOM => {
-                        // The bottom of the cell box is aligned with the bottom of the last row it spans.
-                        used.padding_top
-                            .set(used.padding_top.get() + row_size - used.border_box_block_size(collapsed));
-                    }
-                    vertical_align::SUB
-                    | vertical_align::SUPER
-                    | vertical_align::TEXT_BOTTOM
-                    | vertical_align::TEXT_TOP
-                    | vertical_align::BASELINE => {
-                        // These values do not apply to cells; the cell is aligned at the baseline instead.
-
-                        // The baseline of the cell is put at the same height as the baseline of the first of the rows it spans.
-                        used.padding_top
-                            .set(used.padding_top.get() + self.rows[cell.row_index].baseline - cell.baseline);
-                        used.padding_bottom
-                            .set(used.padding_bottom.get() + row_size - used.border_box_block_size(collapsed));
-                    }
-                    _ => panic!("invalid vertical-align keyword"),
-                }
-            }
             // Compute cell position as specified by https://www.w3.org/TR/css-tables-3/#bounding-box-assignment:
             // left/top location is the sum of:
             // - for top: the height reserved for top captions (including margins), if any
@@ -291894,6 +292075,7 @@ impl<'pass> TableFormattingContext<'pass> {
         self.compute_table_block_size(run);
         self.distribute_block_size_to_rows();
         self.position_row_boxes();
+        self.layout_deferred_cells_inside(run);
         self.position_cell_boxes();
         table_used.set_content_block_size(self.table_block_size);
         // Derive baselines for the table internals bottom-up (rows, then row groups, then the table box)
@@ -644617,265 +644799,3 @@ describe("tagged template literal functionality", () => {
         expect(test1``).toBe(42);
     });
 
-    test("tagging a template literal", () => {
-        function test2(s) {
-            return function (strings) {
-                expect(strings).toBeInstanceOf(Array);
-                expect(strings).toHaveLength(1);
-                expect(strings[0]).toBe("bar");
-                return s + strings[0];
-            };
-        }
-        expect(test2("foo")`bar`).toBe("foobar");
-    });
-
-    test("tagging an object function key", () => {
-        var test3 = {
-            foo(strings, p1) {
-                expect(strings).toBeInstanceOf(Array);
-                expect(strings).toHaveLength(2);
-                expect(strings[0]).toBe("");
-                expect(strings[1]).toBe("");
-                expect(p1).toBe("bar");
-            },
-        };
-        test3.foo`${"bar"}`;
-    });
-
-    test("tagging with a variable in a template expression", () => {
-        function test4(strings, p1) {
-            expect(strings).toBeInstanceOf(Array);
-            expect(strings).toHaveLength(2);
-            expect(strings[0]).toBe("foo");
-            expect(strings[1]).toBe("");
-            expect(p1).toBe(42);
-        }
-        var bar = 42;
-        test4`foo${bar}`;
-    });
-
-    test("template tag result of another template tag", () => {
-        function test5(strings, p1, p2) {
-            expect(strings).toBeInstanceOf(Array);
-            expect(strings).toHaveLength(3);
-            expect(strings[0]).toBe("foo");
-            expect(strings[1]).toBe("baz");
-            expect(strings[2]).toBe("");
-            expect(p1).toBe(42);
-            expect(p2).toBe("qux");
-            return (strings, value) => `${value}${strings[0]}`;
-        }
-        var bar = 42;
-        expect(test5`foo${bar}baz${"qux"}``test${123}`).toBe("123test");
-    });
-
-    test("general test", () => {
-        function review(strings, name, rating) {
-            return `${strings[0]}**${name}**${strings[1]}_${rating}_${strings[2]}`;
-        }
-        var name = "SerenityOS";
-        var rating = "great";
-        expect(review`${name} is a ${rating} project!`).toBe("**SerenityOS** is a _great_ project!");
-    });
-
-    test("template object structure", () => {
-        const getTemplateObject = (...rest) => rest;
-        const getRawTemplateStrings = arr => arr.raw;
-
-        let o = getTemplateObject`foo\nbar`;
-        expect(Object.getOwnPropertyNames(o[0])).toContain("raw");
-
-        let raw = getRawTemplateStrings`foo${1 + 3}\nbar`;
-        expect(Object.getOwnPropertyNames(raw)).not.toContain("raw");
-        expect(raw).toHaveLength(2);
-        expect(raw[0]).toBe("foo");
-        expect(raw[1]).toHaveLength(5);
-        expect(raw[1]).toBe("\\nbar");
-    });
-
-    test("invalid escapes give undefined cooked values but can be accessed in raw form", () => {
-        let calls = 0;
-        let lastValue = null;
-        function noCookedButRaw(values) {
-            ++calls;
-            expect(values).not.toBeNull();
-            expect(values.raw).toHaveLength(1);
-            expect(values.raw[0].length).toBeGreaterThan(0);
-            expect(values.raw[0].charAt(0)).toBe("\\");
-            expect(values[0]).toBeUndefined();
-            lastValue = values.raw[0];
-        }
-        // Invalid unicode escapes.
-        noCookedButRaw`\u`;
-        expect(calls).toBe(1);
-        expect(lastValue).toBe("\\u");
-
-        // Octal escapes (always invalid in templates).
-        noCookedButRaw`\01`;
-        expect(calls).toBe(2);
-        expect(lastValue).toBe("\\01");
-
-        // Unicode code point out of range.
-        noCookedButRaw`\u{10FFFFF}`;
-        expect(calls).toBe(3);
-        expect(lastValue).toBe("\\u{10FFFFF}");
-
-        // Invalid hex escapes.
-        noCookedButRaw`\xZZ`;
-        expect(calls).toBe(4);
-        expect(lastValue).toBe("\\xZZ");
-
-        noCookedButRaw`\x`;
-        expect(calls).toBe(5);
-        expect(lastValue).toBe("\\x");
-
-        // Digit escapes (1-9).
-        noCookedButRaw`\1`;
-        expect(calls).toBe(6);
-        expect(lastValue).toBe("\\1");
-
-        noCookedButRaw`\9`;
-        expect(calls).toBe(7);
-        expect(lastValue).toBe("\\9");
-
-        noCookedButRaw`\8`;
-        expect(calls).toBe(8);
-        expect(lastValue).toBe("\\8");
-
-        // \0 followed by another digit.
-        noCookedButRaw`\00`;
-        expect(calls).toBe(9);
-        expect(lastValue).toBe("\\00");
-
-        noCookedButRaw`\08`;
-        expect(calls).toBe(10);
-        expect(lastValue).toBe("\\08");
-
-        noCookedButRaw`\09`;
-        expect(calls).toBe(11);
-        expect(lastValue).toBe("\\09");
-    });
-
-    test("valid escapes in tagged templates have correct cooked values", () => {
-        function getCooked(values) {
-            return values[0];
-        }
-        // Simple escapes should still work.
-        expect(getCooked`\n`).toBe("\n");
-        expect(getCooked`\r`).toBe("\r");
-        expect(getCooked`\t`).toBe("\t");
-        expect(getCooked`\b`).toBe("\b");
-        expect(getCooked`\f`).toBe("\f");
-        expect(getCooked`\v`).toBe("\v");
-        expect(getCooked`\0`).toBe("\0");
-        expect(getCooked`\\`).toBe("\\");
-        expect(getCooked`\x41`).toBe("A");
-        expect(getCooked`\u0041`).toBe("A");
-        expect(getCooked`\u{41}`).toBe("A");
-    });
-
-    test("for multiple values gives undefined only for invalid strings", () => {
-        let restValue = null;
-        let stringsValue = null;
-        let calls = 0;
-
-        function extractArguments(value, ...arguments) {
-            ++calls;
-            restValue = arguments;
-            stringsValue = value;
-        }
-        extractArguments`valid${1}invalid\u`;
-
-        expect(calls).toBe(1);
-        expect(restValue).toHaveLength(1);
-        expect(restValue[0]).toBe(1);
-        expect(stringsValue).toHaveLength(2);
-        expect(stringsValue[0]).toBe("valid");
-        expect(stringsValue[1]).toBeUndefined();
-        expect(stringsValue.raw).toHaveLength(2);
-        expect(stringsValue.raw[0]).toBe("valid");
-        expect(stringsValue.raw[1]).toBe("invalid\\u");
-    });
-
-    test("string value gets cached per AST node", () => {
-        function call(func, val) {
-            return func`template${val}second`;
-        }
-
-        let firstResult = call(value => value, 1);
-        let secondResult = call(value => value, 2);
-        expect(firstResult).toBe(secondResult);
-    });
-
-    test("template object property attributes", () => {
-        let templateObj = null;
-        function capture(strings) {
-            templateObj = strings;
-        }
-        capture`a${1}b`;
-
-        expect(Object.isFrozen(templateObj)).toBeTrue();
-
-        const desc0 = Object.getOwnPropertyDescriptor(templateObj, 0);
-        expect(desc0.writable).toBeFalse();
-        expect(desc0.enumerable).toBeTrue();
-        expect(desc0.configurable).toBeFalse();
-
-        const desc1 = Object.getOwnPropertyDescriptor(templateObj, 1);
-        expect(desc1.writable).toBeFalse();
-        expect(desc1.enumerable).toBeTrue();
-        expect(desc1.configurable).toBeFalse();
-
-        const rawDesc = Object.getOwnPropertyDescriptor(templateObj, "raw");
-        expect(rawDesc.writable).toBeFalse();
-        expect(rawDesc.enumerable).toBeFalse();
-        expect(rawDesc.configurable).toBeFalse();
-
-        expect(Object.isFrozen(templateObj.raw)).toBeTrue();
-
-        const rawDesc0 = Object.getOwnPropertyDescriptor(templateObj.raw, 0);
-        expect(rawDesc0.writable).toBeFalse();
-        expect(rawDesc0.enumerable).toBeTrue();
-        expect(rawDesc0.configurable).toBeFalse();
-
-        const rawDesc1 = Object.getOwnPropertyDescriptor(templateObj.raw, 1);
-        expect(rawDesc1.writable).toBeFalse();
-        expect(rawDesc1.enumerable).toBeTrue();
-        expect(rawDesc1.configurable).toBeFalse();
-    });
-
-    test("this value of call comes from reference for non-computed, non-super property", () => {
-        let thisValue = null;
-        const obj = {
-            func() {
-                thisValue = this;
-            },
-        };
-
-        obj.func``;
-
-        expect(thisValue).toBe(obj);
-    });
-
-    test("this value of call comes from reference for computed, non-super property", () => {
-        let thisValue = null;
-        const obj = {
-            func() {
-                thisValue = this;
-            },
-        };
-
-        obj["func"]``;
-
-        expect(thisValue).toBe(obj);
-    });
-
-    test("this value of call comes from reference for private property", () => {
-        let thisValue = null;
-        const obj = new (class A {
-            #func = () => {
-                thisValue = this;
-            };
-
-            constructor() {
-                this.#func``;
