@@ -22717,6 +22717,10 @@ void ak_kfree(void* ptr)
     free(ptr);
 }
 
+void ak_kmalloc_collect()
+{
+}
+
 extern "C" {
 void* ladybird_rust_alloc(size_t size, size_t alignment);
 void* ladybird_rust_alloc_zeroed(size_t size, size_t alignment);
@@ -22769,6 +22773,8 @@ void* ak_kmalloc(size_t size)
     return mi_malloc(size);
 }
 
+static thread_local mi_heap_t* s_string_heap = nullptr;
+
 static mi_heap_t* heap_for_partition(HeapPartition partition)
 {
     switch (partition) {
@@ -22787,8 +22793,9 @@ static mi_heap_t* heap_for_partition(HeapPartition partition)
         static mi_heap_t* painting_heap = mi_heap_new();
         return painting_heap;
     case HeapPartition::String:
-        static thread_local mi_heap_t* string_heap = mi_heap_new();
-        return string_heap;
+        if (!s_string_heap)
+            s_string_heap = mi_heap_new();
+        return s_string_heap;
     }
     VERIFY_NOT_REACHED();
 }
@@ -22816,6 +22823,16 @@ size_t ak_kmalloc_good_size(size_t size)
 void ak_kfree(void* ptr)
 {
     mi_free(ptr);
+}
+
+void ak_kmalloc_collect()
+{
+    // mi_collect() only visits the calling thread's default heap, so the string heap has to be collected separately.
+    // The remaining partitions are shared between threads and are left to their owners.
+    if (s_string_heap)
+        mi_heap_collect(s_string_heap, true);
+
+    mi_collect(true);
 }
 
 extern "C" {
@@ -22884,6 +22901,7 @@ void ak_kfree(void* ptr);
 [[nodiscard]] void* ak_krealloc(void* ptr, size_t size);
 [[nodiscard]] void* ak_krealloc(HeapPartition, void* ptr, size_t size);
 [[nodiscard]] size_t ak_kmalloc_good_size(size_t size);
+void ak_kmalloc_collect();
 
 [[nodiscard]] inline void* kcalloc(size_t count, size_t size)
 {
@@ -128611,6 +128629,10 @@ FILE: Libraries/LibGfx/Path.cpp
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
 
+extern "C" {
+void ladybird_gfx_path_destroy(void*);
+}
+
 namespace Gfx {
 
 Path Path::from_serialized_bytes(ReadonlyBytes bytes)
@@ -128644,6 +128666,11 @@ ErrorOr<Gfx::Path> decode(Decoder& decoder)
     return Gfx::Path::from_serialized_bytes(path_data);
 }
 
+}
+
+extern "C" void ladybird_gfx_path_destroy(void* path)
+{
+    delete static_cast<Gfx::Path*>(path);
 }
 
 FILE: Libraries/LibGfx/Path.h
@@ -130761,8 +130788,56 @@ FILE: Libraries/LibGfx/Rust/src/lib.rs
 mod rust_allocator;
 
 pub mod font;
+pub mod path;
 pub mod text_layout;
 pub mod yuv;
+
+FILE: Libraries/LibGfx/Rust/src/path.rs
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+use std::ffi::c_void;
+use std::ptr::NonNull;
+
+unsafe extern "C" {
+    fn ladybird_gfx_path_destroy(path: *mut c_void);
+}
+
+/// The sole owner of a heap-allocated `Gfx::Path`, destroying it on drop.
+pub struct OwnedPath {
+    raw: NonNull<c_void>,
+}
+
+impl OwnedPath {
+    /// Assumes sole ownership of a heap-allocated `Gfx::Path`.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must be the only pointer through which the heap-allocated
+    /// `Gfx::Path` is owned or destroyed.
+    #[inline]
+    pub unsafe fn adopt(raw: *mut c_void) -> Self {
+        Self {
+            raw: NonNull::new(raw).expect("Gfx::Path pointer must not be null"),
+        }
+    }
+
+    /// The raw `Gfx::Path` pointer, still owned by this value.
+    #[inline]
+    pub fn as_raw(&self) -> *mut c_void {
+        self.raw.as_ptr()
+    }
+}
+
+impl Drop for OwnedPath {
+    fn drop(&mut self) {
+        // SAFETY: adopt() took sole ownership of the heap-allocated path.
+        unsafe { ladybird_gfx_path_destroy(self.raw.as_ptr()) };
+    }
+}
 
 FILE: Libraries/LibGfx/Rust/src/text_layout.rs
 /*
@@ -147932,10 +148007,10 @@ size_t InstructionStream::external_memory_size() const
         [](Vector<u8> const& bytecode) -> size_t {
             return vector_external_memory_size(bytecode);
         },
-        [](Core::ImmutableBytes const& bytecode) -> size_t {
+        [this](Core::ImmutableBytes const& bytecode) -> size_t {
             if (bytecode.is_file_backed())
                 return 0;
-            return bytecode.size();
+            return m_size;
         });
 }
 
@@ -148580,7 +148655,7 @@ FILE: Libraries/LibJS/Bytecode/Executable.h
 
 namespace JS::Bytecode {
 
-class InstructionStream {
+class JS_API InstructionStream {
 public:
     explicit InstructionStream(Vector<u8>);
     InstructionStream(Core::ImmutableBytes, size_t offset, size_t size);
@@ -416169,10 +416244,13 @@ FILE: Libraries/LibThreading/ThreadPool.cpp
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Time.h>
+#include <AK/kmalloc.h>
 #include <LibThreading/ThreadPool.h>
 
 static constexpr size_t THREAD_COUNT = 4;
 static constexpr size_t THREAD_STACK_SIZE = 8 * MiB;
+static constexpr auto THREAD_IDLE_MEMORY_COLLECTION_DELAY = AK::Duration::from_seconds(1);
 
 namespace Threading {
 
@@ -416197,15 +416275,34 @@ ThreadPool::ThreadPool()
 
 intptr_t ThreadPool::worker_thread_func()
 {
+    bool collected_since_last_work = false;
+
     while (true) {
         Function<void()> work;
-
+        bool should_collect = false;
         {
             Sync::MutexLocker locker(m_mutex);
-            m_condition.wait_while([this] { return m_work_queue.is_empty(); });
-            work = m_work_queue.dequeue();
+
+            while (m_work_queue.is_empty()) {
+                if (collected_since_last_work) {
+                    m_condition.wait();
+                } else if (!m_condition.wait_for(THREAD_IDLE_MEMORY_COLLECTION_DELAY) && m_work_queue.is_empty()) {
+                    should_collect = true;
+                    break;
+                }
+            }
+
+            if (!should_collect)
+                work = m_work_queue.dequeue();
         }
 
+        if (should_collect) {
+            ak_kmalloc_collect();
+            collected_since_last_work = true;
+            continue;
+        }
+
+        collected_since_last_work = false;
         work();
     }
 }
@@ -603031,7 +603128,12 @@ extern "C" bool selector_ffi_element_is_html_element_in_html_document(void const
 
 extern "C" bool selector_ffi_element_is_document_root(void const* element)
 {
-    return is<HTML::HTMLHtmlElement>(ffi_element(element));
+    // https://drafts.csswg.org/selectors/#root-pseudo
+    // `:root` names the root of the document, which is an `<html>` element only in an HTML
+    // document. A standalone SVG or XML document has one too, and a `<html>` element that is not
+    // its document's root is not it.
+    auto const& subject = ffi_element(element);
+    return &subject == subject.document().document_element();
 }
 
 extern "C" bool selector_ffi_element_is_link(void const* element)
@@ -616634,7 +616736,7 @@ public:
     virtual void resolve_for_size(Layout::NodeWithStyle const&, CSSPixelSize) const { }
 
     virtual bool is_paintable(DOM::Document const&) const = 0;
-    virtual void paint(DisplayListRecordingContext& context, DOM::Document const&, DevicePixelRect const& dest_rect, ImageRendering) const = 0;
+    virtual void paint(DisplayListRecordingContext& context, DOM::Document const&, DevicePixelRect const& dest_rect, ImageRendering, PreferredColorScheme) const = 0;
 
     virtual Optional<Gfx::Color> color_if_single_pixel_bitmap(DOM::Document const&) const { return {}; }
 
@@ -621596,7 +621698,7 @@ void ConicGradientStyleValue::resolve_for_size(Layout::NodeWithStyle const& node
     m_resolved->position = position_value()->resolved(CSSPixelRect { { 0, 0 }, size });
 }
 
-void ConicGradientStyleValue::paint(DisplayListRecordingContext& context, DOM::Document const&, DevicePixelRect const& dest_rect, CSS::ImageRendering) const
+void ConicGradientStyleValue::paint(DisplayListRecordingContext& context, DOM::Document const&, DevicePixelRect const& dest_rect, CSS::ImageRendering, PreferredColorScheme) const
 {
     VERIFY(m_resolved.has_value());
     auto destination_rect = dest_rect.to_type<int>();
@@ -621678,7 +621780,7 @@ public:
 
     void serialize(StringBuilder&, SerializationMode) const;
 
-    void paint(DisplayListRecordingContext&, DOM::Document const&, DevicePixelRect const& dest_rect, CSS::ImageRendering) const override;
+    void paint(DisplayListRecordingContext&, DOM::Document const&, DevicePixelRect const& dest_rect, CSS::ImageRendering, PreferredColorScheme) const override;
 
     ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
     bool equals(StyleValue const& other) const;
@@ -622810,6 +622912,7 @@ Optional<Gfx::ImageCursor> CursorStyleValue::make_image_cursor(Layout::NodeWithS
         return {};
 
     auto const& current_color = layout_node.computed_values().color();
+    auto const current_color_scheme = document.page().preferred_color_scheme();
 
     // Create a bitmap if needed.
     // The cursor size for a given image never changes. It's based either on the image itself, or our default size,
@@ -622841,9 +622944,7 @@ Optional<Gfx::ImageCursor> CursorStyleValue::make_image_cursor(Layout::NodeWithS
     }
 
     // Repaint the bitmap if necessary
-    if (m_cached_bitmap_color != current_color) {
-        m_cached_bitmap_color = current_color;
-
+    if (m_cached_bitmap_color != current_color || m_cached_bitmap_color_scheme != current_color_scheme) {
         // Clear whatever was in the bitmap before.
         auto& bitmap = *m_cached_bitmap->bitmap();
         auto painter = Gfx::Painter::create(bitmap);
@@ -622857,12 +622958,16 @@ Optional<Gfx::ImageCursor> CursorStyleValue::make_image_cursor(Layout::NodeWithS
         DisplayListRecordingContext paint_context { display_list_recorder, document.page().palette(), document.page().client().device_pixels_per_css_pixel(), document.page().chrome_metrics() };
 
         image.resolve_for_size(layout_node, CSSPixelSize { bitmap.size() });
-        image.paint(paint_context, document, DevicePixelRect { bitmap.rect() }, ImageRendering::Auto);
+        // A cursor image is not embedded by any element, so it follows the page's own preference.
+        image.paint(paint_context, document, DevicePixelRect { bitmap.rect() }, ImageRendering::Auto, current_color_scheme);
 
         auto painting_surface = Gfx::PaintingSurface::wrap_bitmap(bitmap);
         Painting::DisplayListPlayerSkia display_list_player;
         display_list_player.execute(*display_list, visual_context_tree, resource_storage, {}, painting_surface);
         display_list_player.flush(*painting_surface);
+
+        m_cached_bitmap_color = current_color;
+        m_cached_bitmap_color_scheme = current_color_scheme;
     }
 
     // "If the values are unspecified, then the natural hotspot defined inside the image resource itself is used.
@@ -622949,6 +623054,7 @@ private:
     ValueComparingRefPtr<StyleValue const> m_y;
 
     mutable Optional<Color> m_cached_bitmap_color;
+    mutable Optional<PreferredColorScheme> m_cached_bitmap_color_scheme;
     mutable Optional<Gfx::ShareableBitmap> m_cached_bitmap;
 };
 
@@ -625438,10 +625544,10 @@ bool ImageSetStyleValue::is_paintable(DOM::Document const& document) const
     return false;
 }
 
-void ImageSetStyleValue::paint(DisplayListRecordingContext& context, DOM::Document const& document, DevicePixelRect const& dest_rect, ImageRendering image_rendering) const
+void ImageSetStyleValue::paint(DisplayListRecordingContext& context, DOM::Document const& document, DevicePixelRect const& dest_rect, ImageRendering image_rendering, PreferredColorScheme color_scheme) const
 {
     if (m_selected_image)
-        m_selected_image->paint(context, document, dest_rect, image_rendering);
+        m_selected_image->paint(context, document, dest_rect, image_rendering, color_scheme);
 }
 
 Optional<Gfx::Color> ImageSetStyleValue::color_if_single_pixel_bitmap(DOM::Document const& document) const
@@ -625522,7 +625628,7 @@ public:
 
     virtual void resolve_for_size(Layout::NodeWithStyle const&, CSSPixelSize) const override;
     virtual bool is_paintable(DOM::Document const&) const override;
-    virtual void paint(DisplayListRecordingContext&, DOM::Document const&, DevicePixelRect const&, ImageRendering) const override;
+    virtual void paint(DisplayListRecordingContext&, DOM::Document const&, DevicePixelRect const&, ImageRendering, PreferredColorScheme) const override;
     virtual Optional<Gfx::Color> color_if_single_pixel_bitmap(DOM::Document const&) const override;
 
     AbstractImageStyleValue const* selected_image() const { return m_selected_image; }
@@ -625756,23 +625862,23 @@ bool ImageStyleValue::is_paintable(DOM::Document const& document) const
     return image_data(document);
 }
 
-void ImageStyleValue::paint(DisplayListRecordingContext& context, DOM::Document const& document, DevicePixelRect const& dest_rect, CSS::ImageRendering image_rendering) const
+void ImageStyleValue::paint(DisplayListRecordingContext& context, DOM::Document const& document, DevicePixelRect const& dest_rect, CSS::ImageRendering image_rendering, PreferredColorScheme color_scheme) const
 {
     auto image_data = this->image_data(document);
     if (!image_data)
         return;
 
     auto dest_int_rect = dest_rect.to_type<int>();
-    image_data->paint(context, dest_int_rect, image_rendering);
+    image_data->paint(context, dest_int_rect, image_rendering, color_scheme);
 }
 
-Optional<Painting::DisplayListResource> ImageStyleValue::record_display_list(DisplayListRecordingContext& context, DOM::Document const& document, DevicePixelRect const& dest_rect) const
+Optional<Painting::DisplayListResource> ImageStyleValue::record_display_list(DisplayListRecordingContext& context, DOM::Document const& document, DevicePixelRect const& dest_rect, PreferredColorScheme color_scheme) const
 {
     auto image_data = this->image_data(document);
     if (!image_data)
         return {};
 
-    return image_data->record_display_list(dest_rect.size().to_type<int>(), context.display_list_recorder().resource_storage());
+    return image_data->record_display_list(dest_rect.size().to_type<int>(), color_scheme, context.display_list_recorder().resource_storage());
 }
 
 Optional<Gfx::DecodedImageFrame> ImageStyleValue::current_frame(DOM::Document const& document, DevicePixelRect const& dest_rect) const
@@ -626072,8 +626178,8 @@ public:
     Optional<CSSPixelFraction> natural_aspect_ratio(DOM::Document const&) const override;
 
     virtual bool is_paintable(DOM::Document const&) const override;
-    void paint(DisplayListRecordingContext& context, DOM::Document const&, DevicePixelRect const& dest_rect, CSS::ImageRendering image_rendering) const override;
-    Optional<Painting::DisplayListResource> record_display_list(DisplayListRecordingContext&, DOM::Document const&, DevicePixelRect const&) const;
+    void paint(DisplayListRecordingContext& context, DOM::Document const&, DevicePixelRect const& dest_rect, CSS::ImageRendering image_rendering, PreferredColorScheme) const override;
+    Optional<Painting::DisplayListResource> record_display_list(DisplayListRecordingContext&, DOM::Document const&, DevicePixelRect const&, PreferredColorScheme) const;
 
     virtual Optional<Gfx::Color> color_if_single_pixel_bitmap(DOM::Document const&) const override;
     Optional<Gfx::DecodedImageFrame> current_frame(DOM::Document const&, DevicePixelRect const& dest_rect = {}) const;
@@ -626938,7 +627044,7 @@ void LinearGradientStyleValue::resolve_for_size(Layout::NodeWithStyle const& nod
     }
 }
 
-void LinearGradientStyleValue::paint(DisplayListRecordingContext& context, DOM::Document const&, DevicePixelRect const& dest_rect, CSS::ImageRendering) const
+void LinearGradientStyleValue::paint(DisplayListRecordingContext& context, DOM::Document const&, DevicePixelRect const& dest_rect, CSS::ImageRendering, PreferredColorScheme) const
 {
     VERIFY(m_resolved.has_value());
     context.display_list_recorder().fill_rect_with_linear_gradient(dest_rect.to_type<int>(), m_resolved.value());
@@ -627028,7 +627134,7 @@ public:
     void resolve_for_size(Layout::NodeWithStyle const&, CSSPixelSize) const override;
 
     bool is_paintable(DOM::Document const&) const override { return true; }
-    void paint(DisplayListRecordingContext& context, DOM::Document const&, DevicePixelRect const& dest_rect, CSS::ImageRendering image_rendering) const override;
+    void paint(DisplayListRecordingContext& context, DOM::Document const&, DevicePixelRect const& dest_rect, CSS::ImageRendering image_rendering, PreferredColorScheme) const override;
 
 private:
     friend class StyleValue;
@@ -627892,7 +627998,7 @@ bool RadialGradientStyleValue::equals(StyleValue const& other) const
         && gradient_color_syntax() == other_gradient.gradient_color_syntax();
 }
 
-void RadialGradientStyleValue::paint(DisplayListRecordingContext& context, DOM::Document const&, DevicePixelRect const& dest_rect, CSS::ImageRendering) const
+void RadialGradientStyleValue::paint(DisplayListRecordingContext& context, DOM::Document const&, DevicePixelRect const& dest_rect, CSS::ImageRendering, PreferredColorScheme) const
 {
     VERIFY(m_resolved.has_value());
     auto center = context.rounded_device_point(m_resolved->center).to_type<int>();
@@ -627938,7 +628044,7 @@ public:
 
     void serialize(StringBuilder&, SerializationMode) const;
 
-    void paint(DisplayListRecordingContext&, DOM::Document const&, DevicePixelRect const& dest_rect, CSS::ImageRendering) const override;
+    void paint(DisplayListRecordingContext&, DOM::Document const&, DevicePixelRect const& dest_rect, CSS::ImageRendering, PreferredColorScheme) const override;
 
     ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
     bool equals(StyleValue const& other) const;
@@ -640192,29 +640298,29 @@ GC::Ptr<Selection::Selection> Document::get_selection() const
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-write
-WebIDL::ExceptionOr<void> Document::write(StringView text)
+WebIDL::ExceptionOr<void> Document::write(Utf16View text)
 {
     // The document.write(...text) method steps are to run the document write steps with this, text, false, and "Document write".
     return run_the_document_write_steps(text, AddLineFeed::No);
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-writeln
-WebIDL::ExceptionOr<void> Document::writeln(StringView text)
+WebIDL::ExceptionOr<void> Document::writeln(Utf16View text)
 {
     // The document.writeln(...text) method steps are to run the document write steps with this, text, true, and "Document writeln".
     return run_the_document_write_steps(text, AddLineFeed::Yes);
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#document-write-steps
-WebIDL::ExceptionOr<void> Document::run_the_document_write_steps(StringView text, AddLineFeed line_feed)
+WebIDL::ExceptionOr<void> Document::run_the_document_write_steps(Utf16View text, AddLineFeed line_feed)
 {
     // 1-4. The binding layer concatenates text and validates it with Trusted Types.
-    StringBuilder string;
+    Utf16StringBuilder string;
     string.append(text);
 
     // 5. If lineFeed is true, append U+000A LINE FEED to string.
     if (line_feed == AddLineFeed::Yes)
-        string.append('\n');
+        string.append_ascii('\n');
 
     // 6. If document is an XML document, then throw an "InvalidStateError" DOMException.
     if (m_type == Type::XML)
@@ -640239,7 +640345,7 @@ WebIDL::ExceptionOr<void> Document::run_the_document_write_steps(StringView text
     }
 
     // 10. Insert string into the input stream just before the insertion point.
-    m_parser->tokenizer().insert_input_at_insertion_point(string.string_view());
+    m_parser->tokenizer().insert_input_at_insertion_point(string.view());
 
     // 11. If document's pending parsing-blocking script is null, then have the HTML parser process string, one code
     //     point at a time, processing resulting tokens as they are emitted, and stopping when the tokenizer reaches
@@ -649168,10 +649274,10 @@ WebIDL::ExceptionOr<GC::Root<DOM::Document>> parse_html_unsafe(JS::Realm& realm,
     return document;
 }
 
-static WebIDL::ExceptionOr<String> document_write_compliant_string(DOM::Document& document, Vector<TrustedTypes::TrustedHTMLOrString> const& text, TrustedTypes::InjectionSink sink)
+static WebIDL::ExceptionOr<Utf16String> document_write_compliant_string(DOM::Document& document, Vector<TrustedTypes::TrustedHTMLOrString> const& text, TrustedTypes::InjectionSink sink)
 {
     // 1. Let string be the empty string.
-    StringBuilder string;
+    Utf16StringBuilder string;
 
     // 2. Let isTrusted be false if text contains a string; otherwise true.
     auto is_trusted = true;
@@ -649185,11 +649291,10 @@ static WebIDL::ExceptionOr<String> document_write_compliant_string(DOM::Document
     // 3. For each value of text:
     for (auto const& value : text) {
         string.append(value.visit(
-                               // 1. If value is a TrustedHTML object, then append value's associated data to string.
-                               [](GC::Root<TrustedTypes::TrustedHTML> const& value) { return value->to_string(); },
-                               // 2. Otherwise, append value to string.
-                               [](Utf16String const& value) { return value; })
-                .to_utf8_but_should_be_ported_to_utf16());
+            // 1. If value is a TrustedHTML object, then append value's associated data to string.
+            [](GC::Root<TrustedTypes::TrustedHTML> const& value) -> Utf16String const& { return value->to_string(); },
+            // 2. Otherwise, append value to string.
+            [](Utf16String const& value) -> Utf16String const& { return value; }));
     }
 
     // 4. If isTrusted is false, set string to the result of invoking the Get Trusted Type compliant string algorithm
@@ -649198,14 +649303,14 @@ static WebIDL::ExceptionOr<String> document_write_compliant_string(DOM::Document
         auto const new_string = TRY(TrustedTypes::get_trusted_type_compliant_string(
             TrustedTypes::TrustedTypeName::TrustedHTML,
             HTML::relevant_global_object(document),
-            Utf16String::from_utf8(MUST(string.to_string())),
+            string.to_string(),
             sink,
             "script"_utf16));
         string.clear();
-        string.append(new_string.to_utf8_but_should_be_ported_to_utf16());
+        string.append(new_string);
     }
 
-    return MUST(string.to_string());
+    return string.to_string();
 }
 
 WebIDL::ExceptionOr<void> write(DOM::Document& document, Vector<TrustedTypes::TrustedHTMLOrString> const& text)
@@ -649819,6 +649924,13 @@ public:
         bump_dom_tree_version();
     }
 
+    // The used `color-scheme` of the element referencing this document, when it is an SVG being
+    // used as an image. `prefers-color-scheme` inside such a document answers with it rather than
+    // with the page's preference, and the same image can be referenced twice with different
+    // answers.
+    Optional<CSS::PreferredColorScheme> svg_image_color_scheme() const { return m_svg_image_color_scheme; }
+    void set_svg_image_color_scheme(CSS::PreferredColorScheme color_scheme) { m_svg_image_color_scheme = color_scheme; }
+
     bool parser_cannot_change_the_mode() const { return m_parser_cannot_change_the_mode; }
     void set_parser_cannot_change_the_mode(bool parser_cannot_change_the_mode) { m_parser_cannot_change_the_mode = parser_cannot_change_the_mode; }
 
@@ -649876,8 +649988,8 @@ public:
 
     void set_window(HTML::Window&);
 
-    WebIDL::ExceptionOr<void> write(StringView text);
-    WebIDL::ExceptionOr<void> writeln(StringView text);
+    WebIDL::ExceptionOr<void> write(Utf16View text);
+    WebIDL::ExceptionOr<void> writeln(Utf16View text);
 
     WebIDL::ExceptionOr<Document*> open(Optional<Utf16String> const& = {}, Optional<Utf16String> const& = {});
     WebIDL::ExceptionOr<GC::Ptr<HTML::WindowProxy>> open(Utf16View url, Utf16View name, Utf16View features);
@@ -650638,7 +650750,7 @@ private:
         Yes,
         No,
     };
-    WebIDL::ExceptionOr<void> run_the_document_write_steps(StringView text, AddLineFeed line_feed);
+    WebIDL::ExceptionOr<void> run_the_document_write_steps(Utf16View text, AddLineFeed line_feed);
 
     void queue_intersection_observer_task();
     void queue_an_intersection_observer_entry(IntersectionObserver::IntersectionObserver&, HighResolutionTime::DOMHighResTimeStamp time, GC::Ref<Geometry::DOMRectReadOnly> root_bounds, GC::Ref<Geometry::DOMRectReadOnly> bounding_client_rect, GC::Ref<Geometry::DOMRectReadOnly> intersection_rect, bool is_intersecting, double intersection_ratio, GC::Ref<Element> target);
@@ -650739,6 +650851,7 @@ private:
 
     QuirksMode m_quirks_mode { QuirksMode::No };
 
+    Optional<CSS::PreferredColorScheme> m_svg_image_color_scheme;
     bool m_parser_cannot_change_the_mode { false };
 
     // https://dom.spec.whatwg.org/#concept-document-type
@@ -669588,98 +669701,3 @@ public:
     auto& registered_observer_list() { return m_registered_observer_list; }
     auto const& registered_observer_list() const { return m_registered_observer_list; }
 
-    void add_registered_observer(RegisteredObserver&);
-
-    void queue_mutation_record(Utf16FlyString const& type, Optional<Utf16FlyString> const& attribute_name, Optional<Utf16FlyString> const& attribute_namespace, Optional<Utf16String> const& old_value, Vector<GC::Root<Node>> added_nodes, Vector<GC::Root<Node>> removed_nodes, Node* previous_sibling, Node* next_sibling);
-
-    // https://dom.spec.whatwg.org/#concept-shadow-including-inclusive-descendant
-    template<typename Callback>
-    TraversalDecision for_each_shadow_including_inclusive_descendant(Callback);
-
-    // https://dom.spec.whatwg.org/#concept-shadow-including-descendant
-    template<typename Callback>
-    TraversalDecision for_each_shadow_including_descendant(Callback);
-
-    Slottable as_slottable();
-
-    template<typename U, typename Callback>
-    WebIDL::ExceptionOr<void> for_each_child_of_type_fallible(Callback callback)
-    {
-        for (auto* node = first_child(); node; node = node->next_sibling()) {
-            if (auto* maybe_node_of_type = as_if<U>(node)) {
-                if (TRY(callback(*maybe_node_of_type)) == IterationDecision::Break)
-                    return {};
-            }
-        }
-        return {};
-    }
-    template<typename U>
-    U const* first_flat_tree_ancestor_of_type() const
-    {
-        return const_cast<Node*>(this)->template first_flat_tree_ancestor_of_type<U>();
-    }
-
-    template<typename U>
-    U* first_flat_tree_ancestor_of_type();
-
-    template<typename Predicate>
-    requires requires(Predicate& predicate, Node const& node) { { predicate(node) } -> ConvertibleTo<bool>; }
-    Node const* find_in_shadow_including_ancestry(Predicate&& predicate) const
-    {
-        for (Node const* it = this; it; it = it->parent_or_shadow_host_node()) {
-            if (predicate(*it))
-                return it;
-        }
-        return nullptr;
-    }
-
-    ErrorOr<Utf16String> accessible_name(Document const&, ShouldComputeRole = ShouldComputeRole::Yes) const;
-    ErrorOr<Utf16String> accessible_description(Document const&) const;
-
-    Optional<Utf16String> locate_a_namespace(Optional<Utf16View> prefix) const;
-    Optional<Utf16String> lookup_namespace_uri(Optional<Utf16String> const& prefix) const;
-    Optional<Utf16String> lookup_namespace_uri(Optional<Utf16View> prefix) const;
-    Optional<Utf16String> lookup_prefix(Optional<Utf16String> const& namespace_) const;
-    Optional<Utf16String> lookup_prefix(Optional<Utf16View> namespace_) const;
-    bool is_default_namespace(Optional<Utf16String> const& namespace_) const;
-    bool is_default_namespace(Optional<Utf16View> namespace_) const;
-    Vector<Utf16FlyString> get_in_scope_prefixes() const;
-
-    bool is_inert() const;
-
-    bool has_inclusive_ancestor_with_display_none_ignoring_animations() const;
-    bool has_inclusive_ancestor_with_event_listener(Utf16FlyString const& type) const;
-
-    GC::Ptr<ShadowRoot> containing_shadow_root();
-    GC::Ptr<ShadowRoot const> containing_shadow_root() const
-    {
-        return const_cast<Node*>(this)->containing_shadow_root();
-    }
-
-protected:
-    Node(Document&, NodeType);
-
-    void set_document(Document&);
-
-    virtual void visit_edges(Cell::Visitor&) override;
-    virtual void finalize() override;
-    virtual size_t external_memory_size() const override;
-
-    GC::Ptr<Document> m_document;
-    WeakPtr<Layout::Node> m_layout_node;
-    WeakPtr<Painting::Paintable> m_paintable;
-    NodeType m_type { NodeType::INVALID };
-    bool m_needs_layout_tree_update { false };
-    bool m_child_needs_layout_tree_update { false };
-
-    bool m_needs_style_update { false };
-    bool m_child_needs_style_update { false };
-    bool m_entire_subtree_needs_style_update { false };
-    bool m_children_may_depend_on_non_inherited_property_inheritance { false };
-    bool m_in_editable_subtree { false };
-    bool m_is_connected { false };
-    bool m_inside_blocking_wheel_event_handler { false };
-
-    mutable Optional<UniqueNodeID> m_unique_id;
-
-    // https://dom.spec.whatwg.org/#registered-observer-list
