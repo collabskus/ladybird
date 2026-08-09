@@ -456,12 +456,28 @@ pub(crate) fn register_contained_abspos_child(
     loop {
         let containing_block = callbacks.containing_block(target);
         let facts = state.node_facts(callbacks, target);
-        if containing_block.is_invalid() || formatting_context_type_created_by_box(facts).is_some() {
+        if containing_block.is_invalid()
+            || (formatting_context_type_created_by_box(facts).is_some()
+                && !containing_block_geometry_is_finalized_by_the_table_run(state, callbacks, target))
+        {
             break;
         }
         target = containing_block;
     }
     state.register_contained_abspos_child(callbacks, target, child, static_position_rect);
+}
+
+fn containing_block_geometry_is_finalized_by_the_table_run(
+    state: &LayoutState,
+    callbacks: &FfiLayoutFcCallbacks,
+    containing_block: Node,
+) -> bool {
+    let facts = state.node_facts(callbacks, containing_block);
+    facts.is_table_cell()
+        || facts.is_table_row()
+        || facts.is_table_row_group()
+        || facts.is_table_header_group()
+        || facts.is_table_footer_group()
 }
 
 pub(crate) fn box_baseline(
@@ -898,7 +914,6 @@ pub struct FfiLayoutFcCallbacks {
     pub needs_inset_resolution: unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool,
     pub report_unexpected_fragmented_inline: unsafe extern "C" fn(*mut c_void, *mut c_void),
     pub release_anchor_name_handle: crate::layout::FfiReleaseAnchorNameHandleCallback,
-    pub build_replaced_content_facts: unsafe extern "C" fn(*mut c_void, *mut c_void) -> crate::layout::FfiReplacedContentFacts,
     pub build_svg_facts: unsafe extern "C" fn(*mut c_void, *mut c_void) -> FfiSvgElementFacts,
     pub read_paintable_geometry:
         unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut crate::layout::FfiPaintableGeometry) -> bool,
@@ -946,6 +961,10 @@ impl FfiLayoutFcCallbacks {
         // set_computed_values verifies no pass is running and no layout node
         // is created mid-pass.
         unsafe { &*std::ptr::from_ref(payloads) }
+    }
+
+    pub(crate) fn replaced_content_facts(&self, node: Node) -> Option<crate::layout::FfiReplacedContentFacts> {
+        self.arena().replaced_content_facts(node)
     }
 
     pub(crate) fn computed_values_view_if_styled(&self, node: Node) -> Option<ComputedValuesView<'static>> {
@@ -1595,12 +1614,7 @@ fn run_formatting_context<'pass>(
         FormattingContextImplementation::Svg(_) | FormattingContextImplementation::ReplacedWithChildren => {}
         FormattingContextImplementation::InternalReplaced | FormattingContextImplementation::InternalDummy => return result,
     }
-    let box_ = run.box_;
-    if run.state.abspos_layout_pass_is_active() {
-        layout_contained_abspos_children(run);
-    } else {
-        run.state.enqueue_for_abspos_layout_pass(box_);
-    }
+    layout_contained_abspos_children(run);
     result
 }
 
@@ -1843,7 +1857,12 @@ pub unsafe extern "C" fn rust_layout_run_root_layout(
             None,
         );
         place_child(&state, &callbacks, root_for_layout, FfiCssPixelPoint::default());
-        run_abspos_layout_pass(state_ref, callbacks, should_collect_devtools_layout_data);
+        drain_remaining_abspos_targets(
+            state_ref,
+            callbacks,
+            should_collect_devtools_layout_data,
+            &[root, root_for_layout],
+        );
         state.commit_replacing(root, std::ptr::null_mut(), &callbacks, sink);
     });
 }
@@ -1904,7 +1923,7 @@ pub unsafe extern "C" fn rust_layout_compute_subtree_layout(
         let fc_type = formatting_context_type_created_by_box(facts)
             .expect("partial relayout root must establish an independent formatting context");
         run_formatting_context(state_ref, root, None, fc_type, LayoutMode::Normal, false, callbacks, input, None);
-        run_abspos_layout_pass(state_ref, callbacks, false);
+        drain_remaining_abspos_targets(state_ref, callbacks, false, &[viewport, root]);
         state.commit_replacing(root, paintable_to_replace, &callbacks, sink);
     });
 }
@@ -1934,7 +1953,7 @@ pub unsafe extern "C" fn rust_layout_replay_saved_abspos_layout(
         assert!(!containing_block.is_invalid());
         let run = crate::layout::FormattingContextRun::new(state_ref, containing_block, LayoutMode::Normal, callbacks, false, false);
         AbsposEngine::new(state_ref, callbacks).replay(&run, box_);
-        run_abspos_layout_pass(state_ref, callbacks, false);
+        drain_remaining_abspos_targets(state_ref, callbacks, false, &[containing_block]);
         state.commit_replacing(box_, paintable_to_replace, &callbacks, sink);
     });
 }
