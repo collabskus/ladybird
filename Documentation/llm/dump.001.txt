@@ -129151,7 +129151,11 @@ Gfx::FloatRect PathImplSkia::bounding_box() const
 float PathImplSkia::length() const
 {
     SkPathMeasure path_measure(sk_path(), false);
-    return path_measure.getLength();
+    float length = 0;
+    do {
+        length += path_measure.getLength();
+    } while (path_measure.nextContour());
+    return length;
 }
 
 bool PathImplSkia::contains(FloatPoint point, Gfx::WindingRule winding_rule) const
@@ -489598,6 +489602,7 @@ set(SOURCES
     CSS/HypotheticalElement.cpp
     CSS/Invalidation/AdoptedStyleSheetInvalidator.cpp
     CSS/Invalidation/AttributeInvalidator.cpp
+    CSS/Invalidation/ContainerQueryInvalidator.cpp
     CSS/Invalidation/CustomElementInvalidator.cpp
     CSS/Invalidation/EmbeddedContentInvalidator.cpp
     CSS/Invalidation/ElementStateInvalidator.cpp
@@ -489978,6 +489983,7 @@ set(SOURCES
     HTML/GlobalEventHandlers.cpp
     HTML/HashChangeEvent.cpp
     HTML/History.cpp
+    HTML/HistoryOperation.cpp
     HTML/HTMLAllCollection.cpp
     HTML/HTMLAnchorElement.cpp
     HTML/HTMLAreaElement.cpp
@@ -527191,7 +527197,20 @@ public:
         RefPtr<AbstractImageStyleValue const> list_style_image;
         QuotesData quotes { InitialValues::quotes() };
 
-        bool operator==(InheritedListValues const&) const = default;
+        bool operator==(InheritedListValues const& other) const
+        {
+            // The image is compared by value: recomputation builds a fresh one for the same
+            // declaration, and comparing the addresses would call the group different for it.
+            auto images_equal = [](auto const& first, auto const& second) {
+                if (!first || !second)
+                    return !first && !second;
+                return *first == *second;
+            };
+            return list_style_type == other.list_style_type
+                && list_style_position == other.list_style_position
+                && images_equal(list_style_image, other.list_style_image)
+                && quotes == other.quotes;
+        }
     };
 
     struct InheritedUIValues {
@@ -529989,6 +530008,23 @@ MatchResult ContainerQuery::evaluate(DOM::AbstractElement const& element, Option
 
         if (!container_satisfies_requirements(*container, m_feature_requirements))
             continue;
+
+        // A style feature asks about the container's own computed style, so the container has to know
+        // that a style change on it is a change for something under it. Nothing else says so: the
+        // dependency is recorded on the element that asked, which is not the element that moves.
+        // The value the query compares against is resolved too, and that resolution can read the
+        // root - `style(--length: calc(1rem * 10))` moves when the root font size does - so the root
+        // is named as well.
+        // A size feature asks about the container's own box, and the scan a resize does for the
+        // dependents under it starts from the same fact: whether anything ever asked.
+        if (m_feature_requirements.contains_size_feature())
+            const_cast<DOM::Element&>(*container).set_is_size_query_container();
+
+        if (m_feature_requirements.contains_style_feature()) {
+            const_cast<DOM::Element&>(*container).set_is_style_query_container();
+            if (auto* root = element.document().document_element())
+                root->set_is_style_query_container();
+        }
 
         // Once an eligible query container has been selected for an element, each container feature in the
         // <container-query> is evaluated against that query container.
@@ -559554,6 +559590,95 @@ void invalidate_style_after_attribute_change(
 
 }
 
+FILE: Libraries/LibWeb/CSS/Invalidation/ContainerQueryInvalidator.cpp
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/Vector.h>
+#include <LibWeb/CSS/Invalidation/ContainerQueryInvalidator.h>
+#include <LibWeb/DOM/Document.h>
+#include <LibWeb/DOM/Element.h>
+#include <LibWeb/DOM/ShadowRoot.h>
+#include <LibWeb/DOM/Text.h>
+#include <LibWeb/HTML/HTMLSlotElement.h>
+
+namespace Web::CSS::Invalidation {
+
+// The children of a node in the flat tree: a host's are its shadow tree's, a slot's are the nodes
+// assigned to it, and everything else's are its DOM children. This is the inverse of the walk that
+// selects a query container, which is what makes it the right one for finding that container's
+// dependents.
+static void append_flat_tree_children(DOM::Node& node, Vector<DOM::Node*>& out)
+{
+    if (auto* element = as_if<DOM::Element>(node)) {
+        if (auto shadow_root = element->shadow_root()) {
+            for (auto* child = shadow_root->first_child(); child; child = child->next_sibling())
+                out.append(child);
+            return;
+        }
+        if (auto* slot = as_if<HTML::HTMLSlotElement>(*element); slot && !slot->assigned_nodes_internal().is_empty()) {
+            for (auto const& slottable : slot->assigned_nodes_internal())
+                slottable.visit([&](auto const& assigned) { out.append(static_cast<DOM::Node*>(assigned.ptr())); });
+            return;
+        }
+    }
+
+    for (auto* child = node.first_child(); child; child = child->next_sibling())
+        out.append(child);
+}
+
+void invalidate_descendant_styles_depending_on_size_container_query(DOM::Element& query_container)
+{
+    // Only an element some size query or container-relative unit resolved against can have a
+    // dependent under it, and `container-type` is set far more widely than it is asked about.
+    if (!query_container.is_size_query_container())
+        return;
+
+    auto& counters = query_container.document().style_invalidation_counters();
+
+    Vector<DOM::Node*> stack;
+    append_flat_tree_children(query_container, stack);
+    while (!stack.is_empty()) {
+        auto* node = stack.take_last();
+        if (auto* element = as_if<DOM::Element>(*node)) {
+            ++counters.size_query_container_scan_visits;
+            if (element->style_depends_on_size_container_query())
+                element->set_needs_style_update(true);
+        }
+        append_flat_tree_children(*node, stack);
+    }
+}
+
+}
+
+FILE: Libraries/LibWeb/CSS/Invalidation/ContainerQueryInvalidator.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+namespace Web::DOM {
+
+class Element;
+
+}
+
+namespace Web::CSS::Invalidation {
+
+// A query container's size moved, so every element whose size query or container-relative unit
+// resolved against it has to be recomputed. Which elements those are is not a selector question:
+// the container is chosen by walking the flat tree upwards, so the dependents are its flat-tree
+// descendants, and a container no query ever selected has none at all.
+void invalidate_descendant_styles_depending_on_size_container_query(DOM::Element& query_container);
+
+}
+
 FILE: Libraries/LibWeb/CSS/Invalidation/CustomElementInvalidator.cpp
 /*
  * Copyright (c) 2026-present, the Ladybird developers.
@@ -563632,6 +563757,10 @@ double Length::container_relative_length_to_px_without_rounding(ResolutionContex
         const_cast<DOM::Element&>(subject).set_style_depends_on_size_container_query();
 
         auto query_container = get_or_compute_query_container_for_axis(context, physical_axis);
+        // A container unit asks about the container's box exactly as a size query does, so the
+        // container has to know that a resize of it is a change for something under it.
+        if (query_container)
+            const_cast<DOM::Element&>(*query_container).set_is_size_query_container();
         if (!query_container) {
             context.record_viewport_relative_length_resolution();
             auto viewport_length = physical_axis == ContainerRelativeAxis::Width ? context.viewport_rect.width() : context.viewport_rect.height();
@@ -606325,7 +606454,7 @@ void StyleComputer::collect_animation_effects_into(DOM::AbstractElement abstract
             .transform_reference_box_width = 0,
             .transform_reference_box_height = 0,
         };
-        if (auto paintable = prepared_values.first().effect->target()->unsafe_paintable(); paintable) {
+        if (auto paintable = prepared_values.first().effect->target()->unsafe_paintable(); paintable && paintable->has_layout_node()) {
             auto reference_box = paintable->transform_reference_box();
             animation_context.has_transform_reference_box = true;
             animation_context.transform_reference_box_width = reference_box.width().to_double();
@@ -606615,7 +606744,12 @@ Vector<GC::Ref<Animations::KeyframeEffect>> StyleComputer::start_needed_transiti
         .transform_reference_box_width = 0,
         .transform_reference_box_height = 0,
     };
-    if (auto paintable = abstract_element.element().unsafe_paintable(); paintable) {
+    // A paintable outlives the layout node it was made for, and a style recompute can reach an
+    // element whose layout node is already gone: the layout tree builder updates the style of an
+    // element a bypass path reached, and `display: none` leaves the flag set until then. A reference
+    // box is a fact about a layout box, so without one there is none - exactly as when the element
+    // was never painted at all.
+    if (auto paintable = abstract_element.element().unsafe_paintable(); paintable && paintable->has_layout_node()) {
         auto reference_box = paintable->transform_reference_box();
         transition_animation_context.has_transform_reference_box = true;
         transition_animation_context.transform_reference_box_width = reference_box.width().to_double();
@@ -612454,6 +612588,14 @@ void StylePropertyMapReadOnly::visit_edges(GC::Cell::Visitor& visitor)
         [&visitor](GC::Ref<CSSStyleDeclaration>& declaration) { visitor.visit(declaration); });
 }
 
+// A computed style map describes an element's computed style, and a disconnected element has none.
+// `getComputedStyle` refuses one outright rather than reporting a style nothing decided, and the map
+// answers the same way: empty, with every property absent.
+static bool has_computed_style(DOM::AbstractElement const& abstract_element)
+{
+    return abstract_element.element().is_connected();
+}
+
 // https://drafts.css-houdini.org/css-typed-om-1/#dom-stylepropertymapreadonly-get
 WebIDL::ExceptionOr<Variant<GC::Ref<CSSStyleValue>, Empty>> StylePropertyMapReadOnly::get(Utf16String property_name)
 {
@@ -612526,6 +612668,8 @@ WebIDL::ExceptionOr<bool> StylePropertyMapReadOnly::has(Utf16String property_nam
     // 4. If props[property] exists, return true. Otherwise, return false.
     return props.visit(
         [&property](DOM::AbstractElement& element) {
+            if (!has_computed_style(element))
+                return false;
             // From https://drafts.css-houdini.org/css-typed-om-1/#dom-element-computedstylemap we need to include:
             // "the name and computed value of every longhand CSS property supported by the User Agent, every
             // registered custom property, and every non-registered custom property which is not set to its initial
@@ -612552,6 +612696,8 @@ WebIDL::UnsignedLong StylePropertyMapReadOnly::size() const
     // 1. Return the size of the value of this’s [[declarations]] internal slot.
     return m_declarations.visit(
         [](DOM::AbstractElement const& element) {
+            if (!has_computed_style(element))
+                return size_t { 0 };
             // From https://drafts.css-houdini.org/css-typed-om-1/#dom-element-computedstylemap we need to include:
             // "the name and computed value of every longhand CSS property supported by the User Agent, every
             // registered custom property, and every non-registered custom property which is not set to its initial
@@ -612579,6 +612725,8 @@ RefPtr<StyleValue const> StylePropertyMapReadOnly::get_style_value(Source& sourc
 {
     return source.visit(
         [&property](DOM::AbstractElement& element) -> RefPtr<StyleValue const> {
+            if (!has_computed_style(element))
+                return nullptr;
             // From https://drafts.css-houdini.org/css-typed-om-1/#dom-element-computedstylemap we need to include:
             // "the name and computed value of every longhand CSS property supported by the User Agent, every
             // registered custom property, and every non-registered custom property which is not set to its initial
@@ -612975,6 +613123,17 @@ void StyleScope::build_rule_cache()
 void StyleScope::populate_rule_cache(StyleRuleCache& rule_cache)
 {
     build_user_style_sheet_if_needed();
+
+    // A user-agent sheet is a process-wide singleton with no owning document, so nothing that walks a
+    // document's own sheets ever evaluates its media rules. Its `@media` answers are still per
+    // document - `(scripting)` is - so they are evaluated here, where the rule cache that consumes
+    // them is built. Without this the cache is built against whatever state some other document
+    // happened to leave behind, and `noscript` keeps the UA sheet's `display: none` only by accident.
+    for (auto origin : { CascadeOrigin::UserAgent, CascadeOrigin::User }) {
+        for_each_stylesheet(origin, [&](CSSStyleSheet& sheet) {
+            sheet.evaluate_media_queries(document());
+        });
+    }
 
     build_qualified_layer_names_cache(rule_cache);
 
@@ -639160,6 +639319,7 @@ FILE: Libraries/LibWeb/DOM/Document.cpp
 #include <LibWeb/CSS/CustomPropertyRegistration.h>
 #include <LibWeb/CSS/FontComputer.h>
 #include <LibWeb/CSS/FontFaceSet.h>
+#include <LibWeb/CSS/Invalidation/ContainerQueryInvalidator.h>
 #include <LibWeb/CSS/Invalidation/MediaQueryInvalidator.h>
 #include <LibWeb/CSS/Invalidation/PseudoClassInvalidator.h>
 #include <LibWeb/CSS/Invalidation/StyleInvalidator.h>
@@ -641296,12 +641456,7 @@ void Document::update_layout(UpdateLayoutReason reason)
                 if (!query_container->is_connected())
                     continue;
 
-                query_container->for_each_shadow_including_descendant([](Node& node) {
-                    if (auto* element = as_if<Element>(node); element && element->style_depends_on_size_container_query())
-                        element->set_needs_style_update(true);
-
-                    return TraversalDecision::Continue;
-                });
+                CSS::Invalidation::invalidate_descendant_styles_depending_on_size_container_query(query_container);
             }
         }
 
@@ -650150,6 +650305,8 @@ public:
         u64 registered_properties_cache_rebuilds { 0 };
         u64 style_sheet_invalidation_set_builds { 0 };
         u64 scope_rule_cache_builds { 0 };
+        u64 style_query_container_scans { 0 };
+        u64 size_query_container_scan_visits { 0 };
         u64 relayouts_performed { 0 };
         u64 scrollable_overflow_recalculations { 0 };
     };
@@ -655029,6 +655186,13 @@ void Element::mark_descendants_with_stale_styles_for_style_update()
 
 void Element::invalidate_descendant_styles_depending_on_style_container_query()
 {
+    // Only an element some style container query resolved against can be what a dependent under it
+    // was asking about, and most documents have no style container queries at all.
+    if (!m_is_style_query_container)
+        return;
+
+    ++document().style_invalidation_counters().style_query_container_scans;
+
     for_each_shadow_including_descendant([](auto& node) {
         auto* element = as_if<Element>(node);
         if (element && element->style_depends_on_style_container_query())
@@ -659510,6 +659674,13 @@ public:
     void set_style_depends_on_size_container_query() { m_style_depends_on_size_container_query = true; }
     bool style_depends_on_style_container_query() const { return m_style_depends_on_style_container_query; }
     void set_style_depends_on_style_container_query() { m_style_depends_on_style_container_query = true; }
+    // Set on the element a container query selected as its query container, so a change on it knows
+    // whether anything under it was ever asking. Neither is ever cleared: a dependent that stops
+    // asking republishes nothing, and answering "maybe" costs the scan the element used to pay
+    // unconditionally.
+    void set_is_style_query_container() { m_is_style_query_container = true; }
+    bool is_size_query_container() const { return m_is_size_query_container; }
+    void set_is_size_query_container() { m_is_size_query_container = true; }
     void invalidate_descendant_styles_depending_on_style_container_query();
 
     bool child_style_uses_tree_counting_function() const { return m_child_style_uses_tree_counting_function; }
@@ -659943,6 +660114,8 @@ private:
     bool m_style_uses_inherit_css_function : 1 { false };
     bool m_style_depends_on_size_container_query : 1 { false };
     bool m_style_depends_on_style_container_query : 1 { false };
+    bool m_is_style_query_container : 1 { false };
+    bool m_is_size_query_container : 1 { false };
     bool m_child_style_uses_tree_counting_function : 1 { false };
     bool m_affected_by_has_pseudo_class_in_subject_position : 1 { false };
     bool m_affected_by_has_pseudo_class_in_non_subject_position : 1 { false };
@@ -665330,7 +665503,6 @@ Node::Node(Document& document, NodeType type)
     : EventTarget()
     , m_document(&document)
     , m_type(type)
-    , m_unique_id(allocate_unique_id(*this))
 {
     // A Document is its own shadow-including root, so it is always connected.
     if (type == NodeType::DOCUMENT_NODE)
@@ -665375,7 +665547,15 @@ CSS::UserSelect Node::user_select_used_value() const
 void Node::finalize()
 {
     Base::finalize();
-    deallocate_unique_id(m_unique_id);
+    if (m_unique_id.has_value())
+        deallocate_unique_id(*m_unique_id);
+}
+
+UniqueNodeID Node::unique_id() const
+{
+    if (!m_unique_id.has_value())
+        m_unique_id = allocate_unique_id(const_cast<Node&>(*this));
+    return *m_unique_id;
 }
 
 void Node::visit_edges(Cell::Visitor& visitor)
@@ -669382,7 +669562,7 @@ public:
     bool is_shadow_including_ancestor_of(Node const&) const;
     bool is_shadow_including_inclusive_ancestor_of(Node const&) const;
 
-    [[nodiscard]] UniqueNodeID unique_id() const { return m_unique_id; }
+    [[nodiscard]] UniqueNodeID unique_id() const;
     static Node* from_unique_id(UniqueNodeID);
 
     WebIDL::ExceptionOr<Utf16String> serialize_fragment(HTML::RequireWellFormed, FragmentSerializationMode = FragmentSerializationMode::Inner) const;
@@ -669500,217 +669680,6 @@ protected:
     bool m_is_connected { false };
     bool m_inside_blocking_wheel_event_handler { false };
 
-    UniqueNodeID m_unique_id;
+    mutable Optional<UniqueNodeID> m_unique_id;
 
     // https://dom.spec.whatwg.org/#registered-observer-list
-    // "Nodes have a strong reference to registered observers in their registered observer list." https://dom.spec.whatwg.org/#garbage-collection
-    OwnPtr<Vector<GC::Ref<RegisteredObserver>>> m_registered_observer_list;
-
-    void build_accessibility_tree(AccessibilityTreeNode& parent);
-
-    ErrorOr<Utf16String> name_or_description(NameOrDescription, Document const&, HashTable<UniqueNodeID>&, IsDescendant = IsDescendant::No, ShouldComputeRole = ShouldComputeRole::Yes) const;
-
-private:
-    void queue_tree_mutation_record(Vector<GC::Root<Node>> added_nodes, Vector<GC::Root<Node>> removed_nodes, Node* previous_sibling, Node* next_sibling);
-
-    void live_range_pre_remove();
-
-    void insert_before_impl(GC::Ref<Node>, GC::Ptr<Node> child);
-    void append_child_impl(GC::Ref<Node>);
-    void remove_child_impl(GC::Ref<Node>);
-    void clear_layout_node_paintable();
-
-    static Optional<Utf16View> first_valid_id(Utf16View, Document const&);
-
-    GC::Ptr<NodeList> m_child_nodes;
-};
-
-}
-
-FILE: Libraries/LibWeb/DOM/Node.idl
-// https://dom.spec.whatwg.org/#node
-[Exposed=Window]
-interface Node : EventTarget {
-    const unsigned short ELEMENT_NODE = 1;
-    const unsigned short ATTRIBUTE_NODE = 2;
-    const unsigned short TEXT_NODE = 3;
-    const unsigned short CDATA_SECTION_NODE = 4;
-    const unsigned short ENTITY_REFERENCE_NODE = 5; // legacy
-    const unsigned short ENTITY_NODE = 6; // legacy
-    const unsigned short PROCESSING_INSTRUCTION_NODE = 7;
-    const unsigned short COMMENT_NODE = 8;
-    const unsigned short DOCUMENT_NODE = 9;
-    const unsigned short DOCUMENT_TYPE_NODE = 10;
-    const unsigned short DOCUMENT_FRAGMENT_NODE = 11;
-    const unsigned short NOTATION_NODE = 12; // legacy
-    readonly attribute unsigned short nodeType;
-    readonly attribute Utf16DOMString nodeName;
-
-    readonly attribute Utf16USVString baseURI;
-
-    readonly attribute boolean isConnected;
-    readonly attribute Document? ownerDocument;
-    Node getRootNode(optional GetRootNodeOptions options = {});
-    readonly attribute Node? parentNode;
-    readonly attribute Element? parentElement;
-    boolean hasChildNodes();
-    [SameObject] readonly attribute NodeList childNodes;
-    readonly attribute Node? firstChild;
-    readonly attribute Node? lastChild;
-    readonly attribute Node? previousSibling;
-    readonly attribute Node? nextSibling;
-
-    [CEReactions] attribute Utf16DOMString? nodeValue;
-    [CEReactions] attribute Utf16DOMString? textContent;
-    [CEReactions] undefined normalize();
-
-    [CEReactions] Node cloneNode(optional boolean deep = false);
-    boolean isEqualNode(Node? otherNode);
-    boolean isSameNode(Node? otherNode); // legacy alias of ===
-
-    const unsigned short DOCUMENT_POSITION_DISCONNECTED = 0x01;
-    const unsigned short DOCUMENT_POSITION_PRECEDING = 0x02;
-    const unsigned short DOCUMENT_POSITION_FOLLOWING = 0x04;
-    const unsigned short DOCUMENT_POSITION_CONTAINS = 0x08;
-    const unsigned short DOCUMENT_POSITION_CONTAINED_BY = 0x10;
-    const unsigned short DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC = 0x20;
-    unsigned short compareDocumentPosition(Node? otherNode);
-    boolean contains(Node? other);
-
-    Utf16DOMString? lookupPrefix(Utf16DOMString? namespace);
-    Utf16DOMString? lookupNamespaceURI(Utf16DOMString? prefix);
-    boolean isDefaultNamespace(Utf16DOMString? namespace);
-
-    [ImplementedAs=pre_insert, CEReactions] Node insertBefore(Node node, Node? child);
-    [CEReactions] Node appendChild(Node node);
-    [CEReactions] Node replaceChild(Node node, Node child);
-    [ImplementedAs=pre_remove, CEReactions] Node removeChild(Node child);
-};
-
-dictionary GetRootNodeOptions {
-    boolean composed = false;
-};
-
-FILE: Libraries/LibWeb/DOM/NodeFilter.cpp
-/*
- * Copyright (c) 2022, Andreas Kling <andreas@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibGC/Heap.h>
-#include <LibJS/Runtime/Realm.h>
-#include <LibJS/Runtime/ValueInlines.h>
-#include <LibWeb/Bindings/Node.h>
-#include <LibWeb/Bindings/WrapperWorld.h>
-#include <LibWeb/DOM/BindingsGlue.h>
-#include <LibWeb/DOM/Node.h>
-#include <LibWeb/DOM/NodeFilter.h>
-#include <LibWeb/DOM/NodeIterator.h>
-#include <LibWeb/DOM/TreeWalker.h>
-#include <LibWeb/WebIDL/AbstractOperations.h>
-#include <LibWeb/WebIDL/DOMException.h>
-
-namespace Web::Bindings {
-
-static JS::Value filter_or_null(GC::Ptr<DOM::NodeFilter> filter)
-{
-    if (!filter)
-        return JS::js_null();
-    return filter->callback().callback;
-}
-
-JS::ThrowCompletionOr<DOM::NodeFilter::Result> accept_node(JS::Realm& realm, DOM::NodeFilter& filter, DOM::Node& node)
-{
-    auto& callback = filter.callback();
-    auto& callback_realm = callback.callback->shape().realm();
-    auto wrapped_node = Bindings::wrap(Bindings::host_defined_wrapper_world(callback_realm), callback_realm, GC::Ref { node });
-    auto result = WebIDL::call_user_object_operation(callback, "acceptNode"_utf16_fly_string, {}, { { wrapped_node } });
-    if (result.is_abrupt())
-        return result;
-
-    auto result_value = TRY(result.value().to_i32(realm.vm()));
-    return static_cast<DOM::NodeFilter::Result>(result_value);
-}
-
-static JS::ThrowCompletionOr<GC::Ptr<DOM::Node>> traversal_result_to_node(JS::Realm& realm, DOM::TraversalResult result, Optional<JS::Completion>& callback_exception, Utf16String const& active_error_message)
-{
-    switch (result.type) {
-    case DOM::TraversalResult::Type::Node:
-        return result.node;
-    case DOM::TraversalResult::Type::Null:
-        return nullptr;
-    case DOM::TraversalResult::Type::AlreadyActive:
-        return throw_completion(realm, WebIDL::InvalidStateError::create(active_error_message));
-    case DOM::TraversalResult::Type::CallbackException:
-        VERIFY(callback_exception.has_value());
-        return callback_exception.release_value();
-    }
-    VERIFY_NOT_REACHED();
-}
-
-template<typename Traverser, typename Callback>
-static JS::ThrowCompletionOr<GC::Ptr<DOM::Node>> traversal(JS::Realm& realm, Traverser& traverser, Callback callback, Utf16String const& active_error_message)
-{
-    Optional<JS::Completion> callback_exception;
-    DOM::TraversalFilter traversal_filter = [&](DOM::Node& node) -> Optional<DOM::NodeFilter::Result> {
-        auto result = accept_node(realm, *traverser.filter(), node);
-        if (result.is_error()) {
-            callback_exception = result.release_error();
-            return {};
-        }
-        return result.release_value();
-    };
-    return traversal_result_to_node(realm, callback(traverser, traversal_filter), callback_exception, active_error_message);
-}
-
-JS::Value filter(DOM::NodeIterator& iterator)
-{
-    return filter_or_null(iterator.filter());
-}
-
-JS::ThrowCompletionOr<GC::Ptr<DOM::Node>> next_node(JS::Realm& realm, DOM::NodeIterator& iterator)
-{
-    return traversal(
-        realm, iterator, [](DOM::NodeIterator& iterator, DOM::TraversalFilter const& traversal_filter) {
-            return iterator.next_node(traversal_filter);
-        },
-        "NodeIterator is already active"_utf16);
-}
-
-JS::ThrowCompletionOr<GC::Ptr<DOM::Node>> previous_node(JS::Realm& realm, DOM::NodeIterator& iterator)
-{
-    return traversal(
-        realm, iterator, [](DOM::NodeIterator& iterator, DOM::TraversalFilter const& traversal_filter) {
-            return iterator.previous_node(traversal_filter);
-        },
-        "NodeIterator is already active"_utf16);
-}
-
-JS::Value filter(DOM::TreeWalker& tree_walker)
-{
-    return filter_or_null(tree_walker.filter());
-}
-
-JS::ThrowCompletionOr<GC::Ptr<DOM::Node>> parent_node(JS::Realm& realm, DOM::TreeWalker& tree_walker)
-{
-    return traversal(
-        realm, tree_walker, [](DOM::TreeWalker& tree_walker, DOM::TraversalFilter const& traversal_filter) {
-            return tree_walker.parent_node(traversal_filter);
-        },
-        "TreeWalker is already active"_utf16);
-}
-
-JS::ThrowCompletionOr<GC::Ptr<DOM::Node>> first_child(JS::Realm& realm, DOM::TreeWalker& tree_walker)
-{
-    return traversal(
-        realm, tree_walker, [](DOM::TreeWalker& tree_walker, DOM::TraversalFilter const& traversal_filter) {
-            return tree_walker.first_child(traversal_filter);
-        },
-        "TreeWalker is already active"_utf16);
-}
-
-JS::ThrowCompletionOr<GC::Ptr<DOM::Node>> last_child(JS::Realm& realm, DOM::TreeWalker& tree_walker)
-{
-    return traversal(
-        realm, tree_walker, [](DOM::TreeWalker& tree_walker, DOM::TraversalFilter const& traversal_filter) {
