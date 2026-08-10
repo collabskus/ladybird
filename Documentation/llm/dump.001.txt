@@ -117573,6 +117573,7 @@ struct ShapingCacheKey {
     Utf16String text;
     u8 text_type { 0 };
     u32 letter_spacing_bit_pattern { 0 };
+    u32 word_spacing_bit_pattern { 0 };
 
     bool operator==(ShapingCacheKey const&) const = default;
 };
@@ -117695,7 +117696,7 @@ template<>
 struct Traits<Gfx::ShapingCacheKey> : public DefaultTraits<Gfx::ShapingCacheKey> {
     static unsigned hash(Gfx::ShapingCacheKey const& key)
     {
-        return pair_int_hash(key.text.hash(), pair_int_hash(key.text_type, key.letter_spacing_bit_pattern));
+        return pair_int_hash(key.text.hash(), pair_int_hash(key.text_type, pair_int_hash(key.letter_spacing_bit_pattern, key.word_spacing_bit_pattern)));
     }
 };
 
@@ -130892,6 +130893,8 @@ pub struct ShapedRunView {
     pub glyphs: *const DrawGlyph,
     pub glyph_count: usize,
     pub width: f32,
+    pub trailing_whitespace_length_in_code_units: usize,
+    pub trailing_whitespace_advance: f32,
     pub retained: *mut c_void,
 }
 
@@ -130903,6 +130906,7 @@ unsafe extern "C" {
         text_type: TextType,
         baseline_start_x: f32,
         letter_spacing: f32,
+        word_spacing: f32,
     ) -> ShapedRunView;
 
     fn ladybird_gfx_glyph_run_unref(retained: *mut c_void);
@@ -130924,6 +130928,8 @@ impl Drop for RetainedGlyphRun {
 pub struct ShapedText {
     glyphs: Vec<DrawGlyph>,
     width: f32,
+    trailing_whitespace_length_in_code_units: usize,
+    trailing_whitespace_advance: f32,
 }
 
 impl ShapedText {
@@ -130936,6 +130942,16 @@ impl ShapedText {
     pub fn width(&self) -> f32 {
         self.width
     }
+
+    #[inline]
+    pub fn trailing_whitespace_length_in_code_units(&self) -> usize {
+        self.trailing_whitespace_length_in_code_units
+    }
+
+    #[inline]
+    pub fn trailing_whitespace_advance(&self) -> f32 {
+        self.trailing_whitespace_advance
+    }
 }
 
 pub fn shape_text(
@@ -130944,6 +130960,7 @@ pub fn shape_text(
     text_type: TextType,
     baseline_start_x: f32,
     letter_spacing: f32,
+    word_spacing: f32,
 ) -> ShapedText {
     // SAFETY: FontRef keeps the font live, and the text slice remains valid
     // for the duration of the synchronous shaping call.
@@ -130955,6 +130972,7 @@ pub fn shape_text(
             text_type,
             baseline_start_x,
             letter_spacing,
+            word_spacing,
         )
     };
     let retained = RetainedGlyphRun {
@@ -130969,8 +130987,15 @@ pub fn shape_text(
         unsafe { std::slice::from_raw_parts(view.glyphs, view.glyph_count) }.to_vec()
     };
     let width = view.width;
+    let trailing_whitespace_length_in_code_units = view.trailing_whitespace_length_in_code_units;
+    let trailing_whitespace_advance = view.trailing_whitespace_advance;
     drop(retained);
-    ShapedText { glyphs, width }
+    ShapedText {
+        glyphs,
+        width,
+        trailing_whitespace_length_in_code_units,
+        trailing_whitespace_advance,
+    }
 }
 
 FILE: Libraries/LibGfx/Rust/src/yuv.rs
@@ -134172,7 +134197,7 @@ Vector<NonnullRefPtr<GlyphRun>> shape_text(FloatPoint baseline_start, Utf16View 
     FloatPoint last_position = baseline_start;
 
     auto add_run = [&runs, &last_position, letter_spacing](Utf16View const& string, Font const& font) {
-        auto run = shape_text(last_position, letter_spacing, string, font, GlyphRun::TextType::Common);
+        auto run = shape_text(last_position, letter_spacing, 0.f, string, font, GlyphRun::TextType::Common);
         last_position.translate_by(run->width(), 0);
         runs.append(*run);
     };
@@ -134242,7 +134267,27 @@ static hb_buffer_t* setup_text_shaping(Utf16View const& string, Font const& font
     return buffer;
 }
 
-static NonnullOwnPtr<ShapedGlyphs> build_origin_relative_shape(Utf16View const& string, Font const& font, GlyphRun::TextType text_type, float letter_spacing)
+// https://drafts.csswg.org/css-text-4/#word-separator
+static bool is_word_separator(u32 code_point)
+{
+    // Word-separator characters include the space (U+0020), the no-break space (U+00A0), the Ethiopic word space
+    // (U+1361), the Aegean word separators (U+10100,U+10101), the Ugaritic word divider (U+1039F), and the Phoenician
+    // Word Separator (U+1091F).
+    // AD-HOC: Only the space and no-break space are treated as word separators, matching other engines. The line feed
+    //         is also included because whitespace collapsing can leave a segment break in shaped text, where it
+    //         behaves as a space.
+    return code_point == 0x0020 || code_point == 0x00A0 || code_point == 0x000A;
+}
+
+static size_t length_of_trailing_whitespace_run(Utf16View const& string)
+{
+    size_t length = 0;
+    while (length < string.length_in_code_units() && is_ascii_space(string.code_unit_at(string.length_in_code_units() - length - 1)))
+        ++length;
+    return length;
+}
+
+static NonnullOwnPtr<ShapedGlyphs> build_origin_relative_shape(Utf16View const& string, Font const& font, GlyphRun::TextType text_type, float letter_spacing, float word_spacing)
 {
     auto const& metrics = font.pixel_metrics();
     auto* buffer = setup_text_shaping(string, font, text_type);
@@ -134254,6 +134299,11 @@ static NonnullOwnPtr<ShapedGlyphs> build_origin_relative_shape(Utf16View const& 
     Vector<DrawGlyph> glyphs;
     glyphs.ensure_capacity(glyph_count);
     FloatPoint point;
+
+    // The trailing whitespace advance is recorded so that trimming it at line end can subtract exactly what shaping
+    // added, spacing included.
+    TrailingWhitespace trailing_whitespace { .length_in_code_units = length_of_trailing_whitespace_run(string), .advance = 0 };
+    auto first_trailing_whitespace_offset = string.length_in_code_units() - trailing_whitespace.length_in_code_units;
 
     // We track the code unit length rather than just the code unit offset because LibWeb may later collapse glyph runs.
     // Updating the offset of each glyph gets tricky when handling text direction (LTR/RTL). So rather than doing that,
@@ -134285,10 +134335,15 @@ static NonnullOwnPtr<ShapedGlyphs> build_origin_relative_shape(Utf16View const& 
             - FloatPoint { 0, metrics.ascent }
             + FloatPoint { positions[i].x_offset, positions[i].y_offset } / text_shaping_resolution;
 
+        auto extra_advance = letter_spacing;
+        if (auto starting_offset = glyph_info[i].cluster; starting_offset < string.length_in_code_units()
+            && is_word_separator(string.code_point_at(starting_offset)))
+            extra_advance += word_spacing;
+
         glyphs.unchecked_append({
             .position = position,
             .length_in_code_units = glyph_length_in_code_units(i),
-            .glyph_width = should_paint ? positions[i].x_advance / text_shaping_resolution + letter_spacing : 0,
+            .glyph_width = should_paint ? positions[i].x_advance / text_shaping_resolution + extra_advance : 0,
             .glyph_id = glyph_info[i].codepoint,
             .should_paint = should_paint,
         });
@@ -134300,19 +134355,24 @@ static NonnullOwnPtr<ShapedGlyphs> build_origin_relative_shape(Utf16View const& 
 
         // NOTE: The spec says that we "really should not" apply letter-spacing to the trailing edge of a line but
         //       other browsers do so we will as well. https://drafts.csswg.org/css-text/#example-7880704e
-        point.translate_by(letter_spacing, 0);
+        point.translate_by(extra_advance, 0);
+
+        if (glyph_info[i].cluster >= first_trailing_whitespace_offset)
+            trailing_whitespace.advance += glyphs.last().glyph_width;
     }
 
     hb_buffer_destroy(buffer);
 
-    return make<ShapedGlyphs>(move(glyphs), point.x());
+    return make<ShapedGlyphs>(move(glyphs), point.x(), trailing_whitespace);
 }
 
-NonnullRefPtr<GlyphRun> shape_text(FloatPoint baseline_start, float letter_spacing, Utf16View const& string, Font const& font, GlyphRun::TextType text_type)
+NonnullRefPtr<GlyphRun> shape_text(FloatPoint baseline_start, float letter_spacing, float word_spacing, Utf16View const& string, Font const& font, GlyphRun::TextType text_type, TrailingWhitespace* out_trailing_whitespace)
 {
     auto& shaping_cache = font.shaping_cache();
 
     auto build_glyph_run = [&](ShapedGlyphs const& shape) -> NonnullRefPtr<GlyphRun> {
+        if (out_trailing_whitespace)
+            *out_trailing_whitespace = shape.trailing_whitespace;
         Vector<DrawGlyph> glyphs = shape.glyphs;
         if (!baseline_start.is_zero()) {
             for (auto& glyph : glyphs)
@@ -134322,32 +134382,34 @@ NonnullRefPtr<GlyphRun> shape_text(FloatPoint baseline_start, float letter_spaci
     };
 
     // FIXME: The cache currently grows unbounded. We should have some limit and LRU mechanism.
-    if (string.length_in_code_units() == 1 && letter_spacing == 0.f && text_type == GlyphRun::TextType::Common) {
+    if (string.length_in_code_units() == 1 && letter_spacing == 0.f && word_spacing == 0.f && text_type == GlyphRun::TextType::Common) {
         auto code_unit = string.code_unit_at(0);
         if (code_unit < 128) {
             auto& cache_slot = shaping_cache.single_ascii_character_map[code_unit];
             if (!cache_slot)
-                cache_slot = build_origin_relative_shape(string, font, text_type, letter_spacing);
+                cache_slot = build_origin_relative_shape(string, font, text_type, letter_spacing, word_spacing);
             return build_glyph_run(*cache_slot);
         }
     }
 
     auto text_type_bits = static_cast<u8>(to_underlying(text_type));
     auto letter_spacing_bit_pattern = bit_cast<u32>(letter_spacing);
-    auto key_hash = pair_int_hash(string.hash(), pair_int_hash(text_type_bits, letter_spacing_bit_pattern));
+    auto word_spacing_bit_pattern = bit_cast<u32>(word_spacing);
+    auto key_hash = pair_int_hash(string.hash(), pair_int_hash(text_type_bits, pair_int_hash(letter_spacing_bit_pattern, word_spacing_bit_pattern)));
 
     if (auto it = shaping_cache.map.find(key_hash, [&](auto const& candidate) {
             return candidate.key.text_type == text_type_bits
                 && candidate.key.letter_spacing_bit_pattern == letter_spacing_bit_pattern
+                && candidate.key.word_spacing_bit_pattern == word_spacing_bit_pattern
                 && candidate.key.text == string;
         });
         it != shaping_cache.map.end()) {
         return build_glyph_run(*it->value);
     }
 
-    auto shape = build_origin_relative_shape(string, font, text_type, letter_spacing);
+    auto shape = build_origin_relative_shape(string, font, text_type, letter_spacing, word_spacing);
     auto run = build_glyph_run(*shape);
-    shaping_cache.map.set({ Utf16String::from_utf16(string), text_type_bits, letter_spacing_bit_pattern }, move(shape));
+    shaping_cache.map.set({ Utf16String::from_utf16(string), text_type_bits, letter_spacing_bit_pattern, word_spacing_bit_pattern }, move(shape));
     return run;
 }
 
@@ -134386,7 +134448,7 @@ static_assert(offsetof(Gfx::FFI::DrawGlyph, glyph_id) == offsetof(Gfx::DrawGlyph
 static_assert(offsetof(Gfx::FFI::DrawGlyph, should_paint) == offsetof(Gfx::DrawGlyph, should_paint));
 
 extern "C" {
-Gfx::FFI::ShapedRunView ladybird_gfx_shape_text(void const*, u16 const*, size_t, Gfx::FFI::TextType, float, float);
+Gfx::FFI::ShapedRunView ladybird_gfx_shape_text(void const*, u16 const*, size_t, Gfx::FFI::TextType, float, float, float);
 void ladybird_gfx_glyph_run_unref(void*);
 }
 
@@ -134396,24 +134458,30 @@ extern "C" Gfx::FFI::ShapedRunView ladybird_gfx_shape_text(
     size_t length_in_code_units,
     Gfx::FFI::TextType text_type,
     float baseline_start_x,
-    float letter_spacing)
+    float letter_spacing,
+    float word_spacing)
 {
     VERIFY(font);
     VERIFY(text_utf16 || length_in_code_units == 0);
     auto text = length_in_code_units == 0
         ? Utf16View {}
         : Utf16View { reinterpret_cast<char16_t const*>(text_utf16), length_in_code_units };
+    Gfx::TrailingWhitespace trailing_whitespace;
     auto run = Gfx::shape_text(
         { baseline_start_x, 0 },
         letter_spacing,
+        word_spacing,
         text,
         *static_cast<Gfx::Font const*>(font),
-        static_cast<Gfx::GlyphRun::TextType>(text_type));
+        static_cast<Gfx::GlyphRun::TextType>(text_type),
+        &trailing_whitespace);
     auto* retained = &run.leak_ref();
     return {
         .glyphs = reinterpret_cast<Gfx::FFI::DrawGlyph const*>(retained->glyphs().data()),
         .glyph_count = retained->glyphs().size(),
         .width = retained->width(),
+        .trailing_whitespace_length_in_code_units = trailing_whitespace.length_in_code_units,
+        .trailing_whitespace_advance = trailing_whitespace.advance,
         .retained = retained,
     };
 }
@@ -134458,9 +134526,15 @@ struct DrawGlyph {
     bool should_paint { true };
 };
 
+struct TrailingWhitespace {
+    size_t length_in_code_units { 0 };
+    float advance { 0 };
+};
+
 struct ShapedGlyphs {
     Vector<DrawGlyph> glyphs;
     float width { 0 };
+    TrailingWhitespace trailing_whitespace;
 };
 
 class GlyphRun : public AtomicRefCounted<GlyphRun> {
@@ -134501,7 +134575,7 @@ private:
     mutable OwnPtr<CachedTextBlob> m_cached_text_blob;
 };
 
-NonnullRefPtr<GlyphRun> shape_text(FloatPoint baseline_start, float letter_spacing, Utf16View const&, Gfx::Font const& font, GlyphRun::TextType);
+NonnullRefPtr<GlyphRun> shape_text(FloatPoint baseline_start, float letter_spacing, float word_spacing, Utf16View const&, Gfx::Font const& font, GlyphRun::TextType, TrailingWhitespace* = nullptr);
 Vector<NonnullRefPtr<GlyphRun>> shape_text(FloatPoint baseline_start, Utf16View const&, FontCascadeList const&, float letter_spacing = 0.f);
 float measure_text_width(Utf16View const&, Font const& font, float letter_spacing = 0.f);
 
@@ -669623,81 +669697,3 @@ public:
     virtual bool is_child_allowed(Node const&) const { return true; }
 
     [[nodiscard]] bool needs_layout_tree_update() const { return m_needs_layout_tree_update; }
-    void set_needs_layout_tree_update(bool, SetNeedsLayoutTreeUpdateReason);
-
-    [[nodiscard]] bool child_needs_layout_tree_update() const { return m_child_needs_layout_tree_update; }
-    void set_child_needs_layout_tree_update(bool b) { m_child_needs_layout_tree_update = b; }
-
-    bool needs_style_update() const { return m_needs_style_update; }
-    void set_needs_style_update(bool);
-    void set_needs_style_update_internal(bool) { m_needs_style_update = true; }
-
-    bool child_needs_style_update() const { return m_child_needs_style_update; }
-    void set_child_needs_style_update(bool b) { m_child_needs_style_update = b; }
-
-    [[nodiscard]] bool entire_subtree_needs_style_update() const { return m_entire_subtree_needs_style_update; }
-    void set_entire_subtree_needs_style_update(bool b) { m_entire_subtree_needs_style_update = b; }
-
-    [[nodiscard]] bool children_may_depend_on_non_inherited_property_inheritance() const { return m_children_may_depend_on_non_inherited_property_inheritance; }
-    void set_children_may_depend_on_non_inherited_property_inheritance() { m_children_may_depend_on_non_inherited_property_inheritance = true; }
-
-    void invalidate_style(StyleInvalidationReason);
-    void invalidate_style(StyleInvalidationReason, Vector<CSS::InvalidationSet::Property> const&, StyleInvalidationOptions);
-    CSS::StyleScope& style_scope();
-    CSS::StyleScope const& style_scope() const { return const_cast<Node*>(this)->style_scope(); }
-    void for_each_style_scope_which_may_observe_the_node(Function<void(CSS::StyleScope&)> const&);
-
-    void set_document(Badge<Document, NamedNodeMap>, Document&);
-
-    virtual EventTarget* get_parent(Event const&) override;
-
-    template<typename T>
-    bool fast_is() const = delete;
-
-    template<typename T>
-    T* fast_as() = delete;
-    template<typename T>
-    T const* fast_as() const = delete;
-
-    WebIDL::ExceptionOr<void> ensure_pre_insertion_validity(GC::Ref<Node> node, GC::Ptr<Node> child, bool exclude_all_children = false) const;
-
-    bool is_host_including_inclusive_ancestor_of(Node const&) const;
-
-    bool is_scripting_enabled() const;
-    bool is_scripting_disabled() const;
-
-    // Used for dumping the DOM Tree
-    void serialize_tree_as_json(JsonObjectSerializer<Utf16StringBuilder>&) const;
-    IterationDecision serialize_child_as_json(JsonArraySerializer<Utf16StringBuilder>& children_array, Node const& child) const;
-
-    bool is_shadow_including_descendant_of(Node const&) const;
-    bool is_shadow_including_inclusive_descendant_of(Node const&) const;
-    bool is_shadow_including_ancestor_of(Node const&) const;
-    bool is_shadow_including_inclusive_ancestor_of(Node const&) const;
-
-    [[nodiscard]] UniqueNodeID unique_id() const;
-    static Node* from_unique_id(UniqueNodeID);
-
-    WebIDL::ExceptionOr<Utf16String> serialize_fragment(HTML::RequireWellFormed, FragmentSerializationMode = FragmentSerializationMode::Inner) const;
-
-    WebIDL::ExceptionOr<void> unsafely_set_html(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>>, Utf16View);
-
-    void replace_all(GC::Ptr<Node>);
-    void string_replace_all(Utf16View);
-    void string_replace_all(Utf16String);
-
-    bool is_same_node(Node const*) const;
-    bool is_equal_node(Node const*) const;
-
-    GC::Ref<Node> get_root_node(RootNodeComposed = RootNodeComposed::No);
-    GC::Ref<Node> get_root_node(Bindings::GetRootNodeOptions const&);
-
-    bool is_uninteresting_whitespace_node() const;
-
-    Utf16String debug_description() const;
-
-    size_t length() const;
-
-    auto& registered_observer_list() { return m_registered_observer_list; }
-    auto const& registered_observer_list() const { return m_registered_observer_list; }
-
