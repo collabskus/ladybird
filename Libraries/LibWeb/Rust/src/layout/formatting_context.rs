@@ -486,7 +486,6 @@ pub(crate) fn register_contained_abspos_child(
             static_position_rect,
             containing_block_info_override,
             inline_containing_block,
-            inline_containing_block_rect: None,
         },
     );
 }
@@ -936,8 +935,6 @@ pub struct FfiLayoutFcCallbacks {
     pub arena: *mut c_void,
     pub initial_containing_block_inline_size: CssPixels,
     pub document_in_quirks_mode: bool,
-    pub static_position_containing_block: unsafe extern "C" fn(*mut c_void, *mut c_void) -> NodeSlotId,
-    pub needs_inset_resolution: unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool,
     pub report_unexpected_fragmented_inline: unsafe extern "C" fn(*mut c_void, *mut c_void),
     pub build_svg_facts: unsafe extern "C" fn(*mut c_void, *mut c_void) -> FfiSvgElementFacts,
     pub read_paintable_geometry:
@@ -1067,10 +1064,6 @@ impl FfiLayoutFcCallbacks {
 
     pub(crate) fn inline_containing_block(&self, node: Node) -> Node {
         self.node_data(node).inline_containing_block
-    }
-
-    pub(crate) fn static_position_containing_block(&self, node: Node) -> Node {
-        unsafe { (self.static_position_containing_block)(self.context, self.shell(node)) }
     }
 
     pub(crate) fn is_ancestor(&self, ancestor: Node, mut node: Node) -> bool {
@@ -1291,6 +1284,12 @@ pub(crate) fn independent_root_automatic_block_size(
         return automatic_content_block_size_of_completed_run.unwrap_or_default();
     }
     let style = StyleValues::for_node(callbacks, node);
+    if style.display().is_flex_inside()
+        && let Some(automatic_content_block_size_reported_by_completed_run) =
+            automatic_content_block_size_of_completed_run
+    {
+        return automatic_content_block_size_reported_by_completed_run;
+    }
     if style.display().is_flex_inside() || style.display().is_grid_inside() || style.display().is_table_inside() {
         // The automatic block size of a flex, grid, or table container is its
         // max-content size.
@@ -1306,6 +1305,63 @@ pub(crate) fn independent_root_automatic_block_size(
     CssPixels::default()
 }
 
+fn flex_self_block_size_resolution_space(
+    run: &FormattingContextRun,
+    resolution_space: AvailableSpace,
+    constraints: ContainingBlockConstraints,
+) -> Option<AvailableSpace> {
+    run.fragments.as_ref()?;
+    let node = run.box_;
+    let style = StyleValues::for_node(&run.callbacks, node);
+    if !style.display().is_flex_inside() || !style.min_height().is_auto() {
+        return None;
+    }
+    if NodeFacts::new(&run.callbacks, node).document_in_quirks_mode() {
+        return None;
+    }
+    let sizing = run.sizing();
+    if !sizing.should_treat_block_size_as_auto(node, resolution_space, constraints)
+        || sizing.box_is_sized_as_replaced_element(node, resolution_space, constraints)
+    {
+        return None;
+    }
+    Some(resolution_space)
+}
+
+// Flex containers with an automatic block size are treated as max-content, so resolve it early.
+fn eagerly_resolve_atomic_flex_root_auto_block_size(
+    run: &FormattingContextRun,
+    input: &LayoutInput,
+    inline_definite_space: AvailableSpace,
+) {
+    let node = run.box_;
+    let sizing = run.sizing();
+    if !StyleValues::for_node(&run.callbacks, node).display().is_flex_inside()
+        || sizing.box_is_sized_as_replaced_element(node, input.available_space, input.containing_block_constraints)
+    {
+        return;
+    }
+    sizing.resolve_used_block_size_if_treated_as_auto(
+        node,
+        inline_definite_space,
+        input.containing_block_constraints,
+        None,
+        || {
+            independent_root_automatic_block_size(
+                run.purpose,
+                &run.records,
+                &run.callbacks,
+                node,
+                run.records
+                    .used_values(node)
+                    .available_inner_space_or_constraints_from(inline_definite_space),
+                input.containing_block_constraints,
+                None,
+            )
+        },
+    );
+}
+
 fn apply_root_sizing_directives(
     run: &FormattingContextRun,
     input: &LayoutInput,
@@ -1315,8 +1371,12 @@ fn apply_root_sizing_directives(
         ParticipationInParentFormattingContext::BlockLevel => dimension_block_level_root(run, input, parent_block),
         ParticipationInParentFormattingContext::Float => {
             let parent = parent_block.expect("a floating run requires an enclosing block formatting context");
-            parent.dimension_float_root(run.box_, input);
-            body_input_with_inner_available_space(run, input)
+            let flex_self_resolution_space =
+                flex_self_block_size_resolution_space(run, input.available_space, input.containing_block_constraints);
+            parent.dimension_float_root(run.box_, input, flex_self_resolution_space.is_some());
+            let mut body_input = body_input_with_inner_available_space(run, input);
+            body_input.sizing.flex_self_block_size_resolution_space = flex_self_resolution_space;
+            body_input
         }
         ParticipationInParentFormattingContext::AtomicInline => {
             run.sizing().dimension_atomic_root(
@@ -1325,7 +1385,18 @@ fn apply_root_sizing_directives(
                 input.containing_block_constraints,
                 run.layout_mode,
             );
-            body_input_with_inner_available_space(run, input)
+            let mut body_input = body_input_with_inner_available_space(run, input);
+            let inline_definite_space = AvailableSpace {
+                inline_size: AvailableSize::definite(run.records.used_values(run.box_).content_inline_size.get()),
+                block_size: AvailableSize::Indefinite,
+            };
+            let flex_self_resolution_space =
+                flex_self_block_size_resolution_space(run, inline_definite_space, input.containing_block_constraints);
+            if flex_self_resolution_space.is_none() {
+                eagerly_resolve_atomic_flex_root_auto_block_size(run, input, inline_definite_space);
+            }
+            body_input.sizing.flex_self_block_size_resolution_space = flex_self_resolution_space;
+            body_input
         }
         ParticipationInParentFormattingContext::AbsolutelyPositioned(abspos_inputs) => {
             AbsposEngine::for_run(run).dimension_out_of_flow_root(run.box_, abspos_inputs);
@@ -1367,7 +1438,8 @@ fn dimension_block_level_root(
     let constraints = input.containing_block_constraints;
     let parent = parent_block.expect("a block-level run requires an enclosing block formatting context");
     parent.commit_block_level_root_inline_size(node, input);
-    parent.resolve_block_level_root_block_size_before_body(node, input);
+    let flex_self_resolution_space = flex_self_block_size_resolution_space(run, available_space, constraints);
+    parent.resolve_block_level_root_block_size_before_body(node, input, flex_self_resolution_space.is_some());
     let sizing = run.sizing();
     let style = StyleValues::for_node(&run.callbacks, node);
     let mut body_input = body_input_with_inner_available_space(run, input);
@@ -1388,6 +1460,7 @@ fn dimension_block_level_root(
         constraints,
         measured_content_block_size,
     );
+    body_input.sizing.flex_self_block_size_resolution_space = flex_self_resolution_space;
     body_input
 }
 
@@ -1431,11 +1504,11 @@ fn size_skipped_independent_root(
         ParticipationInParentFormattingContext::BlockLevel => {
             let parent = parent_block.expect("a block-level run requires an enclosing block formatting context");
             parent.commit_block_level_root_inline_size(child, input);
-            parent.resolve_block_level_root_block_size_before_body(child, input);
+            parent.resolve_block_level_root_block_size_before_body(child, input, false);
         }
         ParticipationInParentFormattingContext::Float => {
             let parent = parent_block.expect("a floating run requires an enclosing block formatting context");
-            parent.dimension_float_root(child, input);
+            parent.dimension_float_root(child, input, false);
             parent.finalize_float_root(child, input, None);
         }
         ParticipationInParentFormattingContext::AbsolutelyPositioned(abspos_inputs) => {
