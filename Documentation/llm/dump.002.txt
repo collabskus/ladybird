@@ -210545,6 +210545,8 @@ void paint_background(DisplayListRecordingContext& context, Paintable const& pai
         clip_shrink.right = context.rounded_device_pixels(border_right.width);
     }
 
+    bool painted_mask_layer = false;
+
     // Note: Background layers are ordered front-to-back, so we paint them in reverse
     for (auto& layer : resolved_background.layers.in_reverse()) {
         DisplayListRecorderStateSaver state { display_list_recorder };
@@ -210565,14 +210567,39 @@ void paint_background(DisplayListRecordingContext& context, Paintable const& pai
             }
         }
 
-        auto const& image = *layer.background_image;
-        auto image_rect = layer.image_rect;
-        auto background_positioning_area = layer.background_positioning_area;
-
         auto original_context = display_list_recorder.accumulated_visual_context();
         ScopeGuard restore_context = [&] {
             display_list_recorder.set_accumulated_visual_context(original_context);
         };
+
+        auto compositing_and_blending_operator = mix_blend_mode_to_compositing_and_blending_operator(layer.blend_mode);
+        // https://drafts.fxtf.org/css-masking-1/#the-mask-composite
+        // If there is no further mask layer, the compositing operator must be ignored.
+        if (layer.mask_composite.has_value()) {
+            if (painted_mask_layer)
+                compositing_and_blending_operator = *layer.mask_composite;
+            painted_mask_layer = true;
+        }
+        bool applied_blend_layer = false;
+        ScopeGuard restore_blend_layer = [&] {
+            if (applied_blend_layer)
+                display_list_recorder.restore();
+        };
+        auto apply_blend_layer = [&] {
+            if (compositing_and_blending_operator == Gfx::CompositingAndBlendingOperator::Normal)
+                return;
+            display_list_recorder.apply_effects(compositing_and_blending_operator);
+            applied_blend_layer = true;
+        };
+
+        if (!layer.background_image) {
+            apply_blend_layer();
+            continue;
+        }
+
+        auto const& image = *layer.background_image;
+        auto image_rect = layer.image_rect;
+        auto background_positioning_area = layer.background_positioning_area;
 
         switch (layer.attachment) {
         case CSS::BackgroundAttachment::Fixed:
@@ -210678,7 +210705,6 @@ void paint_background(DisplayListRecordingContext& context, Paintable const& pai
                     image_rect.set_x(image_x);
                     auto image_device_rect = context.rounded_device_rect(image_rect);
                     // If the image's dimensions were rounded to zero then they need to be restored to avoid a crash.
-                    // There's no need to check that !image_rect.is_empty() because empty images are discarded in resolve_background_layers.
                     if (image_device_rect.width() == 0)
                         image_device_rect.set_width(1);
                     if (image_device_rect.height() == 0)
@@ -210693,15 +210719,6 @@ void paint_background(DisplayListRecordingContext& context, Paintable const& pai
                     break;
                 image_y += y_step;
             }
-        };
-
-        Gfx::CompositingAndBlendingOperator compositing_and_blending_operator = mix_blend_mode_to_compositing_and_blending_operator(layer.blend_mode);
-        bool applied_blend_layer = false;
-        auto apply_blend_layer = [&] {
-            if (compositing_and_blending_operator == Gfx::CompositingAndBlendingOperator::Normal)
-                return;
-            display_list_recorder.apply_effects(compositing_and_blending_operator);
-            applied_blend_layer = true;
         };
 
         // Past this (super-large) tile count, the non-image branch below covers the area with a single repeating
@@ -210734,7 +210751,6 @@ void paint_background(DisplayListRecordingContext& context, Paintable const& pai
             // of a repeated background, so the painter has the opportunity to optimize the painting of repeated images.
             auto dest_rect = context.rounded_device_rect(image_rect);
             // If the image's dimensions were rounded to zero then they need to be restored to avoid a crash.
-            // There's no need to check that !image_rect.is_empty() because empty images are discarded in resolve_background_layers.
             if (dest_rect.width() == 0)
                 dest_rect.set_width(1);
             if (dest_rect.height() == 0)
@@ -210809,10 +210825,6 @@ void paint_background(DisplayListRecordingContext& context, Paintable const& pai
                 image.paint(context, document, image_device_rect, image_rendering, color_scheme);
             });
         }
-
-        if (applied_blend_layer) {
-            display_list_recorder.restore();
-        }
     }
 
     if (paint_into_isolated_group)
@@ -210827,7 +210839,15 @@ void paint_background(DisplayListRecordingContext& context, Paintable const& pai
     }
 }
 
-ResolvedBackground resolve_background_layers(Vector<CSS::BackgroundLayerData> const& layers, Paintable const& paintable_box, Color background_color, CSS::BackgroundBox background_color_clip, CSSPixelRect const& border_rect, BorderRadiiData const& border_radii)
+enum class LayerType : u8 {
+    Background,
+    Mask,
+};
+
+// https://drafts.fxtf.org/css-masking-1/#the-mask-image
+static ResolvedBackground resolve_layers(Vector<CSS::BackgroundLayerData> const& layers,
+    Paintable const& paintable_box, Color background_color, CSS::BackgroundBox background_color_clip,
+    CSSPixelRect const& border_rect, BorderRadiiData const& border_radii, LayerType layer_type)
 {
     BackgroundBox border_box {
         border_rect,
@@ -210837,12 +210857,29 @@ ResolvedBackground resolve_background_layers(Vector<CSS::BackgroundLayerData> co
     auto color_box = get_box(background_color_clip, border_box, paintable_box);
 
     Vector<ResolvedBackgroundLayerData> resolved_layers;
+    // A value of none counts as a transparent black image layer.
+    // A mask reference that is an empty image (zero width or zero height), that fails to download, is not a reference
+    // to an mask element, is non-existent, or that cannot be displayed (e.g. because it is not in a supported image
+    // format) still counts as an image layer of transparent black.
     for (auto const& layer : layers) {
-        if (!layer.background_image)
-            continue;
+        auto mask_composite = layer_type == LayerType::Mask
+            ? mask_composite_to_compositing_and_blending_operator(layer.mask_composite)
+            : Optional<Gfx::CompositingAndBlendingOperator> {};
+        auto append_transparent_mask_layer = [&] {
+            if (layer_type != LayerType::Mask)
+                return;
+            ResolvedBackgroundLayerData transparent_mask_layer {};
+            transparent_mask_layer.clip = layer.clip;
+            transparent_mask_layer.blend_mode = layer.blend_mode;
+            transparent_mask_layer.mask_composite = mask_composite;
+            resolved_layers.append(move(transparent_mask_layer));
+        };
+
         auto const& document = paintable_box.layout_node().document();
-        if (!layer.background_image->is_paintable(document))
+        if (!layer.background_image || !layer.background_image->is_paintable(document)) {
+            append_transparent_mask_layer();
             continue;
+        }
 
         auto background_positioning_area = get_box(layer.origin, border_box, paintable_box).rect;
 
@@ -210873,8 +210910,10 @@ ResolvedBackground resolve_background_layers(Vector<CSS::BackgroundLayerData> co
             background_positioning_area.size());
 
         // If the image has no size, there's nothing to paint.
-        if (concrete_image_size.is_empty())
+        if (concrete_image_size.is_empty()) {
+            append_transparent_mask_layer();
             continue;
+        }
 
         // Size
         CSSPixelRect image_rect;
@@ -210899,8 +210938,10 @@ ResolvedBackground resolve_background_layers(Vector<CSS::BackgroundLayerData> co
         }
 
         // If after sizing we have a 0px image, we're done. Attempting to paint this would be an infinite loop.
-        if (image_rect.is_empty())
+        if (image_rect.is_empty()) {
+            append_transparent_mask_layer();
             continue;
+        }
 
         // If background-repeat is round for one (or both) dimensions, there is a second step.
         // The UA must scale the image in that dimension (or both dimensions) so that it fits a
@@ -210938,8 +210979,10 @@ ResolvedBackground resolve_background_layers(Vector<CSS::BackgroundLayerData> co
         }
 
         // If after round adjustments we have a 0px image, we're done.
-        if (image_rect.is_empty())
+        if (image_rect.is_empty()) {
+            append_transparent_mask_layer();
             continue;
+        }
 
         CSSPixels space_x = background_positioning_area.width() - image_rect.width();
         CSSPixels space_y = background_positioning_area.height() - image_rect.height();
@@ -210947,7 +210990,7 @@ ResolvedBackground resolve_background_layers(Vector<CSS::BackgroundLayerData> co
         CSSPixels position_x = layer.position_x.to_px(space_x);
         CSSPixels position_y = layer.position_y.to_px(space_y);
 
-        resolved_layers.append({ .background_image = *layer.background_image,
+        resolved_layers.append({ .background_image = layer.background_image,
             .attachment = layer.attachment,
             .clip = layer.clip,
             .position_x = position_x,
@@ -210956,7 +210999,8 @@ ResolvedBackground resolve_background_layers(Vector<CSS::BackgroundLayerData> co
             .image_rect = image_rect,
             .repeat_x = layer.repeat_x,
             .repeat_y = layer.repeat_y,
-            .blend_mode = layer.blend_mode });
+            .blend_mode = layer.blend_mode,
+            .mask_composite = mask_composite });
     }
 
     return ResolvedBackground {
@@ -210966,6 +211010,21 @@ ResolvedBackground resolve_background_layers(Vector<CSS::BackgroundLayerData> co
         .background_rect = border_rect,
         .color = background_color
     };
+}
+
+ResolvedBackground resolve_background_layers(Vector<CSS::BackgroundLayerData> const& layers,
+    Paintable const& paintable_box, Color background_color, CSS::BackgroundBox background_color_clip,
+    CSSPixelRect const& border_rect, BorderRadiiData const& border_radii)
+{
+    return resolve_layers(layers, paintable_box, background_color, background_color_clip, border_rect, border_radii,
+        LayerType::Background);
+}
+
+ResolvedBackground resolve_mask_layers(Vector<CSS::BackgroundLayerData> const& layers, Paintable const& paintable_box,
+    CSSPixelRect const& border_rect)
+{
+    return resolve_layers(layers, paintable_box, Color::Transparent, CSS::BackgroundBox::BorderBox, border_rect, {},
+        LayerType::Mask);
 }
 
 }
@@ -210979,6 +211038,7 @@ FILE: Libraries/LibWeb/Painting/BackgroundPainting.h
 
 #pragma once
 
+#include <LibGfx/CompositingAndBlendingOperator.h>
 #include <LibWeb/Export.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/Painting/BorderPainting.h>
@@ -210987,7 +211047,7 @@ FILE: Libraries/LibWeb/Painting/BackgroundPainting.h
 namespace Web::Painting {
 
 struct ResolvedBackgroundLayerData {
-    NonnullRefPtr<CSS::AbstractImageStyleValue const> background_image;
+    RefPtr<CSS::AbstractImageStyleValue const> background_image;
     CSS::BackgroundAttachment attachment;
     CSS::BackgroundBox clip;
     CSSPixels position_x;
@@ -210997,6 +211057,7 @@ struct ResolvedBackgroundLayerData {
     CSS::Repetition repeat_x;
     CSS::Repetition repeat_y;
     CSS::MixBlendMode blend_mode;
+    Optional<Gfx::CompositingAndBlendingOperator> mask_composite;
 };
 
 struct BackgroundBox {
@@ -211019,6 +211080,7 @@ struct ResolvedBackground {
 };
 
 WEB_API ResolvedBackground resolve_background_layers(Vector<CSS::BackgroundLayerData> const& layers, Paintable const& paintable_box, Color background_color, CSS::BackgroundBox background_color_clip, CSSPixelRect const& border_rect, BorderRadiiData const& border_radii);
+ResolvedBackground resolve_mask_layers(Vector<CSS::BackgroundLayerData> const&, Paintable const&, CSSPixelRect const&);
 
 WEB_API void paint_background(DisplayListRecordingContext&, Paintable const&, CSS::ImageRendering, ResolvedBackground const&, BorderRadiiData const&);
 
@@ -211051,6 +211113,23 @@ Gfx::CompositingAndBlendingOperator mix_blend_mode_to_compositing_and_blending_o
     }
 }
 
+// https://drafts.fxtf.org/css-masking-1/#the-mask-composite
+Gfx::CompositingAndBlendingOperator mask_composite_to_compositing_and_blending_operator(
+    CSS::CompositingOperator compositing_operator)
+{
+    switch (compositing_operator) {
+    case CSS::CompositingOperator::Add:
+        return Gfx::CompositingAndBlendingOperator::Normal;
+    case CSS::CompositingOperator::Subtract:
+        return Gfx::CompositingAndBlendingOperator::SourceOut;
+    case CSS::CompositingOperator::Intersect:
+        return Gfx::CompositingAndBlendingOperator::SourceIn;
+    case CSS::CompositingOperator::Exclude:
+        return Gfx::CompositingAndBlendingOperator::Xor;
+    }
+    VERIFY_NOT_REACHED();
+}
+
 }
 
 FILE: Libraries/LibWeb/Painting/Blending.h
@@ -211063,6 +211142,7 @@ FILE: Libraries/LibWeb/Painting/Blending.h
 #pragma once
 
 #include <LibGfx/CompositingAndBlendingOperator.h>
+#include <LibWeb/CSS/Enums.h>
 #include <LibWeb/Forward.h>
 
 namespace Web::Painting {
@@ -211088,6 +211168,7 @@ namespace Web::Painting {
     E(PlusLighter)
 
 Gfx::CompositingAndBlendingOperator mix_blend_mode_to_compositing_and_blending_operator(CSS::MixBlendMode blend_mode);
+Gfx::CompositingAndBlendingOperator mask_composite_to_compositing_and_blending_operator(CSS::CompositingOperator);
 
 }
 
@@ -228963,7 +229044,7 @@ void StackingContext::paint(DisplayListRecordingContext& context) const
             DisplayListRecorder display_list_recorder(*mask_display_list, visual_context_tree, context.display_list_recorder().resource_storage());
             auto mask_painting_context = context.clone(display_list_recorder);
             auto mask_rect = CSSPixelRect { {}, mask_layer.area.size() };
-            auto resolved_mask = resolve_background_layers(mask_layers, paintable_box(), Color::Transparent, CSS::BackgroundBox::BorderBox, mask_rect, {});
+            auto resolved_mask = resolve_mask_layers(mask_layers, paintable_box(), mask_rect);
 
             // FIXME: Respect `image-rendering` here.
             paint_background(mask_painting_context, paintable_box(), CSS::ImageRendering::Auto, resolved_mask, {});
@@ -273532,27 +273613,6 @@ impl BlockFormattingContext {
         }
     }
 
-    pub(crate) fn finalize_float_root(
-        &self,
-        node: Node,
-        input: &LayoutInput,
-        run_automatic_sizes: Option<(CssPixels, CssPixels)>,
-    ) {
-        // A floating table wrapper shrink-to-fits from cached intrinsic sizes, which may not match
-        // the inline size table layout just produced; the wrapper has the same inline size as the table grid box.
-        if self.facts(node).is_table_wrapper()
-            && let Some((automatic_content_inline_size, _)) = run_automatic_sizes
-        {
-            self.used(node).set_content_inline_size(automatic_content_inline_size);
-        }
-        self.resolve_used_block_size_if_treated_as_auto(
-            node,
-            input.available_space,
-            input.containing_block_constraints,
-            run_automatic_sizes.map(|(_, automatic_content_block_size)| automatic_content_block_size),
-        );
-    }
-
     pub(crate) fn layout_floating_box(
         &self,
         run: &FormattingContextRun,
@@ -277862,20 +277922,21 @@ impl MeasurementState {
         Self { callbacks }
     }
 
-    fn run(&self, node: Node, node_used: std::rc::Rc<UsedValues>, input: LayoutInput) -> ChildLayoutResult {
-        self.run_with_layout_mode(node, node_used, LayoutMode::IntrinsicSizing, input).result
+    fn run(&self, node: Node, node_used: &UsedValues, input: LayoutInput) -> ChildLayoutResult {
+        self.run_with_layout_mode(node, node_used, LayoutMode::IntrinsicSizing, input)
     }
 
     pub(crate) fn run_with_layout_mode(
         &self,
         node: Node,
-        node_used: std::rc::Rc<UsedValues>,
+        node_used: &UsedValues,
         layout_mode: LayoutMode,
         input: LayoutInput,
-    ) -> RunOutputs {
+    ) -> ChildLayoutResult {
         let fc_type = crate::layout::independent_formatting_context_type(node, &self.callbacks);
         crate::layout::run_formatting_context(
             LayoutPurpose::Measurement,
+            None,
             node_used,
             node,
             None,
@@ -278481,9 +278542,32 @@ pub(crate) struct ChildLayoutResult {
     pub table_box_in_wrapper_border_box_block_size: Option<CssPixels>,
 }
 
+pub(crate) struct RunRootOutcome {
+    cells: UsedValuesCellState,
+    own_metrics_sealed: bool,
+    line_data: Option<LineData>,
+    rare: Option<UsedValuesRareData>,
+}
+
+impl RunRootOutcome {
+    fn apply_to_record(self, record: &UsedValues) {
+        self.cells.apply_to_record(record);
+        if let Some(line_data) = self.line_data {
+            *record.line_data_cell().borrow_mut() = line_data;
+        }
+        if let Some(rare) = self.rare {
+            rare.install_present_payloads_into(record);
+        }
+        if self.own_metrics_sealed {
+            record.seal_own_metrics();
+        }
+    }
+}
+
 pub(crate) struct RunOutputs {
     pub(crate) result: ChildLayoutResult,
     pub(crate) root: Option<UnplacedRootFragment>,
+    pub(crate) root_outcome: RunRootOutcome,
 }
 
 pub(crate) enum ChildLayoutOutcome {
@@ -278801,7 +278885,18 @@ impl FormattingContextRun {
     }
 
     pub(crate) fn outputs(&self, result: ChildLayoutResult, root: Option<UnplacedRootFragment>) -> RunOutputs {
-        RunOutputs { result, root }
+        let record = self.records.used_values(self.box_);
+        let root_outcome = RunRootOutcome {
+            cells: UsedValuesCellState::capture(&record),
+            own_metrics_sealed: record.own_metrics_are_sealed(),
+            line_data: record.line_data.get().map(std::cell::RefCell::take),
+            rare: record.rare_data.get().map(std::cell::RefCell::take),
+        };
+        RunOutputs {
+            result,
+            root,
+            root_outcome,
+        }
     }
 }
 
@@ -279003,20 +279098,22 @@ pub(crate) fn independent_root_automatic_block_size(
 }
 
 fn flex_self_block_size_resolution_space(
-    run: &FormattingContextRun,
+    child_run_builds_fragments: bool,
+    sizing: &SizingContext,
+    node: Node,
     resolution_space: AvailableSpace,
     constraints: ContainingBlockConstraints,
 ) -> Option<AvailableSpace> {
-    run.fragments.as_ref()?;
-    let node = run.box_;
-    let style = StyleValues::for_node(&run.callbacks, node);
+    if !child_run_builds_fragments {
+        return None;
+    }
+    let style = sizing.style(node);
     if !style.display().is_flex_inside() || !style.min_height().is_auto() {
         return None;
     }
-    if NodeFacts::new(&run.callbacks, node).document_in_quirks_mode() {
+    if sizing.facts(node).document_in_quirks_mode() {
         return None;
     }
-    let sizing = run.sizing();
     if !sizing.should_treat_block_size_as_auto(node, resolution_space, constraints)
         || sizing.box_is_sized_as_replaced_element(node, resolution_space, constraints)
     {
@@ -279059,22 +279156,10 @@ fn eagerly_resolve_atomic_flex_root_auto_block_size(
     );
 }
 
-fn apply_root_sizing_directives(
-    run: &FormattingContextRun,
-    input: &LayoutInput,
-    parent_block: Option<&BlockFormattingContext>,
-) -> LayoutInput {
+fn apply_root_sizing_directives(run: &FormattingContextRun, input: &LayoutInput) -> LayoutInput {
     match input.participation {
-        ParticipationInParentFormattingContext::BlockLevel => dimension_block_level_root(run, input, parent_block),
-        ParticipationInParentFormattingContext::Float => {
-            let parent = parent_block.expect("a floating run requires an enclosing block formatting context");
-            let flex_self_resolution_space =
-                flex_self_block_size_resolution_space(run, input.available_space, input.containing_block_constraints);
-            parent.dimension_float_root(run.box_, input, flex_self_resolution_space.is_some());
-            let mut body_input = body_input_with_inner_available_space(run, input);
-            body_input.sizing.flex_self_block_size_resolution_space = flex_self_resolution_space;
-            body_input
-        }
+        ParticipationInParentFormattingContext::BlockLevel => dimension_block_level_root(run, input),
+        ParticipationInParentFormattingContext::Float => body_input_with_inner_available_space(run, input),
         ParticipationInParentFormattingContext::AtomicInline => {
             run.sizing().dimension_atomic_root(
                 run.box_,
@@ -279087,8 +279172,13 @@ fn apply_root_sizing_directives(
                 inline_size: AvailableSize::definite(run.records.used_values(run.box_).content_inline_size.get()),
                 block_size: AvailableSize::Indefinite,
             };
-            let flex_self_resolution_space =
-                flex_self_block_size_resolution_space(run, inline_definite_space, input.containing_block_constraints);
+            let flex_self_resolution_space = flex_self_block_size_resolution_space(
+                run.fragments.is_some(),
+                &run.sizing(),
+                run.box_,
+                inline_definite_space,
+                input.containing_block_constraints,
+            );
             if flex_self_resolution_space.is_none() {
                 eagerly_resolve_atomic_flex_root_auto_block_size(run, input, inline_definite_space);
             }
@@ -279125,18 +279215,10 @@ fn apply_root_sizing_directives(
     }
 }
 
-fn dimension_block_level_root(
-    run: &FormattingContextRun,
-    input: &LayoutInput,
-    parent_block: Option<&BlockFormattingContext>,
-) -> LayoutInput {
+fn dimension_block_level_root(run: &FormattingContextRun, input: &LayoutInput) -> LayoutInput {
     let node = run.box_;
     let available_space = input.available_space;
     let constraints = input.containing_block_constraints;
-    let parent = parent_block.expect("a block-level run requires an enclosing block formatting context");
-    parent.commit_block_level_root_inline_size(node, input);
-    let flex_self_resolution_space = flex_self_block_size_resolution_space(run, available_space, constraints);
-    parent.resolve_block_level_root_block_size_before_body(node, input, flex_self_resolution_space.is_some());
     let sizing = run.sizing();
     let style = StyleValues::for_node(&run.callbacks, node);
     let mut body_input = body_input_with_inner_available_space(run, input);
@@ -279157,16 +279239,10 @@ fn dimension_block_level_root(
         constraints,
         measured_content_block_size,
     );
-    body_input.sizing.flex_self_block_size_resolution_space = flex_self_resolution_space;
     body_input
 }
 
-fn finalize_block_level_root(
-    run: &FormattingContextRun,
-    input: &LayoutInput,
-    parent_block: Option<&BlockFormattingContext>,
-    body_result: &ChildLayoutResult,
-) {
+fn finalize_block_level_root(run: &FormattingContextRun, input: &LayoutInput, body_result: &ChildLayoutResult) {
     let node = run.box_;
     let facts = NodeFacts::new(&run.callbacks, node);
     if facts.is_table_wrapper() {
@@ -279176,18 +279252,71 @@ fn finalize_block_level_root(
     }
     let style = StyleValues::for_node(&run.callbacks, node);
     if !style.display().is_table_inside() {
-        let parent = parent_block.expect("a block-level run requires an enclosing block formatting context");
-        let resolution_space = parent.sizing().available_space_for_block_size_resolution(
+        let sizing = run.sizing();
+        let resolution_space = sizing.available_space_for_block_size_resolution(
             node,
             input.available_space,
             input.containing_block_constraints,
         );
-        parent.resolve_used_block_size_if_treated_as_auto(
+        sizing.resolve_used_block_size_if_treated_as_auto(
             node,
             resolution_space,
             input.containing_block_constraints,
             Some(body_result.automatic_content_block_size),
+            || unreachable!("a completed block-level run always supplies its automatic content block size"),
         );
+    }
+}
+
+fn finalize_float_root(run: &FormattingContextRun, input: &LayoutInput, body_result: &ChildLayoutResult) {
+    let node = run.box_;
+    if NodeFacts::new(&run.callbacks, node).is_table_wrapper() {
+        run.records
+            .used_values(node)
+            .set_content_inline_size(body_result.automatic_content_inline_size);
+    }
+    run.sizing().resolve_used_block_size_if_treated_as_auto(
+        node,
+        input.available_space,
+        input.containing_block_constraints,
+        Some(body_result.automatic_content_block_size),
+        || unreachable!("a completed float run always supplies its automatic content block size"),
+    );
+}
+
+fn dimension_root_in_parent_scope(
+    parent_block: Option<&BlockFormattingContext>,
+    child: Node,
+    input: &LayoutInput,
+    child_run_builds_fragments: bool,
+) -> Option<AvailableSpace> {
+    match input.participation {
+        ParticipationInParentFormattingContext::BlockLevel => {
+            let parent = parent_block.expect("a block-level run requires an enclosing block formatting context");
+            parent.commit_block_level_root_inline_size(child, input);
+            let flex_self_resolution_space = flex_self_block_size_resolution_space(
+                child_run_builds_fragments,
+                &parent.sizing(),
+                child,
+                input.available_space,
+                input.containing_block_constraints,
+            );
+            parent.resolve_block_level_root_block_size_before_body(child, input, flex_self_resolution_space.is_some());
+            flex_self_resolution_space
+        }
+        ParticipationInParentFormattingContext::Float => {
+            let parent = parent_block.expect("a floating run requires an enclosing block formatting context");
+            let flex_self_resolution_space = flex_self_block_size_resolution_space(
+                child_run_builds_fragments,
+                &parent.sizing(),
+                child,
+                input.available_space,
+                input.containing_block_constraints,
+            );
+            parent.dimension_float_root(child, input, flex_self_resolution_space.is_some());
+            flex_self_resolution_space
+        }
+        _ => None,
     }
 }
 
@@ -279197,23 +279326,26 @@ fn size_skipped_independent_root(
     child: Node,
     input: &LayoutInput,
 ) {
+    dimension_root_in_parent_scope(parent_block, child, input, false);
     match input.participation {
-        ParticipationInParentFormattingContext::BlockLevel => {
-            let parent = parent_block.expect("a block-level run requires an enclosing block formatting context");
-            parent.commit_block_level_root_inline_size(child, input);
-            parent.resolve_block_level_root_block_size_before_body(child, input, false);
-        }
         ParticipationInParentFormattingContext::Float => {
             let parent = parent_block.expect("a floating run requires an enclosing block formatting context");
-            parent.dimension_float_root(child, input, false);
-            parent.finalize_float_root(child, input, None);
+            parent.resolve_used_block_size_if_treated_as_auto(
+                child,
+                input.available_space,
+                input.containing_block_constraints,
+                None,
+            );
         }
         ParticipationInParentFormattingContext::AbsolutelyPositioned(abspos_inputs) => {
             let engine = AbsposEngine::for_run(run);
             engine.dimension_out_of_flow_root(child, abspos_inputs);
             engine.finalize_out_of_flow_root_after_inside_layout(child, abspos_inputs, None);
         }
-        ParticipationInParentFormattingContext::AtomicInline | ParticipationInParentFormattingContext::Item | ParticipationInParentFormattingContext::Root => {}
+        ParticipationInParentFormattingContext::BlockLevel
+        | ParticipationInParentFormattingContext::AtomicInline
+        | ParticipationInParentFormattingContext::Item
+        | ParticipationInParentFormattingContext::Root => {}
     }
 }
 
@@ -279230,7 +279362,37 @@ fn body_input_with_inner_available_space(run: &FormattingContextRun, input: &Lay
 #[expect(clippy::too_many_arguments)]
 fn run_formatting_context(
     purpose: LayoutPurpose,
-    root_used: std::rc::Rc<UsedValues>,
+    parent_fragments: Option<&RunFragmentBuilder>,
+    parent_used: &UsedValues,
+    box_: Node,
+    parent_grid: Option<&GridFormattingContext>,
+    fc_type: FfiFormattingContextType,
+    layout_mode: LayoutMode,
+    should_collect_devtools_layout_data: bool,
+    callbacks: FfiLayoutFcCallbacks,
+    input: LayoutInput,
+    parent_block: Option<&BlockFormattingContext>,
+) -> ChildLayoutResult {
+    let root_cells = UsedValuesCellState::capture(parent_used);
+    let outputs = execute_formatting_context_run(
+        purpose,
+        root_cells,
+        box_,
+        parent_grid,
+        fc_type,
+        layout_mode,
+        should_collect_devtools_layout_data,
+        callbacks,
+        input,
+        parent_block,
+    );
+    absorb_run_outputs(parent_fragments, parent_used, box_, outputs)
+}
+
+#[expect(clippy::too_many_arguments)]
+fn execute_formatting_context_run(
+    purpose: LayoutPurpose,
+    root_cells: UsedValuesCellState,
     box_: Node,
     parent_grid: Option<&GridFormattingContext>,
     fc_type: FfiFormattingContextType,
@@ -279241,6 +279403,7 @@ fn run_formatting_context(
     parent_block: Option<&BlockFormattingContext>,
 ) -> RunOutputs {
     assert!(!box_.is_invalid());
+    let root_used = std::rc::Rc::new(root_cells.materialize_record());
     let run = FormattingContextRun {
         purpose,
         records: std::rc::Rc::new(RunRecords::new(box_, root_used)),
@@ -279258,7 +279421,7 @@ fn run_formatting_context(
         }),
     };
     let run = &run;
-    let body_input = apply_root_sizing_directives(run, &input, parent_block);
+    let body_input = apply_root_sizing_directives(run, &input);
 
     let cached_atomic_block_size = if matches!(input.participation, ParticipationInParentFormattingContext::AtomicInline) {
         run.sizing().apply_cached_intrinsic_inline_measurement(
@@ -279337,15 +279500,10 @@ fn run_formatting_context(
 
     match input.participation {
         ParticipationInParentFormattingContext::BlockLevel => {
-            finalize_block_level_root(run, &input, parent_block, &result);
+            finalize_block_level_root(run, &input, &result);
         }
         ParticipationInParentFormattingContext::Float => {
-            let parent = parent_block.expect("a floating run requires an enclosing block formatting context");
-            parent.finalize_float_root(
-                run.box_,
-                &input,
-                Some((result.automatic_content_inline_size, result.automatic_content_block_size)),
-            );
+            finalize_float_root(run, &input, &result);
         }
         ParticipationInParentFormattingContext::AtomicInline => {
             let automatic_content_block_size_of_completed_body_run = cached_atomic_block_size
@@ -279510,9 +279668,16 @@ pub(crate) fn layout_inside_child(
             run.box_,
             run.treat_block_axis_percentage_insets_as_auto_beyond_root,
         );
-    let outputs = run_formatting_context(
+    input.sizing.flex_self_block_size_resolution_space = dimension_root_in_parent_scope(
+        parent_block,
+        child,
+        &input,
+        layout_mode == LayoutMode::Normal && !run.purpose.is_measurement(),
+    );
+    ChildLayoutOutcome::Created(run_formatting_context(
         run.purpose,
-        used,
+        run.fragments.as_deref(),
+        &used,
         child,
         parent_grid,
         fc_type,
@@ -279521,20 +279686,26 @@ pub(crate) fn layout_inside_child(
         run.callbacks,
         input,
         parent_block,
-    );
-    ChildLayoutOutcome::Created(hold_unplaced_root_and_take_result(run.fragments.as_deref(), child, outputs))
+    ))
 }
 
-pub(crate) fn hold_unplaced_root_and_take_result(
+fn absorb_run_outputs(
     parent_fragments: Option<&RunFragmentBuilder>,
+    parent_used: &UsedValues,
     child: Node,
     outputs: RunOutputs,
 ) -> ChildLayoutResult {
-    if let (Some(fragments), Some(root)) = (parent_fragments, outputs.root) {
+    let RunOutputs {
+        result,
+        root,
+        root_outcome,
+    } = outputs;
+    root_outcome.apply_to_record(parent_used);
+    if let (Some(fragments), Some(root)) = (parent_fragments, root) {
         debug_assert!(root.node == child, "a child run returned a root for a different box");
         fragments.hold_unplaced_root(root);
     }
-    outputs.result
+    result
 }
 
 fn independent_formatting_context_type(
@@ -279659,9 +279830,10 @@ pub unsafe extern "C" fn rust_layout_run_root_layout(
         )
         .with_forced_sizes(viewport_inline_size, viewport_block_size);
         let fc_type = independent_formatting_context_type(root_for_layout, &callbacks);
-        let outputs = run_formatting_context(
+        run_formatting_context(
             LayoutPurpose::Commit,
-            root_for_layout_used,
+            Some(&entry_fragments),
+            &root_for_layout_used,
             root_for_layout,
             None,
             fc_type,
@@ -279671,7 +279843,6 @@ pub unsafe extern "C" fn rust_layout_run_root_layout(
             input,
             None,
         );
-        hold_unplaced_root_and_take_result(Some(&entry_fragments), root_for_layout, outputs);
         place_child(&entry_run, root_for_layout, FfiCssPixelPoint::default(), None);
         drain_and_commit_entry_pass(
             &entry_records,
@@ -279770,9 +279941,10 @@ pub unsafe extern "C" fn rust_layout_compute_subtree_layout(
         let facts = NodeFacts::new(&callbacks, root);
         let fc_type = formatting_context_type_created_by_box(facts)
             .expect("partial relayout root must establish an independent formatting context");
-        let outputs = run_formatting_context(
+        run_formatting_context(
             LayoutPurpose::Commit,
-            root_used.clone(),
+            Some(&entry_fragments),
+            &root_used,
             root,
             None,
             fc_type,
@@ -279782,7 +279954,6 @@ pub unsafe extern "C" fn rust_layout_compute_subtree_layout(
             input,
             None,
         );
-        hold_unplaced_root_and_take_result(Some(&entry_fragments), root, outputs);
         entry_fragments.normalize_arrivals_for_placement(root);
         entry_fragments.build_fragment_for_placed_box(
             &callbacks,
@@ -291650,9 +291821,10 @@ fn layout_replaced_with_children(run: &FormattingContextRun, layout_input: Layou
         .create_used_values(&run.callbacks, wrapper, wrapper_constraints);
     wrapper_state.set_content_inline_size(content_inline_size);
 
-    let wrapper_layout = crate::layout::run_formatting_context(
+    let wrapper_result = crate::layout::run_formatting_context(
         run.purpose,
-        wrapper_state,
+        run.fragments.as_deref(),
+        &wrapper_state,
         wrapper,
         None,
         FfiFormattingContextType::Block,
@@ -291671,9 +291843,6 @@ fn layout_replaced_with_children(run: &FormattingContextRun, layout_input: Layou
         },
         None,
     );
-
-    let wrapper_result =
-        crate::layout::hold_unplaced_root_and_take_result(run.fragments.as_deref(), wrapper, wrapper_layout);
     crate::layout::place_child(run, wrapper, FfiCssPixelPoint::default(), None);
 
     ChildLayoutResult {
@@ -293325,7 +293494,7 @@ impl SizingContext {
         };
         let mut result = measurement.run(
             node,
-            root.clone(),
+            &root,
             LayoutInput::new(
                 AvailableSpace {
                     inline_size: available_inline_size,
@@ -293366,7 +293535,7 @@ impl SizingContext {
         root.set_content_inline_size(inline_size);
         let result = measurement.run(
             node,
-            root,
+            &root,
             LayoutInput::new(
                 AvailableSpace {
                     inline_size: AvailableSize::definite(inline_size),
@@ -293444,11 +293613,10 @@ impl SizingContext {
         measurement
             .run_with_layout_mode(
                 node,
-                node_used,
+                &node_used,
                 layout_mode,
                 LayoutInput::new(inner_available_space, constraints, ParticipationInParentFormattingContext::Root),
             )
-            .result
             .automatic_content_block_size
     }
 
@@ -293636,7 +293804,7 @@ impl SizingContext {
         let wrapper_used = measurement.create_used_values(wrapper, table_wrapper_constraints);
         let wrapper_outputs = measurement.run_with_layout_mode(
             wrapper,
-            wrapper_used,
+            &wrapper_used,
             LayoutMode::IntrinsicSizing,
             LayoutInput {
                 available_space: self
@@ -293650,7 +293818,6 @@ impl SizingContext {
         );
 
         let table_used_block_size = wrapper_outputs
-            .result
             .table_box_in_wrapper_border_box_block_size
             .expect("a table wrapper's measurement run lays out the table box inside it");
         if matches!(available_space.block_size, AvailableSize::Definite(_)) {
@@ -297282,7 +297449,7 @@ impl TableFormattingContext {
 
         let result = measurement.run_with_layout_mode(
             cell.box_,
-            measured_root.clone(),
+            &measured_root,
             self.layout_mode,
             LayoutInput {
                 available_space: inner,
@@ -297294,8 +297461,7 @@ impl TableFormattingContext {
                 },
                 participation: ParticipationInParentFormattingContext::Item,
             },
-        )
-        .result;
+        );
         let measured_cell_used = measured_root;
         Some(MeasuredCellContent {
             content_block_size: result.automatic_content_block_size,
@@ -302146,6 +302312,10 @@ impl<T: Copy> SealableCell<T> {
     pub(crate) fn seal(&self) {
         self.sealed.set(true);
     }
+
+    pub(crate) fn is_sealed(&self) -> bool {
+        self.sealed.get()
+    }
 }
 
 #[derive(Default)]
@@ -302165,6 +302335,54 @@ pub(crate) struct UsedValuesRareData {
     pub(crate) used_grid_tracks: Option<OwnedUsedGridTracks>,
     pub(crate) override_borders_data: Option<FfiBordersData>,
     pub(crate) abspos_layout_inputs: Option<AbsposLayoutInputs>,
+}
+
+impl UsedValuesRareData {
+    pub(crate) fn install_present_payloads_into(self, record: &UsedValues) {
+        let Self {
+            table_cell_coordinates,
+            computed_svg_path,
+            computed_svg_transforms,
+            svg_viewport_size,
+            grid_layout_data,
+            flex_layout_data,
+            used_grid_tracks,
+            override_borders_data,
+            abspos_layout_inputs,
+        } = self;
+        debug_assert!(
+            table_cell_coordinates.is_none() && override_borders_data.is_none() && abspos_layout_inputs.is_none(),
+            "a run authored a parent-owned rare payload on its root record"
+        );
+        if computed_svg_path.is_none()
+            && computed_svg_transforms.is_none()
+            && svg_viewport_size.is_none()
+            && grid_layout_data.is_none()
+            && flex_layout_data.is_none()
+            && used_grid_tracks.is_none()
+        {
+            return;
+        }
+        let mut rare = record.rare_data_mut();
+        if let Some(path) = computed_svg_path {
+            rare.computed_svg_path = Some(path);
+        }
+        if let Some(transforms) = computed_svg_transforms {
+            rare.computed_svg_transforms = Some(transforms);
+        }
+        if let Some(size) = svg_viewport_size {
+            rare.svg_viewport_size = Some(size);
+        }
+        if let Some(data) = grid_layout_data {
+            rare.grid_layout_data = Some(data);
+        }
+        if let Some(data) = flex_layout_data {
+            rare.flex_layout_data = Some(data);
+        }
+        if let Some(tracks) = used_grid_tracks {
+            rare.used_grid_tracks = Some(tracks);
+        }
+    }
 }
 
 /// The per-box geometry stored in a Rust-owned layout pass.
@@ -302302,6 +302520,10 @@ impl UsedValues {
         self.content_offset.seal();
     }
 
+    pub(crate) fn own_metrics_are_sealed(&self) -> bool {
+        self.content_inline_size.is_sealed()
+    }
+
     pub(crate) fn seal_own_metrics(&self) {
         self.content_inline_size.seal();
         self.content_block_size.seal();
@@ -302317,6 +302539,74 @@ impl UsedValues {
         self.padding_right.seal();
         self.padding_top.seal();
         self.padding_bottom.seal();
+    }
+}
+
+macro_rules! used_values_cell_state {
+    ($($field:ident: $type:ty,)+) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(crate) struct UsedValuesCellState {
+            $(pub(crate) $field: $type,)+
+        }
+
+        impl UsedValuesCellState {
+            pub(crate) fn capture(used: &UsedValues) -> Self {
+                Self {
+                    $($field: used.$field.get(),)+
+                }
+            }
+
+            pub(crate) fn apply_to_record(&self, used: &UsedValues) {
+                $(
+                    if used.$field.get() != self.$field {
+                        used.$field.set(self.$field);
+                    }
+                )+
+            }
+        }
+    };
+}
+
+used_values_cell_state! {
+    content_inline_size: CssPixels,
+    content_block_size: CssPixels,
+    margin_left: CssPixels,
+    margin_right: CssPixels,
+    margin_top: CssPixels,
+    margin_bottom: CssPixels,
+    border_left: CssPixels,
+    border_right: CssPixels,
+    border_top: CssPixels,
+    border_bottom: CssPixels,
+    padding_left: CssPixels,
+    padding_right: CssPixels,
+    padding_top: CssPixels,
+    padding_bottom: CssPixels,
+    inset_left: CssPixels,
+    inset_right: CssPixels,
+    inset_top: CssPixels,
+    inset_bottom: CssPixels,
+    has_definite_inline_size: bool,
+    has_definite_block_size: bool,
+    uses_collapsing_borders_model: bool,
+    inline_size_constraint: SizeConstraint,
+    block_size_constraint: SizeConstraint,
+    has_content_offset: bool,
+    content_offset: FfiCssPixelPoint,
+    has_first_baseline: bool,
+    first_baseline: CssPixels,
+    has_last_baseline: bool,
+    last_baseline: CssPixels,
+}
+
+impl UsedValuesCellState {
+    pub(crate) fn materialize_record(&self) -> UsedValues {
+        let record = UsedValues::default();
+        self.apply_to_record(&record);
+        if self.has_content_offset {
+            record.seal_committed_box_metrics();
+        }
+        record
     }
 }
 
@@ -637206,388 +637496,3 @@ test("eval in function prevents optimization of identifiers in that function", (
     function test() {
         eval("var undefined = 42");
         return undefined;
-    }
-    expect(test()).toBe(42);
-});
-
-test("NaN is not affected by eval in sibling function", () => {
-    function foo() {
-        return NaN;
-    }
-
-    function bar() {
-        eval("");
-        return 42;
-    }
-
-    expect(foo()).toBeNaN();
-    expect(bar()).toBe(42);
-});
-
-test("Infinity is not affected by eval in sibling function", () => {
-    function foo() {
-        return Infinity;
-    }
-
-    function bar() {
-        eval("");
-        return 42;
-    }
-
-    expect(foo()).toBe(Infinity);
-    expect(bar()).toBe(42);
-});
-
-test("multiple global identifiers with eval in one function", () => {
-    function withoutEval() {
-        return [undefined, NaN, Infinity];
-    }
-
-    function withEval() {
-        eval("");
-        return 42;
-    }
-
-    const result = withoutEval();
-    expect(result[0]).toBeUndefined();
-    expect(result[1]).toBeNaN();
-    expect(result[2]).toBe(Infinity);
-    expect(withEval()).toBe(42);
-});
-
-test("eval in nested function does not affect outer function globals", () => {
-    function outer() {
-        var u = undefined;
-        function inner() {
-            eval("");
-        }
-        inner();
-        return u;
-    }
-    expect(outer()).toBeUndefined();
-});
-
-test("undefined optimization with eval before reference", () => {
-    function test() {
-        eval("");
-        return undefined;
-    }
-    expect(test()).toBeUndefined();
-});
-
-test("undefined optimization with eval after reference", () => {
-    function test() {
-        var result = undefined;
-        eval("");
-        return result;
-    }
-    expect(test()).toBeUndefined();
-});
-
-test("undefined in arrow function without eval", () => {
-    const test = () => undefined;
-    expect(test()).toBeUndefined();
-});
-
-test("undefined in arrow function with eval in sibling", () => {
-    const foo = () => undefined;
-    const bar = () => {
-        eval("");
-        return 42;
-    };
-
-    expect(foo()).toBeUndefined();
-    expect(bar()).toBe(42);
-});
-
-test("global identifiers in multiple nested scopes with eval", () => {
-    function outer() {
-        function middle() {
-            function inner() {
-                return undefined;
-            }
-            return inner();
-        }
-        return middle();
-    }
-
-    function withEval() {
-        eval("");
-    }
-
-    expect(outer()).toBeUndefined();
-    withEval();
-});
-
-test("eval can create variables that shadow global identifiers", () => {
-    function testVarShadow() {
-        eval("var undefined = 'shadowed'");
-        return undefined;
-    }
-
-    function testNoEval() {
-        // No eval means optimization works
-        return undefined;
-    }
-
-    expect(testVarShadow()).toBe("shadowed");
-    expect(testNoEval()).toBeUndefined();
-});
-
-test("undefined after eval that modifies local scope", () => {
-    function test() {
-        var x = 10;
-        eval("x = 20");
-        return [x, undefined];
-    }
-    const result = test();
-    expect(result[0]).toBe(20);
-    expect(result[1]).toBeUndefined();
-});
-
-test("multiple functions with different eval patterns", () => {
-    function noEval1() {
-        return undefined;
-    }
-
-    function hasEval1() {
-        eval("var x = 1");
-        return undefined;
-    }
-
-    function noEval2() {
-        return NaN;
-    }
-
-    function hasEval2() {
-        eval("");
-        return Infinity;
-    }
-
-    expect(noEval1()).toBeUndefined();
-    expect(hasEval1()).toBeUndefined();
-    expect(noEval2()).toBeNaN();
-    expect(hasEval2()).toBe(Infinity);
-});
-
-test("eval does not affect global identifier in outer scope", () => {
-    var result;
-
-    function outer() {
-        result = undefined;
-
-        function inner() {
-            eval("var y = 42");
-        }
-
-        inner();
-    }
-
-    outer();
-    expect(result).toBeUndefined();
-});
-
-test("complex nesting with eval only in innermost function", () => {
-    function level1() {
-        return (function level2() {
-            return (function level3() {
-                return (function level4() {
-                    eval("");
-                    return undefined;
-                })();
-            })();
-        })();
-    }
-
-    expect(level1()).toBeUndefined();
-});
-
-test("eval in one branch does not affect other branches", () => {
-    function branch1() {
-        return undefined;
-    }
-
-    function branch2() {
-        eval("");
-        return NaN;
-    }
-
-    function branch3() {
-        return Infinity;
-    }
-
-    expect(branch1()).toBeUndefined();
-    expect(branch2()).toBeNaN();
-    expect(branch3()).toBe(Infinity);
-});
-
-// Tests for nested function patterns (typescript.js scenario)
-test("nested function sees eval-shadowed undefined from parent scope", () => {
-    function parent() {
-        function child() {
-            return undefined;
-        }
-        eval("var undefined = 42");
-        return child();
-    }
-    expect(parent()).toBe(42);
-});
-
-test("nested function sees eval-shadowed NaN from parent scope", () => {
-    function parent() {
-        function child() {
-            return NaN;
-        }
-        eval("var NaN = 'shadowed'");
-        return child();
-    }
-    expect(parent()).toBe("shadowed");
-});
-
-test("nested function sees eval-shadowed Infinity from parent scope", () => {
-    function parent() {
-        function child() {
-            return Infinity;
-        }
-        eval("var Infinity = 999");
-        return child();
-    }
-    expect(parent()).toBe(999);
-});
-
-test("deeply nested function sees eval-shadowed value", () => {
-    function level1() {
-        function level2() {
-            function level3() {
-                return undefined;
-            }
-            return level3();
-        }
-        eval("var undefined = 'deep'");
-        return level2();
-    }
-    expect(level1()).toBe("deep");
-});
-
-test("sibling nested functions both see eval-shadowed value", () => {
-    function parent() {
-        function child1() {
-            return undefined;
-        }
-        function child2() {
-            return undefined;
-        }
-        eval("var undefined = 'both'");
-        return [child1(), child2()];
-    }
-    const result = parent();
-    expect(result[0]).toBe("both");
-    expect(result[1]).toBe("both");
-});
-
-test("eval in nested function shadows for that function and its children only", () => {
-    function outer() {
-        var outerResult = undefined;
-        function middle() {
-            function inner() {
-                return undefined;
-            }
-            eval("var undefined = 'middle'");
-            return inner();
-        }
-        return [outerResult, middle()];
-    }
-    const result = outer();
-    expect(result[0]).toBeUndefined();
-    expect(result[1]).toBe("middle");
-});
-
-// IIFE patterns
-test("IIFE with eval does not affect outer scope undefined", () => {
-    var outerUndefined = undefined;
-    (function () {
-        eval("var undefined = 'iife'");
-    })();
-    expect(outerUndefined).toBeUndefined();
-});
-
-test("nested function in IIFE sees eval-shadowed value", () => {
-    var result = (function () {
-        function inner() {
-            return undefined;
-        }
-        eval("var undefined = 'iife-inner'");
-        return inner();
-    })();
-    expect(result).toBe("iife-inner");
-});
-
-test("IIFE without eval does not affect undefined optimization", () => {
-    var result = (function () {
-        return undefined;
-    })();
-    expect(result).toBeUndefined();
-});
-
-test("multiple IIFEs with different eval patterns", () => {
-    var result1 = (function () {
-        return undefined;
-    })();
-
-    var result2 = (function () {
-        eval("var undefined = 'second'");
-        return undefined;
-    })();
-
-    var result3 = (function () {
-        return undefined;
-    })();
-
-    expect(result1).toBeUndefined();
-    expect(result2).toBe("second");
-    expect(result3).toBeUndefined();
-});
-
-// Strict mode tests
-test("strict mode eval does not shadow undefined in same function", () => {
-    function test() {
-        "use strict";
-        eval("var undefined = 42");
-        return undefined;
-    }
-    expect(test()).toBeUndefined();
-});
-
-test("strict mode eval does not shadow undefined in nested function", () => {
-    function parent() {
-        "use strict";
-        function child() {
-            return undefined;
-        }
-        eval("var undefined = 42");
-        return child();
-    }
-    expect(parent()).toBeUndefined();
-});
-
-// Multiple identifiers shadowed
-test("eval shadows multiple global identifiers at once", () => {
-    function test() {
-        eval("var undefined = 1; var NaN = 2; var Infinity = 3");
-        return [undefined, NaN, Infinity];
-    }
-    const result = test();
-    expect(result[0]).toBe(1);
-    expect(result[1]).toBe(2);
-    expect(result[2]).toBe(3);
-});
-
-test("nested function sees multiple shadowed identifiers", () => {
-    function parent() {
-        function child() {
-            return [undefined, NaN, Infinity];
-        }
-        eval("var undefined = 'u'; var NaN = 'n'; var Infinity = 'i'");
-        return child();
-    }
-    const result = parent();
