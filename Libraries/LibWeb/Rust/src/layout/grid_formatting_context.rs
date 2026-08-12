@@ -2817,18 +2817,30 @@ impl GridFormattingContext {
             let containing = self.containing_block_size(item, axis);
             let containing_inline = self.containing_block_size(item, Axis::Column);
             let containing_block = self.containing_block_size(item, Axis::Row);
+            let style = self.style(item.box_);
+            let facts = self.facts(item.box_);
+            // https://drafts.csswg.org/css-sizing-3/#max-content-block-size
+            // Usually the block size of the content after layout.
+            // NB: The column pass has already resolved this item's content width and layout_items() lays the item out
+            //     at that width, so block contents must be measured against the same basis. Orthogonal items with
+            //     inline contents instead contribute their inline-axis size to the physical row axis.
+            let use_resolved_content_width = !axis.is_column()
+                && (style.writing_mode() == writing_mode::HORIZONTAL_TB || !facts.children_are_inline());
+            let available_inline = if use_resolved_content_width {
+                self.used(item).content_inline_size.get()
+            } else {
+                containing_inline
+            };
             let available = AvailableSpace {
-                inline_size: AvailableSize::definite(clamp_to_max_dimension_value(containing_inline)),
+                inline_size: AvailableSize::definite(clamp_to_max_dimension_value(available_inline)),
                 block_size: AvailableSize::definite(clamp_to_max_dimension_value(containing_block)),
             };
             let mut constraints = self.grid_area_constraints(item);
             if !axis.is_column() {
                 constraints.percentage_basis_block_size = Some(containing);
             }
-            let style = self.style(item.box_);
             let preferred = axis.select(style.width(), style.height());
             let alignment = self.item_alignment(item, axis);
-            let facts = self.facts(item.box_);
             let has_natural = axis.select(
                 facts.has_auto_content_width() || facts.has_auto_content_height() && facts.has_preferred_aspect_ratio(),
                 facts.has_auto_content_height() || facts.has_auto_content_width() && facts.has_preferred_aspect_ratio(),
@@ -3945,10 +3957,10 @@ pub(crate) fn resolve_intrinsic_track_sizes(
     };
     let mut contributions = vec![CssPixels::default(); tracks.len()];
     for item in items {
-        // NB: This step repeats the content-sized track step, but only distributes space to flexible tracks.
-        // For min-content column sizing, the later "Expand Flexible Tracks" step resolves the flex fraction
-        // to zero, so fixed-min flexible columns must not grow from their items' intrinsic width here.
-        // Keep min-content row sizing here so intrinsic-height grids still account for their contents.
+        // NB: This step repeats the content-sized track step, but only distributes space to flexible tracks. For
+        //     min-content column sizing, the later "Expand Flexible Tracks" step resolves the flex fraction to zero, so
+        //     flexible columns must not grow beyond their items' minimum contribution here. Keep min-content row sizing
+        //     here so intrinsic-height grids still account for their contents.
         let mut total_flex = 0.0;
         let mut flexible_count = 0usize;
         let mut non_flexible_space = CssPixels::default();
@@ -3965,9 +3977,9 @@ pub(crate) fn resolve_intrinsic_track_sizes(
         if flexible_count == 0 {
             continue;
         }
-        // If the grid container is being sized under a min- or max-content constraint, use the items' limited
-        // min-content contributions in place of their minimum contributions here.
-        let mut contribution = if available.is_intrinsic_sizing_constraint() {
+        let use_limited_min_content =
+            available == AvailableSize::MaxContent || (row_axis && available == AvailableSize::MinContent);
+        let mut contribution = if use_limited_min_content {
             if total_flex == 0.0 && item.is_scroll_container {
                 // https://drafts.csswg.org/css-grid-2/#min-size-auto
                 // A grid item's automatic minimum size is zero if its computed overflow is a scrollable
