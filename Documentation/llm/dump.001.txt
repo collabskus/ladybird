@@ -429691,6 +429691,30 @@ bool Host::is_empty_host() const
     return m_value.has<String>() && m_value.get<String>().is_empty();
 }
 
+// AD-HOC: This isn't a standalone spec concept; instead, it's the host-focused portion of steps 4 and 5 of
+//         https://w3c.github.io/webappsec-secure-contexts/#is-origin-trustworthy — shared here so LibWeb's Secure
+//         Contexts implementation and other components can identify hosts guaranteed to name the loopback interface.
+bool Host::is_loopback_or_localhost() const
+{
+    // If origin's host matches one of the CIDR notations 127.0.0.0/8 or ::1/128 [RFC4632], return "Potentially Trustworthy".
+    // NOTE: For hosts produced by the URL parser, to_u32() is the URL spec's IPv4 number — with the first octet in the
+    //       most-significant byte.
+    if (auto const* ipv4_address = m_value.get_pointer<IPv4Address>())
+        return (ipv4_address->to_u32() & 0xff000000) == 0x7f000000;
+
+    if (auto const* ipv6_address = m_value.get_pointer<IPv6Address>())
+        return *ipv6_address == IPv6Address::loopback();
+
+    // If the user agent conforms to the name resolution rules in [let-localhost-be-localhost] and one of the following is true:
+    // - origin's host is "localhost" or "localhost."
+    // - origin's host ends with ".localhost" or ".localhost."
+    // then return "Potentially Trustworthy".
+    auto const& domain_or_opaque_host = m_value.get<String>();
+    return domain_or_opaque_host.is_one_of("localhost"sv, "localhost."sv)
+        || domain_or_opaque_host.ends_with_bytes(".localhost"sv)
+        || domain_or_opaque_host.ends_with_bytes(".localhost."sv);
+}
+
 // https://url.spec.whatwg.org/#concept-host-serializer
 String Host::serialize() const
 {
@@ -429784,6 +429808,7 @@ public:
 
     bool is_domain() const;
     bool is_empty_host() const;
+    bool is_loopback_or_localhost() const;
 
     template<typename T>
     bool has() const { return m_value.template has<T>(); }
@@ -643349,18 +643374,19 @@ void Document::end_style_stabilization_epoch()
     m_animations_created_in_stabilization_epoch.clear();
 }
 
-static void relayout_subtree(Layout::Box& subtree_root, Painting::Paintable& old_paintable)
+static void relayout_subtree(Layout::Box& subtree_root)
 {
     Layout::LayoutRustBridge bridge;
     // Absolutely positioned boundaries re-resolve their own size and position by replaying
-    // their layout from saved inputs; SVG root boundaries keep the frozen geometry from the
-    // previous layout. Rust reads the old paintable before replacing it in either path.
+    // their layout from saved inputs; SVG root boundaries keep the frozen geometry saved at
+    // the previous commit. The commit sink resolves the paintable to splice out in either
+    // path.
     if (subtree_root.is_absolutely_positioned()) {
         VERIFY(subtree_root.containing_block());
         VERIFY(subtree_root.has_saved_abspos_layout_inputs());
-        bridge.replay_saved_abspos_layout(subtree_root, old_paintable);
+        bridge.replay_saved_abspos_layout(subtree_root);
     } else {
-        bridge.compute_subtree_layout(subtree_root, old_paintable);
+        bridge.compute_subtree_layout(subtree_root);
     }
 
     subtree_root.for_each_in_inclusive_subtree([](auto& node) {
@@ -643627,24 +643653,11 @@ Document::PartialRelayoutResult Document::try_partial_relayout(HashTable<WeakPtr
     // survived the build, plus the nearest boundary containing each rebuilt subtree - which
     // re-discovers a boundary whose own box the build replaced, since the saved layout inputs
     // carried over to the replacement.
-    struct PartialRelayoutRoot {
-        Layout::Box* box { nullptr };
-        RefPtr<Painting::Paintable> old_paintable;
-    };
-    Vector<PartialRelayoutRoot> partial_relayout_roots;
+    Vector<Layout::Box*> partial_relayout_roots;
     HashTable<Layout::Box*> collected_boundaries;
     auto collect_boundary = [&](Layout::Box& box, bool box_was_replaced) {
         if (collected_boundaries.set(&box) != AK::HashSetResult::InsertedNewEntry)
             return true;
-
-        RefPtr<Painting::Paintable> old_paintable = box.paintable_box();
-        if (!old_paintable && box_was_replaced && box.dom_node()) {
-            // A replaced box has no paintable yet; the previous one stays referenced by the
-            // DOM node until the next commit replaces it there.
-            old_paintable = box.dom_node()->unsafe_paintable();
-        }
-        if (!old_paintable)
-            return false;
 
         // A replaced box applies the saved-inputs validity check unconditionally: the change
         // that drove the replacement cannot be classified anymore.
@@ -643652,10 +643665,7 @@ Document::PartialRelayoutResult Document::try_partial_relayout(HashTable<WeakPtr
         if (saved_inputs_may_be_style_stale && box.is_absolutely_positioned() && !Layout::can_replay_saved_abspos_layout_inputs_after_style_change(box))
             return false;
 
-        partial_relayout_roots.append({
-            .box = &box,
-            .old_paintable = old_paintable,
-        });
+        partial_relayout_roots.append(&box);
         return true;
     };
 
@@ -643676,7 +643686,7 @@ Document::PartialRelayoutResult Document::try_partial_relayout(HashTable<WeakPtr
         // The rebuilt box itself may qualify with its paintable still pending; boundaries
         // above it were not replaced and must have one.
         Layout::Box* containing_boundary = nullptr;
-        if (auto* rebuilt_box = as_if<Layout::Box>(*rebuilt_root); rebuilt_box && rebuilt_box->is_partial_relayout_boundary(Layout::RequireExistingPaintable::No))
+        if (auto* rebuilt_box = as_if<Layout::Box>(*rebuilt_root); rebuilt_box && rebuilt_box->is_partial_relayout_boundary())
             containing_boundary = rebuilt_box;
         for (auto* ancestor = rebuilt_root->parent(); !containing_boundary && ancestor; ancestor = ancestor->parent()) {
             if (auto* ancestor_box = as_if<Layout::Box>(*ancestor); ancestor_box && ancestor_box->is_partial_relayout_boundary())
@@ -643687,8 +643697,8 @@ Document::PartialRelayoutResult Document::try_partial_relayout(HashTable<WeakPtr
     }
 
     // A root nested inside another root is relaid out as part of the ancestor's subtree.
-    partial_relayout_roots.remove_all_matching([&](auto const& root) {
-        for (auto* ancestor = root.box->parent(); ancestor; ancestor = ancestor->parent()) {
+    partial_relayout_roots.remove_all_matching([&](auto* root) {
+        for (auto* ancestor = root->parent(); ancestor; ancestor = ancestor->parent()) {
             if (auto* ancestor_box = as_if<Layout::Box>(*ancestor); ancestor_box && collected_boundaries.contains(ancestor_box))
                 return true;
         }
@@ -643699,11 +643709,11 @@ Document::PartialRelayoutResult Document::try_partial_relayout(HashTable<WeakPtr
         return PartialRelayoutResult::NotEligible;
 
     layout_node_arena().sync_enrolled_content_for_layout();
-    for (auto const& root : partial_relayout_roots) {
-        relayout_subtree(*root.box, *root.old_paintable);
+    for (auto* root : partial_relayout_roots) {
+        relayout_subtree(*root);
         // NB: The subtree commit reset the root's descendant paintables, and the subtree's
         //     new size may change ancestor scrollable overflow; scheduling the root covers both.
-        schedule_scrollable_overflow_recalculation(*root.box);
+        schedule_scrollable_overflow_recalculation(*root);
     }
 
     ++m_partial_layout_count;
@@ -665948,20 +665958,3 @@ static bool is_window_event_handler(Utf16FlyString const& name)
         HTML::EventNames::beforeprint,
         HTML::EventNames::beforeunload,
         HTML::EventNames::hashchange,
-        HTML::EventNames::languagechange,
-        HTML::EventNames::message,
-        HTML::EventNames::messageerror,
-        HTML::EventNames::offline,
-        HTML::EventNames::online,
-        HTML::EventNames::pagehide,
-        HTML::EventNames::pageshow,
-        HTML::EventNames::popstate,
-        HTML::EventNames::rejectionhandled,
-        HTML::EventNames::storage,
-        HTML::EventNames::unhandledrejection,
-        HTML::EventNames::unload);
-}
-
-// https://html.spec.whatwg.org/multipage/webappapis.html#determining-the-target-of-an-event-handler
-static EventTarget* determine_target_of_event_handler(EventTarget& event_target, Utf16FlyString const& name)
-{
