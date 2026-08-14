@@ -478484,7 +478484,14 @@ void KeyframeEffect::update_computed_properties(AnimationUpdateContext& context)
     if (!target || !target->is_connected())
         return;
 
-    if (target->has_inclusive_ancestor_with_display_none_ignoring_animations()) {
+    // An effect that animates `display` can be the very thing holding its `display: none` target visible, and
+    // the update being skipped is the one that applies or removes that override, so it must always run.
+    bool affects_display = false;
+    if (auto const* key_frame_set = this->key_frame_set()) {
+        for (auto it = key_frame_set->keyframes_by_key.begin(); !affects_display && it != key_frame_set->keyframes_by_key.end(); ++it)
+            affects_display = it->properties.contains(CSS::PropertyID::Display);
+    }
+    if (!affects_display && target->has_inclusive_ancestor_with_display_none_ignoring_animations()) {
         // FIXME: Reaching this point means we failed to cancel animation for an element that started
         //        being nested in "display: none".
         //        For now this hack is needed to avoid lots of unnecessary work.
@@ -605586,7 +605593,16 @@ void StyleComputer::collect_animations_into(DOM::AbstractElement abstract_elemen
 
 void StyleComputer::collect_animations_into(DOM::AbstractElement abstract_element, ReadonlySpan<GC::Ref<Animations::KeyframeEffect>> effects, ComputedProperties& computed_properties) const
 {
+    m_keyframes_inherited_non_inherited_property = false;
     collect_animation_effects_into(abstract_element, effects, computed_properties, nullptr);
+    // An animation-only overlay update resolves keyframe values just like a full style computation does, so a
+    // keyframe-borne `inherit` on a non-inherited property discovered here must leave the same invalidation
+    // mark behind, or a later change to the parent's value never reaches this element's animated style.
+    if (m_keyframes_inherited_non_inherited_property) {
+        if (auto* parent = abstract_element.element().parent())
+            parent->set_children_may_depend_on_non_inherited_property_inheritance();
+        m_keyframes_inherited_non_inherited_property = false;
+    }
     adjust_animated_element_style_if_needed(computed_properties, abstract_element);
 }
 
@@ -606506,13 +606522,31 @@ Vector<GC::Ref<Animations::KeyframeEffect>> StyleComputer::start_needed_transiti
             delay = transition_attributes.delay;
             duration = transition_attributes.duration;
             allow_discrete = transition_attributes.transition_behavior == TransitionBehavior::AllowDiscrete;
-            before_change_value = stabilization_state.before_change_value;
-            after_change_value = after_change_style->computed_style_value(property_id, ComputedValues::WithAnimationsApplied::No);
+            // https://drafts.csswg.org/css-transitions-1/#starting
+            // The after-change style excludes styles from CSS Transitions but keeps animation-derived values, and the
+            // before-change style has declarative animations updated to the current time. A property that a
+            // non-transition animation currently applies to therefore carries the same animated value on both sides of
+            // the comparison, so a change to the underlying value cannot start a transition beneath a running
+            // animation.
+            RefPtr<StyleValue const> value_covered_by_animation;
+            if (auto const* animated_properties = after_change_style->animated_properties();
+                animated_properties && animated_properties->has_property(property_id)
+                && !animated_properties->is_property_result_of_transition(property_id))
+                value_covered_by_animation = animated_properties->property(property_id);
+
+            if (value_covered_by_animation) {
+                before_change_value = value_covered_by_animation;
+                after_change_value = value_covered_by_animation;
+                before_change_value_originates_from_current_color = value_covered_by_animation->to_keyword() == Keyword::Currentcolor;
+                after_change_value_originates_from_current_color = before_change_value_originates_from_current_color;
+            } else {
+                before_change_value = stabilization_state.before_change_value;
+                after_change_value = after_change_style->computed_style_value(property_id, ComputedValues::WithAnimationsApplied::No);
+                before_change_value_originates_from_current_color = stabilization_state.before_change_value_originates_from_current_color;
+                after_change_value_originates_from_current_color = originates_from_current_color(*after_change_style, property_id);
+            }
             VERIFY(before_change_value);
             VERIFY(after_change_value);
-
-            before_change_value_originates_from_current_color = stabilization_state.before_change_value_originates_from_current_color;
-            after_change_value_originates_from_current_color = originates_from_current_color(*after_change_style, property_id);
             if (existing_transition) {
                 old_reversing_shortening_factor = existing_transition->reversing_shortening_factor();
                 if (has_running_transition)
@@ -609028,7 +609062,15 @@ NonnullRefPtr<ComputedValues const> StyleComputer::build_animated_computed_value
 
 NonnullRefPtr<ComputedProperties> StyleComputer::reconstruct_computed_properties(ComputedValues const& computed_values) const
 {
-    auto style = ComputedProperties::create(ComputedProperties::create_builder_with_base_values_from(computed_values));
+    auto builder = ComputedProperties::create_builder_with_base_values_from(computed_values);
+    // The recorded pre-box-type-transformation display tracks the animated display while one is applied, on both
+    // the animated style and its base. When the animation stops covering `display`, re-adjustment must start over
+    // from the base style's display, or the sampled value the finished animation left behind is resurrected as
+    // the element's display. Box-type transformations are idempotent, so the adjusted base display is a sound
+    // transformation input.
+    if (auto const* animated_properties = computed_values.animated_properties(); animated_properties && animated_properties->has_property(PropertyID::Display))
+        builder.set_display_before_box_type_transformation(computed_values.base_values().display());
+    auto style = ComputedProperties::create(move(builder));
     apply_animated_properties_to_reconstruction(*style, computed_values);
     return style;
 }
@@ -611958,6 +612000,8 @@ FILE: Libraries/LibWeb/CSS/StyleEngineBridge.cpp
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleEngineBridge.h>
 #include <LibWeb/CSS/StyleEngineInput.h>
+#include <LibWeb/DOM/Document.h>
+#include <LibWeb/Page/Page.h>
 
 namespace Web::CSS {
 
@@ -611965,6 +612009,15 @@ static_assert(!IsMoveConstructible<StyleEngine>);
 static_assert(!IsMoveAssignable<StyleEngine>);
 
 #include <LibWeb/StyleEngineBridgeGenerated.inc>
+
+bool StyleEngine::published_style_delta_can_absorb_reaction(PublishedStyleDelta const& delta, u8 reaction, u8 inherited_style_groups)
+{
+    if (delta.gap == StyleEngineFFI::FfiStyleDeltaGap::Materialize)
+        return true;
+    bool const has_additional_reaction = (reaction & ~delta.reaction) != 0;
+    bool const has_additional_inherited_style_groups = (inherited_style_groups & ~delta.inherited_style_groups) != 0;
+    return !has_additional_reaction && !has_additional_inherited_style_groups;
+}
 
 StyleEngine::StyleEngine(DeviceClass device_class, StyleComputer* style_computer)
     : m_impl(StyleEngineFFI::style_engine_create(device_class))
@@ -612177,30 +612230,48 @@ void StyleEngine::set_element_language(StyleNodeID node, StyleAtomID language, U
     StyleEngineFFI::style_engine_set_element_language(m_impl, node.value(), language.value(), code_units.data(), code_units.size());
 }
 
+// Recording input gives the next rendering update style work to do, but touches no layout tree
+// and no paintable, so nothing else asks the page for a frame. On a quiet document a change made
+// from a timer would otherwise sit unflushed indefinitely, and a transition it should start would
+// not run until something unrelated woke the rendering loop. Only the first input needs the poke:
+// the frame it schedules flushes everything recorded before it runs.
+static void request_frame_for_first_recorded_input(StyleEngine const& style_engine, GC::Ptr<StyleComputer> style_computer)
+{
+    if (style_engine.has_recorded_input() || !style_computer)
+        return;
+    style_computer->document().page().client().request_frame();
+}
+
 void StyleEngine::record_tree_delta(StyleEngineFFI::FfiTreeDelta const& delta)
 {
+    request_frame_for_first_recorded_input(*this, m_style_computer);
     m_tree_deltas.append(delta);
 }
 
 void StyleEngine::record_local_feature_delta(StyleEngineFFI::FfiLocalFeatureDelta const& delta)
 {
+    request_frame_for_first_recorded_input(*this, m_style_computer);
     m_local_feature_deltas.append(delta);
 }
 
 void StyleEngine::record_state_delta(StyleEngineFFI::FfiStateDelta const& delta)
 {
+    request_frame_for_first_recorded_input(*this, m_style_computer);
     m_state_deltas.append(delta);
 }
 
 void StyleEngine::record_element_declaration_delta(StyleEngineFFI::FfiElementDeclarationDelta const& delta)
 {
+    request_frame_for_first_recorded_input(*this, m_style_computer);
     m_element_declaration_deltas.append(delta);
 }
 
 void StyleEngine::record_element_style_input_change(StyleNodeID style_node, u8 reaction, u8 inherited_style_groups)
 {
-    if (style_node != 0 && reaction != 0)
+    if (style_node != 0 && reaction != 0) {
+        request_frame_for_first_recorded_input(*this, m_style_computer);
         m_element_style_inputs.append({ style_node.value(), reaction, inherited_style_groups });
+    }
 }
 
 void StyleEngine::record_flat_tree_descendant_style_input_changes(StyleNodeID style_node, u8 reaction, u8 inherited_style_groups)
@@ -612212,6 +612283,7 @@ void StyleEngine::record_flat_tree_descendant_style_input_changes(StyleNodeID st
     // descendants themselves stay in the C++ batch so the next transaction normalizes them with
     // every other feedback action from this stabilization pass.
     submit_recorded_input();
+    request_frame_for_first_recorded_input(*this, m_style_computer);
     struct Context {
         Vector<StyleEngineFFI::FfiElementStyleInput>& inputs;
         u8 reaction;
@@ -612591,6 +612663,7 @@ public:
     void flush();
 
     using PublishedStyleDelta = StyleEngineFFI::FfiStyleDelta;
+    [[nodiscard]] static bool published_style_delta_can_absorb_reaction(PublishedStyleDelta const&, u8 reaction, u8 inherited_style_groups);
     struct PublishedTransactionVersion {
         u64 transaction;
         u64 program;
@@ -613787,6 +613860,11 @@ static void publish_document_kind(DOM::Document& document)
             : 0);
 }
 
+void record_document_kind(DOM::Document& document)
+{
+    publish_document_kind(document);
+}
+
 // Walks a sheet's rules and compiles every style rule's selector list into the program.
 //
 // The parser has already produced a compiled selector for the matching engine, so this hands over
@@ -614954,6 +615032,11 @@ WEB_API void publish_pending_element_features(StyleEngine&, StyleComputer&);
 // assigned to each element; no identity or transaction in the document's
 // resident engine is changed.
 WEB_API void populate_isolated_selector_query_engine(StyleEngine&, DOM::ParentNode&, Function<void(GC::Ref<DOM::Element>, StyleNodeID)> const&);
+
+// Tell the document's engine whether this is an HTML document. Selectors compile against that fact,
+// so it is published before any rule compiles; a selector query compiled by an early script can run
+// before the first sheet attaches, and has to say it itself.
+WEB_API void record_document_kind(DOM::Document&);
 
 // Called while the node is still linked, so its old relations are still readable.
 WEB_API void record_element_disconnecting(DOM::Element&);
@@ -637478,8 +637561,13 @@ static void record_style_engine_reaction(HashMap<u32, StyleEngine::PublishedStyl
     if (reaction == 0 || element.style_node_id() == 0)
         return;
     if (auto pending_reaction = reaction_batch.find(element.style_node_id().value()); pending_reaction != reaction_batch.end()) {
-        pending_reaction->value->reaction |= reaction;
-        pending_reaction->value->inherited_style_groups |= inherited_style_groups;
+        auto& pending = *pending_reaction->value;
+        if (!StyleEngine::published_style_delta_can_absorb_reaction(pending, reaction, inherited_style_groups)) {
+            element.document().style_computer().style_engine().record_element_style_input_change(element.style_node_id(), reaction, inherited_style_groups);
+            return;
+        }
+        pending.reaction |= reaction;
+        pending.inherited_style_groups |= inherited_style_groups;
         return;
     }
     element.document().style_computer().style_engine().record_element_style_input_change(element.style_node_id(), reaction, inherited_style_groups);
@@ -637506,6 +637594,20 @@ static void record_assigned_slottable_style_engine_reactions(DOM::Element& eleme
         if (auto const* assigned_element = slottable.get_pointer<GC::Ref<DOM::Element>>())
             record_style_engine_reaction(reaction_batch, **assigned_element, StyleEngine::RecomputeStyle);
     }
+}
+
+// The static inherited-group swap answers a pure inherited-style reaction without recomputing the element. That
+// is only sound while the element's computed style is a pure function of its cascade inputs and the swapped
+// groups: an element with animations may resolve keyframe values (`inherit`, neutral keyframes) against the
+// parent's style, and an element with transitions or transition-property entries must compare before-change and
+// after-change styles at every style change event. These are the conditions under which
+// Element::apply_style_engine_reaction declines its own inherited-style group swap.
+static bool element_style_depends_on_more_than_the_inherited_groups(DOM::Element const& element)
+{
+    return element.has_relevant_animations()
+        || element.has_css_defined_animations()
+        || !element.property_ids_with_existing_transitions({}).is_empty()
+        || !element.property_ids_with_matching_transition_property_entry({}).is_empty();
 }
 
 static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Document& document, Span<StyleEngine::PublishedStyleDelta> reactions)
@@ -637566,20 +637668,27 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
             VERIFY(needs_inherited_style_recompute);
             VERIFY(!needs_custom_property_recompute);
             VERIFY(reaction.pseudo_kind == NumericLimits<u8>::max());
-            auto* input_record = element->style_input_record();
-            VERIFY(input_record);
-            auto const* payloads = static_cast<void const* const*>(document.style_computer().style_record_payloads(StyleRecordID { reaction.new_style_record }));
-            VERIFY(payloads);
-            constexpr size_t inherited_group_count = ComputedValues::inherited_style_group_count;
-            VERIFY(input_record->words.size() >= inherited_group_count);
-            input_record->pinned_parent_groups.set({ payloads, inherited_group_count });
-            for (size_t index = 0; index < inherited_group_count; ++index)
-                input_record->words[index] = bit_cast<FlatPtr>(payloads[index]);
-            element->set_computed_style({}, StyleRecordID { reaction.new_style_record });
-            invalidation = RequiredInvalidationAfterStyleChange::full();
-            for (size_t index = 0; index < inherited_group_count; ++index) {
-                if (reaction.inherited_style_groups & (1 << index))
-                    invalidation.mark_inherited_style_group_changed(index);
+            if (element_style_depends_on_more_than_the_inherited_groups(*element)) {
+                invalidation = element->apply_style_engine_reaction(
+                    did_change_custom_properties,
+                    DOM::Element::StyleEngineRecomputeReason::General,
+                    0);
+            } else {
+                auto* input_record = element->style_input_record();
+                VERIFY(input_record);
+                auto const* payloads = static_cast<void const* const*>(document.style_computer().style_record_payloads(StyleRecordID { reaction.new_style_record }));
+                VERIFY(payloads);
+                constexpr size_t inherited_group_count = ComputedValues::inherited_style_group_count;
+                VERIFY(input_record->words.size() >= inherited_group_count);
+                input_record->pinned_parent_groups.set({ payloads, inherited_group_count });
+                for (size_t index = 0; index < inherited_group_count; ++index)
+                    input_record->words[index] = bit_cast<FlatPtr>(payloads[index]);
+                element->set_computed_style({}, StyleRecordID { reaction.new_style_record });
+                invalidation = RequiredInvalidationAfterStyleChange::full();
+                for (size_t index = 0; index < inherited_group_count; ++index) {
+                    if (reaction.inherited_style_groups & (1 << index))
+                        invalidation.mark_inherited_style_group_changed(index);
+                }
             }
         } else if (needs_regular_style_recompute || needs_inherited_style_recompute || needs_full_custom_property_recompute) {
             if (!needs_regular_style_recompute
@@ -651680,6 +651789,7 @@ enum class InvalidateLayoutTreeReason {
     X(DocumentElementsFromPoint)             \
     X(DocumentCaretPositionFromPoint)        \
     X(DocumentFindMatchingText)              \
+    X(DocumentReadinessComplete)             \
     X(DocumentSetDesignMode)                 \
     X(DumpDisplayList)                       \
     X(ElementCheckVisibility)                \
@@ -665884,148 +665994,3 @@ WebIDL::CallbackType* EventTarget::get_current_value_of_event_handler(Utf16FlySt
         auto rust_compilation = JS::RustIntegration::compile_dynamic_function(
             vm, source_text, parameters_string, body, JS::FunctionKind::Normal);
 
-        // 7. If body is not parsable as FunctionBody or if parsing detects an early error, then follow these substeps:
-        if (!rust_compilation.has_value() || rust_compilation->is_error()) {
-            // 1. Set eventHandler's value to null.
-            event_handler->value = GC::Ptr<WebIDL::CallbackType> {};
-
-            // FIXME: 2. Report the error for the appropriate script and with the appropriate position (line number and column number) given by location, using settings object's global object.
-
-            // 3. Return null.
-            return nullptr;
-        }
-
-        // 8. Push settings object's realm execution context onto the JavaScript execution context stack; it is now the running JavaScript execution context.
-        vm.push_execution_context(settings_object.realm_execution_context());
-
-        // scope
-        //  1. Let realm be settings object's Realm.
-        auto& realm = settings_object.realm();
-
-        //  2. Let scope be realm.[[GlobalEnv]].
-        auto scope = GC::Ref<JS::Environment> { realm.global_environment() };
-
-        // 3. If eventHandler is an element's event handler, then set scope to NewObjectEnvironment(document, true, scope).
-        //    (Otherwise, eventHandler is a Window object's event handler.)
-        if (is<Element>(this))
-            scope = Bindings::new_event_handler_object_environment(realm, GC::Ref { *document }, scope);
-
-        //  4. If form owner is not null, then set scope to NewObjectEnvironment(form owner, true, scope).
-        if (form_owner)
-            scope = Bindings::new_event_handler_object_environment(realm, GC::Ref { *form_owner }, scope);
-
-        //  5. If element is not null, then set scope to NewObjectEnvironment(element, true, scope).
-        if (element)
-            scope = Bindings::new_event_handler_object_environment(realm, GC::Ref { *element }, scope);
-
-        // 9. Let function be the result of calling OrdinaryFunctionCreate.
-        auto function = JS::ECMAScriptFunctionObject::create_from_function_data(
-            realm,
-            rust_compilation->value(),
-            scope,
-            nullptr);
-
-        // 10. Remove settings object's realm execution context from the JavaScript execution context stack.
-        auto* popped_execution_context = vm.pop_execution_context();
-        VERIFY(popped_execution_context == &settings_object.realm_execution_context());
-
-        // 11. Set function.[[ScriptOrModule]] to null.
-        function->set_script_or_module({});
-
-        // 12. Set eventHandler's value to the result of creating a Web IDL EventHandler callback function object whose object reference is function and whose callback context is settings object.
-        // FIXME: Update this comment once the ShadowRealm proposal is merged to pass realm.
-        event_handler->value = GC::Ptr(GC::Heap::the().allocate<WebIDL::CallbackType>(*function, realm));
-    }
-
-    // 4. Return eventHandler's value.
-    VERIFY(event_handler->value.has<GC::Ptr<WebIDL::CallbackType>>());
-    return event_handler->value.get_pointer<GC::Ptr<WebIDL::CallbackType>>()->ptr();
-}
-
-// https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-attributes:event-handler-idl-attributes-3
-void EventTarget::set_event_handler_attribute(Utf16FlyString const& name, GC::Ptr<WebIDL::CallbackType> value)
-{
-    // 1. Let eventTarget be the result of determining the target of an event handler given this object and name.
-    auto event_target = determine_target_of_event_handler(*this, name);
-
-    // 2. If eventTarget is null, then return.
-    if (!event_target)
-        return;
-
-    // 3. If the given value is null, then deactivate an event handler given eventTarget and name.
-    if (!value) {
-        event_target->deactivate_event_handler(name);
-        return;
-    }
-
-    // 4. Otherwise:
-    //  1. Let handlerMap be eventTarget's event handler map.
-    auto& handler_map = event_target->ensure_data().event_handler_map;
-
-    //  2. Let eventHandler be handlerMap[name].
-    auto event_handler_iterator = handler_map.find(name);
-
-    //  3. Set eventHandler's value to the given value.
-    if (event_handler_iterator == handler_map.end()) {
-        // NOTE: See the optimization comment in get_current_value_of_event_handler about why this is done.
-        auto new_event_handler = GC::Heap::the().allocate<HTML::EventHandler>(*value);
-
-        //  4. Activate an event handler given eventTarget and name.
-        // Optimization: We pass in the event handler here instead of having activate_event_handler do another hash map lookup just to get the same object.
-        //               This handles a new event handler while the other path handles an existing event handler. As such, both paths must have their own
-        //               unique call to activate_event_handler.
-        event_target->activate_event_handler(name, *new_event_handler);
-
-        handler_map.set(name, new_event_handler);
-        return;
-    }
-
-    auto& event_handler = event_handler_iterator->value;
-
-    event_handler->value = GC::Ptr(value);
-
-    //  4. Activate an event handler given eventTarget and name.
-    //  NOTE: See the optimization comment above.
-    event_target->activate_event_handler(name, *event_handler);
-}
-
-// https://html.spec.whatwg.org/multipage/webappapis.html#activate-an-event-handler
-static JS::Realm& event_handler_listener_realm(EventTarget& event_target, HTML::EventHandler& event_handler)
-{
-    if (auto* callback = event_handler.value.get_pointer<GC::Ptr<WebIDL::CallbackType>>()) {
-        if (auto* realm = Bindings::callback_realm(callback->ptr()))
-            return *realm;
-    }
-
-    if (auto* node = as_if<Node>(&event_target))
-        return node->document().relevant_settings_object().realm();
-
-    if (auto* window = as_if<HTML::Window>(&event_target))
-        return window->associated_document().relevant_settings_object().realm();
-
-    VERIFY_NOT_REACHED();
-}
-
-void EventTarget::activate_event_handler(Utf16FlyString const& name, HTML::EventHandler& event_handler)
-{
-    // 1. Let handlerMap be eventTarget's event handler map.
-    // 2. Let eventHandler be handlerMap[name].
-    // NOTE: These are achieved by using the passed in event handler.
-
-    // 3. If eventHandler's listener is not null, then return.
-    if (event_handler.listener)
-        return;
-
-    JS::Realm& realm = event_handler_listener_realm(*this, event_handler);
-
-    // 4. Let callback be the result of creating a Web IDL EventListener instance representing a reference to a function of one argument that executes the steps of the event handler processing algorithm, given eventTarget, name, and its argument.
-    //    The EventListener's callback context can be arbitrary; it does not impact the steps of the event handler processing algorithm. [DOM]
-
-    // NOTE: The callback must keep `this` alive. For example:
-    //          document.body.onunload = () => { console.log("onunload called!"); }
-    //          document.body.remove();
-    //          location.reload();
-    //       The body element is no longer in the DOM and there is no variable holding onto it. However, the onunload handler is still called, meaning the callback keeps the body element alive.
-    auto callback_function = JS::NativeFunction::create(
-        realm, [event_target = this, name](JS::VM& vm) mutable -> JS::ThrowCompletionOr<JS::Value> {
-            // The event dispatcher should only call this with one argument.
