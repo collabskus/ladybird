@@ -52,6 +52,8 @@
 #include <LibWeb/Namespace.h>
 #include <LibWeb/Painting/InlinePaintable.h>
 #include <LibWeb/Painting/PaintableWithLines.h>
+#include <LibWeb/Painting/SVGGraphicsPaintable.h>
+#include <LibWeb/Painting/SVGSVGPaintable.h>
 #include <LibWeb/SVG/SVGDecodedImageData.h>
 
 namespace Web {
@@ -317,6 +319,13 @@ void dump_tree(StringBuilder& builder, Layout::Node const& layout_node, bool sho
 
         dump_box_model();
 
+        // SVG content geometry below is in this viewport's user units; the transform shown here is
+        // what maps it into the viewport's content box.
+        if (auto const* box_paintable = box.paintable_box().ptr()) {
+            if (auto viewport_transform = box_paintable->svg_viewport_transform(); viewport_transform.has_value())
+                builder.appendff(" viewport-transform={}", *viewport_transform);
+        }
+
         if (auto formatting_context_type = Layout::formatting_context_type_created_by_box(box); formatting_context_type.has_value()) {
             switch (formatting_context_type.value()) {
             case Layout::RustFFI::FfiFormattingContextType::Block:
@@ -369,6 +378,13 @@ void dump_tree(StringBuilder& builder, Layout::Node const& layout_node, bool sho
 
     auto dump_fragment = [&](auto& fragment, size_t fragment_index) {
         builder.append_repeated("  "sv, indent);
+        if (!fragment.has_layout_node()) {
+            builder.appendff("  {}frag {}{} with detached layout node\n",
+                fragment_color_on,
+                fragment_index,
+                color_off);
+            return;
+        }
         builder.appendff("  {}frag {}{} from {} ",
             fragment_color_on,
             fragment_index,
@@ -391,7 +407,7 @@ void dump_tree(StringBuilder& builder, Layout::Node const& layout_node, bool sho
         auto paintable_with_lines = block_container->paintable_with_lines();
         for (auto const& fragment : paintable_with_lines->fragments()) {
             // Fragments inside inline boxes are dumped under their box's layout node below.
-            if (fragment.layout_node().nearest_fragmented_inline_ancestor())
+            if (fragment.has_layout_node() && fragment.layout_node().nearest_fragmented_inline_ancestor())
                 continue;
             dump_fragment(fragment, fragment_index++);
         }
@@ -406,7 +422,7 @@ void dump_tree(StringBuilder& builder, Layout::Node const& layout_node, bool sho
                 fragment_index_within_piece = 0;
             }
             // Fragments of nested inline boxes are dumped under their own box.
-            if (fragment.layout_node().nearest_fragmented_inline_ancestor() != &layout_node)
+            if (fragment.has_layout_node() && fragment.layout_node().nearest_fragmented_inline_ancestor() != &layout_node)
                 return;
             dump_fragment(fragment, fragment_index_within_piece++);
         });
