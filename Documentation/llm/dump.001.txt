@@ -440060,6 +440060,14 @@ FILE: Libraries/LibWasm/AbstractMachine/AbstractMachine.cpp
 
 namespace Wasm {
 
+AbstractMachine::AbstractMachine(GC::Heap* heap)
+{
+    if (heap)
+        adopt_heap(*heap);
+}
+
+AbstractMachine::~AbstractMachine() = default;
+
 static auto& module_stats()
 {
     static NeverDestroyed<Sync::MutexProtected<Vector<ModuleStats>>> stats;
@@ -441206,21 +441214,37 @@ Optional<InstantiationError> AbstractMachine::allocate_all_final_phase(Module co
     return {};
 }
 
-Result AbstractMachine::invoke(FunctionAddress address, Vector<Value> arguments)
+Result AbstractMachine::invoke(FunctionAddress address, Vector<Value, ArgumentsStaticSize> arguments)
 {
-    BytecodeInterpreter interpreter(m_stack_info);
-    auto handle = register_scoped(interpreter);
-    return invoke(interpreter, address, move(arguments));
+    auto interpreter = m_available_interpreters.is_empty()
+        ? make<BytecodeInterpreter>(m_stack_info)
+        : m_available_interpreters.take_last();
+
+    auto result = [&] {
+        auto handle = register_scoped(*interpreter);
+        return invoke(*interpreter, address, move(arguments));
+    }();
+
+    interpreter->clear_trap();
+    if (m_available_interpreters.size() < MAX_AVAILABLE_EXECUTION_STATES)
+        m_available_interpreters.append(move(interpreter));
+    return result;
 }
 
-Result AbstractMachine::invoke(Interpreter& interpreter, FunctionAddress address, Vector<Value> arguments)
+Result AbstractMachine::invoke(Interpreter& interpreter, FunctionAddress address, Vector<Value, ArgumentsStaticSize> arguments)
 {
-    Configuration configuration { m_store };
+    auto configuration = m_available_configurations.is_empty()
+        ? make<Configuration>(m_store)
+        : m_available_configurations.take_last();
     if (m_should_limit_instruction_count)
-        configuration.enable_instruction_count_limit();
+        configuration->enable_instruction_count_limit();
 
-    Vector<Value, ArgumentsStaticSize> args = move(arguments);
-    return configuration.call(interpreter, address, args);
+    auto result = configuration->call(interpreter, address, arguments);
+
+    configuration->reset_after_invoke({});
+    if (m_available_configurations.size() < MAX_AVAILABLE_EXECUTION_STATES)
+        m_available_configurations.append(move(configuration));
+    return result;
 }
 
 void Linker::link(ModuleInstance const& instance)
@@ -441333,9 +441357,11 @@ FILE: Libraries/LibWasm/AbstractMachine/AbstractMachine.h
 namespace Wasm {
 
 constexpr inline size_t ArgumentsStaticSize = 3;
+constexpr inline size_t ResultsStaticSize = 1;
 
 class Configuration;
 class Result;
+struct BytecodeInterpreter;
 struct Interpreter;
 struct Trap;
 
@@ -441652,7 +441678,7 @@ struct Trap {
 
 class Result {
 public:
-    explicit Result(Vector<Value> values)
+    explicit Result(Vector<Value, ResultsStaticSize> values)
         : m_result(move(values))
     {
     }
@@ -441663,18 +441689,18 @@ public:
     }
 
     auto is_trap() const { return m_result.has<Trap>(); }
-    auto& values() const { return m_result.get<Vector<Value>>(); }
-    auto& values() { return m_result.get<Vector<Value>>(); }
+    auto& values() const { return m_result.get<Vector<Value, ResultsStaticSize>>(); }
+    auto& values() { return m_result.get<Vector<Value, ResultsStaticSize>>(); }
     auto& trap() const { return m_result.get<Trap>(); }
     auto& trap() { return m_result.get<Trap>(); }
 
 private:
-    explicit Result(Variant<Vector<Value>, Trap>&& result)
+    explicit Result(Variant<Vector<Value, ResultsStaticSize>, Trap>&& result)
         : m_result(move(result))
     {
     }
 
-    Variant<Vector<Value>, Trap> m_result;
+    Variant<Vector<Value, ResultsStaticSize>, Trap> m_result;
 };
 
 enum class InstantiationErrorSource : u8 {
@@ -442271,11 +442297,8 @@ struct HostVisitOps {
 
 class WASM_API AbstractMachine {
 public:
-    explicit AbstractMachine(GC::Heap* heap = nullptr)
-    {
-        if (heap)
-            adopt_heap(*heap);
-    }
+    explicit AbstractMachine(GC::Heap* heap = nullptr);
+    ~AbstractMachine();
 
     GC::Heap& heap()
     {
@@ -442293,8 +442316,8 @@ public:
     ErrorOr<void, ValidationError> validate(Module&, Optional<CompileCacheConfig> cache_config = {}, CompileToNative = CompileToNative::Yes);
     // Load and instantiate a module, and link it into this interpreter.
     InstantiationResult instantiate(Module const&, Vector<ExternValue>);
-    Result invoke(FunctionAddress, Vector<Value>);
-    Result invoke(Interpreter&, FunctionAddress, Vector<Value>);
+    Result invoke(FunctionAddress, Vector<Value, ArgumentsStaticSize>);
+    Result invoke(Interpreter&, FunctionAddress, Vector<Value, ArgumentsStaticSize>);
 
     auto& store() const { return m_store; }
     auto& store() { return m_store; }
@@ -442354,6 +442377,11 @@ private:
     StackInfo m_stack_info;
     HashTable<Interpreter*> m_active_interpreters;
     bool m_should_limit_instruction_count { false };
+
+    // Host functions may reenter Wasm, so retain typical nesting while bounding idle state.
+    static constexpr size_t MAX_AVAILABLE_EXECUTION_STATES = 32;
+    Vector<NonnullOwnPtr<BytecodeInterpreter>, MAX_AVAILABLE_EXECUTION_STATES> m_available_interpreters;
+    Vector<NonnullOwnPtr<Configuration>, MAX_AVAILABLE_EXECUTION_STATES> m_available_configurations;
 };
 
 class WASM_API Linker {
@@ -451173,7 +451201,7 @@ Result Configuration::execute(Interpreter& interpreter)
     if (interpreter.did_trap())
         return interpreter.trap();
 
-    Vector<Value> results { value_stack().span().slice_from_end(frame().arity()) };
+    Vector<Value, ResultsStaticSize> results { value_stack().span().slice_from_end(frame().arity()) };
     value_stack().shrink(value_stack().size() - results.size(), true);
     results.reverse();
 
@@ -451201,6 +451229,26 @@ ErrorOr<void, Trap> Configuration::execute_for_compiled_call(Interpreter& interp
         label_stack().take_last();
 
     return {};
+}
+
+void Configuration::reset_after_invoke(Badge<AbstractMachine>)
+{
+    m_value_stack.reset_and_clear();
+    m_call_record_stack.reset_and_clear();
+
+    m_label_stack.clear_with_capacity();
+    m_frame_stack.clear_with_capacity();
+    m_owned_locals_stack.clear_with_capacity();
+    m_call_argument_freelist.clear_with_capacity();
+    regs.fill(Value(0));
+
+    m_depth = 0;
+    m_ip = 0;
+    m_locals_base = nullptr;
+    m_call_record_base = nullptr;
+    m_memory_instances = nullptr;
+    m_global_instances = nullptr;
+    m_compiled_call_result_scratch = Value(0);
 }
 
 void Configuration::dump_stack()
@@ -451392,6 +451440,8 @@ public:
 
     void enable_instruction_count_limit() { m_should_limit_instruction_count = true; }
     bool should_limit_instruction_count() const { return m_should_limit_instruction_count; }
+
+    void reset_after_invoke(Badge<AbstractMachine>);
 
     void dump_stack();
 
@@ -458560,6 +458610,13 @@ ValueStack::~ValueStack()
         free_region(m_base);
 }
 
+void ValueStack::reset_and_clear()
+{
+    m_top = m_base;
+    for (size_t i = 0; i < conservative_scan_slack; ++i)
+        m_base[i] = Value(0);
+}
+
 }
 
 FILE: Libraries/LibWasm/AbstractMachine/ValueStack.h
@@ -458630,6 +458687,7 @@ public:
         VERIFY(size <= max_values);
         m_top = m_base + size;
     }
+    void reset_and_clear();
 
     void remove(size_t index, size_t count)
     {
@@ -458656,12 +458714,14 @@ public:
 
     // The conservative GC scans a little past the top;
     // a value handed out by unsafe_take_last() can still be live in a caller's register when a collection runs.
-    size_t conservative_scan_size() const { return min(size() + 8, max_values); }
+    size_t conservative_scan_size() const { return min(size() + conservative_scan_slack, max_values); }
 
     static constexpr size_t base_offset() { return __builtin_offsetof(ValueStack, m_base); }
     static constexpr size_t top_offset() { return __builtin_offsetof(ValueStack, m_top); }
 
 private:
+    static constexpr size_t conservative_scan_slack = 8;
+
     Value* m_base { nullptr };
     Value* m_top { nullptr };
     Value* m_limit { nullptr };
@@ -459315,6 +459375,20 @@ i32 wasm_cl_call_indirect(void* interp_ptr, void* config_ptr, i32 table_idx, i32
     auto const* type_expected = module.canonical_types()[type_idx];
     if (!type_actual || !matches_defined_type(*type_actual, *type_expected))
         return interpreter.set_trap(Trap::from_string("Indirect call type mismatch"));
+
+    auto const& function_type = function->visit([](auto const& value) -> FunctionType const& { return value.type(); });
+    if (function_type.results().size() <= 1) {
+        auto parameter_count = function_type.parameters().size();
+        if (parameter_count > config.value_stack().size())
+            return interpreter.set_trap(Trap::from_string("Insufficient arguments for indirect call"));
+
+        auto arguments = config.value_stack().span().slice_from_end(parameter_count);
+        config.value_stack().shrink(config.value_stack().size() - parameter_count);
+        auto did_trap = wasm_cl_finish_call(interpreter, config, address, arguments.data(), arguments.size());
+        if (!did_trap && !function_type.results().is_empty())
+            config.value_stack().unchecked_append(config.compiled_call_result_scratch());
+        return did_trap;
+    }
 
     SourcesAndDestination addrs {};
     addrs.sources[0] = Dispatch::RegisterOrStack::Stack;
@@ -665955,71 +666029,3 @@ void EventTarget::activate_event_handler(Utf16FlyString const& name, HTML::Event
     auto callback_function = JS::NativeFunction::create(
         realm, [event_target = this, name](JS::VM& vm) mutable -> JS::ThrowCompletionOr<JS::Value> {
             // The event dispatcher should only call this with one argument.
-            VERIFY(vm.argument_count() == 1);
-
-            // The argument must be an object and it must be an Event.
-            auto* event = Bindings::event_from_callback_argument(vm);
-            VERIFY(event);
-
-            TRY(event_target->process_event_handler_for_event(name, *event));
-            return JS::js_undefined();
-        },
-        0, Utf16FlyString {}, &realm);
-
-    // NOTE: As per the spec, the callback context is arbitrary.
-    auto callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*callback_function, realm);
-
-    // 5. Let listener be a new event listener whose type is the event handler event type corresponding to eventHandler and callback is callback.
-    auto listener = GC::Heap::the().allocate<DOMEventListener>();
-    listener->type = name;
-    listener->callback = IDLEventListener::create(*callback);
-
-    // 6. Add an event listener with eventTarget and listener.
-    add_an_event_listener(*listener);
-
-    // 7. Set eventHandler's listener to listener.
-    event_handler.listener = listener;
-}
-
-void EventTarget::deactivate_event_handler(Utf16FlyString const& name)
-{
-    // 1. Let handlerMap be eventTarget's event handler map.
-    auto& handler_map = ensure_data().event_handler_map;
-
-    // 2. Let eventHandler be handlerMap[name].
-    auto event_handler_iterator = handler_map.find(name);
-
-    // NOTE: See the optimization comment in get_current_value_of_event_handler about why this is done.
-    if (event_handler_iterator == handler_map.end())
-        return;
-
-    auto& event_handler = event_handler_iterator->value;
-
-    // 4. Let listener be eventHandler's listener. (NOTE: Not necessary)
-
-    // 5. If listener is not null, then remove an event listener with eventTarget and listener.
-    if (event_handler->listener) {
-        remove_an_event_listener(*event_handler->listener);
-    }
-
-    // 6. Set eventHandler's listener to null.
-    event_handler->listener = nullptr;
-
-    // 3. Set eventHandler's value to null.
-    // NOTE: This is done out of order since our equivalent of setting value to null is removing the event handler from the map.
-    //       Given that event_handler is a reference to an entry, this would invalidate event_handler if we did it in order.
-    handler_map.remove(event_handler_iterator);
-}
-
-// https://html.spec.whatwg.org/multipage/webappapis.html#the-event-handler-processing-algorithm
-JS::ThrowCompletionOr<void> EventTarget::process_event_handler_for_event(Utf16FlyString const& name, Event& event)
-{
-    // 1. Let callback be the result of getting the current value of the event handler given eventTarget and name.
-    auto* callback = get_current_value_of_event_handler(name);
-
-    // 2. If callback is null, then return.
-    if (!callback)
-        return {};
-
-    // 3. Let special error event handling be true if event is an ErrorEvent object, event's type is error, and event's currentTarget implements the WindowOrWorkerGlobalScope mixin.
-    //    Otherwise, let special error event handling be false.
