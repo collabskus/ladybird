@@ -94,7 +94,7 @@ set(SOURCES
     CSS/BooleanExpression.cpp
     CSS/CascadedProperties.cpp
     CSS/Clip.cpp
-    CSS/ComputedProperties.cpp
+    CSS/ComputedStyleWorkingSet.cpp
     CSS/ComputedValues.cpp
     CSS/RustStyleBridge.cpp
     CSS/ContainerQuery.cpp
@@ -172,7 +172,6 @@ set(SOURCES
     CSS/EdgeRect.cpp
     CSS/FeatureQuery.cpp
     CSS/Fetch.cpp
-    CSS/Filter.cpp
     CSS/Flex.cpp
     CSS/FontComputer.cpp
     CSS/FontFace.cpp
@@ -230,6 +229,7 @@ set(SOURCES
     CSS/PreferredColorScheme.cpp
     CSS/Ratio.cpp
     CSS/Resolution.cpp
+    CSS/ResolvedTransform.cpp
     CSS/Screen.cpp
     CSS/ScreenOrientation.cpp
     CSS/Selector.cpp
@@ -1065,6 +1065,7 @@ set(SOURCES
     SVG/SVGImageElement.cpp
     SVG/SVGLength.cpp
     SVG/SVGLengthList.cpp
+    SVG/SVGLengthValue.cpp
     SVG/SVGLinearGradientElement.cpp
     SVG/SVGLineElement.cpp
     SVG/SVGList.cpp

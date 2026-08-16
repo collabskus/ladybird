@@ -7,7 +7,6 @@
 #pragma once
 
 #include <AK/Utf16FlyString.h>
-#include <LibWeb/CSS/Parser/ComponentValue.h>
 #include <LibWeb/CSS/Serialize.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
 
@@ -22,13 +21,6 @@ public:
     virtual ~StringStyleValue() override = default;
 
     Utf16FlyString string_value() const { return Utf16FlyString::from_raw(m_value->string.string.raw); }
-    void serialize(StringBuilder& builder, SerializationMode) const { builder.append(serialize_a_string(string_value())); }
-    Vector<Parser::ComponentValue> tokenize() const
-    {
-        return { Parser::Token::create_string(string_value()) };
-    }
-
-    bool properties_equal(StringStyleValue const& other) const { return string_value() == other.string_value(); }
 
 private:
     friend class StyleValue;
@@ -39,7 +31,14 @@ private:
     }
 
     explicit StringStyleValue(Utf16FlyString string)
-        : StyleValueWithDefaultOperators(Type::String, StyleValueFFI::rust_style_value_create_string(string.to_raw_leaked()))
+        : StyleValueWithDefaultOperators(Type::String, [&] {
+            auto keyword = keyword_from_string(string);
+            auto is_valid_animation_name_custom_ident = !string.equals_ignoring_ascii_case("default"sv)
+                && !string.equals_ignoring_ascii_case("none"sv)
+                && (!keyword.has_value() || !CSS::is_css_wide_keyword(keyword.value()));
+            return StyleValueFFI::rust_style_value_create_string(
+                string.to_raw_leaked(), is_valid_animation_name_custom_ident);
+        }())
     {
     }
 };
