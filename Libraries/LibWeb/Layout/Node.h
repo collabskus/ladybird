@@ -52,23 +52,6 @@ static_assert(offsetof(RustFFI::NodeData, shell) == 56);
 static_assert(sizeof(RustFFI::NodeKind) == sizeof(u8));
 static_assert(sizeof(RustFFI::NodeFlag) == sizeof(u32));
 
-class NodeKindSetter;
-
-#define LAYOUT_NODE_KIND(class_) \
-private:                         \
-    NO_UNIQUE_ADDRESS NodeKindSetter m_node_kind_setter { *this, RustFFI::NodeKind::class_ }
-
-#define LAYOUT_NODE(class_, base_class)            \
-public:                                            \
-    using Base = base_class;                       \
-    virtual StringView class_name() const override \
-    {                                              \
-        return #class_##sv;                        \
-    }                                              \
-    LAYOUT_NODE_KIND(class_)
-
-class InlineNode;
-
 enum class LayoutUpdatePropagation : u8 {
     ThroughAncestors,
     BoundarySelfOnly,
@@ -97,9 +80,10 @@ public:
     using Base = RefCountedTreeNode<Node>;
 
     virtual ~Node();
-    virtual StringView class_name() const { return "Node"sv; }
+    StringView class_name() const;
 
     static RustFFI::NodeSlotId slot_id(Node const*);
+    RustFFI::NodeKind kind() const { return m_data->kind; }
     u32 arena_slot_index() const { return m_slot.index; }
     void* arena_handle() const;
     NodeArena& node_arena() const { return *m_arena; }
@@ -168,7 +152,7 @@ public:
     // anonymous table-fixup wrapper), or null when the node is not placed as a top layer box.
     Node* topmost_layout_node_of_top_layer_placement();
 
-    virtual RefPtr<Painting::Paintable> create_paintable() const;
+    RefPtr<Painting::Paintable> create_paintable() const;
 
     DOM::Document& document();
     DOM::Document const& document() const;
@@ -185,7 +169,7 @@ public:
     bool has_style() const { return has_flag(RustFFI::NodeFlag::HasStyle); }
     bool has_style_or_parent_with_style() const;
 
-    virtual bool can_have_children() const { return true; }
+    bool can_have_children() const;
 
     bool is_inline() const;
 
@@ -202,29 +186,30 @@ public:
     // https://www.w3.org/TR/CSS22/visuren.html#positioning-scheme
     bool is_in_flow() const { return !is_out_of_flow(); }
 
-    // These are used to optimize hot is<T> variants for some classes where dynamic_cast is too slow.
+    // These optimize hot is<T> variants for the surviving layout classes where dynamic_cast is too slow.
     virtual bool is_box() const { return false; }
     virtual bool is_block_container() const { return false; }
-    virtual bool is_inline_node() const { return false; }
-    virtual bool is_break_node() const { return false; }
     virtual bool is_text_node() const { return false; }
     virtual bool is_text_slice_node() const { return false; }
     virtual bool is_viewport() const { return false; }
-    virtual bool is_svg_box() const { return false; }
-    virtual bool is_svg_geometry_box() const { return false; }
-    virtual bool is_svg_clip_box() const { return false; }
-    virtual bool is_svg_mask_box() const { return false; }
-    virtual bool is_svg_pattern_box() const { return false; }
-    virtual bool is_svg_svg_box() const { return false; }
-    virtual bool is_svg_graphics_box() const { return false; }
-    virtual bool is_svg_foreign_object_box() const { return false; }
-    virtual bool is_replaced_box() const { return false; }
-    virtual bool is_list_item_box() const { return false; }
-    virtual bool is_list_item_marker_box() const { return false; }
-    virtual bool is_fieldset_box() const { return false; }
-    virtual bool is_legend_box() const { return false; }
-    virtual bool is_table_wrapper() const { return false; }
     virtual bool is_node_with_style() const { return false; }
+
+    bool is_inline_node() const { return kind() == RustFFI::NodeKind::InlineNode; }
+    bool is_break_node() const { return kind() == RustFFI::NodeKind::BreakNode; }
+    bool is_svg_box() const { return RustFFI::layout_node_kind_is_svg_box(kind()); }
+    bool is_svg_geometry_box() const { return kind() == RustFFI::NodeKind::SVGGeometryBox; }
+    bool is_svg_clip_box() const { return kind() == RustFFI::NodeKind::SVGClipBox; }
+    bool is_svg_mask_box() const { return kind() == RustFFI::NodeKind::SVGMaskBox; }
+    bool is_svg_pattern_box() const { return kind() == RustFFI::NodeKind::SVGPatternBox; }
+    bool is_svg_svg_box() const { return kind() == RustFFI::NodeKind::SVGSVGBox; }
+    bool is_svg_graphics_box() const { return RustFFI::layout_node_kind_is_svg_graphics_box(kind()); }
+    bool is_svg_foreign_object_box() const { return kind() == RustFFI::NodeKind::SVGForeignObjectBox; }
+    bool is_replaced_box() const { return RustFFI::layout_node_kind_is_replaced_box(kind()); }
+    bool is_list_item_box() const { return kind() == RustFFI::NodeKind::ListItemBox; }
+    bool is_list_item_marker_box() const { return kind() == RustFFI::NodeKind::ListItemMarkerBox; }
+    bool is_fieldset_box() const { return kind() == RustFFI::NodeKind::FieldSetBox; }
+    bool is_legend_box() const { return kind() == RustFFI::NodeKind::LegendBox; }
+    bool is_table_wrapper() const { return kind() == RustFFI::NodeKind::TableWrapper; }
 
     bool is_replaced_box_with_children() const { return is_replaced_box() && can_have_children(); }
 
@@ -257,7 +242,7 @@ public:
     // positioned element, if applicable. This is needed because m_containing_block can only hold
     // a Box*, but CSS allows inline elements (like a <span> with position:relative) to establish
     // containing blocks for their absolutely positioned descendants.
-    [[nodiscard]] InlineNode const* inline_containing_block_if_applicable() const { return m_inline_containing_block_if_applicable; }
+    [[nodiscard]] NodeWithStyle const* inline_containing_block_if_applicable() const { return m_inline_containing_block_if_applicable; }
 
     void recompute_containing_block(Badge<DOM::Document>);
 
@@ -276,6 +261,8 @@ public:
 
     bool children_are_inline() const { return has_flag(RustFFI::NodeFlag::ChildrenAreInline); }
     void set_children_are_inline(bool value) { set_flag(RustFFI::NodeFlag::ChildrenAreInline, value); }
+
+    void set_list_marker_is_inside(bool value) { set_flag(RustFFI::NodeFlag::ListMarkerIsInside, value); }
 
     bool is_editing_host() const { return has_flag(RustFFI::NodeFlag::IsEditingHost); }
     void set_is_editing_host(bool value) { set_flag(RustFFI::NodeFlag::IsEditingHost, value); }
@@ -312,7 +299,6 @@ protected:
 
 private:
     friend class NodeWithStyle;
-    friend class NodeKindSetter;
     friend class RefCountedTreeNode<Node>;
 
     static constexpr u8 encode_generated_for(CSS::PseudoElement pseudo_element)
@@ -322,11 +308,11 @@ private:
     }
 
     void set_containing_block(Box*);
-    void set_inline_containing_block(InlineNode const*);
-    void set_node_kind(RustFFI::NodeKind);
+    void set_inline_containing_block(NodeWithStyle const*);
     void synchronize_topology();
 
 protected:
+    void set_node_kind(RustFFI::NodeKind);
     void enroll_for_arena_replaced_content_facts_sync_if_eligible();
 
 private:
@@ -342,25 +328,17 @@ private:
     // (because it's not a Box), we store it here. This happens when a block element is inside an
     // inline element - the layout tree restructures so the block becomes a sibling of the inline,
     // but the CSS containing block relationship is based on the DOM structure.
-    InlineNode const* m_inline_containing_block_if_applicable { nullptr };
+    NodeWithStyle const* m_inline_containing_block_if_applicable { nullptr };
 
     GC::Weak<DOM::Element> m_pseudo_element_generator;
 
     bool m_enrolled_for_arena_replaced_content_facts_sync { false };
 };
 
-class NodeKindSetter {
-public:
-    NodeKindSetter(Node& node, RustFFI::NodeKind kind)
-    {
-        node.set_node_kind(kind);
-    }
-};
-
 class WEB_API NodeWithStyle : public Node {
-    LAYOUT_NODE(NodeWithStyle, Node);
-
 public:
+    NodeWithStyle(DOM::Document&, GC::Ptr<DOM::Node>, CSS::LayoutStyle, RustFFI::NodeKind = RustFFI::NodeKind::NodeWithStyle);
+
     virtual ~NodeWithStyle() override;
 
     class ImageObserver final : public CSS::ImageStyleValue::Client {
@@ -723,9 +701,6 @@ public:
     void set_display(CSS::Display);
     void set_content(CSS::ContentData const&);
     void set_overflow(CSS::Overflow overflow_x, CSS::Overflow overflow_y);
-
-protected:
-    NodeWithStyle(DOM::Document&, GC::Ptr<DOM::Node>, CSS::LayoutStyle);
 
 private:
     virtual bool is_node_with_style() const final { return true; }
