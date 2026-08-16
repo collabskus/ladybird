@@ -306251,6 +306251,8 @@ impl StyleEngine {
                 .append_catalog_answer(MatchAnswerID(cascade_input.0), node, None, &mut answer)
                 .is_some()
             {
+                // The catalog canonicalizes rule identities independently of cascade rank.
+                self.order_matches_in_cascade(&mut answer, false);
                 matches = Some(answer);
             }
         }
@@ -306309,7 +306311,8 @@ impl StyleEngine {
         Some(answer)
     }
 
-    /// Stream a published answer into its consumer without constructing another match vector.
+    /// Stream a published answer into its consumer. A materialized payload needs no copy; an
+    /// identity-only payload is restored in cascade order before it crosses the bridge.
     pub(super) fn consume_published_match_answer_with(
         &mut self,
         node: StyleNodeID,
@@ -306334,7 +306337,7 @@ impl StyleEngine {
                 .filter(|_| materialized_len.is_none())
                 .and_then(|identity| self.match_answers.answer(MatchAnswerID(identity.0)))
                 .map(|matches| matches.len());
-            if let Some(len) = materialized_len.or(compact_len) {
+            if let Some(len) = materialized_len {
                 self.published_match_answers.mark_observed(node);
                 self.counters.bump(Counter::PublishedMatchAnswerConsumptions);
                 if len > capacity {
@@ -306344,43 +306347,28 @@ impl StyleEngine {
                     .published_match_answers
                     .lookup(node)
                     .expect("a published answer remains live until the transaction ends");
-                if let Some(matches) = self.published_match_answers.matches_for(published) {
-                    for (index, matched) in matches.iter().enumerate() {
-                        consume(
-                            index,
-                            node,
-                            matched.rule,
-                            self.program.ensure_semantic_declaration(matched.rule),
-                            matched.pseudo_element,
-                            self.cascade_context_host(matched.rule, matched.tree_scope),
-                            matched.scope_proximity,
-                        );
-                    }
-                } else {
-                    let identity = cascade_input.expect("an identity-only answer has a cascade input");
-                    let matches = self
-                        .match_answers
-                        .answer(MatchAnswerID(identity.0))
-                        .expect("a published cascade input remains live");
-                    for (index, matched) in matches.iter().enumerate() {
-                        let pseudo_element = self
-                            .programs
-                            .get(matched.program)
-                            .entries()
-                            .get(matched.entry as usize)
-                            .expect("a retained match references a live selector entry")
-                            .pseudo_element;
-                        consume(
-                            index,
-                            node,
-                            matched.rule,
-                            self.program.ensure_semantic_declaration(matched.rule),
-                            pseudo_element,
-                            self.cascade_context_host(matched.rule, matched.tree_scope),
-                            matched.scope_proximity,
-                        );
-                    }
+                let matches = self
+                    .published_match_answers
+                    .matches_for(published)
+                    .expect("a materialized published answer remains live until the transaction ends");
+                for (index, matched) in matches.iter().enumerate() {
+                    consume(
+                        index,
+                        node,
+                        matched.rule,
+                        self.program.ensure_semantic_declaration(matched.rule),
+                        matched.pseudo_element,
+                        self.cascade_context_host(matched.rule, matched.tree_scope),
+                        matched.scope_proximity,
+                    );
                 }
+                return Some(len);
+            }
+            if let Some(len) = compact_len
+                && len > capacity
+            {
+                self.published_match_answers.mark_observed(node);
+                self.counters.bump(Counter::PublishedMatchAnswerConsumptions);
                 return Some(len);
             }
         }
@@ -306937,6 +306925,8 @@ impl StyleEngine {
                                     self.compact_matches_for_cascade(&mut matches, false, Some(node));
                                     cascade_input = Some(self.intern_cascade_input(&matches));
                                     cached_cascade_winner_inventory_is_complete = None;
+                                } else {
+                                    self.order_matches_in_cascade(&mut matches, false);
                                 }
                                 if scope == TreeScopeID::DOCUMENT
                                     && let Some((generation, group)) = winner_group
@@ -338402,6 +338392,103 @@ fn partial_match_answer_completion_shares_prefix_states_between_nodes() {
     assert_eq!(engine.match_element(nodes[3]).unwrap().len(), 1);
     engine.end_published_match_answer_completion_batch();
     assert_eq!(engine.memory().bytes_in_category(MemoryCategory::BatchScratch), 0);
+}
+
+#[test]
+fn a_cached_prefix_answer_is_returned_in_cascade_order() {
+    let (mut engine, nodes) = nested_document();
+    let guard = StyleAtomID(200);
+    let target = StyleAtomID(201);
+    let specific = add_guard_target_rule(&mut engine, guard, target);
+    let general = add_target_rule(&mut engine, StyleSheetObjectID(2), target);
+    engine.set_rule_declared_properties(specific, &[(1, false)], true);
+    engine.set_rule_declared_properties(general, &[(2, false)], true);
+    for &node in &nodes {
+        for kind in ElementDeclarationKind::ALL {
+            engine.set_element_declared_properties(node, kind, &[], true);
+        }
+    }
+    for (node, class) in [(nodes[1], guard), (nodes[2], target), (nodes[3], target)] {
+        add_feature(&mut engine, node, FeatureKey::Class(class));
+    }
+    discard_transaction(&mut engine);
+
+    assert!(engine.begin_cold_matching_batch(nodes[0]));
+    let first = engine.match_element_for_cascade(nodes[2]).unwrap();
+    let second = engine.match_element_for_cascade(nodes[3]).unwrap();
+    engine.end_cold_matching_batch();
+
+    for matches in [first, second] {
+        assert_eq!(
+            matches.iter().map(|matched| matched.rule).collect::<Vec<_>>(),
+            [general, specific]
+        );
+    }
+    assert_eq!(engine.counters().get(Counter::PrefixAnswerCacheMisses), 1);
+    assert_eq!(engine.counters().get(Counter::PrefixAnswerCacheHits), 1);
+}
+
+#[test]
+fn an_identity_only_published_prefix_answer_is_returned_in_cascade_order() {
+    let (mut engine, nodes) = nested_document();
+    let guard = StyleAtomID(200);
+    let target = StyleAtomID(201);
+    let specific = add_guard_target_rule(&mut engine, guard, target);
+    let general = add_target_rule(&mut engine, StyleSheetObjectID(2), target);
+    engine.set_rule_declared_properties(specific, &[(1, false)], true);
+    engine.set_rule_declared_properties(general, &[(2, false)], true);
+    for &node in &nodes {
+        for kind in ElementDeclarationKind::ALL {
+            engine.set_element_declared_properties(node, kind, &[], true);
+        }
+    }
+    for (node, class) in [(nodes[1], guard), (nodes[2], target), (nodes[3], target)] {
+        add_feature(&mut engine, node, FeatureKey::Class(class));
+    }
+    discard_transaction(&mut engine);
+
+    engine.begin_published_match_answer_completion_batch(nodes[0], false);
+    assert_eq!(
+        engine
+            .match_element_for_cascade(nodes[2])
+            .unwrap()
+            .iter()
+            .map(|matched| matched.rule)
+            .collect::<Vec<_>>(),
+        [general, specific]
+    );
+    let published = engine.complete_published_match_answer(nodes[3], None).unwrap();
+    assert!(published.cascade_input.is_some());
+    assert!(published.matches.is_none());
+    engine.end_published_match_answer_completion_batch();
+    assert_eq!(engine.counters().get(Counter::PrefixAnswerCacheMisses), 1);
+    assert_eq!(engine.counters().get(Counter::PrefixAnswerCacheHits), 1);
+
+    engine
+        .published_match_answers
+        .push(published, &mut engine.memory, &mut engine.counters);
+    engine.published_match_answers.sort();
+
+    let matches = engine.consume_published_match_answer(nodes[3]).unwrap();
+    assert_eq!(
+        matches.iter().map(|matched| matched.rule).collect::<Vec<_>>(),
+        [general, specific]
+    );
+
+    let mut streamed = Vec::new();
+    assert_eq!(
+        engine.consume_published_match_answer_with(nodes[3], 0, |_, _, rule, _, _, _, _| streamed.push(rule)),
+        Some(2)
+    );
+    assert!(streamed.is_empty());
+    assert_eq!(
+        engine.consume_published_match_answer_with(nodes[3], 2, |index, _, rule, _, _, _, _| {
+            assert_eq!(index, streamed.len());
+            streamed.push(rule);
+        }),
+        Some(2)
+    );
+    assert_eq!(streamed, [general, specific]);
 }
 
 #[test]
@@ -620245,78 +620332,3 @@ Program (script) @2:1
 │           ├─ rhs
 │           │  └─ ObjectExpression @28:21
 │           │     └─ ObjectProperty @28:21
-│           │        ├─ StringLiteral "a" @28:23
-│           │        └─ NumericLiteral 1 @28:26
-│           └─ body
-│              └─ BlockStatement @28:31
-└─ FunctionDeclaration "forof_member_lhs" @32:1
-   └─ body
-      └─ FunctionBody @33:5
-         ├─ VariableDeclaration (var) @33:5
-         │  └─ VariableDeclarator @33:5
-         │     ├─ Identifier "obj" [variable:0] (var) @33:9
-         │     └─ ObjectExpression @33:15
-         └─ ForOfStatement @34:18
-            ├─ lhs
-            │  └─ MemberExpression @34:13
-            │     ├─ Identifier "obj" [variable:0] (var) @34:10
-            │     └─ Identifier "key" @34:14
-            ├─ rhs
-            │  └─ ArrayExpression @34:21
-            │     ├─ NumericLiteral 1 @34:22
-            │     └─ NumericLiteral 2 @34:25
-            └─ body
-               └─ BlockStatement @34:29
-
-FILE: Tests/LibJS/AST/expected/for-in-of-scoping.txt
-Program (script) @2:1
-├─ FunctionDeclaration "for_in_let" @2:1
-│  ├─ parameters
-│  │  └─ Identifier "obj" [argument:0] @2:21
-│  └─ body
-│     └─ FunctionBody @3:5
-│        └─ ForInStatement @3:18
-│           ├─ lhs
-│           │  └─ VariableDeclaration (let) @3:10
-│           │     └─ VariableDeclarator @3:10
-│           │        └─ Identifier "key" [variable:0] (let) @3:14
-│           ├─ rhs
-│           │  └─ Identifier "obj" [argument:0] @3:21
-│           └─ body
-│              └─ BlockStatement @3:26
-│                 └─ ExpressionStatement @4:9
-│                    └─ Identifier "key" [variable:0] (let) @4:9
-├─ FunctionDeclaration "for_of_let" @9:1
-│  ├─ parameters
-│  │  └─ Identifier "arr" [argument:0] @9:21
-│  └─ body
-│     └─ FunctionBody @10:5
-│        └─ ForOfStatement @10:19
-│           ├─ lhs
-│           │  └─ VariableDeclaration (let) @10:10
-│           │     └─ VariableDeclarator @10:10
-│           │        └─ Identifier "item" [variable:0] (let) @10:14
-│           ├─ rhs
-│           │  └─ Identifier "arr" [argument:0] @10:22
-│           └─ body
-│              └─ BlockStatement @10:27
-│                 └─ ExpressionStatement @11:9
-│                    └─ Identifier "item" [variable:0] (let) @11:9
-├─ FunctionDeclaration "for_in_var" @16:1
-│  ├─ parameters
-│  │  └─ Identifier "obj" [argument:0] @16:21
-│  └─ body
-│     └─ FunctionBody @17:5
-│        ├─ ForInStatement @17:18
-│        │  ├─ lhs
-│        │  │  └─ VariableDeclaration (var) @17:10
-│        │  │     └─ VariableDeclarator @17:10
-│        │  │        └─ Identifier "key" [variable:0] (var) @17:14
-│        │  ├─ rhs
-│        │  │  └─ Identifier "obj" [argument:0] @17:21
-│        │  └─ body
-│        │     └─ BlockStatement @17:26
-│        │        └─ ExpressionStatement @18:9
-│        │           └─ Identifier "key" [variable:0] (var) @18:9
-│        └─ ReturnStatement @20:5
-│           └─ Identifier "key" [variable:0] @20:12
