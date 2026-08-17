@@ -45,6 +45,7 @@
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/BrowsingContextGroup.h>
 #include <LibWeb/HTML/DocumentState.h>
+#include <LibWeb/HTML/DragDataStore.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/HTMLBRElement.h>
 #include <LibWeb/HTML/HTMLIFrameElement.h>
@@ -892,11 +893,17 @@ void LocalNavigable::activate_history_entry(RefPtr<SessionHistoryEntry> entry, G
     if (new_document->completely_loaded_deferred())
         new_document->completely_finish_loading();
 
-    if (m_ongoing_navigation.has<Empty>()) {
-        for (auto& navigation_observer : m_navigation_observers) {
-            if (navigation_observer.navigation_complete())
-                navigation_observer.navigation_complete()->function()();
-        }
+    notify_navigation_observers_navigation_complete();
+}
+
+void LocalNavigable::notify_navigation_observers_navigation_complete()
+{
+    if (!m_ongoing_navigation.has<Empty>())
+        return;
+
+    for (auto& navigation_observer : m_navigation_observers) {
+        if (navigation_observer.navigation_complete())
+            navigation_observer.navigation_complete()->function()();
     }
 }
 
@@ -4400,7 +4407,27 @@ void LocalNavigable::paste(Utf16View text)
     if (!document)
         return;
 
-    m_event_handler.handle_paste(text, {});
+    // The UI process hands off the text to paste: The system clipboard's text for chrome-initiated paste or the primary
+    // selection's text for middle-click paste. Run the paste action with that as the content to paste — so the paste
+    // clipboard event fires, and canceling suppresses the insertion (as for a paste initiated with keyboard shortcut).
+    // INTEROP: For middle-click paste, Gecko and Blink also fire the paste event — with the event's clipboard data
+    //          reading from the primary selection.
+    auto data_store = DragDataStore::create();
+    data_store->add_item({
+        .kind = DragDataStoreItem::Kind::Text,
+        .type_string = "text/plain"_utf16_fly_string,
+        .data = Utf16String::from_utf16(text),
+        .file_data = {},
+        .file_name = {},
+    });
+    m_event_handler.perform_paste_action(data_store);
+}
+
+void LocalNavigable::paste_from_clipboard()
+{
+    // Run the whole paste action: It retrieves the system clipboard's contents from the UI process itself, which
+    // preserves every supported clipboard representation — where a bare-text handover would keep only the text.
+    (void)m_event_handler.perform_paste_action();
 }
 
 void LocalNavigable::undo()
