@@ -1,4 +1,482 @@
-﻿    EXPECT(client.read_message().has_array("workers"sv));
+﻿        MUST(m_socket->read_until_filled(message_buffer));
+
+        auto value = JsonValue::from_string(message_buffer);
+        VERIFY(!value.is_error());
+        VERIFY(value.value().is_object());
+        return value.release_value().as_object();
+    }
+
+    Core::EventLoop& m_loop;
+    NonnullOwnPtr<Core::TCPSocket> m_socket;
+    Vector<JsonObject> m_pending_messages;
+};
+
+struct TestSession {
+    Core::EventLoop loop;
+    TestDevToolsDelegate delegate;
+    OwnPtr<DevTools::DevToolsServer> server;
+    OwnPtr<ProtocolClient> client;
+};
+
+static NonnullOwnPtr<TestSession> create_session(StringView tab_url = "https://example.test/"sv, u64 tab_id = 1)
+{
+    auto session = make<TestSession>();
+    session->delegate.tab_url = MUST(String::from_utf8(tab_url));
+    session->delegate.tab_id = tab_id;
+    session->server = MUST(DevTools::DevToolsServer::create(session->delegate, 0));
+    session->client = ProtocolClient::connect(session->loop, *session->server);
+    return session;
+}
+
+static String actor_from(JsonObject const& object, StringView key)
+{
+    return object.get_string(key).release_value();
+}
+
+static JsonObject get_tab(ProtocolClient& client)
+{
+    auto tabs = client.request("root"sv, "listTabs"sv).get_array("tabs"sv).release_value();
+    VERIFY(tabs.size() == 1u);
+    return tabs.at(0).as_object();
+}
+
+static size_t style_rule_actor_count(DevTools::DevToolsServer const& server)
+{
+    size_t count = 0;
+    for (auto const& actor : server.actor_registry()) {
+        if (actor.key.bytes_as_string_view().contains("-style-rule"sv))
+            ++count;
+    }
+    return count;
+}
+
+static size_t source_actor_count(DevTools::DevToolsServer const& server)
+{
+    size_t count = 0;
+    for (auto const& actor : server.actor_registry()) {
+        if (actor.key.bytes_as_string_view().contains("-source"sv))
+            ++count;
+    }
+    return count;
+}
+
+TEST_CASE(devtools_server_reports_connection_state)
+{
+    TestSession session;
+    session.server = MUST(DevTools::DevToolsServer::create(session.delegate, 0));
+    EXPECT(!session.server->has_active_connection());
+
+    session.client = ProtocolClient::connect(session.loop, *session.server);
+    EXPECT(session.server->has_active_connection());
+
+    session.client.clear();
+    spin_until(session.loop, [&] { return !session.server->has_active_connection(); });
+    EXPECT(!session.server->has_active_connection());
+}
+
+static JsonObject get_frame_target(ProtocolClient& client, StringView tab_actor)
+{
+    auto watcher_actor = actor_from(client.request(tab_actor, "getWatcher"sv), "actor"sv);
+
+    JsonObject request;
+    request.set("to"sv, watcher_actor);
+    request.set("type"sv, "watchTargets"sv);
+    request.set("targetType"sv, "frame"sv);
+
+    EXPECT_EQ(client.request(move(request)).get_string("from"sv).value(), watcher_actor);
+
+    while (true) {
+        auto message = client.read_message();
+        if (message.get_string("type"sv).value_or({}) == "target-available-form"sv)
+            return message.get_object("target"sv).release_value();
+    }
+}
+
+static JsonObject get_walker(ProtocolClient& client, StringView inspector_actor)
+{
+    return client.request(inspector_actor, "getWalker"sv).get_object("walker"sv).release_value();
+}
+
+static String query_selector(ProtocolClient& client, StringView walker_actor, StringView root_node, StringView selector)
+{
+    JsonObject request;
+    request.set("to"sv, walker_actor);
+    request.set("type"sv, "querySelector"sv);
+    request.set("node"sv, root_node);
+    request.set("selector"sv, selector);
+    return client.request(move(request)).get_object("node"sv)->get_string("actor"sv).release_value();
+}
+
+static JsonObject read_resource(ProtocolClient& client, StringView resource_type, StringView packet_type = "resources-available-array"sv, StringView expected_sender = {})
+{
+    while (true) {
+        auto message = client.read_message();
+        if (message.get_string("type"sv).value_or({}) != packet_type)
+            continue;
+
+        auto array = message.get_array("array"sv);
+        if (!array.has_value())
+            continue;
+
+        for (auto const& entry : array->values()) {
+            if (!entry.is_array() || entry.as_array().size() < 2)
+                continue;
+            if (!entry.as_array().at(0).is_string() || entry.as_array().at(0).as_string() != resource_type)
+                continue;
+            if (!expected_sender.is_empty())
+                EXPECT_EQ(message.get_string("from"sv).value(), expected_sender);
+            auto const& resources = entry.as_array().at(1).as_array();
+            VERIFY(!resources.is_empty());
+            return resources.at(0).as_object();
+        }
+    }
+}
+
+static JsonObject read_packet_with_type(ProtocolClient& client, StringView packet_type)
+{
+    while (true) {
+        auto message = client.read_message();
+        if (message.get_string("type"sv).value_or({}) == packet_type)
+            return message;
+    }
+}
+
+static String get_cookies_actor(ProtocolClient& client)
+{
+    auto tab_actor = actor_from(get_tab(client), "actor"sv);
+    auto watcher_actor = actor_from(client.request(tab_actor, "getWatcher"sv), "actor"sv);
+
+    JsonObject watch_resources;
+    watch_resources.set("to"sv, watcher_actor);
+    watch_resources.set("type"sv, "watchResources"sv);
+    JsonArray resource_types;
+    resource_types.must_append("cookies"sv);
+    watch_resources.set("resourceTypes"sv, move(resource_types));
+    EXPECT_EQ(client.request(move(watch_resources)).get_string("from"sv).value(), watcher_actor);
+
+    auto cookie_resource = read_resource(client, "cookies"sv);
+    return actor_from(cookie_resource, "actor"sv);
+}
+
+static JsonObject get_cookie_store_objects(ProtocolClient& client, StringView cookies_actor, StringView host = "https://example.test"sv)
+{
+    JsonObject get_store_objects;
+    get_store_objects.set("to"sv, cookies_actor);
+    get_store_objects.set("type"sv, "getStoreObjects"sv);
+    get_store_objects.set("host"sv, host);
+    get_store_objects.set("names"sv, JsonValue {});
+    JsonObject options;
+    options.set("sessionString"sv, "Session"sv);
+    get_store_objects.set("options"sv, move(options));
+    return client.request(move(get_store_objects));
+}
+
+static String get_storage_actor(ProtocolClient& client, StringView resource_type)
+{
+    auto tab_actor = actor_from(get_tab(client), "actor"sv);
+    auto watcher_actor = actor_from(client.request(tab_actor, "getWatcher"sv), "actor"sv);
+
+    JsonObject watch_resources;
+    watch_resources.set("to"sv, watcher_actor);
+    watch_resources.set("type"sv, "watchResources"sv);
+    JsonArray resource_types;
+    resource_types.must_append(resource_type);
+    watch_resources.set("resourceTypes"sv, move(resource_types));
+    EXPECT_EQ(client.request(move(watch_resources)).get_string("from"sv).value(), watcher_actor);
+
+    return actor_from(read_resource(client, resource_type), "actor"sv);
+}
+
+static JsonObject get_storage_store_objects(ProtocolClient& client, StringView storage_actor, StringView host = "https://example.test"sv, Optional<JsonArray> names = {})
+{
+    JsonObject get_store_objects;
+    get_store_objects.set("to"sv, storage_actor);
+    get_store_objects.set("type"sv, "getStoreObjects"sv);
+    get_store_objects.set("host"sv, host);
+    if (names.has_value())
+        get_store_objects.set("names"sv, names.release_value());
+    else
+        get_store_objects.set("names"sv, JsonValue {});
+    get_store_objects.set("options"sv, JsonObject {});
+    return client.request(move(get_store_objects));
+}
+
+static JsonArray get_cookie_update_keys(JsonObject const& stores_update, StringView update_type, StringView host = "https://example.test"sv)
+{
+    return stores_update.get_object("data"sv)
+        ->get_object(update_type)
+        ->get_object("cookies"sv)
+        ->get_array(host)
+        .release_value();
+}
+
+static JsonArray get_storage_update_keys(JsonObject const& stores_update, StringView update_type, StringView resource_key, StringView host = "https://example.test"sv)
+{
+    return stores_update.get_object("data"sv)
+        ->get_object(update_type)
+        ->get_object(resource_key)
+        ->get_array(host)
+        .release_value();
+}
+
+static JsonObject make_storage_edit_items(StringView name, StringView value)
+{
+    JsonObject items;
+    items.set("name"sv, name);
+    items.set("value"sv, value);
+    return items;
+}
+
+static JsonObject edit_storage_item(ProtocolClient& client, StringView storage_actor, StringView field, JsonValue old_value, StringView name, StringView value)
+{
+    JsonObject data;
+    data.set("host"sv, "https://example.test"sv);
+    data.set("field"sv, field);
+    data.set("oldValue"sv, move(old_value));
+    data.set("items"sv, make_storage_edit_items(name, value));
+
+    JsonObject request;
+    request.set("to"sv, storage_actor);
+    request.set("type"sv, "editItem"sv);
+    request.set("data"sv, move(data));
+    return client.request(move(request));
+}
+
+static JsonObject add_storage_item(ProtocolClient& client, StringView storage_actor, StringView name)
+{
+    JsonObject request;
+    request.set("to"sv, storage_actor);
+    request.set("type"sv, "addItem"sv);
+    request.set("guid"sv, name);
+    request.set("host"sv, "https://example.test"sv);
+    return client.request(move(request));
+}
+
+static JsonObject remove_storage_item(ProtocolClient& client, StringView storage_actor, StringView name)
+{
+    JsonObject request;
+    request.set("to"sv, storage_actor);
+    request.set("type"sv, "removeItem"sv);
+    request.set("host"sv, "https://example.test"sv);
+    request.set("name"sv, name);
+    return client.request(move(request));
+}
+
+static JsonObject remove_all_storage_items(ProtocolClient& client, StringView storage_actor)
+{
+    JsonObject request;
+    request.set("to"sv, storage_actor);
+    request.set("type"sv, "removeAll"sv);
+    request.set("host"sv, "https://example.test"sv);
+    return client.request(move(request));
+}
+
+static String get_indexed_database_actor(ProtocolClient& client)
+{
+    auto tab_actor = actor_from(get_tab(client), "actor"sv);
+    auto watcher_actor = actor_from(client.request(tab_actor, "getWatcher"sv), "actor"sv);
+
+    JsonObject watch_resources;
+    watch_resources.set("to"sv, watcher_actor);
+    watch_resources.set("type"sv, "watchResources"sv);
+    JsonArray resource_types;
+    resource_types.must_append("indexed-db"sv);
+    watch_resources.set("resourceTypes"sv, move(resource_types));
+    EXPECT_EQ(client.request(move(watch_resources)).get_string("from"sv).value(), watcher_actor);
+
+    auto indexed_database_resource = read_resource(client, "indexed-db"sv);
+    return actor_from(indexed_database_resource, "actor"sv);
+}
+
+static JsonObject get_indexed_database_store_objects(ProtocolClient& client, StringView indexed_database_actor, Optional<String> name = {})
+{
+    JsonObject get_store_objects;
+    get_store_objects.set("to"sv, indexed_database_actor);
+    get_store_objects.set("type"sv, "getStoreObjects"sv);
+    get_store_objects.set("host"sv, "https://example.test"sv);
+    if (name.has_value()) {
+        JsonArray names;
+        names.must_append(*name);
+        get_store_objects.set("names"sv, move(names));
+    } else {
+        get_store_objects.set("names"sv, JsonValue {});
+    }
+    get_store_objects.set("options"sv, JsonObject {});
+    return client.request(move(get_store_objects));
+}
+
+static JsonObject get_indexed_database_store_objects(ProtocolClient& client, StringView indexed_database_actor, JsonArray names)
+{
+    JsonObject get_store_objects;
+    get_store_objects.set("to"sv, indexed_database_actor);
+    get_store_objects.set("type"sv, "getStoreObjects"sv);
+    get_store_objects.set("host"sv, "https://example.test"sv);
+    get_store_objects.set("names"sv, move(names));
+    get_store_objects.set("options"sv, JsonObject {});
+    return client.request(move(get_store_objects));
+}
+
+static JsonArray get_indexed_database_update_paths(JsonObject const& stores_update, StringView update_type, StringView host = "https://example.test"sv)
+{
+    return stores_update.get_object("data"sv)
+        ->get_object(update_type)
+        ->get_object("indexedDB"sv)
+        ->get_array(host)
+        .release_value();
+}
+
+static JsonArray get_indexed_database_cleared_paths(JsonObject const& stores_cleared, StringView host = "https://example.test"sv)
+{
+    return stores_cleared.get_object("data"sv)
+        ->get_object("clearedHostsOrPaths"sv)
+        ->get_array(host)
+        .release_value();
+}
+
+static JsonObject make_cookie_edit_items(HTTP::Cookie::Cookie const& cookie)
+{
+    JsonObject items;
+    items.set("uniqueKey"sv, cookie_unique_key(cookie.name, cookie.domain, cookie.path));
+    items.set("name"sv, cookie.name);
+    items.set("value"sv, cookie.value);
+    items.set("host"sv, cookie.domain);
+    items.set("path"sv, cookie.path);
+    items.set("expires"sv, cookie.persistent ? MUST(cookie.expiry_time.to_string("%a, %d %b %Y %T GMT"sv, UnixDateTime::LocalTime::No)) : "Session"_string);
+    items.set("isSecure"sv, cookie.secure);
+    items.set("isHttpOnly"sv, cookie.http_only);
+    return items;
+}
+
+static JsonObject edit_cookie(ProtocolClient& client, StringView cookies_actor, HTTP::Cookie::Cookie const& cookie, StringView field, JsonValue old_value, JsonValue new_value)
+{
+    JsonObject data;
+    data.set("host"sv, "https://example.test"sv);
+    data.set("field"sv, field);
+    data.set("oldValue"sv, move(old_value));
+    data.set("newValue"sv, move(new_value));
+    data.set("items"sv, make_cookie_edit_items(cookie));
+
+    JsonObject request;
+    request.set("to"sv, cookies_actor);
+    request.set("type"sv, "editItem"sv);
+    request.set("data"sv, move(data));
+    return client.request(move(request));
+}
+
+static JsonObject add_cookie(ProtocolClient& client, StringView cookies_actor, StringView name)
+{
+    JsonObject request;
+    request.set("to"sv, cookies_actor);
+    request.set("type"sv, "addItem"sv);
+    request.set("guid"sv, name);
+    request.set("host"sv, "https://example.test"sv);
+    return client.request(move(request));
+}
+
+static JsonObject remove_cookie(ProtocolClient& client, StringView cookies_actor, StringView name, StringView domain, StringView path)
+{
+    JsonObject request;
+    request.set("to"sv, cookies_actor);
+    request.set("type"sv, "removeItem"sv);
+    request.set("host"sv, "https://example.test"sv);
+    request.set("name"sv, cookie_unique_key(name, domain, path));
+    return client.request(move(request));
+}
+
+static JsonObject remove_all_cookies(ProtocolClient& client, StringView cookies_actor, Optional<StringView> domain = {})
+{
+    JsonObject request;
+    request.set("to"sv, cookies_actor);
+    request.set("type"sv, "removeAll"sv);
+    request.set("host"sv, "https://example.test"sv);
+    if (domain.has_value())
+        request.set("domain"sv, *domain);
+    else
+        request.set("domain"sv, JsonValue {});
+    return client.request(move(request));
+}
+
+static JsonObject remove_all_session_cookies(ProtocolClient& client, StringView cookies_actor, Optional<StringView> domain = {})
+{
+    JsonObject request;
+    request.set("to"sv, cookies_actor);
+    request.set("type"sv, "removeAllSessionCookies"sv);
+    request.set("host"sv, "https://example.test"sv);
+    if (domain.has_value())
+        request.set("domain"sv, *domain);
+    else
+        request.set("domain"sv, JsonValue {});
+    return client.request(move(request));
+}
+
+TEST_CASE(root_actor_and_connection_errors)
+{
+    auto session = create_session();
+    auto& client = *session->client;
+
+    auto greeting = client.read_message();
+    EXPECT_EQ(greeting.get_string("applicationType"sv).value(), "browser"sv);
+    auto traits = greeting.get_object("traits"sv).release_value();
+    EXPECT(traits.get_bool("highlightable"sv).value());
+    EXPECT(traits.get_bool("customHighlighters"sv).value());
+    EXPECT(traits.get_bool("networkMonitor"sv).value());
+
+    EXPECT_EQ(client.request("root"sv, "connect"sv).get_string("from"sv).value(), "root"sv);
+    auto root = client.request("root"sv, "getRoot"sv);
+    EXPECT(root.has_string("deviceActor"sv));
+    EXPECT(root.has_string("parentAccessibilityActor"sv));
+    EXPECT(root.has_string("preferenceActor"sv));
+
+    EXPECT_EQ(client.request("root"sv, "listProcesses"sv).get_array("processes"sv)->size(), 1u);
+    EXPECT(client.request("root"sv, "listAddons"sv).get_array("addons"sv)->is_empty());
+    EXPECT(client.request("root"sv, "listWorkers"sv).get_array("workers"sv)->is_empty());
+    EXPECT(client.request("root"sv, "listServiceWorkerRegistrations"sv).get_array("registrations"sv)->is_empty());
+
+    auto tab = get_tab(client);
+    auto tab_actor = actor_from(tab, "actor"sv);
+    EXPECT_EQ(tab.get_string("title"sv).value(), "Fixture page"sv);
+    EXPECT_EQ(tab.get_integer<u64>("browserId"sv).value(), 1u);
+    auto tab_traits = tab.get_object("traits"sv).release_value();
+    EXPECT(tab_traits.get_bool("supportsReloadDescriptor"sv).value());
+    EXPECT(tab_traits.get_bool("supportsNavigation"sv).value());
+
+    JsonObject get_tab_request;
+    get_tab_request.set("to"sv, "root"sv);
+    get_tab_request.set("type"sv, "getTab"sv);
+    get_tab_request.set("browserId"sv, 1);
+    EXPECT_EQ(client.request(move(get_tab_request)).get_object("tab"sv)->get_string("actor"sv).value(), tab_actor);
+
+    session->server->refresh_tab_list();
+    EXPECT_EQ(client.read_message().get_string("type"sv).value(), "tabListChanged"sv);
+    session->server->refresh_tab_list();
+    pump(session->loop);
+
+    JsonObject missing_to;
+    missing_to.set("type"sv, "connect"sv);
+    client.send(move(missing_to));
+    EXPECT_EQ(client.read_message().get_string("error"sv).value(), "missingParameter"sv);
+
+    JsonObject missing_type;
+    missing_type.set("to"sv, "root"sv);
+    client.send(move(missing_type));
+    EXPECT_EQ(client.read_message().get_string("error"sv).value(), "missingParameter"sv);
+
+    JsonObject unknown_actor;
+    unknown_actor.set("to"sv, "missing"sv);
+    unknown_actor.set("type"sv, "connect"sv);
+    client.send(move(unknown_actor));
+    EXPECT_EQ(client.read_message().get_string("error"sv).value(), "unknownActor"sv);
+    EXPECT_EQ(client.request("root"sv, "notARealPacket"sv).get_string("error"sv).value(), "unrecognizedPacketType"sv);
+
+    JsonObject first;
+    first.set("to"sv, "root"sv);
+    first.set("type"sv, "listWorkers"sv);
+    JsonObject second;
+    second.set("to"sv, "root"sv);
+    second.set("type"sv, "listAddons"sv);
+    client.send(move(first));
+    client.send(move(second));
+    EXPECT(client.read_message().has_array("workers"sv));
     EXPECT(client.read_message().has_array("addons"sv));
 }
 
@@ -112852,6 +113330,51 @@ describe("polymorphic IC boundary tests", () => {
         expect(sum).toBe(4950);
     });
 
+    test("megamorphic prototype property IC", () => {
+        function getValue(object) {
+            return object.value;
+        }
+
+        const prototypes = [];
+        const objects = [];
+        for (let i = 0; i < 20; ++i) {
+            const prototype = { value: i };
+            prototypes.push(prototype);
+            objects.push(Object.create(prototype));
+        }
+
+        for (let iteration = 0; iteration < 10; ++iteration) {
+            let sum = 0;
+            for (const object of objects) sum += getValue(object);
+            expect(sum).toBe(190);
+        }
+
+        prototypes[5].value = 100;
+        expect(getValue(objects[5])).toBe(100);
+
+        delete prototypes[6].value;
+        expect(getValue(objects[6])).toBeUndefined();
+    });
+
+    test("megamorphic setter IC", () => {
+        function setValue(object, value) {
+            object.value = value;
+        }
+
+        const objects = [];
+        for (let i = 0; i < 20; ++i) {
+            const object = {};
+            for (let j = 0; j < i; ++j) object[`property${j}`] = j;
+            objects.push(object);
+        }
+
+        for (let iteration = 0; iteration < 10; ++iteration) {
+            for (let i = 0; i < objects.length; ++i) setValue(objects[i], iteration + i);
+        }
+
+        for (let i = 0; i < objects.length; ++i) expect(objects[i].value).toBe(9 + i);
+    });
+
     test("polymorphic IC with prototype differences", () => {
         function getValue(obj) {
             return obj.x;
@@ -121694,6 +122217,94 @@ test("Modifying prototype in dictionary mode should cause prototype-chain validi
         configurable: true,
     });
     f(obj, 123);
+});
+
+test("Static property lookup cache invalidates missing own properties", () => {
+    const object = {
+        valueOf() {
+            return 1;
+        },
+    };
+
+    for (let i = 0; i < 10; ++i) expect(+object).toBe(1);
+
+    object[Symbol.toPrimitive] = () => 2;
+    expect(+object).toBe(2);
+});
+
+test("Static property lookup cache invalidates missing prototype properties", () => {
+    const prototype = {
+        valueOf() {
+            return 1;
+        },
+    };
+    const object = Object.create(prototype);
+
+    for (let i = 0; i < 10; ++i) expect(+object).toBe(1);
+
+    prototype[Symbol.toPrimitive] = () => 2;
+    expect(+object).toBe(2);
+});
+
+test("GetById cache invalidates missing own properties", () => {
+    function read_value(object) {
+        return object.value;
+    }
+
+    const object = {};
+    for (let i = 0; i < 10; ++i) expect(read_value(object)).toBeUndefined();
+
+    object.value = 42;
+    expect(read_value(object)).toBe(42);
+});
+
+test("GetById cache invalidates missing prototype properties", () => {
+    function read_value(object) {
+        return object.value;
+    }
+
+    const prototype = {};
+    const object = Object.create(prototype);
+    for (let i = 0; i < 10; ++i) expect(read_value(object)).toBeUndefined();
+
+    prototype.value = 42;
+    expect(read_value(object)).toBe(42);
+});
+
+test("GetById cache invokes prototype getters with the receiver", () => {
+    function read_value(object) {
+        return object.value;
+    }
+
+    const prototype = {
+        get value() {
+            return this.payload;
+        },
+    };
+    const object = Object.create(prototype);
+    object.payload = 42;
+
+    for (let i = 0; i < 10; ++i) expect(read_value(object)).toBe(42);
+});
+
+test("GetById cache propagates getter exceptions to the caller", () => {
+    function read_value(object) {
+        return object.value;
+    }
+
+    let should_throw = false;
+    const object = {
+        get value() {
+            if (should_throw) throw new Error("boom");
+            return 42;
+        },
+    };
+
+    for (let i = 0; i < 10; ++i) expect(read_value(object)).toBe(42);
+    should_throw = true;
+    expect(() => read_value(object)).toThrowWithMessage(Error, "boom");
+    should_throw = false;
+    expect(read_value(object)).toBe(42);
 });
 
 FILE: Tests/LibJS/Runtime/regress/interpreter-get-callee-from-environment-tdz-cache.js
@@ -166388,37 +166999,37 @@ SC for Viewport<#document> [0,0 800x600] (z-index: auto)
 
 FILE: Tests/LibWeb/Layout/expected/css-table-cell-verticalalign-text-top.txt
 Viewport <#document> at [0,0] [0+0+0 800 0+0+0] [0+0+0 600 0+0+0] [BFC] children: not-inline
-  BlockContainer <html> at [0,0] [0+0+0 800 0+0+0] [0+0+0 116 0+0+0] [BFC] children: not-inline
+  BlockContainer <html> at [0,0] [0+0+0 800 0+0+0] [0+0+0 118 0+0+0] [BFC] children: not-inline
     BlockContainer <(anonymous)> at [0,0] [0+0+0 800 0+0+0] [0+0+0 0 0+0+0] children: inline
       TextNode <#text> (not painted)
-    BlockContainer <body> at [8,8] [8+0+0 784 0+0+8] [8+0+0 100 0+0+8] children: not-inline
+    BlockContainer <body> at [8,8] [8+0+0 784 0+0+8] [8+0+0 102 0+0+8] children: not-inline
       BlockContainer <(anonymous)> at [8,8] [0+0+0 784 0+0+0] [0+0+0 0 0+0+0] children: inline
         TextNode <#text> (not painted)
-      TableWrapper <(anonymous)> at [8,8] [0+0+0 204 0+0+580] [0+0+0 100 0+0+0] [BFC] children: not-inline
-        Box <table> at [8,8] table-box [0+0+0 204 0+0+0] [0+0+0 100 0+0+0] [TFC] children: not-inline
-          Box <tbody> at [8,8] table-row-group [0+0+0 204 0+0+0] [0+0+0 100 0+0+0] children: not-inline
-            Box <tr> at [8,8] table-row [0+0+0 204 0+0+0] [0+0+0 100 0+0+0] children: not-inline
-              BlockContainer <td> at [10,10] table-cell [0+1+1 200 1+1+0] [0+1+1 16 81+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 15, rect: [10,10 129.296875x16] baseline: 12.796875
+      TableWrapper <(anonymous)> at [8,8] [0+0+0 206 0+0+578] [0+0+0 102 0+0+0] [BFC] children: not-inline
+        Box <table> at [9,9] table-box [0+1+0 204 0+1+0] [0+1+0 100 0+1+0] [TFC] children: not-inline
+          Box <tbody> at [9,9] table-row-group [0+0+0 204 0+0+0] [0+0+0 100 0+0+0] children: not-inline
+            Box <tr> at [9,9] table-row [0+0+0 204 0+0+0] [0+0+0 100 0+0+0] children: not-inline
+              BlockContainer <td> at [11,11] table-cell [0+1+1 200 1+1+0] [0+1+1 16 81+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 15, rect: [11,11 129.296875x16] baseline: 12.796875
                     "Text at the top"
                 TextNode <#text> (not painted)
-      BlockContainer <(anonymous)> at [8,108] [0+0+0 784 0+0+0] [0+0+0 0 0+0+0] children: inline
+      BlockContainer <(anonymous)> at [8,110] [0+0+0 784 0+0+0] [0+0+0 0 0+0+0] children: inline
         TextNode <#text> (not painted)
 
 ViewportPaintable (Viewport<#document>) [0,0 800x600]
-  PaintableWithLines (BlockContainer<HTML>) [0,0 800x116]
+  PaintableWithLines (BlockContainer<HTML>) [0,0 800x118]
     PaintableWithLines (BlockContainer(anonymous)) [0,0 800x0]
-    PaintableWithLines (BlockContainer<BODY>) [8,8 784x100]
+    PaintableWithLines (BlockContainer<BODY>) [8,8 784x102]
       PaintableWithLines (BlockContainer(anonymous)) [8,8 784x0]
-      PaintableWithLines (TableWrapper(anonymous)) [8,8 204x100]
-        Paintable (Box<TABLE>) [8,8 204x100]
-          Paintable (Box<TBODY>) [8,8 204x100]
-            Paintable (Box<TR>) [8,8 204x100]
-              PaintableWithLines (BlockContainer<TD>) [8,8 204x100]
-      PaintableWithLines (BlockContainer(anonymous)) [8,108 784x0]
+      PaintableWithLines (TableWrapper(anonymous)) [8,8 206x102]
+        Paintable (Box<TABLE>) [8,8 206x102]
+          Paintable (Box<TBODY>) [9,9 204x100]
+            Paintable (Box<TR>) [9,9 204x100]
+              PaintableWithLines (BlockContainer<TD>) [9,9 204x100]
+      PaintableWithLines (BlockContainer(anonymous)) [8,110 784x0]
 
 SC for Viewport<#document> [0,0 800x600] (z-index: auto)
- SC for BlockContainer<HTML> [0,0 800x116] (z-index: auto)
+ SC for BlockContainer<HTML> [0,0 800x118] (z-index: auto)
 
 FILE: Tests/LibWeb/Layout/expected/css-text-transform-math-auto.txt
 Viewport <#document> at [0,0] [0+0+0 800 0+0+0] [0+0+0 600 0+0+0] [BFC] children: not-inline
@@ -191878,289 +192489,289 @@ SC for Viewport<#document> [0,0 800x600] (z-index: auto)
 
 FILE: Tests/LibWeb/Layout/expected/table/border-collapse-is-inherited.txt
 Viewport <#document> at [0,0] [0+0+0 800 0+0+0] [0+0+0 600 0+0+0] [BFC] children: not-inline
-  BlockContainer <html> at [0,0] [0+0+0 800 0+0+0] [0+0+0 208 0+0+0] [BFC] children: not-inline
+  BlockContainer <html> at [0,0] [0+0+0 800 0+0+0] [0+0+0 210 0+0+0] [BFC] children: not-inline
     BlockContainer <(anonymous)> at [0,0] [0+0+0 800 0+0+0] [0+0+0 0 0+0+0] children: inline
       TextNode <#text> (not painted)
-    BlockContainer <body> at [8,8] [8+0+0 784 0+0+8] [8+0+0 192 0+0+8] children: not-inline
+    BlockContainer <body> at [8,8] [8+0+0 784 0+0+8] [8+0+0 194 0+0+8] children: not-inline
       BlockContainer <(anonymous)> at [8,8] [0+0+0 784 0+0+0] [0+0+0 0 0+0+0] children: inline
         TextNode <#text> (not painted)
-      BlockContainer <div.horizontal> at [8,8] [0+0+0 784 0+0+0] [0+0+0 192 0+0+0] children: inline
-        frag 0 from BlockContainer start: 0, length: 0, rect: [9,9 161.90625x190] baseline: 100.296875
+      BlockContainer <div.horizontal> at [8,8] [0+0+0 784 0+0+0] [0+0+0 194 0+0+0] children: inline
+        frag 0 from BlockContainer start: 0, length: 0, rect: [9,9 163.90625x192] baseline: 102.296875
         TextNode <#text> (not painted)
-        BlockContainer <table> at [9,9] inline-block [0+1+0 161.90625 0+1+0] [0+1+0 190 0+1+0] [BFC] children: not-inline
-          BlockContainer <(anonymous)> at [9,9] [0+0+0 161.90625 0+0+0] [0+0+0 0 0+0+0] children: inline
+        BlockContainer <table> at [9,9] inline-block [0+1+0 163.90625 0+1+0] [0+1+0 192 0+1+0] [BFC] children: not-inline
+          BlockContainer <(anonymous)> at [9,9] [0+0+0 163.90625 0+0+0] [0+0+0 0 0+0+0] children: inline
             TextNode <#text> (not painted)
-          TableWrapper <(anonymous)> at [9,9] inline-block [0+0+0 161.90625 0+0+0] [0+0+0 190 0+0+0] [BFC] children: not-inline
-            Box <(anonymous)> at [9,9] inline-table table-box [0+0+0 161.90625 0+0+0] [0+0+0 190 0+0+0] [TFC] children: not-inline
-              Box <tbody> at [9,9] table-row-group [0+0+0 161.90625 0+0+0] [0+0+0 190 0+0+0] children: not-inline
-                Box <tr> at [9,9] table-row [0+0+0 161.90625 0+0+0] [0+0+0 38 0+0+0] children: not-inline
-                  BlockContainer <td> at [30,20] table-cell [0+1+20 14.265625 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
-                    frag 0 from TextNode start: 0, length: 1, rect: [30,20 14.265625x16] baseline: 12.796875
+          TableWrapper <(anonymous)> at [9,9] inline-block [0+0+0 163.90625 0+0+0] [0+0+0 192 0+0+0] [BFC] children: not-inline
+            Box <(anonymous)> at [10,10] inline-table table-box [0+1+0 161.90625 0+1+0] [0+1+0 190 0+1+0] [TFC] children: not-inline
+              Box <tbody> at [10,10] table-row-group [0+0+0 161.90625 0+0+0] [0+0+0 190 0+0+0] children: not-inline
+                Box <tr> at [10,10] table-row [0+0+0 161.90625 0+0+0] [0+0+0 38 0+0+0] children: not-inline
+                  BlockContainer <td> at [31,21] table-cell [0+1+20 14.265625 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
+                    frag 0 from TextNode start: 0, length: 1, rect: [31,21 14.265625x16] baseline: 12.796875
                         "A"
                     TextNode <#text> (not painted)
                   BlockContainer <(anonymous)> (not painted) children: inline
                     TextNode <#text> (not painted)
-                  BlockContainer <td> at [86.265625,20] table-cell [0+1+20 12.546875 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
-                    frag 0 from TextNode start: 0, length: 1, rect: [87.859375,20 9.34375x16] baseline: 12.796875
+                  BlockContainer <td> at [87.265625,21] table-cell [0+1+20 12.546875 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
+                    frag 0 from TextNode start: 0, length: 1, rect: [88.859375,21 9.34375x16] baseline: 12.796875
                         "B"
                     TextNode <#text> (not painted)
                   BlockContainer <(anonymous)> (not painted) children: inline
                     TextNode <#text> (not painted)
-                  BlockContainer <td> at [140.8125,20] table-cell [0+1+20 9.09375 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
-                    frag 0 from TextNode start: 0, length: 1, rect: [142.1875,20 6.34375x16] baseline: 12.796875
+                  BlockContainer <td> at [141.8125,21] table-cell [0+1+20 9.09375 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
+                    frag 0 from TextNode start: 0, length: 1, rect: [143.1875,21 6.34375x16] baseline: 12.796875
                         "1"
                     TextNode <#text> (not painted)
                 BlockContainer <(anonymous)> (not painted) children: inline
                   TextNode <#text> (not painted)
-                Box <tr> at [9,47] table-row [0+0+0 161.90625 0+0+0] [0+0+0 38 0+0+0] children: not-inline
-                  BlockContainer <td> at [30,58] table-cell [0+1+20 14.265625 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
-                    frag 0 from TextNode start: 0, length: 1, rect: [31.96875,58 10.3125x16] baseline: 12.796875
+                Box <tr> at [10,48] table-row [0+0+0 161.90625 0+0+0] [0+0+0 38 0+0+0] children: not-inline
+                  BlockContainer <td> at [31,59] table-cell [0+1+20 14.265625 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
+                    frag 0 from TextNode start: 0, length: 1, rect: [32.96875,59 10.3125x16] baseline: 12.796875
                         "C"
                     TextNode <#text> (not painted)
                   BlockContainer <(anonymous)> (not painted) children: inline
                     TextNode <#text> (not painted)
-                  BlockContainer <td> at [86.265625,58] table-cell [0+1+20 12.546875 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
-                    frag 0 from TextNode start: 0, length: 1, rect: [86.96875,58 11.140625x16] baseline: 12.796875
+                  BlockContainer <td> at [87.265625,59] table-cell [0+1+20 12.546875 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
+                    frag 0 from TextNode start: 0, length: 1, rect: [87.96875,59 11.140625x16] baseline: 12.796875
                         "D"
                     TextNode <#text> (not painted)
                   BlockContainer <(anonymous)> (not painted) children: inline
                     TextNode <#text> (not painted)
-                  BlockContainer <td> at [140.8125,58] table-cell [0+1+20 9.09375 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
-                    frag 0 from TextNode start: 0, length: 1, rect: [140.953125,58 8.8125x16] baseline: 12.796875
+                  BlockContainer <td> at [141.8125,59] table-cell [0+1+20 9.09375 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
+                    frag 0 from TextNode start: 0, length: 1, rect: [141.953125,59 8.8125x16] baseline: 12.796875
                         "2"
                     TextNode <#text> (not painted)
                 BlockContainer <(anonymous)> (not painted) children: inline
                   TextNode <#text> (not painted)
-                Box <tr> at [9,85] table-row [0+0+0 161.90625 0+0+0] [0+0+0 38 0+0+0] children: not-inline
-                  BlockContainer <td> at [30,96] table-cell [0+1+20 14.265625 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
-                    frag 0 from TextNode start: 0, length: 1, rect: [31.203125,96 11.859375x16] baseline: 12.796875
+                Box <tr> at [10,86] table-row [0+0+0 161.90625 0+0+0] [0+0+0 38 0+0+0] children: not-inline
+                  BlockContainer <td> at [31,97] table-cell [0+1+20 14.265625 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
+                    frag 0 from TextNode start: 0, length: 1, rect: [32.203125,97 11.859375x16] baseline: 12.796875
                         "E"
                     TextNode <#text> (not painted)
                   BlockContainer <(anonymous)> (not painted) children: inline
                     TextNode <#text> (not painted)
-                  BlockContainer <td> at [86.265625,96] table-cell [0+1+20 12.546875 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
-                    frag 0 from TextNode start: 0, length: 1, rect: [86.265625,96 12.546875x16] baseline: 12.796875
+                  BlockContainer <td> at [87.265625,97] table-cell [0+1+20 12.546875 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
+                    frag 0 from TextNode start: 0, length: 1, rect: [87.265625,97 12.546875x16] baseline: 12.796875
                         "F"
                     TextNode <#text> (not painted)
                   BlockContainer <(anonymous)> (not painted) children: inline
                     TextNode <#text> (not painted)
-                  BlockContainer <td> at [140.8125,96] table-cell [0+1+20 9.09375 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
-                    frag 0 from TextNode start: 0, length: 1, rect: [140.8125,96 9.09375x16] baseline: 12.796875
+                  BlockContainer <td> at [141.8125,97] table-cell [0+1+20 9.09375 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
+                    frag 0 from TextNode start: 0, length: 1, rect: [141.8125,97 9.09375x16] baseline: 12.796875
                         "3"
                     TextNode <#text> (not painted)
                 BlockContainer <(anonymous)> (not painted) children: inline
                   TextNode <#text> (not painted)
-                Box <tr> at [9,123] table-row [0+0+0 161.90625 0+0+0] [0+0+0 38 0+0+0] children: not-inline
-                  BlockContainer <td> at [30,134] table-cell [0+1+20 14.265625 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
-                    frag 0 from TextNode start: 0, length: 1, rect: [30.515625,134 13.234375x16] baseline: 12.796875
+                Box <tr> at [10,124] table-row [0+0+0 161.90625 0+0+0] [0+0+0 38 0+0+0] children: not-inline
+                  BlockContainer <td> at [31,135] table-cell [0+1+20 14.265625 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
+                    frag 0 from TextNode start: 0, length: 1, rect: [31.515625,135 13.234375x16] baseline: 12.796875
                         "G"
                     TextNode <#text> (not painted)
                   BlockContainer <(anonymous)> (not painted) children: inline
                     TextNode <#text> (not painted)
-                  BlockContainer <td> at [86.265625,134] table-cell [0+1+20 12.546875 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
-                    frag 0 from TextNode start: 0, length: 1, rect: [86.421875,134 12.234375x16] baseline: 12.796875
+                  BlockContainer <td> at [87.265625,135] table-cell [0+1+20 12.546875 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
+                    frag 0 from TextNode start: 0, length: 1, rect: [87.421875,135 12.234375x16] baseline: 12.796875
                         "H"
                     TextNode <#text> (not painted)
                   BlockContainer <(anonymous)> (not painted) children: inline
                     TextNode <#text> (not painted)
-                  BlockContainer <td> at [140.8125,134] table-cell [0+1+20 9.09375 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
-                    frag 0 from TextNode start: 0, length: 1, rect: [141.484375,134 7.75x16] baseline: 12.796875
+                  BlockContainer <td> at [141.8125,135] table-cell [0+1+20 9.09375 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
+                    frag 0 from TextNode start: 0, length: 1, rect: [142.484375,135 7.75x16] baseline: 12.796875
                         "4"
                     TextNode <#text> (not painted)
                 BlockContainer <(anonymous)> (not painted) children: inline
                   TextNode <#text> (not painted)
-                Box <tr> at [9,161] table-row [0+0+0 161.90625 0+0+0] [0+0+0 38 0+0+0] children: not-inline
-                  BlockContainer <td> at [30,172] table-cell [0+1+20 14.265625 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
-                    frag 0 from TextNode start: 0, length: 1, rect: [34.828125,172 4.59375x16] baseline: 12.796875
+                Box <tr> at [10,162] table-row [0+0+0 161.90625 0+0+0] [0+0+0 38 0+0+0] children: not-inline
+                  BlockContainer <td> at [31,173] table-cell [0+1+20 14.265625 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
+                    frag 0 from TextNode start: 0, length: 1, rect: [35.828125,173 4.59375x16] baseline: 12.796875
                         "I"
                     TextNode <#text> (not painted)
                   BlockContainer <(anonymous)> (not painted) children: inline
                     TextNode <#text> (not painted)
-                  BlockContainer <td> at [86.265625,172] table-cell [0+1+20 12.546875 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
-                    frag 0 from TextNode start: 0, length: 1, rect: [88.078125,172 8.90625x16] baseline: 12.796875
+                  BlockContainer <td> at [87.265625,173] table-cell [0+1+20 12.546875 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
+                    frag 0 from TextNode start: 0, length: 1, rect: [89.078125,173 8.90625x16] baseline: 12.796875
                         "J"
                     TextNode <#text> (not painted)
                   BlockContainer <(anonymous)> (not painted) children: inline
                     TextNode <#text> (not painted)
-                  BlockContainer <td> at [140.8125,172] table-cell [0+1+20 9.09375 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
-                    frag 0 from TextNode start: 0, length: 1, rect: [141.125,172 8.453125x16] baseline: 12.796875
+                  BlockContainer <td> at [141.8125,173] table-cell [0+1+20 9.09375 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
+                    frag 0 from TextNode start: 0, length: 1, rect: [142.125,173 8.453125x16] baseline: 12.796875
                         "5"
                     TextNode <#text> (not painted)
               BlockContainer <(anonymous)> (not painted) children: inline
                 TextNode <#text> (not painted)
         TextNode <#text> (not painted)
-      BlockContainer <(anonymous)> at [8,200] [0+0+0 784 0+0+0] [0+0+0 0 0+0+0] children: inline
+      BlockContainer <(anonymous)> at [8,202] [0+0+0 784 0+0+0] [0+0+0 0 0+0+0] children: inline
         TextNode <#text> (not painted)
 
 ViewportPaintable (Viewport<#document>) [0,0 800x600]
-  PaintableWithLines (BlockContainer<HTML>) [0,0 800x208]
+  PaintableWithLines (BlockContainer<HTML>) [0,0 800x210]
     PaintableWithLines (BlockContainer(anonymous)) [0,0 800x0]
-    PaintableWithLines (BlockContainer<BODY>) [8,8 784x192]
+    PaintableWithLines (BlockContainer<BODY>) [8,8 784x194]
       PaintableWithLines (BlockContainer(anonymous)) [8,8 784x0]
-      PaintableWithLines (BlockContainer<DIV>.horizontal) [8,8 784x192]
-        PaintableWithLines (BlockContainer<TABLE>) [8,8 163.90625x192]
-          PaintableWithLines (BlockContainer(anonymous)) [9,9 161.90625x0]
-          PaintableWithLines (TableWrapper(anonymous)) [9,9 161.90625x190]
-            Paintable (Box(anonymous)) [9,9 161.90625x190]
-              Paintable (Box<TBODY>) [9,9 161.90625x190]
-                Paintable (Box<TR>) [9,9 161.90625x38]
-                  PaintableWithLines (BlockContainer<TD>) [9,9 56.265625x38]
-                  PaintableWithLines (BlockContainer<TD>) [65.265625,9 54.546875x38]
-                  PaintableWithLines (BlockContainer<TD>) [119.8125,9 51.09375x38]
-                Paintable (Box<TR>) [9,47 161.90625x38]
-                  PaintableWithLines (BlockContainer<TD>) [9,47 56.265625x38]
-                  PaintableWithLines (BlockContainer<TD>) [65.265625,47 54.546875x38]
-                  PaintableWithLines (BlockContainer<TD>) [119.8125,47 51.09375x38]
-                Paintable (Box<TR>) [9,85 161.90625x38]
-                  PaintableWithLines (BlockContainer<TD>) [9,85 56.265625x38]
-                  PaintableWithLines (BlockContainer<TD>) [65.265625,85 54.546875x38]
-                  PaintableWithLines (BlockContainer<TD>) [119.8125,85 51.09375x38]
-                Paintable (Box<TR>) [9,123 161.90625x38]
-                  PaintableWithLines (BlockContainer<TD>) [9,123 56.265625x38]
-                  PaintableWithLines (BlockContainer<TD>) [65.265625,123 54.546875x38]
-                  PaintableWithLines (BlockContainer<TD>) [119.8125,123 51.09375x38]
-                Paintable (Box<TR>) [9,161 161.90625x38]
-                  PaintableWithLines (BlockContainer<TD>) [9,161 56.265625x38]
-                  PaintableWithLines (BlockContainer<TD>) [65.265625,161 54.546875x38]
-                  PaintableWithLines (BlockContainer<TD>) [119.8125,161 51.09375x38]
-      PaintableWithLines (BlockContainer(anonymous)) [8,200 784x0]
+      PaintableWithLines (BlockContainer<DIV>.horizontal) [8,8 784x194]
+        PaintableWithLines (BlockContainer<TABLE>) [8,8 165.90625x194]
+          PaintableWithLines (BlockContainer(anonymous)) [9,9 163.90625x0]
+          PaintableWithLines (TableWrapper(anonymous)) [9,9 163.90625x192]
+            Paintable (Box(anonymous)) [9,9 163.90625x192]
+              Paintable (Box<TBODY>) [10,10 161.90625x190]
+                Paintable (Box<TR>) [10,10 161.90625x38]
+                  PaintableWithLines (BlockContainer<TD>) [10,10 56.265625x38]
+                  PaintableWithLines (BlockContainer<TD>) [66.265625,10 54.546875x38]
+                  PaintableWithLines (BlockContainer<TD>) [120.8125,10 51.09375x38]
+                Paintable (Box<TR>) [10,48 161.90625x38]
+                  PaintableWithLines (BlockContainer<TD>) [10,48 56.265625x38]
+                  PaintableWithLines (BlockContainer<TD>) [66.265625,48 54.546875x38]
+                  PaintableWithLines (BlockContainer<TD>) [120.8125,48 51.09375x38]
+                Paintable (Box<TR>) [10,86 161.90625x38]
+                  PaintableWithLines (BlockContainer<TD>) [10,86 56.265625x38]
+                  PaintableWithLines (BlockContainer<TD>) [66.265625,86 54.546875x38]
+                  PaintableWithLines (BlockContainer<TD>) [120.8125,86 51.09375x38]
+                Paintable (Box<TR>) [10,124 161.90625x38]
+                  PaintableWithLines (BlockContainer<TD>) [10,124 56.265625x38]
+                  PaintableWithLines (BlockContainer<TD>) [66.265625,124 54.546875x38]
+                  PaintableWithLines (BlockContainer<TD>) [120.8125,124 51.09375x38]
+                Paintable (Box<TR>) [10,162 161.90625x38]
+                  PaintableWithLines (BlockContainer<TD>) [10,162 56.265625x38]
+                  PaintableWithLines (BlockContainer<TD>) [66.265625,162 54.546875x38]
+                  PaintableWithLines (BlockContainer<TD>) [120.8125,162 51.09375x38]
+      PaintableWithLines (BlockContainer(anonymous)) [8,202 784x0]
 
 SC for Viewport<#document> [0,0 800x600] (z-index: auto)
- SC for BlockContainer<HTML> [0,0 800x208] (z-index: auto)
+ SC for BlockContainer<HTML> [0,0 800x210] (z-index: auto)
 
 FILE: Tests/LibWeb/Layout/expected/table/border-conflict-resolution-with-cell.txt
 Viewport <#document> at [0,0] [0+0+0 800 0+0+0] [0+0+0 600 0+0+0] [BFC] children: not-inline
-  BlockContainer <html> at [0,0] [0+0+0 800 0+0+0] [0+0+0 100 0+0+0] [BFC] children: not-inline
-    BlockContainer <body> at [8,8] [8+0+0 784 0+0+8] [8+0+0 84 0+0+8] children: not-inline
-      TableWrapper <(anonymous)> at [8,8] [0+0+0 172.671875 0+0+611.328125] [0+0+0 84 0+0+0] [BFC] children: not-inline
-        Box <table> at [8,8] table-box [0+0+0 172.671875 0+0+0] [0+0+0 84 0+0+0] [TFC] children: not-inline
-          Box <tbody> at [8,8] table-row-group [0+0+0 172.671875 0+0+0] [0+0+0 84 0+0+0] children: not-inline
-            Box <tr> at [8,8] table-row [0+0+0 172.671875 0+0+0] [0+0+0 42 0+0+0] children: not-inline
-              BlockContainer <td> at [29,21] table-cell [0+1+20 14.265625 20+5+0] [0+1+12 16 12+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [29,21 14.265625x16] baseline: 12.796875
+  BlockContainer <html> at [0,0] [0+0+0 800 0+0+0] [0+0+0 106 0+0+0] [BFC] children: not-inline
+    BlockContainer <body> at [8,8] [8+0+0 784 0+0+8] [8+0+0 90 0+0+8] children: not-inline
+      TableWrapper <(anonymous)> at [8,8] [0+0+0 176.671875 0+0+607.328125] [0+0+0 90 0+0+0] [BFC] children: not-inline
+        Box <table> at [9,11] table-box [0+1+0 172.671875 0+5+0] [0+5+0 84 0+5+0] [TFC] children: not-inline
+          Box <tbody> at [9,11] table-row-group [0+0+0 172.671875 0+0+0] [0+0+0 84 0+0+0] children: not-inline
+            Box <tr> at [9,11] table-row [0+0+0 172.671875 0+0+0] [0+0+0 42 0+0+0] children: not-inline
+              BlockContainer <td> at [30,24] table-cell [0+1+20 14.265625 20+5+0] [0+1+12 16 12+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [30,24 14.265625x16] baseline: 12.796875
                     "A"
                 TextNode <#text> (not painted)
               BlockContainer <(anonymous)> (not painted) children: inline
                 TextNode <#text> (not painted)
-              BlockContainer <td.td-thick-border> at [89.265625,21] table-cell [0+5+20 9.859375 20+5+0] [0+5+10 16 10+5+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [89.265625,21 9.34375x16] baseline: 12.796875
+              BlockContainer <td.td-thick-border> at [90.265625,24] table-cell [0+5+20 9.859375 20+5+0] [0+5+10 16 10+5+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [90.265625,24 9.34375x16] baseline: 12.796875
                     "B"
                 TextNode <#text> (not painted)
               BlockContainer <(anonymous)> (not painted) children: inline
                 TextNode <#text> (not painted)
-              BlockContainer <td> at [145.125,20] table-cell [0+5+20 14.546875 20+1+0] [0+1+11 16 11+5+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [145.125,20 10.3125x16] baseline: 12.796875
+              BlockContainer <td> at [146.125,23] table-cell [0+5+20 14.546875 20+1+0] [0+1+11 16 11+5+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [146.125,23 10.3125x16] baseline: 12.796875
                     "C"
                 TextNode <#text> (not painted)
             BlockContainer <(anonymous)> (not painted) children: inline
               TextNode <#text> (not painted)
-            Box <tr> at [8,50] table-row [0+0+0 172.671875 0+0+0] [0+0+0 42 0+0+0] children: not-inline
-              BlockContainer <td> at [29,63] table-cell [0+1+20 16.265625 20+1+0] [0+1+12 16 12+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [29,63 11.140625x16] baseline: 12.796875
+            Box <tr> at [9,53] table-row [0+0+0 172.671875 0+0+0] [0+0+0 42 0+0+0] children: not-inline
+              BlockContainer <td> at [30,66] table-cell [0+1+20 16.265625 20+1+0] [0+1+12 16 12+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [30,66 11.140625x16] baseline: 12.796875
                     "D"
                 TextNode <#text> (not painted)
               BlockContainer <(anonymous)> (not painted) children: inline
                 TextNode <#text> (not painted)
-              BlockContainer <td> at [87.265625,64] table-cell [0+1+20 11.859375 20+5+0] [0+5+11 16 11+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [87.265625,64 11.859375x16] baseline: 12.796875
+              BlockContainer <td> at [88.265625,67] table-cell [0+1+20 11.859375 20+5+0] [0+5+11 16 11+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [88.265625,67 11.859375x16] baseline: 12.796875
                     "E"
                 TextNode <#text> (not painted)
               BlockContainer <(anonymous)> (not painted) children: inline
                 TextNode <#text> (not painted)
-              BlockContainer <td.td-thick-border> at [145.125,63] table-cell [0+5+20 12.546875 20+5+0] [0+5+10 16 10+5+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [145.125,63 12.546875x16] baseline: 12.796875
+              BlockContainer <td.td-thick-border> at [146.125,66] table-cell [0+5+20 12.546875 20+5+0] [0+5+10 16 10+5+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [146.125,66 12.546875x16] baseline: 12.796875
                     "F"
                 TextNode <#text> (not painted)
 
 ViewportPaintable (Viewport<#document>) [0,0 800x600]
-  PaintableWithLines (BlockContainer<HTML>) [0,0 800x100]
-    PaintableWithLines (BlockContainer<BODY>) [8,8 784x84]
-      PaintableWithLines (TableWrapper(anonymous)) [8,8 172.671875x84]
-        Paintable (Box<TABLE>) [8,8 172.671875x84]
-          Paintable (Box<TBODY>) [8,8 172.671875x84]
-            Paintable (Box<TR>) [8,8 172.671875x42]
-              PaintableWithLines (BlockContainer<TD>) [8,8 58.265625x42]
-              PaintableWithLines (BlockContainer<TD>.td-thick-border) [66.265625,8 55.859375x42]
-              PaintableWithLines (BlockContainer<TD>) [122.125,8 58.546875x42]
-            Paintable (Box<TR>) [8,50 172.671875x42]
-              PaintableWithLines (BlockContainer<TD>) [8,50 58.265625x42]
-              PaintableWithLines (BlockContainer<TD>) [66.265625,50 55.859375x42]
-              PaintableWithLines (BlockContainer<TD>.td-thick-border) [122.125,50 58.546875x42]
+  PaintableWithLines (BlockContainer<HTML>) [0,0 800x106]
+    PaintableWithLines (BlockContainer<BODY>) [8,8 784x90]
+      PaintableWithLines (TableWrapper(anonymous)) [8,8 176.671875x90]
+        Paintable (Box<TABLE>) [8,8 176.671875x90]
+          Paintable (Box<TBODY>) [9,11 172.671875x84]
+            Paintable (Box<TR>) [9,11 172.671875x42]
+              PaintableWithLines (BlockContainer<TD>) [9,11 58.265625x42]
+              PaintableWithLines (BlockContainer<TD>.td-thick-border) [67.265625,11 55.859375x42]
+              PaintableWithLines (BlockContainer<TD>) [123.125,11 58.546875x42]
+            Paintable (Box<TR>) [9,53 172.671875x42]
+              PaintableWithLines (BlockContainer<TD>) [9,53 58.265625x42]
+              PaintableWithLines (BlockContainer<TD>) [67.265625,53 55.859375x42]
+              PaintableWithLines (BlockContainer<TD>.td-thick-border) [123.125,53 58.546875x42]
 
 SC for Viewport<#document> [0,0 800x600] (z-index: auto)
- SC for BlockContainer<HTML> [0,0 800x100] (z-index: auto)
+ SC for BlockContainer<HTML> [0,0 800x106] (z-index: auto)
 
 FILE: Tests/LibWeb/Layout/expected/table/border-conflict-resolution-with-col.txt
 Viewport <#document> at [0,0] [0+0+0 800 0+0+0] [0+0+0 600 0+0+0] [BFC] children: not-inline
-  BlockContainer <html> at [0,0] [0+0+0 800 0+0+0] [0+0+0 172 0+0+0] [BFC] children: not-inline
+  BlockContainer <html> at [0,0] [0+0+0 800 0+0+0] [0+0+0 178 0+0+0] [BFC] children: not-inline
     BlockContainer <(anonymous)> at [0,0] [0+0+0 800 0+0+0] [0+0+0 0 0+0+0] children: inline
       TextNode <#text> (not painted)
-    BlockContainer <body> at [8,8] [8+0+0 784 0+0+8] [8+0+0 156 0+0+8] children: not-inline
+    BlockContainer <body> at [8,8] [8+0+0 784 0+0+8] [8+0+0 162 0+0+8] children: not-inline
       BlockContainer <(anonymous)> at [8,8] [0+0+0 784 0+0+0] [0+0+0 0 0+0+0] children: inline
         TextNode <#text> (not painted)
-      TableWrapper <(anonymous)> at [8,8] [0+0+0 60.265625 0+0+723.734375] [0+0+0 156 0+0+0] [BFC] children: not-inline
-        Box <table> at [8,8] table-box [0+0+0 60.265625 0+0+0] [0+0+0 156 0+0+0] [TFC] children: not-inline
+      TableWrapper <(anonymous)> at [8,8] [0+0+0 66.265625 0+0+717.734375] [0+0+0 162 0+0+0] [BFC] children: not-inline
+        Box <table> at [11,11] table-box [0+5+0 60.265625 0+5+0] [0+5+0 156 0+5+0] [TFC] children: not-inline
           BlockContainer <colgroup> (not painted) table-column-group children: not-inline
             BlockContainer <col> (not painted) children: not-inline
           BlockContainer <(anonymous)> (not painted) children: inline
             TextNode <#text> (not painted)
-          Box <tbody> at [8,8] table-row-group [0+0+0 60.265625 0+0+0] [0+0+0 156 0+0+0] children: not-inline
-            Box <tr> at [8,8] table-row [0+0+0 60.265625 0+0+0] [0+0+0 40 0+0+0] children: not-inline
-              BlockContainer <td> at [31,21] table-cell [0+5+20 14.265625 20+5+0] [0+5+10 16 10+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [31,21 14.265625x16] baseline: 12.796875
+          Box <tbody> at [11,11] table-row-group [0+0+0 60.265625 0+0+0] [0+0+0 156 0+0+0] children: not-inline
+            Box <tr> at [11,11] table-row [0+0+0 60.265625 0+0+0] [0+0+0 40 0+0+0] children: not-inline
+              BlockContainer <td> at [34,24] table-cell [0+5+20 14.265625 20+5+0] [0+5+10 16 10+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [34,24 14.265625x16] baseline: 12.796875
                     "A"
                 TextNode <#text> (not painted)
             BlockContainer <(anonymous)> (not painted) children: inline
               TextNode <#text> (not painted)
-            Box <tr> at [8,48] table-row [0+0+0 60.265625 0+0+0] [0+0+0 38 0+0+0] children: not-inline
-              BlockContainer <td> at [31,59] table-cell [0+5+20 14.265625 20+5+0] [0+1+10 16 10+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [31,59 9.34375x16] baseline: 12.796875
+            Box <tr> at [11,51] table-row [0+0+0 60.265625 0+0+0] [0+0+0 38 0+0+0] children: not-inline
+              BlockContainer <td> at [34,62] table-cell [0+5+20 14.265625 20+5+0] [0+1+10 16 10+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [34,62 9.34375x16] baseline: 12.796875
                     "B"
                 TextNode <#text> (not painted)
             BlockContainer <(anonymous)> (not painted) children: inline
               TextNode <#text> (not painted)
-            Box <tr> at [8,86] table-row [0+0+0 60.265625 0+0+0] [0+0+0 38 0+0+0] children: not-inline
-              BlockContainer <td> at [31,97] table-cell [0+5+20 14.265625 20+5+0] [0+1+10 16 10+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [31,97 10.3125x16] baseline: 12.796875
+            Box <tr> at [11,89] table-row [0+0+0 60.265625 0+0+0] [0+0+0 38 0+0+0] children: not-inline
+              BlockContainer <td> at [34,100] table-cell [0+5+20 14.265625 20+5+0] [0+1+10 16 10+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [34,100 10.3125x16] baseline: 12.796875
                     "C"
                 TextNode <#text> (not painted)
             BlockContainer <(anonymous)> (not painted) children: inline
               TextNode <#text> (not painted)
-            Box <tr> at [8,124] table-row [0+0+0 60.265625 0+0+0] [0+0+0 40 0+0+0] children: not-inline
-              BlockContainer <td> at [31,135] table-cell [0+5+20 14.265625 20+5+0] [0+1+10 16 10+5+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [31,135 11.140625x16] baseline: 12.796875
+            Box <tr> at [11,127] table-row [0+0+0 60.265625 0+0+0] [0+0+0 40 0+0+0] children: not-inline
+              BlockContainer <td> at [34,138] table-cell [0+5+20 14.265625 20+5+0] [0+1+10 16 10+5+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [34,138 11.140625x16] baseline: 12.796875
                     "D"
                 TextNode <#text> (not painted)
-      BlockContainer <(anonymous)> at [8,164] [0+0+0 784 0+0+0] [0+0+0 0 0+0+0] children: inline
+      BlockContainer <(anonymous)> at [8,170] [0+0+0 784 0+0+0] [0+0+0 0 0+0+0] children: inline
         TextNode <#text> (not painted)
 
 ViewportPaintable (Viewport<#document>) [0,0 800x600]
-  PaintableWithLines (BlockContainer<HTML>) [0,0 800x172]
+  PaintableWithLines (BlockContainer<HTML>) [0,0 800x178]
     PaintableWithLines (BlockContainer(anonymous)) [0,0 800x0]
-    PaintableWithLines (BlockContainer<BODY>) [8,8 784x156]
+    PaintableWithLines (BlockContainer<BODY>) [8,8 784x162]
       PaintableWithLines (BlockContainer(anonymous)) [8,8 784x0]
-      PaintableWithLines (TableWrapper(anonymous)) [8,8 60.265625x156]
-        Paintable (Box<TABLE>) [8,8 60.265625x156]
-          Paintable (Box<TBODY>) [8,8 60.265625x156]
-            Paintable (Box<TR>) [8,8 60.265625x40]
-              PaintableWithLines (BlockContainer<TD>) [8,8 60.265625x40]
-            Paintable (Box<TR>) [8,48 60.265625x38]
-              PaintableWithLines (BlockContainer<TD>) [8,48 60.265625x38]
-            Paintable (Box<TR>) [8,86 60.265625x38]
-              PaintableWithLines (BlockContainer<TD>) [8,86 60.265625x38]
-            Paintable (Box<TR>) [8,124 60.265625x40]
-              PaintableWithLines (BlockContainer<TD>) [8,124 60.265625x40]
-      PaintableWithLines (BlockContainer(anonymous)) [8,164 784x0]
+      PaintableWithLines (TableWrapper(anonymous)) [8,8 66.265625x162]
+        Paintable (Box<TABLE>) [8,8 66.265625x162]
+          Paintable (Box<TBODY>) [11,11 60.265625x156]
+            Paintable (Box<TR>) [11,11 60.265625x40]
+              PaintableWithLines (BlockContainer<TD>) [11,11 60.265625x40]
+            Paintable (Box<TR>) [11,51 60.265625x38]
+              PaintableWithLines (BlockContainer<TD>) [11,51 60.265625x38]
+            Paintable (Box<TR>) [11,89 60.265625x38]
+              PaintableWithLines (BlockContainer<TD>) [11,89 60.265625x38]
+            Paintable (Box<TR>) [11,127 60.265625x40]
+              PaintableWithLines (BlockContainer<TD>) [11,127 60.265625x40]
+      PaintableWithLines (BlockContainer(anonymous)) [8,170 784x0]
 
 SC for Viewport<#document> [0,0 800x600] (z-index: auto)
- SC for BlockContainer<HTML> [0,0 800x172] (z-index: auto)
+ SC for BlockContainer<HTML> [0,0 800x178] (z-index: auto)
 
 FILE: Tests/LibWeb/Layout/expected/table/border-conflict-resolution-with-multiple-colgroups.txt
 Viewport <#document> at [0,0] [0+0+0 800 0+0+0] [0+0+0 600 0+0+0] [BFC] children: not-inline
-  BlockContainer <html> at [0,0] [0+0+0 800 0+0+0] [0+0+0 54 0+0+0] [BFC] children: not-inline
-    BlockContainer <body> at [8,8] [8+0+0 784 0+0+8] [8+0+0 38 0+0+8] children: not-inline
-      TableWrapper <(anonymous)> at [8,8] [0+0+0 113.609375 0+0+670.390625] [0+0+0 38 0+0+0] [BFC] children: not-inline
-        Box <table> at [8,8] table-box [0+0+0 113.609375 0+0+0] [0+0+0 38 0+0+0] [TFC] children: not-inline
+  BlockContainer <html> at [0,0] [0+0+0 800 0+0+0] [0+0+0 56 0+0+0] [BFC] children: not-inline
+    BlockContainer <body> at [8,8] [8+0+0 784 0+0+8] [8+0+0 40 0+0+8] children: not-inline
+      TableWrapper <(anonymous)> at [8,8] [0+0+0 115.609375 0+0+668.390625] [0+0+0 40 0+0+0] [BFC] children: not-inline
+        Box <table> at [9,9] table-box [0+1+0 113.609375 0+1+0] [0+1+0 38 0+1+0] [TFC] children: not-inline
           BlockContainer <colgroup> (not painted) table-column-group children: not-inline
             BlockContainer <col> (not painted) children: not-inline
           BlockContainer <(anonymous)> (not painted) children: inline
@@ -192169,164 +192780,164 @@ Viewport <#document> at [0,0] [0+0+0 800 0+0+0] [0+0+0 600 0+0+0] [BFC] children
             BlockContainer <col.right> (not painted) children: not-inline
           BlockContainer <(anonymous)> (not painted) children: inline
             TextNode <#text> (not painted)
-          Box <tbody> at [8,8] table-row-group [0+0+0 113.609375 0+0+0] [0+0+0 38 0+0+0] children: not-inline
-            Box <tr> at [8,8] table-row [0+0+0 113.609375 0+0+0] [0+0+0 38 0+0+0] children: not-inline
-              BlockContainer <td> at [29,19] table-cell [0+1+20 14.265625 20+8+0] [0+1+10 16 10+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [29,19 14.265625x16] baseline: 12.796875
+          Box <tbody> at [9,9] table-row-group [0+0+0 113.609375 0+0+0] [0+0+0 38 0+0+0] children: not-inline
+            Box <tr> at [9,9] table-row [0+0+0 113.609375 0+0+0] [0+0+0 38 0+0+0] children: not-inline
+              BlockContainer <td> at [30,20] table-cell [0+1+20 14.265625 20+8+0] [0+1+10 16 10+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [30,20 14.265625x16] baseline: 12.796875
                     "A"
                 TextNode <#text> (not painted)
               BlockContainer <(anonymous)> (not painted) children: inline
                 TextNode <#text> (not painted)
-              BlockContainer <td> at [91.265625,19] table-cell [0+8+20 9.34375 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [91.265625,19 9.34375x16] baseline: 12.796875
+              BlockContainer <td> at [92.265625,20] table-cell [0+8+20 9.34375 20+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [92.265625,20 9.34375x16] baseline: 12.796875
                     "B"
                 TextNode <#text> (not painted)
-      BlockContainer <(anonymous)> at [8,46] [0+0+0 784 0+0+0] [0+0+0 0 0+0+0] children: inline
+      BlockContainer <(anonymous)> at [8,48] [0+0+0 784 0+0+0] [0+0+0 0 0+0+0] children: inline
         TextNode <#text> (not painted)
 
 ViewportPaintable (Viewport<#document>) [0,0 800x600]
-  PaintableWithLines (BlockContainer<HTML>) [0,0 800x54]
-    PaintableWithLines (BlockContainer<BODY>) [8,8 784x38]
-      PaintableWithLines (TableWrapper(anonymous)) [8,8 113.609375x38]
-        Paintable (Box<TABLE>) [8,8 113.609375x38]
-          Paintable (Box<TBODY>) [8,8 113.609375x38]
-            Paintable (Box<TR>) [8,8 113.609375x38]
-              PaintableWithLines (BlockContainer<TD>) [8,8 59.265625x38]
-              PaintableWithLines (BlockContainer<TD>) [67.265625,8 54.34375x38]
-      PaintableWithLines (BlockContainer(anonymous)) [8,46 784x0]
+  PaintableWithLines (BlockContainer<HTML>) [0,0 800x56]
+    PaintableWithLines (BlockContainer<BODY>) [8,8 784x40]
+      PaintableWithLines (TableWrapper(anonymous)) [8,8 115.609375x40]
+        Paintable (Box<TABLE>) [8,8 115.609375x40]
+          Paintable (Box<TBODY>) [9,9 113.609375x38]
+            Paintable (Box<TR>) [9,9 113.609375x38]
+              PaintableWithLines (BlockContainer<TD>) [9,9 59.265625x38]
+              PaintableWithLines (BlockContainer<TD>) [68.265625,9 54.34375x38]
+      PaintableWithLines (BlockContainer(anonymous)) [8,48 784x0]
 
 SC for Viewport<#document> [0,0 800x600] (z-index: auto)
- SC for BlockContainer<HTML> [0,0 800x54] (z-index: auto)
+ SC for BlockContainer<HTML> [0,0 800x56] (z-index: auto)
 
 FILE: Tests/LibWeb/Layout/expected/table/border-conflict-resolution-with-row.txt
 Viewport <#document> at [0,0] [0+0+0 800 0+0+0] [0+0+0 600 0+0+0] [BFC] children: not-inline
-  BlockContainer <html> at [0,0] [0+0+0 800 0+0+0] [0+0+0 142 0+0+0] [BFC] children: not-inline
-    BlockContainer <body> at [8,8] [8+0+0 784 0+0+8] [8+0+0 126 0+0+8] children: not-inline
-      TableWrapper <(anonymous)> at [8,8] [0+0+0 114.8125 0+0+669.1875] [0+0+0 126 0+0+0] [BFC] children: not-inline
-        Box <table> at [8,8] table-box [0+0+0 114.8125 0+0+0] [0+0+0 126 0+0+0] [TFC] children: not-inline
-          Box <tbody> at [8,8] table-row-group [0+0+0 114.8125 0+0+0] [0+0+0 126 0+0+0] children: not-inline
-            Box <tr.td-thick-border> at [8,8] table-row [0+0+0 114.8125 0+0+0] [0+0+0 42 0+0+0] children: not-inline
-              BlockContainer <td> at [31,21] table-cell [0+5+20 14.265625 20+1+0] [0+5+10 16 10+5+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [31,21 14.265625x16] baseline: 12.796875
+  BlockContainer <html> at [0,0] [0+0+0 800 0+0+0] [0+0+0 148 0+0+0] [BFC] children: not-inline
+    BlockContainer <body> at [8,8] [8+0+0 784 0+0+8] [8+0+0 132 0+0+8] children: not-inline
+      TableWrapper <(anonymous)> at [8,8] [0+0+0 120.8125 0+0+663.1875] [0+0+0 132 0+0+0] [BFC] children: not-inline
+        Box <table> at [11,11] table-box [0+5+0 114.8125 0+5+0] [0+5+0 126 0+5+0] [TFC] children: not-inline
+          Box <tbody> at [11,11] table-row-group [0+0+0 114.8125 0+0+0] [0+0+0 126 0+0+0] children: not-inline
+            Box <tr.td-thick-border> at [11,11] table-row [0+0+0 114.8125 0+0+0] [0+0+0 42 0+0+0] children: not-inline
+              BlockContainer <td> at [34,24] table-cell [0+5+20 14.265625 20+1+0] [0+5+10 16 10+5+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [34,24 14.265625x16] baseline: 12.796875
                     "A"
                 TextNode <#text> (not painted)
               BlockContainer <(anonymous)> (not painted) children: inline
                 TextNode <#text> (not painted)
-              BlockContainer <td> at [87.265625,21] table-cell [0+1+20 12.546875 20+5+0] [0+5+10 16 10+5+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [87.265625,21 9.34375x16] baseline: 12.796875
+              BlockContainer <td> at [90.265625,24] table-cell [0+1+20 12.546875 20+5+0] [0+5+10 16 10+5+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [90.265625,24 9.34375x16] baseline: 12.796875
                     "B"
                 TextNode <#text> (not painted)
             BlockContainer <(anonymous)> (not painted) children: inline
               TextNode <#text> (not painted)
-            Box <tr> at [8,50] table-row [0+0+0 114.8125 0+0+0] [0+0+0 42 0+0+0] children: not-inline
-              BlockContainer <td> at [29,63] table-cell [0+1+20 16.265625 20+1+0] [0+5+10 16 10+5+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [29,63 10.3125x16] baseline: 12.796875
+            Box <tr> at [11,53] table-row [0+0+0 114.8125 0+0+0] [0+0+0 42 0+0+0] children: not-inline
+              BlockContainer <td> at [32,66] table-cell [0+1+20 16.265625 20+1+0] [0+5+10 16 10+5+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [32,66 10.3125x16] baseline: 12.796875
                     "C"
                 TextNode <#text> (not painted)
               BlockContainer <(anonymous)> (not painted) children: inline
                 TextNode <#text> (not painted)
-              BlockContainer <td> at [87.265625,63] table-cell [0+1+20 14.546875 20+1+0] [0+5+10 16 10+5+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [87.265625,63 11.140625x16] baseline: 12.796875
+              BlockContainer <td> at [90.265625,66] table-cell [0+1+20 14.546875 20+1+0] [0+5+10 16 10+5+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [90.265625,66 11.140625x16] baseline: 12.796875
                     "D"
                 TextNode <#text> (not painted)
             BlockContainer <(anonymous)> (not painted) children: inline
               TextNode <#text> (not painted)
-            Box <tr.td-thick-border> at [8,92] table-row [0+0+0 114.8125 0+0+0] [0+0+0 42 0+0+0] children: not-inline
-              BlockContainer <td> at [31,105] table-cell [0+5+20 14.265625 20+1+0] [0+5+10 16 10+5+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [31,105 11.859375x16] baseline: 12.796875
+            Box <tr.td-thick-border> at [11,95] table-row [0+0+0 114.8125 0+0+0] [0+0+0 42 0+0+0] children: not-inline
+              BlockContainer <td> at [34,108] table-cell [0+5+20 14.265625 20+1+0] [0+5+10 16 10+5+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [34,108 11.859375x16] baseline: 12.796875
                     "E"
                 TextNode <#text> (not painted)
               BlockContainer <(anonymous)> (not painted) children: inline
                 TextNode <#text> (not painted)
-              BlockContainer <td> at [87.265625,105] table-cell [0+1+20 12.546875 20+5+0] [0+5+10 16 10+5+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [87.265625,105 12.546875x16] baseline: 12.796875
+              BlockContainer <td> at [90.265625,108] table-cell [0+1+20 12.546875 20+5+0] [0+5+10 16 10+5+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [90.265625,108 12.546875x16] baseline: 12.796875
                     "F"
                 TextNode <#text> (not painted)
 
 ViewportPaintable (Viewport<#document>) [0,0 800x600]
-  PaintableWithLines (BlockContainer<HTML>) [0,0 800x142]
-    PaintableWithLines (BlockContainer<BODY>) [8,8 784x126]
-      PaintableWithLines (TableWrapper(anonymous)) [8,8 114.8125x126]
-        Paintable (Box<TABLE>) [8,8 114.8125x126]
-          Paintable (Box<TBODY>) [8,8 114.8125x126]
-            Paintable (Box<TR>.td-thick-border) [8,8 114.8125x42]
-              PaintableWithLines (BlockContainer<TD>) [8,8 58.265625x42]
-              PaintableWithLines (BlockContainer<TD>) [66.265625,8 56.546875x42]
-            Paintable (Box<TR>) [8,50 114.8125x42]
-              PaintableWithLines (BlockContainer<TD>) [8,50 58.265625x42]
-              PaintableWithLines (BlockContainer<TD>) [66.265625,50 56.546875x42]
-            Paintable (Box<TR>.td-thick-border) [8,92 114.8125x42]
-              PaintableWithLines (BlockContainer<TD>) [8,92 58.265625x42]
-              PaintableWithLines (BlockContainer<TD>) [66.265625,92 56.546875x42]
+  PaintableWithLines (BlockContainer<HTML>) [0,0 800x148]
+    PaintableWithLines (BlockContainer<BODY>) [8,8 784x132]
+      PaintableWithLines (TableWrapper(anonymous)) [8,8 120.8125x132]
+        Paintable (Box<TABLE>) [8,8 120.8125x132]
+          Paintable (Box<TBODY>) [11,11 114.8125x126]
+            Paintable (Box<TR>.td-thick-border) [11,11 114.8125x42]
+              PaintableWithLines (BlockContainer<TD>) [11,11 58.265625x42]
+              PaintableWithLines (BlockContainer<TD>) [69.265625,11 56.546875x42]
+            Paintable (Box<TR>) [11,53 114.8125x42]
+              PaintableWithLines (BlockContainer<TD>) [11,53 58.265625x42]
+              PaintableWithLines (BlockContainer<TD>) [69.265625,53 56.546875x42]
+            Paintable (Box<TR>.td-thick-border) [11,95 114.8125x42]
+              PaintableWithLines (BlockContainer<TD>) [11,95 58.265625x42]
+              PaintableWithLines (BlockContainer<TD>) [69.265625,95 56.546875x42]
 
 SC for Viewport<#document> [0,0 800x600] (z-index: auto)
- SC for BlockContainer<HTML> [0,0 800x142] (z-index: auto)
+ SC for BlockContainer<HTML> [0,0 800x148] (z-index: auto)
 
 FILE: Tests/LibWeb/Layout/expected/table/border-conflict-resolution-with-rowgroup.txt
 Viewport <#document> at [0,0] [0+0+0 800 0+0+0] [0+0+0 600 0+0+0] [BFC] children: not-inline
-  BlockContainer <html> at [0,0] [0+0+0 800 0+0+0] [0+0+0 136 0+0+0] [BFC] children: not-inline
-    BlockContainer <body> at [8,8] [8+0+0 784 0+0+8] [8+0+0 120 0+0+8] children: not-inline
-      TableWrapper <(anonymous)> at [8,8] [0+0+0 113.40625 0+0+670.59375] [0+0+0 120 0+0+0] [BFC] children: not-inline
-        Box <table> at [8,8] table-box [0+0+0 113.40625 0+0+0] [0+0+0 120 0+0+0] [TFC] children: not-inline
-          Box <thead> at [8,8] table-header-group [0+0+0 113.40625 0+0+0] [0+0+0 40 0+0+0] children: not-inline
-            Box <tr> at [8,8] table-row [0+0+0 113.40625 0+0+0] [0+0+0 40 0+0+0] children: not-inline
-              BlockContainer <td> at [29,19] table-cell [0+1+20 16.265625 20+1+0] [0+1+10 16 10+5+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [29,19 9.59375x16] baseline: 12.796875
+  BlockContainer <html> at [0,0] [0+0+0 800 0+0+0] [0+0+0 140 0+0+0] [BFC] children: not-inline
+    BlockContainer <body> at [8,8] [8+0+0 784 0+0+8] [8+0+0 124 0+0+8] children: not-inline
+      TableWrapper <(anonymous)> at [8,8] [0+0+0 119.40625 0+0+664.59375] [0+0+0 124 0+0+0] [BFC] children: not-inline
+        Box <table> at [11,9] table-box [0+5+0 113.40625 0+5+0] [0+1+0 120 0+5+0] [TFC] children: not-inline
+          Box <thead> at [11,9] table-header-group [0+0+0 113.40625 0+0+0] [0+0+0 40 0+0+0] children: not-inline
+            Box <tr> at [11,9] table-row [0+0+0 113.40625 0+0+0] [0+0+0 40 0+0+0] children: not-inline
+              BlockContainer <td> at [32,20] table-cell [0+1+20 16.265625 20+1+0] [0+1+10 16 10+5+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [32,20 9.59375x16] baseline: 12.796875
                     "0"
                 TextNode <#text> (not painted)
               BlockContainer <(anonymous)> (not painted) children: inline
                 TextNode <#text> (not painted)
-              BlockContainer <td> at [87.265625,19] table-cell [0+1+20 13.140625 20+1+0] [0+1+10 16 10+5+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [87.265625,19 6.34375x16] baseline: 12.796875
+              BlockContainer <td> at [90.265625,20] table-cell [0+1+20 13.140625 20+1+0] [0+1+10 16 10+5+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [90.265625,20 6.34375x16] baseline: 12.796875
                     "1"
                 TextNode <#text> (not painted)
           BlockContainer <(anonymous)> (not painted) children: inline
             TextNode <#text> (not painted)
-          Box <tbody.thick-border> at [8,48] table-row-group [0+0+0 113.40625 0+0+0] [0+0+0 80 0+0+0] children: not-inline
-            Box <tr> at [8,48] table-row [0+0+0 113.40625 0+0+0] [0+0+0 40 0+0+0] children: not-inline
-              BlockContainer <td> at [31,61] table-cell [0+5+20 14.265625 20+1+0] [0+5+10 16 10+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [31,61 14.265625x16] baseline: 12.796875
+          Box <tbody.thick-border> at [11,49] table-row-group [0+0+0 113.40625 0+0+0] [0+0+0 80 0+0+0] children: not-inline
+            Box <tr> at [11,49] table-row [0+0+0 113.40625 0+0+0] [0+0+0 40 0+0+0] children: not-inline
+              BlockContainer <td> at [34,62] table-cell [0+5+20 14.265625 20+1+0] [0+5+10 16 10+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [34,62 14.265625x16] baseline: 12.796875
                     "A"
                 TextNode <#text> (not painted)
               BlockContainer <(anonymous)> (not painted) children: inline
                 TextNode <#text> (not painted)
-              BlockContainer <td> at [87.265625,61] table-cell [0+1+20 11.140625 20+5+0] [0+5+10 16 10+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [87.265625,61 9.34375x16] baseline: 12.796875
+              BlockContainer <td> at [90.265625,62] table-cell [0+1+20 11.140625 20+5+0] [0+5+10 16 10+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [90.265625,62 9.34375x16] baseline: 12.796875
                     "B"
                 TextNode <#text> (not painted)
             BlockContainer <(anonymous)> (not painted) children: inline
               TextNode <#text> (not painted)
-            Box <tr> at [8,88] table-row [0+0+0 113.40625 0+0+0] [0+0+0 40 0+0+0] children: not-inline
-              BlockContainer <td> at [31,99] table-cell [0+5+20 14.265625 20+1+0] [0+1+10 16 10+5+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [31,99 10.3125x16] baseline: 12.796875
+            Box <tr> at [11,89] table-row [0+0+0 113.40625 0+0+0] [0+0+0 40 0+0+0] children: not-inline
+              BlockContainer <td> at [34,100] table-cell [0+5+20 14.265625 20+1+0] [0+1+10 16 10+5+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [34,100 10.3125x16] baseline: 12.796875
                     "C"
                 TextNode <#text> (not painted)
               BlockContainer <(anonymous)> (not painted) children: inline
                 TextNode <#text> (not painted)
-              BlockContainer <td> at [87.265625,99] table-cell [0+1+20 11.140625 20+5+0] [0+1+10 16 10+5+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [87.265625,99 11.140625x16] baseline: 12.796875
+              BlockContainer <td> at [90.265625,100] table-cell [0+1+20 11.140625 20+5+0] [0+1+10 16 10+5+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [90.265625,100 11.140625x16] baseline: 12.796875
                     "D"
                 TextNode <#text> (not painted)
 
 ViewportPaintable (Viewport<#document>) [0,0 800x600]
-  PaintableWithLines (BlockContainer<HTML>) [0,0 800x136]
-    PaintableWithLines (BlockContainer<BODY>) [8,8 784x120]
-      PaintableWithLines (TableWrapper(anonymous)) [8,8 113.40625x120]
-        Paintable (Box<TABLE>) [8,8 113.40625x120]
-          Paintable (Box<THEAD>) [8,8 113.40625x40]
-            Paintable (Box<TR>) [8,8 113.40625x40]
-              PaintableWithLines (BlockContainer<TD>) [8,8 58.265625x40]
-              PaintableWithLines (BlockContainer<TD>) [66.265625,8 55.140625x40]
-          Paintable (Box<TBODY>.thick-border) [8,48 113.40625x80]
-            Paintable (Box<TR>) [8,48 113.40625x40]
-              PaintableWithLines (BlockContainer<TD>) [8,48 58.265625x40]
-              PaintableWithLines (BlockContainer<TD>) [66.265625,48 55.140625x40]
-            Paintable (Box<TR>) [8,88 113.40625x40]
-              PaintableWithLines (BlockContainer<TD>) [8,88 58.265625x40]
-              PaintableWithLines (BlockContainer<TD>) [66.265625,88 55.140625x40]
+  PaintableWithLines (BlockContainer<HTML>) [0,0 800x140]
+    PaintableWithLines (BlockContainer<BODY>) [8,8 784x124]
+      PaintableWithLines (TableWrapper(anonymous)) [8,8 119.40625x124]
+        Paintable (Box<TABLE>) [8,8 119.40625x124]
+          Paintable (Box<THEAD>) [11,9 113.40625x40]
+            Paintable (Box<TR>) [11,9 113.40625x40]
+              PaintableWithLines (BlockContainer<TD>) [11,9 58.265625x40]
+              PaintableWithLines (BlockContainer<TD>) [69.265625,9 55.140625x40]
+          Paintable (Box<TBODY>.thick-border) [11,49 113.40625x80]
+            Paintable (Box<TR>) [11,49 113.40625x40]
+              PaintableWithLines (BlockContainer<TD>) [11,49 58.265625x40]
+              PaintableWithLines (BlockContainer<TD>) [69.265625,49 55.140625x40]
+            Paintable (Box<TR>) [11,89 113.40625x40]
+              PaintableWithLines (BlockContainer<TD>) [11,89 58.265625x40]
+              PaintableWithLines (BlockContainer<TD>) [69.265625,89 55.140625x40]
 
 SC for Viewport<#document> [0,0 800x600] (z-index: auto)
- SC for BlockContainer<HTML> [0,0 800x136] (z-index: auto)
+ SC for BlockContainer<HTML> [0,0 800x140] (z-index: auto)
 
 FILE: Tests/LibWeb/Layout/expected/table/border-conflict-resolutions-with-more-cells-than-cols.txt
 Viewport <#document> at [0,0] [0+0+0 800 0+0+0] [0+0+0 600 0+0+0] [BFC] children: not-inline
@@ -193406,69 +194017,69 @@ SC for Viewport<#document> [0,0 800x600] (z-index: auto)
 
 FILE: Tests/LibWeb/Layout/expected/table/clip-spans-to-table-end.txt
 Viewport <#document> at [0,0] [0+0+0 800 0+0+0] [0+0+0 600 0+0+0] [BFC] children: not-inline
-  BlockContainer <html> at [0,0] [0+0+0 800 0+0+0] [0+0+0 130 0+0+0] [BFC] children: not-inline
-    BlockContainer <body> at [8,8] [8+0+0 784 0+0+8] [8+0+0 114 0+0+8] children: not-inline
-      TableWrapper <(anonymous)> at [8,8] [0+0+0 93.359375 0+0+690.640625] [0+0+0 114 0+0+0] [BFC] children: not-inline
-        Box <table> at [8,8] table-box [0+0+0 93.359375 0+0+0] [0+0+0 114 0+0+0] [TFC] children: not-inline
-          Box <tbody> at [8,8] table-row-group [0+0+0 93.359375 0+0+0] [0+0+0 114 0+0+0] children: not-inline
-            Box <tr> at [8,8] table-row [0+0+0 93.359375 0+0+0] [0+0+0 38 0+0+0] children: not-inline
-              BlockContainer <td> at [19,19] table-cell [0+1+10 8.453125 10+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [19,19 6.34375x16] baseline: 12.796875
+  BlockContainer <html> at [0,0] [0+0+0 800 0+0+0] [0+0+0 132 0+0+0] [BFC] children: not-inline
+    BlockContainer <body> at [8,8] [8+0+0 784 0+0+8] [8+0+0 116 0+0+8] children: not-inline
+      TableWrapper <(anonymous)> at [8,8] [0+0+0 95.359375 0+0+688.640625] [0+0+0 116 0+0+0] [BFC] children: not-inline
+        Box <table> at [9,9] table-box [0+1+0 93.359375 0+1+0] [0+1+0 114 0+1+0] [TFC] children: not-inline
+          Box <tbody> at [9,9] table-row-group [0+0+0 93.359375 0+0+0] [0+0+0 114 0+0+0] children: not-inline
+            Box <tr> at [9,9] table-row [0+0+0 93.359375 0+0+0] [0+0+0 38 0+0+0] children: not-inline
+              BlockContainer <td> at [20,20] table-cell [0+1+10 8.453125 10+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [20,20 6.34375x16] baseline: 12.796875
                     "1"
                 TextNode <#text> (not painted)
               BlockContainer <(anonymous)> (not painted) children: inline
                 TextNode <#text> (not painted)
-              BlockContainer <td> at [49.453125,19] table-cell [0+1+10 8.8125 10+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [49.453125,19 8.8125x16] baseline: 12.796875
+              BlockContainer <td> at [50.453125,20] table-cell [0+1+10 8.8125 10+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [50.453125,20 8.8125x16] baseline: 12.796875
                     "2"
                 TextNode <#text> (not painted)
               BlockContainer <(anonymous)> (not painted) children: inline
                 TextNode <#text> (not painted)
-              BlockContainer <td> at [80.265625,19] table-cell [0+1+10 9.09375 10+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [80.265625,19 9.09375x16] baseline: 12.796875
+              BlockContainer <td> at [81.265625,20] table-cell [0+1+10 9.09375 10+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [81.265625,20 9.09375x16] baseline: 12.796875
                     "3"
                 TextNode <#text> (not painted)
-              BlockContainer <(anonymous)> at [101.359375,26.5] table-cell [0+1+0 0 0+0+0] [0+0+18.5 0 18.5+1+0] [BFC] children: not-inline
+              BlockContainer <(anonymous)> at [102.359375,27.5] table-cell [0+1+0 0 0+0+0] [0+0+18.5 0 18.5+1+0] [BFC] children: not-inline
             BlockContainer <(anonymous)> (not painted) children: inline
               TextNode <#text> (not painted)
-            Box <tr> at [8,46] table-row [0+0+0 93.359375 0+0+0] [0+0+0 38 0+0+0] children: not-inline
-              BlockContainer <td> at [19,57] table-cell [0+1+10 8.453125 10+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [19,57 7.75x16] baseline: 12.796875
+            Box <tr> at [9,47] table-row [0+0+0 93.359375 0+0+0] [0+0+0 38 0+0+0] children: not-inline
+              BlockContainer <td> at [20,58] table-cell [0+1+10 8.453125 10+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [20,58 7.75x16] baseline: 12.796875
                     "4"
                 TextNode <#text> (not painted)
               BlockContainer <(anonymous)> (not painted) children: inline
                 TextNode <#text> (not painted)
-              BlockContainer <td> at [49.453125,76] table-cell [0+1+10 40.90625 10+1+0] [0+1+29 16 29+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 3, rect: [49.453125,76 24.046875x16] baseline: 12.796875
+              BlockContainer <td> at [50.453125,77] table-cell [0+1+10 40.90625 10+1+0] [0+1+29 16 29+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 3, rect: [50.453125,77 24.046875x16] baseline: 12.796875
                     "6-9"
                 TextNode <#text> (not painted)
             BlockContainer <(anonymous)> (not painted) children: inline
               TextNode <#text> (not painted)
-            Box <tr> at [8,84] table-row [0+0+0 93.359375 0+0+0] [0+0+0 38 0+0+0] children: not-inline
-              BlockContainer <td> at [19,95] table-cell [0+1+10 8.453125 10+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [19,95 8.453125x16] baseline: 12.796875
+            Box <tr> at [9,85] table-row [0+0+0 93.359375 0+0+0] [0+0+0 38 0+0+0] children: not-inline
+              BlockContainer <td> at [20,96] table-cell [0+1+10 8.453125 10+1+0] [0+1+10 16 10+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [20,96 8.453125x16] baseline: 12.796875
                     "5"
                 TextNode <#text> (not painted)
 
 ViewportPaintable (Viewport<#document>) [0,0 800x600]
-  PaintableWithLines (BlockContainer<HTML>) [0,0 800x130]
-    PaintableWithLines (BlockContainer<BODY>) [8,8 784x114]
-      PaintableWithLines (TableWrapper(anonymous)) [8,8 93.359375x114]
-        Paintable (Box<TABLE>) [8,8 93.359375x114]
-          Paintable (Box<TBODY>) [8,8 93.359375x114]
-            Paintable (Box<TR>) [8,8 93.359375x38]
-              PaintableWithLines (BlockContainer<TD>) [8,8 30.453125x38]
-              PaintableWithLines (BlockContainer<TD>) [38.453125,8 30.8125x38]
-              PaintableWithLines (BlockContainer<TD>) [69.265625,8 31.09375x38]
-              PaintableWithLines (BlockContainer(anonymous)) [100.359375,8 1x38]
-            Paintable (Box<TR>) [8,46 93.359375x38]
-              PaintableWithLines (BlockContainer<TD>) [8,46 30.453125x38]
-              PaintableWithLines (BlockContainer<TD>) [38.453125,46 62.90625x76]
-            Paintable (Box<TR>) [8,84 93.359375x38]
-              PaintableWithLines (BlockContainer<TD>) [8,84 30.453125x38]
+  PaintableWithLines (BlockContainer<HTML>) [0,0 800x132]
+    PaintableWithLines (BlockContainer<BODY>) [8,8 784x116]
+      PaintableWithLines (TableWrapper(anonymous)) [8,8 95.359375x116]
+        Paintable (Box<TABLE>) [8,8 95.359375x116]
+          Paintable (Box<TBODY>) [9,9 93.359375x114]
+            Paintable (Box<TR>) [9,9 93.359375x38]
+              PaintableWithLines (BlockContainer<TD>) [9,9 30.453125x38]
+              PaintableWithLines (BlockContainer<TD>) [39.453125,9 30.8125x38]
+              PaintableWithLines (BlockContainer<TD>) [70.265625,9 31.09375x38]
+              PaintableWithLines (BlockContainer(anonymous)) [101.359375,9 1x38]
+            Paintable (Box<TR>) [9,47 93.359375x38]
+              PaintableWithLines (BlockContainer<TD>) [9,47 30.453125x38]
+              PaintableWithLines (BlockContainer<TD>) [39.453125,47 62.90625x76]
+            Paintable (Box<TR>) [9,85 93.359375x38]
+              PaintableWithLines (BlockContainer<TD>) [9,85 30.453125x38]
 
 SC for Viewport<#document> [0,0 800x600] (z-index: auto)
- SC for BlockContainer<HTML> [0,0 800x130] (z-index: auto)
+ SC for BlockContainer<HTML> [0,0 800x132] (z-index: auto)
 
 FILE: Tests/LibWeb/Layout/expected/table/col-span-crash.txt
 Viewport <#document> at [0,0] [0+0+0 800 0+0+0] [0+0+0 600 0+0+0] [BFC] children: not-inline
@@ -194554,46 +195165,46 @@ SC for Viewport<#document> [0,0 800x600] (z-index: auto)
 
 FILE: Tests/LibWeb/Layout/expected/table/line-breaking-in-cells.txt
 Viewport <#document> at [0,0] [0+0+0 800 0+0+0] [0+0+0 600 0+0+0] [BFC] children: not-inline
-  BlockContainer <html> at [0,0] [0+0+0 800 0+0+0] [0+0+0 52 0+0+0] [BFC] children: not-inline
-    BlockContainer <body> at [8,8] [8+0+0 784 0+0+8] [8+0+0 36 0+0+8] children: not-inline
-      TableWrapper <(anonymous)> at [8,8] [0+0+0 61 0+0+723] [0+0+0 36 0+0+0] [BFC] children: not-inline
-        Box <table> at [8,8] table-box [0+0+0 61 0+0+0] [0+0+0 36 0+0+0] [TFC] children: not-inline
-          Box <tbody> at [8,8] table-row-group [0+0+0 61 0+0+0] [0+0+0 36 0+0+0] children: not-inline
-            Box <tr> at [8,8] table-row [0+0+0 61 0+0+0] [0+0+0 36 0+0+0] children: not-inline
-              BlockContainer <td> at [10,18] table-cell [0+1+1 14.296875 1+1+0] [0+1+9 16 9+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [10,18 14.265625x16] baseline: 12.796875
+  BlockContainer <html> at [0,0] [0+0+0 800 0+0+0] [0+0+0 54 0+0+0] [BFC] children: not-inline
+    BlockContainer <body> at [8,8] [8+0+0 784 0+0+8] [8+0+0 38 0+0+8] children: not-inline
+      TableWrapper <(anonymous)> at [8,8] [0+0+0 63 0+0+721] [0+0+0 38 0+0+0] [BFC] children: not-inline
+        Box <table> at [9,9] table-box [0+1+0 61 0+1+0] [0+1+0 36 0+1+0] [TFC] children: not-inline
+          Box <tbody> at [9,9] table-row-group [0+0+0 61 0+0+0] [0+0+0 36 0+0+0] children: not-inline
+            Box <tr> at [9,9] table-row [0+0+0 61 0+0+0] [0+0+0 36 0+0+0] children: not-inline
+              BlockContainer <td> at [11,19] table-cell [0+1+1 14.296875 1+1+0] [0+1+9 16 9+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [11,19 14.265625x16] baseline: 12.796875
                     "A"
                 TextNode <#text> (not painted)
               BlockContainer <(anonymous)> (not painted) children: inline
                 TextNode <#text> (not painted)
-              BlockContainer <td> at [28.296875,10] table-cell [0+1+1 20.40625 1+1+0] [0+1+1 32 1+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 5, length: 1, rect: [28.296875,10 9.34375x16] baseline: 12.796875
+              BlockContainer <td> at [29.296875,11] table-cell [0+1+1 20.40625 1+1+0] [0+1+1 32 1+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 5, length: 1, rect: [29.296875,11 9.34375x16] baseline: 12.796875
                     "B"
-                frag 1 from TextNode start: 0, length: 1, rect: [28.296875,26 10.3125x16] baseline: 12.796875
+                frag 1 from TextNode start: 0, length: 1, rect: [29.296875,27 10.3125x16] baseline: 12.796875
                     "C"
                 TextNode <#text> (not painted)
                 BreakNode <br> (not painted)
                 TextNode <#text> (not painted)
               BlockContainer <(anonymous)> (not painted) children: inline
                 TextNode <#text> (not painted)
-              BlockContainer <td> at [52.703125,18] table-cell [0+1+1 14.296875 1+1+0] [0+1+9 16 9+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 5, length: 1, rect: [52.703125,18 11.140625x16] baseline: 12.796875
+              BlockContainer <td> at [53.703125,19] table-cell [0+1+1 14.296875 1+1+0] [0+1+9 16 9+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 5, length: 1, rect: [53.703125,19 11.140625x16] baseline: 12.796875
                     "D"
                 TextNode <#text> (not painted)
 
 ViewportPaintable (Viewport<#document>) [0,0 800x600]
-  PaintableWithLines (BlockContainer<HTML>) [0,0 800x52]
-    PaintableWithLines (BlockContainer<BODY>) [8,8 784x36]
-      PaintableWithLines (TableWrapper(anonymous)) [8,8 61x36]
-        Paintable (Box<TABLE>) [8,8 61x36]
-          Paintable (Box<TBODY>) [8,8 61x36]
-            Paintable (Box<TR>) [8,8 61x36]
-              PaintableWithLines (BlockContainer<TD>) [8,8 18.296875x36]
-              PaintableWithLines (BlockContainer<TD>) [26.296875,8 24.40625x36]
-              PaintableWithLines (BlockContainer<TD>) [50.703125,8 18.296875x36]
+  PaintableWithLines (BlockContainer<HTML>) [0,0 800x54]
+    PaintableWithLines (BlockContainer<BODY>) [8,8 784x38]
+      PaintableWithLines (TableWrapper(anonymous)) [8,8 63x38]
+        Paintable (Box<TABLE>) [8,8 63x38]
+          Paintable (Box<TBODY>) [9,9 61x36]
+            Paintable (Box<TR>) [9,9 61x36]
+              PaintableWithLines (BlockContainer<TD>) [9,9 18.296875x36]
+              PaintableWithLines (BlockContainer<TD>) [27.296875,9 24.40625x36]
+              PaintableWithLines (BlockContainer<TD>) [51.703125,9 18.296875x36]
 
 SC for Viewport<#document> [0,0 800x600] (z-index: auto)
- SC for BlockContainer<HTML> [0,0 800x52] (z-index: auto)
+ SC for BlockContainer<HTML> [0,0 800x54] (z-index: auto)
 
 FILE: Tests/LibWeb/Layout/expected/table/long-caption-increases-width.txt
 Viewport <#document> at [0,0] [0+0+0 800 0+0+0] [0+0+0 600 0+0+0] [BFC] children: not-inline
@@ -195011,42 +195622,42 @@ SC for Viewport<#document> [0,0 800x600] (z-index: auto)
 
 FILE: Tests/LibWeb/Layout/expected/table/percentage-width-max-width-columns.txt
 Viewport <#document> at [0,0] [0+0+0 800 0+0+0] [0+0+0 600 0+0+0] [BFC] children: not-inline
-  BlockContainer <html> at [0,0] [0+0+0 800 0+0+0] [0+0+0 36 0+0+0] [BFC] children: not-inline
-    BlockContainer <body> at [8,8] [8+0+0 784 0+0+8] [8+0+0 20 0+0+8] children: not-inline
-      TableWrapper <(anonymous)> at [8,8] [0+0+0 119 0+0+665] [0+0+0 20 0+0+0] [BFC] children: not-inline
-        Box <table> at [8,8] table-box [0+0+0 119 0+0+0] [0+0+0 20 0+0+0] [TFC] children: not-inline
-          Box <tbody> at [8,8] table-row-group [0+0+0 119 0+0+0] [0+0+0 20 0+0+0] children: not-inline
-            Box <tr> at [8,8] table-row [0+0+0 119 0+0+0] [0+0+0 20 0+0+0] children: not-inline
-              BlockContainer <td> at [10,10] table-cell [0+1+1 31.703125 1+1+0] [0+1+1 16 1+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 3, rect: [10,10 31.609375x16] baseline: 12.796875
+  BlockContainer <html> at [0,0] [0+0+0 800 0+0+0] [0+0+0 38 0+0+0] [BFC] children: not-inline
+    BlockContainer <body> at [8,8] [8+0+0 784 0+0+8] [8+0+0 22 0+0+8] children: not-inline
+      TableWrapper <(anonymous)> at [8,8] [0+0+0 121 0+0+663] [0+0+0 22 0+0+0] [BFC] children: not-inline
+        Box <table> at [9,9] table-box [0+1+0 119 0+1+0] [0+1+0 20 0+1+0] [TFC] children: not-inline
+          Box <tbody> at [9,9] table-row-group [0+0+0 119 0+0+0] [0+0+0 20 0+0+0] children: not-inline
+            Box <tr> at [9,9] table-row [0+0+0 119 0+0+0] [0+0+0 20 0+0+0] children: not-inline
+              BlockContainer <td> at [11,11] table-cell [0+1+1 31.703125 1+1+0] [0+1+1 16 1+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 3, rect: [11,11 31.609375x16] baseline: 12.796875
                     "A B"
                 TextNode <#text> (not painted)
               BlockContainer <(anonymous)> (not painted) children: inline
                 TextNode <#text> (not painted)
-              BlockContainer <td> at [45.703125,10] table-cell [0+1+1 43.59375 1+1+0] [0+1+1 16 1+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [45.703125,10 10.3125x16] baseline: 12.796875
+              BlockContainer <td> at [46.703125,11] table-cell [0+1+1 43.59375 1+1+0] [0+1+1 16 1+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [46.703125,11 10.3125x16] baseline: 12.796875
                     "C"
                 TextNode <#text> (not painted)
               BlockContainer <(anonymous)> (not painted) children: inline
                 TextNode <#text> (not painted)
-              BlockContainer <td> at [93.296875,10] table-cell [0+1+1 31.703125 1+1+0] [0+1+1 16 1+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 0, length: 1, rect: [93.296875,10 11.140625x16] baseline: 12.796875
+              BlockContainer <td> at [94.296875,11] table-cell [0+1+1 31.703125 1+1+0] [0+1+1 16 1+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 0, length: 1, rect: [94.296875,11 11.140625x16] baseline: 12.796875
                     "D"
                 TextNode <#text> (not painted)
 
 ViewportPaintable (Viewport<#document>) [0,0 800x600]
-  PaintableWithLines (BlockContainer<HTML>) [0,0 800x36]
-    PaintableWithLines (BlockContainer<BODY>) [8,8 784x20]
-      PaintableWithLines (TableWrapper(anonymous)) [8,8 119x20]
-        Paintable (Box<TABLE>) [8,8 119x20]
-          Paintable (Box<TBODY>) [8,8 119x20]
-            Paintable (Box<TR>) [8,8 119x20]
-              PaintableWithLines (BlockContainer<TD>) [8,8 35.703125x20]
-              PaintableWithLines (BlockContainer<TD>) [43.703125,8 47.59375x20]
-              PaintableWithLines (BlockContainer<TD>) [91.296875,8 35.703125x20]
+  PaintableWithLines (BlockContainer<HTML>) [0,0 800x38]
+    PaintableWithLines (BlockContainer<BODY>) [8,8 784x22]
+      PaintableWithLines (TableWrapper(anonymous)) [8,8 121x22]
+        Paintable (Box<TABLE>) [8,8 121x22]
+          Paintable (Box<TBODY>) [9,9 119x20]
+            Paintable (Box<TR>) [9,9 119x20]
+              PaintableWithLines (BlockContainer<TD>) [9,9 35.703125x20]
+              PaintableWithLines (BlockContainer<TD>) [44.703125,9 47.59375x20]
+              PaintableWithLines (BlockContainer<TD>) [92.296875,9 35.703125x20]
 
 SC for Viewport<#document> [0,0 800x600] (z-index: auto)
- SC for BlockContainer<HTML> [0,0 800x36] (z-index: auto)
+ SC for BlockContainer<HTML> [0,0 800x38] (z-index: auto)
 
 FILE: Tests/LibWeb/Layout/expected/table/propagate-style-update-to-wrapper.txt
 Viewport <#document> at [0,0] [0+0+0 800 0+0+0] [0+0+0 600 0+0+0] [BFC] children: not-inline
@@ -196716,42 +197327,42 @@ SC for Viewport<#document> [0,0 800x600] (z-index: auto)
 
 FILE: Tests/LibWeb/Layout/expected/table/width-distribution-of-max-width-increment.txt
 Viewport <#document> at [0,0] [0+0+0 800 0+0+0] [0+0+0 600 0+0+0] [BFC] children: not-inline
-  BlockContainer <html> at [0,0] [0+0+0 800 0+0+0] [0+0+0 36 0+0+0] [BFC] children: not-inline
-    BlockContainer <body> at [8,8] [8+0+0 784 0+0+8] [8+0+0 20 0+0+8] children: not-inline
-      TableWrapper <(anonymous)> at [8,8] [0+0+0 784 0+0+0] [0+0+0 20 0+0+0] [BFC] children: not-inline
-        Box <table> at [8,8] table-box [0+0+0 784 0+0+0] [0+0+0 20 0+0+0] [TFC] children: not-inline
-          Box <tbody> at [8,8] table-row-group [0+0+0 784 0+0+0] [0+0+0 20 0+0+0] children: not-inline
-            Box <tr> at [8,8] table-row [0+0+0 784 0+0+0] [0+0+0 20 0+0+0] children: not-inline
-              BlockContainer <td> at [10,10] table-cell [0+1+1 216.09375 1+1+0] [0+1+1 16 1+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 17, length: 1, rect: [10,10 14.265625x16] baseline: 12.796875
+  BlockContainer <html> at [0,0] [0+0+0 800 0+0+0] [0+0+0 38 0+0+0] [BFC] children: not-inline
+    BlockContainer <body> at [8,8] [8+0+0 784 0+0+8] [8+0+0 22 0+0+8] children: not-inline
+      TableWrapper <(anonymous)> at [8,8] [0+0+0 784 0+0+0] [0+0+0 22 0+0+0] [BFC] children: not-inline
+        Box <table> at [9,9] table-box [0+1+0 782 0+1+0] [0+1+0 20 0+1+0] [TFC] children: not-inline
+          Box <tbody> at [9,9] table-row-group [0+0+0 781.984375 0+0+0] [0+0+0 20 0+0+0] children: not-inline
+            Box <tr> at [9,9] table-row [0+0+0 781.984375 0+0+0] [0+0+0 20 0+0+0] children: not-inline
+              BlockContainer <td> at [11,11] table-cell [0+1+1 215.53125 1+1+0] [0+1+1 16 1+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 17, length: 1, rect: [11,11 14.265625x16] baseline: 12.796875
                     "A"
                 TextNode <#text> (not painted)
               BlockContainer <(anonymous)> (not painted) children: inline
                 TextNode <#text> (not painted)
-              BlockContainer <td> at [230.09375,10] table-cell [0+1+1 156.796875 1+1+0] [0+1+1 16 1+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 17, length: 1, rect: [230.09375,10 9.34375x16] baseline: 12.796875
+              BlockContainer <td> at [230.53125,11] table-cell [0+1+1 156.375 1+1+0] [0+1+1 16 1+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 17, length: 1, rect: [230.53125,11 9.34375x16] baseline: 12.796875
                     "B"
                 TextNode <#text> (not painted)
               BlockContainer <(anonymous)> (not painted) children: inline
                 TextNode <#text> (not painted)
-              BlockContainer <td> at [390.890625,10] table-cell [0+1+1 399.109375 1+1+0] [0+1+1 16 1+1+0] [BFC] children: inline
-                frag 0 from TextNode start: 17, length: 3, rect: [390.890625,10 29.453125x16] baseline: 12.796875
+              BlockContainer <td> at [390.90625,11] table-cell [0+1+1 398.078125 1+1+0] [0+1+1 16 1+1+0] [BFC] children: inline
+                frag 0 from TextNode start: 17, length: 3, rect: [390.90625,11 29.453125x16] baseline: 12.796875
                     "C D"
                 TextNode <#text> (not painted)
 
 ViewportPaintable (Viewport<#document>) [0,0 800x600]
-  PaintableWithLines (BlockContainer<HTML>) [0,0 800x36]
-    PaintableWithLines (BlockContainer<BODY>) [8,8 784x20]
-      PaintableWithLines (TableWrapper(anonymous)) [8,8 784x20]
-        Paintable (Box<TABLE>) [8,8 784x20]
-          Paintable (Box<TBODY>) [8,8 784x20]
-            Paintable (Box<TR>) [8,8 784x20]
-              PaintableWithLines (BlockContainer<TD>) [8,8 220.09375x20]
-              PaintableWithLines (BlockContainer<TD>) [228.09375,8 160.796875x20]
-              PaintableWithLines (BlockContainer<TD>) [388.890625,8 403.109375x20]
+  PaintableWithLines (BlockContainer<HTML>) [0,0 800x38]
+    PaintableWithLines (BlockContainer<BODY>) [8,8 784x22]
+      PaintableWithLines (TableWrapper(anonymous)) [8,8 784x22]
+        Paintable (Box<TABLE>) [8,8 784x22]
+          Paintable (Box<TBODY>) [9,9 781.984375x20]
+            Paintable (Box<TR>) [9,9 781.984375x20]
+              PaintableWithLines (BlockContainer<TD>) [9,9 219.53125x20]
+              PaintableWithLines (BlockContainer<TD>) [228.53125,9 160.375x20]
+              PaintableWithLines (BlockContainer<TD>) [388.90625,9 402.078125x20]
 
 SC for Viewport<#document> [0,0 800x600] (z-index: auto)
- SC for BlockContainer<HTML> [0,0 800x36] (z-index: auto)
+ SC for BlockContainer<HTML> [0,0 800x38] (z-index: auto)
 
 FILE: Tests/LibWeb/Layout/expected/table/wrap-float-in-anonymous-table-cell.txt
 Viewport <#document> at [0,0] [0+0+0 800 0+0+0] [0+0+0 600 0+0+0] [BFC] children: not-inline
@@ -225545,12 +226156,13 @@ FILE: Tests/LibWeb/Ref/expected/scrollable-contains-table-ref.html
         #scrollable-div {
             width: 300px;
             height: 300px;
-            overflow: auto;
+            overflow: hidden;
             border: 1px solid #000;
         }
         table {
             width: 100%;
             border-collapse: collapse;
+            margin-top: -100px;
         }
         th,
         td {
@@ -225565,7 +226177,21 @@ FILE: Tests/LibWeb/Ref/expected/scrollable-contains-table-ref.html
 <body>
     <div id="scrollable-div">
         <table>
+            <thead>
+                <tr>
+                    <th>TH 1</th>
+                    <th>TH 2</th>
+                    <th>TH 3</th>
+                    <th>TH 4</th>
+                </tr>
+            </thead>
             <tbody>
+                <tr>
+                    <td>Row 1, Cell 1</td>
+                    <td>Row 1, Cell 2</td>
+                    <td>Row 1, Cell 3</td>
+                    <td>Row 1, Cell 4</td>
+                </tr>
                 <tr>
                     <td>Row 2, Cell 1</td>
                     <td>Row 2, Cell 2</td>
@@ -227409,6 +228035,228 @@ FILE: Tests/LibWeb/Ref/expected/table-collapse-ignored-in-cells-ref.html
   </table>
 </body>
 
+FILE: Tests/LibWeb/Ref/expected/table-collapsed-borders-colgroup-ref.html
+<!DOCTYPE html>
+<style>
+    body {
+        margin: 0;
+    }
+    table {
+        margin: 20px;
+        border-collapse: collapse;
+        table-layout: fixed;
+        width: 300px;
+    }
+    td {
+        height: 40px;
+        padding: 0;
+    }
+    tr:first-child td:nth-child(-n + 2) {
+        border-top: 4px solid indigo;
+    }
+    tr:last-child td:nth-child(-n + 2) {
+        border-bottom: 4px solid indigo;
+    }
+    td:first-child {
+        border-left: 4px solid indigo;
+    }
+    tr:first-child td:last-child {
+        border-top: 6px solid orange;
+    }
+    tr:last-child td:last-child {
+        border-bottom: 6px solid orange;
+    }
+    td:last-child {
+        border-left: 6px solid orange;
+        border-right: 6px solid orange;
+    }
+</style>
+<table>
+    <tr><td></td><td></td><td></td></tr>
+    <tr><td></td><td></td><td></td></tr>
+</table>
+
+FILE: Tests/LibWeb/Ref/expected/table-collapsed-borders-float-ref.html
+<!DOCTYPE html>
+<style>
+    body {
+        margin: 0;
+    }
+    table {
+        margin: 20px;
+        border-collapse: collapse;
+        table-layout: fixed;
+        width: 200px;
+    }
+    td {
+        height: 50px;
+        padding: 0;
+        border: 4px solid black;
+    }
+</style>
+<table>
+    <tr><td></td><td></td></tr>
+    <tr><td></td><td></td></tr>
+</table>
+
+FILE: Tests/LibWeb/Ref/expected/table-collapsed-borders-hidden-at-joint-ref.html
+<!DOCTYPE html>
+<style>
+    body {
+        margin: 0;
+    }
+    table {
+        margin: 20px;
+        border-collapse: collapse;
+        table-layout: fixed;
+        width: 200px;
+    }
+    td {
+        height: 50px;
+        padding: 0;
+        border: 4px solid black;
+    }
+    td:first-child {
+        border-right: none;
+    }
+    td:last-child {
+        border-left: none;
+    }
+</style>
+<table>
+    <tr><td></td><td></td></tr>
+    <tr><td></td><td></td></tr>
+</table>
+
+FILE: Tests/LibWeb/Ref/expected/table-collapsed-borders-in-stacking-context-ref.html
+<!DOCTYPE html>
+<style>
+    body {
+        margin: 0;
+    }
+    table {
+        margin: 20px;
+        border-collapse: collapse;
+        table-layout: fixed;
+        width: 200px;
+    }
+    td {
+        height: 50px;
+        padding: 0;
+        border: 4px solid black;
+    }
+</style>
+<table>
+    <tr><td></td><td></td></tr>
+    <tr><td></td><td></td></tr>
+</table>
+<table>
+    <tr><td></td><td></td></tr>
+    <tr><td></td><td></td></tr>
+</table>
+
+FILE: Tests/LibWeb/Ref/expected/table-collapsed-borders-joint-widths-ref.html
+<!DOCTYPE html>
+<style>
+    body {
+        margin: 0;
+    }
+    div {
+        position: absolute;
+    }
+</style>
+<div style="left: 117px; top: 20px; width: 6px; height: 104px; background: blue"></div>
+<div style="left: 20px; top: 20px; width: 97px; height: 4px; background: red"></div>
+<div style="left: 123px; top: 20px; width: 97px; height: 4px; background: red"></div>
+<div style="left: 20px; top: 70px; width: 97px; height: 4px; background: red"></div>
+<div style="left: 123px; top: 70px; width: 97px; height: 4px; background: red"></div>
+<div style="left: 20px; top: 120px; width: 97px; height: 4px; background: red"></div>
+<div style="left: 123px; top: 120px; width: 97px; height: 4px; background: red"></div>
+<div style="left: 20px; top: 144px; width: 200px; height: 6px; background: green"></div>
+<div style="left: 20px; top: 194px; width: 200px; height: 6px; background: green"></div>
+<div style="left: 20px; top: 244px; width: 200px; height: 6px; background: green"></div>
+<div style="left: 118px; top: 150px; width: 4px; height: 44px; background: orange"></div>
+<div style="left: 118px; top: 200px; width: 4px; height: 44px; background: orange"></div>
+
+FILE: Tests/LibWeb/Ref/expected/table-collapsed-borders-nested-table-ref.html
+<!DOCTYPE html>
+<style>
+    body {
+        margin: 0;
+    }
+    .outer {
+        margin: 20px;
+        border-collapse: separate;
+        border-spacing: 0;
+    }
+    .outer > tbody > tr > td {
+        padding: 0;
+    }
+    .inner {
+        border-collapse: separate;
+        border-spacing: 6px;
+        table-layout: fixed;
+        width: 120px;
+    }
+    .inner td {
+        height: 30px;
+        padding: 0;
+        border: 3px solid blue;
+    }
+</style>
+<table class="outer">
+    <tr>
+        <td>
+            <table class="inner">
+                <tr><td></td><td></td></tr>
+                <tr><td></td><td></td></tr>
+            </table>
+        </td>
+    </tr>
+</table>
+
+FILE: Tests/LibWeb/Ref/expected/table-collapsed-borders-span-interior-ref.html
+<!DOCTYPE html>
+<style>
+    body {
+        margin: 0;
+    }
+    table {
+        margin: 20px;
+        border-collapse: collapse;
+        table-layout: fixed;
+        width: 300px;
+    }
+    td {
+        height: 40px;
+        padding: 0;
+        border: 2px solid silver;
+    }
+    tr:nth-child(2) td {
+        border-top: 4px solid purple;
+    }
+</style>
+<table>
+    <tr><td></td><td rowspan="2"></td><td></td></tr>
+    <tr><td></td><td></td></tr>
+    <tr><td></td><td></td><td></td></tr>
+</table>
+
+FILE: Tests/LibWeb/Ref/expected/table-collapsed-borders-tie-precedence-ref.html
+<!DOCTYPE html>
+<style>
+    body {
+        margin: 0;
+    }
+    div {
+        position: absolute;
+    }
+</style>
+<div style="left: 118px; top: 20px; width: 4px; height: 50px; background: red"></div>
+<div style="left: 20px; top: 138px; width: 100px; height: 4px; background: red"></div>
+<div style="left: 20px; top: 258px; width: 200px; height: 4px; background: red"></div>
+<div style="left: 20px; top: 330px; width: 200px; height: 4px; background: blue"></div>
+
 FILE: Tests/LibWeb/Ref/expected/table-margin-auto-inside-flex-item-ref.html
 <!DOCTYPE html>
 <style>
@@ -227422,6 +228270,55 @@ FILE: Tests/LibWeb/Ref/expected/table-margin-auto-inside-flex-item-ref.html
         <div class="block">content</div>
     </div>
 </div>
+
+FILE: Tests/LibWeb/Ref/expected/table-separate-borders-empty-cells-ref.html
+<!DOCTYPE html>
+<style>
+    body {
+        margin: 0;
+    }
+    table {
+        margin: 20px;
+        border-collapse: separate;
+        border-spacing: 6px;
+        table-layout: fixed;
+        width: 218px;
+    }
+    td {
+        height: 50px;
+        padding: 0;
+        border: 3px solid transparent;
+        border-radius: 8px;
+    }
+    td.visible {
+        border-color: teal;
+        background: lightyellow;
+    }
+</style>
+<table>
+    <tr><td class="visible"><div>x</div></td><td></td></tr>
+    <tr><td></td><td></td></tr>
+</table>
+
+FILE: Tests/LibWeb/Ref/expected/table-separate-borders-radius-ref.html
+<!DOCTYPE html>
+<style>
+    body {
+        margin: 0;
+    }
+    div {
+        position: absolute;
+        box-sizing: border-box;
+        width: 100px;
+        height: 50px;
+        border: 3px solid rgba(0, 0, 255, 0.5);
+        border-radius: 10px;
+    }
+</style>
+<div style="left: 26px; top: 26px"></div>
+<div style="left: 132px; top: 26px"></div>
+<div style="left: 26px; top: 82px"></div>
+<div style="left: 132px; top: 82px"></div>
 
 FILE: Tests/LibWeb/Ref/expected/tables-width-z-index-ref.html
 <!DOCTYPE html>
@@ -253739,6 +254636,292 @@ FILE: Tests/LibWeb/Ref/input/table-collapse-ignored-in-cells.html
   </table>
 </body>
 
+FILE: Tests/LibWeb/Ref/input/table-collapsed-borders-colgroup.html
+<!DOCTYPE html>
+<link rel="match" href="../expected/table-collapsed-borders-colgroup-ref.html" />
+<style>
+    body {
+        margin: 0;
+    }
+    table {
+        margin: 20px;
+        border-collapse: collapse;
+        table-layout: fixed;
+        width: 300px;
+    }
+    td {
+        height: 40px;
+        padding: 0;
+    }
+    colgroup.left-pair {
+        border: 4px solid indigo;
+    }
+    colgroup.right-single {
+        border: 6px solid orange;
+    }
+</style>
+<table>
+    <colgroup class="left-pair"><col><col></colgroup>
+    <colgroup class="right-single"><col></colgroup>
+    <tr><td></td><td></td><td></td></tr>
+    <tr><td></td><td></td><td></td></tr>
+</table>
+
+FILE: Tests/LibWeb/Ref/input/table-collapsed-borders-float.html
+<!DOCTYPE html>
+<link rel="match" href="../expected/table-collapsed-borders-float-ref.html" />
+<style>
+    body {
+        margin: 0;
+    }
+    table {
+        margin: 20px;
+        border-collapse: collapse;
+        table-layout: fixed;
+        width: 200px;
+        float: left;
+    }
+    td {
+        height: 50px;
+        padding: 0;
+        border: 4px solid black;
+    }
+</style>
+<table>
+    <tr><td></td><td></td></tr>
+    <tr><td></td><td></td></tr>
+</table>
+
+FILE: Tests/LibWeb/Ref/input/table-collapsed-borders-hidden-at-joint.html
+<!DOCTYPE html>
+<link rel="match" href="../expected/table-collapsed-borders-hidden-at-joint-ref.html" />
+<style>
+    body {
+        margin: 0;
+    }
+    table {
+        margin: 20px;
+        border-collapse: collapse;
+        table-layout: fixed;
+        width: 200px;
+    }
+    td {
+        height: 50px;
+        padding: 0;
+        border: 4px solid black;
+    }
+    td:first-child {
+        border-right: 6px hidden;
+    }
+</style>
+<table>
+    <tr><td></td><td></td></tr>
+    <tr><td></td><td></td></tr>
+</table>
+
+FILE: Tests/LibWeb/Ref/input/table-collapsed-borders-in-stacking-context.html
+<!DOCTYPE html>
+<link rel="match" href="../expected/table-collapsed-borders-in-stacking-context-ref.html" />
+<style>
+    body {
+        margin: 0;
+    }
+    table {
+        margin: 20px;
+        border-collapse: collapse;
+        table-layout: fixed;
+        width: 200px;
+    }
+    td {
+        height: 50px;
+        padding: 0;
+        border: 4px solid black;
+    }
+    .context-root {
+        position: relative;
+        z-index: 0;
+    }
+    .pseudo-context {
+        position: relative;
+    }
+</style>
+<table class="context-root">
+    <tr><td></td><td></td></tr>
+    <tr><td></td><td></td></tr>
+</table>
+<table class="pseudo-context">
+    <tr><td></td><td></td></tr>
+    <tr><td></td><td></td></tr>
+</table>
+
+FILE: Tests/LibWeb/Ref/input/table-collapsed-borders-joint-widths.html
+<!DOCTYPE html>
+<link rel="match" href="../expected/table-collapsed-borders-joint-widths-ref.html" />
+<style>
+    body {
+        margin: 0;
+    }
+    table {
+        margin: 20px;
+        border-collapse: collapse;
+        table-layout: fixed;
+        width: 200px;
+    }
+    td {
+        height: 50px;
+        padding: 0;
+    }
+    .wide-vertical td {
+        border-top: 4px solid red;
+        border-bottom: 4px solid red;
+    }
+    .wide-vertical td:first-child {
+        border-right: 6px solid blue;
+    }
+    .wide-horizontal td {
+        border-top: 6px solid green;
+        border-bottom: 6px solid green;
+    }
+    .wide-horizontal td:first-child {
+        border-right: 4px solid orange;
+    }
+</style>
+<table class="wide-vertical">
+    <tr><td></td><td></td></tr>
+    <tr><td></td><td></td></tr>
+</table>
+<table class="wide-horizontal">
+    <tr><td></td><td></td></tr>
+    <tr><td></td><td></td></tr>
+</table>
+
+FILE: Tests/LibWeb/Ref/input/table-collapsed-borders-nested-table.html
+<!DOCTYPE html>
+<link rel="match" href="../expected/table-collapsed-borders-nested-table-ref.html" />
+<style>
+    body {
+        margin: 0;
+    }
+    .outer {
+        margin: 20px;
+        border-collapse: collapse;
+    }
+    .outer > tbody > tr > td {
+        padding: 0;
+    }
+    .inner {
+        border-collapse: separate;
+        border-spacing: 6px;
+        table-layout: fixed;
+        width: 120px;
+    }
+    .inner td {
+        height: 30px;
+        padding: 0;
+        border: 3px solid blue;
+    }
+</style>
+<table class="outer">
+    <tr>
+        <td>
+            <table class="inner">
+                <tr><td></td><td></td></tr>
+                <tr><td></td><td></td></tr>
+            </table>
+        </td>
+    </tr>
+</table>
+
+FILE: Tests/LibWeb/Ref/input/table-collapsed-borders-span-interior.html
+<!DOCTYPE html>
+<link rel="match" href="../expected/table-collapsed-borders-span-interior-ref.html" />
+<style>
+    body {
+        margin: 0;
+    }
+    table {
+        margin: 20px;
+        border-collapse: collapse;
+        table-layout: fixed;
+        width: 300px;
+    }
+    td {
+        height: 40px;
+        padding: 0;
+        border: 2px solid silver;
+    }
+    tr:first-child {
+        border-bottom: 4px solid purple;
+    }
+</style>
+<table>
+    <tr><td></td><td rowspan="2"></td><td></td></tr>
+    <tr><td></td><td></td></tr>
+    <tr><td></td><td></td><td></td></tr>
+</table>
+
+FILE: Tests/LibWeb/Ref/input/table-collapsed-borders-tie-precedence.html
+<!DOCTYPE html>
+<link rel="match" href="../expected/table-collapsed-borders-tie-precedence-ref.html" />
+<style>
+    body {
+        margin: 0;
+    }
+    table {
+        margin: 20px;
+        border-collapse: collapse;
+        table-layout: fixed;
+        width: 200px;
+    }
+    td {
+        height: 50px;
+        padding: 0;
+    }
+    .cell-vs-cell-column {
+        width: 200px;
+    }
+    .cell-vs-cell-column td:first-child {
+        border-right: 4px solid red;
+    }
+    .cell-vs-cell-column td:last-child {
+        border-left: 4px solid orange;
+    }
+    .cell-vs-cell-row {
+        width: 100px;
+    }
+    .cell-vs-cell-row tr:first-child td {
+        border-bottom: 4px solid red;
+    }
+    .cell-vs-cell-row tr:last-child td {
+        border-top: 4px solid teal;
+    }
+    .cell-vs-row td {
+        border-bottom: 4px solid red;
+    }
+    .cell-vs-row tr {
+        border-bottom: 4px solid blue;
+    }
+    .row-vs-table tr {
+        border-bottom: 4px solid blue;
+    }
+    .row-vs-table {
+        border-bottom: 4px solid green;
+    }
+</style>
+<table class="cell-vs-cell-column">
+    <tr><td></td><td></td></tr>
+</table>
+<table class="cell-vs-cell-row">
+    <tr><td></td></tr>
+    <tr><td></td></tr>
+</table>
+<table class="cell-vs-row">
+    <tr><td></td><td></td></tr>
+</table>
+<table class="row-vs-table">
+    <tr><td></td><td></td></tr>
+</table>
+
 FILE: Tests/LibWeb/Ref/input/table-margin-auto-inside-flex-item.html
 <!DOCTYPE html>
 <link rel="match" href="../expected/table-margin-auto-inside-flex-item-ref.html" />
@@ -253753,6 +254936,60 @@ FILE: Tests/LibWeb/Ref/input/table-margin-auto-inside-flex-item.html
         <div class="table">content</div>
     </div>
 </div>
+
+FILE: Tests/LibWeb/Ref/input/table-separate-borders-empty-cells.html
+<!DOCTYPE html>
+<link rel="match" href="../expected/table-separate-borders-empty-cells-ref.html" />
+<style>
+    body {
+        margin: 0;
+    }
+    table {
+        margin: 20px;
+        border-collapse: separate;
+        border-spacing: 6px;
+        table-layout: fixed;
+        width: 218px;
+        empty-cells: hide;
+    }
+    td {
+        height: 50px;
+        padding: 0;
+        border: 3px solid teal;
+        border-radius: 8px;
+        background: lightyellow;
+    }
+</style>
+<table>
+    <tr><td><div>x</div></td><td></td></tr>
+    <tr><td></td><td></td></tr>
+</table>
+
+FILE: Tests/LibWeb/Ref/input/table-separate-borders-radius.html
+<!DOCTYPE html>
+<link rel="match" href="../expected/table-separate-borders-radius-ref.html" />
+<style>
+    body {
+        margin: 0;
+    }
+    table {
+        margin: 20px;
+        border-collapse: separate;
+        border-spacing: 6px;
+        table-layout: fixed;
+        width: 218px;
+    }
+    td {
+        height: 50px;
+        padding: 0;
+        border: 3px solid rgba(0, 0, 255, 0.5);
+        border-radius: 10px;
+    }
+</style>
+<table>
+    <tr><td></td><td></td></tr>
+    <tr><td></td><td></td></tr>
+</table>
 
 FILE: Tests/LibWeb/Ref/input/tables-with-z-index.html
 <!DOCTYPE html>
@@ -302308,6 +303545,8 @@ Text/input/HTML/HTMLMediaElement-preload-none-does-not-fetch.html
 Text/input/css/FontFace-arraybuffer-matching.html
 Text/input/wpt-import/mediacapture-streams/idlharness.https.window.html
 Text/input/css/font-face-load-dedups-same-url.html
+Text/input/css/font-load-delays-document-load-event.html
+Text/input/css/font-face-unused-face-not-fetched.html
 Text/input/css/unrecognized-font-family-fallback-honors-weight.html
 Text/input/wpt-import/html/syntax/parsing/html5lib_url.html
 Text/input/wpt-import/html/syntax/parsing/html5lib_write.html
@@ -312059,6 +313298,7 @@ TEST_CASE(per_world_windowproxy_and_window_wrapper)
 
     auto& main_wrapper = Web::Bindings::platform_object_for_window(*window, window->principal_realm());
     auto main_proxy = browsing_context->window_proxy();
+    EXPECT(main_proxy->shape().prototype() == &main_wrapper);
 
     auto run_script = [&](JS::Realm& realm, Utf16View source) {
         auto script_or_error = JS::Script::parse(source, realm);
@@ -312096,6 +313336,7 @@ TEST_CASE(per_world_windowproxy_and_window_wrapper)
     EXPECT(extension_proxy != main_proxy);
     EXPECT(extension_proxy == browsing_context->window_proxy_for(*extension_world, extension_realm));
     EXPECT(extension_proxy->window().ptr() == window.ptr());
+    EXPECT(extension_proxy->shape().prototype() == nullptr);
     EXPECT(&Web::Bindings::this_value_realm(extension_realm, extension_proxy) == &extension_realm);
 
     auto& extension_wrapper = Web::Bindings::platform_object_for_window(*window, extension_realm);
@@ -312159,6 +313400,8 @@ TEST_CASE(per_world_windowproxy_and_window_wrapper)
     browsing_context->set_active_window(replacement_window);
     EXPECT(main_proxy->window().ptr() == replacement_window.ptr());
     EXPECT(extension_proxy->window().ptr() == replacement_window.ptr());
+    EXPECT(main_proxy->shape().prototype() == &Web::Bindings::platform_object_for_window(*replacement_window, main_proxy->realm()));
+    EXPECT(extension_proxy->shape().prototype() == nullptr);
 
     vm.pop_execution_context();
 }
@@ -320101,7 +321344,7 @@ shadow target after shadow input focus: shadow-target
 FILE: Tests/LibWeb/Text/expected/css/font-face-activation-after-stylesheet-media-change.txt
 Initial face count: 0
 Matching face count: 1
-Matching face status: loaded
+Matching face status: unloaded
 Final face count: 0
 
 FILE: Tests/LibWeb/Text/expected/css/font-face-connection-disconnection.txt
@@ -320157,6 +321400,12 @@ range=U+41 status=loaded
 range=U+42 status=unloaded
 range=U+43 status=unloaded
 
+FILE: Tests/LibWeb/Text/expected/css/font-face-unused-face-not-fetched.txt
+Unused face status: unloaded
+Font requests while unused: 0
+Used face status: loaded
+Font requests after use: 1
+
 FILE: Tests/LibWeb/Text/expected/css/font-face-width-matching.txt
 reference fonts differ: true
 condensed uses HashSans: true
@@ -320193,6 +321442,9 @@ font-variation-settings: normal
 
 FILE: Tests/LibWeb/Text/expected/css/font-language-override-short.txt
 PASS (didn't crash)
+
+FILE: Tests/LibWeb/Text/expected/css/font-load-delays-document-load-event.txt
+tspan rect at iframe load: left=108 top=108 width=200 height=100
 
 FILE: Tests/LibWeb/Text/expected/css/font-rules-within-grouping-rules.txt
 Nested face count: 2
@@ -321317,9 +322569,9 @@ resized font-size: 30px
 
 FILE: Tests/LibWeb/Text/expected/css/native-corner-shape-computation.txt
 corner-top-left-shape: round
-corner-top-right-shape: superellipse(2)
-corner-bottom-right-shape: superellipse(-1)
-corner-bottom-left-shape: superellipse(2)
+corner-top-right-shape: squircle
+corner-bottom-right-shape: scoop
+corner-bottom-left-shape: squircle
 used no C++ longhand fallback: true
 
 FILE: Tests/LibWeb/Text/expected/css/native-font-longhand-computation.txt
@@ -322334,6 +323586,14 @@ two of three conjuncts leave at once: [one]
 two of three conjuncts arrive at once: [two]
 one conjunct leaves as another arrives: [three]
 the origin compound loses two conjuncts at once: [target]
+
+FILE: Tests/LibWeb/Text/expected/css/style-engine/computed-calc-collapses-to-numeric.txt
+z-index calc: 235
+z-index numeric: 235
+flex-grow calc: 5
+flex-grow numeric: 5
+orphans calc: 235
+orphans numeric: 235
 
 FILE: Tests/LibWeb/Text/expected/css/style-engine/computed-color-scheme-closure.txt
 color scheme longhand evaluations: 11
@@ -345042,6 +346302,10 @@ anchor2
 FILE: Tests/LibWeb/Text/expected/DOM/HTMLCollection-property-names-iteration-order.txt
 0,1,2,foo,bar,baz
 
+FILE: Tests/LibWeb/Text/expected/DOM/HTMLCollection-static-property-absence-cache.txt
+undefined
+value
+
 FILE: Tests/LibWeb/Text/expected/DOM/HTMLSelectElement-length.txt
 0
 1
@@ -345460,6 +346724,11 @@ beforeinput target ranges: 0-0, 1-1, 2-2, 3-3
 input types: insertText, insertText, insertText, insertText
 input selection offsets: 1, 2, 3, 4
 
+FILE: Tests/LibWeb/Text/expected/Editing/clipboard-chrome-paste-preserves-flavors.txt
+text handover types: ["text/plain"]
+clipboard paste: types=["text/plain","text/html"] html="<b>html flavor</b>"
+editor after clipboard paste: <b>html flavor</b>
+
 FILE: Tests/LibWeb/Text/expected/Editing/clipboard-copy-rendered-text.txt
 "First :)\n\nOne\nTwo\nLast"
 
@@ -345495,6 +346764,15 @@ paste event data: "PASTED"
 editor text after paste: "aPASTEDb"
 canceled paste event data: "PASTED"
 editor text after canceled paste: "aPASTEDb"
+
+FILE: Tests/LibWeb/Text/expected/Editing/clipboard-ui-initiated-paste.txt
+paste events: paste(bubbles=true cancelable=true composed=true isTrusted=true types=["text/plain"] data="pasted text") beforeinput(inputType=insertFromPaste data="pasted text")
+value after paste: "pasted text"
+canceled paste events: paste(bubbles=true cancelable=true composed=true isTrusted=true types=["text/plain"] data="must not appear")
+value after canceled paste: ""
+verification code fields: 1 2 3 4 5 6
+non-editable paste events: paste(data="nowhere to go")
+values after non-editable paste: "" "not editable"
 
 FILE: Tests/LibWeb/Text/expected/Editing/contenteditable-arrow-navigation.txt
 Home: position=0 character="h"
@@ -351660,6 +352938,14 @@ scrollbars is BarProp: true visible: true
 statusbar is BarProp: true visible: true
 toolbar is BarProp: true visible: true
 
+FILE: Tests/LibWeb/Text/expected/HTML/Window-cached-document-attribute.txt
+document remains an accessor: true
+cache slot remains private: true
+custom receiver rejected: true
+first document identity: true
+stale function sees new document: true
+new document has new identity: true
+
 FILE: Tests/LibWeb/Text/expected/HTML/Window-close.txt
 window.closed = false
 window.closed = true
@@ -351970,6 +353256,17 @@ colno = 28
 error = Error: Reporting an Error!
 filename URL scheme = file:
 filename URL final path segment = WindowOrWorkerGlobalScope-reportError.html
+
+FILE: Tests/LibWeb/Text/expected/HTML/WindowProxy-cached-self-properties.txt
+public prototype unchanged: true
+initial value: initial
+cached initial value: initial
+changed value: changed
+accessor value: getter with proxy receiver
+re-added value: re-added
+first document value: first document
+cached first document value: first document
+stale function sees new value: second document
 
 FILE: Tests/LibWeb/Text/expected/HTML/windowproxy-cross-window-singleton-pinning.txt
 parent navigator after iframe-first read: true
@@ -447073,469 +448370,3 @@ RECREATED: position sticky -> static on inline in table-footer-group | fixture a
 RECREATED: position sticky -> static on inline in table-footer-group | distant sibling
 RECREATED: position sticky -> static on inline in table-footer-group | distant sibling descendant
 RECREATED: position sticky -> static on inline in table-footer-group | DOM parent
-RECREATED: position sticky -> static on inline in table-footer-group | preceding sibling
-RECREATED: position sticky -> static on inline in table-footer-group | preceding sibling descendant
-RECREATED: position sticky -> static on inline in table-footer-group | target
-RECREATED: position sticky -> static on inline in table-footer-group | target descendant
-RECREATED: position sticky -> static on inline in table-footer-group | following sibling
-RECREATED: position sticky -> static on inline in table-footer-group | following sibling descendant
-STATS: position sticky -> static on inline in table-footer-group | rebuilt subtree roots=1, escaped=false
-PASS: position sticky -> static on inline in table-footer-group | incremental tree matches full rebuild
-PRESERVED: float left -> none on inline in block flow-root | fixture ancestor
-PRESERVED: float left -> none on inline in block flow-root | distant sibling
-PRESERVED: float left -> none on inline in block flow-root | distant sibling descendant
-RECREATED: float left -> none on inline in block flow-root | DOM parent
-RECREATED: float left -> none on inline in block flow-root | preceding sibling
-RECREATED: float left -> none on inline in block flow-root | preceding sibling descendant
-RECREATED: float left -> none on inline in block flow-root | target
-RECREATED: float left -> none on inline in block flow-root | target descendant
-RECREATED: float left -> none on inline in block flow-root | following sibling
-RECREATED: float left -> none on inline in block flow-root | following sibling descendant
-STATS: float left -> none on inline in block flow-root | rebuilt subtree roots=1, escaped=false
-PASS: float left -> none on inline in block flow-root | incremental tree matches full rebuild
-PRESERVED: float inline-start -> none on inline in block flow list-item | fixture ancestor
-PRESERVED: float inline-start -> none on inline in block flow list-item | distant sibling
-PRESERVED: float inline-start -> none on inline in block flow list-item | distant sibling descendant
-RECREATED: float inline-start -> none on inline in block flow list-item | DOM parent
-RECREATED: float inline-start -> none on inline in block flow list-item | preceding sibling
-RECREATED: float inline-start -> none on inline in block flow list-item | preceding sibling descendant
-RECREATED: float inline-start -> none on inline in block flow list-item | target
-RECREATED: float inline-start -> none on inline in block flow list-item | target descendant
-RECREATED: float inline-start -> none on inline in block flow list-item | following sibling
-RECREATED: float inline-start -> none on inline in block flow list-item | following sibling descendant
-STATS: float inline-start -> none on inline in block flow list-item | rebuilt subtree roots=1, escaped=false
-PASS: float inline-start -> none on inline in block flow list-item | incremental tree matches full rebuild
-PRESERVED: clear none -> left on inline in list-item | fixture ancestor
-PRESERVED: clear none -> left on inline in list-item | distant sibling
-PRESERVED: clear none -> left on inline in list-item | distant sibling descendant
-PRESERVED: clear none -> left on inline in list-item | DOM parent
-PRESERVED: clear none -> left on inline in list-item | preceding sibling
-PRESERVED: clear none -> left on inline in list-item | preceding sibling descendant
-PRESERVED: clear none -> left on inline in list-item | target
-PRESERVED: clear none -> left on inline in list-item | target descendant
-PRESERVED: clear none -> left on inline in list-item | following sibling
-PRESERVED: clear none -> left on inline in list-item | following sibling descendant
-STATS: clear none -> left on inline in list-item | no layout tree build
-PASS: clear none -> left on inline in list-item | incremental tree matches full rebuild
-PRESERVED: clear right -> both on inline in math | fixture ancestor
-PRESERVED: clear right -> both on inline in math | distant sibling
-PRESERVED: clear right -> both on inline in math | distant sibling descendant
-PRESERVED: clear right -> both on inline in math | DOM parent
-PRESERVED: clear right -> both on inline in math | preceding sibling
-PRESERVED: clear right -> both on inline in math | preceding sibling descendant
-PRESERVED: clear right -> both on inline in math | target
-PRESERVED: clear right -> both on inline in math | target descendant
-PRESERVED: clear right -> both on inline in math | following sibling
-PRESERVED: clear right -> both on inline in math | following sibling descendant
-STATS: clear right -> both on inline in math | no layout tree build
-PASS: clear right -> both on inline in math | incremental tree matches full rebuild
-PRESERVED: position static -> relative on flow-root in inline-block | fixture ancestor
-PRESERVED: position static -> relative on flow-root in inline-block | distant sibling
-PRESERVED: position static -> relative on flow-root in inline-block | distant sibling descendant
-PRESERVED: position static -> relative on flow-root in inline-block | DOM parent
-PRESERVED: position static -> relative on flow-root in inline-block | preceding sibling
-PRESERVED: position static -> relative on flow-root in inline-block | preceding sibling descendant
-RECREATED: position static -> relative on flow-root in inline-block | target
-RECREATED: position static -> relative on flow-root in inline-block | target descendant
-PRESERVED: position static -> relative on flow-root in inline-block | following sibling
-PRESERVED: position static -> relative on flow-root in inline-block | following sibling descendant
-STATS: position static -> relative on flow-root in inline-block | rebuilt subtree roots=1, escaped=false
-PASS: position static -> relative on flow-root in inline-block | incremental tree matches full rebuild
-RECREATED: position absolute -> static on flow-root in table | fixture ancestor
-RECREATED: position absolute -> static on flow-root in table | distant sibling
-RECREATED: position absolute -> static on flow-root in table | distant sibling descendant
-RECREATED: position absolute -> static on flow-root in table | DOM parent
-RECREATED: position absolute -> static on flow-root in table | preceding sibling
-RECREATED: position absolute -> static on flow-root in table | preceding sibling descendant
-RECREATED: position absolute -> static on flow-root in table | target
-RECREATED: position absolute -> static on flow-root in table | target descendant
-RECREATED: position absolute -> static on flow-root in table | following sibling
-RECREATED: position absolute -> static on flow-root in table | following sibling descendant
-STATS: position absolute -> static on flow-root in table | rebuilt subtree roots=1, escaped=false
-PASS: position absolute -> static on flow-root in table | incremental tree matches full rebuild
-RECREATED: position sticky -> static on flow-root in table-row | fixture ancestor
-RECREATED: position sticky -> static on flow-root in table-row | distant sibling
-RECREATED: position sticky -> static on flow-root in table-row | distant sibling descendant
-RECREATED: position sticky -> static on flow-root in table-row | DOM parent
-RECREATED: position sticky -> static on flow-root in table-row | preceding sibling
-RECREATED: position sticky -> static on flow-root in table-row | preceding sibling descendant
-RECREATED: position sticky -> static on flow-root in table-row | target
-RECREATED: position sticky -> static on flow-root in table-row | target descendant
-RECREATED: position sticky -> static on flow-root in table-row | following sibling
-RECREATED: position sticky -> static on flow-root in table-row | following sibling descendant
-STATS: position sticky -> static on flow-root in table-row | rebuilt subtree roots=1, escaped=false
-PASS: position sticky -> static on flow-root in table-row | incremental tree matches full rebuild
-RECREATED: float left -> none on flow-root in inline flow-root | fixture ancestor
-RECREATED: float left -> none on flow-root in inline flow-root | distant sibling
-RECREATED: float left -> none on flow-root in inline flow-root | distant sibling descendant
-RECREATED: float left -> none on flow-root in inline flow-root | DOM parent
-RECREATED: float left -> none on flow-root in inline flow-root | preceding sibling
-RECREATED: float left -> none on flow-root in inline flow-root | preceding sibling descendant
-RECREATED: float left -> none on flow-root in inline flow-root | target
-RECREATED: float left -> none on flow-root in inline flow-root | target descendant
-RECREATED: float left -> none on flow-root in inline flow-root | following sibling
-RECREATED: float left -> none on flow-root in inline flow-root | following sibling descendant
-STATS: float left -> none on flow-root in inline flow-root | rebuilt subtree roots=1, escaped=false
-PASS: float left -> none on flow-root in inline flow-root | incremental tree matches full rebuild
-RECREATED: float inline-start -> none on flow-root in inline flow list-item | fixture ancestor
-RECREATED: float inline-start -> none on flow-root in inline flow list-item | distant sibling
-RECREATED: float inline-start -> none on flow-root in inline flow list-item | distant sibling descendant
-RECREATED: float inline-start -> none on flow-root in inline flow list-item | DOM parent
-RECREATED: float inline-start -> none on flow-root in inline flow list-item | preceding sibling
-RECREATED: float inline-start -> none on flow-root in inline flow list-item | preceding sibling descendant
-RECREATED: float inline-start -> none on flow-root in inline flow list-item | target
-RECREATED: float inline-start -> none on flow-root in inline flow list-item | target descendant
-RECREATED: float inline-start -> none on flow-root in inline flow list-item | following sibling
-RECREATED: float inline-start -> none on flow-root in inline flow list-item | following sibling descendant
-STATS: float inline-start -> none on flow-root in inline flow list-item | rebuilt subtree roots=1, escaped=false
-PASS: float inline-start -> none on flow-root in inline flow list-item | incremental tree matches full rebuild
-PRESERVED: clear none -> left on flow-root in inline list-item | fixture ancestor
-PRESERVED: clear none -> left on flow-root in inline list-item | distant sibling
-PRESERVED: clear none -> left on flow-root in inline list-item | distant sibling descendant
-PRESERVED: clear none -> left on flow-root in inline list-item | DOM parent
-PRESERVED: clear none -> left on flow-root in inline list-item | preceding sibling
-PRESERVED: clear none -> left on flow-root in inline list-item | preceding sibling descendant
-PRESERVED: clear none -> left on flow-root in inline list-item | target
-PRESERVED: clear none -> left on flow-root in inline list-item | target descendant
-PRESERVED: clear none -> left on flow-root in inline list-item | following sibling
-PRESERVED: clear none -> left on flow-root in inline list-item | following sibling descendant
-STATS: clear none -> left on flow-root in inline list-item | no layout tree build
-PASS: clear none -> left on flow-root in inline list-item | incremental tree matches full rebuild
-PRESERVED: clear right -> both on flow-root in -webkit-box | fixture ancestor
-PRESERVED: clear right -> both on flow-root in -webkit-box | distant sibling
-PRESERVED: clear right -> both on flow-root in -webkit-box | distant sibling descendant
-PRESERVED: clear right -> both on flow-root in -webkit-box | DOM parent
-PRESERVED: clear right -> both on flow-root in -webkit-box | preceding sibling
-PRESERVED: clear right -> both on flow-root in -webkit-box | preceding sibling descendant
-PRESERVED: clear right -> both on flow-root in -webkit-box | target
-PRESERVED: clear right -> both on flow-root in -webkit-box | target descendant
-PRESERVED: clear right -> both on flow-root in -webkit-box | following sibling
-PRESERVED: clear right -> both on flow-root in -webkit-box | following sibling descendant
-STATS: clear right -> both on flow-root in -webkit-box | no layout tree build
-PASS: clear right -> both on flow-root in -webkit-box | incremental tree matches full rebuild
-PRESERVED: position static -> relative on inline-block in run-in | fixture ancestor
-PRESERVED: position static -> relative on inline-block in run-in | distant sibling
-PRESERVED: position static -> relative on inline-block in run-in | distant sibling descendant
-RECREATED: position static -> relative on inline-block in run-in | DOM parent
-RECREATED: position static -> relative on inline-block in run-in | preceding sibling
-RECREATED: position static -> relative on inline-block in run-in | preceding sibling descendant
-RECREATED: position static -> relative on inline-block in run-in | target
-RECREATED: position static -> relative on inline-block in run-in | target descendant
-RECREATED: position static -> relative on inline-block in run-in | following sibling
-RECREATED: position static -> relative on inline-block in run-in | following sibling descendant
-STATS: position static -> relative on inline-block in run-in | rebuilt subtree roots=1, escaped=false
-PASS: position static -> relative on inline-block in run-in | incremental tree matches full rebuild
-RECREATED: position absolute -> static on inline-block in inline-table | fixture ancestor
-RECREATED: position absolute -> static on inline-block in inline-table | distant sibling
-RECREATED: position absolute -> static on inline-block in inline-table | distant sibling descendant
-RECREATED: position absolute -> static on inline-block in inline-table | DOM parent
-RECREATED: position absolute -> static on inline-block in inline-table | preceding sibling
-RECREATED: position absolute -> static on inline-block in inline-table | preceding sibling descendant
-RECREATED: position absolute -> static on inline-block in inline-table | target
-RECREATED: position absolute -> static on inline-block in inline-table | target descendant
-RECREATED: position absolute -> static on inline-block in inline-table | following sibling
-RECREATED: position absolute -> static on inline-block in inline-table | following sibling descendant
-STATS: position absolute -> static on inline-block in inline-table | rebuilt subtree roots=1, escaped=false
-PASS: position absolute -> static on inline-block in inline-table | incremental tree matches full rebuild
-RECREATED: position sticky -> static on inline-block in table-cell | fixture ancestor
-RECREATED: position sticky -> static on inline-block in table-cell | distant sibling
-RECREATED: position sticky -> static on inline-block in table-cell | distant sibling descendant
-RECREATED: position sticky -> static on inline-block in table-cell | DOM parent
-RECREATED: position sticky -> static on inline-block in table-cell | preceding sibling
-RECREATED: position sticky -> static on inline-block in table-cell | preceding sibling descendant
-RECREATED: position sticky -> static on inline-block in table-cell | target
-RECREATED: position sticky -> static on inline-block in table-cell | target descendant
-RECREATED: position sticky -> static on inline-block in table-cell | following sibling
-RECREATED: position sticky -> static on inline-block in table-cell | following sibling descendant
-STATS: position sticky -> static on inline-block in table-cell | rebuilt subtree roots=1, escaped=false
-PASS: position sticky -> static on inline-block in table-cell | incremental tree matches full rebuild
-PRESERVED: float left -> none on inline-block in block flex | fixture ancestor
-PRESERVED: float left -> none on inline-block in block flex | distant sibling
-PRESERVED: float left -> none on inline-block in block flex | distant sibling descendant
-RECREATED: float left -> none on inline-block in block flex | DOM parent
-RECREATED: float left -> none on inline-block in block flex | preceding sibling
-RECREATED: float left -> none on inline-block in block flex | preceding sibling descendant
-RECREATED: float left -> none on inline-block in block flex | target
-RECREATED: float left -> none on inline-block in block flex | target descendant
-RECREATED: float left -> none on inline-block in block flex | following sibling
-RECREATED: float left -> none on inline-block in block flex | following sibling descendant
-STATS: float left -> none on inline-block in block flex | rebuilt subtree roots=1, escaped=false
-PASS: float left -> none on inline-block in block flex | incremental tree matches full rebuild
-RECREATED: float inline-start -> none on inline-block in contents | fixture ancestor
-RECREATED: float inline-start -> none on inline-block in contents | distant sibling
-RECREATED: float inline-start -> none on inline-block in contents | distant sibling descendant
-ABSENT: float inline-start -> none on inline-block in contents | DOM parent
-RECREATED: float inline-start -> none on inline-block in contents | preceding sibling
-RECREATED: float inline-start -> none on inline-block in contents | preceding sibling descendant
-RECREATED: float inline-start -> none on inline-block in contents | target
-RECREATED: float inline-start -> none on inline-block in contents | target descendant
-RECREATED: float inline-start -> none on inline-block in contents | following sibling
-RECREATED: float inline-start -> none on inline-block in contents | following sibling descendant
-STATS: float inline-start -> none on inline-block in contents | rebuilt subtree roots=1, escaped=false
-PASS: float inline-start -> none on inline-block in contents | incremental tree matches full rebuild
-PRESERVED: clear none -> left on inline-block in flex | fixture ancestor
-PRESERVED: clear none -> left on inline-block in flex | distant sibling
-PRESERVED: clear none -> left on inline-block in flex | distant sibling descendant
-PRESERVED: clear none -> left on inline-block in flex | DOM parent
-PRESERVED: clear none -> left on inline-block in flex | preceding sibling
-PRESERVED: clear none -> left on inline-block in flex | preceding sibling descendant
-PRESERVED: clear none -> left on inline-block in flex | target
-PRESERVED: clear none -> left on inline-block in flex | target descendant
-PRESERVED: clear none -> left on inline-block in flex | following sibling
-PRESERVED: clear none -> left on inline-block in flex | following sibling descendant
-STATS: clear none -> left on inline-block in flex | no layout tree build
-PASS: clear none -> left on inline-block in flex | incremental tree matches full rebuild
-PRESERVED: clear right -> both on inline-block in -webkit-inline-box | fixture ancestor
-PRESERVED: clear right -> both on inline-block in -webkit-inline-box | distant sibling
-PRESERVED: clear right -> both on inline-block in -webkit-inline-box | distant sibling descendant
-PRESERVED: clear right -> both on inline-block in -webkit-inline-box | DOM parent
-PRESERVED: clear right -> both on inline-block in -webkit-inline-box | preceding sibling
-PRESERVED: clear right -> both on inline-block in -webkit-inline-box | preceding sibling descendant
-PRESERVED: clear right -> both on inline-block in -webkit-inline-box | target
-PRESERVED: clear right -> both on inline-block in -webkit-inline-box | target descendant
-PRESERVED: clear right -> both on inline-block in -webkit-inline-box | following sibling
-PRESERVED: clear right -> both on inline-block in -webkit-inline-box | following sibling descendant
-STATS: clear right -> both on inline-block in -webkit-inline-box | no layout tree build
-PASS: clear right -> both on inline-block in -webkit-inline-box | incremental tree matches full rebuild
-PRESERVED: position static -> relative on run-in in list-item | fixture ancestor
-PRESERVED: position static -> relative on run-in in list-item | distant sibling
-PRESERVED: position static -> relative on run-in in list-item | distant sibling descendant
-PRESERVED: position static -> relative on run-in in list-item | DOM parent
-PRESERVED: position static -> relative on run-in in list-item | preceding sibling
-PRESERVED: position static -> relative on run-in in list-item | preceding sibling descendant
-RECREATED: position static -> relative on run-in in list-item | target
-RECREATED: position static -> relative on run-in in list-item | target descendant
-PRESERVED: position static -> relative on run-in in list-item | following sibling
-PRESERVED: position static -> relative on run-in in list-item | following sibling descendant
-STATS: position static -> relative on run-in in list-item | rebuilt subtree roots=1, escaped=false
-PASS: position static -> relative on run-in in list-item | incremental tree matches full rebuild
-RECREATED: position absolute -> static on run-in in math | fixture ancestor
-RECREATED: position absolute -> static on run-in in math | distant sibling
-RECREATED: position absolute -> static on run-in in math | distant sibling descendant
-RECREATED: position absolute -> static on run-in in math | DOM parent
-RECREATED: position absolute -> static on run-in in math | preceding sibling
-RECREATED: position absolute -> static on run-in in math | preceding sibling descendant
-RECREATED: position absolute -> static on run-in in math | target
-RECREATED: position absolute -> static on run-in in math | target descendant
-RECREATED: position absolute -> static on run-in in math | following sibling
-RECREATED: position absolute -> static on run-in in math | following sibling descendant
-STATS: position absolute -> static on run-in in math | rebuilt subtree roots=1, escaped=false
-PASS: position absolute -> static on run-in in math | incremental tree matches full rebuild
-PRESERVED: position sticky -> static on run-in in table-column-group | fixture ancestor
-PRESERVED: position sticky -> static on run-in in table-column-group | distant sibling
-PRESERVED: position sticky -> static on run-in in table-column-group | distant sibling descendant
-PRESERVED: position sticky -> static on run-in in table-column-group | DOM parent
-ABSENT: position sticky -> static on run-in in table-column-group | preceding sibling
-ABSENT: position sticky -> static on run-in in table-column-group | preceding sibling descendant
-ABSENT: position sticky -> static on run-in in table-column-group | target
-ABSENT: position sticky -> static on run-in in table-column-group | target descendant
-ABSENT: position sticky -> static on run-in in table-column-group | following sibling
-ABSENT: position sticky -> static on run-in in table-column-group | following sibling descendant
-STATS: position sticky -> static on run-in in table-column-group | rebuilt subtree roots=0, escaped=true
-PASS: position sticky -> static on run-in in table-column-group | incremental tree matches full rebuild
-RECREATED: float left -> none on run-in in inline flex | fixture ancestor
-RECREATED: float left -> none on run-in in inline flex | distant sibling
-RECREATED: float left -> none on run-in in inline flex | distant sibling descendant
-RECREATED: float left -> none on run-in in inline flex | DOM parent
-RECREATED: float left -> none on run-in in inline flex | preceding sibling
-RECREATED: float left -> none on run-in in inline flex | preceding sibling descendant
-RECREATED: float left -> none on run-in in inline flex | target
-RECREATED: float left -> none on run-in in inline flex | target descendant
-RECREATED: float left -> none on run-in in inline flex | following sibling
-RECREATED: float left -> none on run-in in inline flex | following sibling descendant
-STATS: float left -> none on run-in in inline flex | rebuilt subtree roots=1, escaped=false
-PASS: float left -> none on run-in in inline flex | incremental tree matches full rebuild
-PRESERVED: float inline-start -> none on run-in in block | fixture ancestor
-PRESERVED: float inline-start -> none on run-in in block | distant sibling
-PRESERVED: float inline-start -> none on run-in in block | distant sibling descendant
-RECREATED: float inline-start -> none on run-in in block | DOM parent
-RECREATED: float inline-start -> none on run-in in block | preceding sibling
-RECREATED: float inline-start -> none on run-in in block | preceding sibling descendant
-RECREATED: float inline-start -> none on run-in in block | target
-RECREATED: float inline-start -> none on run-in in block | target descendant
-RECREATED: float inline-start -> none on run-in in block | following sibling
-RECREATED: float inline-start -> none on run-in in block | following sibling descendant
-STATS: float inline-start -> none on run-in in block | rebuilt subtree roots=1, escaped=false
-PASS: float inline-start -> none on run-in in block | incremental tree matches full rebuild
-PRESERVED: clear none -> left on run-in in inline-flex | fixture ancestor
-PRESERVED: clear none -> left on run-in in inline-flex | distant sibling
-PRESERVED: clear none -> left on run-in in inline-flex | distant sibling descendant
-PRESERVED: clear none -> left on run-in in inline-flex | DOM parent
-PRESERVED: clear none -> left on run-in in inline-flex | preceding sibling
-PRESERVED: clear none -> left on run-in in inline-flex | preceding sibling descendant
-PRESERVED: clear none -> left on run-in in inline-flex | target
-PRESERVED: clear none -> left on run-in in inline-flex | target descendant
-PRESERVED: clear none -> left on run-in in inline-flex | following sibling
-PRESERVED: clear none -> left on run-in in inline-flex | following sibling descendant
-STATS: clear none -> left on run-in in inline-flex | no layout tree build
-PASS: clear none -> left on run-in in inline-flex | incremental tree matches full rebuild
-PRESERVED: clear right -> both on run-in in table-row-group | fixture ancestor
-PRESERVED: clear right -> both on run-in in table-row-group | distant sibling
-PRESERVED: clear right -> both on run-in in table-row-group | distant sibling descendant
-PRESERVED: clear right -> both on run-in in table-row-group | DOM parent
-PRESERVED: clear right -> both on run-in in table-row-group | preceding sibling
-PRESERVED: clear right -> both on run-in in table-row-group | preceding sibling descendant
-PRESERVED: clear right -> both on run-in in table-row-group | target
-PRESERVED: clear right -> both on run-in in table-row-group | target descendant
-PRESERVED: clear right -> both on run-in in table-row-group | following sibling
-PRESERVED: clear right -> both on run-in in table-row-group | following sibling descendant
-STATS: clear right -> both on run-in in table-row-group | no layout tree build
-PASS: clear right -> both on run-in in table-row-group | incremental tree matches full rebuild
-PRESERVED: position static -> relative on list-item in inline list-item | fixture ancestor
-PRESERVED: position static -> relative on list-item in inline list-item | distant sibling
-PRESERVED: position static -> relative on list-item in inline list-item | distant sibling descendant
-PRESERVED: position static -> relative on list-item in inline list-item | DOM parent
-PRESERVED: position static -> relative on list-item in inline list-item | preceding sibling
-PRESERVED: position static -> relative on list-item in inline list-item | preceding sibling descendant
-RECREATED: position static -> relative on list-item in inline list-item | target
-RECREATED: position static -> relative on list-item in inline list-item | target descendant
-PRESERVED: position static -> relative on list-item in inline list-item | following sibling
-PRESERVED: position static -> relative on list-item in inline list-item | following sibling descendant
-STATS: position static -> relative on list-item in inline list-item | rebuilt subtree roots=1, escaped=false
-PASS: position static -> relative on list-item in inline list-item | incremental tree matches full rebuild
-PRESERVED: position absolute -> static on list-item in -webkit-box | fixture ancestor
-PRESERVED: position absolute -> static on list-item in -webkit-box | distant sibling
-PRESERVED: position absolute -> static on list-item in -webkit-box | distant sibling descendant
-RECREATED: position absolute -> static on list-item in -webkit-box | DOM parent
-RECREATED: position absolute -> static on list-item in -webkit-box | preceding sibling
-RECREATED: position absolute -> static on list-item in -webkit-box | preceding sibling descendant
-RECREATED: position absolute -> static on list-item in -webkit-box | target
-RECREATED: position absolute -> static on list-item in -webkit-box | target descendant
-RECREATED: position absolute -> static on list-item in -webkit-box | following sibling
-RECREATED: position absolute -> static on list-item in -webkit-box | following sibling descendant
-STATS: position absolute -> static on list-item in -webkit-box | rebuilt subtree roots=1, escaped=false
-PASS: position absolute -> static on list-item in -webkit-box | incremental tree matches full rebuild
-PRESERVED: position sticky -> static on list-item in table-column | fixture ancestor
-PRESERVED: position sticky -> static on list-item in table-column | distant sibling
-PRESERVED: position sticky -> static on list-item in table-column | distant sibling descendant
-PRESERVED: position sticky -> static on list-item in table-column | DOM parent
-ABSENT: position sticky -> static on list-item in table-column | preceding sibling
-ABSENT: position sticky -> static on list-item in table-column | preceding sibling descendant
-ABSENT: position sticky -> static on list-item in table-column | target
-ABSENT: position sticky -> static on list-item in table-column | target descendant
-ABSENT: position sticky -> static on list-item in table-column | following sibling
-ABSENT: position sticky -> static on list-item in table-column | following sibling descendant
-STATS: position sticky -> static on list-item in table-column | rebuilt subtree roots=0, escaped=true
-PASS: position sticky -> static on list-item in table-column | incremental tree matches full rebuild
-PRESERVED: float left -> none on list-item in block grid | fixture ancestor
-PRESERVED: float left -> none on list-item in block grid | distant sibling
-PRESERVED: float left -> none on list-item in block grid | distant sibling descendant
-RECREATED: float left -> none on list-item in block grid | DOM parent
-RECREATED: float left -> none on list-item in block grid | preceding sibling
-RECREATED: float left -> none on list-item in block grid | preceding sibling descendant
-RECREATED: float left -> none on list-item in block grid | target
-RECREATED: float left -> none on list-item in block grid | target descendant
-RECREATED: float left -> none on list-item in block grid | following sibling
-RECREATED: float left -> none on list-item in block grid | following sibling descendant
-STATS: float left -> none on list-item in block grid | rebuilt subtree roots=1, escaped=false
-PASS: float left -> none on list-item in block grid | incremental tree matches full rebuild
-RECREATED: float inline-start -> none on list-item in inline | fixture ancestor
-RECREATED: float inline-start -> none on list-item in inline | distant sibling
-RECREATED: float inline-start -> none on list-item in inline | distant sibling descendant
-RECREATED: float inline-start -> none on list-item in inline | DOM parent
-RECREATED: float inline-start -> none on list-item in inline | preceding sibling
-RECREATED: float inline-start -> none on list-item in inline | preceding sibling descendant
-RECREATED: float inline-start -> none on list-item in inline | target
-RECREATED: float inline-start -> none on list-item in inline | target descendant
-RECREATED: float inline-start -> none on list-item in inline | following sibling
-RECREATED: float inline-start -> none on list-item in inline | following sibling descendant
-STATS: float inline-start -> none on list-item in inline | rebuilt subtree roots=1, escaped=false
-PASS: float inline-start -> none on list-item in inline | incremental tree matches full rebuild
-PRESERVED: clear none -> left on list-item in grid | fixture ancestor
-PRESERVED: clear none -> left on list-item in grid | distant sibling
-PRESERVED: clear none -> left on list-item in grid | distant sibling descendant
-PRESERVED: clear none -> left on list-item in grid | DOM parent
-PRESERVED: clear none -> left on list-item in grid | preceding sibling
-PRESERVED: clear none -> left on list-item in grid | preceding sibling descendant
-PRESERVED: clear none -> left on list-item in grid | target
-PRESERVED: clear none -> left on list-item in grid | target descendant
-PRESERVED: clear none -> left on list-item in grid | following sibling
-PRESERVED: clear none -> left on list-item in grid | following sibling descendant
-STATS: clear none -> left on list-item in grid | no layout tree build
-PASS: clear none -> left on list-item in grid | incremental tree matches full rebuild
-PRESERVED: clear right -> both on list-item in table-header-group | fixture ancestor
-PRESERVED: clear right -> both on list-item in table-header-group | distant sibling
-PRESERVED: clear right -> both on list-item in table-header-group | distant sibling descendant
-PRESERVED: clear right -> both on list-item in table-header-group | DOM parent
-PRESERVED: clear right -> both on list-item in table-header-group | preceding sibling
-PRESERVED: clear right -> both on list-item in table-header-group | preceding sibling descendant
-PRESERVED: clear right -> both on list-item in table-header-group | target
-PRESERVED: clear right -> both on list-item in table-header-group | target descendant
-PRESERVED: clear right -> both on list-item in table-header-group | following sibling
-PRESERVED: clear right -> both on list-item in table-header-group | following sibling descendant
-STATS: clear right -> both on list-item in table-header-group | no layout tree build
-PASS: clear right -> both on list-item in table-header-group | incremental tree matches full rebuild
-PRESERVED: position static -> relative on inline list-item in flex | fixture ancestor
-PRESERVED: position static -> relative on inline list-item in flex | distant sibling
-PRESERVED: position static -> relative on inline list-item in flex | distant sibling descendant
-PRESERVED: position static -> relative on inline list-item in flex | DOM parent
-PRESERVED: position static -> relative on inline list-item in flex | preceding sibling
-PRESERVED: position static -> relative on inline list-item in flex | preceding sibling descendant
-RECREATED: position static -> relative on inline list-item in flex | target
-RECREATED: position static -> relative on inline list-item in flex | target descendant
-PRESERVED: position static -> relative on inline list-item in flex | following sibling
-PRESERVED: position static -> relative on inline list-item in flex | following sibling descendant
-STATS: position static -> relative on inline list-item in flex | rebuilt subtree roots=1, escaped=false
-PASS: position static -> relative on inline list-item in flex | incremental tree matches full rebuild
-RECREATED: position absolute -> static on inline list-item in -webkit-inline-box | fixture ancestor
-RECREATED: position absolute -> static on inline list-item in -webkit-inline-box | distant sibling
-RECREATED: position absolute -> static on inline list-item in -webkit-inline-box | distant sibling descendant
-RECREATED: position absolute -> static on inline list-item in -webkit-inline-box | DOM parent
-RECREATED: position absolute -> static on inline list-item in -webkit-inline-box | preceding sibling
-RECREATED: position absolute -> static on inline list-item in -webkit-inline-box | preceding sibling descendant
-RECREATED: position absolute -> static on inline list-item in -webkit-inline-box | target
-RECREATED: position absolute -> static on inline list-item in -webkit-inline-box | target descendant
-RECREATED: position absolute -> static on inline list-item in -webkit-inline-box | following sibling
-RECREATED: position absolute -> static on inline list-item in -webkit-inline-box | following sibling descendant
-STATS: position absolute -> static on inline list-item in -webkit-inline-box | rebuilt subtree roots=1, escaped=false
-PASS: position absolute -> static on inline list-item in -webkit-inline-box | incremental tree matches full rebuild
-RECREATED: position sticky -> static on inline list-item in table-caption | fixture ancestor
-RECREATED: position sticky -> static on inline list-item in table-caption | distant sibling
-RECREATED: position sticky -> static on inline list-item in table-caption | distant sibling descendant
-RECREATED: position sticky -> static on inline list-item in table-caption | DOM parent
-RECREATED: position sticky -> static on inline list-item in table-caption | preceding sibling
-RECREATED: position sticky -> static on inline list-item in table-caption | preceding sibling descendant
-RECREATED: position sticky -> static on inline list-item in table-caption | target
-RECREATED: position sticky -> static on inline list-item in table-caption | target descendant
-RECREATED: position sticky -> static on inline list-item in table-caption | following sibling
-RECREATED: position sticky -> static on inline list-item in table-caption | following sibling descendant
-STATS: position sticky -> static on inline list-item in table-caption | rebuilt subtree roots=1, escaped=false
-PASS: position sticky -> static on inline list-item in table-caption | incremental tree matches full rebuild
-RECREATED: float left -> none on inline list-item in inline grid | fixture ancestor
-RECREATED: float left -> none on inline list-item in inline grid | distant sibling
-RECREATED: float left -> none on inline list-item in inline grid | distant sibling descendant
-RECREATED: float left -> none on inline list-item in inline grid | DOM parent
-RECREATED: float left -> none on inline list-item in inline grid | preceding sibling
-RECREATED: float left -> none on inline list-item in inline grid | preceding sibling descendant
-RECREATED: float left -> none on inline list-item in inline grid | target
-RECREATED: float left -> none on inline list-item in inline grid | target descendant
-RECREATED: float left -> none on inline list-item in inline grid | following sibling
-RECREATED: float left -> none on inline list-item in inline grid | following sibling descendant
-STATS: float left -> none on inline list-item in inline grid | rebuilt subtree roots=1, escaped=false
-PASS: float left -> none on inline list-item in inline grid | incremental tree matches full rebuild
-PRESERVED: float inline-start -> none on inline list-item in flow-root | fixture ancestor
-PRESERVED: float inline-start -> none on inline list-item in flow-root | distant sibling
-PRESERVED: float inline-start -> none on inline list-item in flow-root | distant sibling descendant
-RECREATED: float inline-start -> none on inline list-item in flow-root | DOM parent
-RECREATED: float inline-start -> none on inline list-item in flow-root | preceding sibling
-RECREATED: float inline-start -> none on inline list-item in flow-root | preceding sibling descendant
-RECREATED: float inline-start -> none on inline list-item in flow-root | target
-RECREATED: float inline-start -> none on inline list-item in flow-root | target descendant
-RECREATED: float inline-start -> none on inline list-item in flow-root | following sibling
-RECREATED: float inline-start -> none on inline list-item in flow-root | following sibling descendant
-STATS: float inline-start -> none on inline list-item in flow-root | rebuilt subtree roots=1, escaped=false
-PASS: float inline-start -> none on inline list-item in flow-root | incremental tree matches full rebuild
-PRESERVED: clear none -> left on inline list-item in inline-grid | fixture ancestor
-PRESERVED: clear none -> left on inline list-item in inline-grid | distant sibling
-PRESERVED: clear none -> left on inline list-item in inline-grid | distant sibling descendant
-PRESERVED: clear none -> left on inline list-item in inline-grid | DOM parent
-PRESERVED: clear none -> left on inline list-item in inline-grid | preceding sibling
-PRESERVED: clear none -> left on inline list-item in inline-grid | preceding sibling descendant
-PRESERVED: clear none -> left on inline list-item in inline-grid | target
-PRESERVED: clear none -> left on inline list-item in inline-grid | target descendant
-PRESERVED: clear none -> left on inline list-item in inline-grid | following sibling
-PRESERVED: clear none -> left on inline list-item in inline-grid | following sibling descendant
-STATS: clear none -> left on inline list-item in inline-grid | no layout tree build
-PASS: clear none -> left on inline list-item in inline-grid | incremental tree matches full rebuild
-PRESERVED: clear right -> both on inline list-item in table-footer-group | fixture ancestor
-PRESERVED: clear right -> both on inline list-item in table-footer-group | distant sibling
