@@ -144866,6 +144866,7 @@ FILE: Libraries/LibIPC/AttachmentMachPort.cpp
 #include <LibCore/MachPort.h>
 #include <LibCore/System.h>
 #include <LibIPC/Attachment.h>
+#include <errno.h>
 
 // fileport_makeport() and fileport_makefd() are private macOS APIs that convert
 // between file descriptors and Mach port rights. Since Mach messages can only
@@ -144909,7 +144910,10 @@ int Attachment::to_fd()
 {
     VERIFY(MACH_PORT_VALID(m_port.port()));
     int fd = fileport_makefd(m_port.port());
-    VERIFY(fd >= 0);
+    if (fd < 0) {
+        dbgln("IPC::Attachment: Failed to obtain a file descriptor from a file port: {}", Error::from_errno(errno));
+        return -1;
+    }
     mach_port_deallocate(mach_task_self(), m_port.release());
     return fd;
 }
@@ -145208,7 +145212,7 @@ ConnectionBase::PeerEOF ConnectionBase::drain_messages_from_peer()
     });
 
     if (parse_error) {
-        dbgln("IPC::ConnectionBase ({:p}): Disconnecting misbehaving peer due to malformed message", this);
+        dbgln("IPC::ConnectionBase ({:p}): Disconnecting peer after failing to parse a message", this);
         schedule_shutdown = Transport::ShouldShutdown::Yes;
     }
 
@@ -390041,7 +390045,7 @@ void PlaybackManager::set_video_sink_ticking(VideoSinkHandle handle, bool tickin
     manager->update_pipeline_state();
 }
 
-void PlaybackManager::detach_lost_video_sink(VideoSinkHandle handle)
+void PlaybackManager::detach_video_sink(VideoSinkHandle handle)
 {
     auto* track_data = find_video_data_for_handle(handle);
     if (!track_data)
@@ -390091,12 +390095,15 @@ RefPtr<VideoFrame> PlaybackManager::current_presented_frame(VideoSinkHandle hand
     return track_data.video_sink->current_frame();
 }
 
-void PlaybackManager::release_video_edge(VideoSinkHandle handle)
+void PlaybackManager::release_video_edge(VideoSinkHandle handle, VideoSink const& released_sink)
 {
     auto* manager = video_sink_registrations().get(handle).value_or(nullptr);
     if (!manager)
         return;
-    manager->disable_video_sink_by_handle(handle);
+    auto* track_data = manager->find_video_data_for_handle(handle);
+    if (!track_data || track_data->video_sink != &released_sink)
+        return;
+    manager->detach_video_sink(handle);
 }
 
 void PlaybackManager::enable_an_audio_track(Track const& track)
@@ -390306,7 +390313,7 @@ public:
     VideoSinkHandle reserve_video_sink_handle(Track const&);
     void disable_video_sink_by_handle(VideoSinkHandle);
     static void set_video_sink_ticking(VideoSinkHandle, bool);
-    void detach_lost_video_sink(VideoSinkHandle);
+    void detach_video_sink(VideoSinkHandle);
     void set_video_resize_handler(VideoSinkHandle, Function<void(Gfx::Size<u32>)>);
 
     void enable_an_audio_track(Track const&);
@@ -390347,7 +390354,7 @@ public:
     static ErrorOr<RemoteVideoEdge> create_video_edge(VideoSinkHandle, RemoteVideoSink::Delegates);
     static void attach_video_edge(VideoSinkHandle, NonnullRefPtr<RemoteVideoSink> const&);
     static RefPtr<VideoFrame> current_presented_frame(VideoSinkHandle);
-    static void release_video_edge(VideoSinkHandle);
+    static void release_video_edge(VideoSinkHandle, VideoSink const& released_sink);
 
 private:
     struct VideoTrackData {
@@ -397275,16 +397282,6 @@ void VideoPresentationClientConnection::release_edge(VideoSinkHandle handle)
     async_release_video_edge(*edge_id_to_release);
 }
 
-void VideoPresentationClientConnection::set_sink_ticking(VideoSinkHandle handle, bool ticking)
-{
-    for (auto& entry : m_edge_states) {
-        if (entry.value.handle == handle) {
-            async_set_sink_ticking(entry.key, ticking);
-            return;
-        }
-    }
-}
-
 void VideoPresentationClientConnection::video_edge_ready(u64 edge_id, VideoEdgeQueue edge, PresentedFramePage presented_frame_page, MediaTimeReader time_reader)
 {
     auto edge_state = m_edge_states.get(edge_id);
@@ -397428,7 +397425,6 @@ public:
     // DisplayingVideoSink once it arrives. The edge id correlating the request and reply is allocated and kept here.
     void create_edge(VideoSinkHandle, Function<void(NonnullRefPtr<DisplayingVideoSink>)> on_ready);
     void release_edge(VideoSinkHandle);
-    void set_sink_ticking(VideoSinkHandle, bool ticking);
 
 private:
     virtual void die() override;
@@ -397473,7 +397469,6 @@ endpoint VideoPresentationServer {
 
     notify_sink_status(u64 edge_id, Media::PipelineStatus status, u32 requested_seek_id) =|
     notify_sink_resize(u64 edge_id, u32 width, u32 height) =|
-    set_sink_ticking(u64 edge_id, bool ticking) =|
 }
 
 FILE: Libraries/LibMedia/VideoPresentation/VideoPresentationServerConnection.cpp
@@ -397504,7 +397499,7 @@ void VideoPresentationServerConnection::die()
 {
     revoke_weak_refs();
     for (auto& entry : m_edge_states)
-        PlaybackManager::release_video_edge(entry.value.handle);
+        PlaybackManager::release_video_edge(entry.value.handle, *entry.value.pump);
     m_edge_states.clear();
 }
 
@@ -397576,8 +397571,9 @@ void VideoPresentationServerConnection::release_video_edge(u64 edge_id)
     if (it == m_edge_states.end())
         return;
     auto handle = it->value.handle;
+    auto pump = it->value.pump;
     m_edge_states.remove(it);
-    PlaybackManager::release_video_edge(handle);
+    PlaybackManager::release_video_edge(handle, *pump);
 }
 
 void VideoPresentationServerConnection::request_start(u64 edge_id)
@@ -397620,14 +397616,6 @@ void VideoPresentationServerConnection::notify_sink_resize(u64 edge_id, u32 widt
     if (it == m_edge_states.end())
         return;
     it->value.pump->report_remote_resize(Gfx::Size<u32> { width, height });
-}
-
-void VideoPresentationServerConnection::set_sink_ticking(u64 edge_id, bool ticking)
-{
-    auto it = m_edge_states.find(edge_id);
-    if (it == m_edge_states.end())
-        return;
-    PlaybackManager::set_video_sink_ticking(it->value.handle, ticking);
 }
 
 }
@@ -397677,7 +397665,6 @@ private:
     virtual void notify_space_available(u64 edge_id) override;
     virtual void notify_sink_status(u64 edge_id, PipelineStatus status, u32 requested_seek_id) override;
     virtual void notify_sink_resize(u64 edge_id, u32 width, u32 height) override;
-    virtual void set_sink_ticking(u64 edge_id, bool ticking) override;
 
     struct EdgeState {
         NonnullRefPtr<RemoteVideoSink> pump;
@@ -494521,9 +494508,9 @@ void CompositorContextHandle::remove_video_sink(Media::VideoSinkHandle video_sin
     m_host.remove_video_sink(video_sink_handle);
 }
 
-void CompositorContextHandle::set_video_update_flags(Media::VideoSinkHandle video_sink_handle, VideoUpdateFlags flags)
+void CompositorContextHandle::set_video_sink_ticking(Media::VideoSinkHandle video_sink_handle, bool should_tick)
 {
-    m_host.set_video_update_flags(video_sink_handle, flags);
+    m_host.set_video_sink_ticking(video_sink_handle, should_tick);
 }
 
 void CompositorContextHandle::update_scroll_state(Painting::ScrollStateSnapshot&& scroll_state_snapshot)
@@ -494643,7 +494630,7 @@ public:
     void update_visual_context_tree(Painting::AccumulatedVisualContextTree);
     void add_video_sink(Media::VideoSinkHandle);
     void remove_video_sink(Media::VideoSinkHandle);
-    void set_video_update_flags(Media::VideoSinkHandle, VideoUpdateFlags);
+    void set_video_sink_ticking(Media::VideoSinkHandle, bool should_tick);
     void update_scroll_state(Painting::ScrollStateSnapshot&&);
     void invalidate_wheel_event_listener_state(u64 generation);
     AsyncScrollEnqueueResult async_scroll_by(UniqueNodeID expected_document_id, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_device_pixels,
@@ -494688,7 +494675,7 @@ public:
     virtual void update_visual_context_tree(CompositorContextId, Painting::AccumulatedVisualContextTree) = 0;
     virtual void add_video_sink(Media::VideoSinkHandle) = 0;
     virtual void remove_video_sink(Media::VideoSinkHandle) = 0;
-    virtual void set_video_update_flags(Media::VideoSinkHandle, VideoUpdateFlags) = 0;
+    virtual void set_video_sink_ticking(Media::VideoSinkHandle, bool should_tick) = 0;
     virtual void update_scroll_state(CompositorContextId, Painting::ScrollStateSnapshot&&) = 0;
     virtual void invalidate_wheel_event_listener_state(CompositorContextId, u64 generation) = 0;
     virtual AsyncScrollEnqueueResult async_scroll_by(CompositorContextId, UniqueNodeID expected_document_id, Gfx::FloatPoint position,
@@ -494927,18 +494914,6 @@ enum class PagePresentationRegistration {
     No,
     Yes,
 };
-
-// Facts about a video element that the compositor combines with its own paint knowledge to
-// decide when its sink is updated: a visible sink updates while painted, a captured one updates
-// regardless of paint, and a time-stopped one updates only until everything due at the settled
-// position has been presented. Every flag change wakes the sink's update scheduling.
-enum class VideoUpdateFlags : u8 {
-    None = 0,
-    Visible = 1 << 0,
-    Captured = 1 << 1,
-    TimeStopped = 1 << 2,
-};
-AK_ENUM_BITWISE_OPERATORS(VideoUpdateFlags);
 
 struct PendingAsyncScrollUpdates {
     Vector<AsyncScrollOffset> scroll_offsets;
@@ -665627,3 +665602,28 @@ GC::Ref<Node> Node::get_root_node(RootNodeComposed composed)
 GC::Ref<Node> Node::get_root_node(Bindings::GetRootNodeOptions const& options)
 {
     return get_root_node(options.composed ? RootNodeComposed::Yes : RootNodeComposed::No);
+}
+
+Utf16String Node::debug_description() const
+{
+    Utf16StringBuilder builder;
+    builder.append(node_name().to_ascii_lowercase());
+    if (is_element()) {
+        auto const& element = static_cast<DOM::Element const&>(*this);
+        if (element.id().has_value())
+            builder.appendff("#{}", element.id().value());
+        for (auto const& class_name : element.class_names())
+            builder.appendff(".{}", class_name);
+    }
+    return builder.to_string();
+}
+
+// https://dom.spec.whatwg.org/#concept-node-length
+size_t Node::length() const
+{
+    // 1. If node is a DocumentType or Attr node, then return 0.
+    if (is_document_type() || is_attribute())
+        return 0;
+
+    // 2. If node is a CharacterData node, then return node’s data’s length.
+    if (is_character_data())
