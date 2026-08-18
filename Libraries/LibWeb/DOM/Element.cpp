@@ -64,6 +64,7 @@
 #include <LibWeb/DOM/DocumentFragment.h>
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/ElementFactory.h>
+#include <LibWeb/DOM/ElementRareData.h>
 #include <LibWeb/DOM/HTMLCollection.h>
 #include <LibWeb/DOM/NamedNodeMap.h>
 #include <LibWeb/DOM/SelectorQuery.h>
@@ -155,6 +156,120 @@
 
 namespace Web::DOM {
 
+Element::RareData::~RareData() = default;
+
+void Element::RareData::visit_edges(Cell::Visitor& visitor)
+{
+    Node::RareData::visit_edges(visitor);
+    SlottableMixin::RareData::visit_edges(visitor);
+    visitor.visit(class_list);
+    visitor.visit(part_list);
+    if (custom_element_reaction_queue) {
+        for (auto const& reaction : *custom_element_reaction_queue) {
+            reaction.visit(
+                [&](CustomElementUpgradeReaction const& upgrade_reaction) {
+                    visitor.visit(upgrade_reaction.custom_element_definition);
+                },
+                [&](CustomElementCallbackReaction const& callback_reaction) {
+                    visitor.visit(callback_reaction.callback);
+                    callback_reaction.arguments.visit(
+                        [](Empty) {},
+                        [&](CustomElementAdoptedCallbackReactionArguments const& adopted_arguments) {
+                            visitor.visit(adopted_arguments.old_document);
+                            visitor.visit(adopted_arguments.new_document);
+                        },
+                        [&](CustomElementAttributeChangedCallbackReactionArguments const&) {},
+                        [&](CustomElementFormAssociatedCallbackReactionArguments const& form_associated_arguments) {
+                            visitor.visit(form_associated_arguments.form);
+                        },
+                        [&](CustomElementFormDisabledCallbackReactionArguments const&) {});
+                },
+                [&](CustomElementConnectedMoveCallbackReaction const& connected_move_reaction) {
+                    visitor.visit(connected_move_reaction.disconnected_callback);
+                    visitor.visit(connected_move_reaction.connected_callback);
+                });
+        }
+    }
+    visitor.visit(custom_state_set);
+    visitor.visit(computed_style_map_cache);
+    visitor.visit(attribute_style_map);
+    visitor.visit(custom_element_definition);
+    visitor.visit(custom_element_registry);
+    visitor.visit(dataset);
+    if (pseudo_element_data) {
+        for (auto& pseudo_element : *pseudo_element_data)
+            visitor.visit(pseudo_element.value);
+    }
+    if (registered_intersection_observers) {
+        for (auto& observer : *registered_intersection_observers)
+            visitor.visit(observer);
+    }
+    if (counters_set)
+        counters_set->visit_edges(visitor);
+}
+
+OwnPtr<Node::RareData> Element::create_rare_data() const
+{
+    return make<RareData>();
+}
+
+SlottableMixin::RareData* Element::slottable_rare_data()
+{
+    return element_rare_data();
+}
+
+SlottableMixin::RareData const* Element::slottable_rare_data() const
+{
+    return element_rare_data();
+}
+
+SlottableMixin::RareData& Element::ensure_slottable_rare_data()
+{
+    return ensure_element_rare_data();
+}
+
+ARIA::ARIAMixin::RareData* Element::aria_rare_data()
+{
+    return element_rare_data();
+}
+
+ARIA::ARIAMixin::RareData const* Element::aria_rare_data() const
+{
+    return element_rare_data();
+}
+
+ARIA::ARIAMixin::RareData& Element::ensure_aria_rare_data()
+{
+    return ensure_element_rare_data();
+}
+
+Element::RareData& Element::ensure_element_rare_data() const
+{
+    return static_cast<RareData&>(ensure_rare_data());
+}
+
+Element::RareData* Element::element_rare_data()
+{
+    return static_cast<RareData*>(rare_data());
+}
+
+Element::RareData const* Element::element_rare_data() const
+{
+    return static_cast<RareData const*>(rare_data());
+}
+
+Element::PseudoElementData* Element::pseudo_element_data()
+{
+    auto* rare_data = element_rare_data();
+    return rare_data ? rare_data->pseudo_element_data.ptr() : nullptr;
+}
+
+Element::PseudoElementData const* Element::pseudo_element_data() const
+{
+    auto const* rare_data = element_rare_data();
+    return rare_data ? rare_data->pseudo_element_data.ptr() : nullptr;
+}
+
 GC_DEFINE_ALLOCATOR(Element);
 
 static void invalidate_content_blocker_style_if_needed(Element& element)
@@ -195,57 +310,11 @@ Element::~Element() = default;
 void Element::visit_edges(Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
-    SlottableMixin::visit_edges(visitor);
     Animatable::visit_edges(visitor);
-    ARIAMixin::visit_edges(visitor);
 
     visitor.visit(m_attributes);
     visitor.visit(m_inline_style);
-    visitor.visit(m_class_list);
     visitor.visit(m_shadow_root);
-    visitor.visit(m_part_list);
-    visitor.visit(m_custom_element_registry);
-    visitor.visit(m_custom_element_definition);
-    if (m_custom_element_reaction_queue) {
-        for (auto const& reaction : *m_custom_element_reaction_queue) {
-            reaction.visit(
-                [&](CustomElementUpgradeReaction const& upgrade_reaction) {
-                    visitor.visit(upgrade_reaction.custom_element_definition);
-                },
-                [&](CustomElementCallbackReaction const& callback_reaction) {
-                    visitor.visit(callback_reaction.callback);
-                    callback_reaction.arguments.visit(
-                        [](Empty) {},
-                        [&](CustomElementAdoptedCallbackReactionArguments const& adopted_arguments) {
-                            visitor.visit(adopted_arguments.old_document);
-                            visitor.visit(adopted_arguments.new_document);
-                        },
-                        [&](CustomElementAttributeChangedCallbackReactionArguments const&) {},
-                        [&](CustomElementFormAssociatedCallbackReactionArguments const& form_associated_arguments) {
-                            visitor.visit(form_associated_arguments.form);
-                        },
-                        [&](CustomElementFormDisabledCallbackReactionArguments const&) {});
-                },
-                [&](CustomElementConnectedMoveCallbackReaction const& connected_move_reaction) {
-                    visitor.visit(connected_move_reaction.disconnected_callback);
-                    visitor.visit(connected_move_reaction.connected_callback);
-                });
-        }
-    }
-    visitor.visit(m_custom_state_set);
-    visitor.visit(m_computed_style_map_cache);
-    visitor.visit(m_attribute_style_map);
-    if (m_pseudo_element_data) {
-        for (auto& pseudo_element : *m_pseudo_element_data) {
-            visitor.visit(pseudo_element.value);
-        }
-    }
-    if (m_registered_intersection_observers) {
-        for (auto& observer : *m_registered_intersection_observers)
-            visitor.visit(observer);
-    }
-    if (m_counters_set)
-        m_counters_set->visit_edges(visitor);
 }
 
 // https://dom.spec.whatwg.org/#dom-element-getattribute
@@ -1218,8 +1287,12 @@ static CSS::StyleComputer::ComputedStyleInvalidation compute_required_invalidati
     // NB: The adoption also makes an unchanged element keep sharing group storage with its
     //     previous style generation, which future diffs turn into pure pointer compares.
     bool const all_group_payloads_shared = new_computed_values.adopt_identical_group_payloads(old_computed_values);
+    // The inheritance-dependent specified values live outside the group payloads, and swapping
+    // one for a concrete value with the same used color changes what descendants inherit, so
+    // equal payloads alone cannot prove the diff away.
     bool const property_diff_can_be_skipped = all_group_payloads_shared
-        && !CSS::ComputedValues::either_carries_animated_overlay(old_computed_values, new_computed_values);
+        && !CSS::ComputedValues::either_carries_animated_overlay(old_computed_values, new_computed_values)
+        && old_computed_values.inheritance_dependent_specified_values_equal(new_computed_values);
     static bool const verify_fast_path = getenv("LIBWEB_VERIFY_STYLE_DIFF_FAST_PATH") != nullptr;
 
     if (!property_diff_can_be_skipped || verify_fast_path) {
@@ -1940,9 +2013,10 @@ void Element::invalidate_descendant_styles_depending_on_style_container_query()
 
 GC::Ref<DOMTokenList> Element::class_list()
 {
-    if (!m_class_list)
-        m_class_list = DOMTokenList::create(*this, HTML::AttributeNames::class_);
-    return *m_class_list;
+    auto& rare_data = ensure_element_rare_data();
+    if (!rare_data.class_list)
+        rare_data.class_list = DOMTokenList::create(*this, HTML::AttributeNames::class_);
+    return *rare_data.class_list;
 }
 
 // https://drafts.csswg.org/css-shadow-1/#dom-element-part
@@ -1950,9 +2024,18 @@ GC::Ref<DOMTokenList> Element::part_list()
 {
     // The part attribute’s getter must return a DOMTokenList object whose associated element is the context object and
     // whose associated attribute’s local name is part.
-    if (!m_part_list)
-        m_part_list = DOMTokenList::create(*this, HTML::AttributeNames::part);
-    return *m_part_list;
+    auto& rare_data = ensure_element_rare_data();
+    if (!rare_data.part_list)
+        rare_data.part_list = DOMTokenList::create(*this, HTML::AttributeNames::part);
+    return *rare_data.part_list;
+}
+
+ReadonlySpan<Utf16FlyString> Element::part_names() const
+{
+    auto const* rare_data = element_rare_data();
+    if (!rare_data)
+        return {};
+    return rare_data->parts;
 }
 
 // https://dom.spec.whatwg.org/#valid-shadow-host-name
@@ -1980,10 +2063,10 @@ WebIDL::ExceptionOr<void> Element::attach_a_shadow_root(ShadowRootMode mode, boo
         return WebIDL::NotSupportedError::create("Element's local name is not a valid shadow host name"_utf16);
 
     // 3. If element’s local name is a valid custom element name, or element’s is value is not null:
-    if (HTML::is_valid_custom_element_name(local_name()) || m_is_value.has_value()) {
+    if (HTML::is_valid_custom_element_name(local_name()) || is_value().has_value()) {
         // 1. Let definition be the result of looking up a custom element definition given element’s custom element
         //    registry, its namespace, its local name, and its is value.
-        auto definition = HTML::look_up_a_custom_element_definition(custom_element_registry(), namespace_uri(), local_name(), m_is_value);
+        auto definition = HTML::look_up_a_custom_element_definition(custom_element_registry(), namespace_uri(), local_name(), is_value());
 
         // 2. If definition is non-null and definition’s disable shadow is true, then throw a "NotSupportedError"
         //    DOMException.
@@ -2237,9 +2320,10 @@ GC::Ref<CSS::CSSStyleProperties> Element::style()
 
 GC::Ref<CSS::StylePropertyMap> Element::attribute_style_map()
 {
-    if (!m_attribute_style_map)
-        m_attribute_style_map = CSS::StylePropertyMap::create(style());
-    return *m_attribute_style_map;
+    auto& rare_data = ensure_element_rare_data();
+    if (!rare_data.attribute_style_map)
+        rare_data.attribute_style_map = CSS::StylePropertyMap::create(style());
+    return *rare_data.attribute_style_map;
 }
 
 void Element::set_inline_style(GC::Ptr<CSS::CSSStyleProperties> style)
@@ -2248,8 +2332,8 @@ void Element::set_inline_style(GC::Ptr<CSS::CSSStyleProperties> style)
         return;
     auto had_declarations = m_inline_style && !m_inline_style->properties().is_empty();
     m_inline_style = style;
-    if (m_attribute_style_map)
-        m_attribute_style_map = nullptr;
+    if (auto* rare_data = element_rare_data())
+        rare_data->attribute_style_map = nullptr;
 
     // The element's own declarations moved without an attribute moving: a user-agent shadow tree
     // hands its inner elements a style object directly, and an `<input>`'s placeholder swaps
@@ -2525,7 +2609,7 @@ void Element::inserted()
             document().set_needs_mathml_and_svg_user_agent_style_sheets();
         if (m_id.has_value())
             document().element_with_id_was_added({}, *this);
-        if (m_name.has_value())
+        if (m_has_name)
             document().element_with_name_was_added({}, *this);
         if (m_id.has_value() || !m_classes.is_empty())
             invalidate_content_blocker_style_if_needed(*this);
@@ -2550,7 +2634,7 @@ void Element::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor, No
     if (old_root.is_connected()) {
         if (m_id.has_value())
             document().element_with_id_was_removed({}, *this);
-        if (m_name.has_value())
+        if (m_has_name)
             document().element_with_name_was_removed({}, *this);
         if (anchor_values) {
             auto& anchor_names = is<ShadowRoot>(old_root)
@@ -2769,7 +2853,7 @@ bool Element::matches_focus_within_pseudo_class() const
 
 bool Element::has_synthetic_pseudo_elements() const
 {
-    if (m_pseudo_element_data) {
+    if (pseudo_element_data()) {
         bool has_any_synthetic_pseudo_elements = false;
 
         for_each_synthetic_pseudo_element([&](CSS::PseudoElement, SyntheticPseudoElement const& pseudo_element) {
@@ -2824,13 +2908,14 @@ void Element::serialize_children_as_json(JsonObjectSerializer<Utf16StringBuilder
     };
 
     if (has_pseudo_elements) {
-        if (auto backdrop = m_pseudo_element_data->get(CSS::PseudoElement::Backdrop); backdrop.has_value()) {
+        auto const& pseudo_elements = *pseudo_element_data();
+        if (auto backdrop = pseudo_elements.get(CSS::PseudoElement::Backdrop); backdrop.has_value()) {
             serialize_pseudo_element(CSS::PseudoElement::Backdrop, backdrop.value());
         }
-        if (auto marker = m_pseudo_element_data->get(CSS::PseudoElement::Marker); marker.has_value()) {
+        if (auto marker = pseudo_elements.get(CSS::PseudoElement::Marker); marker.has_value()) {
             serialize_pseudo_element(CSS::PseudoElement::Marker, marker.value());
         }
-        if (auto before = m_pseudo_element_data->get(CSS::PseudoElement::Before); before.has_value()) {
+        if (auto before = pseudo_elements.get(CSS::PseudoElement::Before); before.has_value()) {
             serialize_pseudo_element(CSS::PseudoElement::Before, before.value());
         }
     }
@@ -2844,7 +2929,7 @@ void Element::serialize_children_as_json(JsonObjectSerializer<Utf16StringBuilder
     for_each_child(add_child);
 
     if (has_pseudo_elements) {
-        if (auto after = m_pseudo_element_data->get(CSS::PseudoElement::After); after.has_value()) {
+        if (auto after = pseudo_element_data()->get(CSS::PseudoElement::After); after.has_value()) {
             serialize_pseudo_element(CSS::PseudoElement::After, after.value());
         }
 
@@ -4136,10 +4221,53 @@ void Element::enqueue_a_form_disabled_callback_reaction(bool is_disabled)
                                                                                                        });
 }
 
+GC::Ptr<HTML::CustomElementDefinition> Element::custom_element_definition() const
+{
+    auto const* rare_data = element_rare_data();
+    return rare_data ? rare_data->custom_element_definition : nullptr;
+}
+
+void Element::set_custom_element_definition(GC::Ptr<HTML::CustomElementDefinition> definition)
+{
+    if (!definition) {
+        if (auto* rare_data = element_rare_data())
+            rare_data->custom_element_definition = nullptr;
+        return;
+    }
+    ensure_element_rare_data().custom_element_definition = definition;
+}
+
+GC::Ptr<HTML::CustomElementRegistry> Element::custom_element_registry() const
+{
+    if (m_uses_document_global_custom_element_registry)
+        return document().effective_global_custom_element_registry();
+    auto const* rare_data = element_rare_data();
+    return rare_data ? rare_data->custom_element_registry : nullptr;
+}
+
+void Element::set_custom_element_registry(GC::Ptr<HTML::CustomElementRegistry> registry)
+{
+    if (HTML::is_a_global_custom_element_registry(registry) && registry == document().custom_element_registry()) {
+        m_uses_document_global_custom_element_registry = true;
+        if (auto* rare_data = element_rare_data())
+            rare_data->custom_element_registry = nullptr;
+        return;
+    }
+
+    m_uses_document_global_custom_element_registry = false;
+    if (!registry) {
+        if (auto* rare_data = element_rare_data())
+            rare_data->custom_element_registry = nullptr;
+        return;
+    }
+    ensure_element_rare_data().custom_element_registry = registry;
+}
+
 void Element::enqueue_a_custom_element_callback_reaction(Utf16FlyString const& callback_name, CustomElementCallbackReactionArguments arguments)
 {
     // 1. Let definition be element's custom element definition.
-    auto& definition = m_custom_element_definition;
+    auto definition = custom_element_definition();
+    VERIFY(definition);
 
     // 2. Let callback be the value of the entry in definition's lifecycle callbacks with key callbackName.
     GC::Ptr<Web::WebIDL::CallbackType> callback;
@@ -4236,8 +4364,8 @@ void Element::set_custom_element_state(CustomElementState state)
 
 void Element::clear_custom_element_reaction_queue()
 {
-    if (m_custom_element_reaction_queue)
-        m_custom_element_reaction_queue->clear();
+    if (auto* rare_data = element_rare_data(); rare_data && rare_data->custom_element_reaction_queue)
+        rare_data->custom_element_reaction_queue->clear();
 }
 
 // https://html.spec.whatwg.org/multipage/dom.html#html-element-constructors
@@ -4247,16 +4375,17 @@ void Element::setup_custom_element_from_constructor(HTML::CustomElementDefinitio
     set_custom_element_state(CustomElementState::Custom);
 
     // 7.7. Set element's custom element definition to definition.
-    m_custom_element_definition = custom_element_definition;
+    set_custom_element_definition(custom_element_definition);
 
     // 7.8. Set element's is value to is value.
-    m_is_value = is_value;
+    set_is_value(is_value);
 }
 
 void Element::set_prefix(Optional<Utf16FlyString> value)
 {
     m_qualified_name.set_prefix(move(value));
-    m_html_uppercased_qualified_name.clear();
+    if (auto* rare_data = element_rare_data())
+        rare_data->html_uppercased_qualified_name.clear();
 }
 
 // https://dom.spec.whatwg.org/#locate-a-namespace-prefix
@@ -4432,7 +4561,15 @@ void Element::set_associated_shadow_host_pseudo_element(CSS::PseudoElement type)
 
     shadow_root.host()->register_element_reference_pseudo_element(type, *this);
 
-    m_associated_shadow_host_pseudo_element = type;
+    ensure_element_rare_data().associated_shadow_host_pseudo_element = type;
+}
+
+Optional<CSS::PseudoElement> Element::associated_shadow_host_pseudo_element() const
+{
+    auto const* rare_data = element_rare_data();
+    if (!rare_data)
+        return {};
+    return rare_data->associated_shadow_host_pseudo_element;
 }
 
 Optional<SyntheticPseudoElement&> Element::get_synthetic_pseudo_element(CSS::PseudoElement type) const
@@ -4449,14 +4586,15 @@ Optional<SyntheticPseudoElement&> Element::get_synthetic_pseudo_element(CSS::Pse
 
 Optional<PseudoElement&> Element::get_pseudo_element(CSS::PseudoElement type) const
 {
-    if (!m_pseudo_element_data)
+    auto const* pseudo_element_data = this->pseudo_element_data();
+    if (!pseudo_element_data)
         return {};
 
     if (!CSS::Selector::PseudoElementSelector::is_known_pseudo_element_type(type)) {
         return {};
     }
 
-    auto pseudo_element = m_pseudo_element_data->get(type);
+    auto pseudo_element = pseudo_element_data->get(type);
     if (!pseudo_element.has_value())
         return {};
 
@@ -4467,36 +4605,39 @@ void Element::register_element_reference_pseudo_element(CSS::PseudoElement type,
 {
     VERIFY(CSS::is_element_reference_pseudo_element(type));
 
-    if (!m_pseudo_element_data)
-        m_pseudo_element_data = make<PseudoElementData>();
+    auto& pseudo_element_data = ensure_element_rare_data().pseudo_element_data;
+    if (!pseudo_element_data)
+        pseudo_element_data = make<PseudoElementData>();
 
-    m_pseudo_element_data->set(type, GC::Heap::the().allocate<ElementReferencePseudoElement>(element));
+    pseudo_element_data->set(type, GC::Heap::the().allocate<ElementReferencePseudoElement>(element));
 }
 
 void Element::clear_element_reference_pseudo_elements()
 {
-    if (!m_pseudo_element_data)
+    auto* pseudo_element_data = this->pseudo_element_data();
+    if (!pseudo_element_data)
         return;
 
     for (auto i = to_underlying(CSS::first_element_reference_pseudo_element); i <= to_underlying(CSS::last_element_reference_pseudo_element); ++i)
-        m_pseudo_element_data->remove(static_cast<CSS::PseudoElement>(i));
+        pseudo_element_data->remove(static_cast<CSS::PseudoElement>(i));
 }
 
 SyntheticPseudoElement& Element::ensure_synthetic_pseudo_element(CSS::PseudoElement type) const
 {
-    if (!m_pseudo_element_data)
-        m_pseudo_element_data = make<PseudoElementData>();
+    auto& pseudo_element_data = ensure_element_rare_data().pseudo_element_data;
+    if (!pseudo_element_data)
+        pseudo_element_data = make<PseudoElementData>();
 
     VERIFY(CSS::is_synthetic_pseudo_element(type));
 
-    if (!m_pseudo_element_data->get(type).has_value()) {
+    if (!pseudo_element_data->get(type).has_value()) {
         if (is_pseudo_element_root(type))
-            m_pseudo_element_data->set(type, heap().allocate<SyntheticPseudoElementTreeNode>(const_cast<Element&>(*this)));
+            pseudo_element_data->set(type, heap().allocate<SyntheticPseudoElementTreeNode>(const_cast<Element&>(*this)));
         else
-            m_pseudo_element_data->set(type, heap().allocate<SyntheticPseudoElement>(const_cast<Element&>(*this)));
+            pseudo_element_data->set(type, heap().allocate<SyntheticPseudoElement>(const_cast<Element&>(*this)));
     }
 
-    return as<SyntheticPseudoElement>(*m_pseudo_element_data->get(type).value());
+    return as<SyntheticPseudoElement>(*pseudo_element_data->get(type).value());
 }
 
 void Element::set_custom_property_data(Optional<CSS::PseudoElement> pseudo_element, RefPtr<CSS::CustomPropertyData const> data)
@@ -4752,6 +4893,12 @@ bool Element::check_visibility(CheckVisibilityOptions const& options)
     return true;
 }
 
+ProximityToTheViewport Element::proximity_to_the_viewport() const
+{
+    auto const* rare_data = element_rare_data();
+    return rare_data ? rare_data->proximity_to_the_viewport : ProximityToTheViewport::NotDetermined;
+}
+
 // https://drafts.csswg.org/css-contain/#proximity-to-the-viewport
 void Element::determine_proximity_to_the_viewport()
 {
@@ -4765,8 +4912,10 @@ void Element::determine_proximity_to_the_viewport()
     // viewport soon. A margin of 50% is suggested as a reasonable default.
     viewport_rect.inflate(viewport_rect.width(), viewport_rect.height());
     // FIXME: We don't have paint containment or the overflow clip edge yet, so this is just using the absolute rect for now.
-    if (paintable_box()->absolute_rect().intersects(viewport_rect))
-        m_proximity_to_the_viewport = ProximityToTheViewport::CloseToTheViewport;
+    if (paintable_box()->absolute_rect().intersects(viewport_rect)) {
+        ensure_element_rare_data().proximity_to_the_viewport = ProximityToTheViewport::CloseToTheViewport;
+        return;
+    }
 
     // FIXME: If a filter (see [FILTER-EFFECTS-1]) with non local effects includes the element as part of its input, the user
     //        agent should also treat the element as relevant to the user when the filter’s output can affect the rendering
@@ -4775,7 +4924,7 @@ void Element::determine_proximity_to_the_viewport()
 
     // - The element is far away from the viewport: In this state, the element’s proximity to the viewport has been
     //   computed and is not close to the viewport.
-    m_proximity_to_the_viewport = ProximityToTheViewport::FarAwayFromTheViewport;
+    ensure_element_rare_data().proximity_to_the_viewport = ProximityToTheViewport::FarAwayFromTheViewport;
 
     // - The element’s proximity to the viewport is not determined: In this state, the computation to determine the
     //   element’s proximity to the viewport has not been done since the last time the element was connected.
@@ -4788,7 +4937,7 @@ bool Element::is_relevant_to_the_user()
     // An element is relevant to the user if any of the following conditions are true:
 
     // The element is close to the viewport.
-    if (m_proximity_to_the_viewport == ProximityToTheViewport::CloseToTheViewport)
+    if (proximity_to_the_viewport() == ProximityToTheViewport::CloseToTheViewport)
         return true;
 
     // Either the element or its contents are focused, as described in the focus section of the HTML spec.
@@ -4822,6 +4971,22 @@ bool Element::is_relevant_to_the_user()
 
     // NOTE: none of the above conditions are true, so the element is not relevant to the user.
     return false;
+}
+
+bool Element::captured_in_a_view_transition() const
+{
+    auto const* rare_data = element_rare_data();
+    return rare_data && rare_data->captured_in_a_view_transition;
+}
+
+void Element::set_captured_in_a_view_transition(bool value)
+{
+    if (!value) {
+        if (auto* rare_data = element_rare_data())
+            rare_data->captured_in_a_view_transition = false;
+        return;
+    }
+    ensure_element_rare_data().captured_in_a_view_transition = true;
 }
 
 // https://drafts.csswg.org/css-contain-2/#skips-its-contents
@@ -4861,16 +5026,18 @@ bool Element::id_reference_exists(Utf16View id_reference) const
 
 void Element::register_intersection_observer(Badge<IntersectionObserver::IntersectionObserver>, GC::Ref<IntersectionObserver::IntersectionObserver> observer)
 {
-    if (!m_registered_intersection_observers)
-        m_registered_intersection_observers = make<Vector<GC::Ref<IntersectionObserver::IntersectionObserver>>>();
-    m_registered_intersection_observers->append(observer);
+    auto& registered_intersection_observers = ensure_element_rare_data().registered_intersection_observers;
+    if (!registered_intersection_observers)
+        registered_intersection_observers = make<Vector<GC::Ref<IntersectionObserver::IntersectionObserver>>>();
+    registered_intersection_observers->append(observer);
 }
 
 void Element::unregister_intersection_observer(Badge<IntersectionObserver::IntersectionObserver>, GC::Ref<IntersectionObserver::IntersectionObserver> observer)
 {
-    if (!m_registered_intersection_observers)
+    auto* rare_data = element_rare_data();
+    if (!rare_data || !rare_data->registered_intersection_observers)
         return;
-    m_registered_intersection_observers->remove_first_matching([&observer](GC::Ref<IntersectionObserver::IntersectionObserver> const& entry) {
+    rare_data->registered_intersection_observers->remove_first_matching([&observer](GC::Ref<IntersectionObserver::IntersectionObserver> const& entry) {
         return entry == observer;
     });
 }
@@ -4882,7 +5049,8 @@ CSSPixelPoint Element::scroll_offset(Optional<CSS::PseudoElement> pseudo_element
             return pseudo_element->scroll_offset();
         return {};
     }
-    return m_scroll_offset;
+    auto const* rare_data = element_rare_data();
+    return rare_data ? rare_data->scroll_offset : CSSPixelPoint {};
 }
 
 void Element::set_scroll_offset(Optional<CSS::PseudoElement> pseudo_element_type, CSSPixelPoint offset)
@@ -4891,8 +5059,17 @@ void Element::set_scroll_offset(Optional<CSS::PseudoElement> pseudo_element_type
         if (auto pseudo_element = get_synthetic_pseudo_element(*pseudo_element_type); pseudo_element.has_value())
             pseudo_element->set_scroll_offset(offset);
     } else {
-        m_scroll_offset = offset;
+        if (!offset.is_zero())
+            ensure_element_rare_data().scroll_offset = offset;
+        else if (auto* rare_data = element_rare_data())
+            rare_data->scroll_offset = {};
     }
+}
+
+Optional<Element::Dir> Element::dir() const
+{
+    auto const* rare_data = element_rare_data();
+    return rare_data ? rare_data->dir : Optional<Dir> {};
 }
 
 // https://html.spec.whatwg.org/multipage/dom.html#translation-mode
@@ -5222,10 +5399,12 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
             document().element_id_changed({}, *this, old_id);
         }
     } else if (local_name == HTML::AttributeNames::name) {
-        if (value_or_empty.is_empty())
-            m_name = {};
-        else
-            m_name = Utf16FlyString::from_utf16(value_or_empty);
+        m_has_name = !value_or_empty.is_empty();
+        if (m_has_name) {
+            ensure_element_rare_data().name = Utf16FlyString::from_utf16(value_or_empty);
+        } else if (auto* rare_data = element_rare_data()) {
+            rare_data->name = {};
+        }
 
         if (is_connected())
             document().element_name_changed({}, *this);
@@ -5239,8 +5418,8 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
                 return IterationDecision::Continue;
             });
         }
-        if (m_class_list)
-            m_class_list->associated_attribute_changed(value_or_empty);
+        if (auto* rare_data = element_rare_data(); rare_data && rare_data->class_list)
+            rare_data->class_list->associated_attribute_changed(value_or_empty);
     } else if (local_name == HTML::AttributeNames::style) {
         // https://drafts.csswg.org/cssom/#ref-for-cssstyledeclaration-updating-flag
         if (m_inline_style && m_inline_style->is_updating())
@@ -5253,26 +5432,32 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
         bool const is_dir = local_name == HTML::AttributeNames::dir;
         if (is_dir) {
             // https://html.spec.whatwg.org/multipage/dom.html#attr-dir
+            Optional<Dir> dir;
             if (value_or_empty.equals_ignoring_ascii_case(u"ltr"sv))
-                m_dir = Dir::Ltr;
+                dir = Dir::Ltr;
             else if (value_or_empty.equals_ignoring_ascii_case(u"rtl"sv))
-                m_dir = Dir::Rtl;
+                dir = Dir::Rtl;
             else if (value_or_empty.equals_ignoring_ascii_case(u"auto"sv))
-                m_dir = Dir::Auto;
-            else
-                m_dir = {};
+                dir = Dir::Auto;
+
+            if (dir.has_value())
+                ensure_element_rare_data().dir = dir;
+            else if (auto* rare_data = element_rare_data())
+                rare_data->dir = {};
         }
         if (is_dir)
             CSS::Invalidation::invalidate_style_after_directionality_change(*this);
         else
             CSS::Invalidation::invalidate_style_after_language_change(*this);
     } else if (local_name == HTML::AttributeNames::part) {
-        m_parts.clear();
+        if (auto* rare_data = element_rare_data())
+            rare_data->parts.clear();
         if (!value_or_empty.is_empty()) {
+            auto& parts = ensure_element_rare_data().parts;
             auto new_parts = value_or_empty;
             auto append_part = [&](Utf16View new_part) {
-                if (!m_parts.contains_slow(new_part))
-                    m_parts.append(Utf16FlyString::from_utf16(new_part));
+                if (!parts.contains_slow(new_part))
+                    parts.append(Utf16FlyString::from_utf16(new_part));
             };
             size_t start = 0;
             for (size_t i = 0; i <= new_parts.length_in_code_units(); ++i) {
@@ -5283,8 +5468,8 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
                 start = i + 1;
             }
         }
-        if (m_part_list)
-            m_part_list->associated_attribute_changed(value_or_empty);
+        if (auto* rare_data = element_rare_data(); rare_data && rare_data->part_list)
+            rare_data->part_list->associated_attribute_changed(value_or_empty);
         CSS::record_element_parts_changed(*this);
     } else if (local_name == HTML::AttributeNames::exportparts) {
         CSS::Invalidation::invalidate_style_after_exportparts_attribute_change(*this);
@@ -5321,18 +5506,63 @@ void Element::attribute_changed(Utf16FlyString const& local_name, Optional<Utf16
         CSS::record_element_class_list_changed(*this, old_style_engine_classes, m_classes);
 }
 
+Optional<Utf16FlyString> Element::name() const
+{
+    if (!m_has_name)
+        return {};
+    auto const* rare_data = element_rare_data();
+    VERIFY(rare_data);
+    VERIFY(rare_data->name.has_value());
+    return rare_data->name;
+}
+
 auto Element::ensure_custom_element_reaction_queue() -> CustomElementReactionQueue&
 {
-    if (!m_custom_element_reaction_queue)
-        m_custom_element_reaction_queue = make<CustomElementReactionQueue>();
-    return *m_custom_element_reaction_queue;
+    auto& custom_element_reaction_queue = ensure_element_rare_data().custom_element_reaction_queue;
+    if (!custom_element_reaction_queue)
+        custom_element_reaction_queue = make<CustomElementReactionQueue>();
+    return *custom_element_reaction_queue;
+}
+
+auto Element::custom_element_reaction_queue() -> CustomElementReactionQueue*
+{
+    auto* rare_data = element_rare_data();
+    return rare_data ? rare_data->custom_element_reaction_queue.ptr() : nullptr;
+}
+
+auto Element::custom_element_reaction_queue() const -> CustomElementReactionQueue const*
+{
+    auto const* rare_data = element_rare_data();
+    return rare_data ? rare_data->custom_element_reaction_queue.ptr() : nullptr;
 }
 
 HTML::CustomStateSet& Element::ensure_custom_state_set()
 {
-    if (!m_custom_state_set)
-        m_custom_state_set = HTML::CustomStateSet::create(*this);
-    return *m_custom_state_set;
+    auto& custom_state_set = ensure_element_rare_data().custom_state_set;
+    if (!custom_state_set)
+        custom_state_set = HTML::CustomStateSet::create(*this);
+    return *custom_state_set;
+}
+
+GC::Ptr<HTML::CustomStateSet const> Element::custom_state_set() const
+{
+    auto const* rare_data = element_rare_data();
+    return rare_data ? rare_data->custom_state_set : nullptr;
+}
+
+Optional<Utf16FlyString> const& Element::is_value() const
+{
+    static NeverDestroyed<Optional<Utf16FlyString>> empty_is_value;
+    auto const* rare_data = element_rare_data();
+    return rare_data ? rare_data->is_value : *empty_is_value;
+}
+
+void Element::set_is_value(Optional<Utf16FlyString> const& is)
+{
+    if (is.has_value())
+        ensure_element_rare_data().is_value = is;
+    else if (auto* rare_data = element_rare_data())
+        rare_data->is_value.clear();
 }
 
 CSS::StyleSheetList& Element::document_or_shadow_root_style_sheets()
@@ -5381,21 +5611,32 @@ WebIDL::ExceptionOr<void> Element::set_html_unsafe(StringView html)
 
 Optional<CSS::CountersSet const&> Element::counters_set() const
 {
-    if (!m_counters_set)
+    auto const* rare_data = element_rare_data();
+    if (!rare_data || !rare_data->counters_set)
         return {};
-    return *m_counters_set;
+    return *rare_data->counters_set;
 }
 
 CSS::CountersSet& Element::ensure_counters_set()
 {
-    if (!m_counters_set)
-        m_counters_set = make<CSS::CountersSet>();
-    return *m_counters_set;
+    auto& counters_set = ensure_element_rare_data().counters_set;
+    if (!counters_set)
+        counters_set = make<CSS::CountersSet>();
+    return *counters_set;
 }
 
 void Element::set_counters_set(OwnPtr<CSS::CountersSet>&& counters_set)
 {
-    m_counters_set = move(counters_set);
+    if (counters_set)
+        ensure_element_rare_data().counters_set = move(counters_set);
+    else if (auto* rare_data = element_rare_data())
+        rare_data->counters_set = nullptr;
+}
+
+bool Element::has_non_empty_counters_set() const
+{
+    auto const* rare_data = element_rare_data();
+    return rare_data && rare_data->counters_set;
 }
 
 // https://html.spec.whatwg.org/multipage/dom.html#the-lang-and-xml:lang-attributes
@@ -5558,7 +5799,7 @@ GC::Ptr<NamedNodeMap const> Element::attributes() const
 
 Utf16FlyString const& Element::html_uppercased_qualified_name() const
 {
-    return m_html_uppercased_qualified_name.ensure([&] { return make_html_uppercased_qualified_name(); });
+    return ensure_element_rare_data().html_uppercased_qualified_name.ensure([&] { return make_html_uppercased_qualified_name(); });
 }
 
 void Element::play_or_cancel_animations_after_display_property_change()
@@ -5659,7 +5900,13 @@ bool Element::is_focusable() const
 
 void Element::set_had_duplicate_attribute_during_tokenization(Badge<HTML::HTMLParser>)
 {
-    m_had_duplicate_attribute_during_tokenization = true;
+    ensure_element_rare_data().had_duplicate_attribute_during_tokenization = true;
+}
+
+bool Element::had_duplicate_attribute_during_tokenization() const
+{
+    auto const* rare_data = element_rare_data();
+    return rare_data && rare_data->had_duplicate_attribute_during_tokenization;
 }
 
 // https://drafts.css-houdini.org/css-typed-om-1/#dom-element-computedstylemap
@@ -5677,12 +5924,13 @@ GC::Ref<CSS::StylePropertyMapReadOnly> Element::computed_style_map()
     //
     // NOTE: In practice, since the values are "hidden" behind a .get() method call, UAs can delay computing anything
     //    until a given property is actually requested.
-    if (m_computed_style_map_cache == nullptr) {
-        m_computed_style_map_cache = CSS::StylePropertyMapReadOnly::create_computed_style(AbstractElement { *this });
+    auto& computed_style_map_cache = ensure_element_rare_data().computed_style_map_cache;
+    if (computed_style_map_cache == nullptr) {
+        computed_style_map_cache = CSS::StylePropertyMapReadOnly::create_computed_style(AbstractElement { *this });
     }
 
     // 2. Return this’s [[computedStyleMapCache]] internal slot.
-    return *m_computed_style_map_cache;
+    return *computed_style_map_cache;
 }
 
 double Element::ensure_css_random_base_value(CSS::RandomCachingKey const& random_caching_key)
@@ -5692,7 +5940,7 @@ double Element::ensure_css_random_base_value(CSS::RandomCachingKey const& random
     if (!random_caching_key.element_id.has_value())
         return document().ensure_element_shared_css_random_base_value(random_caching_key);
 
-    return m_element_specific_css_random_base_value_cache.ensure(random_caching_key, []() {
+    return ensure_element_rare_data().element_specific_css_random_base_value_cache.ensure(random_caching_key, []() {
         static XorShift128PlusRNG random_number_generator;
         return random_number_generator.get();
     });
@@ -5720,6 +5968,22 @@ void Element::set_fullscreen_flag(bool is_fullscreen)
         return;
     m_fullscreen_flag = is_fullscreen;
     CSS::record_element_state_changed(*this, CSS::PseudoClass::Fullscreen, is_fullscreen);
+}
+
+void Element::set_fullscreen_request_type(Fullscreen::RequestType request_type)
+{
+    if (request_type == Fullscreen::RequestType::Standard) {
+        if (auto* rare_data = element_rare_data())
+            rare_data->fullscreen_request_type = request_type;
+        return;
+    }
+    ensure_element_rare_data().fullscreen_request_type = request_type;
+}
+
+Fullscreen::RequestType Element::fullscreen_request_type() const
+{
+    auto const* rare_data = element_rare_data();
+    return rare_data ? rare_data->fullscreen_request_type : Fullscreen::RequestType::Standard;
 }
 
 GC::Ptr<Element const> Element::element_to_inherit_style_from(Optional<CSS::PseudoElement> pseudo_element) const
