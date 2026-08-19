@@ -63290,6 +63290,9 @@ if (ENABLE_GUI_TARGETS)
     add_subdirectory(LibImageDecoders)
     add_subdirectory(LibImageDecoderClient)
     add_subdirectory(LibMedia)
+    if (ENABLE_CRANELIFT_JIT)
+        add_subdirectory(LibWasmCompilerClient)
+    endif()
     add_subdirectory(LibWeb)
     add_subdirectory(LibWebView)
 endif()
@@ -65043,13 +65046,94 @@ FILE: Libraries/LibCore/AnonymousBuffer.cpp
 #include <LibCore/System.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <unistd.h>
+
+#if defined(AK_OS_MACOS)
+#    include <mach/mach.h>
+#    include <mach/mach_vm.h>
+#endif
 
 namespace Core {
 
-ErrorOr<AnonymousBuffer> AnonymousBuffer::create_with_size(size_t size)
+ErrorOr<AnonymousBuffer> AnonymousBuffer::create_with_size(size_t size, Sealability sealability)
 {
-    auto fd = TRY(Core::System::anon_create(size, O_CLOEXEC));
+    auto allow_sealing = sealability == Sealability::Sealable
+        ? Core::System::AllowSealing::Yes
+        : Core::System::AllowSealing::No;
+    auto fd = TRY(Core::System::anon_create(size, O_CLOEXEC, allow_sealing));
     return create_from_anon_fd(fd, size);
+}
+
+ErrorOr<AnonymousBuffer> AnonymousBuffer::create_from_anon_fd(int fd, size_t size)
+{
+    auto impl = TRY(AnonymousBufferImpl::create(fd, size));
+    return AnonymousBuffer(move(impl));
+}
+
+ErrorOr<AnonymousBuffer> AnonymousBuffer::snapshot(Sealability sealability) const
+{
+    if (!is_valid())
+        return Error::from_string_literal("Cannot snapshot an invalid anonymous buffer");
+
+    bool is_size_sealed = false;
+
+#if defined(F_ADD_SEALS) && defined(F_GET_SEALS) && defined(F_SEAL_GROW) && defined(F_SEAL_SHRINK) && defined(F_SEAL_SEAL)
+    static constexpr auto REQUIRED_SEALS = F_SEAL_GROW | F_SEAL_SHRINK;
+
+    auto seals = TRY(Core::System::fcntl(fd(), F_GET_SEALS, static_cast<uintptr_t>(0)));
+
+    if ((seals & REQUIRED_SEALS) != REQUIRED_SEALS && !(seals & F_SEAL_SEAL)) {
+        TRY(Core::System::fcntl(fd(), F_ADD_SEALS, REQUIRED_SEALS));
+        seals |= REQUIRED_SEALS;
+    }
+
+    is_size_sealed = (seals & REQUIRED_SEALS) == REQUIRED_SEALS;
+#endif
+
+    auto file_status = TRY(Core::System::fstat(fd()));
+    if (file_status.st_size < 0 || static_cast<u64>(file_status.st_size) < size())
+        return Error::from_string_literal("Anonymous buffer is smaller than its claimed size");
+
+    auto copy = TRY(create_with_size(size(), sealability));
+    if (size() == 0)
+        return copy;
+
+    if (is_size_sealed) {
+        bytes().copy_to({ copy.data<u8>(), copy.size() });
+        return copy;
+    }
+
+#if defined(AK_OS_MACOS)
+    // POSIX shared memory descriptors reject pread() on macOS. Copy through Mach so a concurrent truncation is reported
+    // as an error instead of raising SIGBUS while reading the mapping directly.
+    mach_vm_size_t copied_size = 0;
+
+    auto result = mach_vm_read_overwrite(mach_task_self(),
+        reinterpret_cast<mach_vm_address_t>(data<void>()), size(),
+        reinterpret_cast<mach_vm_address_t>(copy.data<void>()), &copied_size);
+
+    if (result != KERN_SUCCESS || copied_size != size())
+        return Error::from_string_literal("Failed to snapshot anonymous buffer");
+#else
+    // Unlike bytes().copy_to(), pread() reports a concurrent truncation as a short read instead of raising SIGBUS
+    // while reading the unsealed mapping.
+    size_t copied_size = 0;
+
+    while (copied_size < size()) {
+        auto bytes_read = ::pread(fd(), copy.data<u8>() + copied_size, size() - copied_size, static_cast<off_t>(copied_size));
+        if (bytes_read < 0) {
+            if (errno == EINTR)
+                continue;
+            return Error::from_errno(errno);
+        }
+
+        if (bytes_read == 0)
+            return Error::from_string_literal("Anonymous buffer was truncated while being snapshotted");
+        copied_size += static_cast<size_t>(bytes_read);
+    }
+#endif
+
+    return copy;
 }
 
 ErrorOr<NonnullRefPtr<AnonymousBufferImpl>> AnonymousBufferImpl::create(int fd, size_t size)
@@ -65083,12 +65167,6 @@ AnonymousBufferImpl::~AnonymousBufferImpl()
         auto rc = munmap(m_data, round_up_to_power_of_two(m_size, PAGE_SIZE));
         VERIFY(rc == 0);
     }
-}
-
-ErrorOr<AnonymousBuffer> AnonymousBuffer::create_from_anon_fd(int fd, size_t size)
-{
-    auto impl = TRY(AnonymousBufferImpl::create(fd, size));
-    return AnonymousBuffer(move(impl));
 }
 
 AnonymousBufferImpl::AnonymousBufferImpl(int fd, size_t size, void* data)
@@ -65140,12 +65218,19 @@ private:
 
 class CORE_API AnonymousBuffer {
 public:
-    static ErrorOr<AnonymousBuffer> create_with_size(size_t);
+    enum class Sealability {
+        Unsealable,
+        Sealable,
+    };
+
+    static ErrorOr<AnonymousBuffer> create_with_size(size_t, Sealability = Sealability::Unsealable);
     static ErrorOr<AnonymousBuffer> create_from_anon_fd(int fd, size_t);
 
     AnonymousBuffer() = default;
 
     bool is_valid() const { return m_impl; }
+
+    ErrorOr<AnonymousBuffer> snapshot(Sealability = Sealability::Unsealable) const;
 
     int fd() const { return m_impl ? m_impl->fd() : -1; }
     size_t size() const { return m_impl ? m_impl->size() : 0; }
@@ -65244,8 +65329,9 @@ ErrorOr<NonnullRefPtr<AnonymousBufferImpl>> AnonymousBufferImpl::create(int fd, 
     return adopt_ref(*new AnonymousBufferImpl(fd, size, ptr));
 }
 
-ErrorOr<AnonymousBuffer> AnonymousBuffer::create_with_size(size_t size)
+ErrorOr<AnonymousBuffer> AnonymousBuffer::create_with_size(size_t size, Sealability)
 {
+    // FIXME: Support sealability on Windows.
     auto impl = TRY(AnonymousBufferImpl::create(size));
     return AnonymousBuffer(move(impl));
 }
@@ -65254,6 +65340,16 @@ ErrorOr<AnonymousBuffer> AnonymousBuffer::create_from_anon_fd(int fd, size_t siz
 {
     auto impl = TRY(AnonymousBufferImpl::create(fd, size));
     return AnonymousBuffer(move(impl));
+}
+
+ErrorOr<AnonymousBuffer> AnonymousBuffer::snapshot(Sealability sealability) const
+{
+    if (!is_valid())
+        return Error::from_string_literal("Cannot snapshot an invalid anonymous buffer");
+
+    auto copy = TRY(create_with_size(size(), sealability));
+    bytes().copy_to({ copy.data<u8>(), copy.size() });
+    return copy;
 }
 
 }
@@ -77180,12 +77276,15 @@ ErrorOr<void> release_address_space(void* address, size_t size)
     return {};
 }
 
-ErrorOr<int> anon_create([[maybe_unused]] size_t size, [[maybe_unused]] int options)
+ErrorOr<int> anon_create([[maybe_unused]] size_t size, [[maybe_unused]] int options, [[maybe_unused]] AllowSealing allow_sealing)
 {
     int fd = -1;
 #if defined(AK_OS_LINUX) || defined(AK_OS_FREEBSD)
-    // FIXME: Support more options on Linux.
     auto linux_options = ((options & O_CLOEXEC) > 0) ? MFD_CLOEXEC : 0;
+#    ifdef MFD_ALLOW_SEALING
+    if (allow_sealing == AllowSealing::Yes)
+        linux_options |= MFD_ALLOW_SEALING;
+#    endif
     fd = memfd_create("", linux_options);
 #elif defined(SHM_ANON)
     fd = shm_open(SHM_ANON, O_RDWR | O_CREAT | options, 0600);
@@ -77990,7 +78089,11 @@ ErrorOr<int> openat(int fd, StringView path, int options, mode_t mode = 0);
 CORE_API ErrorOr<int> fcntl(int fd, int command, ...);
 ErrorOr<void*> mmap(void* address, size_t, int protection, int flags, int fd, off_t, size_t alignment = 0, StringView name = {});
 ErrorOr<void> munmap(void* address, size_t);
-ErrorOr<int> anon_create(size_t size, int options);
+enum class AllowSealing {
+    No,
+    Yes,
+};
+ErrorOr<int> anon_create(size_t size, int options, AllowSealing = AllowSealing::No);
 CORE_API ErrorOr<int> open(StringView path, int options, mode_t mode = 0);
 ErrorOr<void> ftruncate(int fd, off_t length);
 CORE_API ErrorOr<struct stat> stat(StringView path);
@@ -409794,7 +409897,7 @@ static ErrorOr<void> append_allowed_executables(StringBuilder& builder, Readonly
     if (executable_paths.is_empty())
         return {};
 
-    builder.append("(allow process-exec"sv);
+    builder.append("(allow process-fork)\n(allow process-exec"sv);
     for (auto const& path : executable_paths) {
         builder.append(" (literal "sv);
         append_sandbox_string_literal(builder, path);
@@ -410236,7 +410339,7 @@ static constexpr u32 thread_clone_allowed_flags = thread_clone_required_flags
     | CLONE_CHILD_CLEARTID
     | CLONE_DETACHED
     | CLONE_CHILD_SETTID;
-static constexpr u32 vfork_clone_flags = CLONE_VM | CLONE_VFORK | SIGCHLD;
+static constexpr u32 fork_clone_flags = CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID | SIGCHLD;
 
 #ifdef O_LARGEFILE
 static constexpr unsigned read_only_open_flags = O_CLOEXEC | O_LARGEFILE;
@@ -411106,6 +411209,9 @@ void SeccompPolicy::allow_file_descriptor_operations()
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, close);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, fstat);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, dup);
+#ifdef __NR_dup2
+    SECCOMP_APPEND_ALLOW_SYSCALL(*this, dup2);
+#endif
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, dup3);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, pipe2);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, ftruncate);
@@ -411210,13 +411316,31 @@ void SeccompPolicy::allow_file_descriptor_operations()
 
 void SeccompPolicy::allow_process_creation()
 {
+#ifdef __NR_arch_prctl
+    SECCOMP_APPEND_ALLOW_SYSCALL(*this, arch_prctl);
+#endif
+#ifdef __NR_getppid
+    SECCOMP_APPEND_ALLOW_SYSCALL(*this, getppid);
+#endif
+#ifdef __NR_fork
+    SECCOMP_APPEND_ALLOW_SYSCALL(*this, fork);
+#endif
+
 #ifdef __NR_clone
     append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone, 0, 5));
     append(SECCOMP_LOAD_ARGUMENT(0));
-    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, ~vfork_clone_flags));
-    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, fork_clone_flags, 0, 1));
     append(SECCOMP_ALLOW);
     append(SECCOMP_LOAD_SYSCALL_NR);
+    append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
+
+    // musl implements fork() as clone(SIGCHLD, ...).
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(0));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SIGCHLD, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+    append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
 #endif
 
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, execve);
@@ -443867,7 +443991,9 @@ void BytecodeInterpreter::interpret(Configuration& configuration)
     bool const may_run_native = native_entry != 0 || expression.compiled_instructions.has_tier_up_checkpoints;
     CompiledFaultRecoveryContext compiled_fault_recovery;
     bool did_install_compiled_fault_recovery = false;
-    if (may_run_native && !s_compiled_fault_recovery) {
+    if (may_run_native) {
+        // A host function can reenter Wasm with a different configuration (and therefore a different memory).
+        // Keep the innermost configuration active so its compiled faults are classified and recovered correctly.
         install_compiled_fault_handlers();
         compiled_fault_recovery.interpreter = this;
         compiled_fault_recovery.configuration = &configuration;
@@ -459760,8 +459886,6 @@ if (NOT WIN32)
     list(APPEND SOURCES WASI/Wasi.cpp)
 endif()
 
-option(ENABLE_CRANELIFT_JIT "Enable Cranelift-based AOT compilation for WebAssembly" ON)
-
 set(WASM_COMPILED_FAULT_RECOVERY_SUPPORTED 0)
 
 if(WIN32 AND (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|aarch64|ARM64|arm64)$"))
@@ -459902,6 +460026,7 @@ FILE: Libraries/LibWasm/CraneliftBridge.cpp
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Array.h>
 #include <AK/ByteString.h>
 #include <AK/Checked.h>
 #include <AK/LexicalPath.h>
@@ -459909,6 +460034,7 @@ FILE: Libraries/LibWasm/CraneliftBridge.cpp
 #include <AK/Platform.h>
 #include <AK/ScopeGuard.h>
 #include <CraneliftFFI.h>
+#include <LibCore/AnonymousBuffer.h>
 #include <LibCore/Process.h>
 #include <LibCore/System.h>
 #include <LibFileSystem/FileSystem.h>
@@ -459921,6 +460047,7 @@ FILE: Libraries/LibWasm/CraneliftBridge.cpp
 
 #if defined(AK_OS_WINDOWS)
 #    include <AK/Windows.h>
+#    include <LibSync/Mutex.h>
 #else
 #    include <fcntl.h>
 #    include <sys/mman.h>
@@ -459939,10 +460066,9 @@ namespace {
 
 struct InputHeader {
     u32 function_count;
-    u32 helpers_offset;
+    u32 layout_offset;
     u64 outcome_return;
-    u64 code_region_start;
-    u64 reloc_region_start;
+    u64 output_size;
     u64 total_size;
 };
 
@@ -459955,6 +460081,17 @@ struct InputFunctionEntry {
     u32 num_params;
 };
 
+static_assert(sizeof(InputHeader) == 32);
+static_assert(sizeof(InputFunctionEntry) == 24);
+
+struct OutputHeader {
+    u32 function_count;
+    u32 _pad;
+    u64 code_base_offset;
+    u64 reloc_region_start;
+    u64 total_size;
+};
+
 struct OutputFunctionEntry {
     u64 code_offset;
     u32 code_size;
@@ -459965,10 +460102,15 @@ struct OutputFunctionEntry {
     // with the live address of helper N for the current process.
     u64 reloc_offset;
     u32 reloc_count;
+    u32 _padding_after_reloc_count;
     u64 trap_offset;
     u32 trap_count;
-    u32 _pad;
+    u32 _padding;
 };
+
+static_assert(sizeof(OutputHeader) == 32);
+static_assert(sizeof(OutputFunctionEntry) == 48);
+static_assert(offsetof(OutputFunctionEntry, trap_offset) == 32);
 
 struct CodeMapping {
     void* mapping;
@@ -459986,6 +460128,43 @@ static size_t align_up(size_t value, size_t alignment)
     VERIFY(alignment > 0);
     auto remainder = value % alignment;
     return remainder == 0 ? value : value + (alignment - remainder);
+}
+
+static ErrorOr<size_t> compute_output_buffer_size(size_t function_count, size_t instruction_count)
+{
+    Checked<size_t> output_entries_size = sizeof(OutputFunctionEntry);
+    output_entries_size *= function_count;
+    if (output_entries_size.has_overflow())
+        return Error::from_string_literal("Cranelift output size overflow");
+
+    Checked<size_t> output_size = sizeof(OutputHeader);
+    output_size += output_entries_size.value();
+    if (output_size.has_overflow())
+        return Error::from_string_literal("Cranelift output size overflow");
+
+    output_size = align_up(output_size.value(), SERIALIZED_CODE_ALIGNMENT);
+
+    Checked<size_t> maximum_code_size = instruction_count;
+    maximum_code_size *= oop_code_bytes_per_insn;
+    if (maximum_code_size.has_overflow())
+        return Error::from_string_literal("Cranelift output size overflow");
+
+    output_size += max(oop_code_region_min_size, maximum_code_size.value());
+    if (output_size.has_overflow())
+        return Error::from_string_literal("Cranelift output size overflow");
+
+    output_size = align_up(output_size.value(), alignof(HelperReloc));
+
+    Checked<size_t> maximum_reloc_size = instruction_count;
+    maximum_reloc_size *= oop_reloc_bytes_per_insn;
+    if (maximum_reloc_size.has_overflow())
+        return Error::from_string_literal("Cranelift output size overflow");
+
+    output_size += max(oop_reloc_region_min_size, maximum_reloc_size.value());
+    if (output_size.has_overflow() || output_size.value() > NumericLimits<u32>::max())
+        return Error::from_string_literal("Cranelift output is too large");
+
+    return output_size.value();
 }
 
 struct BatchInput {
@@ -460056,7 +460235,13 @@ static CacheState& cranelift_cache_state()
     return *state;
 }
 
-static u64 compute_layout_hash(RuntimeHelpers const& h)
+static CraneliftCompileCallback& cranelift_compile_callback()
+{
+    static NeverDestroyed<CraneliftCompileCallback> callback;
+    return *callback;
+}
+
+static u64 compute_layout_hash(RuntimeLayout const& layout)
 {
     auto fnv1a = [](u64 hash, u64 value) {
         for (int i = 0; i < 8; ++i) {
@@ -460066,38 +460251,33 @@ static u64 compute_layout_hash(RuntimeHelpers const& h)
         return hash;
     };
     u64 hash = 0xcbf29ce484222325ULL;
-    hash = fnv1a(hash, h.regs_offset);
-    hash = fnv1a(hash, h.value_size);
-    hash = fnv1a(hash, h.locals_base_offset);
-    hash = fnv1a(hash, h.memory_instances_offset);
-    hash = fnv1a(hash, h.global_instances_offset);
-    hash = fnv1a(hash, h.global_instance_value_offset);
-    hash = fnv1a(hash, h.memory_instance_data_offset);
-    hash = fnv1a(hash, h.memory_buffer_storage_offset_offset);
-    hash = fnv1a(hash, h.compiled_call_result_scratch_offset);
-    hash = fnv1a(hash, h.value_stack_base_offset);
-    hash = fnv1a(hash, h.value_stack_top_offset);
-    hash = fnv1a(hash, h.call_record_base_offset);
+    hash = fnv1a(hash, layout.regs_offset);
+    hash = fnv1a(hash, layout.value_size);
+    hash = fnv1a(hash, layout.locals_base_offset);
+    hash = fnv1a(hash, layout.memory_instances_offset);
+    hash = fnv1a(hash, layout.global_instances_offset);
+    hash = fnv1a(hash, layout.global_instance_value_offset);
+    hash = fnv1a(hash, layout.memory_instance_data_offset);
+    hash = fnv1a(hash, layout.memory_buffer_storage_offset_offset);
+    hash = fnv1a(hash, layout.compiled_call_result_scratch_offset);
+    hash = fnv1a(hash, layout.value_stack_base_offset);
+    hash = fnv1a(hash, layout.value_stack_top_offset);
+    hash = fnv1a(hash, layout.call_record_base_offset);
     return hash;
 }
 
-// `HelperId` values are assigned in lockstep with the field order of `RuntimeHelpers`,
-// so the helper address for id N is simply the N-th `size_t` field of the struct.
-static_assert(offsetof(RuntimeHelpers, call_function) == 0);
-static_assert(offsetof(RuntimeHelpers, memory_fill) == sizeof(size_t) * 11);
-static_assert(offsetof(RuntimeHelpers, primitive_storage_cage_base) == sizeof(size_t) * 12);
+using RuntimeHelperAddresses = Array<size_t, HELPER_COUNT>;
 static_assert(HELPER_COUNT == 13);
 
-static bool apply_helper_relocs(u8* code_bytes, size_t code_size, HelperReloc const* relocs, size_t reloc_count, RuntimeHelpers const& helpers)
+static bool apply_helper_relocs(u8* code_bytes, size_t code_size, HelperReloc const* relocs, size_t reloc_count, RuntimeHelperAddresses const& helper_addresses)
 {
-    auto const* helper_table = reinterpret_cast<size_t const*>(&helpers);
     for (size_t i = 0; i < reloc_count; ++i) {
         auto const& r = relocs[i];
         if (r.helper_id >= HELPER_COUNT)
             return false;
         if (static_cast<size_t>(r.code_offset) + sizeof(u64) > code_size)
             return false;
-        u64 addr = static_cast<u64>(helper_table[r.helper_id]) + static_cast<u64>(r.addend);
+        u64 addr = static_cast<u64>(helper_addresses[r.helper_id]) + static_cast<u64>(r.addend);
         __builtin_memcpy(code_bytes + r.code_offset, &addr, sizeof(addr));
     }
     return true;
@@ -460107,7 +460287,7 @@ static bool apply_helper_relocs(u8* code_bytes, size_t code_size, HelperReloc co
 // helper-address patches, and install the resulting function pointer into `target`.
 // Used by both the fresh-compile path (bytes come from the subprocess shm) and the
 // cache-install path (bytes come from a `.wasmjit` blob).
-static bool install_compiled_function(CompiledInstructions& target, ReadonlyBytes code_bytes, HelperReloc const* relocs, size_t reloc_count, ReadonlySpan<CraneliftTrap> traps, RuntimeHelpers const& helpers)
+static bool install_compiled_function(CompiledInstructions& target, ReadonlyBytes code_bytes, HelperReloc const* relocs, size_t reloc_count, ReadonlySpan<CraneliftTrap> traps, RuntimeHelperAddresses const& helper_addresses)
 {
     if (target.dispatches.is_empty())
         return false;
@@ -460125,7 +460305,7 @@ static bool install_compiled_function(CompiledInstructions& target, ReadonlyByte
     if (!jit_mem)
         return false;
     __builtin_memcpy(jit_mem, code_bytes.data(), code_size);
-    if (!apply_helper_relocs(static_cast<u8*>(jit_mem), code_size, relocs, reloc_count, helpers)) {
+    if (!apply_helper_relocs(static_cast<u8*>(jit_mem), code_size, relocs, reloc_count, helper_addresses)) {
         VirtualFree(jit_mem, 0, MEM_RELEASE);
         return false;
     }
@@ -460143,7 +460323,7 @@ static bool install_compiled_function(CompiledInstructions& target, ReadonlyByte
 
     pthread_jit_write_protect_np(0);
     __builtin_memcpy(jit_mapping, code_bytes.data(), code_size);
-    if (!apply_helper_relocs(static_cast<u8*>(jit_mapping), code_size, relocs, reloc_count, helpers)) {
+    if (!apply_helper_relocs(static_cast<u8*>(jit_mapping), code_size, relocs, reloc_count, helper_addresses)) {
         munmap(jit_mapping, rx_aligned_size);
         return false;
     }
@@ -460158,7 +460338,7 @@ static bool install_compiled_function(CompiledInstructions& target, ReadonlyByte
     if (rw_mapping == MAP_FAILED)
         return false;
     __builtin_memcpy(rw_mapping, code_bytes.data(), code_size);
-    if (!apply_helper_relocs(static_cast<u8*>(rw_mapping), code_size, relocs, reloc_count, helpers) || mprotect(rw_mapping, rx_aligned_size, PROT_READ | PROT_EXEC) != 0) {
+    if (!apply_helper_relocs(static_cast<u8*>(rw_mapping), code_size, relocs, reloc_count, helper_addresses) || mprotect(rw_mapping, rx_aligned_size, PROT_READ | PROT_EXEC) != 0) {
         munmap(rw_mapping, rx_aligned_size);
         return false;
     }
@@ -460571,22 +460751,28 @@ void wasm_cl_pop_frame(void* config_ptr, u32 arity)
 
 namespace Wasm {
 
-static RuntimeHelpers make_runtime_helpers()
+static RuntimeHelperAddresses make_runtime_helper_addresses()
 {
-    return RuntimeHelpers {
-        .call_function = bit_cast<uintptr_t>(&wasm_cl_call_function),
-        .set_trap = bit_cast<uintptr_t>(&wasm_cl_set_trap),
-        .memory_size = bit_cast<uintptr_t>(&wasm_cl_memory_size),
-        .memory_grow = bit_cast<uintptr_t>(&wasm_cl_memory_grow),
-        .call_with_record = bit_cast<uintptr_t>(&wasm_cl_call_with_record),
-        .direct_call_0 = bit_cast<uintptr_t>(&wasm_cl_direct_call_0),
-        .direct_call_1 = bit_cast<uintptr_t>(&wasm_cl_direct_call_1),
-        .direct_call_2 = bit_cast<uintptr_t>(&wasm_cl_direct_call_2),
-        .direct_call_3 = bit_cast<uintptr_t>(&wasm_cl_direct_call_3),
-        .call_indirect = bit_cast<uintptr_t>(&wasm_cl_call_indirect),
-        .memory_copy = bit_cast<uintptr_t>(&wasm_cl_memory_copy),
-        .memory_fill = bit_cast<uintptr_t>(&wasm_cl_memory_fill),
-        .primitive_storage_cage_base = bit_cast<uintptr_t>(&js_primitive_storage_cage_base),
+    RuntimeHelperAddresses addresses {};
+    addresses[to_underlying(HelperId::call_function)] = bit_cast<uintptr_t>(&wasm_cl_call_function);
+    addresses[to_underlying(HelperId::set_trap)] = bit_cast<uintptr_t>(&wasm_cl_set_trap);
+    addresses[to_underlying(HelperId::memory_size)] = bit_cast<uintptr_t>(&wasm_cl_memory_size);
+    addresses[to_underlying(HelperId::memory_grow)] = bit_cast<uintptr_t>(&wasm_cl_memory_grow);
+    addresses[to_underlying(HelperId::call_with_record)] = bit_cast<uintptr_t>(&wasm_cl_call_with_record);
+    addresses[to_underlying(HelperId::direct_call_0)] = bit_cast<uintptr_t>(&wasm_cl_direct_call_0);
+    addresses[to_underlying(HelperId::direct_call_1)] = bit_cast<uintptr_t>(&wasm_cl_direct_call_1);
+    addresses[to_underlying(HelperId::direct_call_2)] = bit_cast<uintptr_t>(&wasm_cl_direct_call_2);
+    addresses[to_underlying(HelperId::direct_call_3)] = bit_cast<uintptr_t>(&wasm_cl_direct_call_3);
+    addresses[to_underlying(HelperId::call_indirect)] = bit_cast<uintptr_t>(&wasm_cl_call_indirect);
+    addresses[to_underlying(HelperId::memory_copy)] = bit_cast<uintptr_t>(&wasm_cl_memory_copy);
+    addresses[to_underlying(HelperId::memory_fill)] = bit_cast<uintptr_t>(&wasm_cl_memory_fill);
+    addresses[to_underlying(HelperId::primitive_storage_cage_base)] = bit_cast<uintptr_t>(&js_primitive_storage_cage_base);
+    return addresses;
+}
+
+static RuntimeLayout make_runtime_layout()
+{
+    return RuntimeLayout {
         .regs_offset = static_cast<u32>(offsetof(Configuration, regs)),
         .value_size = static_cast<u32>(sizeof(Value)),
         .locals_base_offset = static_cast<u32>(Configuration::locals_base_offset()),
@@ -460600,6 +460786,18 @@ static RuntimeHelpers make_runtime_helpers()
         .value_stack_top_offset = static_cast<u32>(Configuration::value_stack_top_offset()),
         .call_record_base_offset = static_cast<u32>(Configuration::call_record_base_offset()),
     };
+}
+
+static RuntimeLayout const& runtime_layout()
+{
+    static auto const layout = make_runtime_layout();
+    return layout;
+}
+
+static u64 runtime_layout_hash()
+{
+    static auto const hash = compute_layout_hash(runtime_layout());
+    return hash;
 }
 
 static CraneliftInsn serialize_insn(Dispatch const& dispatch, SourcesAndDestination const& addr)
@@ -460736,7 +460934,7 @@ static CraneliftInsn serialize_insn(Dispatch const& dispatch, SourcesAndDestinat
     return out;
 }
 
-static StringView resolve_cranelift_compiler_path()
+ByteString const& cranelift_compiler_path()
 {
     // Lookup order: LADYBIRD_CRANELIFT_COMPILER, compile-time path, sibling-of-self.
     static NeverDestroyed<ByteString> s_path = []() -> ByteString {
@@ -460760,15 +460958,185 @@ static StringView resolve_cranelift_compiler_path()
 
         return WASM_CRANELIFT_COMPILER_PATH;
     }();
-    return s_path->view();
+
+    return *s_path;
 }
 
-static void try_cranelift_compile_batch(Vector<BatchInput>& batch)
+template<typename T>
+static ErrorOr<T> read_cranelift_input(ReadonlyBytes input, size_t offset)
+{
+    Checked<size_t> end = offset;
+    end += sizeof(T);
+    if (end.has_overflow() || end.value() > input.size())
+        return Error::from_string_literal("Cranelift input is truncated");
+
+    T value;
+    input.slice(offset, sizeof(T)).copy_to({ &value, sizeof(T) });
+    return value;
+}
+
+static ErrorOr<Core::AnonymousBuffer> create_cranelift_output_buffer(ReadonlyBytes input)
+{
+    if (input.size() < sizeof(InputHeader))
+        return Error::from_string_literal("Cranelift input header is truncated");
+
+    auto header = TRY(read_cranelift_input<InputHeader>(input, 0));
+    if (header.total_size != input.size())
+        return Error::from_string_literal("Cranelift input size does not match its header");
+
+    Checked<size_t> entries_size = sizeof(InputFunctionEntry);
+    entries_size *= header.function_count;
+    if (entries_size.has_overflow())
+        return Error::from_string_literal("Cranelift input entries are too large");
+
+    Checked<size_t> entries_end = sizeof(InputHeader);
+    entries_end += entries_size.value();
+    if (entries_end.has_overflow() || entries_end.value() > input.size())
+        return Error::from_string_literal("Cranelift input entries are truncated");
+
+    size_t instruction_count = 0;
+    size_t locals_size = 0;
+    for (size_t i = 0; i < header.function_count; ++i) {
+        auto entry = TRY(read_cranelift_input<InputFunctionEntry>(input, sizeof(InputHeader) + i * sizeof(InputFunctionEntry)));
+        Checked<size_t> new_instruction_count = instruction_count;
+        new_instruction_count += entry.insn_count;
+        if (new_instruction_count.has_overflow())
+            return Error::from_string_literal("Cranelift instruction count overflow");
+        instruction_count = new_instruction_count.value();
+
+        Checked<size_t> new_locals_size = locals_size;
+        new_locals_size += entry.num_locals;
+        if (new_locals_size.has_overflow())
+            return Error::from_string_literal("Cranelift locals size overflow");
+        locals_size = new_locals_size.value();
+    }
+
+    auto insn_region_offset = align_up(entries_end.value(), alignof(CraneliftInsn));
+    Checked<size_t> insn_region_size = instruction_count;
+    insn_region_size *= sizeof(CraneliftInsn);
+    if (insn_region_size.has_overflow())
+        return Error::from_string_literal("Cranelift instruction region is too large");
+
+    Checked<size_t> locals_region_offset = insn_region_offset;
+    locals_region_offset += insn_region_size.value();
+    if (locals_region_offset.has_overflow())
+        return Error::from_string_literal("Cranelift locals region offset overflow");
+
+    Checked<size_t> layout_offset = locals_region_offset.value();
+    layout_offset += locals_size;
+    if (layout_offset.has_overflow())
+        return Error::from_string_literal("Cranelift layout offset overflow");
+    auto aligned_layout_offset = align_up(layout_offset.value(), alignof(RuntimeLayout));
+
+    Checked<size_t> expected_input_size = aligned_layout_offset;
+    expected_input_size += sizeof(RuntimeLayout);
+    if (expected_input_size.has_overflow() || expected_input_size.value() != input.size() || header.layout_offset != aligned_layout_offset)
+        return Error::from_string_literal("Cranelift input regions are not canonical");
+
+    size_t insn_cursor = insn_region_offset;
+    size_t locals_cursor = locals_region_offset.value();
+    for (size_t i = 0; i < header.function_count; ++i) {
+        auto entry = TRY(read_cranelift_input<InputFunctionEntry>(input, sizeof(InputHeader) + i * sizeof(InputFunctionEntry)));
+        if (entry.insn_offset != insn_cursor || entry.locals_offset != locals_cursor)
+            return Error::from_string_literal("Cranelift input regions are not canonical");
+
+        insn_cursor += static_cast<size_t>(entry.insn_count) * sizeof(CraneliftInsn);
+        locals_cursor += entry.num_locals;
+    }
+
+    auto output_size = TRY(compute_output_buffer_size(header.function_count, instruction_count));
+    if (header.output_size != output_size)
+        return Error::from_string_literal("Cranelift output size does not match its input");
+
+    return Core::AnonymousBuffer::create_with_size(output_size, Core::AnonymousBuffer::Sealability::Sealable);
+}
+
+static ErrorOr<Core::AnonymousBuffer> finalize_cranelift_output_buffer(Core::AnonymousBuffer const& output)
+{
+    if (output.size() < sizeof(OutputHeader))
+        return Error::from_string_literal("Cranelift output header is truncated");
+
+    auto const& header = *output.data<OutputHeader>();
+    auto output_size = static_cast<size_t>(header.total_size);
+    if (output_size < sizeof(OutputHeader) || output_size > output.size())
+        return Error::from_string_literal("Cranelift output size is invalid");
+
+    auto output_fd = TRY(Core::System::dup(output.fd()));
+    return Core::AnonymousBuffer::create_from_anon_fd(output_fd, output_size);
+}
+
+ErrorOr<Core::AnonymousBuffer> compile_cranelift_buffer(Core::AnonymousBuffer const& input)
+{
+    auto output = TRY(create_cranelift_output_buffer(input.bytes()));
+
+#if defined(AK_OS_WINDOWS)
+    auto process = TRY([&]() -> ErrorOr<Core::Process> {
+        // FIXME: Use Core::FileAction::DupFd once it is supported on Windows so spawning does not require temporarily
+        //        inheritable handles.
+        static Sync::Mutex spawn_mutex;
+        Sync::MutexLocker locker(spawn_mutex);
+
+        auto inherited_input_fd = TRY(Core::System::dup(input.fd()));
+        ScopeGuard close_inherited_input_fd { [&]() { (void)Core::System::close(inherited_input_fd); } };
+        TRY(Core::System::set_close_on_exec(inherited_input_fd, false));
+
+        auto inherited_output_fd = TRY(Core::System::dup(output.fd()));
+        ScopeGuard close_inherited_output_fd { [&]() { (void)Core::System::close(inherited_output_fd); } };
+        TRY(Core::System::set_close_on_exec(inherited_output_fd, false));
+
+        Vector<ByteString> arguments;
+        arguments.append(ByteString::number(reinterpret_cast<uintptr_t>(to_handle(inherited_input_fd))));
+        arguments.append(ByteString::number(input.size()));
+        arguments.append(ByteString::number(reinterpret_cast<uintptr_t>(to_handle(inherited_output_fd))));
+        arguments.append(ByteString::number(output.size()));
+
+        return Core::Process::spawn({
+            .name = "cranelift-compiler"sv,
+            .executable = cranelift_compiler_path(),
+            .die_with_parent = true,
+            .arguments = arguments,
+        });
+    }());
+#else
+    // Reserve the child descriptor numbers with close-on-exec duplicates. This prevents concurrent spawns from claiming
+    // or inheriting them before the child-side DupFd actions replace them and clear close-on-exec.
+    auto compiler_input_fd = TRY(Core::System::fcntl(input.fd(), F_DUPFD_CLOEXEC, STDERR_FILENO + 1));
+    ScopeGuard close_compiler_input_fd { [&]() { (void)Core::System::close(compiler_input_fd); } };
+
+    auto compiler_output_fd = TRY(Core::System::fcntl(output.fd(), F_DUPFD_CLOEXEC, STDERR_FILENO + 1));
+    ScopeGuard close_compiler_output_fd { [&]() { (void)Core::System::close(compiler_output_fd); } };
+
+    Vector<ByteString> arguments;
+    arguments.append(ByteString::number(compiler_input_fd));
+    arguments.append(ByteString::number(input.size()));
+    arguments.append(ByteString::number(compiler_output_fd));
+    arguments.append(ByteString::number(output.size()));
+
+    auto process = TRY(Core::Process::spawn({
+        .name = "cranelift-compiler"sv,
+        .executable = cranelift_compiler_path(),
+        .die_with_parent = true,
+        .arguments = arguments,
+        .file_actions = {
+            Core::FileAction::DupFd { .write_fd = input.fd(), .fd = compiler_input_fd },
+            Core::FileAction::DupFd { .write_fd = output.fd(), .fd = compiler_output_fd },
+        },
+    }));
+#endif
+
+    if (TRY(process.wait_for_termination()) != 0)
+        return Error::from_string_literal("Failed to compile a WebAssembly module");
+
+    return finalize_cranelift_output_buffer(output);
+}
+
+static ErrorOr<void> try_cranelift_compile_batch(ReadonlySpan<BatchInput> batch)
 {
     if (batch.is_empty())
-        return;
+        return {};
 
-    static auto helpers = make_runtime_helpers();
+    static auto helper_addresses = make_runtime_helper_addresses();
+    auto const& layout = runtime_layout();
     u64 outcome_return = to_underlying(Outcome::Return);
 
     size_t function_count = batch.size();
@@ -460777,7 +461145,7 @@ static void try_cranelift_compile_batch(Vector<BatchInput>& batch)
 
     size_t total_insn_count = 0;
     size_t total_locals_bytes = 0;
-    for (auto& entry : batch) {
+    for (auto const& entry : batch) {
         total_insn_count += entry.insns.size();
         total_locals_bytes += entry.num_locals;
     }
@@ -460785,80 +461153,27 @@ static void try_cranelift_compile_batch(Vector<BatchInput>& batch)
     auto const insn_region_offset = align_up(entries_offset + entries_size, alignof(CraneliftInsn));
     auto const insn_bytes = total_insn_count * sizeof(CraneliftInsn);
     auto const locals_region_offset = insn_region_offset + insn_bytes; // u8, no alignment needed
-    auto const helpers_offset = align_up(locals_region_offset + total_locals_bytes, alignof(RuntimeHelpers));
-    auto const code_region_start = align_up(helpers_offset + sizeof(RuntimeHelpers), alignof(OutputFunctionEntry));
-    auto const code_region_size = max(oop_code_region_min_size, total_insn_count * oop_code_bytes_per_insn);
-    auto const reloc_region_start = align_up(code_region_start + sizeof(OutputFunctionEntry) * function_count + code_region_size, alignof(HelperReloc));
-    auto const reloc_region_size = max(oop_reloc_region_min_size, total_insn_count * oop_reloc_bytes_per_insn);
-    auto const total_size = reloc_region_start + reloc_region_size;
+    auto const layout_offset = align_up(locals_region_offset + total_locals_bytes, alignof(RuntimeLayout));
+    auto const total_size = layout_offset + sizeof(RuntimeLayout);
+    auto const output_size = TRY(compute_output_buffer_size(function_count, total_insn_count));
 
-#if defined(AK_OS_WINDOWS)
-    DWORD size_hi = static_cast<DWORD>(static_cast<u64>(total_size) >> 32);
-    DWORD size_lo = static_cast<DWORD>(total_size & 0xFFFFFFFF);
-    HANDLE section_handle = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, size_hi, size_lo, NULL);
-    if (!section_handle)
-        return;
-    SetHandleInformation(section_handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-    ScopeGuard close_handle = [section_handle] { CloseHandle(section_handle); };
-
-    auto* mapping = MapViewOfFile(section_handle, FILE_MAP_ALL_ACCESS, 0, 0, total_size);
-    if (!mapping)
-        return;
-    ScopeGuard unmap = [mapping] { UnmapViewOfFile(mapping); };
-#elif defined(AK_OS_MACOS)
-    // macOS lacks memfd_create; use shm_open + shm_unlink for an anonymous fd.
-    char shm_name[] = "/libwasm-cranelift-XXXXXX";
-    constexpr size_t shm_suffix_offset = sizeof("/libwasm-cranelift-") - 1;
-    arc4random_buf(shm_name + shm_suffix_offset, 6);
-    for (size_t i = shm_suffix_offset; i < shm_suffix_offset + 6; ++i)
-        shm_name[i] = 'A' + (static_cast<unsigned char>(shm_name[i]) % 26);
-    int fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0600);
-    if (fd < 0)
-        return;
-    shm_unlink(shm_name);
-    // POSIX shm_open sets FD_CLOEXEC on the returned fd, which would close it
-    // in the spawned cranelift-compiler child. Clear it so the child inherits.
-    if (auto flags = fcntl(fd, F_GETFD); flags >= 0)
-        fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC);
-    ScopeGuard close_fd = [fd] { close(fd); };
-    if (ftruncate(fd, static_cast<off_t>(total_size)) < 0)
-        return;
-
-    auto* mapping = mmap(nullptr, total_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (mapping == MAP_FAILED)
-        return;
-    ScopeGuard unmap = [mapping, total_size] { munmap(mapping, total_size); };
-#else
-    int fd = memfd_create("libwasm-cranelift", 0);
-    if (fd < 0)
-        return;
-    ScopeGuard close_fd = [fd] { close(fd); };
-    if (ftruncate(fd, static_cast<off_t>(total_size)) < 0)
-        return;
-
-    auto* mapping = mmap(nullptr, total_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (mapping == MAP_FAILED)
-        return;
-    ScopeGuard unmap = [mapping, total_size] { munmap(mapping, total_size); };
-#endif
-
-    auto* base = static_cast<u8*>(mapping);
+    auto buffer = TRY(Core::AnonymousBuffer::create_with_size(total_size, Core::AnonymousBuffer::Sealability::Sealable));
+    auto* base = buffer.data<u8>();
     __builtin_memset(base, 0, total_size);
 
     auto* header = reinterpret_cast<InputHeader*>(base);
     *header = InputHeader {
         .function_count = static_cast<u32>(function_count),
-        .helpers_offset = static_cast<u32>(helpers_offset),
+        .layout_offset = static_cast<u32>(layout_offset),
         .outcome_return = outcome_return,
-        .code_region_start = code_region_start,
-        .reloc_region_start = reloc_region_start,
+        .output_size = output_size,
         .total_size = total_size,
     };
 
     size_t insn_cursor = insn_region_offset;
     size_t locals_cursor = locals_region_offset;
     for (size_t i = 0; i < function_count; ++i) {
-        auto& input = batch[i];
+        auto const& input = batch[i];
         auto* entry = reinterpret_cast<InputFunctionEntry*>(base + entries_offset + i * sizeof(InputFunctionEntry));
         *entry = InputFunctionEntry {
             .insn_offset = static_cast<u32>(insn_cursor),
@@ -460877,69 +461192,82 @@ static void try_cranelift_compile_batch(Vector<BatchInput>& batch)
         locals_cursor += input.num_locals;
     }
 
-    __builtin_memcpy(base + helpers_offset, &helpers, sizeof(helpers));
+    __builtin_memcpy(base + layout_offset, &layout, sizeof(layout));
 
-    Vector<ByteString> arguments;
-#if defined(AK_OS_WINDOWS)
-    arguments.append(ByteString::number(reinterpret_cast<uintptr_t>(section_handle)));
-#else
-    arguments.append(ByteString::number(fd));
-#endif
-
-    auto process_result = Core::Process::spawn({
-        .name = "cranelift-compiler"sv,
-        .executable = resolve_cranelift_compiler_path(),
-        .arguments = arguments,
-    });
-    if (process_result.is_error())
-        return;
-    auto status_result = process_result.release_value().wait_for_termination();
-    if (status_result.is_error() || status_result.value() != 0)
-        return;
+    auto output_buffer = TRY([&]() -> ErrorOr<Core::AnonymousBuffer> {
+        if (auto& callback = cranelift_compile_callback()) {
+            auto output = callback(buffer);
+            return output.snapshot();
+        }
+        return compile_cranelift_buffer(buffer);
+    }());
+    if (!output_buffer.is_valid() || output_buffer.size() < sizeof(OutputHeader))
+        return Error::from_string_literal("Failed to compile a WebAssembly module");
 
     // Extract results for each function.
-    auto const code_base_offset = code_region_start + sizeof(OutputFunctionEntry) * function_count;
+    auto const* output_base = output_buffer.data<u8>();
+    auto const& output_header = *reinterpret_cast<OutputHeader const*>(output_base);
+    auto const output_entries_offset = sizeof(OutputHeader);
+    auto const output_entries_size = sizeof(OutputFunctionEntry) * function_count;
+    auto const code_base_offset = static_cast<size_t>(output_header.code_base_offset);
+    auto const reloc_region_start = static_cast<size_t>(output_header.reloc_region_start);
+    auto const compact_output_size = static_cast<size_t>(output_header.total_size);
+    if (output_header.function_count != function_count
+        || compact_output_size != output_buffer.size()
+        || code_base_offset < output_entries_offset + output_entries_size
+        || code_base_offset % SERIALIZED_CODE_ALIGNMENT != 0
+        || reloc_region_start < code_base_offset
+        || reloc_region_start % alignof(HelperReloc) != 0
+        || reloc_region_start > compact_output_size)
+        return Error::from_string_literal("Cranelift compiler returned an invalid buffer");
+
+    auto const code_region_size = reloc_region_start - code_base_offset;
+    auto const reloc_region_size = compact_output_size - reloc_region_start;
 
     for (size_t i = 0; i < function_count; ++i) {
-        auto const* output = reinterpret_cast<OutputFunctionEntry const*>(base + code_region_start + i * sizeof(OutputFunctionEntry));
-        if (!output->compiled)
+        auto const& output = *reinterpret_cast<OutputFunctionEntry const*>(output_base + output_entries_offset + i * sizeof(OutputFunctionEntry));
+        if (!output.compiled)
             continue;
 
-        auto code_offset = static_cast<size_t>(output->code_offset);
-        auto code_size = static_cast<size_t>(output->code_size);
+        auto code_offset = static_cast<size_t>(output.code_offset);
+        auto code_size = static_cast<size_t>(output.code_size);
         if (code_offset > code_region_size || code_size > code_region_size - code_offset)
             continue;
         auto code_start = code_base_offset + code_offset;
-        if (code_start + code_size > total_size)
+        if (code_start + code_size > compact_output_size)
             continue;
 
-        auto const reloc_offset = static_cast<size_t>(output->reloc_offset);
-        auto const reloc_count = static_cast<size_t>(output->reloc_count);
+        auto const reloc_offset = static_cast<size_t>(output.reloc_offset);
+        auto const reloc_count = static_cast<size_t>(output.reloc_count);
         auto const reloc_bytes = reloc_count * sizeof(HelperReloc);
         if (reloc_count != 0 && reloc_bytes / sizeof(HelperReloc) != reloc_count)
             continue;
+        if (reloc_offset % alignof(HelperReloc) != 0)
+            continue;
         if (reloc_offset > reloc_region_size || reloc_bytes > reloc_region_size - reloc_offset)
             continue;
-        if (reloc_region_start + reloc_offset + reloc_bytes > total_size)
+        if (reloc_region_start + reloc_offset + reloc_bytes > compact_output_size)
             continue;
 
-        auto const trap_offset = static_cast<size_t>(output->trap_offset);
-        auto const trap_count = static_cast<size_t>(output->trap_count);
+        auto const trap_offset = static_cast<size_t>(output.trap_offset);
+        auto const trap_count = static_cast<size_t>(output.trap_count);
         auto const trap_bytes = trap_count * sizeof(CraneliftTrap);
         if (trap_count != 0 && trap_bytes / sizeof(CraneliftTrap) != trap_count)
             continue;
+        if (trap_offset % alignof(CraneliftTrap) != 0)
+            continue;
         if (trap_offset > reloc_region_size || trap_bytes > reloc_region_size - trap_offset)
             continue;
-        if (reloc_region_start + trap_offset + trap_bytes > total_size)
+        if (reloc_region_start + trap_offset + trap_bytes > compact_output_size)
             continue;
 
-        auto code_bytes = ReadonlyBytes { base + code_start, code_size };
+        auto code_bytes = ReadonlyBytes { output_base + code_start, code_size };
         auto const* relocs = reloc_count == 0
             ? nullptr
-            : reinterpret_cast<HelperReloc const*>(base + reloc_region_start + reloc_offset);
+            : reinterpret_cast<HelperReloc const*>(output_base + reloc_region_start + reloc_offset);
         auto traps = trap_count == 0
             ? ReadonlySpan<CraneliftTrap> {}
-            : ReadonlySpan<CraneliftTrap> { reinterpret_cast<CraneliftTrap const*>(base + reloc_region_start + trap_offset), trap_count };
+            : ReadonlySpan<CraneliftTrap> { reinterpret_cast<CraneliftTrap const*>(output_base + reloc_region_start + trap_offset), trap_count };
 
         auto& capture = cranelift_cache_state().cache_capture;
         if (capture.capturing && batch[i].function_index != NumericLimits<u32>::max()) {
@@ -460957,8 +461285,10 @@ static void try_cranelift_compile_batch(Vector<BatchInput>& batch)
             }
         }
 
-        install_compiled_function(*batch[i].target, code_bytes, relocs, reloc_count, traps, helpers);
+        install_compiled_function(*batch[i].target, code_bytes, relocs, reloc_count, traps, helper_addresses);
     }
+
+    return {};
 }
 
 bool try_cranelift_compile(CompiledInstructions& compiled, u32 result_arity)
@@ -460987,14 +461317,14 @@ bool try_cranelift_compile(CompiledInstructions& compiled, u32 result_arity)
     if (cranelift_cache_state().pending_install.active && s_active_function_index != NumericLimits<u32>::max()) {
         auto record = cranelift_cache_state().pending_install.records.take(s_active_function_index);
         if (record.has_value()) {
-            static auto cache_install_helpers = make_runtime_helpers();
+            static auto cache_install_helper_addresses = make_runtime_helper_addresses();
             if (install_compiled_function(
                     compiled,
                     record->unpatched_code.bytes(),
                     record->relocs.is_empty() ? nullptr : record->relocs.data(),
                     record->relocs.size(),
                     record->traps.span(),
-                    cache_install_helpers)) {
+                    cache_install_helper_addresses)) {
                 return true;
             }
             // Put it back so we can try later.
@@ -461126,7 +461456,11 @@ void flush_cranelift_batch()
 {
     if (cranelift_cache_state().pending_batch.is_empty())
         return;
-    try_cranelift_compile_batch(cranelift_cache_state().pending_batch);
+
+    auto result = try_cranelift_compile_batch(cranelift_cache_state().pending_batch);
+    if (result.is_error())
+        warnln("Cranelift compilation failed: {}", result.error());
+
     cranelift_cache_state().pending_batch.clear();
 }
 
@@ -461185,8 +461519,6 @@ Optional<ByteBuffer> serialize_cranelift_cache_blob(ReadonlyBytes wasm_hash)
     if (wasm_hash.size() != 32)
         return {};
 
-    static auto helpers = make_runtime_helpers();
-
     size_t total_size = sizeof(CacheBlobHeader);
     for (auto const& r : capture.records) {
         total_size += sizeof(CacheBlobFunctionEntry);
@@ -461205,7 +461537,7 @@ Optional<ByteBuffer> serialize_cranelift_cache_blob(ReadonlyBytes wasm_hash)
     header->magic = cache_blob_magic;
     header->format_version = cache_blob_format_version;
     header->helper_count = HELPER_COUNT;
-    header->layout_hash = compute_layout_hash(helpers);
+    header->layout_hash = runtime_layout_hash();
     __builtin_memcpy(header->wasm_hash, wasm_hash.data(), 32);
     header->function_count = static_cast<u32>(capture.records.size());
 
@@ -461252,8 +461584,7 @@ bool try_install_cranelift_cache_blob(ReadonlyBytes expected_wasm_hash, Readonly
     if (__builtin_memcmp(header->wasm_hash, expected_wasm_hash.data(), 32) != 0)
         return false;
 
-    static auto helpers = make_runtime_helpers();
-    if (header->layout_hash != compute_layout_hash(helpers))
+    if (header->layout_hash != runtime_layout_hash())
         return false;
 
     size_t offset = sizeof(CacheBlobHeader);
@@ -461307,6 +461638,14 @@ bool try_install_cranelift_cache_blob(ReadonlyBytes expected_wasm_hash, Readonly
     return true;
 }
 
+void set_cranelift_compile_callback(CraneliftCompileCallback callback)
+{
+    auto& installed_callback = cranelift_compile_callback();
+    VERIFY(!installed_callback);
+
+    installed_callback = move(callback);
+}
+
 }
 
 FILE: Libraries/LibWasm/CraneliftStubs.cpp
@@ -461316,6 +461655,7 @@ FILE: Libraries/LibWasm/CraneliftStubs.cpp
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/NeverDestroyed.h>
 #include <LibWasm/Types.h>
 
 namespace Wasm {
@@ -461330,6 +461670,18 @@ void abort_cranelift_cache_capture() { }
 void abort_cranelift_cache_install() { }
 Optional<ByteBuffer> serialize_cranelift_cache_blob(ReadonlyBytes) { return {}; }
 bool try_install_cranelift_cache_blob(ReadonlyBytes, ReadonlyBytes) { return false; }
+void set_cranelift_compile_callback(CraneliftCompileCallback) { }
+
+ErrorOr<Core::AnonymousBuffer> compile_cranelift_buffer(Core::AnonymousBuffer const&)
+{
+    return Error::from_string_literal("Cranelift is disabled");
+}
+
+ByteString const& cranelift_compiler_path()
+{
+    static NeverDestroyed<ByteString> path;
+    return *path;
+}
 
 }
 
@@ -465439,6 +465791,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=cbindgen.toml");
     println!("cargo:rerun-if-changed=src/lib.rs");
+    println!("cargo:rerun-if-changed=src/serialized.rs");
 
     generate_opcodes(&manifest_dir, &out_dir)?;
 
@@ -465500,7 +465853,7 @@ sys_includes = ["stdint.h", "stddef.h"]
 usize_is_size_t = true
 
 [export]
-include = ["CraneliftInsn", "RuntimeHelpers", "HelperReloc", "HelperId", "HELPER_COUNT"]
+include = ["CraneliftInsn", "RuntimeLayout", "HelperReloc", "HelperId", "HELPER_COUNT", "SERIALIZED_CODE_ALIGNMENT"]
 
 [export.mangle]
 rename_types = "PascalCase"
@@ -465514,85 +465867,14 @@ FILE: Libraries/LibWasm/Rust/src/bin/cranelift-compiler.rs
 
 #![allow(clippy::manual_let_else)]
 
-use libwasm_cranelift::CompiledFunction;
-use libwasm_cranelift::CraneliftInsn;
-use libwasm_cranelift::CraneliftTrap;
-use libwasm_cranelift::HelperReloc;
-use libwasm_cranelift::RuntimeHelpers;
-use libwasm_cranelift::compile_to_bytes;
+use libwasm_cranelift::serialized::compile_serialized_buffer;
 use std::env;
-use std::mem::size_of;
-use std::mem::size_of_val;
-
-#[cfg(all(unix, not(target_os = "macos")))]
-use std::fs::File;
-#[cfg(all(unix, not(target_os = "macos")))]
-use std::io;
-#[cfg(all(unix, not(target_os = "macos")))]
-use std::os::fd::FromRawFd;
-#[cfg(all(unix, not(target_os = "macos")))]
-use std::os::unix::fs::FileExt;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct InputHeader {
-    function_count: u32,
-    helpers_offset: u32,
-    outcome_return: u64,
-    code_region_start: u64,
-    reloc_region_start: u64,
-    total_size: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct InputFunctionEntry {
-    insn_offset: u32,
-    insn_count: u32,
-    result_arity: u32,
-    num_locals: u32,
-    locals_offset: u32,
-    num_params: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct OutputFunctionEntry {
-    code_offset: u64,
-    code_size: u32,
-    compiled: u32,
-    reloc_offset: u64,
-    reloc_count: u32,
-    trap_offset: u64,
-    trap_count: u32,
-    _pad: u32,
-}
-
-fn as_bytes_slice<T>(value: &[T]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(value.as_ptr().cast::<u8>(), size_of_val(value)) }
-}
-
-fn read_pod<T: Copy>(base: &[u8], offset: usize) -> Result<T, &'static str> {
-    let end = offset.checked_add(size_of::<T>()).ok_or("overflow")?;
-    let bytes = base.get(offset..end).ok_or("out of bounds read")?;
-    Ok(unsafe { (bytes.as_ptr().cast::<T>()).read_unaligned() })
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn read_exact_at_offset(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
-    file.read_exact_at(buf, offset)
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn write_all_at_offset(file: &File, data: &[u8], offset: u64) -> io::Result<()> {
-    file.write_all_at(data, offset)
-}
 
 // macOS POSIX shm objects don't support read/write/pread/pwrite, only mmap and
-// ftruncate. So we mmap the parent's shm fd directly instead of using the
-// file-based path the Linux memfd build takes.
-#[cfg(target_os = "macos")]
-mod mac {
+// ftruncate. Mmap both buffers on all Unix platforms so Linux does not need to
+// copy them through temporary Vecs.
+#[cfg(unix)]
+mod unix {
     use std::ffi::c_void;
     use std::io;
 
@@ -465603,22 +465885,16 @@ mod mac {
     }
 
     impl Mapping {
-        pub fn open(fd: i32) -> Result<Self, Box<dyn std::error::Error>> {
-            let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            if unsafe { libc::fstat(fd, &raw mut st) } != 0 {
-                return Err(io::Error::last_os_error().into());
+        pub fn open(fd: i32, len: usize, writable: bool) -> Result<Self, Box<dyn std::error::Error>> {
+            if fd < 0 {
+                return Err("invalid fd".into());
             }
-            let len = usize::try_from(st.st_size).map_err(|_| "stat size overflow")?;
-            let ptr = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    len,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED,
-                    fd,
-                    0,
-                )
+            let protection = if writable {
+                libc::PROT_READ | libc::PROT_WRITE
+            } else {
+                libc::PROT_READ
             };
+            let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, protection, libc::MAP_SHARED, fd, 0) };
             if ptr == libc::MAP_FAILED {
                 return Err(io::Error::last_os_error().into());
             }
@@ -465627,6 +465903,10 @@ mod mac {
                 len,
                 fd,
             })
+        }
+
+        pub fn as_slice(&self) -> &[u8] {
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
         }
 
         pub fn as_slice_mut(&mut self) -> &mut [u8] {
@@ -465649,6 +465929,7 @@ mod win {
     use std::ffi::c_void;
     use std::io;
 
+    const FILE_MAP_READ: u32 = 0x0004;
     const FILE_MAP_ALL_ACCESS: u32 = 0xf001f;
 
     #[link(name = "kernel32")]
@@ -465673,19 +465954,22 @@ mod win {
     }
 
     impl Mapping {
-        pub fn open(arg: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        pub fn open(arg: &str, len: usize, writable: bool) -> Result<Self, Box<dyn std::error::Error>> {
             let handle_val = arg.parse::<usize>()?;
             let handle = handle_val as *mut c_void;
-            let ptr = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, 0) };
+            let desired_access = if writable { FILE_MAP_ALL_ACCESS } else { FILE_MAP_READ };
+            let ptr = unsafe { MapViewOfFile(handle, desired_access, 0, 0, len) };
             if ptr.is_null() {
                 return Err(io::Error::last_os_error().into());
             }
-            let header = unsafe { ptr.cast::<super::InputHeader>().read_unaligned() };
-            let len = usize::try_from(header.total_size).map_err(|_| "size overflow")?;
             Ok(Mapping {
                 ptr: ptr.cast::<u8>(),
                 len,
             })
+        }
+
+        pub fn as_slice(&self) -> &[u8] {
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
         }
 
         pub fn as_slice_mut(&mut self) -> &mut [u8] {
@@ -465703,215 +465987,25 @@ mod win {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let arg = env::args()
-        .nth(1)
-        .ok_or("Usage: cranelift-compiler <shm-fd-or-handle>")?;
+    let mut arguments = env::args().skip(1);
+    let input_handle = arguments
+        .next()
+        .ok_or("Usage: cranelift-compiler <input-handle> <input-size> <output-handle> <output-size>")?;
+    let input_size = arguments.next().ok_or("missing input size")?.parse::<usize>()?;
+    let output_handle = arguments.next().ok_or("missing output handle")?;
+    let output_size = arguments.next().ok_or("missing output size")?.parse::<usize>()?;
 
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let (file, mut owned_mapped): (File, Vec<u8>) = {
-        let shmfd = arg.parse::<i32>()?;
-        if shmfd < 0 {
-            return Err("invalid fd".into());
-        }
-        let file = unsafe { File::from_raw_fd(shmfd) };
-
-        let mut header_buf = [0u8; size_of::<InputHeader>()];
-        read_exact_at_offset(&file, &mut header_buf, 0)?;
-        let header = unsafe { (header_buf.as_ptr().cast::<InputHeader>()).read_unaligned() };
-
-        let total_size = usize::try_from(header.total_size).map_err(|_| "total_size overflow")?;
-        let mut buf = vec![0u8; total_size];
-        read_exact_at_offset(&file, &mut buf, 0)?;
-        (file, buf)
-    };
-
-    #[cfg(target_os = "macos")]
-    let mut mac_mapping = {
-        let shmfd = arg.parse::<i32>()?;
-        if shmfd < 0 {
-            return Err("invalid fd".into());
-        }
-        mac::Mapping::open(shmfd)?
-    };
-
+    #[cfg(unix)]
+    let input = unix::Mapping::open(input_handle.parse::<i32>()?, input_size, false)?;
     #[cfg(windows)]
-    let mut mapping = win::Mapping::open(&arg)?;
+    let input = win::Mapping::open(&input_handle, input_size, false)?;
 
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let mapped: &mut [u8] = &mut owned_mapped;
-    #[cfg(target_os = "macos")]
-    let mapped: &mut [u8] = mac_mapping.as_slice_mut();
+    #[cfg(unix)]
+    let mut output = unix::Mapping::open(output_handle.parse::<i32>()?, output_size, true)?;
     #[cfg(windows)]
-    let mapped: &mut [u8] = mapping.as_slice_mut();
+    let mut output = win::Mapping::open(&output_handle, output_size, true)?;
 
-    let header: InputHeader = read_pod(mapped, 0)?;
-    let func_count = usize::try_from(header.function_count).map_err(|_| "function_count overflow")?;
-    let entries_offset = size_of::<InputHeader>();
-    let helpers_offset = usize::try_from(header.helpers_offset).map_err(|_| "helpers_offset overflow")?;
-    let code_region_start = usize::try_from(header.code_region_start).map_err(|_| "code_region_start overflow")?;
-    let helpers: RuntimeHelpers = read_pod(mapped, helpers_offset)?;
-
-    let out_entries_offset = code_region_start;
-    let code_base_offset = out_entries_offset + func_count * size_of::<OutputFunctionEntry>();
-    let reloc_region_start = usize::try_from(header.reloc_region_start).map_err(|_| "reloc_region_start overflow")?;
-    let code_capacity = reloc_region_start
-        .checked_sub(code_base_offset)
-        .ok_or("bad code region")?;
-    let reloc_capacity = mapped.len().checked_sub(reloc_region_start).ok_or("bad reloc region")?;
-
-    let mut entries: Vec<InputFunctionEntry> = Vec::with_capacity(func_count);
-    for i in 0..func_count {
-        let entry_offset = entries_offset + i * size_of::<InputFunctionEntry>();
-        entries.push(read_pod(mapped, entry_offset)?);
-    }
-
-    let thread_count = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .max(1);
-    let chunk_size = func_count.div_ceil(thread_count.max(1));
-    let mapped_ref: &[u8] = mapped;
-    let helpers_ref = &helpers;
-    let outcome_return = header.outcome_return;
-
-    let compiled_chunks: Vec<Vec<(usize, CompiledFunction)>> = std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(thread_count);
-        for chunk_idx in 0..thread_count {
-            let start = chunk_idx * chunk_size;
-            if start >= func_count {
-                break;
-            }
-            let end = (start + chunk_size).min(func_count);
-            let chunk_entries = &entries[start..end];
-            handles.push(scope.spawn(move || {
-                let mut out: Vec<(usize, CompiledFunction)> = Vec::with_capacity(end - start);
-                for (offset_in_chunk, entry) in chunk_entries.iter().enumerate() {
-                    let i = start + offset_in_chunk;
-                    if entry.insn_count == 0 {
-                        continue;
-                    }
-                    let insn_offset = match usize::try_from(entry.insn_offset) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    let insn_count = entry.insn_count as usize;
-                    let insn_bytes_len = match insn_count.checked_mul(size_of::<CraneliftInsn>()) {
-                        Some(v) => v,
-                        None => continue,
-                    };
-                    let insn_bytes = match mapped_ref.get(insn_offset..insn_offset + insn_bytes_len) {
-                        Some(b) => b,
-                        None => continue,
-                    };
-                    let insns =
-                        unsafe { std::slice::from_raw_parts(insn_bytes.as_ptr().cast::<CraneliftInsn>(), insn_count) };
-                    let num_locals = entry.num_locals as usize;
-                    let local_types = usize::try_from(entry.locals_offset)
-                        .ok()
-                        .and_then(|off| mapped_ref.get(off..off + num_locals))
-                        .unwrap_or(&[]);
-                    if let Ok(compiled) = compile_to_bytes(
-                        insns,
-                        helpers_ref,
-                        outcome_return,
-                        entry.result_arity,
-                        entry.num_locals,
-                        entry.num_params,
-                        local_types,
-                    ) {
-                        out.push((i, compiled));
-                    }
-                }
-                out
-            }));
-        }
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-
-    let mut code_cursor = 0usize;
-    let mut reloc_cursor = 0usize;
-    for chunk in compiled_chunks {
-        for (i, compiled) in chunk {
-            let code = compiled.code;
-            let relocs = compiled.relocs;
-            let traps = compiled.traps;
-            let aligned = (code.len() + 15) & !15;
-            let reloc_bytes_len = relocs.len() * size_of::<HelperReloc>();
-            let trap_bytes_len = traps.len() * size_of::<CraneliftTrap>();
-            if code_cursor + aligned > code_capacity {
-                continue;
-            }
-            if reloc_cursor + reloc_bytes_len + trap_bytes_len > reloc_capacity {
-                continue;
-            }
-            let code_offset = code_cursor;
-            let code_dst = code_base_offset + code_offset;
-            mapped[code_dst..code_dst + code.len()].copy_from_slice(&code);
-
-            let reloc_offset = reloc_cursor;
-            if !relocs.is_empty() {
-                let reloc_dst = reloc_region_start + reloc_offset;
-                mapped[reloc_dst..reloc_dst + reloc_bytes_len].copy_from_slice(as_bytes_slice(&relocs));
-            }
-
-            let trap_offset = reloc_cursor + reloc_bytes_len;
-            if !traps.is_empty() {
-                let trap_dst = reloc_region_start + trap_offset;
-                mapped[trap_dst..trap_dst + trap_bytes_len].copy_from_slice(as_bytes_slice(&traps));
-            }
-
-            let entry = OutputFunctionEntry {
-                code_offset: u64::try_from(code_offset).map_err(|_| "code offset overflow")?,
-                code_size: u32::try_from(code.len()).map_err(|_| "code size overflow")?,
-                compiled: 1,
-                reloc_offset: u64::try_from(reloc_offset).map_err(|_| "reloc offset overflow")?,
-                reloc_count: u32::try_from(relocs.len()).map_err(|_| "reloc count overflow")?,
-                trap_offset: u64::try_from(trap_offset).map_err(|_| "trap offset overflow")?,
-                trap_count: u32::try_from(traps.len()).map_err(|_| "trap count overflow")?,
-                _pad: 0,
-            };
-            let entry_dst = out_entries_offset + i * size_of::<OutputFunctionEntry>();
-            let entry_bytes = as_bytes_slice(std::slice::from_ref(&entry));
-            mapped[entry_dst..entry_dst + size_of::<OutputFunctionEntry>()].copy_from_slice(entry_bytes);
-
-            code_cursor += aligned;
-            reloc_cursor += reloc_bytes_len + trap_bytes_len;
-        }
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        write_all_at_offset(
-            &file,
-            &mapped[out_entries_offset..code_base_offset],
-            u64::try_from(out_entries_offset)?,
-        )?;
-        write_all_at_offset(
-            &file,
-            &mapped[code_base_offset..code_base_offset + code_cursor],
-            u64::try_from(code_base_offset)?,
-        )?;
-        if reloc_cursor > 0 {
-            write_all_at_offset(
-                &file,
-                &mapped[reloc_region_start..reloc_region_start + reloc_cursor],
-                u64::try_from(reloc_region_start)?,
-            )?;
-        }
-        let _ = file.sync_all();
-    }
-    // On macOS we mmap'd the parent's shm fd with MAP_SHARED, so the writes
-    // above are already visible in the parent's mapping. Nothing to flush.
-    #[cfg(target_os = "macos")]
-    {
-        let _ = (
-            out_entries_offset,
-            code_base_offset,
-            code_cursor,
-            reloc_region_start,
-            reloc_cursor,
-        );
-    }
+    compile_serialized_buffer(input.as_slice(), output.as_slice_mut())?;
 
     Ok(())
 }
@@ -465928,7 +466022,7 @@ use crate::CraneliftInsn;
 use crate::CraneliftTrap;
 use crate::HelperId;
 use crate::HelperReloc;
-use crate::RuntimeHelpers;
+use crate::RuntimeLayout;
 
 use cranelift_codegen::Context;
 use cranelift_codegen::FinalizedRelocTarget;
@@ -466010,7 +466104,7 @@ pub struct CraneliftCompiler;
 impl CraneliftCompiler {
     pub fn compile_to_bytes(
         insns: &[CraneliftInsn],
-        helpers: &RuntimeHelpers,
+        layout: &RuntimeLayout,
         outcome_return_value: u64,
         result_arity: u32,
         num_locals: u32,
@@ -466074,8 +466168,8 @@ impl CraneliftCompiler {
 
         // Load regs[0..7] from configuration. regs is at offset `regs_offset` from Configuration*.
         // Each Value is `value_size` bytes; the low 8 bytes are the i64 payload.
-        let regs_offset = helpers.regs_offset as i32;
-        let value_size = helpers.value_size as i32;
+        let regs_offset = layout.regs_offset as i32;
+        let value_size = layout.value_size as i32;
         for (i, var) in reg_vars.iter().enumerate() {
             let offset = regs_offset + (i as i32) * value_size;
             let val = builder
@@ -466155,16 +466249,16 @@ impl CraneliftCompiler {
         let h_memory_copy = decl_helper!(memory_copy_sig, HelperId::memory_copy);
         let h_memory_fill = decl_helper!(memory_fill_sig, HelperId::memory_fill);
         let h_primitive_storage_cage_base = decl_helper!(cage_base_sig, HelperId::primitive_storage_cage_base);
-        let locals_base_offset = helpers.locals_base_offset as i32;
-        let memory_instances_offset = helpers.memory_instances_offset as i32;
-        let global_instances_offset = helpers.global_instances_offset as i32;
-        let global_instance_value_offset = helpers.global_instance_value_offset as i32;
-        let memory_instance_data_offset = helpers.memory_instance_data_offset as i32;
-        let memory_buffer_storage_offset_offset = helpers.memory_buffer_storage_offset_offset as i32;
-        let compiled_call_result_scratch_offset = helpers.compiled_call_result_scratch_offset as i32;
-        let value_stack_base_offset = helpers.value_stack_base_offset as i32;
-        let value_stack_top_offset = helpers.value_stack_top_offset as i32;
-        let call_record_base_offset = helpers.call_record_base_offset as i32;
+        let locals_base_offset = layout.locals_base_offset as i32;
+        let memory_instances_offset = layout.memory_instances_offset as i32;
+        let global_instances_offset = layout.global_instances_offset as i32;
+        let global_instance_value_offset = layout.global_instance_value_offset as i32;
+        let memory_instance_data_offset = layout.memory_instance_data_offset as i32;
+        let memory_buffer_storage_offset_offset = layout.memory_buffer_storage_offset_offset as i32;
+        let compiled_call_result_scratch_offset = layout.compiled_call_result_scratch_offset as i32;
+        let value_stack_base_offset = layout.value_stack_base_offset as i32;
+        let value_stack_top_offset = layout.value_stack_top_offset as i32;
+        let call_record_base_offset = layout.call_record_base_offset as i32;
         // Accesses to memory32 are unchecked and may fault; the fault handler turns
         // faults inside a memory's guarded reservation into wasm traps.
         let wasm_memory_flags = MemFlags::new();
@@ -468551,6 +468645,7 @@ FILE: Libraries/LibWasm/Rust/src/lib.rs
  */
 
 pub mod compiler;
+pub mod serialized;
 
 use compiler::CraneliftCompiler;
 
@@ -468576,31 +468671,7 @@ pub struct CraneliftInsn {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-pub struct RuntimeHelpers {
-    // i32 fn(interp, config, func_index); returns 1 on trap
-    pub call_function: usize,
-    // void fn(interp, msg_ptr, msg_len)
-    pub set_trap: usize,
-    // i64 fn(config, mem_idx); returns size in pages
-    pub memory_size: usize,
-    // i32 fn(config, mem_idx, pages); returns old size or -1
-    pub memory_grow: usize,
-    // i32 fn(interp, config, func_index); call using call record args
-    pub call_with_record: usize,
-    // i32 fn(interp, config, func_index, ...args); direct call via compiled function table
-    pub direct_call_0: usize,
-    pub direct_call_1: usize,
-    pub direct_call_2: usize,
-    pub direct_call_3: usize,
-    // i32 fn(interp, config, table_idx, type_idx, element_index)
-    pub call_indirect: usize,
-    // i32 fn(interp, config, dst_mem, src_mem, dst, src, count)
-    pub memory_copy: usize,
-    // i32 fn(interp, config, mem_idx, offset, value, count)
-    pub memory_fill: usize,
-    // Address of the process-global primitive storage cage base.
-    pub primitive_storage_cage_base: usize,
-
+pub struct RuntimeLayout {
     pub regs_offset: u32,
     pub value_size: u32,
     pub locals_base_offset: u32,
@@ -468638,6 +468709,7 @@ pub enum HelperId {
 }
 
 pub const HELPER_COUNT: u32 = 13;
+pub const SERIALIZED_CODE_ALIGNMENT: usize = 16;
 
 /// One relocation slot in the generated machine code. `code_offset` is the byte offset
 /// from the start of the function where 8 contiguous bytes hold the absolute helper
@@ -468668,7 +468740,7 @@ pub struct CompiledFunction {
 
 pub fn compile_to_bytes(
     insns: &[CraneliftInsn],
-    helpers: &RuntimeHelpers,
+    layout: &RuntimeLayout,
     outcome_return_value: u64,
     result_arity: u32,
     num_locals: u32,
@@ -468677,13 +468749,536 @@ pub fn compile_to_bytes(
 ) -> Result<CompiledFunction, &'static str> {
     CraneliftCompiler::compile_to_bytes(
         insns,
-        helpers,
+        layout,
         outcome_return_value,
         result_arity,
         num_locals,
         num_params,
         local_types,
     )
+}
+
+FILE: Libraries/LibWasm/Rust/src/serialized.rs
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+use crate::CompiledFunction;
+use crate::CraneliftInsn;
+use crate::CraneliftTrap;
+use crate::HelperReloc;
+use crate::RuntimeLayout;
+use crate::SERIALIZED_CODE_ALIGNMENT;
+use crate::compile_to_bytes;
+use std::mem::align_of;
+use std::mem::size_of;
+use std::mem::size_of_val;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct InputHeader {
+    function_count: u32,
+    layout_offset: u32,
+    outcome_return: u64,
+    output_size: u64,
+    total_size: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct InputFunctionEntry {
+    insn_offset: u32,
+    insn_count: u32,
+    result_arity: u32,
+    num_locals: u32,
+    locals_offset: u32,
+    num_params: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct OutputHeader {
+    function_count: u32,
+    _pad: u32,
+    code_base_offset: u64,
+    reloc_region_start: u64,
+    total_size: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct OutputFunctionEntry {
+    code_offset: u64,
+    code_size: u32,
+    compiled: u32,
+    reloc_offset: u64,
+    reloc_count: u32,
+    _padding_after_reloc_count: u32,
+    trap_offset: u64,
+    trap_count: u32,
+    _padding: u32,
+}
+
+fn align_up(value: usize, alignment: usize) -> Result<usize, &'static str> {
+    value.checked_next_multiple_of(alignment).ok_or("alignment overflow")
+}
+
+fn as_bytes_slice<T>(value: &[T]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(value.as_ptr().cast::<u8>(), size_of_val(value)) }
+}
+
+fn read_pod<T: Copy>(base: &[u8], offset: usize) -> Result<T, &'static str> {
+    let end = offset.checked_add(size_of::<T>()).ok_or("overflow")?;
+    let bytes = base.get(offset..end).ok_or("out of bounds read")?;
+    Ok(unsafe { (bytes.as_ptr().cast::<T>()).read_unaligned() })
+}
+
+fn parse_input(
+    input: &[u8],
+    output_size: usize,
+) -> Result<(InputHeader, Vec<InputFunctionEntry>, RuntimeLayout), &'static str> {
+    let header: InputHeader = read_pod(input, 0)?;
+    if usize::try_from(header.total_size).map_err(|_| "total_size overflow")? != input.len() {
+        return Err("input buffer size mismatch");
+    }
+    if usize::try_from(header.output_size).map_err(|_| "output_size overflow")? != output_size {
+        return Err("output buffer size mismatch");
+    }
+
+    let func_count = usize::try_from(header.function_count).map_err(|_| "function_count overflow")?;
+    let entries_offset = size_of::<InputHeader>();
+    let entries_size = func_count
+        .checked_mul(size_of::<InputFunctionEntry>())
+        .ok_or("input entries size overflow")?;
+    let entries_end = entries_offset
+        .checked_add(entries_size)
+        .ok_or("input entries size overflow")?;
+    if entries_end > input.len() {
+        return Err("input entries are truncated");
+    }
+
+    let mut entries = Vec::with_capacity(func_count);
+    let mut total_insn_count = 0usize;
+    let mut total_locals_size = 0usize;
+    for i in 0..func_count {
+        let entry_offset = i
+            .checked_mul(size_of::<InputFunctionEntry>())
+            .and_then(|offset| entries_offset.checked_add(offset))
+            .ok_or("input entry offset overflow")?;
+        let entry: InputFunctionEntry = read_pod(input, entry_offset)?;
+        total_insn_count = total_insn_count
+            .checked_add(entry.insn_count as usize)
+            .ok_or("instruction count overflow")?;
+        total_locals_size = total_locals_size
+            .checked_add(entry.num_locals as usize)
+            .ok_or("locals size overflow")?;
+        entries.push(entry);
+    }
+
+    let insn_region_offset = align_up(entries_end, align_of::<CraneliftInsn>())?;
+    let insn_region_size = total_insn_count
+        .checked_mul(size_of::<CraneliftInsn>())
+        .ok_or("instruction region size overflow")?;
+    let locals_region_offset = insn_region_offset
+        .checked_add(insn_region_size)
+        .ok_or("locals region offset overflow")?;
+    let layout_offset = align_up(
+        locals_region_offset
+            .checked_add(total_locals_size)
+            .ok_or("layout offset overflow")?,
+        align_of::<RuntimeLayout>(),
+    )?;
+    let expected_size = layout_offset
+        .checked_add(size_of::<RuntimeLayout>())
+        .ok_or("input size overflow")?;
+    if expected_size != input.len()
+        || usize::try_from(header.layout_offset).map_err(|_| "layout_offset overflow")? != layout_offset
+    {
+        return Err("input regions are not canonical");
+    }
+
+    let mut insn_cursor = insn_region_offset;
+    let mut locals_cursor = locals_region_offset;
+    for entry in &entries {
+        if entry.insn_offset as usize != insn_cursor || entry.locals_offset as usize != locals_cursor {
+            return Err("input regions are not canonical");
+        }
+        insn_cursor = insn_cursor
+            .checked_add(
+                (entry.insn_count as usize)
+                    .checked_mul(size_of::<CraneliftInsn>())
+                    .ok_or("instruction region size overflow")?,
+            )
+            .ok_or("instruction region offset overflow")?;
+        locals_cursor = locals_cursor
+            .checked_add(entry.num_locals as usize)
+            .ok_or("locals region offset overflow")?;
+    }
+
+    let layout = read_pod(input, layout_offset)?;
+    Ok((header, entries, layout))
+}
+
+fn select_compiled_functions(
+    compiled_chunks: Vec<Vec<(usize, CompiledFunction)>>,
+    code_base_offset: usize,
+    output_size: usize,
+) -> (Vec<(usize, CompiledFunction)>, usize, usize) {
+    let mut compiled_functions = Vec::new();
+    let mut code_size = 0usize;
+    let mut reloc_size = 0usize;
+    for (index, compiled) in compiled_chunks.into_iter().flatten() {
+        let Some(aligned_code_size) = align_up(compiled.code.len(), SERIALIZED_CODE_ALIGNMENT).ok() else {
+            continue;
+        };
+        let Some(function_reloc_size) = compiled
+            .relocs
+            .len()
+            .checked_mul(size_of::<HelperReloc>())
+            .and_then(|size| {
+                compiled
+                    .traps
+                    .len()
+                    .checked_mul(size_of::<CraneliftTrap>())
+                    .and_then(|trap_size| size.checked_add(trap_size))
+            })
+        else {
+            continue;
+        };
+        let Some(candidate_code_size) = code_size.checked_add(aligned_code_size) else {
+            continue;
+        };
+        let Some(candidate_reloc_size) = reloc_size.checked_add(function_reloc_size) else {
+            continue;
+        };
+        let Some(candidate_total_size) = code_base_offset
+            .checked_add(candidate_code_size)
+            .and_then(|offset| align_up(offset, align_of::<HelperReloc>()).ok())
+            .and_then(|offset| offset.checked_add(candidate_reloc_size))
+        else {
+            continue;
+        };
+        if candidate_total_size > output_size {
+            continue;
+        }
+
+        code_size = candidate_code_size;
+        reloc_size = candidate_reloc_size;
+        compiled_functions.push((index, compiled));
+    }
+
+    (compiled_functions, code_size, reloc_size)
+}
+
+pub fn compile_serialized_buffer(input: &[u8], output: &mut [u8]) -> Result<usize, &'static str> {
+    let (header, entries, layout) = parse_input(input, output.len())?;
+    let func_count = usize::try_from(header.function_count).map_err(|_| "function_count overflow")?;
+
+    let thread_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(1);
+    let chunk_size = func_count.div_ceil(thread_count.max(1));
+    let mapped_ref: &[u8] = input;
+    let layout_ref = &layout;
+    let outcome_return = header.outcome_return;
+
+    // Compile into temporary per-function allocations first so the serialized
+    // output contains only bytes that Cranelift actually produced.
+    let compiled_chunks = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(thread_count);
+        for chunk_idx in 0..thread_count {
+            let start = chunk_idx * chunk_size;
+            if start >= func_count {
+                break;
+            }
+            let end = (start + chunk_size).min(func_count);
+            let chunk_entries = &entries[start..end];
+            handles.push(scope.spawn(move || {
+                let mut out: Vec<(usize, CompiledFunction)> = Vec::with_capacity(end - start);
+                for (offset_in_chunk, entry) in chunk_entries.iter().enumerate() {
+                    let i = start + offset_in_chunk;
+                    if entry.insn_count == 0 {
+                        continue;
+                    }
+                    let Ok(insn_offset) = usize::try_from(entry.insn_offset) else {
+                        continue;
+                    };
+                    let insn_count = entry.insn_count as usize;
+                    let Some(insn_bytes_len) = insn_count.checked_mul(size_of::<CraneliftInsn>()) else {
+                        continue;
+                    };
+                    let Some(insn_end) = insn_offset.checked_add(insn_bytes_len) else {
+                        continue;
+                    };
+                    let Some(insn_bytes) = mapped_ref.get(insn_offset..insn_end) else {
+                        continue;
+                    };
+                    if insn_offset % align_of::<CraneliftInsn>() != 0 {
+                        continue;
+                    }
+                    let (prefix, insns, suffix) = unsafe { insn_bytes.align_to::<CraneliftInsn>() };
+                    if !prefix.is_empty() || !suffix.is_empty() || insns.len() != insn_count {
+                        continue;
+                    }
+                    let num_locals = entry.num_locals as usize;
+                    let local_types = usize::try_from(entry.locals_offset)
+                        .ok()
+                        .and_then(|offset| offset.checked_add(num_locals).map(|end| (offset, end)))
+                        .and_then(|(offset, end)| mapped_ref.get(offset..end))
+                        .unwrap_or(&[]);
+                    if let Ok(compiled) = compile_to_bytes(
+                        insns,
+                        layout_ref,
+                        outcome_return,
+                        entry.result_arity,
+                        entry.num_locals,
+                        entry.num_params,
+                        local_types,
+                    ) {
+                        out.push((i, compiled));
+                    }
+                }
+                out
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().map_err(|_| "compiler worker panicked"))
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+
+    // Pack the results as a header and function table followed by compact code
+    // and relocation regions.
+    let out_entries_offset = size_of::<OutputHeader>();
+    let output_entries_size = func_count
+        .checked_mul(size_of::<OutputFunctionEntry>())
+        .ok_or("output entries size overflow")?;
+    let code_base_offset = align_up(
+        out_entries_offset
+            .checked_add(output_entries_size)
+            .ok_or("code base offset overflow")?,
+        SERIALIZED_CODE_ALIGNMENT,
+    )?;
+
+    if code_base_offset > output.len() {
+        return Err("output metadata out of bounds");
+    }
+
+    // Keep the successfully compiled functions that fit in the supplied output
+    // buffer. A single unusually code-dense function should fall back to the
+    // interpreter without discarding the rest of the batch.
+    let (compiled_functions, code_size, reloc_size) =
+        select_compiled_functions(compiled_chunks, code_base_offset, output.len());
+
+    let reloc_region_start = align_up(
+        code_base_offset
+            .checked_add(code_size)
+            .ok_or("relocation region offset overflow")?,
+        align_of::<HelperReloc>(),
+    )?;
+    let total_size = reloc_region_start
+        .checked_add(reloc_size)
+        .ok_or("output size overflow")?;
+    debug_assert!(total_size <= output.len());
+
+    output
+        .get_mut(0..code_base_offset)
+        .ok_or("output metadata out of bounds")?
+        .fill(0);
+    let output_header = OutputHeader {
+        function_count: header.function_count,
+        _pad: 0,
+        code_base_offset: u64::try_from(code_base_offset).map_err(|_| "code base offset overflow")?,
+        reloc_region_start: u64::try_from(reloc_region_start).map_err(|_| "relocation region offset overflow")?,
+        total_size: u64::try_from(total_size).map_err(|_| "output size overflow")?,
+    };
+    let output_header_bytes = as_bytes_slice(std::slice::from_ref(&output_header));
+    output
+        .get_mut(0..output_header_bytes.len())
+        .ok_or("output header out of bounds")?
+        .copy_from_slice(output_header_bytes);
+
+    let mut code_cursor = 0usize;
+    let mut reloc_cursor = 0usize;
+    for (i, compiled) in compiled_functions {
+        let code = compiled.code;
+        let relocs = compiled.relocs;
+        let traps = compiled.traps;
+        let aligned = align_up(code.len(), SERIALIZED_CODE_ALIGNMENT).map_err(|_| "code alignment overflow")?;
+        let reloc_bytes_len = relocs
+            .len()
+            .checked_mul(size_of::<HelperReloc>())
+            .ok_or("relocation size overflow")?;
+        let trap_bytes_len = traps
+            .len()
+            .checked_mul(size_of::<CraneliftTrap>())
+            .ok_or("trap size overflow")?;
+        let Some(code_end) = code_cursor.checked_add(aligned) else {
+            continue;
+        };
+        if code_end > code_size {
+            continue;
+        }
+        let Some(reloc_end) = reloc_cursor
+            .checked_add(reloc_bytes_len)
+            .and_then(|end| end.checked_add(trap_bytes_len))
+        else {
+            continue;
+        };
+        if reloc_end > reloc_size {
+            continue;
+        }
+        let code_offset = code_cursor;
+        let code_dst = code_base_offset
+            .checked_add(code_offset)
+            .ok_or("code destination overflow")?;
+        let code_dst_end = code_dst.checked_add(code.len()).ok_or("code destination overflow")?;
+        output
+            .get_mut(code_dst..code_dst_end)
+            .ok_or("code destination out of bounds")?
+            .copy_from_slice(&code);
+
+        let reloc_offset = reloc_cursor;
+        if !relocs.is_empty() {
+            let reloc_dst = reloc_region_start
+                .checked_add(reloc_offset)
+                .ok_or("relocation destination overflow")?;
+            let reloc_dst_end = reloc_dst
+                .checked_add(reloc_bytes_len)
+                .ok_or("relocation destination overflow")?;
+            output
+                .get_mut(reloc_dst..reloc_dst_end)
+                .ok_or("relocation destination out of bounds")?
+                .copy_from_slice(as_bytes_slice(&relocs));
+        }
+
+        let trap_offset = reloc_cursor
+            .checked_add(reloc_bytes_len)
+            .ok_or("trap offset overflow")?;
+        if !traps.is_empty() {
+            let trap_dst = reloc_region_start
+                .checked_add(trap_offset)
+                .ok_or("trap destination overflow")?;
+            let trap_dst_end = trap_dst
+                .checked_add(trap_bytes_len)
+                .ok_or("trap destination overflow")?;
+            output
+                .get_mut(trap_dst..trap_dst_end)
+                .ok_or("trap destination out of bounds")?
+                .copy_from_slice(as_bytes_slice(&traps));
+        }
+
+        let entry = OutputFunctionEntry {
+            code_offset: u64::try_from(code_offset).map_err(|_| "code offset overflow")?,
+            code_size: u32::try_from(code.len()).map_err(|_| "code size overflow")?,
+            compiled: 1,
+            reloc_offset: u64::try_from(reloc_offset).map_err(|_| "reloc offset overflow")?,
+            reloc_count: u32::try_from(relocs.len()).map_err(|_| "reloc count overflow")?,
+            _padding_after_reloc_count: 0,
+            trap_offset: u64::try_from(trap_offset).map_err(|_| "trap offset overflow")?,
+            trap_count: u32::try_from(traps.len()).map_err(|_| "trap count overflow")?,
+            _padding: 0,
+        };
+        let entry_dst = i
+            .checked_mul(size_of::<OutputFunctionEntry>())
+            .and_then(|offset| out_entries_offset.checked_add(offset))
+            .ok_or("output entry offset overflow")?;
+        let entry_dst_end = entry_dst
+            .checked_add(size_of::<OutputFunctionEntry>())
+            .ok_or("output entry offset overflow")?;
+        let entry_bytes = as_bytes_slice(std::slice::from_ref(&entry));
+        output
+            .get_mut(entry_dst..entry_dst_end)
+            .ok_or("output entry out of bounds")?
+            .copy_from_slice(entry_bytes);
+
+        code_cursor = code_end;
+        reloc_cursor = reloc_end;
+    }
+
+    Ok(total_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_function_entry_layout_has_no_implicit_padding() {
+        assert_eq!(size_of::<OutputFunctionEntry>(), 48);
+        assert_eq!(std::mem::offset_of!(OutputFunctionEntry, trap_offset), 32);
+    }
+
+    #[test]
+    fn rejects_truncated_header() {
+        assert_eq!(
+            compile_serialized_buffer(&[], &mut []).unwrap_err(),
+            "out of bounds read"
+        );
+    }
+
+    #[test]
+    fn rejects_buffer_size_mismatch() {
+        let input = vec![0; size_of::<InputHeader>()];
+        assert_eq!(
+            compile_serialized_buffer(&input, &mut []).unwrap_err(),
+            "input buffer size mismatch"
+        );
+    }
+
+    #[test]
+    fn rejects_function_count_larger_than_the_input() {
+        let header = InputHeader {
+            function_count: u32::MAX,
+            layout_offset: 0,
+            outcome_return: 0,
+            output_size: 0,
+            total_size: size_of::<InputHeader>() as u64,
+        };
+        let input = as_bytes_slice(std::slice::from_ref(&header));
+        assert_eq!(
+            compile_serialized_buffer(input, &mut []).unwrap_err(),
+            "input entries are truncated"
+        );
+    }
+
+    #[test]
+    fn skips_only_compiled_functions_that_do_not_fit() {
+        let compiled = vec![vec![
+            (
+                0,
+                CompiledFunction {
+                    code: vec![0; 16],
+                    relocs: vec![],
+                    traps: vec![],
+                },
+            ),
+            (
+                1,
+                CompiledFunction {
+                    code: vec![0; 64],
+                    relocs: vec![],
+                    traps: vec![],
+                },
+            ),
+            (
+                2,
+                CompiledFunction {
+                    code: vec![0; 16],
+                    relocs: vec![],
+                    traps: vec![],
+                },
+            ),
+        ]];
+
+        let (selected, code_size, reloc_size) = select_compiled_functions(compiled, 32, 64);
+        assert_eq!(selected.iter().map(|(index, _)| *index).collect::<Vec<_>>(), vec![0, 2]);
+        assert_eq!(code_size, 32);
+        assert_eq!(reloc_size, 0);
+    }
 }
 
 FILE: Libraries/LibWasm/Tests/CI/ci-sanity-check.c
@@ -469508,6 +470103,7 @@ FILE: Libraries/LibWasm/Types.h
 #include <AK/UFixedBigInt.h>
 #include <AK/Variant.h>
 #include <AK/WeakPtr.h>
+#include <LibCore/AnonymousBuffer.h>
 #include <LibSync/ConditionVariable.h>
 #include <LibSync/Mutex.h>
 #include <LibWasm/Constants.h>
@@ -471284,6 +471880,12 @@ void flush_cranelift_batch();
 void discard_cranelift_batch();
 
 void compile_module_to_native(Module&);
+
+WASM_API ByteString const& cranelift_compiler_path();
+WASM_API ErrorOr<Core::AnonymousBuffer> compile_cranelift_buffer(Core::AnonymousBuffer const&);
+
+using CraneliftCompileCallback = Function<Core::AnonymousBuffer(Core::AnonymousBuffer const&)>;
+WASM_API void set_cranelift_compile_callback(CraneliftCompileCallback);
 
 WASM_API void record_module_stats(ModuleStats);
 WASM_API void dump_module_stats();
@@ -474237,6 +474839,467 @@ struct Formatter<Wasm::Wasi::SockRecvResult> : AK::Formatter<FormatString> {
     {
         return Formatter<FormatString>::format(builder, "size={}"sv, value.size);
     }
+};
+
+}
+
+FILE: Libraries/LibWasmCompilerClient/Client.cpp
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/ScopeGuard.h>
+#include <LibWasmCompilerClient/Client.h>
+
+namespace WasmCompilerClient {
+
+static constexpr auto COMPILE_TIMEOUT = AK::Duration::from_seconds(70);
+
+Client::Client(NonnullOwnPtr<IPC::Transport> transport)
+    : IPC::ConnectionToServer<WasmCompilerClientEndpoint, WasmCompilerServerEndpoint>(*this, move(transport))
+{
+}
+
+Core::AnonymousBuffer Client::compile(Core::AnonymousBuffer const& buffer)
+{
+    auto request_id = m_next_request_id.fetch_add(1, AK::MemoryOrder::memory_order_relaxed);
+    auto pending_compilation = adopt_ref(*new PendingCompilation);
+    {
+        Sync::MutexLocker locker(m_pending_compilations_mutex);
+        if (!is_open())
+            return {};
+        m_pending_compilations.set(request_id, pending_compilation);
+    }
+
+    async_compile(buffer, request_id);
+
+    ScopeGuard remove_pending_compilation = [&]() {
+        Sync::MutexLocker locker(m_pending_compilations_mutex);
+        m_pending_compilations.remove(request_id);
+    };
+
+    Sync::MutexLocker locker(pending_compilation->mutex);
+    auto timeout_at = MonotonicTime::now() + COMPILE_TIMEOUT;
+
+    while (!pending_compilation->result.has_value()) {
+        auto now = MonotonicTime::now();
+        if (now >= timeout_at)
+            break;
+        pending_compilation->condition.wait_for(timeout_at - now);
+    }
+
+    if (!pending_compilation->result.has_value())
+        return {};
+    return pending_compilation->result.release_value();
+}
+
+void Client::die()
+{
+    HashMap<u64, NonnullRefPtr<PendingCompilation>> pending_compilations;
+    {
+        Sync::MutexLocker locker(m_pending_compilations_mutex);
+        pending_compilations = move(m_pending_compilations);
+    }
+
+    for (auto& pending_compilation : pending_compilations) {
+        Sync::MutexLocker locker(pending_compilation.value->mutex);
+        pending_compilation.value->result = Core::AnonymousBuffer {};
+        pending_compilation.value->condition.broadcast();
+    }
+}
+
+void Client::did_compile(u64 request_id, Core::AnonymousBuffer output)
+{
+    Optional<NonnullRefPtr<PendingCompilation>> pending_compilation;
+    {
+        Sync::MutexLocker locker(m_pending_compilations_mutex);
+        pending_compilation = m_pending_compilations.take(request_id);
+    }
+
+    if (!pending_compilation.has_value())
+        return;
+
+    Sync::MutexLocker locker(pending_compilation.value()->mutex);
+    pending_compilation.value()->result = move(output);
+    pending_compilation.value()->condition.broadcast();
+}
+
+}
+
+FILE: Libraries/LibWasmCompilerClient/Client.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Atomic.h>
+#include <AK/AtomicRefCounted.h>
+#include <AK/Function.h>
+#include <AK/HashMap.h>
+#include <AK/Optional.h>
+#include <LibCore/AnonymousBuffer.h>
+#include <LibIPC/ConnectionToServer.h>
+#include <LibSync/ConditionVariable.h>
+#include <LibSync/Mutex.h>
+#include <WasmCompiler/WasmCompilerClientEndpoint.h>
+#include <WasmCompiler/WasmCompilerServerEndpoint.h>
+
+namespace WasmCompilerClient {
+
+class Client final
+    : public IPC::ConnectionToServer<WasmCompilerClientEndpoint, WasmCompilerServerEndpoint>
+    , public WasmCompilerClientEndpoint {
+    C_OBJECT_ABSTRACT(Client);
+
+public:
+    using InitTransport = Messages::WasmCompilerServer::InitTransport;
+
+    explicit Client(NonnullOwnPtr<IPC::Transport>);
+
+    Core::AnonymousBuffer compile(Core::AnonymousBuffer const&);
+
+    Function<void()> on_death;
+
+private:
+    struct PendingCompilation final : public AtomicRefCounted<PendingCompilation> {
+        Sync::Mutex mutex;
+        Sync::ConditionVariable condition { mutex };
+        Optional<Core::AnonymousBuffer> result;
+    };
+
+    virtual void die() override;
+    virtual void did_compile(u64 request_id, Core::AnonymousBuffer output) override;
+
+    Atomic<u64> m_next_request_id { 0 };
+
+    Sync::Mutex m_pending_compilations_mutex;
+    HashMap<u64, NonnullRefPtr<PendingCompilation>> m_pending_compilations;
+};
+
+}
+
+FILE: Libraries/LibWasmCompilerClient/CMakeLists.txt
+set(SOURCES
+    Client.cpp
+    State.cpp
+    ThreadedClient.cpp
+)
+
+compile_ipc(../../Services/WasmCompiler/WasmCompilerClient.ipc ../../Services/WasmCompiler/WasmCompilerClientEndpoint.h)
+compile_ipc(../../Services/WasmCompiler/WasmCompilerServer.ipc ../../Services/WasmCompiler/WasmCompilerServerEndpoint.h)
+
+set(GENERATED_SOURCES
+    ../../Services/WasmCompiler/WasmCompilerClientEndpoint.h
+    ../../Services/WasmCompiler/WasmCompilerServerEndpoint.h
+)
+
+ladybird_lib(LibWasmCompilerClient wasmcompilerclient)
+target_link_libraries(LibWasmCompilerClient PRIVATE LibCore LibIPC LibSync LibThreading LibWasm)
+
+FILE: Libraries/LibWasmCompilerClient/Forward.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+namespace WasmCompilerClient {
+
+class Client;
+class ThreadedClient;
+
+}
+
+FILE: Libraries/LibWasmCompilerClient/State.cpp
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/NeverDestroyed.h>
+#include <LibIPC/Transport.h>
+#include <LibIPC/TransportHandle.h>
+#include <LibWasm/Types.h>
+#include <LibWasmCompilerClient/State.h>
+#include <LibWasmCompilerClient/ThreadedClient.h>
+
+namespace WasmCompilerClient {
+
+void CompilerState::install_compiler_callback()
+{
+    Wasm::set_cranelift_compile_callback([this](Core::AnonymousBuffer const& buffer) {
+        RefPtr<ThreadedClient> client;
+        {
+            Sync::MutexLocker locker(m_mutex);
+            client = m_client;
+        }
+
+        return client ? client->compile(buffer) : Core::AnonymousBuffer {};
+    });
+}
+
+static ErrorOr<NonnullRefPtr<ThreadedClient>> connect_to_wasm_compiler(IPC::TransportHandle const& handle)
+{
+    auto transport = TRY(handle.create_transport());
+    return ThreadedClient::create(move(transport));
+}
+
+void CompilerState::replace_connection(IPC::TransportHandle const& handle)
+{
+    RefPtr<ThreadedClient> new_client;
+
+    if (auto result = connect_to_wasm_compiler(handle); result.is_error())
+        dbgln("Failed to connect to WebAssembly compiler: {}", result.error());
+    else
+        new_client = result.release_value();
+
+    RefPtr<ThreadedClient> old_client;
+    {
+        Sync::MutexLocker locker(m_mutex);
+        old_client = move(m_client);
+        m_client = move(new_client);
+    }
+}
+
+CompilerState& compiler_state()
+{
+    static NeverDestroyed<CompilerState> state;
+    return *state;
+}
+
+}
+
+FILE: Libraries/LibWasmCompilerClient/State.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/RefPtr.h>
+#include <LibIPC/Forward.h>
+#include <LibSync/Mutex.h>
+#include <LibWasmCompilerClient/Forward.h>
+
+namespace WasmCompilerClient {
+
+class CompilerState {
+public:
+    void install_compiler_callback();
+    void replace_connection(IPC::TransportHandle const&);
+
+private:
+    RefPtr<ThreadedClient> m_client;
+    Sync::Mutex m_mutex;
+};
+
+CompilerState& compiler_state();
+
+}
+
+FILE: Libraries/LibWasmCompilerClient/ThreadedClient.cpp
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/ScopeGuard.h>
+#include <LibCore/EventLoop.h>
+#include <LibCore/System.h>
+#include <LibThreading/Thread.h>
+#include <LibWasmCompilerClient/Client.h>
+#include <LibWasmCompilerClient/ThreadedClient.h>
+
+namespace WasmCompilerClient {
+
+ErrorOr<NonnullRefPtr<ThreadedClient>> ThreadedClient::create(NonnullOwnPtr<IPC::Transport> transport)
+{
+    auto client = adopt_ref(*new ThreadedClient(move(transport)));
+
+    Optional<Error> initialization_error;
+    {
+        Sync::MutexLocker locker(client->m_mutex);
+        client->m_initialization_condition.wait_while([&]() { return !client->m_initialized; });
+        initialization_error = move(client->m_initialization_error);
+    }
+
+    if (initialization_error.has_value())
+        return initialization_error.release_value();
+
+    return client;
+}
+
+ThreadedClient::ThreadedClient(NonnullOwnPtr<IPC::Transport> transport)
+    : m_thread(Threading::Thread::construct("WasmCompiler IPC"sv, [this, transport = move(transport)]() mutable {
+        return thread_main(move(transport));
+    }))
+{
+    m_thread->start();
+}
+
+ThreadedClient::~ThreadedClient()
+{
+    RefPtr<Core::WeakEventLoopReference> event_loop;
+    {
+        Sync::MutexLocker locker(m_mutex);
+        event_loop = m_event_loop;
+    }
+
+    if (event_loop) {
+        if (auto strong_event_loop = event_loop->take()) {
+            strong_event_loop->deferred_invoke([]() {
+                Core::EventLoop::current().quit(0);
+            });
+        }
+    }
+
+    if (m_thread->needs_to_be_joined())
+        (void)m_thread->join();
+}
+
+Core::AnonymousBuffer ThreadedClient::compile(Core::AnonymousBuffer const& buffer)
+{
+    Client* client = nullptr;
+    {
+        Sync::MutexLocker locker(m_mutex);
+        client = m_client;
+        if (!client)
+            return {};
+        ++m_active_compilations;
+    }
+
+    ScopeGuard compilation_finished = [&]() {
+        Sync::MutexLocker locker(m_mutex);
+        VERIFY(m_active_compilations > 0);
+
+        if (--m_active_compilations == 0)
+            m_client_unused_condition.broadcast();
+    };
+
+    return client->compile(buffer);
+}
+
+intptr_t ThreadedClient::thread_main(NonnullOwnPtr<IPC::Transport> transport)
+{
+    Core::EventLoop event_loop;
+    auto client_or_error = try_make_ref_counted<Client>(move(transport));
+
+    if (client_or_error.is_error()) {
+        Sync::MutexLocker locker(m_mutex);
+        m_initialization_error = client_or_error.release_error();
+        m_initialized = true;
+        m_initialization_condition.broadcast();
+        return 1;
+    }
+
+    auto client = client_or_error.release_value();
+
+#ifdef AK_OS_WINDOWS
+    auto response = client->send_sync_but_allow_failure<Client::InitTransport>(Core::System::getpid());
+    if (!response) {
+        Sync::MutexLocker locker(m_mutex);
+        m_initialization_error = Error::from_string_literal("Failed to initialize WebAssembly compiler transport");
+        m_initialized = true;
+        m_initialization_condition.broadcast();
+        return 1;
+    }
+    client->transport().set_peer_pid(response->peer_pid());
+#endif
+
+    {
+        Sync::MutexLocker locker(m_mutex);
+
+        m_event_loop = Core::EventLoop::current_weak();
+        m_client = client.ptr();
+        m_initialized = true;
+        m_initialization_condition.broadcast();
+    }
+
+    auto result = event_loop.exec();
+
+    {
+        Sync::MutexLocker locker(m_mutex);
+        m_client = nullptr;
+    }
+
+    if (client->is_open())
+        client->shutdown();
+
+    {
+        Sync::MutexLocker locker(m_mutex);
+        m_client_unused_condition.wait_while([&]() { return m_active_compilations != 0; });
+        m_event_loop.clear();
+    }
+
+    return result;
+}
+
+}
+
+FILE: Libraries/LibWasmCompilerClient/ThreadedClient.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/AtomicRefCounted.h>
+#include <AK/Error.h>
+#include <AK/NonnullRefPtr.h>
+#include <AK/Optional.h>
+#include <AK/RefPtr.h>
+#include <LibCore/AnonymousBuffer.h>
+#include <LibCore/Forward.h>
+#include <LibIPC/Forward.h>
+#include <LibSync/ConditionVariable.h>
+#include <LibSync/Mutex.h>
+#include <LibThreading/Forward.h>
+
+namespace WasmCompilerClient {
+
+class Client;
+
+class ThreadedClient final : public AtomicRefCounted<ThreadedClient> {
+    AK_MAKE_NONCOPYABLE(ThreadedClient);
+    AK_MAKE_NONMOVABLE(ThreadedClient);
+
+public:
+    static ErrorOr<NonnullRefPtr<ThreadedClient>> create(NonnullOwnPtr<IPC::Transport>);
+    ~ThreadedClient();
+
+    Core::AnonymousBuffer compile(Core::AnonymousBuffer const&);
+
+private:
+    explicit ThreadedClient(NonnullOwnPtr<IPC::Transport>);
+
+    intptr_t thread_main(NonnullOwnPtr<IPC::Transport>);
+
+    NonnullRefPtr<Threading::Thread> m_thread;
+
+    Sync::Mutex m_mutex;
+    Sync::ConditionVariable m_initialization_condition { m_mutex };
+    Sync::ConditionVariable m_client_unused_condition { m_mutex };
+
+    bool m_initialized { false };
+    Optional<Error> m_initialization_error;
+
+    RefPtr<Core::WeakEventLoopReference> m_event_loop;
+    Client* m_client { nullptr };
+
+    size_t m_active_compilations { 0 };
 };
 
 }
@@ -544327,17 +545390,6 @@ RefPtr<StyleValue const> CSSStyleProperties::style_value_for_computed_property(L
 
         // -> Any other property
         //    The resolved value is the computed value.
-    case PropertyID::Contain: {
-        auto contain = layout_node.contain();
-        if (contain.layout_containment && contain.style_containment && contain.paint_containment) {
-            if (contain.size_containment)
-                return KeywordStyleValue::create(Keyword::Strict);
-            if (!contain.inline_size_containment)
-                return KeywordStyleValue::create(Keyword::Content);
-        }
-
-        return get_computed_value(property_id);
-    }
     case PropertyID::WebkitTextFillColor:
         return resolve_color_style_value(*get_computed_value(property_id), layout_node.webkit_text_fill_color(), &color_resolution_context);
     case PropertyID::LetterSpacing: {
@@ -593860,8 +594912,7 @@ FILE: Libraries/LibWeb/CSS/Properties.json
     "animation-type": "none",
     "inherited": false,
     "initial": "none",
-    "needs-layout-node-for-resolved-value": true,
-    "requires-computation": "never",
+    "requires-computation": "cascaded-value",
     "valid-types": [
       "contain"
     ]
@@ -608477,6 +609528,43 @@ static NonnullRefPtr<StyleValue const> compute_style_value_list(NonnullRefPtr<St
     return StyleValueList::create(move(computed_entries), StyleValueList::Separator::Comma);
 }
 
+// https://drafts.csswg.org/css-contain-2/#contain-property
+static NonnullRefPtr<StyleValue const> collapse_containment_list(NonnullRefPtr<StyleValue const> const& style_value)
+{
+    auto const* containment_list = as_if<StyleValueList>(*style_value);
+    if (!containment_list)
+        return style_value;
+
+    bool contains_size = false;
+    bool contains_layout = false;
+    bool contains_style = false;
+    bool contains_paint = false;
+
+    for (auto const& containment : containment_list->values()) {
+        switch (containment->to_keyword()) {
+        case Keyword::Size:
+            contains_size = true;
+            break;
+        case Keyword::Layout:
+            contains_layout = true;
+            break;
+        case Keyword::Style:
+            contains_style = true;
+            break;
+        case Keyword::Paint:
+            contains_paint = true;
+            break;
+        default:
+            return style_value;
+        }
+    }
+
+    if (!contains_layout || !contains_style || !contains_paint)
+        return style_value;
+
+    return KeywordStyleValue::create(contains_size ? Keyword::Strict : Keyword::Content);
+}
+
 static NonnullRefPtr<StyleValue const> repeat_style_value_list_to_n_elements(NonnullRefPtr<StyleValue const> const& style_value, size_t n)
 {
     auto const& value_list = style_value->as_value_list();
@@ -608526,6 +609614,8 @@ NonnullRefPtr<StyleValue const> StyleComputer::compute_value_of_property(
     case PropertyID::BorderTopWidth:
     case PropertyID::OutlineWidth:
         return compute_border_or_outline_width(absolutized_value, device_pixels_per_css_pixel);
+    case PropertyID::Contain:
+        return collapse_containment_list(absolutized_value);
     case PropertyID::CornerBottomLeftShape:
     case PropertyID::CornerBottomRightShape:
     case PropertyID::CornerTopLeftShape:
@@ -664833,718 +665923,3 @@ void Node::insert_before(GC::Ref<Node> node, GC::Ptr<Node> child, bool suppress_
         //    increase its start offset by count.
         for (auto& range : Range::live_ranges()) {
             if (range->start_container().ptr() == this && range->start_offset() > child->index())
-                range->increase_start_offset(count);
-        }
-
-        // 2. For each live range whose end node is parent and end offset is greater than child’s index:
-        //    increase its end offset by count.
-        for (auto& range : Range::live_ranges()) {
-            if (range->end_container().ptr() == this && range->end_offset() > child->index())
-                range->increase_end_offset(count);
-        }
-    }
-
-    // 6. Let previousSibling be child’s previous sibling or parent’s last child if child is null.
-    GC::Ptr<Node> previous_sibling;
-    if (child)
-        previous_sibling = child->previous_sibling();
-    else
-        previous_sibling = last_child();
-
-    // 7. For each node in nodes, in tree order:
-    // FIXME: In tree order
-    for (auto& node_to_insert : nodes) {
-        // 1. Adopt node into parent’s node document.
-        document().adopt_node_steps(*node_to_insert);
-
-        // 2. If child is null, then append node to parent’s children.
-        if (!child)
-            append_child_impl(*node_to_insert);
-        // 3. Otherwise, insert node into parent’s children before child’s index.
-        else
-            insert_before_impl(*node_to_insert, child);
-
-        // 4. If parent is a shadow host whose shadow root’s slot assignment is "named" and node is a slottable, then
-        //    assign a slot for node.
-        if (auto* element = as_if<DOM::Element>(*this)) {
-            auto is_named_shadow_host = element->is_shadow_host()
-                && element->shadow_root()->slot_assignment() == SlotAssignmentMode::Named;
-
-            if (is_named_shadow_host && node_to_insert->is_slottable())
-                assign_a_slot(node_to_insert->as_slottable());
-        }
-
-        // 5. If parent’s root is a shadow root, and parent is a slot whose assigned nodes is the empty list, then run
-        //    signal a slot change for parent.
-        if (auto* this_slot_element = as_if<HTML::HTMLSlotElement>(*this); this_slot_element && root().is_shadow_root()) {
-            if (this_slot_element->assigned_nodes_internal().is_empty())
-                signal_a_slot_change(*this_slot_element);
-        }
-
-        // AD-HOC: Register any slot elements in the inserted subtree with the shadow root’s slot registry
-        //         before running assign_slottables_for_a_tree, so the registry is up-to-date.
-        if (auto* shadow_root = as_if<ShadowRoot>(node_to_insert->root())) {
-            node_to_insert->for_each_in_inclusive_subtree_of_type<HTML::HTMLSlotElement>([&](auto& slot) {
-                shadow_root->register_slot(slot);
-                return TraversalDecision::Continue;
-            });
-        }
-
-        // 6. Run assign slottables for a tree with node’s root.
-        assign_slottables_for_a_tree(node_to_insert->root());
-
-        // And a subtree holding the focused or hovered node brings `:focus-within` and `:hover` to
-        // the chain it lands under.
-        CSS::Invalidation::invalidate_style_after_subtree_place_changed(*node_to_insert, nullptr);
-
-        CSS::prepare_style_nodes_for_subtree(*node_to_insert);
-
-        // 7. For each shadow-including inclusive descendant inclusiveDescendant of node, in shadow-including tree order:
-        node_to_insert->for_each_shadow_including_inclusive_descendant([&](Node& inclusive_descendant) {
-            // 1. Run the insertion steps with inclusiveDescendant.
-            inclusive_descendant.inserted();
-
-            // 2. If inclusiveDescendant is not connected, then continue.
-            if (!inclusive_descendant.is_connected())
-                return TraversalDecision::Continue;
-
-            // 3. If inclusiveDescendant is an element and inclusiveDescendant’s custom element registry is non-null:
-            if (auto* element = as_if<Element>(inclusive_descendant); element && element->custom_element_registry()) {
-                // 1. If inclusiveDescendant’s custom element registry’s is scoped is true, then append
-                //    inclusiveDescendant’s node document to inclusiveDescendant’s custom element registry’s scoped
-                //    document set.
-                if (element->custom_element_registry()->is_scoped())
-                    element->custom_element_registry()->append_scoped_document(element->document());
-
-                // 2. If inclusiveDescendant is custom, then enqueue a custom element callback reaction with
-                //    inclusiveDescendant, callback name "connectedCallback", and « ».
-                if (element->is_custom())
-                    element->enqueue_a_custom_element_callback_reaction(HTML::CustomElementReactionNames::connectedCallback);
-
-                // 3. Otherwise, try to upgrade inclusiveDescendant.
-                else {
-                    element->try_to_upgrade();
-                }
-            }
-            // 4. Otherwise, if inclusiveDescendant is a shadow root, inclusiveDescendant’s custom element registry is
-            //    non-null, and inclusiveDescendant’s custom element registry’s is scoped is true, then append
-            //    inclusiveDescendant’s node document to inclusiveDescendant’s custom element registry’s scoped
-            //    document set.
-            else if (auto* shadow_root = as_if<ShadowRoot>(inclusive_descendant);
-                shadow_root && shadow_root->custom_element_registry() && shadow_root->custom_element_registry()->is_scoped()) {
-
-                shadow_root->custom_element_registry()->append_scoped_document(shadow_root->document());
-            }
-
-            return TraversalDecision::Continue;
-        });
-    }
-
-    // 8. If suppressObservers is false, then queue a tree mutation record for parent with nodes, « », previousSibling,
-    //    and child.
-    if (!suppress_observers) {
-        queue_tree_mutation_record(nodes, {}, previous_sibling.ptr(), child.ptr());
-    }
-
-    // 9. Run the children changed steps for parent.
-    ChildrenChangedMetadata metadata { ChildrenChangedMetadata::Type::Inserted, node };
-    children_changed(metadata);
-
-    // 10. Let staticNodeList be a list of nodes, initially « ».
-    // NOTE: We collect all nodes before calling the post-connection steps on any one of them, instead of calling the
-    //       post-connection steps while we’re traversing the node tree. This is because the post-connection steps can
-    //       modify the tree’s structure, making live traversal unsafe, possibly leading to the post-connection steps
-    //       being called multiple times on the same node.
-    GC::RootVector<GC::Ref<Node>> static_node_list;
-
-    // 11. For each node of nodes, in tree order:
-    for (auto& node : nodes) {
-        // 1. For each shadow-including inclusive descendant inclusiveDescendant of node, in shadow-including tree
-        //    order: append inclusiveDescendant to staticNodeList.
-        node->for_each_shadow_including_inclusive_descendant([&static_node_list](Node& inclusive_descendant) {
-            static_node_list.append(inclusive_descendant);
-            return TraversalDecision::Continue;
-        });
-    }
-
-    // 12. For each node of staticNodeList: if node is connected, then run the post-connection steps with node.
-    for (auto& node : static_node_list) {
-        if (node->is_connected())
-            node->post_connection();
-    }
-
-    auto is_boxless_style_element = (is_html_style_element() || is_svg_style_element()) && !unsafe_layout_node();
-    if (is_connected() && !is_boxless_style_element) {
-        // NB: Called during DOM insertion, layout is not up to date.
-        if (auto* element = as_if<Element>(*this); element && element->has_style() && CSS::display_from_ffi_display(element->style_group<CSS::ComputedValues::BoxValues>()->display).is_contents() && parent_element()) {
-            parent_element()->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeInsertBeforeWithDisplayContents);
-        }
-        set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeInsertBefore);
-        for (auto& inserted_node : nodes) {
-            auto inserted_subtree_already_needs_layout_tree_update = inserted_node->needs_layout_tree_update() || inserted_node->child_needs_layout_tree_update();
-            inserted_node->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeInsertBefore);
-
-            // An inserted subtree may already need a layout tree update, for example after being adopted from another
-            // document. Setting the same value again is coalesced, so explicitly propagate it through its new parent.
-            if (inserted_subtree_already_needs_layout_tree_update)
-                set_child_needs_layout_tree_update(true);
-        }
-    }
-
-    // AD-HOC: An inserted list item renumbers the list-item counter for its list owner's whole list.
-    for (auto& inserted_node : nodes) {
-        if (inserted_node->is_html_li_element()) {
-            static_cast<Element&>(*inserted_node).invalidate_list_item_counters_for_list_owner();
-            break;
-        }
-    }
-
-    document().bump_dom_tree_version();
-}
-
-// https://dom.spec.whatwg.org/#concept-node-pre-insert
-WebIDL::ExceptionOr<GC::Ref<Node>> Node::pre_insert(GC::Ref<Node> node, GC::Ptr<Node> child)
-{
-    // 1. Ensure pre-insertion validity of node into parent before child.
-    TRY(ensure_pre_insertion_validity(node, child));
-
-    // 2. Let referenceChild be child.
-    auto reference_child = child;
-
-    // 3. If referenceChild is node, then set referenceChild to node’s next sibling.
-    if (reference_child == node)
-        reference_child = node->next_sibling();
-
-    // 4. Insert node into parent before referenceChild.
-    insert_before(node, reference_child);
-
-    // 5. Return node.
-    return node;
-}
-
-// https://dom.spec.whatwg.org/#dom-node-removechild
-WebIDL::ExceptionOr<GC::Ref<Node>> Node::remove_child(GC::Ref<Node> child)
-{
-    // The removeChild(child) method steps are to return the result of pre-removing child from this.
-    return pre_remove(child);
-}
-
-// https://dom.spec.whatwg.org/#concept-node-pre-remove
-WebIDL::ExceptionOr<GC::Ref<Node>> Node::pre_remove(GC::Ref<Node> child)
-{
-    // 1. If child’s parent is not parent, then throw a "NotFoundError" DOMException.
-    if (child->parent() != this)
-        return WebIDL::NotFoundError::create("Child does not belong to this node"_utf16);
-
-    // 2. Remove child.
-    child->remove();
-
-    // 3. Return child.
-    return child;
-}
-
-// https://dom.spec.whatwg.org/#concept-node-append
-WebIDL::ExceptionOr<GC::Ref<Node>> Node::append_child(GC::Ref<Node> node)
-{
-    // To append a node node to a node parent: pre-insert node into parent before null.
-    return pre_insert(node, nullptr);
-}
-
-// https://dom.spec.whatwg.org/#live-range-pre-remove-steps
-void Node::live_range_pre_remove()
-{
-    // 1. Let parent be node’s parent.
-    auto* parent = this->parent();
-
-    // 2. Assert: parent is not null.
-    VERIFY(parent);
-
-    // 3. Let index be node’s index.
-    auto index = this->index();
-
-    // 4. For each live range whose start node is an inclusive descendant of node, set its start to (parent, index).
-    for (auto* range : Range::live_ranges()) {
-        if (range->start_container()->is_inclusive_descendant_of(*this))
-            MUST(range->set_start(*parent, index));
-    }
-
-    // 5. For each live range whose end node is an inclusive descendant of node, set its end to (parent, index).
-    for (auto* range : Range::live_ranges()) {
-        if (range->end_container()->is_inclusive_descendant_of(*this))
-            MUST(range->set_end(*parent, index));
-    }
-
-    // 6. For each live range whose start node is parent and start offset is greater than index, decrease its start
-    //    offset by 1.
-    for (auto* range : Range::live_ranges()) {
-        if (range->start_container().ptr() == parent && range->start_offset() > index)
-            range->decrease_start_offset(1);
-    }
-
-    // 7. For each live range whose end node is parent and end offset is greater than index, decrease its end offset by 1.
-    for (auto* range : Range::live_ranges()) {
-        if (range->end_container().ptr() == parent && range->end_offset() > index)
-            range->decrease_end_offset(1);
-    }
-}
-
-static bool node_contributes_to_layout_tree(Node const& node)
-{
-    if (node.unsafe_layout_node())
-        return true;
-
-    auto const* element = as_if<Element>(node);
-    return element && element->has_style()
-        && CSS::display_from_ffi_display(element->style_group<CSS::ComputedValues::BoxValues>()->display).is_contents();
-}
-
-static bool can_detach_layout_subtree_for_removal(Node const& node, Node const& parent)
-{
-    auto const* layout_node = as_if<Layout::NodeWithStyle>(node.unsafe_layout_node());
-    auto const* parent_layout_node = parent.unsafe_layout_node();
-    if (!layout_node || !parent_layout_node || layout_node->parent() != parent_layout_node || layout_node->is_out_of_flow())
-        return false;
-    if (CSS::subtree_affects_generated_content_state(node))
-        return false;
-
-    auto const* parent_with_style = as_if<Layout::NodeWithStyle>(parent_layout_node);
-    if (!parent_with_style)
-        return false;
-
-    auto sibling_is_direct_layout_child = [&](Node const* sibling) {
-        if (!sibling)
-            return true;
-        if (auto const* sibling_layout_node = sibling->unsafe_layout_node())
-            return sibling_layout_node->parent() == parent_layout_node;
-        auto const* sibling_element = as_if<Element>(*sibling);
-        return !sibling_element || !sibling_element->has_style()
-            || !CSS::display_from_ffi_display(sibling_element->style_group<CSS::ComputedValues::BoxValues>()->display).is_contents();
-    };
-    if (!sibling_is_direct_layout_child(node.previous_sibling())
-        && !sibling_is_direct_layout_child(node.next_sibling())) {
-        return false;
-    }
-
-    auto parent_display = parent_with_style->display();
-    if (parent_display.is_flex_inside() || parent_display.is_grid_inside())
-        return true;
-
-    // Direct block children and in-flow atomic inline children can be detached without changing
-    // anonymous wrapper structure. Other box kinds still rebuild the parent so tree fixup can
-    // reconstruct any affected wrappers.
-    if ((parent_display.is_flow_inside() || parent_display.is_flow_root_inside())
-        && !parent_layout_node->children_are_inline()) {
-        if (auto previous_layout_sibling = layout_node->previous_sibling(); previous_layout_sibling && previous_layout_sibling->is_anonymous()) {
-            if (auto next_layout_sibling = layout_node->next_sibling(); next_layout_sibling && next_layout_sibling->is_anonymous())
-                return false;
-        }
-        return layout_node->display().is_block_outside();
-    }
-    return parent_layout_node->children_are_inline() && layout_node->is_inline_block() && !layout_node->is_out_of_flow();
-}
-
-// https://dom.spec.whatwg.org/#concept-node-remove
-void Node::remove(bool suppress_observers)
-{
-    // NB: Mutations during a recorded editing command must go through the Editing proxy functions.
-    if (auto history = document().editing_history_if_exists())
-        history->notify_dom_mutation();
-
-    // 1. Let parent be node’s parent
-    auto* parent = this->parent();
-
-    // 2. Assert: parent is non-null.
-    VERIFY(parent);
-
-    // 3. Run the live range pre-remove steps, given node.
-    live_range_pre_remove();
-
-    // 4. For each NodeIterator object iterator whose root’s node document is node’s node document:
-    //    run the NodeIterator pre-removing steps given node and iterator.
-    document().for_each_node_iterator([&](NodeIterator& node_iterator) {
-        node_iterator.run_pre_removing_steps(*this);
-    });
-
-    // 5. Let oldPreviousSibling be node’s previous sibling.
-    GC::Ptr<Node> old_previous_sibling = previous_sibling();
-
-    // 6. Let oldNextSibling be node’s next sibling.
-    GC::Ptr<Node> old_next_sibling = next_sibling();
-
-    // AD-HOC: A removed list item renumbers the list-item counter for its list owner's whole list.
-    if (is_element()) {
-        auto* this_element = static_cast<Element*>(this);
-        auto style = this_element->computed_style();
-        if (is_html_li_element() || (style && style->display().is_list_item()))
-            this_element->invalidate_list_item_counters_for_list_owner();
-    }
-
-    if (is_connected()) {
-        // A text or comment node leaving connects no element to record a delta from, but it can
-        // leave its parent empty, and `:empty` is about the parent.
-        if (!is<Element>(*this)) {
-            if (auto* parent = as_if<Element>(parent_node())) {
-                auto const* text = as_if<Text>(*this);
-                CSS::record_element_emptiness_changed(*parent, *this, text && !text->data().is_empty(), false);
-            }
-        }
-
-        // NB: Recorded here rather than in removed_from(), because StyleEngine's tree delta carries
-        //     the old relations and this is the last point at which they are still readable.
-        CSS::record_subtree_disconnecting(*this);
-
-        // A display: contents element has no principal layout node of its own, but removing it also removes
-        // all of its children's boxes from the parent's layout subtree.
-        // NB: Called during DOM removal, layout is not up to date.
-        if (node_contributes_to_layout_tree(*this)) {
-            if (auto* first_letter_owner = first_letter_owner_for_layout_subtree_from(*parent)) {
-                first_letter_owner->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeRemove);
-            } else if (can_detach_layout_subtree_for_removal(*this, *parent)) {
-                RefPtr<Layout::Node> layout_node = unsafe_layout_node();
-                layout_node->for_each_in_inclusive_subtree([](Layout::Node& node) {
-                    node.clear_paintable();
-                    return TraversalDecision::Continue;
-                });
-                layout_node->prepare_subtree_for_detach_from_layout_tree();
-                layout_node->remove();
-                if (auto* parent_layout_node = parent->unsafe_layout_node(); !parent_layout_node->has_children())
-                    parent_layout_node->set_children_are_inline(false);
-                parent->set_needs_layout_update(SetNeedsLayoutReason::LayoutTreeUpdate);
-            } else {
-                parent->set_needs_layout_tree_update(true, SetNeedsLayoutTreeUpdateReason::NodeRemove);
-            }
-        }
-    }
-
-    // 7. Remove node from its parent’s children.
-    parent->remove_child_impl(*this);
-
-    // 8. If node is assigned, then run assign slottables for node’s assigned slot.
-    if (auto assigned_slot = assigned_slot_for_node(*this))
-        assign_slottables(*assigned_slot);
-
-    auto& parent_root = parent->root();
-
-    // 9. If parent’s root is a shadow root, and parent is a slot whose assigned nodes is the empty list, then run
-    //    signal a slot change for parent.
-    if (auto* parent_slot_element = as_if<HTML::HTMLSlotElement>(parent); parent_slot_element && parent_root.is_shadow_root()) {
-        if (parent_slot_element->assigned_nodes_internal().is_empty())
-            signal_a_slot_change(*parent_slot_element);
-    }
-
-    // 10. If node has an inclusive descendant that is a slot, then:
-    auto has_descendent_slot = false;
-    auto* shadow_root = as_if<ShadowRoot>(parent_root);
-
-    for_each_in_inclusive_subtree_of_type<HTML::HTMLSlotElement>([&](auto& slot) {
-        has_descendent_slot = true;
-        if (!shadow_root)
-            return TraversalDecision::Break;
-        // AD-HOC: Unregister slot from the shadow root's registry before assign_slottables_for_a_tree.
-        shadow_root->unregister_slot(slot);
-        return TraversalDecision::Continue;
-    });
-
-    if (has_descendent_slot) {
-        // 1. Run assign slottables for a tree with parent’s root.
-        assign_slottables_for_a_tree(parent_root);
-
-        // 2. Run assign slottables for a tree with node.
-        assign_slottables_for_a_tree(*this);
-    }
-
-    // 11. Run the removing steps with node, true, and parent.
-    removed_from(IsSubtreeRoot::Yes, parent, parent_root);
-
-    // A subtree holding the focused or hovered node takes `:focus-within` and `:hover` out of the
-    // chain it hung off. Nothing about any element in that chain moved, so it has to be told.
-    CSS::Invalidation::invalidate_style_after_subtree_place_changed(*this, parent);
-
-    // 12. Let isParentConnected be parent’s connected.
-    bool is_parent_connected = parent->is_connected();
-
-    // 13. If node is custom and isParentConnected is true, then enqueue a custom element callback reaction with node,
-    //     callback name "disconnectedCallback", and an empty argument list.
-    // Spec Note: It is intentional for now that custom elements do not get parent passed.
-    //            This might change in the future if there is a need.
-    if (auto* element = as_if<DOM::Element>(*this)) {
-        if (element->is_custom() && is_parent_connected)
-            element->enqueue_a_custom_element_callback_reaction(HTML::CustomElementReactionNames::disconnectedCallback);
-    }
-
-    // 14. For each shadow-including descendant descendant of node, in shadow-including tree order:
-    for_each_shadow_including_descendant([&](Node& descendant) {
-        // 1. Run the removing steps with descendant, false, and parent.
-        descendant.removed_from(IsSubtreeRoot::No, parent, parent_root);
-
-        // 2. If descendant is custom and isParentConnected is true, then enqueue a custom element callback reaction
-        //    with descendant, callback name "disconnectedCallback", and « ».
-        if (auto* element = as_if<DOM::Element>(descendant)) {
-            if (element->is_custom() && is_parent_connected)
-                element->enqueue_a_custom_element_callback_reaction(HTML::CustomElementReactionNames::disconnectedCallback);
-        }
-
-        return TraversalDecision::Continue;
-    });
-
-    // 15. For each inclusive ancestor inclusiveAncestor of parent, and then for each registered of inclusiveAncestor’s
-    //     registered observer list, if registered’s options["subtree"] is true, then append a new transient registered
-    //     observer whose observer is registered’s observer, options is registered’s options, and source is registered
-    //     to node’s registered observer list.
-    for (auto* inclusive_ancestor = parent; inclusive_ancestor; inclusive_ancestor = inclusive_ancestor->parent()) {
-        auto* registered_observer_list = inclusive_ancestor->registered_observer_list();
-        if (!registered_observer_list)
-            continue;
-        for (auto& registered : *registered_observer_list) {
-            if (registered->options().subtree) {
-                auto transient_observer = TransientRegisteredObserver::create(registered->observer(), registered->options(), registered);
-                add_registered_observer(move(transient_observer));
-            }
-        }
-    }
-
-    // 16. If suppressObservers is false, then queue a tree mutation record for parent with « », « node »,
-    //     oldPreviousSibling, and oldNextSibling.
-    if (!suppress_observers) {
-        parent->queue_tree_mutation_record({}, { *this }, old_previous_sibling.ptr(), old_next_sibling.ptr());
-    }
-
-    // 17. Run the children changed steps for parent.
-    ChildrenChangedMetadata metadata { ChildrenChangedMetadata::Type::Removal, *this };
-    parent->children_changed(metadata);
-
-    document().bump_dom_tree_version();
-}
-
-// https://dom.spec.whatwg.org/#concept-node-replace
-WebIDL::ExceptionOr<GC::Ref<Node>> Node::replace_child(GC::Ref<Node> node, GC::Ref<Node> child)
-{
-    // 1. If parent is not a Document, DocumentFragment, or Element node, then throw a "HierarchyRequestError"
-    //    DOMException.
-    if (!is<Document>(this) && !is<DocumentFragment>(this) && !is<Element>(this))
-        return WebIDL::HierarchyRequestError::create("Can only insert into a document, document fragment or element"_utf16);
-
-    // 2. If node is a host-including inclusive ancestor of parent, then throw a "HierarchyRequestError" DOMException.
-    if (node->is_host_including_inclusive_ancestor_of(*this))
-        return WebIDL::HierarchyRequestError::create("New node is an ancestor of this node"_utf16);
-
-    // 3. If child’s parent is not parent, then throw a "NotFoundError" DOMException.
-    if (child->parent() != this)
-        return WebIDL::NotFoundError::create("This node is not the parent of the given child"_utf16);
-
-    // FIXME: All the following "Invalid node type for insertion" messages could be more descriptive.
-
-    // 4. If node is not a DocumentFragment, DocumentType, Element, or CharacterData node, then throw a "HierarchyRequestError" DOMException.
-    if (!is<DocumentFragment>(*node) && !is<DocumentType>(*node) && !is<Element>(*node) && !is<Text>(*node) && !is<Comment>(*node) && !is<ProcessingInstruction>(*node))
-        return WebIDL::HierarchyRequestError::create("Invalid node type for insertion"_utf16);
-
-    // 5. If either node is a Text node and parent is a document, or node is a doctype and parent is not a document, then throw a "HierarchyRequestError" DOMException.
-    if ((is<Text>(*node) && is<Document>(this)) || (is<DocumentType>(*node) && !is<Document>(this)))
-        return WebIDL::HierarchyRequestError::create("Invalid node type for insertion"_utf16);
-
-    // If parent is a document, and any of the statements below, switched on the interface node implements, are true, then throw a "HierarchyRequestError" DOMException.
-    if (is<Document>(this)) {
-        // DocumentFragment
-        if (is<DocumentFragment>(*node)) {
-            // If node has more than one element child or has a Text node child.
-            // Otherwise, if node has one element child and either parent has an element child that is not child or a doctype is following child.
-            auto node_element_child_count = as<DocumentFragment>(*node).child_element_count();
-            if ((node_element_child_count > 1 || node->has_child_of_type<Text>())
-                || (node_element_child_count == 1 && (first_child_of_type<Element>() != child.ptr() || child->has_following_node_of_type_in_tree_order<DocumentType>()))) {
-                return WebIDL::HierarchyRequestError::create("Invalid node type for insertion"_utf16);
-            }
-        } else if (is<Element>(*node)) {
-            // Element
-            // parent has an element child that is not child or a doctype is following child.
-            if (first_child_of_type<Element>() != child.ptr() || child->has_following_node_of_type_in_tree_order<DocumentType>())
-                return WebIDL::HierarchyRequestError::create("Invalid node type for insertion"_utf16);
-        } else if (is<DocumentType>(*node)) {
-            // DocumentType
-            // parent has a doctype child that is not child, or an element is preceding child.
-            if (first_child_of_type<DocumentType>() != child.ptr() || child->has_preceding_node_of_type_in_tree_order<Element>())
-                return WebIDL::HierarchyRequestError::create("Invalid node type for insertion"_utf16);
-        }
-    }
-
-    // 7. Let referenceChild be child’s next sibling.
-    GC::Ptr<Node> reference_child = child->next_sibling();
-
-    // 8. If referenceChild is node, then set referenceChild to node’s next sibling.
-    if (reference_child == node)
-        reference_child = node->next_sibling();
-
-    // 9. Let previousSibling be child’s previous sibling.
-    GC::Ptr<Node> previous_sibling = child->previous_sibling();
-
-    // 10. Let removedNodes be the empty set.
-    Vector<GC::Root<Node>> removed_nodes;
-
-    // 11. If child’s parent is non-null:
-    // NOTE: The above can only be false if child is node.
-    if (child->parent()) {
-        // 1. Set removedNodes to « child ».
-        removed_nodes.append(GC::make_root(*child));
-
-        // 2. Remove child with suppressObservers set to true.
-        child->remove(true);
-    }
-
-    // 12. Let nodes be node’s children if node is a DocumentFragment node; otherwise « node ».
-    Vector<GC::Root<Node>> nodes;
-    if (is<DocumentFragment>(*node))
-        nodes = node->children_as_vector();
-    else
-        nodes.append(GC::make_root(*node));
-
-    // AD-HOC: Since removing the child may have executed arbitrary code, we have to verify
-    //         the sanity of inserting `node` before `reference_child` again, as well as
-    //         `child` not being reinserted elsewhere.
-    if (!reference_child || (reference_child->parent() == this && !child->parent_node())) {
-        // 13. Insert node into parent before referenceChild with suppressObservers set to true.
-        insert_before(node, reference_child, true);
-    }
-
-    // 14. Queue a tree mutation record for parent with nodes, removedNodes, previousSibling, and referenceChild.
-    queue_tree_mutation_record(move(nodes), move(removed_nodes), previous_sibling.ptr(), reference_child.ptr());
-
-    // 15. Return child.
-    return child;
-}
-
-// https://dom.spec.whatwg.org/#concept-node-clone
-WebIDL::ExceptionOr<GC::Ref<Node>> Node::clone_node(GC::Ptr<Document> document, bool subtree, GC::Ptr<Node> parent, GC::Ptr<HTML::CustomElementRegistry> fallback_registry) const
-{
-    // To clone a node given a node node and an optional document document (default node’s node document),
-    // boolean subtree (default false), node-or-null parent (default null), and null or a CustomElementRegistry object
-    // fallbackRegistry (default null):
-    if (!document)
-        document = m_document;
-
-    // 1. Assert: node is not a document or node is document.
-    VERIFY(!is_document() || this == document.ptr());
-
-    // 2. Let copy be the result of cloning a single node given node, document, and fallbackRegistry.
-    auto copy = TRY(clone_single_node(*document, fallback_registry));
-
-    // 3. Run any cloning steps defined for node in other applicable specifications and pass node, copy, and subtree as
-    //    parameters.
-    TRY(cloned(*copy, subtree));
-
-    // 4. If parent is non-null, then append copy to parent.
-    if (parent)
-        TRY(parent->append_child(copy));
-
-    // 5. If subtree is true, then for each child of node’s children, in tree order:
-    //    clone a node given child with document set to document, subtree set to subtree, parent set to copy, and
-    //    fallbackRegistry set to fallbackRegistry.
-    if (subtree) {
-        for (auto child = first_child(); child; child = child->next_sibling()) {
-            TRY(child->clone_node(document, subtree, copy, fallback_registry));
-        }
-    }
-
-    // 6. If node is an element, node is a shadow host, and node’s shadow root’s clonable is true:
-    if (auto* node_element = as_if<Element>(*this); node_element && node_element->is_shadow_host() && node_element->shadow_root()->clonable()) {
-        // 1. Assert: copy is not a shadow host.
-        auto& copy_element = as<Element>(*copy);
-        VERIFY(!copy_element.is_shadow_host());
-
-        // 2. Let shadowRootRegistry be node’s shadow root’s custom element registry.
-        auto shadow_root_registry = node_element->shadow_root()->custom_element_registry();
-
-        // 3. If shadowRootRegistry is a global custom element registry, then set shadowRootRegistry to document’s
-        //    effective global custom element registry.
-        if (is_a_global_custom_element_registry(shadow_root_registry))
-            shadow_root_registry = document->effective_global_custom_element_registry();
-
-        // 4. Attach a shadow root with copy, node’s shadow root’s mode, true, node’s shadow root’s serializable,
-        //    node’s shadow root’s delegates focus, node’s shadow root’s slot assignment, and shadowRootRegistry.
-        TRY(copy_element.attach_a_shadow_root(node_element->shadow_root()->mode(), true, node_element->shadow_root()->serializable(), node_element->shadow_root()->delegates_focus(), node_element->shadow_root()->slot_assignment(), shadow_root_registry));
-
-        // 5. Set copy’s shadow root’s declarative to node’s shadow root’s declarative.
-        copy_element.shadow_root()->set_declarative(node_element->shadow_root()->declarative());
-
-        // 6. Set copy’s shadow root’s keep custom element registry null to node’s shadow root’s keep custom element
-        //    registry null.
-        copy_element.shadow_root()->set_keep_custom_element_registry_null(node_element->shadow_root()->keep_custom_element_registry_null());
-
-        // 7. For each child of node’s shadow root’s children, in tree order:
-        //    clone a node given child with document set to document, subtree set to subtree, and parent set to copy’s
-        //    shadow root.
-        for (auto child = node_element->shadow_root()->first_child(); child; child = child->next_sibling()) {
-            TRY(child->clone_node(document, subtree, copy_element.shadow_root()));
-        }
-    }
-
-    // 7. Return copy.
-    return GC::Ref { *copy };
-}
-
-// https://dom.spec.whatwg.org/#move
-WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
-{
-    // 1. If newParent’s shadow-including root is not the same as node’s shadow-including root, then throw a "HierarchyRequestError" DOMException.
-    if (&new_parent.shadow_including_root() != &shadow_including_root())
-        return WebIDL::HierarchyRequestError::create("New parent is not in the same shadow tree"_utf16);
-
-    // NOTE: This has the side effect of ensuring that a move is only performed if newParent’s connected is node’s connected.
-
-    // 2. If node is a host-including inclusive ancestor of newParent, then throw a "HierarchyRequestError" DOMException.
-    if (is_host_including_inclusive_ancestor_of(new_parent))
-        return WebIDL::HierarchyRequestError::create("New parent is an ancestor of this node"_utf16);
-
-    // 3. If child is non-null and its parent is not newParent, then throw a "NotFoundError" DOMException.
-    if (child && child->parent() != &new_parent)
-        return WebIDL::NotFoundError::create("Child does not belong to the new parent"_utf16);
-
-    // 4. If node is not an Element or a CharacterData node, then throw a "HierarchyRequestError" DOMException.
-    if (!is<Element>(*this) && !is<CharacterData>(*this))
-        return WebIDL::HierarchyRequestError::create("Invalid node type for insertion"_utf16);
-
-    // 5. If node is a Text node and newParent is a document, then throw a "HierarchyRequestError" DOMException.
-    if (is<Text>(*this) && is<Document>(new_parent))
-        return WebIDL::HierarchyRequestError::create("Invalid node type for insertion"_utf16);
-
-    // 6. If newParent is a document, node is an Element node, and either newParent has an element child, child is a doctype,
-    //    or child is non-null and a doctype is following child then throw a "HierarchyRequestError" DOMException.
-    if (is<Document>(new_parent) && is<Element>(*this)) {
-        if (new_parent.has_child_of_type<Element>() || is<DocumentType>(child) || (child && child->has_following_node_of_type_in_tree_order<DocumentType>()))
-            return WebIDL::HierarchyRequestError::create("Invalid node type for insertion"_utf16);
-    }
-
-    // 7. Let oldParent be node’s parent.
-    auto* old_parent = this->parent();
-
-    // 8. Assert: oldParent is non-null.
-    VERIFY(old_parent);
-
-    struct PreviousReadWriteState {
-        GC::Ptr<Element> element;
-        bool value;
-    };
-    GC::ConservativeVector<PreviousReadWriteState> previous_read_write_states;
-    if (old_parent->in_editable_subtree() != new_parent.in_editable_subtree()) {
-        for_each_in_inclusive_subtree_of_type<Element>([&](Element& element) {
-            previous_read_write_states.append({ element, SelectorMatching::element_matches_state(element, CSS::PseudoClass::ReadWrite) });
-            return TraversalDecision::Continue;
-        });
-    }
-
-    // 9. Run the live range pre-remove steps, given node.
-    live_range_pre_remove();
-
-    // 10. For each NodeIterator object iterator whose root’s node document is node’s node document:
-    //     run the NodeIterator pre-remove steps given node and iterator.
-    document().for_each_node_iterator([&](NodeIterator& node_iterator) {
-        node_iterator.run_pre_removing_steps(*this);
-    });
-
-    // 11. Let oldPreviousSibling be node’s previous sibling.
-    auto* old_previous_sibling = previous_sibling();
-
-    // 12. Let oldNextSibling be node’s next sibling.
-    auto* old_next_sibling = next_sibling();
-
-    // A move keeps the element's identity, so nothing disconnects and nothing connects to say its
-    // relations changed. Remember where it was, which has to happen here: step 13 takes the node out
-    // of its old parent's children, and once it has there is nothing left to read the old place off.
