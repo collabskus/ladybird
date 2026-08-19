@@ -1,4 +1,8 @@
-﻿                if (layout_text_node->update_produces_line_box_fragment_when_empty_flag())
+﻿                layout_node->set_is_editing_host(is_editing_host);
+                node.set_needs_layout_update(SetNeedsLayoutReason::EditableStateChange);
+            }
+            if (auto* layout_text_node = as_if<Layout::TextNode>(*layout_node)) {
+                if (layout_text_node->update_produces_line_box_fragment_when_empty_flag())
                     node.set_needs_layout_update(SetNeedsLayoutReason::EditableStateChange);
             }
         }
@@ -60549,6 +60553,11 @@ namespace Web::HTML {
 
 bool is_valid_custom_element_name(Utf16View const& name)
 {
+    // OPTIMIZATION: A valid custom element name must contain a hyphen. Check this first so ordinary built-in element
+    //               names do not need the more expensive element local name validation below.
+    if (!name.contains('-'))
+        return false;
+
     // A string name is a valid custom element name if all of the following are true:
     // - name is a valid element local name;
     if (!DOM::is_valid_element_local_name(name))
@@ -60561,16 +60570,13 @@ bool is_valid_custom_element_name(Utf16View const& name)
     // - name does not contain any ASCII upper alphas;
     // - name contains a U+002D (-); and
     bool contains_ascii_upper_alpha = false;
-    bool contains_hyphen = false;
     for (auto code_point : name) {
         if (is_ascii_upper_alpha(code_point)) {
             contains_ascii_upper_alpha = true;
             break;
         }
-        if (code_point == '-')
-            contains_hyphen = true;
     }
-    if (contains_ascii_upper_alpha || !contains_hyphen)
+    if (contains_ascii_upper_alpha)
         return false;
 
     // - name is not one of the following:
@@ -61349,6 +61355,11 @@ GC::Ptr<CustomElementDefinition> look_up_a_custom_element_definition(GC::Ptr<Cus
 
     // 2. If namespace is not the HTML namespace, then return null.
     if (namespace_ != Namespace::HTML)
+        return nullptr;
+
+    // OPTIMIZATION: Without an `is` value, an ordinary built-in local name cannot match either kind of custom
+    //               element definition. Avoid searching the registry for names that cannot be registered.
+    if (!is.has_value() && !is_valid_custom_element_name(local_name))
         return nullptr;
 
     // 3. If registry's custom element definition set contains an item with name and local name both equal to
@@ -77630,13 +77641,15 @@ void HTMLElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16St
 
     // 1. If namespace is not null, or localName is not the name of an event handler content attribute on element, then return.
     // FIXME: Add the namespace part once we support attribute namespaces.
+    if (name.view().starts_with(u"on"sv)) {
 #undef __ENUMERATE
 #define __ENUMERATE(attribute_name, event_name)               \
     if (name == HTML::AttributeNames::attribute_name) {       \
         element_event_handler_attribute_changed(name, value); \
     }
-    ENUMERATE_GLOBAL_EVENT_HANDLERS(__ENUMERATE)
+        ENUMERATE_GLOBAL_EVENT_HANDLERS(__ENUMERATE)
 #undef __ENUMERATE
+    }
 
     [&]() {
         // https://html.spec.whatwg.org/multipage/popover.html#the-popover-attribute:concept-element-attributes-change-ext
@@ -78995,7 +79008,9 @@ void HTMLElement::removed_from(IsSubtreeRoot is_subtree_root, Node* old_ancestor
 
     // 5. If removedNode's popover attribute is not in the No Popover state, then run the hide popover algorithm given
     //    removedNode, false, false, false, true, and null.
-    if (popover().has_value())
+    // OPTIMIZATION: The hide popover algorithm immediately returns for a hidden popover, so avoid parsing the
+    //               attribute unless removal can actually hide it.
+    if (popover_visibility_state() == PopoverVisibilityState::Showing)
         MUST(hide_popover(FocusPreviousElement::No, FireEvents::No, ThrowExceptions::No, IgnoreDomState::Yes, nullptr));
 
     // AD-HOC: Update inertness
@@ -135794,9 +135809,14 @@ impl TreeBuilder {
         // SAFETY: TreeBuilder is only constructed with a tokenizer pointer owned by the C++
         // HTMLParser's Rust tokenizer handle, and the handle outlives each parser run.
         unsafe {
-            self.tokenizer
-                .as_mut()
-                .next_token(stop_at_insertion_point, cdata_allowed)
+            let tokenizer = self.tokenizer.as_mut();
+            if !stop_at_insertion_point && let Some((code_point, position)) = tokenizer.try_fast_data_char() {
+                let mut token = Token::new_character(code_point);
+                token.start_position = position;
+                token.end_position = position;
+                return Some(token);
+            }
+            tokenizer.next_token(stop_at_insertion_point, cdata_allowed)
         }
     }
 
@@ -135808,6 +135828,33 @@ impl TreeBuilder {
 
     fn run(&mut self, stop_at_insertion_point: bool) {
         loop {
+            if !stop_at_insertion_point
+                && !self.next_line_feed_can_be_ignored
+                && self.insertion_mode == InsertionMode::InBody
+                && self
+                    .adjusted_current_node()
+                    .is_some_and(|node| node.namespace_ == RustFfiHtmlNamespace::Html)
+            {
+                // SAFETY: TreeBuilder is only constructed with a tokenizer pointer owned by the
+                // C++ HTMLParser's Rust tokenizer handle, and the handle outlives each parser run.
+                let has_fast_data_run = unsafe { self.tokenizer.as_ref().has_fast_data_run() };
+                if has_fast_data_run {
+                    self.reconstruct_the_active_formatting_elements();
+                    // SAFETY: See above. Reconstructing the active formatting elements does not
+                    // run the tokenizer, so the same Data-state run is still available.
+                    let contains_non_whitespace = unsafe {
+                        self.tokenizer
+                            .as_mut()
+                            .try_fast_data_run(&mut self.pending_text)
+                            .unwrap()
+                    };
+                    if contains_non_whitespace {
+                        self.frameset_ok = false;
+                    }
+                    continue;
+                }
+            }
+
             let cdata_allowed = self
                 .adjusted_current_node()
                 .is_some_and(|node| node.namespace_ != RustFfiHtmlNamespace::Html);
@@ -138294,7 +138341,6 @@ impl TreeBuilder {
     fn insert_html_element_for_document(&mut self, token: &Token, document: usize) -> usize {
         self.flush_character_insertions();
         let attributes = attributes_from_token(token, RustFfiHtmlNamespace::Html);
-        let owned_attributes = owned_attributes_from_token(token, RustFfiHtmlNamespace::Html);
         let local_name = token.tag_name();
         let element = self.create_element(
             document,
@@ -138311,7 +138357,7 @@ impl TreeBuilder {
             local_name: local_name.to_string(),
             namespace_: RustFfiHtmlNamespace::Html,
             namespace_uri: None,
-            attributes: owned_attributes,
+            attributes: Vec::new(),
             template_content: None,
         });
         element
@@ -138336,7 +138382,11 @@ impl TreeBuilder {
         let adjusted_insertion_location = self.appropriate_place_for_inserting_node(None);
         let local_name = adjusted_foreign_tag_name(token.tag_name(), namespace_);
         let attributes = attributes_from_token(token, namespace_);
-        let owned_attributes = owned_attributes_from_token(token, namespace_);
+        let owned_attributes = if namespace_ == RustFfiHtmlNamespace::MathMl && local_name == "annotation-xml" {
+            owned_attributes_from_token(token, namespace_)
+        } else {
+            Vec::new()
+        };
         let namespace_uri = if namespace_ == RustFfiHtmlNamespace::Other {
             self.adjusted_current_node()
                 .and_then(|node| node.namespace_uri.as_ref())
@@ -141932,6 +141982,67 @@ impl HtmlTokenizer {
         self.prev_offset = self.current_offset;
         self.current_offset += 1;
         Some((cp, pos))
+    }
+
+    /// Append a run of ordinary ASCII characters from the Data state to
+    /// `output`. The caller can process the run as character tokens without
+    /// constructing and dispatching a `Token` for each code point.
+    #[inline(always)]
+    pub fn try_fast_data_run(&mut self, output: &mut String) -> Option<bool> {
+        if !self.has_fast_data_run() {
+            return None;
+        }
+
+        let start_offset = self.current_offset;
+        let input_len = self.fast_scan_limit();
+        let mut offset = start_offset;
+        let mut contains_non_whitespace = false;
+        while offset < input_len {
+            let code_point = self.input[offset];
+            if code_point == 0x3C
+                || code_point == 0x26
+                || code_point == 0x00
+                || code_point == 0x0D
+                || code_point >= 0x80
+            {
+                break;
+            }
+            if !is_whitespace(code_point) {
+                contains_non_whitespace = true;
+            }
+            offset += 1;
+        }
+        if offset == start_offset {
+            self.sync_source_positions();
+            return None;
+        }
+
+        output.reserve(offset - start_offset);
+        for &code_point in &self.input[start_offset..offset] {
+            // SAFETY: The scan above only accepts ASCII code points.
+            unsafe { output.as_mut_vec().push(code_point as u8) };
+            if code_point == 0x0A {
+                self.current_line += 1;
+                self.current_column = 0;
+            } else {
+                self.current_column += 1;
+            }
+        }
+        self.prev_offset = offset - 1;
+        self.current_offset = offset;
+        Some(contains_non_whitespace)
+    }
+
+    #[inline(always)]
+    pub fn has_fast_data_run(&self) -> bool {
+        if self.aborted || self.state != State::Data || !self.queued_tokens.is_empty() {
+            return false;
+        }
+        if self.current_offset >= self.fast_scan_limit() {
+            return false;
+        }
+        let code_point = self.input[self.current_offset];
+        code_point != 0x3C && code_point != 0x26 && code_point != 0x00 && code_point != 0x0D && code_point < 0x80
     }
 
     /// Resynchronise `source_positions` with the scalar current_line /
@@ -430663,7 +430774,8 @@ Optional<TrustedTypeData> get_trusted_type_data_for_attribute(ElementInterface c
     auto const& [element_name, element_ns] = element;
 
     // 2. If attributeNs is null, « HTML namespace, SVG namespace, MathML namespace » contains element’s namespace, and attribute is the name of an event handler content attribute:
-    if (!attribute_ns.has_value()
+    if (attribute.starts_with("on"sv)
+        && !attribute_ns.has_value()
         && (Namespace::HTML == element_ns || Namespace::SVG == element_ns || Namespace::MathML == element_ns)) {
 #undef __ENUMERATE
 #define __ENUMERATE(attribute_name, event_name)                                                                                                                        \
@@ -430675,6 +430787,10 @@ Optional<TrustedTypeData> get_trusted_type_data_for_attribute(ElementInterface c
         ENUMERATE_WINDOW_EVENT_HANDLERS(__ENUMERATE)
 #undef __ENUMERATE
     }
+
+    // OPTIMIZATION: Every remaining row has one of these three attribute names.
+    if (!attribute.is_one_of(HTML::AttributeNames::srcdoc, HTML::AttributeNames::src, HTML::AttributeNames::href))
+        return {};
 
     static auto const& table = *new Vector<TrustedTypeData> {
         { "HTMLIFrameElement"_utf16, {}, HTML::AttributeNames::srcdoc, TrustedTypeName::TrustedHTML, InjectionSink::HTMLIFrameElement_srcdoc },
@@ -620896,144 +621012,3 @@ TEST_CASE(test_unsigned_bigint_subtraction_regression_1)
 
 TEST_CASE(test_unsigned_bigint_simple_multiplication)
 {
-    Crypto::UnsignedBigInteger num1(8);
-    Crypto::UnsignedBigInteger num2(251);
-    Crypto::UnsignedBigInteger result = num1.multiplied_by(num2);
-    EXPECT_EQ(result.words(), Vector<u32> { 2008 });
-}
-
-TEST_CASE(test_unsigned_bigint_multiplication_with_big_numbers1)
-{
-    Crypto::UnsignedBigInteger num1 = bigint_fibonacci(200);
-    Crypto::UnsignedBigInteger num2(12345678);
-    Crypto::UnsignedBigInteger result = num1.multiplied_by(num2);
-    Vector<u32> expected_result { 669961318, 143970113, 4028714974, 3164551305, 1589380278, 2 };
-    EXPECT_EQ(result.words(), expected_result);
-}
-
-TEST_CASE(test_unsigned_bigint_multiplication_with_big_numbers2)
-{
-    Crypto::UnsignedBigInteger num1 = bigint_fibonacci(200);
-    Crypto::UnsignedBigInteger num2 = bigint_fibonacci(341);
-    Crypto::UnsignedBigInteger result = num1.multiplied_by(num2);
-    Vector<u32> expected_result {
-        3017415433, 2741793511, 1957755698, 3731653885, 3154681877,
-        785762127, 3200178098, 4260616581, 529754471, 3632684436,
-        1073347813, 2516430
-    };
-    EXPECT_EQ(result.words(), expected_result);
-}
-
-TEST_CASE(test_unsigned_bigint_simple_division)
-{
-    Crypto::UnsignedBigInteger num1(27194);
-    Crypto::UnsignedBigInteger num2(251);
-    auto result = num1.divided_by(num2);
-    Crypto::UnsignedDivisionResult expected = { Crypto::UnsignedBigInteger(108), Crypto::UnsignedBigInteger(86) };
-    EXPECT_EQ(result.quotient, expected.quotient);
-    EXPECT_EQ(result.remainder, expected.remainder);
-}
-
-TEST_CASE(test_unsigned_bigint_division_with_big_numbers)
-{
-    Crypto::UnsignedBigInteger num1 = bigint_fibonacci(386);
-    Crypto::UnsignedBigInteger num2 = bigint_fibonacci(238);
-    auto result = num1.divided_by(num2);
-    Crypto::UnsignedDivisionResult expected = {
-        Crypto::UnsignedBigInteger(Vector<u32> { 2300984486, 2637503534, 2022805584, 107 }),
-        Crypto::UnsignedBigInteger(Vector<u32> { 1483061863, 446680044, 1123294122, 191895498, 3347106536, 16, 0, 0, 0 })
-    };
-    EXPECT_EQ(result.quotient, expected.quotient);
-    EXPECT_EQ(result.remainder, expected.remainder);
-}
-
-TEST_CASE(test_unsigned_bigint_division_combined_test)
-{
-    auto num1 = bigint_fibonacci(497);
-    auto num2 = bigint_fibonacci(238);
-    auto div_result = num1.divided_by(num2);
-    EXPECT_EQ(div_result.quotient.multiplied_by(num2).plus(div_result.remainder), num1);
-}
-
-TEST_CASE(test_unsigned_bigint_base10_from_string)
-{
-    auto result = TRY_OR_FAIL(Crypto::UnsignedBigInteger::from_base(10, "57195071295721390579057195715793"sv));
-    Vector<u32> expected_result { 3806301393, 954919431, 3879607298, 721 };
-    EXPECT_EQ(result.words(), expected_result);
-
-    Vector<StringView> invalid_base10_number_strings { "1A"sv, "1:"sv, "Z1"sv, "1/"sv };
-    for (auto invalid_base10_number_string : invalid_base10_number_strings)
-        EXPECT_EQ(Crypto::UnsignedBigInteger::from_base(10, invalid_base10_number_string).is_error(), true);
-}
-
-TEST_CASE(test_bigint_from_utf16_string)
-{
-    auto unsigned_result = TRY_OR_FAIL(Crypto::UnsignedBigInteger::from_base(16, u"ffffffffffff"sv));
-    EXPECT_EQ(MUST(unsigned_result.to_base(16)), "ffffffffffff");
-
-    auto signed_result = TRY_OR_FAIL(Crypto::SignedBigInteger::from_base(10, u"-123456789"sv));
-    EXPECT_EQ(MUST(signed_result.to_base(10)), "-123456789");
-
-    EXPECT(Crypto::UnsignedBigInteger::from_base(10, u"12\u00a0"sv).is_error());
-}
-
-TEST_CASE(test_unsigned_bigint_base10_to_string)
-{
-    auto bigint = Crypto::UnsignedBigInteger {
-        Vector<u32> { 3806301393, 954919431, 3879607298, 721 }
-    };
-    auto result = MUST(bigint.to_base(10));
-    EXPECT_EQ(result, "57195071295721390579057195715793");
-}
-
-TEST_CASE(test_unsigned_bigint_count_digits)
-{
-    constexpr auto count_digits = [](u64 number, u16 base) {
-        u8 digits = 0;
-
-        do {
-            number /= base;
-            ++digits;
-        } while (number > 0);
-
-        return digits;
-    };
-
-    for (auto base : to_array<u16>({ 2, 8, 10, 16 })) {
-        for (auto test : to_array<u64>({ 0, 9, 10, 19, 99, 100, 999, 1000, 9999, 10000, 99999, 10000000000, 99999999999 })) {
-            auto bigint = Crypto::UnsignedBigInteger { test };
-
-            auto result = bigint.count_digits_in_base(base);
-            auto expected = count_digits(test, base);
-
-            EXPECT_EQ(result, expected);
-        }
-    }
-}
-
-static size_t count_leading_zeros(Bytes data)
-{
-    auto leading_zeros = 0u;
-    for (auto i = 0u; i < data.size(); ++i) {
-        if (data[i] == 0u)
-            leading_zeros++;
-        else
-            break;
-    }
-    return leading_zeros;
-}
-
-TEST_CASE(test_bigint_import_big_endian_decode_encode_roundtrip)
-{
-    u8 random_bytes[128];
-    u8 target_buffer[128];
-    fill_with_random(random_bytes);
-    auto encoded = Crypto::UnsignedBigInteger::import_data(random_bytes);
-    auto result = encoded.export_data(target_buffer);
-    EXPECT_EQ(result.size(), sizeof(target_buffer) - count_leading_zeros(random_bytes));
-    EXPECT(Bytes { random_bytes }.ends_with(result));
-}
-
-TEST_CASE(test_bigint_import_big_endian_encode_decode_roundtrip)
-{
-    u8 target_buffer[128];
