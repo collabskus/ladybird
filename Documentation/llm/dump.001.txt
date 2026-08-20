@@ -121247,6 +121247,36 @@ hb_face_t* Typeface::harfbuzz_typeface() const
     return m_harfbuzz_face;
 }
 
+Typeface::BoundingBoxInFontUnits Typeface::bounding_box_in_font_units() const
+{
+    if (m_bounding_box_in_font_units.has_value())
+        return *m_bounding_box_in_font_units;
+
+    BoundingBoxInFontUnits bounding_box;
+    auto* face = harfbuzz_typeface();
+    auto* head_table = hb_face_reference_table(face, HB_TAG('h', 'e', 'a', 'd'));
+    unsigned head_table_length = 0;
+    auto const* head_table_data = reinterpret_cast<u8 const*>(hb_blob_get_data(head_table, &head_table_length));
+
+    // https://learn.microsoft.com/en-us/typography/opentype/spec/head
+    // xMin, yMin, xMax and yMax are big-endian int16 values at byte offsets 36, 38, 40 and 42 of a 54-byte table.
+    constexpr unsigned head_table_size = 54;
+    if (head_table_data && head_table_length >= head_table_size) {
+        auto read_i16 = [&](unsigned offset) {
+            return static_cast<i16>((head_table_data[offset] << 8) | head_table_data[offset + 1]);
+        };
+        bounding_box.x_min = read_i16(36);
+        bounding_box.y_min = read_i16(38);
+        bounding_box.x_max = read_i16(40);
+        bounding_box.y_max = read_i16(42);
+        bounding_box.units_per_em = hb_face_get_upem(face);
+    }
+    hb_blob_destroy(head_table);
+
+    m_bounding_box_in_font_units = bounding_box;
+    return bounding_box;
+}
+
 hb_face_t* Typeface::create_harfbuzz_face() const
 {
     if (!m_harfbuzz_blob)
@@ -121418,6 +121448,19 @@ public:
 
     hb_face_t* harfbuzz_typeface() const;
 
+    // Union of all glyph bounding boxes as recorded in the `head` table, in font units with y pointing up.
+    // is_empty() when the face has no usable `head` table (e.g. bitmap-only fonts).
+    struct BoundingBoxInFontUnits {
+        i16 x_min { 0 };
+        i16 y_min { 0 };
+        i16 x_max { 0 };
+        i16 y_max { 0 };
+        u16 units_per_em { 0 };
+
+        bool is_empty() const { return x_min >= x_max || y_min >= y_max || units_per_em == 0; }
+    };
+    BoundingBoxInFontUnits bounding_box_in_font_units() const;
+
     template<typename T>
     bool fast_is() const = delete;
 
@@ -121455,6 +121498,7 @@ private:
     mutable HashMap<FontCacheKey, NonnullRefPtr<Font>> m_fonts;
     mutable hb_blob_t* m_harfbuzz_blob { nullptr };
     mutable hb_face_t* m_harfbuzz_face { nullptr };
+    mutable Optional<BoundingBoxInFontUnits> m_bounding_box_in_font_units;
 };
 
 }
@@ -137850,26 +137894,22 @@ FILE: Libraries/LibGfx/TextLayout.cpp
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Array.h>
 #include <AK/BitCast.h>
 #include <AK/HashFunctions.h>
+#include <AK/Math.h>
+#include <AK/NumericLimits.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16View.h>
 #include <LibGfx/Font/Font.h>
+#include <LibGfx/Font/Typeface.h>
 #include <LibGfx/Point.h>
 #include <LibGfx/TextLayout.h>
 #include <LibUnicode/CharacterTypes.h>
 #include <RustFFI.h>
-#include <core/SkFont.h>
-#include <core/SkTextBlob.h>
 #include <harfbuzz/hb.h>
 
 namespace Gfx {
-
-struct GlyphRun::CachedTextBlob {
-    sk_sp<SkTextBlob> blob;
-    FloatRect bounds;
-    float scale { 0 };
-};
 
 GlyphRun::GlyphRun(Vector<DrawGlyph>&& glyphs, NonnullRefPtr<Font const> font, TextType text_type, float width)
     : m_glyphs(move(glyphs))
@@ -137895,75 +137935,352 @@ NonnullRefPtr<GlyphRun> GlyphRun::slice(size_t start, size_t length) const
     return adopt_ref(*new GlyphRun(move(sliced_glyphs), m_font, m_text_type, width));
 }
 
-void GlyphRun::ensure_text_blob(float scale) const
+FloatRect GlyphRun::bounding_box(float scale) const
 {
-    if (m_cached_text_blob && m_cached_text_blob->scale == scale)
-        return;
+    auto font_ascent = m_font->pixel_metrics().ascent;
 
-    auto sk_font = m_font->skia_font(scale);
-    size_t glyph_count = 0;
-    for (auto const& glyph : m_glyphs) {
-        if (glyph.should_paint)
-            ++glyph_count;
-    }
-
-    m_cached_text_blob = make<CachedTextBlob>();
-    m_cached_text_blob->scale = scale;
-
-    if (glyph_count == 0)
-        return;
-
-    SkTextBlobBuilder builder;
-    auto const& run = builder.allocRunPos(sk_font, glyph_count);
-
-    float font_ascent = m_font->pixel_metrics().ascent;
-    size_t painted_glyph_index = 0;
+    // NOTE: This is a plain min/max rather than FloatRect::unite(), because a run with a single glyph must still
+    //       produce a (zero-sized) origin box that gets expanded by the font bounds below.
+    bool has_painted_glyphs = false;
+    float min_x = NumericLimits<float>::max();
+    float min_y = NumericLimits<float>::max();
+    float max_x = NumericLimits<float>::lowest();
+    float max_y = NumericLimits<float>::lowest();
     for (auto const& glyph : m_glyphs) {
         if (!glyph.should_paint)
             continue;
-        run.glyphs[painted_glyph_index] = glyph.glyph_id;
-        run.pos[painted_glyph_index * 2] = glyph.position.x() * scale;
-        run.pos[painted_glyph_index * 2 + 1] = (glyph.position.y() + font_ascent) * scale;
-        ++painted_glyph_index;
+        auto origin_x = glyph.position.x() * scale;
+        auto origin_y = (glyph.position.y() + font_ascent) * scale;
+        if (!__builtin_isfinite(origin_x) || !__builtin_isfinite(origin_y))
+            return {};
+        min_x = min(min_x, origin_x);
+        min_y = min(min_y, origin_y);
+        max_x = max(max_x, origin_x);
+        max_y = max(max_y, origin_y);
+        has_painted_glyphs = true;
     }
-
-    m_cached_text_blob->blob = builder.make();
-
-    if (m_cached_text_blob->blob) {
-        auto const& sk_bounds = m_cached_text_blob->blob->bounds();
-        m_cached_text_blob->bounds = { sk_bounds.x(), sk_bounds.y(), sk_bounds.width(), sk_bounds.height() };
-    }
-}
-
-FloatRect GlyphRun::cached_blob_bounds() const
-{
-    if (!m_cached_text_blob)
+    if (!has_painted_glyphs)
         return {};
-    return m_cached_text_blob->bounds;
+
+    auto font_bounding_box = m_font->typeface().bounding_box_in_font_units();
+    if (!font_bounding_box.is_empty()) {
+        auto font_units_to_pixels = m_font->pixel_size() * scale / font_bounding_box.units_per_em;
+        // Font units have y pointing up, device pixels have y pointing down.
+        auto left = min_x + font_bounding_box.x_min * font_units_to_pixels;
+        auto right = max_x + font_bounding_box.x_max * font_units_to_pixels;
+        auto top = min_y - font_bounding_box.y_max * font_units_to_pixels;
+        auto bottom = max_y - font_bounding_box.y_min * font_units_to_pixels;
+        return { left, top, right - left, bottom - top };
+    }
+
+    // The font doesn't record an overall bounding box (e.g. bitmap-only fonts), so unite the glyphs' own extents.
+    auto* hb_font = m_font->harfbuzz_font();
+    int x_scale = 0;
+    int y_scale = 0;
+    hb_font_get_scale(hb_font, &x_scale, &y_scale);
+    if (x_scale <= 0 || y_scale <= 0)
+        return {};
+    auto units_to_pixels_x = m_font->pixel_size() * scale / x_scale;
+    auto units_to_pixels_y = m_font->pixel_size() * scale / y_scale;
+
+    FloatRect bounds;
+    for (auto const& glyph : m_glyphs) {
+        if (!glyph.should_paint)
+            continue;
+        hb_glyph_extents_t extents;
+        if (!hb_font_get_glyph_extents(hb_font, glyph.glyph_id, &extents))
+            continue;
+        auto origin_x = glyph.position.x() * scale;
+        auto origin_y = (glyph.position.y() + font_ascent) * scale;
+        // HarfBuzz extents have y pointing up, so `height` is negative for ink above the baseline.
+        FloatRect glyph_bounds {
+            origin_x + extents.x_bearing * units_to_pixels_x,
+            origin_y - extents.y_bearing * units_to_pixels_y,
+            extents.width * units_to_pixels_x,
+            -extents.height * units_to_pixels_y,
+        };
+        bounds.unite(glyph_bounds);
+    }
+    return bounds;
 }
 
-SkTextBlob* GlyphRun::cached_skia_text_blob() const
+namespace {
+
+struct OutlinePoint {
+    double x { 0 };
+    double y { 0 };
+};
+
+// Roots of a*t^2 + b*t + c = 0 with t in [0, 1]. Duplicate roots may be reported twice.
+size_t quadratic_roots_in_unit_interval(double a, double b, double c, Array<double, 2>& roots)
 {
-    if (!m_cached_text_blob || !m_cached_text_blob->blob)
-        return nullptr;
-    return m_cached_text_blob->blob.get();
+    size_t count = 0;
+    auto add_root = [&](double t) {
+        // NOTE: Written so that a NaN root (e.g. from a degenerate division) is rejected too.
+        if (t >= 0 && t <= 1)
+            roots[count++] = t;
+    };
+
+    if (a == 0) {
+        if (b != 0)
+            add_root(-c / b);
+        return count;
+    }
+
+    auto discriminant = b * b - 4 * a * c;
+    if (discriminant < 0)
+        return 0;
+
+    // The numerically stable form: computing the smaller root as c / q instead of (-b - sqrt(d)) / 2a avoids
+    // catastrophic cancellation when |a| is tiny compared to |b| (a nearly-linear curve).
+    auto q = -0.5 * (b + __builtin_copysign(AK::sqrt(discriminant), b));
+    add_root(q / a);
+    if (q != 0)
+        add_root(c / q);
+    return count;
+}
+
+// Roots of a*t^3 + b*t^2 + c*t + d = 0 with t in [0, 1]. The polynomial is split at the extrema of its derivative,
+// so each piece is monotonic and has at most one root, which is then found by bisection. Unlike a closed-form
+// solution, this can neither miss nor invent roots inside the interval.
+size_t cubic_roots_in_unit_interval(double a, double b, double c, double d, Array<double, 3>& roots)
+{
+    auto evaluate = [&](double t) {
+        return ((a * t + b) * t + c) * t + d;
+    };
+
+    Array<double, 4> breakpoints {};
+    size_t breakpoint_count = 0;
+    breakpoints[breakpoint_count++] = 0;
+    Array<double, 2> extrema;
+    auto extrema_count = quadratic_roots_in_unit_interval(3 * a, 2 * b, c, extrema);
+    if (extrema_count == 2 && extrema[0] > extrema[1])
+        swap(extrema[0], extrema[1]);
+    for (size_t i = 0; i < extrema_count; ++i) {
+        if (extrema[i] > 0 && extrema[i] < 1 && extrema[i] != breakpoints[breakpoint_count - 1])
+            breakpoints[breakpoint_count++] = extrema[i];
+    }
+    breakpoints[breakpoint_count++] = 1;
+
+    constexpr double value_tolerance = 1e-6;
+    constexpr double parameter_tolerance = 1e-7;
+
+    size_t count = 0;
+    for (size_t i = 0; i + 1 < breakpoint_count; ++i) {
+        auto start = breakpoints[i];
+        auto end = breakpoints[i + 1];
+        auto value_at_start = evaluate(start);
+        auto value_at_end = evaluate(end);
+        if (AK::fabs(value_at_start) <= value_tolerance) {
+            roots[count++] = start;
+            continue;
+        }
+        if (AK::fabs(value_at_end) <= value_tolerance) {
+            roots[count++] = end;
+            continue;
+        }
+        if ((value_at_start < 0) == (value_at_end < 0))
+            continue;
+        while (end - start > parameter_tolerance) {
+            auto middle = 0.5 * (start + end);
+            auto value_at_middle = evaluate(middle);
+            if (value_at_middle == 0) {
+                start = end = middle;
+                break;
+            }
+            if ((value_at_middle < 0) == (value_at_start < 0)) {
+                start = middle;
+                value_at_start = value_at_middle;
+            } else {
+                end = middle;
+            }
+        }
+        roots[count++] = 0.5 * (start + end);
+    }
+    return count;
+}
+
+// Tracks the horizontal extent of a glyph outline's ink inside a horizontal band, in glyph-local device pixels with
+// y pointing down. This mirrors how Skia computes text blob intercepts: every point where an outline segment
+// crosses the top or bottom edge of the band widens the extent, and so does every segment point (including
+// control points) that lies strictly inside the band.
+struct InkExtentInBand {
+    double band_top { 0 };
+    double band_bottom { 0 };
+    double units_to_pixels_x { 0 };
+    double units_to_pixels_y { 0 };
+    double left { NumericLimits<double>::max() };
+    double right { NumericLimits<double>::lowest() };
+
+    OutlinePoint to_device_pixels(float x, float y) const
+    {
+        // HarfBuzz outlines have y pointing up.
+        return { x * units_to_pixels_x, -y * units_to_pixels_y };
+    }
+
+    void expand(double x)
+    {
+        left = min(left, x);
+        right = max(right, x);
+    }
+
+    bool overlaps_band(double segment_top, double segment_bottom) const
+    {
+        return band_top <= segment_bottom && segment_top <= band_bottom;
+    }
+
+    void expand_by_points_strictly_inside_band(ReadonlySpan<OutlinePoint> points)
+    {
+        for (auto const& point : points) {
+            if (band_top < point.y && point.y < band_bottom)
+                expand(point.x);
+        }
+    }
+
+    void add_line(OutlinePoint p0, OutlinePoint p1)
+    {
+        if (!overlaps_band(min(p0.y, p1.y), max(p0.y, p1.y)))
+            return;
+        for (auto offset : { band_top, band_bottom }) {
+            // NOTE: A horizontal line makes this a division by zero; the resulting inf/NaN fails the range check.
+            auto t = (offset - p0.y) / (p1.y - p0.y);
+            if (t >= 0 && t < 1)
+                expand(p0.x + t * (p1.x - p0.x));
+        }
+        expand_by_points_strictly_inside_band(Array { p0, p1 });
+    }
+
+    void add_quadratic(OutlinePoint p0, OutlinePoint p1, OutlinePoint p2)
+    {
+        if (!overlaps_band(min(p0.y, min(p1.y, p2.y)), max(p0.y, max(p1.y, p2.y))))
+            return;
+        // y(t) = (y0 - 2*y1 + y2) * t^2 + 2 * (y1 - y0) * t + y0
+        auto a = p0.y - 2 * p1.y + p2.y;
+        auto b = 2 * (p1.y - p0.y);
+        for (auto offset : { band_top, band_bottom }) {
+            Array<double, 2> roots;
+            auto count = quadratic_roots_in_unit_interval(a, b, p0.y - offset, roots);
+            for (size_t i = 0; i < count; ++i) {
+                auto t = roots[i];
+                auto u = 1 - t;
+                expand(u * u * p0.x + 2 * u * t * p1.x + t * t * p2.x);
+            }
+        }
+        expand_by_points_strictly_inside_band(Array { p0, p1, p2 });
+    }
+
+    void add_cubic(OutlinePoint p0, OutlinePoint p1, OutlinePoint p2, OutlinePoint p3)
+    {
+        if (!overlaps_band(min(min(p0.y, p1.y), min(p2.y, p3.y)), max(max(p0.y, p1.y), max(p2.y, p3.y))))
+            return;
+        // y(t) = (-y0 + 3*y1 - 3*y2 + y3) * t^3 + (3*y0 - 6*y1 + 3*y2) * t^2 + (-3*y0 + 3*y1) * t + y0
+        auto a = -p0.y + 3 * p1.y - 3 * p2.y + p3.y;
+        auto b = 3 * p0.y - 6 * p1.y + 3 * p2.y;
+        auto c = -3 * p0.y + 3 * p1.y;
+        for (auto offset : { band_top, band_bottom }) {
+            Array<double, 3> roots;
+            auto count = cubic_roots_in_unit_interval(a, b, c, p0.y - offset, roots);
+            for (size_t i = 0; i < count; ++i) {
+                auto t = roots[i];
+                auto u = 1 - t;
+                expand(u * u * u * p0.x + 3 * u * u * t * p1.x + 3 * u * t * t * p2.x + t * t * t * p3.x);
+            }
+        }
+        expand_by_points_strictly_inside_band(Array { p0, p1, p2, p3 });
+    }
+};
+
+// NOTE: HarfBuzz emits the implicit line that closes each contour as a regular line_to before close_path, so only
+//       the segment callbacks are needed. The quadratic callback must be set, otherwise HarfBuzz converts quadratic
+//       segments to cubics.
+hb_draw_funcs_t* ink_extent_draw_funcs()
+{
+    static hb_draw_funcs_t* draw_funcs = [] {
+        auto* funcs = hb_draw_funcs_create();
+        hb_draw_funcs_set_line_to_func(
+            funcs, [](hb_draw_funcs_t*, void* draw_data, hb_draw_state_t* state, float to_x, float to_y, void*) {
+                auto& ink_extent = *static_cast<InkExtentInBand*>(draw_data);
+                ink_extent.add_line(
+                    ink_extent.to_device_pixels(state->current_x, state->current_y),
+                    ink_extent.to_device_pixels(to_x, to_y));
+            },
+            nullptr, nullptr);
+        hb_draw_funcs_set_quadratic_to_func(
+            funcs, [](hb_draw_funcs_t*, void* draw_data, hb_draw_state_t* state, float control_x, float control_y, float to_x, float to_y, void*) {
+                auto& ink_extent = *static_cast<InkExtentInBand*>(draw_data);
+                ink_extent.add_quadratic(
+                    ink_extent.to_device_pixels(state->current_x, state->current_y),
+                    ink_extent.to_device_pixels(control_x, control_y),
+                    ink_extent.to_device_pixels(to_x, to_y));
+            },
+            nullptr, nullptr);
+        hb_draw_funcs_set_cubic_to_func(
+            funcs, [](hb_draw_funcs_t*, void* draw_data, hb_draw_state_t* state, float control1_x, float control1_y, float control2_x, float control2_y, float to_x, float to_y, void*) {
+                auto& ink_extent = *static_cast<InkExtentInBand*>(draw_data);
+                ink_extent.add_cubic(
+                    ink_extent.to_device_pixels(state->current_x, state->current_y),
+                    ink_extent.to_device_pixels(control1_x, control1_y),
+                    ink_extent.to_device_pixels(control2_x, control2_y),
+                    ink_extent.to_device_pixels(to_x, to_y));
+            },
+            nullptr, nullptr);
+        hb_draw_funcs_make_immutable(funcs);
+        return funcs;
+    }();
+    return draw_funcs;
+}
+
 }
 
 Vector<float> GlyphRun::get_glyph_intercepts(float scale, float y_top, float y_bottom) const
 {
-    ensure_text_blob(scale);
-    auto* blob = cached_skia_text_blob();
-    if (!blob)
+    if (!(scale > 0) || !__builtin_isfinite(scale))
         return {};
 
-    Array<SkScalar, 2> bounds { y_top, y_bottom };
-    int count = blob->getIntercepts(bounds.data(), nullptr);
-    if (count < 2)
+    auto* hb_font = m_font->harfbuzz_font();
+    int x_scale = 0;
+    int y_scale = 0;
+    hb_font_get_scale(hb_font, &x_scale, &y_scale);
+    if (x_scale <= 0 || y_scale <= 0)
         return {};
+    auto units_to_pixels_x = static_cast<double>(m_font->pixel_size()) * scale / x_scale;
+    auto units_to_pixels_y = static_cast<double>(m_font->pixel_size()) * scale / y_scale;
+    auto font_ascent = m_font->pixel_metrics().ascent;
 
     Vector<float> intervals;
-    intervals.resize(count);
-    blob->getIntercepts(bounds.data(), intervals.data());
+    for (auto const& glyph : m_glyphs) {
+        if (!glyph.should_paint)
+            continue;
+        auto origin_x = static_cast<double>(glyph.position.x()) * scale;
+        auto origin_y = (static_cast<double>(glyph.position.y()) + font_ascent) * scale;
+
+        // Move the band into glyph-local coordinates, with the origin at the glyph's baseline origin.
+        auto band_top = y_top - origin_y;
+        auto band_bottom = y_bottom - origin_y;
+
+        // Skip glyphs whose bounding box doesn't reach the band before decoding their outline.
+        hb_glyph_extents_t extents;
+        if (hb_font_get_glyph_extents(hb_font, glyph.glyph_id, &extents)) {
+            auto glyph_top = -extents.y_bearing * units_to_pixels_y;
+            auto glyph_bottom = -(extents.y_bearing + extents.height) * units_to_pixels_y;
+            if (glyph_bottom < band_top || band_bottom < glyph_top)
+                continue;
+        }
+
+        InkExtentInBand ink_extent {
+            .band_top = band_top,
+            .band_bottom = band_bottom,
+            .units_to_pixels_x = units_to_pixels_x,
+            .units_to_pixels_y = units_to_pixels_y,
+        };
+        hb_font_draw_glyph(hb_font, glyph.glyph_id, ink_extent_draw_funcs(), &ink_extent);
+
+        // Glyphs without an outline (e.g. spaces) never widen the extent and produce no interval.
+        if (ink_extent.left < ink_extent.right) {
+            intervals.append(static_cast<float>(ink_extent.left + origin_x));
+            intervals.append(static_cast<float>(ink_extent.right + origin_x));
+        }
+    }
     return intervals;
 }
 
@@ -138288,7 +138605,6 @@ FILE: Libraries/LibGfx/TextLayout.h
 
 #include <AK/AtomicRefCounted.h>
 #include <AK/Forward.h>
-#include <AK/OwnPtr.h>
 #include <AK/Vector.h>
 #include <LibGfx/Font/Font.h>
 #include <LibGfx/FontCascadeList.h>
@@ -138296,8 +138612,6 @@ FILE: Libraries/LibGfx/TextLayout.h
 #include <LibGfx/Point.h>
 #include <LibGfx/Rect.h>
 #include <LibGfx/ShapeFeature.h>
-
-class SkTextBlob;
 
 namespace Gfx {
 
@@ -138341,11 +138655,14 @@ public:
 
     [[nodiscard]] NonnullRefPtr<GlyphRun> slice(size_t start, size_t length) const;
 
-    void ensure_text_blob(float scale) const;
+    // Conservative bounds of the painted glyphs in device pixels, relative to the run's baseline origin (glyph
+    // positions scaled by `scale`, with the font ascent added to y). The bounding box of the glyph origins is
+    // expanded by the font's overall glyph bounding box, falling back to tight per-glyph extents when the font
+    // doesn't record one.
+    [[nodiscard]] FloatRect bounding_box(float scale) const;
 
-    FloatRect cached_blob_bounds() const;
-    SkTextBlob* cached_skia_text_blob() const;
-
+    // Pairs of [start, end] device-pixel x values, relative to the run's baseline origin, where glyph ink intersects
+    // the horizontal band [y_top, y_bottom]. One pair per painted glyph that has ink inside the band, in run order.
     [[nodiscard]] Vector<float> get_glyph_intercepts(float scale, float y_top, float y_bottom) const;
 
 private:
@@ -138353,9 +138670,6 @@ private:
     NonnullRefPtr<Font const> m_font;
     TextType m_text_type;
     float m_width { 0 };
-
-    struct CachedTextBlob;
-    mutable OwnPtr<CachedTextBlob> m_cached_text_blob;
 };
 
 NonnullRefPtr<GlyphRun> shape_text(FloatPoint baseline_start, float letter_spacing, float word_spacing, Utf16View const&, Gfx::Font const& font, GlyphRun::TextType, TrailingWhitespace* = nullptr);
@@ -496146,7 +496460,6 @@ set(SOURCES
     Layout/LayoutRustBridge.cpp
     Layout/Node.cpp
     Layout/NodeArena.cpp
-    Layout/ScrollableOverflow.cpp
     Layout/TextNode.cpp
     Layout/TextOffsetMapping.cpp
     Layout/TreeBuilder.cpp
@@ -639466,7 +639779,6 @@ FILE: Libraries/LibWeb/DOM/Document.cpp
 #include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/NodeArena.h>
-#include <LibWeb/Layout/ScrollableOverflow.h>
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/TextOffsetMapping.h>
 #include <LibWeb/Layout/TreeBuilder.h>
@@ -640643,7 +640955,8 @@ void Document::tear_down_layout_tree()
     m_hit_test_display_list = nullptr;
     m_layout_root = nullptr;
     m_paintable = nullptr;
-    m_scrollable_overflow_contained_boxes_from_last_layout.clear();
+    if (m_layout_node_arena)
+        Layout::RustFFI::layout_arena_clear_scrollable_overflow_contained_boxes(m_layout_node_arena->handle());
     m_needs_full_layout_tree_update = true;
 }
 
@@ -641049,24 +641362,18 @@ static void relayout_subtree(Layout::Box& subtree_root)
     });
 }
 
-// The pre-order traversal visits ancestors before the descendants that mark them, so clearing
-// the flag on visit and marking upwards compose within one walk.
-void Document::recompute_containing_block_and_derive_abspos_escape_flags(Layout::Node& layout_node)
+// Recomputes containing blocks and derives the abspos escape flags for the inclusive subtree
+// inside the Rust arena; the DOM-ancestry half of the inline containing-block workaround stays
+// on the C++ side as the callback.
+static void recompute_containing_blocks_in_inclusive_subtree(Layout::NodeArena& arena, Layout::Node& subtree_root)
 {
-    layout_node.recompute_containing_block({});
-
-    auto* box = as_if<Layout::Box>(layout_node);
-    if (!box)
-        return;
-    box->set_abspos_descendant_escapes(false);
-
-    if (!box->is_absolutely_positioned())
-        return;
-    auto const* containing_block = box->containing_block();
-    for (auto* ancestor = box->parent(); ancestor && ancestor != containing_block; ancestor = ancestor->parent()) {
-        if (auto* ancestor_box = as_if<Layout::Box>(*ancestor))
-            ancestor_box->set_abspos_descendant_escapes(true);
-    }
+    Layout::RustFFI::layout_arena_recompute_containing_blocks(
+        arena.handle(), Layout::Node::slot_id(&subtree_root),
+        [](void* node_shell, void* containing_block_shell) -> Layout::RustFFI::NodeSlotId {
+            auto const& node = *static_cast<Layout::Node const*>(node_shell);
+            auto const& containing_block = *static_cast<Layout::Box const*>(containing_block_shell);
+            return Layout::Node::slot_id(node.find_inline_containing_block(containing_block));
+        });
 }
 
 // Refreshes every structure derived from committed layout results, shared by the partial and
@@ -641081,10 +641388,10 @@ void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed, Layout
     set_needs_to_refresh_scroll_state(true);
 
     // A commit that changed the tree can have replaced boxes referenced by the cached
-    // contained-boxes map; refresh it before overflow measurement follows them. A pending full
-    // recalculation rebuilds the map inside its own measurement traversal instead.
+    // contained-boxes index; refresh it before overflow measurement follows them. A pending full
+    // recalculation rebuilds the index inside its own measurement traversal instead.
     if (layout_tree_changed == LayoutTreeChanged::Yes && !m_needs_full_scrollable_overflow_recalculation)
-        Layout::collect_scrollable_overflow_contained_boxes(*m_layout_root, m_scrollable_overflow_contained_boxes_from_last_layout);
+        Layout::RustFFI::layout_arena_rebuild_scrollable_overflow_contained_boxes(layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root.ptr()));
     if (layout_commit_scope == LayoutCommitScope::Full)
         update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates::HandledByFullLayoutCommit, boxes_needing_eager_overflow_measurement);
     else
@@ -641300,12 +641607,8 @@ Document::PartialRelayoutResult Document::try_partial_relayout(HashTable<WeakPtr
     // Nodes created by the incremental build have no containing blocks assigned yet, and the
     // mutation may have moved where existing out-of-flow descendants belong; recompute both so
     // boundary qualification below reads facts matching the just-built tree.
-    for (auto* rebuilt_root : rebuilt_subtree_roots) {
-        rebuilt_root->for_each_in_inclusive_subtree([](Layout::Node& node) {
-            recompute_containing_block_and_derive_abspos_escape_flags(node);
-            return TraversalDecision::Continue;
-        });
-    }
+    for (auto* rebuilt_root : rebuilt_subtree_roots)
+        recompute_containing_blocks_in_inclusive_subtree(layout_node_arena(), *rebuilt_root);
 
     // Collect the live boundary set from the post-build tree: registered boundaries that
     // survived the build, plus the nearest boundary containing each rebuilt subtree - which
@@ -641467,11 +641770,7 @@ void Document::update_layout(UpdateLayoutReason reason)
             });
         }
 
-        m_layout_root->for_each_in_inclusive_subtree([&](auto& layout_node) {
-            recompute_containing_block_and_derive_abspos_escape_flags(layout_node);
-
-            return TraversalDecision::Continue;
-        });
+        recompute_containing_blocks_in_inclusive_subtree(layout_node_arena(), *m_layout_root);
 
         // The walk above re-derived every fact partial relayout boundary qualification depends
         // on, so pending changes that escaped classification are accounted for from here on.
@@ -641485,12 +641784,15 @@ void Document::update_layout(UpdateLayoutReason reason)
             viewport_rect.width(),
             viewport_rect.height(),
             should_collect_devtools_layout_data);
-        Layout::collect_scrollable_overflow_contained_boxes(
-            *m_layout_root, m_scrollable_overflow_contained_boxes_from_last_layout, [&](Layout::Box const& box) {
-                auto paintable = box.paintable_box();
-                if (&box == m_layout_root.ptr() || box.is_scroll_container() || (paintable && !paintable->scroll_offset().is_zero()))
-                    boxes_needing_eager_overflow_measurement.append(&box);
-            });
+        m_layout_root->for_each_in_inclusive_subtree_of_type<Layout::Box>([&](auto& box) {
+            auto paintable = box.paintable_box();
+            if (!paintable)
+                return TraversalDecision::Continue;
+            if (&box == m_layout_root.ptr() || box.is_scroll_container() || !paintable->scroll_offset().is_zero())
+                boxes_needing_eager_overflow_measurement.append(&box);
+            return TraversalDecision::Continue;
+        });
+        Layout::RustFFI::layout_arena_rebuild_scrollable_overflow_contained_boxes(layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root.ptr()));
 
         style_invalidation_counters().relayouts_performed++;
 
@@ -641777,9 +642079,10 @@ void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpda
         // measured recursively when their overflow contributes to one of these roots, so they do
         // not need separate eager measurement.
         for (auto const* box : boxes_needing_eager_measurement) {
-            Layout::measure_scrollable_overflow(*box, m_scrollable_overflow_contained_boxes_from_last_layout);
-            if (auto box_paintable = box->paintable_box())
+            if (auto box_paintable = box->paintable_box()) {
+                Painting::rust_measure_scrollable_overflow(*box_paintable);
                 clamp_scroll_offset(const_cast<Painting::Paintable&>(*box_paintable));
+            }
         }
         return;
     }
@@ -641796,8 +642099,11 @@ void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpda
     };
 
     if (needs_full_recalculation) {
-        Layout::collect_scrollable_overflow_contained_boxes(
-            *m_layout_root, m_scrollable_overflow_contained_boxes_from_last_layout, [&](Layout::Box const& box) { record_and_clear_overflow_data(box); });
+        m_layout_root->for_each_in_inclusive_subtree_of_type<Layout::Box>([&](auto& box) {
+            record_and_clear_overflow_data(box);
+            return TraversalDecision::Continue;
+        });
+        Layout::RustFFI::layout_arena_rebuild_scrollable_overflow_contained_boxes(layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root.ptr()));
     } else {
         for (auto const& weak_paintable : pending_paintables) {
             auto paintable = weak_paintable.strong_ref();
@@ -641837,7 +642143,7 @@ void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpda
         if (!it.value.has_value() && it.key != m_layout_root.ptr() && !it.key->is_scroll_container() && box_paintable->scroll_offset().is_zero())
             continue;
 
-        Layout::measure_scrollable_overflow(*it.key, m_scrollable_overflow_contained_boxes_from_last_layout);
+        Painting::rust_measure_scrollable_overflow(*box_paintable);
         clamp_scroll_offset(const_cast<Painting::Paintable&>(*box_paintable));
     }
 
@@ -641893,7 +642199,7 @@ void Document::ensure_scrollable_overflow_is_measured(Layout::Box const& box) co
     auto paintable = box.paintable_box();
     if (!paintable || paintable->overflow_data().has_value() || paintable->cached_overflow_data().has_value())
         return;
-    Layout::measure_scrollable_overflow(box, m_scrollable_overflow_contained_boxes_from_last_layout);
+    Painting::rust_measure_scrollable_overflow(*paintable);
 }
 
 void Document::update_paint_and_hit_testing_properties_if_needed()
@@ -649518,7 +649824,6 @@ FILE: Libraries/LibWeb/DOM/Document.h
 #include <LibWeb/HTML/VisibilityState.h>
 #include <LibWeb/Infra/SerializedURL.h>
 #include <LibWeb/InvalidateDisplayList.h>
-#include <LibWeb/Layout/ScrollableOverflow.h>
 #include <LibWeb/Painting/FlexboxInspectorOverlay.h>
 #include <LibWeb/Painting/Forward.h>
 #include <LibWeb/Painting/GridInspectorOverlay.h>
@@ -650888,7 +651193,6 @@ private:
     bool needs_style_update_after_layout();
     bool any_anchor_names_are_registered() const;
     PartialRelayoutResult try_partial_relayout(HashTable<WeakPtr<Layout::Box>> registered_partial_relayout_roots, bool& needs_layout_tree_rebuild, bool should_collect_devtools_layout_data);
-    static void recompute_containing_block_and_derive_abspos_escape_flags(Layout::Node&);
     enum class LayoutTreeChanged : u8 {
         No,
         Yes,
@@ -651272,10 +651576,6 @@ private:
 
     bool m_needs_full_scrollable_overflow_recalculation { false };
     Vector<WeakPtr<Painting::Paintable>> m_paintable_boxes_needing_scrollable_overflow_recalculation;
-    // NB: Holds raw layout node pointers that are only safe to read while m_layout_root still owns
-    //     the tree they came from: every full layout rebuilds the map, layout tree teardown clears
-    //     it, and overflow measurement only reads it while that root remains current.
-    Layout::ContainedBoxesMap m_scrollable_overflow_contained_boxes_from_last_layout;
     CSS::SheetSetStyleCacheRegistry m_sheet_set_style_cache_registry;
     RefPtr<Painting::HitTestDisplayList> m_hit_test_display_list;
     // The previous recording's list, retained so cached per-paintable item ranges can be spliced into
@@ -665814,403 +666114,3 @@ void queue_mutation_observer_microtask(HTML::SimilarOriginWindowAgent& surroundi
                 if (!node)
                     continue;
 
-                if (node->registered_observer_list()) {
-                    node->registered_observer_list()->remove_all_matching([&mutation_observer](RegisteredObserver& registered_observer) {
-                        return is<TransientRegisteredObserver>(registered_observer) && static_cast<TransientRegisteredObserver&>(registered_observer).observer().ptr() == mutation_observer.ptr();
-                    });
-                }
-            }
-
-            // 4. If records is not empty, then invoke mo’s callback with « records, mo » and "report", and with
-            //    callback this value mo.
-            if (!records.is_empty()) {
-                invoke_mutation_observer_callback(*mutation_observer, records);
-            }
-        }
-
-        // 7. For each slot of signalSet, fire an event named slotchange, with its bubbles attribute set to true, at slot.
-        for (auto& slot : signal_set) {
-            EventInit event_init;
-            event_init.bubbles = true;
-            slot->dispatch_event(Event::create(HTML::EventNames::slotchange, event_init, HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*slot))));
-        }
-    }));
-}
-
-GC::Ref<RegisteredObserver> RegisteredObserver::create(MutationObserver& observer, MutationObserverOptions const& options)
-{
-    return GC::Heap::the().allocate<RegisteredObserver>(observer, options);
-}
-
-RegisteredObserver::RegisteredObserver(MutationObserver& observer, MutationObserverOptions const& options)
-    : m_observer(observer)
-    , m_options(options)
-{
-}
-
-RegisteredObserver::~RegisteredObserver() = default;
-
-void RegisteredObserver::visit_edges(Cell::Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-    visitor.visit(m_observer);
-}
-
-GC::Ref<TransientRegisteredObserver> TransientRegisteredObserver::create(MutationObserver& observer, MutationObserverOptions const& options, RegisteredObserver& source)
-{
-    return GC::Heap::the().allocate<TransientRegisteredObserver>(observer, options, source);
-}
-
-TransientRegisteredObserver::TransientRegisteredObserver(MutationObserver& observer, MutationObserverOptions const& options, RegisteredObserver& source)
-    : RegisteredObserver(observer, options)
-    , m_source(source)
-{
-}
-
-TransientRegisteredObserver::~TransientRegisteredObserver() = default;
-
-void TransientRegisteredObserver::visit_edges(Cell::Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-    visitor.visit(m_source);
-}
-
-}
-
-FILE: Libraries/LibWeb/DOM/MutationObserver.h
-/*
- * Copyright (c) 2022, Luke Wilde <lukew@serenityos.org>
- * Copyright (c) 2022, Andreas Kling <andreas@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/Optional.h>
-#include <AK/Utf16FlyString.h>
-#include <AK/Vector.h>
-#include <LibGC/Root.h>
-#include <LibWeb/Bindings/MutationObserver.h>
-#include <LibWeb/Bindings/Wrappable.h>
-#include <LibWeb/DOM/MutationRecord.h>
-#include <LibWeb/Export.h>
-#include <LibWeb/WebIDL/CallbackType.h>
-#include <LibWeb/WebIDL/ExceptionOr.h>
-
-namespace Web::HTML {
-
-struct SimilarOriginWindowAgent;
-
-}
-
-namespace Web::DOM {
-
-struct MutationObserverOptions {
-    Optional<Vector<Utf16FlyString>> attribute_filter;
-    Optional<bool> attribute_old_value;
-    Optional<bool> attributes;
-    Optional<bool> character_data;
-    Optional<bool> character_data_old_value;
-    bool child_list { false };
-    bool subtree { false };
-};
-
-// https://dom.spec.whatwg.org/#mutationobserver
-class MutationObserver final : public Bindings::GCAllocatedWrappable {
-    WEB_WRAPPABLE(MutationObserver, Bindings::GCAllocatedWrappable);
-    GC_DECLARE_ALLOCATOR(MutationObserver);
-
-public:
-    static WebIDL::ExceptionOr<GC::Ref<MutationObserver>> create(GC::Ptr<WebIDL::CallbackType>);
-    virtual ~MutationObserver() override;
-
-    WebIDL::ExceptionOr<void> observe(Node& target, MutationObserverOptions options);
-    WebIDL::ExceptionOr<void> observe(Node& target, Bindings::MutationObserverInit const& options);
-    void disconnect();
-    Vector<GC::Root<MutationRecord>> take_records();
-
-    Vector<GC::Weak<Node>>& node_list() { return m_node_list; }
-    Vector<GC::Weak<Node>> const& node_list() const { return m_node_list; }
-
-    WebIDL::CallbackType& callback() { return *m_callback; }
-
-    void enqueue_record(Badge<Node>, GC::Ref<MutationRecord> mutation_record)
-    {
-        m_record_queue.append(*mutation_record);
-    }
-
-private:
-    explicit MutationObserver(GC::Ptr<WebIDL::CallbackType>);
-
-    virtual void visit_edges(GC::Cell::Visitor&) override;
-
-    // https://dom.spec.whatwg.org/#concept-mo-callback
-    GC::Ptr<WebIDL::CallbackType> m_callback;
-
-    // https://dom.spec.whatwg.org/#mutationobserver-node-list
-    // Registered observers in a node’s registered observer list have a weak reference to the node.
-    Vector<GC::Weak<Node>> m_node_list;
-
-    // https://dom.spec.whatwg.org/#concept-mo-queue
-    Vector<GC::Ref<MutationRecord>> m_record_queue;
-};
-
-// https://dom.spec.whatwg.org/#registered-observer
-class RegisteredObserver : public JS::Cell {
-    GC_CELL(RegisteredObserver, JS::Cell);
-    GC_DECLARE_ALLOCATOR(RegisteredObserver);
-
-public:
-    static GC::Ref<RegisteredObserver> create(MutationObserver&, MutationObserverOptions const&);
-    virtual ~RegisteredObserver() override;
-
-    virtual bool is_transient() const { return false; }
-
-    GC::Ref<MutationObserver> observer() const { return m_observer; }
-
-    MutationObserverOptions const& options() const { return m_options; }
-    void set_options(MutationObserverOptions options) { m_options = move(options); }
-
-    template<typename T>
-    bool fast_is() const = delete;
-
-protected:
-    RegisteredObserver(MutationObserver& observer, MutationObserverOptions const& options);
-
-    virtual void visit_edges(Cell::Visitor&) override;
-
-private:
-    GC::Ref<MutationObserver> m_observer;
-    MutationObserverOptions m_options;
-};
-
-// https://dom.spec.whatwg.org/#transient-registered-observer
-class TransientRegisteredObserver final : public RegisteredObserver {
-    GC_CELL(TransientRegisteredObserver, RegisteredObserver);
-    GC_DECLARE_ALLOCATOR(TransientRegisteredObserver);
-
-public:
-    static GC::Ref<TransientRegisteredObserver> create(MutationObserver&, MutationObserverOptions const&, RegisteredObserver& source);
-    virtual ~TransientRegisteredObserver() override;
-
-    GC::Ref<RegisteredObserver> source() const { return m_source; }
-
-    virtual bool is_transient() const override { return true; }
-
-private:
-    TransientRegisteredObserver(MutationObserver& observer, MutationObserverOptions const& options, RegisteredObserver& source);
-
-    virtual void visit_edges(Cell::Visitor&) override;
-
-    GC::Ref<RegisteredObserver> m_source;
-};
-
-template<>
-inline bool RegisteredObserver::fast_is<TransientRegisteredObserver>() const { return is_transient(); }
-
-WEB_API void queue_mutation_observer_microtask(HTML::SimilarOriginWindowAgent&);
-
-}
-
-FILE: Libraries/LibWeb/DOM/MutationObserver.idl
-// https://dom.spec.whatwg.org/#interface-mutationobserver
-[Exposed=Window]
-interface MutationObserver {
-    constructor(MutationCallback callback);
-
-    undefined observe(Node target, optional MutationObserverInit options = {});
-    undefined disconnect();
-    sequence<MutationRecord> takeRecords();
-};
-
-callback MutationCallback = undefined (sequence<MutationRecord> mutations, MutationObserver observer);
-
-dictionary MutationObserverInit {
-    boolean childList = false;
-    boolean attributes;
-    boolean characterData;
-    boolean subtree = false;
-    boolean attributeOldValue;
-    boolean characterDataOldValue;
-    sequence<[Utf16FlyString] Utf16DOMString> attributeFilter;
-};
-
-FILE: Libraries/LibWeb/DOM/MutationRecord.cpp
-/*
- * Copyright (c) 2022, Luke Wilde <lukew@serenityos.org>
- * Copyright (c) 2022, Andreas Kling <andreas@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibGC/Heap.h>
-#include <LibWeb/DOM/MutationRecord.h>
-#include <LibWeb/DOM/Node.h>
-#include <LibWeb/DOM/NodeList.h>
-
-namespace Web::DOM {
-
-GC_DEFINE_ALLOCATOR(MutationRecord);
-
-GC::Ref<MutationRecord> MutationRecord::create(Utf16FlyString const& type, Node const& target, NodeList& added_nodes, NodeList& removed_nodes, Node* previous_sibling, Node* next_sibling, Optional<Utf16FlyString> const& attribute_name, Optional<Utf16FlyString> const& attribute_namespace, Optional<Utf16String> const& old_value)
-{
-    return GC::Heap::the().allocate<MutationRecord>(type, target, added_nodes, removed_nodes, previous_sibling, next_sibling, attribute_name, attribute_namespace, old_value);
-}
-
-MutationRecord::MutationRecord(Utf16FlyString const& type, Node const& target, NodeList& added_nodes, NodeList& removed_nodes, Node* previous_sibling, Node* next_sibling, Optional<Utf16FlyString> const& attribute_name, Optional<Utf16FlyString> const& attribute_namespace, Optional<Utf16String> const& old_value)
-    : m_type(type)
-    , m_target(GC::make_root(target))
-    , m_added_nodes(added_nodes)
-    , m_removed_nodes(removed_nodes)
-    , m_previous_sibling(GC::make_root(previous_sibling))
-    , m_next_sibling(GC::make_root(next_sibling))
-    , m_attribute_name(attribute_name)
-    , m_attribute_namespace(attribute_namespace)
-    , m_old_value(old_value)
-{
-}
-
-MutationRecord::~MutationRecord() = default;
-
-void MutationRecord::visit_edges(GC::Cell::Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-    visitor.visit(m_target);
-    visitor.visit(m_added_nodes);
-    visitor.visit(m_removed_nodes);
-    visitor.visit(m_previous_sibling);
-    visitor.visit(m_next_sibling);
-}
-
-}
-
-FILE: Libraries/LibWeb/DOM/MutationRecord.h
-/*
- * Copyright (c) 2022, Luke Wilde <lukew@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/FlyString.h>
-#include <LibWeb/Bindings/Wrappable.h>
-
-namespace Web::DOM {
-
-// https://dom.spec.whatwg.org/#mutationrecord
-class MutationRecord : public Bindings::GCAllocatedWrappable {
-    WEB_WRAPPABLE(MutationRecord, Bindings::GCAllocatedWrappable);
-    GC_DECLARE_ALLOCATOR(MutationRecord);
-
-public:
-    [[nodiscard]] static GC::Ref<MutationRecord> create(Utf16FlyString const& type, Node const& target, NodeList& added_nodes, NodeList& removed_nodes, Node* previous_sibling, Node* next_sibling, Optional<Utf16FlyString> const& attribute_name, Optional<Utf16FlyString> const& attribute_namespace, Optional<Utf16String> const& old_value);
-
-    virtual ~MutationRecord() override;
-
-    Utf16FlyString const& type() const { return m_type; }
-    Node const* target() const { return m_target.ptr(); }
-    NodeList const* added_nodes() const { return m_added_nodes.ptr(); }
-    NodeList const* removed_nodes() const { return m_removed_nodes.ptr(); }
-    Node const* previous_sibling() const { return m_previous_sibling.ptr(); }
-    Node const* next_sibling() const { return m_next_sibling.ptr(); }
-    Optional<Utf16String> attribute_name() const
-    {
-        return m_attribute_name.map([](auto const& name) { return name.to_utf16_string(); });
-    }
-    Optional<Utf16String> attribute_namespace() const
-    {
-        return m_attribute_namespace.map([](auto const& namespace_) { return namespace_.to_utf16_string(); });
-    }
-    Optional<Utf16String> const& old_value() const { return m_old_value; }
-
-private:
-    MutationRecord(Utf16FlyString const& type, Node const& target, NodeList& added_nodes, NodeList& removed_nodes, Node* previous_sibling, Node* next_sibling, Optional<Utf16FlyString> const& attribute_name, Optional<Utf16FlyString> const& attribute_namespace, Optional<Utf16String> const& old_value);
-
-    virtual void visit_edges(GC::Cell::Visitor&) override;
-
-    Utf16FlyString m_type;
-    GC::Ptr<Node const> m_target;
-    GC::Ptr<NodeList> m_added_nodes;
-    GC::Ptr<NodeList> m_removed_nodes;
-    GC::Ptr<Node> m_previous_sibling;
-    GC::Ptr<Node> m_next_sibling;
-    Optional<Utf16FlyString> m_attribute_name;
-    Optional<Utf16FlyString> m_attribute_namespace;
-    Optional<Utf16String> m_old_value;
-};
-
-}
-
-FILE: Libraries/LibWeb/DOM/MutationRecord.idl
-// https://dom.spec.whatwg.org/#interface-mutationrecord
-[Exposed=Window]
-interface MutationRecord {
-    readonly attribute Utf16DOMString type;
-    [SameObject] readonly attribute Node target;
-    [SameObject] readonly attribute NodeList addedNodes;
-    [SameObject] readonly attribute NodeList removedNodes;
-    readonly attribute Node? previousSibling;
-    readonly attribute Node? nextSibling;
-    readonly attribute Utf16DOMString? attributeName;
-    readonly attribute Utf16DOMString? attributeNamespace;
-    readonly attribute Utf16DOMString? oldValue;
-};
-
-FILE: Libraries/LibWeb/DOM/MutationType.cpp
-/*
- * Copyright (c) 2022, Luke Wilde <lukew@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibWeb/DOM/MutationType.h>
-
-namespace Web::DOM::MutationType {
-
-#define __ENUMERATE_MUTATION_TYPE(name) \
-    Utf16FlyString const& name = *new Utf16FlyString(#name##_utf16_fly_string);
-ENUMERATE_MUTATION_TYPES
-#undef __ENUMERATE_MUTATION_TYPE
-
-}
-
-FILE: Libraries/LibWeb/DOM/MutationType.h
-/*
- * Copyright (c) 2022, Luke Wilde <lukew@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/Utf16FlyString.h>
-#include <LibWeb/Export.h>
-
-namespace Web::DOM::MutationType {
-
-#define ENUMERATE_MUTATION_TYPES             \
-    __ENUMERATE_MUTATION_TYPE(attributes)    \
-    __ENUMERATE_MUTATION_TYPE(characterData) \
-    __ENUMERATE_MUTATION_TYPE(childList)
-
-#define __ENUMERATE_MUTATION_TYPE(name) extern WEB_API Utf16FlyString const& name;
-ENUMERATE_MUTATION_TYPES
-#undef __ENUMERATE_MUTATION_TYPE
-
-}
-
-FILE: Libraries/LibWeb/DOM/NamedNodeMap.cpp
-/*
- * Copyright (c) 2021, Tim Flynn <trflynn89@serenityos.org>
- * Copyright (c) 2022, Andreas Kling <andreas@ladybird.org>
- * Copyright (c) 2022, Alexander Narsudinov <a.narsudinov@gmail.com>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibGC/Heap.h>
-#include <LibWeb/Bindings/Wrappable.h>
-#include <LibWeb/DOM/Attr.h>
-#include <LibWeb/DOM/Document.h>
