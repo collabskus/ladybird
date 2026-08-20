@@ -44,10 +44,6 @@
 #include <LibWeb/Layout/TextNode.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Painting/PaintableWithLines.h>
-#include <LibWeb/Painting/SVGForeignObjectPaintable.h>
-#include <LibWeb/Painting/SVGGraphicsPaintable.h>
-#include <LibWeb/Painting/SVGPathPaintable.h>
-#include <LibWeb/Painting/SVGSVGPaintable.h>
 #include <LibWeb/SVG/SVGClipPathElement.h>
 #include <LibWeb/SVG/SVGGeometryElement.h>
 #include <LibWeb/SVG/SVGImageElement.h>
@@ -283,18 +279,6 @@ static RustFFI::FfiAffineTransform to_ffi_affine_transform(Gfx::AffineTransform 
         .d = transform.d(),
         .e = transform.e(),
         .f = transform.f(),
-    };
-}
-
-static Gfx::AffineTransform from_ffi_affine_transform(RustFFI::FfiAffineTransform const& transform)
-{
-    return {
-        transform.a,
-        transform.b,
-        transform.c,
-        transform.d,
-        transform.e,
-        transform.f,
     };
 }
 
@@ -713,42 +697,6 @@ RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
 {
     return {
         .context = this,
-        .begin_commit = [](void* context, void* root_pointer) {
-            auto& bridge = *static_cast<LayoutRustBridge*>(context);
-            auto& root = *static_cast<Box*>(root_pointer);
-            VERIFY(!bridge.m_replaced_paintable);
-            VERIFY(!bridge.m_commit_parent_paintable);
-            VERIFY(!bridge.m_commit_insert_before_paintable);
-            VERIFY(bridge.m_reused_paintables.is_empty());
-
-            if (!root.is_viewport()) {
-                bridge.m_replaced_paintable = root.paintable();
-                if (!bridge.m_replaced_paintable && root.dom_node()) {
-                    // A rebuilt box has no paintable yet; the previous one stays referenced by
-                    // the DOM node (and alive in the paint tree) until this commit replaces it.
-                    bridge.m_replaced_paintable = root.dom_node()->unsafe_paintable();
-                }
-            }
-
-            if (bridge.m_replaced_paintable) {
-                // Keep the old subtree alive while its replacement is spliced
-                // into the exact same paint-order position.
-                bridge.m_commit_parent_paintable = bridge.m_replaced_paintable->parent();
-                bridge.m_commit_insert_before_paintable = bridge.m_replaced_paintable->next_sibling();
-                if (bridge.m_commit_parent_paintable)
-                    bridge.m_commit_parent_paintable->remove_child(*bridge.m_replaced_paintable);
-            }
-
-            auto slot_of = [](Painting::Paintable const* paintable) {
-                return paintable ? paintable->rust_slot() : RustFFI::PaintableSlotId { RustFFI::INVALID_PAINTABLE_SLOT_INDEX };
-            };
-            return RustFFI::FfiCommitPosition {
-                .parent_paintable = bridge.m_commit_parent_paintable.ptr(),
-                .insert_before_paintable = bridge.m_commit_insert_before_paintable.ptr(),
-                .replaced_paintable_slot = slot_of(bridge.m_replaced_paintable.ptr()),
-                .parent_paintable_slot = slot_of(bridge.m_commit_parent_paintable.ptr()),
-                .insert_before_paintable_slot = slot_of(bridge.m_commit_insert_before_paintable.ptr()),
-            }; },
         .finish_commit = [](void* context) {
             auto& bridge = *static_cast<LayoutRustBridge*>(context);
             for (auto& reused : bridge.m_reused_paintables) {
@@ -756,10 +704,7 @@ RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
                 if (new_absolute_position != reused.old_absolute_position)
                     reused.paintable->translate_reused_subtree_absolute_geometry(new_absolute_position - reused.old_absolute_position);
             }
-            bridge.m_reused_paintables.clear();
-            bridge.m_commit_insert_before_paintable = nullptr;
-            bridge.m_commit_parent_paintable = nullptr;
-            bridge.m_replaced_paintable = nullptr; },
+            bridge.m_reused_paintables.clear(); },
         .prepare_node = [](void* context, void* node_pointer, bool has_used_values, bool reuses_committed_subtree) -> RustFFI::FfiPreparedPaintable {
             auto& bridge = *static_cast<LayoutRustBridge*>(context);
             auto& node = *static_cast<Node*>(node_pointer);
@@ -773,8 +718,6 @@ RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
                 if (reuses_committed_subtree) {
                     VERIFY(paintable);
                     bridge.m_reused_paintables.append({ *paintable, paintable->absolute_position() });
-                    if (paintable->parent())
-                        paintable->remove();
                 } else if (paintable) {
                     paintable->reset_for_relayout();
                     reused = true;
@@ -894,56 +837,18 @@ RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
             // consumers read out of bounds.
             for (auto const& piece : line_context->paintable.inline_box_pieces())
                 VERIFY(piece.first_fragment_index + piece.fragment_count <= line_context->paintable.fragments().size()); },
-        .set_svg_viewport_transform = [](void*, void* paintable_pointer, RustFFI::FfiAffineTransform transform) {
-            auto& paintable = *static_cast<Painting::Paintable*>(paintable_pointer);
-            paintable.set_svg_viewport_transform(from_ffi_affine_transform(transform)); },
-        .set_svg_viewport_size = [](void*, void* paintable_pointer, RustFFI::FfiCssPixelSize viewport_size) {
-            auto& paintable = *static_cast<Painting::Paintable*>(paintable_pointer);
-            if (auto* svg_svg_paintable = as_if<Painting::SVGSVGPaintable>(paintable)) {
-                svg_svg_paintable->set_svg_viewport_size({
-                    CSSPixels::from_raw(viewport_size.width),
-                    CSSPixels::from_raw(viewport_size.height),
-                });
-            } },
-        .set_computed_svg_path = [](void*, void* paintable_pointer, void* path_pointer, u64 path_identity) {
-            VERIFY(path_pointer);
-            auto& paintable = *static_cast<Painting::Paintable*>(paintable_pointer);
-            // The path stays owned by the Rust fragment tree, which may emit it again on a
-            // later commit; the identity is process-unique per path allocation, so a match
-            // means the preserved copy is already this exact path and the copy can be skipped.
-            auto const* path = static_cast<Gfx::Path const*>(path_pointer);
-            if (auto* svg_path_paintable = as_if<Painting::SVGPathPaintable>(paintable))
-                svg_path_paintable->set_computed_path_if_identity_changed(*path, path_identity); },
-        .finish_node = [](void*, void* node_pointer, void* paintable_pointer, void* parent_paintable_pointer, void* insert_before_paintable_pointer) {
+        .finish_node = [](void*, void* node_pointer, void* paintable_pointer) {
             auto& node = *static_cast<Node*>(node_pointer);
             auto* paintable = static_cast<Painting::Paintable*>(paintable_pointer);
-            auto* parent_paintable = static_cast<Painting::Paintable*>(parent_paintable_pointer);
-            auto* insert_before_paintable = static_cast<Painting::Paintable*>(insert_before_paintable_pointer);
             auto* dom_node = node.dom_node();
-            Painting::Paintable* paintable_for_children = nullptr;
             if (paintable) {
-                if (parent_paintable && !paintable->forms_unconnected_subtree()) {
-                    VERIFY(!paintable->parent());
-                    parent_paintable->insert_before(*paintable, insert_before_paintable);
-                }
                 paintable->set_dom_node(dom_node);
                 if (dom_node)
                     dom_node->set_paintable(paintable);
                 paintable->invalidate_absolute_geometry_cache(Painting::Paintable::InvalidateDescendantGeometry::No);
-                paintable_for_children = paintable;
-            } else {
-                if (dom_node)
-                    dom_node->clear_paintable();
-                // An inline box without a paintable must not orphan its descendants' paintables; pass the
-                // nearest ancestor paintable through. Other paintable-less nodes (e.g. non-rendered SVG
-                // subtrees) keep their descendants disconnected on purpose.
-                if (node.is_fragmented_inline())
-                    paintable_for_children = parent_paintable;
-            }
-            return RustFFI::FfiCommitNodeResult {
-                .paintable = paintable,
-                .paintable_for_children = paintable_for_children,
-            }; },
+            } else if (dom_node) {
+                dom_node->clear_paintable();
+            } },
         .assign_inline_box_geometry = [](void*, void* paintable_pointer) { as<Painting::PaintableWithLines>(*static_cast<Painting::Paintable*>(paintable_pointer)).assign_inline_box_geometry(); },
     };
 }
