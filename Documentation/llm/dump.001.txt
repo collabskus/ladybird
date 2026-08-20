@@ -114027,6 +114027,341 @@ using IntBoundingBox = BoundingBox<int>;
 
 }
 
+FILE: Libraries/LibGfx/BSPTree.cpp
+/*
+ * Copyright (c) 2026, Tim Ledbetter <tim.ledbetter@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/NumericLimits.h>
+#include <AK/Optional.h>
+#include <AK/QuickSort.h>
+#include <LibGfx/BSPTree.h>
+#include <LibGfx/Vector4.h>
+
+namespace Gfx {
+
+// Vertices closer to a splitting plane than this distance count as lying on it, giving the plane a thickness that
+// absorbs floating-point noise from the projection.
+static constexpr float on_plane_threshold = 0.05f;
+
+Vector<FloatVector3, 8> map_rect_through_projection(FloatMatrix4x4 const& matrix, FloatRect const& rect)
+{
+    // Projecting a point divides it by w, which only works in front of the eye plane where w is positive.
+    // Edges crossing behind the eye are clipped at this small positive w so the divide stays finite.
+    static constexpr float minimum_projection_w = 0.00001f;
+
+    Array corners = {
+        matrix * FloatVector4 { rect.left(), rect.top(), 0, 1 },
+        matrix * FloatVector4 { rect.right(), rect.top(), 0, 1 },
+        matrix * FloatVector4 { rect.right(), rect.bottom(), 0, 1 },
+        matrix * FloatVector4 { rect.left(), rect.bottom(), 0, 1 },
+    };
+
+    Vector<FloatVector3, 8> result;
+    auto append_projected = [&](FloatVector4 const& vertex) {
+        result.append({ vertex.x() / vertex.w(), vertex.y() / vertex.w(), vertex.z() / vertex.w() });
+    };
+    for (size_t i = 0; i < corners.size(); ++i) {
+        auto const& current = corners[i];
+        auto const& next = corners[(i + 1) % corners.size()];
+        bool current_in_front_of_eye = current.w() > minimum_projection_w;
+        bool next_in_front_of_eye = next.w() > minimum_projection_w;
+        if (current_in_front_of_eye)
+            append_projected(current);
+        if (current_in_front_of_eye != next_in_front_of_eye) {
+            auto t = (minimum_projection_w - current.w()) / (next.w() - current.w());
+            append_projected(current + (next - current) * t);
+        }
+    }
+    return result;
+}
+
+static Optional<FloatVector3> polygon_normal(ReadonlySpan<FloatVector3> vertices)
+{
+    if (vertices.size() < 3)
+        return {};
+    FloatVector3 normal { 0, 0, 0 };
+    for (size_t i = 1; i < vertices.size() - 1; ++i)
+        normal += (vertices[i] - vertices[0]).cross(vertices[i + 1] - vertices[0]);
+    auto length = normal.length();
+    // Returns no value for polygons that enclose no area, as they do not define a plane.
+    if (length == 0)
+        return {};
+    return normal / length;
+}
+
+namespace {
+
+struct PartitionedPolygon {
+    BSPPolygon polygon;
+    FloatVector3 plane_normal;
+    float plane_distance { 0 };
+};
+
+constexpr size_t no_bsp_node = NumericLimits<size_t>::max();
+
+struct BSPTreeNode {
+    FloatVector3 plane_normal;
+    float plane_distance { 0 };
+    Vector<BSPPolygon> coplanar_polygons;
+    size_t front { no_bsp_node };
+    size_t back { no_bsp_node };
+};
+
+// The polygons of a subtree that has not been built yet, and the parent slot that will reference its node.
+struct PendingSubtree {
+    Vector<PartitionedPolygon> polygons;
+    size_t parent { no_bsp_node };
+    bool is_front_child { false };
+};
+
+struct PolygonSplit {
+    Optional<PartitionedPolygon> front_piece;
+    Optional<PartitionedPolygon> back_piece;
+};
+
+}
+
+static PolygonSplit split_polygon(PartitionedPolygon polygon, ReadonlySpan<float> vertex_distances)
+{
+    Vector<FloatVector3, 8> front_vertices;
+    Vector<FloatVector3, 8> back_vertices;
+    auto const& vertices = polygon.polygon.vertices;
+    for (size_t i = 0; i < vertices.size(); ++i) {
+        size_t next_index = (i + 1) % vertices.size();
+        auto current_distance = vertex_distances[i];
+        auto next_distance = vertex_distances[next_index];
+        if (current_distance >= -on_plane_threshold)
+            front_vertices.append(vertices[i]);
+        if (current_distance <= on_plane_threshold)
+            back_vertices.append(vertices[i]);
+        bool edge_crosses_plane = (current_distance > on_plane_threshold && next_distance < -on_plane_threshold)
+            || (current_distance < -on_plane_threshold && next_distance > on_plane_threshold);
+        if (edge_crosses_plane) {
+            auto t = current_distance / (current_distance - next_distance);
+            auto intersection = vertices[i] + (vertices[next_index] - vertices[i]) * t;
+            front_vertices.append(intersection);
+            back_vertices.append(intersection);
+        }
+    }
+
+    auto make_piece = [&](Vector<FloatVector3, 8> piece_vertices) -> Optional<PartitionedPolygon> {
+        if (piece_vertices.size() < 3)
+            return {};
+        return PartitionedPolygon {
+            BSPPolygon { move(piece_vertices), polygon.polygon.plane_index, true },
+            polygon.plane_normal,
+            polygon.plane_distance,
+        };
+    };
+    return { make_piece(move(front_vertices)), make_piece(move(back_vertices)) };
+}
+
+static Vector<BSPTreeNode> build_bsp_tree(Vector<PartitionedPolygon> polygons)
+{
+    Vector<BSPTreeNode> nodes;
+    Vector<PendingSubtree> pending_subtrees;
+    if (!polygons.is_empty())
+        pending_subtrees.append({ move(polygons), no_bsp_node, false });
+
+    Vector<float, 8> vertex_distances;
+    while (!pending_subtrees.is_empty()) {
+        auto subtree = pending_subtrees.take_last();
+        auto node_index = nodes.size();
+        if (subtree.parent != no_bsp_node) {
+            if (subtree.is_front_child) {
+                nodes[subtree.parent].front = node_index;
+            } else {
+                nodes[subtree.parent].back = node_index;
+            }
+        }
+
+        auto splitter_index = subtree.polygons.size() / 2;
+        auto plane_normal = subtree.polygons[splitter_index].plane_normal;
+        auto plane_distance = subtree.polygons[splitter_index].plane_distance;
+
+        Vector<BSPPolygon> coplanar_polygons;
+        Vector<PartitionedPolygon> front_list;
+        Vector<PartitionedPolygon> back_list;
+        for (size_t polygon_index = 0; polygon_index < subtree.polygons.size(); ++polygon_index) {
+            auto& polygon = subtree.polygons[polygon_index];
+            if (polygon_index == splitter_index) {
+                coplanar_polygons.append(move(polygon.polygon));
+                continue;
+            }
+            vertex_distances.clear_with_capacity();
+            size_t front_count = 0;
+            size_t back_count = 0;
+            for (auto const& vertex : polygon.polygon.vertices) {
+                auto distance = plane_normal.dot(vertex) - plane_distance;
+                vertex_distances.append(distance);
+                if (distance > on_plane_threshold) {
+                    ++front_count;
+                } else if (distance < -on_plane_threshold) {
+                    ++back_count;
+                }
+            }
+
+            if (front_count == 0 && back_count == 0) {
+                coplanar_polygons.append(move(polygon.polygon));
+            } else if (back_count == 0) {
+                front_list.append(move(polygon));
+            } else if (front_count == 0) {
+                back_list.append(move(polygon));
+            } else {
+                auto [front_piece, back_piece] = split_polygon(move(polygon), vertex_distances);
+                if (front_piece.has_value())
+                    front_list.append(front_piece.release_value());
+                if (back_piece.has_value())
+                    back_list.append(back_piece.release_value());
+            }
+        }
+        nodes.append({ plane_normal, plane_distance, move(coplanar_polygons), no_bsp_node, no_bsp_node });
+
+        if (!front_list.is_empty())
+            pending_subtrees.append({ move(front_list), node_index, true });
+        if (!back_list.is_empty())
+            pending_subtrees.append({ move(back_list), node_index, false });
+    }
+    return nodes;
+}
+
+static Vector<BSPPolygon> collect_back_to_front(Vector<BSPTreeNode> nodes)
+{
+    Vector<BSPPolygon> ordered;
+    if (nodes.is_empty())
+        return ordered;
+
+    size_t polygon_count = 0;
+    for (auto const& node : nodes)
+        polygon_count += node.coplanar_polygons.size();
+    ordered.ensure_capacity(polygon_count);
+
+    struct TraversalStep {
+        size_t node_index { 0 };
+        bool ready_to_emit { false };
+    };
+    Vector<TraversalStep> traversal_stack;
+    traversal_stack.append({ 0, false });
+    while (!traversal_stack.is_empty()) {
+        auto step = traversal_stack.take_last();
+        auto& node = nodes[step.node_index];
+        // The subtree on the side of the plane the viewer is on paints last. Coplanar polygons paint in their stored
+        // paint order regardless of which way the plane faces.
+        auto far_subtree = node.plane_normal.z() > 0 ? node.back : node.front;
+        auto near_subtree = node.plane_normal.z() > 0 ? node.front : node.back;
+        if (!step.ready_to_emit) {
+            traversal_stack.append({ step.node_index, true });
+            if (far_subtree != no_bsp_node)
+                traversal_stack.append({ far_subtree, false });
+            continue;
+        }
+        for (auto& polygon : node.coplanar_polygons)
+            ordered.unchecked_append(move(polygon));
+        if (near_subtree != no_bsp_node)
+            traversal_stack.append({ near_subtree, false });
+    }
+    return ordered;
+}
+
+static bool all_planes_are_parallel(ReadonlySpan<PartitionedPolygon> polygons)
+{
+    // The cross product of two unit normals has the sine of the angle between the planes as its length.
+    // Below a microradian of tilt the planes are treated as parallel.
+    static constexpr float maximum_parallel_cross_length_squared = 1e-12f;
+    auto const& first_normal = polygons.first().plane_normal;
+    for (auto const& polygon : polygons.slice(1)) {
+        auto cross = polygon.plane_normal.cross(first_normal);
+        if (cross.dot(cross) > maximum_parallel_cross_length_squared)
+            return false;
+    }
+    return true;
+}
+
+static Vector<BSPPolygon> sort_parallel_polygons_back_to_front(Vector<PartitionedPolygon> polygons)
+{
+    // Fast path for parallel planes, where no splitting is needed.
+
+    auto axis = polygons.first().plane_normal;
+    if (axis.z() < 0)
+        axis = -axis;
+
+    struct DepthOrderedPolygon {
+        float depth { 0 };
+        size_t input_index { 0 };
+    };
+    Vector<DepthOrderedPolygon> order;
+    order.ensure_capacity(polygons.size());
+    for (size_t i = 0; i < polygons.size(); ++i) {
+        auto depth = polygons[i].plane_normal.dot(axis) > 0 ? polygons[i].plane_distance : -polygons[i].plane_distance;
+        order.unchecked_append({ depth, i });
+    }
+    quick_sort(order, [](DepthOrderedPolygon const& a, DepthOrderedPolygon const& b) {
+        if (a.depth != b.depth)
+            return a.depth < b.depth;
+        return a.input_index < b.input_index;
+    });
+
+    Vector<BSPPolygon> ordered;
+    ordered.ensure_capacity(order.size());
+    for (auto const& entry : order)
+        ordered.unchecked_append(move(polygons[entry.input_index].polygon));
+    return ordered;
+}
+
+Vector<BSPPolygon> split_and_sort_polygons_back_to_front(Vector<BSPPolygon> polygons)
+{
+    Vector<PartitionedPolygon> partitioned;
+    partitioned.ensure_capacity(polygons.size());
+    for (auto& polygon : polygons) {
+        auto normal = polygon_normal(polygon.vertices);
+        if (!normal.has_value())
+            continue;
+        auto distance = normal->dot(polygon.vertices.first());
+        partitioned.unchecked_append({ move(polygon), *normal, distance });
+    }
+
+    if (!partitioned.is_empty() && all_planes_are_parallel(partitioned))
+        return sort_parallel_polygons_back_to_front(move(partitioned));
+
+    return collect_back_to_front(build_bsp_tree(move(partitioned)));
+}
+
+}
+
+FILE: Libraries/LibGfx/BSPTree.h
+/*
+ * Copyright (c) 2026, Tim Ledbetter <tim.ledbetter@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Vector.h>
+#include <LibGfx/Matrix4x4.h>
+#include <LibGfx/Rect.h>
+#include <LibGfx/Vector3.h>
+
+namespace Gfx {
+
+// A convex polygon in the shared post-projection space of a three-dimensional scene, where x and y
+// are surface coordinates and the positive z-axis points toward the viewer. The plane index
+// identifies the plane the polygon was built from and is preserved on pieces produced by splitting.
+struct BSPPolygon {
+    Vector<FloatVector3, 8> vertices;
+    size_t plane_index { 0 };
+    bool clipped { false };
+};
+
+Vector<FloatVector3, 8> map_rect_through_projection(FloatMatrix4x4 const&, FloatRect const&);
+
+Vector<BSPPolygon> split_and_sort_polygons_back_to_front(Vector<BSPPolygon>);
+
+}
+
 FILE: Libraries/LibGfx/CanvasCommandList.cpp
 /*
  * Copyright (c) 2026, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
@@ -114893,6 +115228,7 @@ private:
 FILE: Libraries/LibGfx/CMakeLists.txt
 set(SOURCES
     AffineTransform.cpp
+    BSPTree.cpp
     Bitmap.cpp
     BitmapExport.cpp
     BitmapSequence.cpp
@@ -495868,6 +496204,7 @@ set(SOURCES
     Painting/BoxModelMetrics.cpp
     Painting/Canvas2DCommandStream.cpp
     Painting/ChromeWidget.cpp
+    Painting/DepthSortedReplayPlan.cpp
     Painting/DisplayList.cpp
     Painting/DisplayListCommand.cpp
     Painting/DisplayListDamage.cpp
@@ -559415,8 +559752,16 @@ WebIDL::ExceptionOr<bool> FontFaceSet::check(Utf16String const& font, Utf16Strin
 }
 
 // https://drafts.csswg.org/css-font-loading/#font-face-set-ready
-GC::Ref<WebIDL::Promise> FontFaceSet::ready() const
+GC::Ref<WebIDL::Promise> FontFaceSet::ready()
 {
+    // Pending style or layout changes can start a deferred font load. Flush them before returning an already fulfilled
+    // promise so switching the FontFaceSet to loading can replace it with a new pending promise.
+    if (WebIDL::is_promise_fulfilled(m_ready_promise)) {
+        auto& global = relevant_settings_object().global_object();
+        if (auto* window = HTML::window_from_global_object(global))
+            window->associated_document().update_layout(DOM::UpdateLayoutReason::FontFaceSetReady);
+    }
+
     return m_ready_promise;
 }
 
@@ -559489,6 +559834,16 @@ void FontFaceSet::switch_to_loaded()
         m_is_stuck_on_the_environment = true;
         return;
     }
+
+    // NB: Pending style or layout changes can depend on a recently loaded font or start another deferred font load.
+    auto& global = relevant_settings_object().global_object();
+    if (auto* window = HTML::window_from_global_object(global)) {
+        auto& document = window->associated_document();
+        if (!document.is_running_update_layout())
+            document.update_layout(DOM::UpdateLayoutReason::FontFaceSetReady);
+    }
+    if (!m_loading_fonts.is_empty())
+        return;
 
     // 3. Set font face set’s status attribute to "loaded".
     m_status = FontFaceSetLoadStatus::Loaded;
@@ -559663,7 +560018,7 @@ public:
     Vector<GC::Ref<FontFace>>& loaded_fonts() { return m_loaded_fonts; }
     Vector<GC::Ref<FontFace>>& failed_fonts() { return m_failed_fonts; }
 
-    GC::Ref<WebIDL::Promise> ready() const;
+    GC::Ref<WebIDL::Promise> ready();
     HTML::EnvironmentSettingsObject& relevant_settings_object() const { return *m_environment; }
     FontFaceSetLoadStatus status() const { return m_status; }
 
@@ -639108,6 +639463,7 @@ FILE: Libraries/LibWeb/DOM/Document.cpp
 #include <LibWeb/Infra/SerializedURL.h>
 #include <LibWeb/Infra/Strings.h>
 #include <LibWeb/IntersectionObserver/IntersectionObserver.h>
+#include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Layout/ScrollableOverflow.h>
@@ -640728,7 +641084,7 @@ void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed, Layout
     // contained-boxes map; refresh it before overflow measurement follows them. A pending full
     // recalculation rebuilds the map inside its own measurement traversal instead.
     if (layout_tree_changed == LayoutTreeChanged::Yes && !m_needs_full_scrollable_overflow_recalculation)
-        m_scrollable_overflow_contained_boxes_from_last_layout = Layout::collect_scrollable_overflow_contained_boxes(*m_layout_root);
+        Layout::collect_scrollable_overflow_contained_boxes(*m_layout_root, m_scrollable_overflow_contained_boxes_from_last_layout);
     if (layout_commit_scope == LayoutCommitScope::Full)
         update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates::HandledByFullLayoutCommit, boxes_needing_eager_overflow_measurement);
     else
@@ -640742,9 +641098,10 @@ void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed, Layout
 
     if (layout_tree_changed == LayoutTreeChanged::Yes) {
         // Broadcast the current viewport rect to any new paintables, so they know whether
-        // they're visible or not, and re-collect the content-visibility:auto set.
+        // they're visible or not. If necessary, re-collect the content-visibility:auto set.
         inform_all_viewport_clients_about_the_current_viewport_rect();
-        collect_paintable_boxes_with_auto_content_visibility();
+        if (m_may_have_content_visibility_auto_style)
+            collect_paintable_boxes_with_auto_content_visibility();
     }
 
     m_document->set_needs_repaint();
@@ -641128,8 +641485,8 @@ void Document::update_layout(UpdateLayoutReason reason)
             viewport_rect.width(),
             viewport_rect.height(),
             should_collect_devtools_layout_data);
-        m_scrollable_overflow_contained_boxes_from_last_layout = Layout::collect_scrollable_overflow_contained_boxes(
-            *m_layout_root, [&](Layout::Box const& box) {
+        Layout::collect_scrollable_overflow_contained_boxes(
+            *m_layout_root, m_scrollable_overflow_contained_boxes_from_last_layout, [&](Layout::Box const& box) {
                 auto paintable = box.paintable_box();
                 if (&box == m_layout_root.ptr() || box.is_scroll_container() || (paintable && !paintable->scroll_offset().is_zero()))
                     boxes_needing_eager_overflow_measurement.append(&box);
@@ -641143,10 +641500,8 @@ void Document::update_layout(UpdateLayoutReason reason)
 
         after_layout_commit(LayoutTreeChanged::Yes, LayoutCommitScope::Full, boxes_needing_eager_overflow_measurement);
 
-        m_layout_root->for_each_in_inclusive_subtree([](auto& node) {
-            node.reset_needs_layout_update();
-            return TraversalDecision::Continue;
-        });
+        Layout::RustFFI::layout_arena_reset_layout_update_flags_in_subtree(
+            layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root.ptr()));
 
         if constexpr (UPDATE_LAYOUT_DEBUG) {
             dbgln("LAYOUT {} {} µs", to_string(reason), timer.elapsed_time().to_microseconds());
@@ -641441,8 +641796,8 @@ void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpda
     };
 
     if (needs_full_recalculation) {
-        m_scrollable_overflow_contained_boxes_from_last_layout = Layout::collect_scrollable_overflow_contained_boxes(
-            *m_layout_root, [&](Layout::Box const& box) { record_and_clear_overflow_data(box); });
+        Layout::collect_scrollable_overflow_contained_boxes(
+            *m_layout_root, m_scrollable_overflow_contained_boxes_from_last_layout, [&](Layout::Box const& box) { record_and_clear_overflow_data(box); });
     } else {
         for (auto const& weak_paintable : pending_paintables) {
             auto paintable = weak_paintable.strong_ref();
@@ -641570,6 +641925,33 @@ void Document::update_paint_and_hit_testing_properties_if_needed()
     // the snapshot must be derived only after structure work is done.
     if (auto paintable = this->unsafe_paintable())
         paintable->refresh_scroll_state();
+}
+
+bool Document::can_compute_client_rects_without_accumulated_visual_contexts_update(Layout::Node const& layout_node) const
+{
+    if (!m_needs_accumulated_visual_contexts_update || !m_layout_root)
+        return false;
+
+    for (auto const* node = &layout_node; node; node = node->parent()) {
+        if (node->is_svg_box() || node->is_svg_svg_box() || node->is_svg_foreign_object_box())
+            return false;
+
+        auto const* node_with_style = as_if<Layout::NodeWithStyle>(*node);
+        if (!node_with_style)
+            continue;
+        if (node_with_style->has_css_transform() || node_with_style->perspective().has_value() || node_with_style->is_sticky_position())
+            return false;
+        if (m_may_have_default_scroll_shift_anchor) {
+            if (auto const* box = as_if<Layout::Box>(*node); box && box->default_scroll_shift_anchor())
+                return false;
+        }
+        // A scroll container's contents move, but its own border box does not.
+        if (node != &layout_node) {
+            if (auto paintable = node->paintable(); paintable && !paintable->scroll_offset().is_zero())
+                return false;
+        }
+    }
+    return true;
 }
 
 void Document::set_normal_link_color(Optional<Color> color)
@@ -644044,6 +644426,19 @@ void Document::decrement_number_of_things_delaying_the_load_event(Badge<Document
     page().client().page_did_update_resource_count(m_number_of_things_delaying_the_load_event);
 
     schedule_html_parser_end_check();
+}
+
+void Document::increment_number_of_pending_style_sheet_requests(Badge<DocumentLoadEventDelayer>)
+{
+    ++m_number_of_pending_style_sheet_requests;
+    page().client().request_frame();
+}
+
+void Document::decrement_number_of_pending_style_sheet_requests(Badge<DocumentLoadEventDelayer>)
+{
+    VERIFY(m_number_of_pending_style_sheet_requests);
+    --m_number_of_pending_style_sheet_requests;
+    page().client().request_frame();
 }
 
 void Document::set_html_parser_end_state(GC::Ptr<HTML::HTMLParserEndState> state)
@@ -649200,6 +649595,7 @@ enum class InvalidateLayoutTreeReason {
     X(EventHandlerHandleMouseWheel)          \
     X(EventHandlerRunActivationBehavior)     \
     X(EventHandlerShowContextMenu)           \
+    X(FontFaceSetReady)                      \
     X(HTMLElementGetTheTextSteps)            \
     X(HTMLElementOffsetHeight)               \
     X(HTMLElementOffsetLeft)                 \
@@ -649531,6 +649927,8 @@ public:
     bool update_style_for_element(AbstractElement const&);
     bool update_style_for_element(AbstractElement const&, StyleUpdateMode);
     void update_layout(UpdateLayoutReason);
+    void note_content_visibility_auto_style() { m_may_have_content_visibility_auto_style = true; }
+    void note_default_scroll_shift_anchor() { m_may_have_default_scroll_shift_anchor = true; }
     enum class PartialRelayoutResult : u8 {
         NotEligible,
         Done,
@@ -649783,6 +650181,9 @@ public:
 
     void add_pending_css_import_rule(Badge<CSS::CSSImportRule>, GC::Ref<CSS::CSSImportRule>);
     void remove_pending_css_import_rule(Badge<CSS::CSSImportRule>, GC::Ref<CSS::CSSImportRule>);
+    bool has_pending_style_sheet_requests() const { return m_number_of_pending_style_sheet_requests > 0 || !m_pending_css_import_rules.is_empty(); }
+    void increment_number_of_pending_style_sheet_requests(Badge<DocumentLoadEventDelayer>);
+    void decrement_number_of_pending_style_sheet_requests(Badge<DocumentLoadEventDelayer>);
 
     bool page_showing() const { return m_page_showing; }
     void set_page_showing(bool);
@@ -650181,6 +650582,7 @@ public:
     void record_layout_tree_build(u64 rebuilt_subtree_root_count, bool escaped_rebuild_roots);
 
     void set_needs_accumulated_visual_contexts_update(bool);
+    bool can_compute_client_rects_without_accumulated_visual_contexts_update(Layout::Node const&) const;
     void schedule_accumulated_visual_context_value_update(Element&);
     void schedule_accumulated_visual_context_value_update(Layout::Node const&);
     void schedule_scrollable_overflow_recalculation(Element&);
@@ -650556,6 +650958,8 @@ private:
 
     RefPtr<Layout::NodeArena> m_layout_node_arena;
     RefPtr<Layout::Viewport> m_layout_root;
+    bool m_may_have_content_visibility_auto_style { false };
+    bool m_may_have_default_scroll_shift_anchor { false };
 
     GC::Ptr<Node> m_hovered_node;
     GC::Ptr<Node> m_inspected_node;
@@ -650664,6 +651068,7 @@ private:
     HashTable<GC::Ref<DOM::Element>> m_script_blocking_style_sheet_set;
 
     HashTable<GC::Ref<CSS::CSSImportRule>> m_pending_css_import_rules;
+    size_t m_number_of_pending_style_sheet_requests { 0 };
 
     GC::Ptr<HTML::History> m_history;
 
@@ -651307,14 +651712,18 @@ FILE: Libraries/LibWeb/DOM/DocumentLoadEventDelayer.cpp
 
 namespace Web::DOM {
 
-DocumentLoadEventDelayer::DocumentLoadEventDelayer(Document& document)
+DocumentLoadEventDelayer::DocumentLoadEventDelayer(Document& document, DocumentLoadEventDelayerReason reason)
     : m_document(document)
+    , m_reason(reason)
 {
     m_document->increment_number_of_things_delaying_the_load_event({});
+    if (m_reason == DocumentLoadEventDelayerReason::StyleSheetRequest)
+        m_document->increment_number_of_pending_style_sheet_requests({});
 }
 
 DocumentLoadEventDelayer::DocumentLoadEventDelayer(DocumentLoadEventDelayer&& delayer)
     : m_document(move(delayer.m_document))
+    , m_reason(delayer.m_reason)
 {
     delayer.m_document = nullptr;
 }
@@ -651324,10 +651733,14 @@ DocumentLoadEventDelayer& DocumentLoadEventDelayer::operator=(DocumentLoadEventD
     if (this == &delayer)
         return *this;
 
-    if (m_document)
+    if (m_document) {
+        if (m_reason == DocumentLoadEventDelayerReason::StyleSheetRequest)
+            m_document->decrement_number_of_pending_style_sheet_requests({});
         m_document->decrement_number_of_things_delaying_the_load_event({});
+    }
 
     m_document = move(delayer.m_document);
+    m_reason = delayer.m_reason;
     delayer.m_document = nullptr;
 
     return *this;
@@ -651335,8 +651748,11 @@ DocumentLoadEventDelayer& DocumentLoadEventDelayer::operator=(DocumentLoadEventD
 
 DocumentLoadEventDelayer::~DocumentLoadEventDelayer()
 {
-    if (m_document)
+    if (m_document) {
+        if (m_reason == DocumentLoadEventDelayerReason::StyleSheetRequest)
+            m_document->decrement_number_of_pending_style_sheet_requests({});
         m_document->decrement_number_of_things_delaying_the_load_event({});
+    }
 }
 
 }
@@ -651356,11 +651772,16 @@ FILE: Libraries/LibWeb/DOM/DocumentLoadEventDelayer.h
 
 namespace Web::DOM {
 
+enum class DocumentLoadEventDelayerReason {
+    Other,
+    StyleSheetRequest,
+};
+
 class DocumentLoadEventDelayer {
     AK_MAKE_NONCOPYABLE(DocumentLoadEventDelayer);
 
 public:
-    explicit DocumentLoadEventDelayer(Document&);
+    explicit DocumentLoadEventDelayer(Document&, DocumentLoadEventDelayerReason = DocumentLoadEventDelayerReason::Other);
 
     DocumentLoadEventDelayer(DocumentLoadEventDelayer&&);
     DocumentLoadEventDelayer& operator=(DocumentLoadEventDelayer&&);
@@ -651369,6 +651790,7 @@ public:
 
 private:
     GC::Weak<Document> m_document;
+    DocumentLoadEventDelayerReason m_reason { DocumentLoadEventDelayerReason::Other };
 };
 
 }
@@ -656108,13 +656530,21 @@ CSSPixelRect Element::get_bounding_client_rect() const
     return bounding_rect_from_client_rects(get_client_rects());
 }
 
-static void append_transformed_border_box_rect(Vector<CSSPixelRect>& rects, Painting::Paintable const& paintable_box)
+enum class VisualContextTransform {
+    Apply,
+    Identity,
+};
+
+static void append_border_box_rect(Vector<CSSPixelRect>& rects, Painting::Paintable const& paintable_box, VisualContextTransform visual_context_transform)
 {
     auto absolute_rect = paintable_box.absolute_border_box_rect();
-    rects.append(paintable_box.transform_rect_to_viewport(absolute_rect, Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No));
+    if (visual_context_transform == VisualContextTransform::Identity)
+        rects.append(absolute_rect);
+    else
+        rects.append(paintable_box.transform_rect_to_viewport(absolute_rect, Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No));
 }
 
-static Vector<CSSPixelRect> compute_client_rects_assuming_layout_clean(Element const& element)
+static Vector<CSSPixelRect> compute_client_rects_assuming_layout_clean(Element const& element, VisualContextTransform visual_context_transform = VisualContextTransform::Apply)
 {
     // 1. If the element on which it was invoked does not have an associated layout box return an empty DOMRectList
     //    object and stop this algorithm.
@@ -656139,17 +656569,20 @@ static Vector<CSSPixelRect> compute_client_rects_assuming_layout_clean(Element c
             if (piece.is_geometry_only_placeholder)
                 return;
             auto absolute_rect = inline_paintable->absolute_piece_border_box_rect(piece);
-            rects.append(inline_paintable->transform_rect_to_viewport(absolute_rect, Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No));
+            if (visual_context_transform == VisualContextTransform::Identity)
+                rects.append(absolute_rect);
+            else
+                rects.append(inline_paintable->transform_rect_to_viewport(absolute_rect, Painting::AccumulatedVisualContextTree::IncludeVisualViewportTransform::No));
         });
         // An inline element whose content is only interrupting blocks generates no line fragments, but per CSSOM
         // we still report its (zero-sized) border area instead of an empty list.
         if (rects.is_empty())
-            append_transformed_border_box_rect(rects, *inline_paintable);
+            append_border_box_rect(rects, *inline_paintable, visual_context_transform);
         return rects;
     }
 
     if (auto paintable_box = element.paintable_box()) {
-        append_transformed_border_box_rect(rects, *paintable_box);
+        append_border_box_rect(rects, *paintable_box, visual_context_transform);
     } else if (element.paintable()) {
         dbgln("FIXME: Failed to get client rects for element ({})", element.debug_description());
     }
@@ -656169,6 +656602,9 @@ Vector<CSSPixelRect> Element::get_client_rects() const
 
     if (!layout_node())
         return {};
+
+    if (document().can_compute_client_rects_without_accumulated_visual_contexts_update(*layout_node()))
+        return compute_client_rects_assuming_layout_clean(*this, VisualContextTransform::Identity);
 
     // NOTE: Make sure CSS transforms are resolved before they are used to calculate the rect position.
     const_cast<Document&>(document()).update_paint_and_hit_testing_properties_if_needed();
@@ -665778,456 +666214,3 @@ FILE: Libraries/LibWeb/DOM/NamedNodeMap.cpp
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/DOM/Attr.h>
 #include <LibWeb/DOM/Document.h>
-#include <LibWeb/DOM/NamedNodeMap.h>
-#include <LibWeb/Infra/Strings.h>
-#include <LibWeb/Namespace.h>
-#include <LibWeb/TrustedTypes/TrustedTypePolicy.h>
-
-namespace Web::DOM {
-
-GC_DEFINE_ALLOCATOR(NamedNodeMap);
-
-static bool contains_ascii_uppercase(Utf16View string)
-{
-    for (auto code_unit : string) {
-        if (is_ascii_upper_alpha(code_unit))
-            return true;
-    }
-    return false;
-}
-
-GC::Ref<NamedNodeMap> NamedNodeMap::create(Element& element)
-{
-    return GC::Heap::the().allocate<NamedNodeMap>(element);
-}
-
-NamedNodeMap::NamedNodeMap(Element& element)
-    : m_element(element)
-{
-}
-
-void NamedNodeMap::visit_edges(GC::Cell::Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-    visitor.visit(m_element);
-    visitor.visit(m_attribute_nodes);
-}
-
-size_t NamedNodeMap::length() const
-{
-    return associated_element().attribute_list_size();
-}
-
-GC::Ptr<Attr> NamedNodeMap::find_attribute_node(QualifiedName const& name) const
-{
-    for (auto& attribute : m_attribute_nodes) {
-        if (attribute->namespace_uri() == name.namespace_() && attribute->local_name() == name.local_name())
-            return attribute;
-    }
-    return nullptr;
-}
-
-GC::Ref<Attr> NamedNodeMap::ensure_attribute_node(QualifiedName const& name) const
-{
-    if (auto attribute = find_attribute_node(name))
-        return *attribute;
-    auto& element = const_cast<Element&>(associated_element());
-    auto attribute = Attr::create(element.document(), name, {}, element);
-    m_attribute_nodes.append(attribute);
-    return attribute;
-}
-
-// https://dom.spec.whatwg.org/#ref-for-dfn-supported-property-names%E2%91%A0
-Vector<Utf16FlyString> NamedNodeMap::supported_property_names() const
-{
-    // 1. Let names be the qualified names of the attributes in this NamedNodeMap object’s attribute list, with duplicates omitted, in order.
-    Vector<Utf16FlyString> names;
-    names.ensure_capacity(length());
-
-    for (size_t index = 0; index < length(); ++index) {
-        auto name = associated_element().m_attributes->at(index).name.as_string();
-        if (!names.contains_slow(name))
-            names.append(move(name));
-    }
-
-    // 2. If this NamedNodeMap object’s element is in the HTML namespace and its node document is an HTML document, then for each name of names:
-    if (associated_element().namespace_uri() == Namespace::HTML && associated_element().document().is_html_document()) {
-        // 1. Let lowercaseName be name, in ASCII lowercase.
-        // 2. If lowercaseName is not equal to name, remove name from names.
-        names.remove_all_matching([](auto const& name) { return contains_ascii_uppercase(name.view()); });
-    }
-
-    // 3. Return names.
-    return names;
-}
-
-// https://dom.spec.whatwg.org/#dom-namednodemap-item
-GC::Ptr<Attr> NamedNodeMap::item(u32 index) const
-{
-    // 1. If index is equal to or greater than this’s attribute list’s size, then return null.
-    if (index >= length())
-        return nullptr;
-
-    // 2. Otherwise, return this’s attribute list[index].
-    auto name = associated_element().m_attributes->at(index).name;
-    return ensure_attribute_node(move(name));
-}
-
-// https://dom.spec.whatwg.org/#dom-namednodemap-getnameditem
-GC::Ptr<Attr> NamedNodeMap::get_named_item(Utf16FlyString const& qualified_name) const
-{
-    return get_attribute(qualified_name);
-}
-
-// https://dom.spec.whatwg.org/#dom-namednodemap-getnameditemns
-GC::Ptr<Attr> NamedNodeMap::get_named_item_ns(Optional<Utf16FlyString> const& namespace_, Utf16FlyString const& local_name) const
-{
-    return get_attribute_ns(namespace_, local_name);
-}
-
-// https://dom.spec.whatwg.org/#dom-namednodemap-setnameditem
-WebIDL::ExceptionOr<GC::Ptr<Attr>> NamedNodeMap::set_named_item(Attr& attribute)
-{
-    return set_attribute(GC::Ref { attribute });
-}
-
-// https://dom.spec.whatwg.org/#dom-namednodemap-setnameditemns
-WebIDL::ExceptionOr<GC::Ptr<Attr>> NamedNodeMap::set_named_item_ns(Attr& attribute)
-{
-    return set_attribute(GC::Ref { attribute });
-}
-
-// https://dom.spec.whatwg.org/#dom-namednodemap-removenameditem
-WebIDL::ExceptionOr<GC::Ref<Attr>> NamedNodeMap::remove_named_item(Utf16FlyString const& qualified_name)
-{
-    // 1. Let attr be the result of removing an attribute given qualifiedName and element.
-    auto attribute = remove_attribute(qualified_name);
-
-    // 2. If attr is null, then throw a "NotFoundError" DOMException.
-    if (!attribute)
-        return WebIDL::NotFoundError::create(Utf16String::formatted("Attribute with name '{}' not found", qualified_name));
-
-    // 3. Return attr.
-    return GC::Ref { *attribute };
-}
-
-// https://dom.spec.whatwg.org/#dom-namednodemap-removenameditemns
-WebIDL::ExceptionOr<GC::Ref<Attr>> NamedNodeMap::remove_named_item_ns(Optional<Utf16FlyString> const& namespace_, Utf16FlyString const& local_name)
-{
-    // 1. Let attr be the result of removing an attribute given namespace, localName, and element.
-    auto attribute = remove_attribute_ns(namespace_, local_name);
-
-    // 2. If attr is null, then throw a "NotFoundError" DOMException.
-    if (!attribute)
-        return WebIDL::NotFoundError::create(Utf16String::formatted("Attribute with namespace '{}' and local name '{}' not found", namespace_, local_name));
-
-    // 3. Return attr.
-    return GC::Ref { *attribute };
-}
-
-// https://dom.spec.whatwg.org/#concept-element-attributes-get-by-name
-GC::Ptr<Attr> NamedNodeMap::get_attribute(Utf16FlyString const& qualified_name, size_t* item_index) const
-{
-    if (item_index)
-        *item_index = 0;
-    auto index = associated_element().find_attribute_index(qualified_name);
-    if (!index.has_value())
-        return nullptr;
-    if (item_index)
-        *item_index = *index;
-    auto name = associated_element().m_attributes->at(*index).name;
-    return ensure_attribute_node(move(name));
-}
-
-// https://dom.spec.whatwg.org/#concept-element-attributes-get-by-namespace
-GC::Ptr<Attr> NamedNodeMap::get_attribute_ns(Optional<Utf16FlyString> const& namespace_, Utf16FlyString const& local_name, size_t* item_index) const
-{
-    if (item_index)
-        *item_index = 0;
-    auto index = associated_element().find_attribute_index_ns(namespace_, local_name);
-    if (!index.has_value())
-        return nullptr;
-    if (item_index)
-        *item_index = *index;
-    auto name = associated_element().m_attributes->at(*index).name;
-    return ensure_attribute_node(move(name));
-}
-
-// https://dom.spec.whatwg.org/#concept-element-attributes-set
-WebIDL::ExceptionOr<GC::Ptr<Attr>> NamedNodeMap::set_attribute(GC::Ref<Attr> attribute)
-{
-    // 1. Let verifiedValue be the result of calling get Trusted Types-compliant attribute value
-    //    with attr’s local name, attr’s namespace, element, and attr’s value
-    auto const verifiedValue = TRY(TrustedTypes::get_trusted_types_compliant_attribute_value(
-        attribute->local_name(),
-        attribute->namespace_uri(),
-        associated_element(),
-        attribute->value()));
-
-    // 2. If attr’s element is neither null nor element, throw an "InUseAttributeError" DOMException.
-    if ((attribute->owner_element() != nullptr) && (attribute->owner_element() != &associated_element()))
-        return WebIDL::InUseAttributeError::create("Attribute must not already be in use"_utf16);
-
-    // 3. Let oldAttr be the result of getting an attribute given attr’s namespace, attr’s local name, and element.
-    size_t old_attribute_index = 0;
-    auto old_attribute = get_attribute_ns(attribute->namespace_uri(), attribute->local_name(), &old_attribute_index);
-
-    // 4. If oldAttr is attr, return attr.
-    if (old_attribute == attribute)
-        return attribute;
-
-    // 5. Set attr’s value to verifiedValue.
-    TRY(attribute->set_value(verifiedValue));
-
-    // 6. If oldAttr is non-null, then replace oldAttr with attr.
-    if (old_attribute) {
-        replace_attribute(*old_attribute, attribute, old_attribute_index);
-    }
-    // 7. Otherwise, append attr to element.
-    else {
-        append_attribute(attribute);
-    }
-
-    // 8. Return oldAttr.
-    return old_attribute;
-}
-
-// https://dom.spec.whatwg.org/#concept-element-attributes-replace
-void NamedNodeMap::replace_attribute(GC::Ref<Attr> old_attribute, GC::Ref<Attr> new_attribute, size_t old_attribute_index)
-{
-    VERIFY(old_attribute->owner_element());
-
-    // 1. Let element be oldAttribute’s element.
-    auto* element = old_attribute->owner_element();
-
-    // 2. Replace oldAttribute by newAttribute in element’s attribute list.
-    auto old_value = element->m_attributes->at(old_attribute_index).value;
-    auto new_name = new_attribute->m_qualified_name;
-    auto new_value = new_attribute->value();
-    element->m_attributes->at(old_attribute_index) = { new_name, new_value };
-
-    // 3. Set newAttribute’s element to element.
-    new_attribute->set_owner_element(element);
-
-    // 4. Set newAttribute’s node document to element’s node document.
-    new_attribute->set_document(Badge<NamedNodeMap> {}, element->document());
-
-    // 5. Set oldAttribute’s element to null.
-    detach_attribute_node(old_attribute->m_qualified_name, old_value);
-    m_attribute_nodes.append(new_attribute);
-
-    // 6. Handle attribute changes for oldAttribute with element, oldAttribute’s value, and newAttribute’s value.
-    element->handle_attribute_changes(move(new_name), move(old_value), move(new_value));
-}
-
-// https://dom.spec.whatwg.org/#concept-element-attributes-append
-void NamedNodeMap::append_attribute(GC::Ref<Attr> attribute)
-{
-    // 1. Append attribute to element’s attribute list.
-    auto value = attribute->value();
-    associated_element().ensure_attribute_list().empend(attribute->m_qualified_name, value);
-
-    // 2. Set attribute’s element to element.
-    attribute->set_owner_element(&associated_element());
-
-    // 3. Set attribute’s node document to element’s node document.
-    attribute->set_document(Badge<NamedNodeMap> {}, associated_element().document());
-    m_attribute_nodes.append(attribute);
-
-    // 4. Handle attribute changes for attribute with element, null, and attribute’s value.
-    associated_element().handle_attribute_changes(attribute->m_qualified_name, {}, value);
-}
-
-void NamedNodeMap::detach_attribute_node(QualifiedName const& name, Utf16String value)
-{
-    for (size_t index = 0; index < m_attribute_nodes.size(); ++index) {
-        auto& attribute = m_attribute_nodes[index];
-        if (attribute->namespace_uri() != name.namespace_() || attribute->local_name() != name.local_name())
-            continue;
-        attribute->detach_from_element(move(value));
-        m_attribute_nodes.remove(index);
-        return;
-    }
-}
-
-// https://dom.spec.whatwg.org/#concept-element-attributes-remove
-void NamedNodeMap::remove_attribute_at_index(size_t attribute_index)
-{
-    associated_element().remove_attribute_at(attribute_index);
-}
-
-// https://dom.spec.whatwg.org/#concept-element-attributes-remove-by-name
-GC::Ptr<Attr> NamedNodeMap::remove_attribute(Utf16FlyString const& qualified_name)
-{
-    size_t item_index = 0;
-
-    // 1. Let attr be the result of getting an attribute given qualifiedName and element.
-    auto attribute = get_attribute(qualified_name, &item_index);
-
-    // 2. If attr is non-null, then remove attr.
-    if (attribute)
-        remove_attribute_at_index(item_index);
-
-    // 3. Return attr.
-    return attribute;
-}
-
-// https://dom.spec.whatwg.org/#concept-element-attributes-remove-by-namespace
-GC::Ptr<Attr> NamedNodeMap::remove_attribute_ns(Optional<Utf16FlyString> const& namespace_, Utf16FlyString const& local_name)
-{
-    size_t item_index = 0;
-
-    // 1. Let attr be the result of getting an attribute given namespace, localName, and element.
-    auto attribute = get_attribute_ns(namespace_, local_name, &item_index);
-
-    // 2. If attr is non-null, then remove attr.
-    if (attribute)
-        remove_attribute_at_index(item_index);
-
-    // 3. Return attr.
-    return attribute;
-}
-
-// https://dom.spec.whatwg.org/#dom-element-removeattributenode
-WebIDL::ExceptionOr<GC::Ref<Attr>> NamedNodeMap::remove_attribute_node(GC::Ref<Attr> attr)
-{
-    // 1. If this’s attribute list does not contain attr, then throw a "NotFoundError" DOMException.
-    if (attr->owner_element() != &associated_element())
-        return WebIDL::NotFoundError::create("Attribute not found"_utf16);
-
-    auto index = associated_element().find_attribute_index_ns(attr->namespace_uri(), attr->local_name());
-    if (!index.has_value())
-        return WebIDL::NotFoundError::create("Attribute not found"_utf16);
-
-    // 2. Remove attr.
-    remove_attribute_at_index(*index);
-
-    // 3. Return attr.
-    return attr;
-}
-
-}
-
-FILE: Libraries/LibWeb/DOM/NamedNodeMap.h
-/*
- * Copyright (c) 2021, Tim Flynn <trflynn89@serenityos.org>
- * Copyright (c) 2022, Andreas Kling <andreas@ladybird.org>
- * Copyright (c) 2022, Alexander Narsudinov <a.narsudinov@gmail.com>
- * Copyright (c) 2023, Luke Wilde <lukew@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <LibWeb/Bindings/Wrappable.h>
-#include <LibWeb/Export.h>
-#include <LibWeb/Forward.h>
-#include <LibWeb/WebIDL/ExceptionOr.h>
-
-namespace Web::DOM {
-
-// https://dom.spec.whatwg.org/#interface-namednodemap
-class WEB_API NamedNodeMap : public Bindings::GCAllocatedWrappable {
-    WEB_WRAPPABLE(NamedNodeMap, Bindings::GCAllocatedWrappable);
-    GC_DECLARE_ALLOCATOR(NamedNodeMap);
-
-public:
-    [[nodiscard]] static GC::Ref<NamedNodeMap> create(Element&);
-    ~NamedNodeMap() = default;
-
-    virtual Vector<Utf16FlyString> supported_property_names() const override;
-
-    size_t length() const;
-    bool is_empty() const { return length() == 0; }
-
-    // Methods defined by the spec for JavaScript:
-    GC::Ptr<Attr> item(u32 index) const;
-    GC::Ptr<Attr> get_named_item(Utf16FlyString const& qualified_name) const;
-    GC::Ptr<Attr> get_named_item_ns(Optional<Utf16FlyString> const& namespace_, Utf16FlyString const& local_name) const;
-    WebIDL::ExceptionOr<GC::Ptr<Attr>> set_named_item(Attr& attribute);
-    WebIDL::ExceptionOr<GC::Ptr<Attr>> set_named_item_ns(Attr& attribute);
-    WebIDL::ExceptionOr<GC::Ref<Attr>> remove_named_item(Utf16FlyString const& qualified_name);
-    WebIDL::ExceptionOr<GC::Ref<Attr>> remove_named_item_ns(Optional<Utf16FlyString> const& namespace_, Utf16FlyString const& local_name);
-
-    // Methods defined by the spec for internal use:
-    GC::Ptr<Attr> get_attribute(Utf16FlyString const& qualified_name, size_t* item_index = nullptr) const;
-    WebIDL::ExceptionOr<GC::Ptr<Attr>> set_attribute(GC::Ref<Attr> attribute);
-    void replace_attribute(GC::Ref<Attr> old_attribute, GC::Ref<Attr> new_attribute, size_t old_attribute_index);
-    void append_attribute(GC::Ref<Attr> attribute);
-    void detach_attribute_node(QualifiedName const&, Utf16String value);
-
-    GC::Ptr<Attr> get_attribute_ns(Optional<Utf16FlyString> const& namespace_, Utf16FlyString const& local_name, size_t* item_index = nullptr) const;
-
-    GC::Ptr<Attr> remove_attribute(Utf16FlyString const& qualified_name);
-    GC::Ptr<Attr> remove_attribute_ns(Optional<Utf16FlyString> const& namespace_, Utf16FlyString const& local_name);
-
-    WebIDL::ExceptionOr<GC::Ref<Attr>> remove_attribute_node(GC::Ref<Attr>);
-
-private:
-    explicit NamedNodeMap(Element&);
-
-    virtual void visit_edges(GC::Cell::Visitor&) override;
-
-    Element& associated_element() { return *m_element; }
-    Element const& associated_element() const { return *m_element; }
-
-    void remove_attribute_at_index(size_t attribute_index);
-    GC::Ptr<Attr> find_attribute_node(QualifiedName const&) const;
-    GC::Ref<Attr> ensure_attribute_node(QualifiedName const&) const;
-
-    GC::Ref<DOM::Element> m_element;
-    mutable Vector<GC::Ref<Attr>> m_attribute_nodes;
-};
-
-}
-
-FILE: Libraries/LibWeb/DOM/NamedNodeMap.idl
-// https://dom.spec.whatwg.org/#interface-namednodemap
-[Exposed=Window, LegacyUnenumerableNamedProperties]
-interface NamedNodeMap {
-    readonly attribute unsigned long length;
-
-    getter Attr? item(unsigned long index);
-    getter Attr? getNamedItem([Utf16FlyString] Utf16DOMString qualifiedName);
-    Attr? getNamedItemNS([Utf16FlyString] Utf16DOMString? namespace, [Utf16FlyString] Utf16DOMString localName);
-
-    [CEReactions] Attr? setNamedItem(Attr attr);
-    [CEReactions] Attr? setNamedItemNS(Attr attr);
-    [CEReactions] Attr removeNamedItem([Utf16FlyString] Utf16DOMString qualifiedName);
-    [CEReactions] Attr removeNamedItemNS([Utf16FlyString] Utf16DOMString? namespace, [Utf16FlyString] Utf16DOMString localName);
-};
-
-FILE: Libraries/LibWeb/DOM/Node.cpp
-/*
- * Copyright (c) 2018-2024, Andreas Kling <andreas@ladybird.org>
- * Copyright (c) 2021-2022, Linus Groh <linusg@serenityos.org>
- * Copyright (c) 2021, Luke Wilde <lukew@serenityos.org>
- * Copyright (c) 2024-2025, Jelle Raaijmakers <jelle@ladybird.org>
- * Copyright (c) 2025, Shannon Booth <shannon@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <AK/HashTable.h>
-#include <AK/JsonObjectSerializer.h>
-#include <AK/NeverDestroyed.h>
-#include <AK/Utf16StringBuilder.h>
-#include <LibGC/ConservativeVector.h>
-#include <LibGC/DeferGC.h>
-#include <LibGC/Heap.h>
-#include <LibGC/WeakHashMap.h>
-#include <LibJS/Runtime/ExternalMemory.h>
-#include <LibWeb/Animations/Animation.h>
-#include <LibWeb/Bindings/Node.h>
-#include <LibWeb/CSS/ComputedValues.h>
-#include <LibWeb/CSS/GeneratedContent.h>
-#include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
-#include <LibWeb/CSS/Invalidation/LanguageInvalidator.h>
-#include <LibWeb/CSS/Invalidation/PseudoClassInvalidator.h>
-#include <LibWeb/CSS/SelectorMatching.h>
-#include <LibWeb/CSS/StyleComputer.h>
-#include <LibWeb/CSS/StyleEngineInput.h>
-#include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
-#include <LibWeb/DOM/AccessibilityTreeNode.h>
-#include <LibWeb/DOM/Attr.h>
