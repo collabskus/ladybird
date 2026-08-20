@@ -269,8 +269,10 @@ static TransformData transform_data_from_export(Layout::RustFFI::FfiVisualContex
     return TransformData {
         .matrix = matrix_from_export(node.matrix),
         .origin = { node.origin[0], node.origin[1] },
+        .sorting_context_root_index = node.has_sorting_context_root ? Optional<VisualContextIndex> { VisualContextIndex { node.index_value } } : OptionalNone {},
         .flattens_inherited_transform = node.flattens_inherited_transform,
         .role = static_cast<TransformDataRole>(node.transform_role),
+        .synthetic_plane = node.synthetic_plane,
     };
 }
 
@@ -845,6 +847,7 @@ Layout::RustFFI::FfiPaintHostCallbacks paint_host_callbacks(PaintHostContext& co
                     out.present = true;
                     write_css_rect(scrollbar_data->gutter_rect, out.gutter_rect);
                     write_css_rect(scrollbar_data->thumb_rect, out.thumb_rect);
+                    write_css_rect(scrollbar_data->track_rect, out.track_rect);
                     out.thumb_travel_to_scroll_ratio = scrollbar_data->thumb_travel_to_scroll_ratio.to_double();
                 }
             }

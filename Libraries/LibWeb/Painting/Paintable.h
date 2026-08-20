@@ -26,8 +26,6 @@
 #include <LibWeb/CSS/StyleValues/AbstractImageStyleValue.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/InvalidateDisplayList.h>
-#include <LibWeb/Layout/FlexLayoutData.h>
-#include <LibWeb/Layout/GridLayoutData.h>
 #include <LibWeb/Layout/NodeArena.h>
 #include <LibWeb/Painting/AccumulatedVisualContext.h>
 #include <LibWeb/Painting/BorderRadiiData.h>
@@ -419,6 +417,7 @@ public:
     struct ScrollbarData {
         CSSPixelRect gutter_rect;
         CSSPixelRect thumb_rect;
+        CSSPixelRect track_rect;
         CSSPixelFraction thumb_travel_to_scroll_ratio { 0 };
     };
     enum class ScrollDirection {
@@ -479,8 +478,8 @@ public:
 
     Optional<UsedGridTrackList> used_values_for_grid_template_columns() const;
     Optional<UsedGridTrackList> used_values_for_grid_template_rows() const;
-    OwnPtr<Layout::GridLayoutData> grid_layout_data() const;
-    OwnPtr<Layout::FlexLayoutData> flex_layout_data() const;
+    Optional<String> grid_layout_json(UniqueNodeID container_node_id) const;
+    Optional<String> flex_layout_json(UniqueNodeID container_node_id) const;
 
     [[nodiscard]] bool has_accumulated_visual_context() const { return rust_data().has_accumulated_visual_context; }
     [[nodiscard]] VisualContextIndex accumulated_visual_context_index() const { return VisualContextIndex { rust_data().accumulated_visual_context_index }; }

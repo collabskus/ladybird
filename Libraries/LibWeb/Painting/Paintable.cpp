@@ -1375,7 +1375,7 @@ Optional<Paintable::ScrollbarData> Paintable::compute_scrollbar_data(ScrollDirec
     CSSPixels min_thumb_length = min(usable_scrollbar_length, metrics.scroll_thumb_min_length);
     CSSPixels thumb_length = max(usable_scrollbar_length * (scrollport_size / scrollable_overflow_length), min_thumb_length);
 
-    ScrollbarData scrollbar_data = { .gutter_rect = {}, .thumb_rect = scrollbar_rect.value(), .thumb_travel_to_scroll_ratio = 0 };
+    ScrollbarData scrollbar_data = { .gutter_rect = {}, .thumb_rect = scrollbar_rect.value(), .track_rect = scrollbar_rect.value(), .thumb_travel_to_scroll_ratio = 0 };
 
     if (scrollable_overflow_length > scrollport_size)
         scrollbar_data.thumb_travel_to_scroll_ratio = (usable_scrollbar_length - thumb_length) / (scrollable_overflow_length - scrollport_size);
@@ -1420,22 +1420,22 @@ Optional<UsedGridTrackList> Paintable::used_values_for_grid_template_rows() cons
     return result;
 }
 
-OwnPtr<Layout::GridLayoutData> Paintable::grid_layout_data() const
+Optional<String> Paintable::grid_layout_json(UniqueNodeID container_node_id) const
 {
-    OwnPtr<Layout::GridLayoutData> result;
-    Layout::RustFFI::layout_arena_paintable_grid_layout_data(rust_arena().handle(), rust_slot(), &result,
-        [](void* context, Layout::RustFFI::FfiGridLayoutData const* data) {
-            *static_cast<OwnPtr<Layout::GridLayoutData>*>(context) = Layout::build_grid_layout_data(*data);
+    Optional<String> result;
+    Layout::RustFFI::layout_arena_paintable_grid_layout_json(rust_arena().handle(), rust_slot(), container_node_id.value(), &result,
+        [](void* context, u8 const* bytes, size_t length) {
+            *static_cast<Optional<String>*>(context) = MUST(String::from_utf8(StringView { bytes, length }));
         });
     return result;
 }
 
-OwnPtr<Layout::FlexLayoutData> Paintable::flex_layout_data() const
+Optional<String> Paintable::flex_layout_json(UniqueNodeID container_node_id) const
 {
-    OwnPtr<Layout::FlexLayoutData> result;
-    Layout::RustFFI::layout_arena_paintable_flex_layout_data(rust_arena().handle(), rust_slot(), &result,
-        [](void* context, Layout::RustFFI::FfiFlexLayoutData const* data) {
-            *static_cast<OwnPtr<Layout::FlexLayoutData>*>(context) = Layout::build_flex_layout_data(*data);
+    Optional<String> result;
+    Layout::RustFFI::layout_arena_paintable_flex_layout_json(rust_arena().handle(), rust_slot(), container_node_id.value(), &result,
+        [](void* context, u8 const* bytes, size_t length) {
+            *static_cast<Optional<String>*>(context) = MUST(String::from_utf8(StringView { bytes, length }));
         });
     return result;
 }
