@@ -89340,6 +89340,7 @@ FILE: Libraries/LibDatabase/Database.cpp
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/ByteBuffer.h>
 #include <AK/ByteString.h>
 #include <AK/String.h>
 #include <AK/Time.h>
@@ -89380,6 +89381,7 @@ static constexpr StringView sql_error(int error_code)
     __ENUMERATE_TYPE(String)       \
     __ENUMERATE_TYPE(Utf16String)  \
     __ENUMERATE_TYPE(ByteString)   \
+    __ENUMERATE_TYPE(ByteBuffer)   \
     __ENUMERATE_TYPE(UnixDateTime) \
     __ENUMERATE_TYPE(i8)           \
     __ENUMERATE_TYPE(i16)          \
@@ -89578,7 +89580,7 @@ ErrorOr<void> Database::try_apply_placeholder(StatementID statement_id, int inde
         TRY(try_apply_placeholder(statement_id, index, value.to_utf8()));
     } else if constexpr (IsSame<ValueType, ByteString>) {
         TRY(bind_blob_bytes(statement, index, value.bytes()));
-    } else if constexpr (IsOneOf<ValueType, Bytes, ReadonlyBytes>) {
+    } else if constexpr (IsOneOf<ValueType, ByteBuffer, Bytes, ReadonlyBytes>) {
         TRY(bind_blob_bytes(statement, index, value));
     } else if constexpr (IsSame<ValueType, UnixDateTime>) {
         TRY(try_apply_placeholder(statement_id, index, value.offset_to_epoch().to_milliseconds()));
@@ -89620,6 +89622,10 @@ ValueType Database::result_column(StatementID statement_id, int column)
         auto const* blob = sqlite3_column_blob(statement, column);
         auto length = sqlite3_column_bytes(statement, column);
         return ByteString { reinterpret_cast<char const*>(blob), static_cast<size_t>(length) };
+    } else if constexpr (IsSame<ValueType, ByteBuffer>) {
+        auto const* blob = sqlite3_column_blob(statement, column);
+        auto length = sqlite3_column_bytes(statement, column);
+        return MUST(ByteBuffer::copy(blob, static_cast<size_t>(length)));
     } else if constexpr (IsSame<ValueType, UnixDateTime>) {
         auto milliseconds = result_column<sqlite3_int64>(statement_id, column);
         return UnixDateTime::from_milliseconds_since_epoch(milliseconds);
@@ -650165,6 +650171,12 @@ public:
     u64 dom_tree_version() const { return m_dom_tree_version; }
     void bump_dom_tree_version() { ++m_dom_tree_version; }
 
+    u64 form_associated_custom_element_version() const { return m_form_associated_custom_element_version; }
+    void bump_form_associated_custom_element_version() { ++m_form_associated_custom_element_version; }
+
+    u64 option_selectedness_version() const { return m_option_selectedness_version; }
+    void bump_option_selectedness_version() { ++m_option_selectedness_version; }
+
     // Everything a style input record cannot name by an identity of its own: a stylesheet rule's
     // declarations changing under a block that has not moved, a font finishing loading, the
     // viewport moving, a registration or counter style arriving. A record taken under one version
@@ -651719,6 +651731,8 @@ private:
     Optional<AK::UnixDateTime> m_last_modified;
 
     u64 m_dom_tree_version { 0 };
+    u64 m_form_associated_custom_element_version { 0 };
+    u64 m_option_selectedness_version { 0 };
     u64 m_style_environment_version { 0 };
     u64 m_next_counter_style_environment_identity { 1 };
     u64 m_character_data_version { 0 };
@@ -658791,12 +658805,19 @@ GC::Ptr<HTML::CustomElementDefinition> Element::custom_element_definition() cons
 
 void Element::set_custom_element_definition(GC::Ptr<HTML::CustomElementDefinition> definition)
 {
+    auto old_definition = custom_element_definition();
+    bool was_form_associated = old_definition && old_definition->form_associated();
+    bool is_form_associated = definition && definition->form_associated();
+
     if (!definition) {
         if (auto* rare_data = element_rare_data())
             rare_data->custom_element_definition = nullptr;
-        return;
+    } else {
+        ensure_element_rare_data().custom_element_definition = definition;
     }
-    ensure_element_rare_data().custom_element_definition = definition;
+
+    if (was_form_associated != is_form_associated)
+        document().bump_form_associated_custom_element_version();
 }
 
 GC::Ptr<HTML::CustomElementRegistry> Element::custom_element_registry() const
@@ -665486,17 +665507,18 @@ namespace Web::DOM {
 
 GC_DEFINE_ALLOCATOR(HTMLCollection);
 
-GC::Ref<HTMLCollection> HTMLCollection::create(ParentNode& root, Scope scope, Function<bool(Element const&)> filter, Function<bool(Element const&, Element const&)> sort)
+GC::Ref<HTMLCollection> HTMLCollection::create(ParentNode& root, Scope scope, Function<bool(Element const&)> filter, Function<bool(Element const&, Element const&)> sort, Kind kind)
 {
-    return GC::Heap::the().allocate<HTMLCollection>(root, scope, move(filter), move(sort));
+    return GC::Heap::the().allocate<HTMLCollection>(root, scope, move(filter), move(sort), kind);
 }
 
-HTMLCollection::HTMLCollection(ParentNode& root, Scope scope, Function<bool(Element const&)> filter, Function<bool(Element const&, Element const&)> sort)
+HTMLCollection::HTMLCollection(ParentNode& root, Scope scope, Function<bool(Element const&)> filter, Function<bool(Element const&, Element const&)> sort, Kind kind)
     : GC::WeakContainer(heap())
     , m_root(root)
     , m_filter(move(filter))
     , m_sort(move(sort))
     , m_scope(scope)
+    , m_kind(kind)
 {
 }
 
@@ -665554,10 +665576,14 @@ void HTMLCollection::update_name_to_element_mappings_if_needed() const
 void HTMLCollection::update_cache_if_needed() const
 {
     auto& document = root()->document();
+    auto invalidation_version = this->invalidation_version(document);
 
     // Nothing to do, the DOM hasn't updated since we last built the cache.
-    if (m_cached_document.ptr().ptr() == &document && m_cached_dom_tree_version == document.dom_tree_version())
+    if (m_cached_document.ptr().ptr() == &document
+        && m_cached_dom_tree_version == document.dom_tree_version()
+        && m_cached_invalidation_version == invalidation_version) {
         return;
+    }
 
     m_cached_elements.clear();
     m_cached_name_to_element_mappings = nullptr;
@@ -665583,6 +665609,20 @@ void HTMLCollection::update_cache_if_needed() const
 
     m_cached_document = document;
     m_cached_dom_tree_version = document.dom_tree_version();
+    m_cached_invalidation_version = invalidation_version;
+}
+
+u64 HTMLCollection::invalidation_version(Document const& document) const
+{
+    switch (m_kind) {
+    case Kind::Generic:
+        return 0;
+    case Kind::FormControls:
+        return document.form_associated_custom_element_version();
+    case Kind::SelectedOptions:
+        return document.option_selectedness_version();
+    }
+    VERIFY_NOT_REACHED();
 }
 
 GC::RootVector<GC::Ref<Element>> HTMLCollection::collect_matching_elements() const
@@ -665687,7 +665727,14 @@ public:
         Children,
         Descendants,
     };
-    [[nodiscard]] static GC::Ref<HTMLCollection> create(ParentNode& root, Scope, ESCAPING Function<bool(Element const&)> filter, ESCAPING Function<bool(Element const&, Element const&)> sort = nullptr);
+
+    enum class Kind {
+        Generic,
+        FormControls,
+        SelectedOptions,
+    };
+
+    [[nodiscard]] static GC::Ref<HTMLCollection> create(ParentNode& root, Scope, ESCAPING Function<bool(Element const&)> filter, ESCAPING Function<bool(Element const&, Element const&)> sort = nullptr, Kind = Kind::Generic);
 
     virtual ~HTMLCollection() override;
 
@@ -665701,10 +665748,11 @@ public:
     virtual bool is_supported_property_name(Utf16FlyString const&) const override;
 
 protected:
-    HTMLCollection(ParentNode& root, Scope, ESCAPING Function<bool(Element const&)> filter, ESCAPING Function<bool(Element const&, Element const&)> sort = nullptr);
+    HTMLCollection(ParentNode& root, Scope, ESCAPING Function<bool(Element const&)> filter, ESCAPING Function<bool(Element const&, Element const&)> sort = nullptr, Kind = Kind::Generic);
 
     GC::Ref<ParentNode> root() { return *m_root; }
     GC::Ref<ParentNode const> root() const { return *m_root; }
+    bool element_matches_filter(Element const& element) const { return m_filter(element); }
 
     virtual void visit_edges(GC::Cell::Visitor&) override;
 
@@ -665714,9 +665762,11 @@ private:
 
     void update_cache_if_needed() const;
     void update_name_to_element_mappings_if_needed() const;
+    u64 invalidation_version(Document const&) const;
 
     mutable GC::Weak<Document const> m_cached_document;
     mutable u64 m_cached_dom_tree_version { 0 };
+    mutable u64 m_cached_invalidation_version { 0 };
     mutable Vector<GC::RawPtr<Element>> m_cached_elements;
     mutable OwnPtr<OrderedHashMap<Utf16FlyString, GC::RawPtr<Element>>> m_cached_name_to_element_mappings;
 
@@ -665725,6 +665775,7 @@ private:
     Function<bool(Element const&, Element const&)> m_sort;
 
     Scope m_scope { Scope::Descendants };
+    Kind m_kind { Kind::Generic };
 };
 
 }
@@ -665888,17 +665939,18 @@ namespace Web::DOM {
 
 GC_DEFINE_ALLOCATOR(LiveNodeList);
 
-GC::Ref<NodeList> LiveNodeList::create(Node const& root, Scope scope, Function<bool(Node const&)> filter)
+GC::Ref<NodeList> LiveNodeList::create(Node const& root, Scope scope, Function<bool(Node const&)> filter, Kind kind)
 {
-    return GC::Heap::the().allocate<LiveNodeList>(root, scope, move(filter));
+    return GC::Heap::the().allocate<LiveNodeList>(root, scope, move(filter), kind);
 }
 
-LiveNodeList::LiveNodeList(Node const& root, Scope scope, Function<bool(Node const&)> filter)
+LiveNodeList::LiveNodeList(Node const& root, Scope scope, Function<bool(Node const&)> filter, Kind kind)
     : NodeList()
     , GC::WeakContainer(heap())
     , m_root(root)
     , m_filter(move(filter))
     , m_scope(scope)
+    , m_kind(kind)
 {
 }
 
@@ -665927,8 +665979,12 @@ void LiveNodeList::remove_dead_cells(Badge<GC::Heap>)
 void LiveNodeList::update_cache_if_needed() const
 {
     auto& document = m_root->document();
-    if (m_cached_document.ptr().ptr() == &document && m_cached_dom_tree_version == document.dom_tree_version())
+    auto invalidation_version = this->invalidation_version(document);
+    if (m_cached_document.ptr().ptr() == &document
+        && m_cached_dom_tree_version == document.dom_tree_version()
+        && m_cached_invalidation_version == invalidation_version) {
         return;
+    }
 
     m_cached_nodes.clear();
     if (m_scope == Scope::Descendants) {
@@ -665947,6 +666003,19 @@ void LiveNodeList::update_cache_if_needed() const
 
     m_cached_document = document;
     m_cached_dom_tree_version = document.dom_tree_version();
+    m_cached_invalidation_version = invalidation_version;
+}
+
+u64 LiveNodeList::invalidation_version(Document const& document) const
+{
+    switch (m_kind) {
+    case Kind::Generic:
+        return 0;
+    case Kind::Labels:
+    case Kind::FormControls:
+        return document.form_associated_custom_element_version();
+    }
+    VERIFY_NOT_REACHED();
 }
 
 Node* LiveNodeList::first_matching(Function<bool(Node const&)> const& filter) const
@@ -666009,14 +666078,20 @@ public:
         Descendants,
     };
 
-    [[nodiscard]] static GC::Ref<NodeList> create(Node const& root, Scope, ESCAPING Function<bool(Node const&)> filter);
+    enum class Kind {
+        Generic,
+        Labels,
+        FormControls,
+    };
+
+    [[nodiscard]] static GC::Ref<NodeList> create(Node const& root, Scope, ESCAPING Function<bool(Node const&)> filter, Kind = Kind::Generic);
     virtual ~LiveNodeList() override;
 
     virtual u32 length() const override;
     virtual Node const* item(u32 index) const override;
 
 protected:
-    LiveNodeList(Node const& root, Scope, ESCAPING Function<bool(Node const&)> filter);
+    LiveNodeList(Node const& root, Scope, ESCAPING Function<bool(Node const&)> filter, Kind = Kind::Generic);
 
     Node* first_matching(Function<bool(Node const&)> const& filter) const;
 
@@ -666026,14 +666101,17 @@ private:
     virtual GC::Cell const& owner_cell(Badge<GC::Heap>) const override;
 
     void update_cache_if_needed() const;
+    u64 invalidation_version(Document const&) const;
 
     mutable GC::Weak<Document const> m_cached_document;
     mutable u64 m_cached_dom_tree_version { 0 };
+    mutable u64 m_cached_invalidation_version { 0 };
     mutable Vector<GC::RawPtr<Node>> m_cached_nodes;
 
     GC::Ref<Node const> m_root;
     Function<bool(Node const&)> m_filter;
     Scope m_scope { Scope::Descendants };
+    Kind m_kind { Kind::Generic };
 };
 
 }
@@ -666108,41 +666186,3 @@ static void invoke_mutation_observer_callback(MutationObserver& mutation_observe
     auto& settings = callback.callback_context;
 
     auto wrapped_records = MUST(JS::Array::create(settings->realm(), 0));
-    auto& wrapper_world = Bindings::host_defined_wrapper_world(settings->realm());
-    for (size_t i = 0; i < records.size(); ++i) {
-        auto& record = records.at(i);
-        auto property_index = JS::PropertyKey { i };
-        MUST(wrapped_records->create_data_property(property_index, Bindings::wrap(wrapper_world, settings->realm(), GC::Ref { *record })));
-    }
-
-    auto wrapped_mutation_observer = Bindings::wrap(wrapper_world, settings->realm(), GC::Ref { mutation_observer });
-    (void)WebIDL::invoke_callback(callback, wrapped_mutation_observer, WebIDL::ExceptionBehavior::Report, { { wrapped_records, wrapped_mutation_observer } });
-}
-
-// https://dom.spec.whatwg.org/#dom-mutationobserver-observe
-WebIDL::ExceptionOr<void> MutationObserver::observe(Node& target, MutationObserverOptions options)
-{
-    // 1. If either options["attributeOldValue"] or options["attributeFilter"] exists, and options["attributes"] does not exist, then set options["attributes"] to true.
-    if ((options.attribute_old_value.has_value() || options.attribute_filter.has_value()) && !options.attributes.has_value())
-        options.attributes = true;
-
-    // 2. If options["characterDataOldValue"] exists and options["characterData"] does not exist, then set options["characterData"] to true.
-    if (options.character_data_old_value.has_value() && !options.character_data.has_value())
-        options.character_data = true;
-
-    // 3. If none of options["childList"], options["attributes"], and options["characterData"] is true, then throw a TypeError.
-    if (!options.child_list && (!options.attributes.has_value() || !options.attributes.value()) && (!options.character_data.has_value() || !options.character_data.value()))
-        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "Options must have one of childList, attributes or characterData set to true."_utf16 };
-
-    // 4. If options["attributeOldValue"] is true and options["attributes"] is false, then throw a TypeError.
-    // NOTE: If attributeOldValue is present, attributes will be present because of step 1.
-    if (options.attribute_old_value.has_value() && options.attribute_old_value.value() && !options.attributes.value())
-        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "attributes must be true if attributeOldValue is true."_utf16 };
-
-    // 5. If options["attributeFilter"] is present and options["attributes"] is false, then throw a TypeError.
-    // NOTE: If attributeFilter is present, attributes will be present because of step 1.
-    if (options.attribute_filter.has_value() && !options.attributes.value())
-        return WebIDL::SimpleException { WebIDL::SimpleExceptionType::TypeError, "attributes must be true if attributeFilter is present."_utf16 };
-
-    // 6. If options["characterDataOldValue"] is true and options["characterData"] is false, then throw a TypeError.
-    // NOTE: If characterDataOldValue is present, characterData will be present because of step 2.
