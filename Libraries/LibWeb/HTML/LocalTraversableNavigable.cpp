@@ -32,7 +32,7 @@
 #include <LibWeb/HTML/Window.h>
 #include <LibWeb/Layout/Viewport.h>
 #include <LibWeb/Page/Page.h>
-#include <LibWeb/Painting/Paintable.h>
+#include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/Timer.h>
 
@@ -1708,7 +1708,7 @@ void LocalTraversableNavigable::finalize_same_document_navigation(GC::Ref<LocalN
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#close-a-top-level-traversable
-void LocalTraversableNavigable::close_top_level_traversable()
+void LocalTraversableNavigable::close_top_level_traversable(PromptToUnload prompt_to_unload)
 {
     // 1. If traversable's is closing is true, then return.
     if (is_closing())
@@ -1718,22 +1718,15 @@ void LocalTraversableNavigable::close_top_level_traversable()
     set_closing(true);
 
     // 2. Definitely close traversable.
-    definitely_close_top_level_traversable();
+    definitely_close_top_level_traversable(prompt_to_unload);
 }
 
 // https://html.spec.whatwg.org/multipage/document-sequences.html#definitely-close-a-top-level-traversable
-void LocalTraversableNavigable::definitely_close_top_level_traversable()
+void LocalTraversableNavigable::definitely_close_top_level_traversable(PromptToUnload prompt_to_unload)
 {
     VERIFY(is_top_level_traversable());
 
-    // 1. Let toUnload be traversable's active document's inclusive descendant navigables.
-    auto to_unload = active_document()->inclusive_descendant_navigables();
-
-    // 2. If the result of checking if unloading is canceled for toUnload is not "continue", then return.
-    check_if_unloading_is_canceled(move(to_unload), GC::create_function(heap(), [this](CheckIfUnloadingIsCanceledResult result) {
-        if (result != CheckIfUnloadingIsCanceledResult::Continue)
-            return;
-
+    auto append_close_steps = [this] {
         // 3. Append the following session history traversal steps to traversable:
         request_history_operation(
             CloseTopLevelTraversableHistoryOperationParameters { .traversable_id = id() },
@@ -1749,6 +1742,26 @@ void LocalTraversableNavigable::definitely_close_top_level_traversable()
                     ready->function()(HistoryStepResult::Applied);
                 }),
             });
+    };
+
+    if (prompt_to_unload == PromptToUnload::No) {
+        append_close_steps();
+        return;
+    }
+
+    // 1. Let toUnload be traversable's active document's inclusive descendant navigables.
+    auto to_unload = active_document()->inclusive_descendant_navigables();
+
+    // 2. If the result of checking if unloading is canceled for toUnload is not "continue", then return.
+    check_if_unloading_is_canceled(move(to_unload), GC::create_function(heap(), [this, append_close_steps = move(append_close_steps)](CheckIfUnloadingIsCanceledResult result) {
+        if (result != CheckIfUnloadingIsCanceledResult::Continue) {
+            // AD-HOC: Allow a later close attempt if this one was canceled.
+            set_closing(false);
+            return;
+        }
+
+        // 3. Append the following session history traversal steps to traversable:
+        append_close_steps();
     }));
 }
 
@@ -1892,11 +1905,12 @@ void LocalTraversableNavigable::process_screenshot_requests()
             auto* dom_node = DOM::Node::from_unique_id(*task.node_id);
             if (dom_node)
                 dom_node->document().update_layout(DOM::UpdateLayoutReason::ProcessScreenshot);
-            if (!dom_node || !dom_node->paintable_box()) {
+            auto const* layout_node = dom_node ? dom_node->layout_node() : nullptr;
+            if (!layout_node || !Painting::has_committed_box(*layout_node)) {
                 client.page_did_take_screenshot({});
                 continue;
             }
-            auto rect = page().enclosing_device_rect(dom_node->paintable_box()->absolute_border_box_rect());
+            auto rect = page().enclosing_device_rect(Painting::absolute_border_box_rect(*layout_node));
             auto bitmap_or_error = Gfx::Bitmap::create(Gfx::BitmapFormat::BGRA8888, rect.size().to_type<int>());
             if (bitmap_or_error.is_error()) {
                 client.page_did_take_screenshot({});
@@ -1910,7 +1924,9 @@ void LocalTraversableNavigable::process_screenshot_requests()
             });
         } else {
             active_document()->update_layout(DOM::UpdateLayoutReason::ProcessScreenshot);
-            auto scrollable_overflow_rect = active_document()->layout_node()->paintable_box()->scrollable_overflow_rect();
+            auto const* layout_node = active_document()->layout_node();
+            VERIFY(layout_node && Painting::has_committed_box(*layout_node));
+            auto scrollable_overflow_rect = Painting::scrollable_overflow_rect(*layout_node);
             auto rect = page().enclosing_device_rect(scrollable_overflow_rect.value());
             auto bitmap_or_error = Gfx::Bitmap::create(Gfx::BitmapFormat::BGRA8888, rect.size().to_type<int>());
             if (bitmap_or_error.is_error()) {
