@@ -74,9 +74,54 @@ pub(crate) fn paintable_kind_for_node(facts: &NodeFacts<'_>, kind: NodeKind) -> 
     }
 }
 
+fn committed_offset_delta(
+    arena: &PaintableArena,
+    offsets_before_commit: &std::collections::HashMap<PaintableSlotId, FfiCssPixelPoint>,
+    slot: PaintableSlotId,
+) -> FfiCssPixelPoint {
+    let Some(offset_before_commit) = offsets_before_commit.get(&slot) else {
+        return FfiCssPixelPoint::default();
+    };
+    let offset = arena.data_ref(slot).offset;
+    FfiCssPixelPoint {
+        x: offset.x - offset_before_commit.x,
+        y: offset.y - offset_before_commit.y,
+    }
+}
+
+fn reused_subtree_absolute_position_delta(
+    arena: &PaintableArena,
+    offsets_before_commit: &std::collections::HashMap<PaintableSlotId, FfiCssPixelPoint>,
+    root: PaintableSlotId,
+) -> FfiCssPixelPoint {
+    let mut delta = committed_offset_delta(arena, offsets_before_commit, root);
+    if crate::painting::paintable_geometry::is_svg_paintable(arena.data_ref(root).kind) {
+        return delta;
+    }
+    let mut block = arena.data_ref(root).containing_block;
+    while !block.is_invalid() && arena.is_live(block) {
+        let block_data = arena.data_ref(block);
+        if block_data.kind == PaintableKind::SVGSVGPaintable
+            || crate::painting::paintable_geometry::is_svg_paintable(block_data.kind)
+        {
+            break;
+        }
+        let block_delta = committed_offset_delta(arena, offsets_before_commit, block);
+        delta.x += block_delta.x;
+        delta.y += block_delta.y;
+        if block_data.kind == PaintableKind::SVGForeignObjectPaintable {
+            break;
+        }
+        block = block_data.containing_block;
+    }
+    delta
+}
+
 pub(crate) struct PaintableCommit<'a> {
     callbacks: &'a FfiLayoutFcCallbacks,
     arena: &'a RefCell<PaintableArena>,
+    offsets_before_commit: RefCell<std::collections::HashMap<PaintableSlotId, FfiCssPixelPoint>>,
+    reused_subtree_roots: RefCell<Vec<PaintableSlotId>>,
 }
 
 impl<'a> PaintableCommit<'a> {
@@ -84,6 +129,36 @@ impl<'a> PaintableCommit<'a> {
         Self {
             callbacks,
             arena: callbacks.arena().paintables(),
+            offsets_before_commit: RefCell::new(std::collections::HashMap::new()),
+            reused_subtree_roots: RefCell::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn discard_absolute_rects_memoized_during_commit(&self) {
+        self.arena.borrow().clear_absolute_rect_memo();
+    }
+
+    pub(crate) fn translate_reused_subtrees(&self) {
+        let roots = self.reused_subtree_roots.borrow();
+        if roots.is_empty() {
+            return;
+        }
+        let arena = self.arena.borrow();
+        let offsets_before_commit = self.offsets_before_commit.borrow();
+        for &root in roots.iter() {
+            let delta = reused_subtree_absolute_position_delta(&arena, &offsets_before_commit, root);
+            if delta == FfiCssPixelPoint::default() {
+                continue;
+            }
+            arena.for_each_in_subtree(root, |slot| {
+                arena.update_data(slot, |data| {
+                    if data.has_overflow {
+                        data.overflow.rect.x += delta.x;
+                        data.overflow.rect.y += delta.y;
+                    }
+                });
+                arena.invalidate_paint_cache(slot);
+            });
         }
     }
 
@@ -212,6 +287,10 @@ impl<'a> PaintableCommit<'a> {
                 "reused subtree root is not the node's own paintable"
             );
             debug_assert!(!prepared.reused, "a kept subtree's shell must not have been reset");
+            self.offsets_before_commit
+                .borrow_mut()
+                .insert(slot, arena.data_ref(slot).offset);
+            self.reused_subtree_roots.borrow_mut().push(slot);
             arena.remove_from_tree(slot);
             return slot;
         }
@@ -240,6 +319,9 @@ impl<'a> PaintableCommit<'a> {
                 slot,
                 "reused paintable is not the node's own"
             );
+            self.offsets_before_commit
+                .borrow_mut()
+                .insert(slot, arena.data_ref(slot).offset);
             arena.reset_for_relayout(slot);
         } else {
             arena.update_data(slot, |paintable| {
@@ -283,8 +365,13 @@ impl<'a> PaintableCommit<'a> {
         slot
     }
 
-    pub(crate) fn set_box_metrics(&self, slot: PaintableSlotId, metrics: &FfiCommittedBoxMetrics) {
+    pub(crate) fn set_box_metrics(
+        &self,
+        slot: PaintableSlotId,
+        metrics: &FfiCommittedBoxMetrics,
+    ) -> Option<(FfiCssPixelSize, FfiCssPixelSize)> {
         let arena = self.arena.borrow();
+        let mut content_size_change = None;
         arena.update_data(slot, |data| {
             if data.layout_fragment_identity != metrics.fragment_identity {
                 data.layout_fragment_identity = metrics.fragment_identity;
@@ -315,10 +402,18 @@ impl<'a> PaintableCommit<'a> {
                 bottom: metrics.margin_bottom,
                 left: metrics.margin_left,
             };
-            data.content_size = FfiCssPixelSize {
+            let new_content_size = FfiCssPixelSize {
                 width: metrics.content_inline_size,
                 height: metrics.content_block_size,
             };
+            if data.content_size != new_content_size {
+                assert!(
+                    !metrics.reuses_committed_subtree,
+                    "a reused committed subtree changed its content size"
+                );
+                content_size_change = Some((data.content_size, new_content_size));
+            }
+            data.content_size = new_content_size;
             data.offset = metrics.content_offset;
             if metrics.has_containing_line_box_index {
                 data.containing_line_box_index = metrics.containing_line_box_index;
@@ -326,6 +421,7 @@ impl<'a> PaintableCommit<'a> {
             }
             data.uses_collapsing_borders_model = metrics.uses_collapsing_borders_model;
         });
+        content_size_change
     }
 
     pub(crate) fn set_line_data(

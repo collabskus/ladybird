@@ -494,49 +494,15 @@ void LayoutRustBridge::replay_saved_abspos_layout(Box& box)
     }
 }
 
-static CSSPixelPoint committed_content_offset_delta(HashMap<Painting::Paintable const*, CSSPixelPoint> const& content_offsets_before_commit, Painting::Paintable const& paintable)
-{
-    auto content_offset_before_commit = content_offsets_before_commit.get(&paintable);
-    if (!content_offset_before_commit.has_value())
-        return {};
-    return paintable.offset() - *content_offset_before_commit;
-}
-
-// The absolute movement of a reused subtree, accumulated over the same containing-block chain
-// (with the same SVG coordinate-space breaks) that Paintable::compute_absolute_rect walks.
-static CSSPixelPoint committed_absolute_position_delta(HashMap<Painting::Paintable const*, CSSPixelPoint> const& content_offsets_before_commit, Painting::Paintable const& reused_subtree_root)
-{
-    if (reused_subtree_root.is_svg_paintable()) {
-        for (auto const* ancestor = reused_subtree_root.layout_node().parent(); ancestor; ancestor = ancestor->parent()) {
-            if (ancestor->is_svg_svg_box())
-                return committed_content_offset_delta(content_offsets_before_commit, reused_subtree_root);
-        }
-    }
-
-    auto delta = committed_content_offset_delta(content_offsets_before_commit, reused_subtree_root);
-    for (auto block = reused_subtree_root.containing_block(); block; block = block->containing_block()) {
-        if (block->is_svg_svg_paintable() || block->is_svg_paintable())
-            break;
-        delta += committed_content_offset_delta(content_offsets_before_commit, *block);
-        if (block->is_svg_foreign_object_paintable())
-            break;
-    }
-    return delta;
-}
-
 RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
 {
     return {
         .context = this,
         .finish_commit = [](void* context) {
             auto& bridge = *static_cast<LayoutRustBridge*>(context);
-            for (auto& reused_subtree_root : bridge.m_reused_subtree_roots) {
-                auto delta = committed_absolute_position_delta(bridge.m_content_offsets_before_commit, *reused_subtree_root);
-                if (!delta.is_zero())
-                    reused_subtree_root->translate_reused_subtree_absolute_geometry(delta);
-            }
-            bridge.m_reused_subtree_roots.clear();
-            bridge.m_content_offsets_before_commit.clear(); },
+            for (auto& navigable_container_viewport : bridge.m_committed_navigable_container_viewports)
+                as<Box>(navigable_container_viewport->layout_node()).notify_content_navigable_of_committed_viewport();
+            bridge.m_committed_navigable_container_viewports.clear(); },
         .prepare_node = [](void* context, void* node_pointer, bool has_used_values, bool reuses_committed_subtree) -> RustFFI::FfiPreparedPaintable {
             auto& bridge = *static_cast<LayoutRustBridge*>(context);
             auto& node = *static_cast<Node*>(node_pointer);
@@ -547,11 +513,8 @@ RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
                 // Inline boxes that never went through inline layout (so they have no used values) still
                 // need a paintable so DOM geometry queries have something to answer from.
                 paintable = node.paintable();
-                if (paintable)
-                    bridge.m_content_offsets_before_commit.set(paintable.ptr(), paintable->offset());
                 if (reuses_committed_subtree) {
                     VERIFY(paintable);
-                    bridge.m_reused_subtree_roots.append(*paintable);
                 } else if (paintable) {
                     paintable->reset_for_relayout();
                     reused = true;
@@ -559,6 +522,8 @@ RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
                     paintable = node.create_paintable();
                 }
                 node.set_paintable(paintable);
+                if (node.kind() == RustFFI::NodeKind::NavigableContainerViewport && paintable)
+                    bridge.m_committed_navigable_container_viewports.append(*paintable);
             } else if (node.paintable_ptr()) {
                 // A paintable surviving from a previous layout on a node this pass did not lay out is
                 // stale; drop it so the layout tree only points into the paint tree built by this commit.
@@ -570,20 +535,12 @@ RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
                 .reused = reused,
             };
         },
-        .set_box_metrics = [](void*, void* paintable_pointer, RustFFI::FfiCommittedBoxMetrics metrics) {
+        .content_size_changed = [](void*, void* paintable_pointer, RustFFI::FfiCssPixelSize old_size, RustFFI::FfiCssPixelSize new_size) {
             auto& paintable = *static_cast<Painting::Paintable*>(paintable_pointer);
-            paintable.set_offset({
-                CSSPixels::from_raw(metrics.content_offset.x),
-                CSSPixels::from_raw(metrics.content_offset.y),
-            });
-            CSSPixelSize content_size {
-                CSSPixels::from_raw(metrics.content_inline_size),
-                CSSPixels::from_raw(metrics.content_block_size)
-            };
-            if (metrics.reuses_committed_subtree)
-                VERIFY(paintable.content_size() == content_size);
-            else
-                paintable.set_content_size(content_size); },
+            Painting::invalidate_descendant_styles_for_container_query_size_change(
+                paintable,
+                { CSSPixels::from_raw(old_size.width), CSSPixels::from_raw(old_size.height) },
+                { CSSPixels::from_raw(new_size.width), CSSPixels::from_raw(new_size.height) }); },
         .finish_node = [](void*, void* node_pointer, void* paintable_pointer) {
             auto& node = *static_cast<Node*>(node_pointer);
             auto* paintable = static_cast<Painting::Paintable*>(paintable_pointer);
@@ -592,7 +549,6 @@ RustFFI::FfiCommitSink LayoutRustBridge::commit_sink()
                 paintable->set_dom_node(dom_node);
                 if (dom_node)
                     dom_node->set_paintable(paintable);
-                paintable->invalidate_absolute_geometry_cache(Painting::Paintable::InvalidateDescendantGeometry::No);
             } else if (dom_node) {
                 dom_node->clear_paintable();
             } },
