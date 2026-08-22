@@ -1,4 +1,562 @@
-﻿    //          location.reload();
+﻿GC::Ref<EventTarget> EventTarget::create()
+{
+    // The new EventTarget() constructor steps are to do nothing.
+    return GC::Heap::the().allocate<EventTarget>();
+}
+
+void EventTarget::visit_edges(Cell::Visitor& visitor)
+{
+    Base::visit_edges(visitor);
+
+    if (auto const* data = m_data.ptr()) {
+        visitor.visit(data->event_listener_list);
+        visitor.visit(data->event_handler_map);
+    }
+}
+
+size_t EventTarget::external_memory_size() const
+{
+    auto size = Base::external_memory_size();
+    if (!m_data)
+        return size;
+
+    size = JS::saturating_add_external_memory_size(size, JS::vector_external_memory_size(m_data->event_listener_list));
+    size = JS::saturating_add_external_memory_size(size, JS::hash_map_external_memory_size(m_data->event_handler_map));
+    return size;
+}
+
+Vector<GC::Root<DOMEventListener>> EventTarget::event_listener_list() const
+{
+    Vector<GC::Root<DOMEventListener>> list;
+    if (!m_data)
+        return list;
+    for (auto& listener : m_data->event_listener_list)
+        list.append(*listener);
+    return list;
+}
+
+// https://dom.spec.whatwg.org/#default-passive-value
+static bool default_passive_value(Utf16FlyString const& type, EventTarget* event_target)
+{
+    // 1. Return true if all of the following are true:
+    //    - type is one of "touchstart", "touchmove", "wheel", or "mousewheel".
+    //    - eventTarget is a Window object, or is a node whose node document is eventTarget, or is a node whose node document’s document element is eventTarget,
+    //      or is a node whose node document’s body element is eventTarget.
+    if (AK::first_is_one_of(type, u"touchstart"sv, u"touchmove"sv, u"wheel"sv, u"mousewheel"sv)) {
+        if (is<HTML::Window>(event_target))
+            return true;
+
+        if (auto* node = as_if<Node>(event_target)) {
+            if (&node->document() == event_target || node->document().document_element() == event_target || node->document().body() == event_target)
+                return true;
+        }
+    }
+
+    // 2. Return false.
+    return false;
+}
+
+static bool is_blocking_wheel_event_listener(DOMEventListener const& listener)
+{
+    return AK::first_is_one_of(listener.type, u"wheel"sv, u"mousewheel"sv) && listener.passive != true;
+}
+
+static void invalidate_compositor_wheel_event_listener_state(EventTarget& event_target, DOMEventListener const& listener)
+{
+    if (!is_blocking_wheel_event_listener(listener))
+        return;
+
+    if (auto* window = as_if<HTML::Window>(event_target)) {
+        auto& document = window->associated_document();
+        document.set_needs_to_record_display_list();
+        document.page().invalidate_compositor_wheel_event_listener_state();
+        return;
+    }
+
+    if (auto* node = as_if<Node>(event_target)) {
+        node->update_inside_blocking_wheel_event_handler_state_for_subtree();
+        node->set_needs_repaint();
+        node->document().page().invalidate_compositor_wheel_event_listener_state();
+    }
+}
+
+static void update_needs_beforeunload_check(EventTarget& event_target, DOMEventListener const& listener)
+{
+    if (listener.type != HTML::EventNames::beforeunload)
+        return;
+
+    auto* window = as_if<HTML::Window>(event_target);
+    if (!window)
+        return;
+
+    auto navigable = window->associated_document().navigable();
+    if (!navigable)
+        return;
+
+    if (auto traversable = navigable->traversable_navigable())
+        traversable->page().update_needs_beforeunload_check();
+}
+
+// https://dom.spec.whatwg.org/#dom-eventtarget-addeventlistener
+void EventTarget::add_event_listener(FlyString const& type, GC::Ptr<IDLEventListener> callback, AddEventListenerOptions const& options)
+{
+    // 1. Let capture, passive, once, and signal be the result of flattening more options.
+
+    // 2. Add an event listener with this and an event listener whose type is type, callback is callback, capture is capture, passive is passive,
+    //    once is once, and signal is signal.
+
+    auto event_listener = GC::Heap::the().allocate<DOMEventListener>();
+    event_listener->type = Utf16FlyString::from_fly_string(type);
+    event_listener->callback = callback;
+    event_listener->signal = options.signal;
+    event_listener->capture = options.capture;
+    event_listener->passive = options.passive;
+    event_listener->once = options.once;
+    add_an_event_listener(*event_listener);
+}
+
+void EventTarget::add_event_listener(Utf16FlyString const& type, GC::Ptr<IDLEventListener> callback, AddEventListenerOptions const& options)
+{
+    auto event_listener = GC::Heap::the().allocate<DOMEventListener>();
+    event_listener->type = type;
+    event_listener->callback = callback;
+    event_listener->signal = options.signal;
+    event_listener->capture = options.capture;
+    event_listener->passive = options.passive;
+    event_listener->once = options.once;
+    add_an_event_listener(*event_listener);
+}
+
+void EventTarget::add_event_listener_without_options(Utf16FlyString const& type, IDLEventListener& callback)
+{
+    auto utf8_type = type.to_utf16_string().to_utf8();
+    add_event_listener(MUST(FlyString::from_utf8(utf8_type.bytes_as_string_view())), &callback, {});
+}
+
+// https://dom.spec.whatwg.org/#add-an-event-listener
+void EventTarget::add_an_event_listener(DOMEventListener& listener)
+{
+    // FIXME: 1. If eventTarget is a ServiceWorkerGlobalScope object, its service worker’s script resource’s has ever been evaluated flag is set,
+    //           and listener’s type matches the type attribute value of any of the service worker events, then report a warning to the console
+    //           that this might not give the expected results. [SERVICE-WORKERS]
+
+    auto& event_listener_list = ensure_data().event_listener_list;
+
+    // 2. If listener’s signal is not null and is aborted, then return.
+    if (listener.signal && listener.signal->aborted())
+        return;
+
+    // 3. If listener’s callback is null, then return.
+    if (!listener.callback)
+        return;
+
+    // 4. If listener’s passive is null, then set it to the default passive value given listener’s type and eventTarget.
+    if (!listener.passive.has_value()) {
+        listener.passive = default_passive_value(listener.type, this);
+    }
+
+    // 5. If eventTarget’s event listener list does not contain an event listener whose type is listener’s type, callback is listener’s callback,
+    //    and capture is listener’s capture, then append listener to eventTarget’s event listener list.
+    auto it = event_listener_list.find_if([&](auto& entry) {
+        return entry->type == listener.type
+            && entry->callback->callback().callback == listener.callback->callback().callback
+            && entry->capture == listener.capture;
+    });
+    if (it == event_listener_list.end()) {
+        event_listener_list.append(listener);
+        invalidate_compositor_wheel_event_listener_state(*this, listener);
+        update_needs_beforeunload_check(*this, listener);
+        event_listener_list_changed();
+    }
+
+    // 6. If listener’s signal is not null, then add the following abort steps to it:
+    if (listener.signal) {
+        // NOTE: `this` and `listener` are protected by AbortSignal using GC::HeapFunction.
+        (void)listener.signal->add_abort_algorithm([this, &listener] {
+            // 1. Remove an event listener with eventTarget and listener.
+            remove_an_event_listener(listener);
+        });
+    }
+}
+
+// https://dom.spec.whatwg.org/#dom-eventtarget-removeeventlistener
+void EventTarget::remove_event_listener(FlyString const& type, GC::Ptr<IDLEventListener> callback, EventListenerOptions const& options)
+{
+    auto& event_listener_list = ensure_data().event_listener_list;
+
+    // 1. Let capture be the result of flattening options.
+    bool capture = options.capture;
+
+    // 2. If this’s event listener list contains an event listener whose type is type, callback is callback, and capture is capture,
+    //    then remove an event listener with this and that event listener.
+    auto callbacks_match = [&](DOMEventListener& entry) {
+        if (!entry.callback && !callback)
+            return true;
+        if (!entry.callback || !callback)
+            return false;
+        return entry.callback->callback().callback == callback->callback().callback;
+    };
+    auto utf16_type = Utf16FlyString::from_fly_string(type);
+    auto it = event_listener_list.find_if([&](auto& entry) {
+        return entry->type == utf16_type
+            && callbacks_match(*entry)
+            && entry->capture == capture;
+    });
+    if (it != event_listener_list.end())
+        remove_an_event_listener(**it);
+}
+
+void EventTarget::remove_event_listener(Utf16FlyString const& type, GC::Ptr<IDLEventListener> callback, EventListenerOptions const& options)
+{
+    remove_event_listener(FlyString { type.to_utf16_string().to_utf8() }, callback, options);
+}
+
+void EventTarget::remove_event_listener_without_options(Utf16FlyString const& type, IDLEventListener& callback)
+{
+    auto utf8_type = type.to_utf16_string().to_utf8();
+    remove_event_listener(MUST(FlyString::from_utf8(utf8_type.bytes_as_string_view())), &callback, {});
+}
+
+// https://dom.spec.whatwg.org/#remove-an-event-listener
+void EventTarget::remove_an_event_listener(DOMEventListener& listener)
+{
+    // FIXME: 1. If eventTarget is a ServiceWorkerGlobalScope object and its service worker’s set of event types to handle contains type,
+    //           then report a warning to the console that this might not give the expected results. [SERVICE-WORKERS]
+
+    // 2. Set listener’s removed to true and remove listener from eventTarget’s event listener list.
+    listener.removed = true;
+    VERIFY(m_data);
+    auto did_remove = m_data->event_listener_list.remove_first_matching([&](auto& entry) { return entry.ptr() == &listener; });
+    if (did_remove) {
+        invalidate_compositor_wheel_event_listener_state(*this, listener);
+        update_needs_beforeunload_check(*this, listener);
+        event_listener_list_changed();
+    }
+}
+
+// https://dom.spec.whatwg.org/#dom-eventtarget-dispatchevent
+WebIDL::ExceptionOr<bool> EventTarget::dispatch_event_for_bindings(Event& event)
+{
+    // 1. If event’s dispatch flag is set, or if its initialized flag is not set, then throw an "InvalidStateError" DOMException.
+    if (event.dispatched())
+        return WebIDL::InvalidStateError::create("The event is already being dispatched."_utf16);
+
+    if (!event.initialized())
+        return WebIDL::InvalidStateError::create("Cannot dispatch an uninitialized event."_utf16);
+
+    // 2. Initialize event’s isTrusted attribute to false.
+    event.set_is_trusted(false);
+
+    // 3. Return the result of dispatching event to this.
+    return dispatch_event(event);
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#window-reflecting-body-element-event-handler-set
+bool is_window_reflecting_body_element_event_handler(Utf16FlyString const& name)
+{
+    return name.is_one_of(
+        HTML::EventNames::blur,
+        HTML::EventNames::error,
+        HTML::EventNames::focus,
+        HTML::EventNames::load,
+        UIEvents::EventNames::resize,
+        HTML::EventNames::scroll);
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#windoweventhandlers
+static bool is_window_event_handler(Utf16FlyString const& name)
+{
+    return name.is_one_of(
+        HTML::EventNames::afterprint,
+        HTML::EventNames::beforeprint,
+        HTML::EventNames::beforeunload,
+        HTML::EventNames::hashchange,
+        HTML::EventNames::languagechange,
+        HTML::EventNames::message,
+        HTML::EventNames::messageerror,
+        HTML::EventNames::offline,
+        HTML::EventNames::online,
+        HTML::EventNames::pagehide,
+        HTML::EventNames::pageshow,
+        HTML::EventNames::popstate,
+        HTML::EventNames::rejectionhandled,
+        HTML::EventNames::storage,
+        HTML::EventNames::unhandledrejection,
+        HTML::EventNames::unload);
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#determining-the-target-of-an-event-handler
+static EventTarget* determine_target_of_event_handler(EventTarget& event_target, Utf16FlyString const& name)
+{
+    // To determine the target of an event handler, given an EventTarget object eventTarget on which the event handler is exposed,
+    // and an event handler name name, the following steps are taken:
+
+    // 1. If eventTarget is not a body element or a frameset element, then return eventTarget.
+    if (!is<HTML::HTMLBodyElement>(event_target) && !is<HTML::HTMLFrameSetElement>(event_target))
+        return &event_target;
+
+    auto& event_target_element = static_cast<HTML::HTMLElement&>(event_target);
+
+    // 2. If name is not the name of an attribute member of the WindowEventHandlers interface mixin and the Window-reflecting
+    //    body element event handler set does not contain name, then return eventTarget.
+    if (!is_window_event_handler(name) && !is_window_reflecting_body_element_event_handler(name))
+        return &event_target;
+
+    // 3. If eventTarget's node document is not an active document, then return null.
+    if (!event_target_element.document().is_active())
+        return nullptr;
+
+    // 4. Return eventTarget's node document's relevant global object.
+    return event_target_element.document().window().ptr();
+}
+
+static Optional<Utf16FlyString> event_name_from_event_handler_attribute_local_name(Utf16FlyString const& local_name)
+{
+#undef __ENUMERATE
+#define __ENUMERATE(attribute_name, event_name)             \
+    if (local_name == HTML::AttributeNames::attribute_name) \
+        return event_name;
+    ENUMERATE_GLOBAL_EVENT_HANDLERS(__ENUMERATE)
+    ENUMERATE_WINDOW_EVENT_HANDLERS(__ENUMERATE)
+#undef __ENUMERATE
+
+    return {};
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-attributes:event-handler-idl-attributes-2
+WebIDL::CallbackType* EventTarget::event_handler_attribute(Utf16FlyString const& name)
+{
+    // 1. Let eventTarget be the result of determining the target of an event handler given this object and name.
+    auto target = determine_target_of_event_handler(*this, name);
+
+    // 2. If eventTarget is null, then return null.
+    if (!target)
+        return nullptr;
+
+    // 3. Return the result of getting the current value of the event handler given eventTarget and name.
+    return target->get_current_value_of_event_handler(name);
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#getting-the-current-value-of-the-event-handler
+WebIDL::CallbackType* EventTarget::get_current_value_of_event_handler(Utf16FlyString const& name)
+{
+    // 1. Let handlerMap be eventTarget's event handler map. (NOTE: Not necessary)
+    auto& handler_map = ensure_data().event_handler_map;
+
+    // 2. Let eventHandler be handlerMap[name].
+    auto event_handler_iterator = handler_map.find(name);
+
+    // Optimization: The spec creates all the event handlers exposed on an object up front and has the initial value of the handler set to null.
+    //               If the event handler hasn't been set, null would be returned in step 4.
+    //               However, this would be very allocation heavy. For example, each DOM::Element includes GlobalEventHandlers, which defines 60+(!) event handler attributes.
+    //               Plus, the vast majority of these allocations would be likely wasted, as I imagine web content will only use a handful of these attributes on certain elements, if any at all.
+    //               Thus, we treat the event handler not being in the event handler map as being equivalent to an event handler with an initial null value.
+    if (event_handler_iterator == handler_map.end())
+        return nullptr;
+
+    auto& event_handler = event_handler_iterator->value;
+
+    // 3. If eventHandler's value is an internal raw uncompiled handler, then:
+    if (event_handler->value.has<Utf16String>()) {
+        // 1. If eventTarget is an element, then let element be eventTarget, and document be element's node document.
+        //    Otherwise, eventTarget is a Window object, let element be null, and document be eventTarget's associated Document.
+        GC::Ptr<Element> element;
+        GC::Ptr<Document> document;
+
+        if (auto* element_event_target = as_if<Element>(this)) {
+            element = element_event_target;
+            document = &element_event_target->document();
+        } else {
+            auto& window_event_target = as<HTML::Window>(*this);
+            document = window_event_target.associated_document();
+        }
+
+        VERIFY(document);
+
+        // 2. If scripting is disabled for document, then return null.
+        if (document->is_scripting_disabled())
+            return nullptr;
+
+        // 3. Let body be the uncompiled script body in eventHandler's value.
+        auto const& body = event_handler->value.get<Utf16String>();
+
+        // FIXME: 4. Let location be the location where the script body originated, as given by eventHandler's value.
+
+        // 5. If element is not null and element has a form owner, let form owner be that form owner. Otherwise, let form owner be null.
+        GC::Ptr<HTML::HTMLFormElement> form_owner;
+        if (auto* form_associated_element = as_if<HTML::FormAssociatedElement>(element.ptr())) {
+            if (auto* form = form_associated_element->form())
+                form_owner = form;
+        }
+
+        // 6. Let settings object be the relevant settings object of document.
+        auto& settings_object = document->relevant_settings_object();
+
+        // Build source text and parameter strings for the event handler function.
+        Utf16StringBuilder source_builder;
+        Utf16View parameters_string;
+
+        // sourceText / ParameterList
+        if (name == HTML::EventNames::error && is<HTML::Window>(this)) {
+            //  -> If name is onerror and eventTarget is a Window object
+            //      Let the function have five arguments, named event, source, lineno, colno, and error.
+            source_builder.appendff("function on{}(event, source, lineno, colno, error) {{\n{}\n}}", name, body);
+            parameters_string = u"event, source, lineno, colno, error"sv;
+        } else {
+            //  -> Otherwise
+            //      Let the function have a single argument called event.
+            source_builder.appendff("function on{}(event) {{\n{}\n}}", name, body);
+            parameters_string = u"event"sv;
+        }
+
+        auto source_text = source_builder.to_string();
+
+        auto& vm = Bindings::main_thread_vm();
+
+        auto rust_compilation = JS::RustIntegration::compile_dynamic_function(
+            vm, source_text, parameters_string, body, JS::FunctionKind::Normal);
+
+        // 7. If body is not parsable as FunctionBody or if parsing detects an early error, then follow these substeps:
+        if (!rust_compilation.has_value() || rust_compilation->is_error()) {
+            // 1. Set eventHandler's value to null.
+            event_handler->value = GC::Ptr<WebIDL::CallbackType> {};
+
+            // FIXME: 2. Report the error for the appropriate script and with the appropriate position (line number and column number) given by location, using settings object's global object.
+
+            // 3. Return null.
+            return nullptr;
+        }
+
+        // 8. Push settings object's realm execution context onto the JavaScript execution context stack; it is now the running JavaScript execution context.
+        vm.push_execution_context(settings_object.realm_execution_context());
+
+        // scope
+        //  1. Let realm be settings object's Realm.
+        auto& realm = settings_object.realm();
+
+        //  2. Let scope be realm.[[GlobalEnv]].
+        auto scope = GC::Ref<JS::Environment> { realm.global_environment() };
+
+        // 3. If eventHandler is an element's event handler, then set scope to NewObjectEnvironment(document, true, scope).
+        //    (Otherwise, eventHandler is a Window object's event handler.)
+        if (is<Element>(this))
+            scope = Bindings::new_event_handler_object_environment(realm, GC::Ref { *document }, scope);
+
+        //  4. If form owner is not null, then set scope to NewObjectEnvironment(form owner, true, scope).
+        if (form_owner)
+            scope = Bindings::new_event_handler_object_environment(realm, GC::Ref { *form_owner }, scope);
+
+        //  5. If element is not null, then set scope to NewObjectEnvironment(element, true, scope).
+        if (element)
+            scope = Bindings::new_event_handler_object_environment(realm, GC::Ref { *element }, scope);
+
+        // 9. Let function be the result of calling OrdinaryFunctionCreate.
+        auto function = JS::ECMAScriptFunctionObject::create_from_function_data(
+            realm,
+            rust_compilation->value(),
+            scope,
+            nullptr);
+
+        // 10. Remove settings object's realm execution context from the JavaScript execution context stack.
+        auto* popped_execution_context = vm.pop_execution_context();
+        VERIFY(popped_execution_context == &settings_object.realm_execution_context());
+
+        // 11. Set function.[[ScriptOrModule]] to null.
+        function->set_script_or_module({});
+
+        // 12. Set eventHandler's value to the result of creating a Web IDL EventHandler callback function object whose object reference is function and whose callback context is settings object.
+        // FIXME: Update this comment once the ShadowRealm proposal is merged to pass realm.
+        event_handler->value = GC::Ptr(GC::Heap::the().allocate<WebIDL::CallbackType>(*function, realm));
+    }
+
+    // 4. Return eventHandler's value.
+    VERIFY(event_handler->value.has<GC::Ptr<WebIDL::CallbackType>>());
+    return event_handler->value.get_pointer<GC::Ptr<WebIDL::CallbackType>>()->ptr();
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-attributes:event-handler-idl-attributes-3
+void EventTarget::set_event_handler_attribute(Utf16FlyString const& name, GC::Ptr<WebIDL::CallbackType> value)
+{
+    // 1. Let eventTarget be the result of determining the target of an event handler given this object and name.
+    auto event_target = determine_target_of_event_handler(*this, name);
+
+    // 2. If eventTarget is null, then return.
+    if (!event_target)
+        return;
+
+    // 3. If the given value is null, then deactivate an event handler given eventTarget and name.
+    if (!value) {
+        event_target->deactivate_event_handler(name);
+        return;
+    }
+
+    // 4. Otherwise:
+    //  1. Let handlerMap be eventTarget's event handler map.
+    auto& handler_map = event_target->ensure_data().event_handler_map;
+
+    //  2. Let eventHandler be handlerMap[name].
+    auto event_handler_iterator = handler_map.find(name);
+
+    //  3. Set eventHandler's value to the given value.
+    if (event_handler_iterator == handler_map.end()) {
+        // NOTE: See the optimization comment in get_current_value_of_event_handler about why this is done.
+        auto new_event_handler = GC::Heap::the().allocate<HTML::EventHandler>(*value);
+
+        //  4. Activate an event handler given eventTarget and name.
+        // Optimization: We pass in the event handler here instead of having activate_event_handler do another hash map lookup just to get the same object.
+        //               This handles a new event handler while the other path handles an existing event handler. As such, both paths must have their own
+        //               unique call to activate_event_handler.
+        event_target->activate_event_handler(name, *new_event_handler);
+
+        handler_map.set(name, new_event_handler);
+        return;
+    }
+
+    auto& event_handler = event_handler_iterator->value;
+
+    event_handler->value = GC::Ptr(value);
+
+    //  4. Activate an event handler given eventTarget and name.
+    //  NOTE: See the optimization comment above.
+    event_target->activate_event_handler(name, *event_handler);
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#activate-an-event-handler
+static JS::Realm& event_handler_listener_realm(EventTarget& event_target, HTML::EventHandler& event_handler)
+{
+    if (auto* callback = event_handler.value.get_pointer<GC::Ptr<WebIDL::CallbackType>>()) {
+        if (auto* realm = Bindings::callback_realm(callback->ptr()))
+            return *realm;
+    }
+
+    if (auto* node = as_if<Node>(&event_target))
+        return node->document().relevant_settings_object().realm();
+
+    if (auto* window = as_if<HTML::Window>(&event_target))
+        return window->associated_document().relevant_settings_object().realm();
+
+    VERIFY_NOT_REACHED();
+}
+
+void EventTarget::activate_event_handler(Utf16FlyString const& name, HTML::EventHandler& event_handler)
+{
+    // 1. Let handlerMap be eventTarget's event handler map.
+    // 2. Let eventHandler be handlerMap[name].
+    // NOTE: These are achieved by using the passed in event handler.
+
+    // 3. If eventHandler's listener is not null, then return.
+    if (event_handler.listener)
+        return;
+
+    JS::Realm& realm = event_handler_listener_realm(*this, event_handler);
+
+    // 4. Let callback be the result of creating a Web IDL EventListener instance representing a reference to a function of one argument that executes the steps of the event handler processing algorithm, given eventTarget, name, and its argument.
+    //    The EventListener's callback context can be arbitrary; it does not impact the steps of the event handler processing algorithm. [DOM]
+
+    // NOTE: The callback must keep `this` alive. For example:
+    //          document.body.onunload = () => { console.log("onunload called!"); }
+    //          document.body.remove();
+    //          location.reload();
     //       The body element is no longer in the DOM and there is no variable holding onto it. However, the onunload handler is still called, meaning the callback keeps the body element alive.
     auto callback_function = JS::NativeFunction::create(
         realm, [event_target = this, name](JS::VM& vm) mutable -> JS::ThrowCompletionOr<JS::Value> {
@@ -234388,6 +234946,7 @@ style-replay = ["style-recording"]
 # After changing dependencies, regenerate the Flatpak sources:
 #   python3 Meta/CMake/flatpak/generate-cargo-sources.py
 [dependencies]
+ak = { path = "../../../AK/Rust" }
 chardetng = "1.0.0"
 foldhash = "0.1"
 hashbrown = "0.16.1"
@@ -265771,26 +266330,15 @@ FILE: Libraries/LibWeb/Rust/src/css/retained_fly_string.rs
 //! the same arrangement `display.rs` uses for `FfiDisplay`.
 
 use crate::css::style_value::retained_list_partial_eq;
-use std::ffi::c_void;
-use std::sync::Arc;
-
-struct FlyStringStorage {
-    raw: usize,
-}
-
-impl Drop for FlyStringStorage {
-    fn drop(&mut self) {
-        crate::css::ffi_stats::release_utf16_fly_string(self.raw);
-    }
-}
-
-/// A retained AK::Utf16FlyString. Rust clones share one storage reference, so
-/// copying style values and computed payloads never crosses into C++.
+/// A retained `AK::Utf16FlyString` with the same one-word representation.
 #[repr(C)]
 pub struct RetainedUtf16FlyString {
     raw: usize,
-    storage: *const c_void,
+    _not_send_or_sync: std::marker::PhantomData<*const ()>,
 }
+
+const _: () = assert!(size_of::<RetainedUtf16FlyString>() == size_of::<usize>());
+const _: () = assert!(align_of::<RetainedUtf16FlyString>() == align_of::<usize>());
 
 impl RetainedUtf16FlyString {
     /// The raw one-word representation; fly strings are interned, so equal raw
@@ -265799,12 +266347,16 @@ impl RetainedUtf16FlyString {
         self.raw
     }
 
+    pub(crate) fn raw_word(&self) -> &usize {
+        &self.raw
+    }
+
     /// The no-string sentinel; holds no reference. No real fly string uses the
     /// zero raw representation.
     pub(crate) fn none() -> Self {
         Self {
             raw: 0,
-            storage: std::ptr::null(),
+            _not_send_or_sync: std::marker::PhantomData,
         }
     }
 
@@ -265815,7 +266367,7 @@ impl RetainedUtf16FlyString {
         }
         Self {
             raw,
-            storage: Arc::into_raw(Arc::new(FlyStringStorage { raw })).cast(),
+            _not_send_or_sync: std::marker::PhantomData,
         }
     }
 }
@@ -265825,11 +266377,11 @@ impl Clone for RetainedUtf16FlyString {
         if self.raw == 0 {
             return Self::none();
         }
-        // SAFETY: Every non-zero value owns one Arc strong reference.
-        unsafe { Arc::increment_strong_count(self.storage.cast::<FlyStringStorage>()) };
+        // SAFETY: Every non-zero value owns one reference to a valid fly string.
+        unsafe { ak::reference_utf16_string(self.raw) };
         Self {
             raw: self.raw,
-            storage: self.storage,
+            _not_send_or_sync: std::marker::PhantomData,
         }
     }
 }
@@ -265839,8 +266391,8 @@ impl Drop for RetainedUtf16FlyString {
         if self.raw == 0 {
             return;
         }
-        // SAFETY: Every non-zero value owns one Arc strong reference.
-        unsafe { Arc::decrement_strong_count(self.storage.cast::<FlyStringStorage>()) };
+        // SAFETY: Every non-zero value owns one reference to a valid fly string.
+        unsafe { ak::release_utf16_string_with(self.raw, crate::css::ffi_stats::release_utf16_fly_string) };
     }
 }
 
@@ -265866,25 +266418,14 @@ impl std::fmt::Debug for RetainedUtf16FlyString {
 pub struct RetainedUtf16FlyStringList {
     pointer: *mut RetainedUtf16FlyString,
     length: usize,
-    raw_pointer: *mut usize,
 }
 
 impl RetainedUtf16FlyStringList {
     pub(crate) fn from_retained_strings(strings: Vec<RetainedUtf16FlyString>) -> Self {
-        let raw_slice = strings
-            .iter()
-            .map(RetainedUtf16FlyString::raw)
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        let raw_pointer = Box::into_raw(raw_slice) as *mut usize;
         let slice = strings.into_boxed_slice();
         let length = slice.len();
         let pointer = Box::into_raw(slice) as *mut RetainedUtf16FlyString;
-        Self {
-            pointer,
-            length,
-            raw_pointer,
-        }
+        Self { pointer, length }
     }
 
     /// Takes ownership of one leaked reference to each string.
@@ -265895,19 +266436,9 @@ impl RetainedUtf16FlyStringList {
         let slice: Box<[RetainedUtf16FlyString]> = (0..length)
             .map(|i| unsafe { RetainedUtf16FlyString::from_leaked_raw(*strings.add(i)) })
             .collect();
-        let raw_slice = slice
-            .iter()
-            .map(RetainedUtf16FlyString::raw)
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        let raw_pointer = Box::into_raw(raw_slice) as *mut usize;
         let length = slice.len();
         let pointer = Box::into_raw(slice) as *mut RetainedUtf16FlyString;
-        Self {
-            pointer,
-            length,
-            raw_pointer,
-        }
+        Self { pointer, length }
     }
 
     pub(crate) fn clone_retained(&self) -> Self {
@@ -265924,10 +266455,11 @@ impl RetainedUtf16FlyStringList {
     /// The list viewed as raw fly-string words; fly strings are interned, so
     /// equal raws mean equal strings.
     pub(crate) fn raws(&self) -> &[usize] {
-        if self.raw_pointer.is_null() {
+        if self.pointer.is_null() {
             return &[];
         }
-        unsafe { std::slice::from_raw_parts(self.raw_pointer, self.length) }
+        // SAFETY: `RetainedUtf16FlyString` is represented by its single raw word.
+        unsafe { std::slice::from_raw_parts(self.pointer.cast::<usize>(), self.length) }
     }
 }
 
@@ -265941,9 +266473,6 @@ impl Drop for RetainedUtf16FlyStringList {
     fn drop(&mut self) {
         if !self.pointer.is_null() {
             drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.pointer, self.length)) });
-        }
-        if !self.raw_pointer.is_null() {
-            drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.raw_pointer, self.length)) });
         }
     }
 }
@@ -269100,9 +269629,9 @@ FILE: Libraries/LibWeb/Rust/src/css/serialize.rs
 //!
 //! Serializes Rust-owned [`StyleValueData`] into text without crossing the FFI per component.
 //! The output stays ASCII until the first non-ASCII code unit forces UTF-16 storage, matching
-//! AK::Utf16String's ASCII-or-UTF16 representation so C++ can adopt the buffer without
-//! transcoding. Value types whose serialization has not been ported yet return the null
-//! serialization, and the C++ dispatcher falls back to the legacy per-class serializer.
+//! AK::Utf16String's ASCII-or-UTF16 representation, then moves a native string owner to C++.
+//! Value types whose serialization has not been ported yet return no string, and the C++
+//! dispatcher falls back to the legacy per-class serializer.
 
 use std::ffi::c_void;
 
@@ -269128,32 +269657,6 @@ impl SerializationMode {
     }
 }
 
-unsafe extern "C" {
-    /// Reads the contents of a retained Utf16FlyString. Short strings are decoded into
-    /// `short_buffer`, which must hold at least 16 bytes; long strings return a pointer into
-    /// the refcounted heap data the retained reference keeps alive.
-    fn ladybird_utf16_fly_string_view(raw: usize, short_buffer: *mut u8) -> FfiFlyStringView;
-}
-
-#[repr(C)]
-pub(crate) struct FfiFlyStringView {
-    data: *const c_void,
-    length: usize,
-    is_ascii: bool,
-}
-
-impl FfiFlyStringView {
-    /// The empty view, used by the cargo-test bridge stub.
-    #[cfg(test)]
-    pub(crate) fn empty() -> Self {
-        Self {
-            data: std::ptr::null(),
-            length: 0,
-            is_ascii: true,
-        }
-    }
-}
-
 /// The decoded storage of a fly string: ASCII bytes or UTF-16 code units.
 pub(crate) enum StringUnits<'a> {
     Ascii(&'a [u8]),
@@ -269162,22 +269665,10 @@ pub(crate) enum StringUnits<'a> {
 
 /// Calls `f` with a view of the fly string's contents.
 pub(crate) fn with_fly_string_units<R>(string: &RetainedUtf16FlyString, f: impl FnOnce(StringUnits) -> R) -> R {
-    if string.raw() == 0 {
-        return f(StringUnits::Ascii(&[]));
-    }
-    let mut short_buffer = [0u8; 16];
-    // SAFETY: The retained reference keeps the fly string alive; the buffer outlives the view.
-    let view = unsafe { ladybird_utf16_fly_string_view(string.raw(), short_buffer.as_mut_ptr()) };
-    if view.length == 0 {
-        return f(StringUnits::Ascii(&[]));
-    }
-    let units = if view.is_ascii {
-        // SAFETY: `data` points either at `short_buffer` or at heap storage kept alive by the
-        // retained reference for the duration of this call.
-        StringUnits::Ascii(unsafe { std::slice::from_raw_parts(view.data.cast::<u8>(), view.length) })
-    } else {
-        // SAFETY: Non-ASCII storage is never short, so `data` is stable heap storage.
-        StringUnits::Utf16(unsafe { std::slice::from_raw_parts(view.data.cast::<u16>(), view.length) })
+    // SAFETY: The retained owner remains borrowed for the returned view's lifetime.
+    let units = match unsafe { ak::utf16_string_units(string.raw_word()) } {
+        ak::Utf16StringUnits::Ascii(bytes) => StringUnits::Ascii(bytes),
+        ak::Utf16StringUnits::Utf16(units) => StringUnits::Utf16(units),
     };
     f(units)
 }
@@ -269347,24 +269838,13 @@ pub(crate) fn serialize_computed_size(size: &crate::css::computed_value_types::C
 }
 
 pub(crate) fn fly_string_raw_to_string(raw: usize) -> String {
-    if raw == 0 {
-        return String::new();
-    }
-    let mut short_buffer = [0u8; 16];
     // SAFETY: Callers hold a retained fly-string owner while converting the raw value.
-    let view = unsafe { ladybird_utf16_fly_string_view(raw, short_buffer.as_mut_ptr()) };
-    if view.length == 0 {
-        return String::new();
-    }
-    if view.is_ascii {
-        // SAFETY: The view points to ASCII bytes that remain live for this call.
-        let bytes = unsafe { std::slice::from_raw_parts(view.data.cast::<u8>(), view.length) };
-        // SAFETY: ASCII is valid UTF-8.
-        unsafe { String::from_utf8_unchecked(bytes.to_vec()) }
-    } else {
-        // SAFETY: The view points to UTF-16 units that remain live for this call.
-        let units = unsafe { std::slice::from_raw_parts(view.data.cast::<u16>(), view.length) };
-        String::from_utf16_lossy(units)
+    match unsafe { ak::utf16_string_units(&raw) } {
+        ak::Utf16StringUnits::Ascii(bytes) => {
+            // SAFETY: ASCII is valid UTF-8.
+            unsafe { String::from_utf8_unchecked(bytes.to_vec()) }
+        }
+        ak::Utf16StringUnits::Utf16(units) => String::from_utf16_lossy(units),
     }
 }
 
@@ -272582,55 +273062,33 @@ fn serialize_shorthand(
     default_serialize(sink)
 }
 
-/// A serialized text buffer handed to C++. Exactly one of `ascii` and `utf16` is set when
-/// `storage` is non-null; a null `storage` means the value's serialization is not ported.
+/// A native `AK::Utf16String` ownership reference handed to C++ without copying.
 #[repr(C)]
 pub struct FfiSerializedText {
-    pub ascii: *const u8,
-    pub utf16: *const u16,
-    pub length: usize,
-    pub storage: *mut c_void,
+    pub raw: usize,
+    pub has_value: bool,
 }
 
 impl FfiSerializedText {
     fn unported() -> Self {
         Self {
-            ascii: std::ptr::null(),
-            utf16: std::ptr::null(),
-            length: 0,
-            storage: std::ptr::null_mut(),
+            raw: 0,
+            has_value: false,
         }
     }
 }
 
-struct SerializedTextStorage {
-    ascii: Vec<u8>,
-    utf16: Vec<u16>,
-}
-
 pub(crate) fn sink_into_ffi(sink: TextSink) -> FfiSerializedText {
-    let storage = Box::new(SerializedTextStorage {
-        ascii: sink.ascii,
-        utf16: sink.utf16,
-    });
-    let result = if sink.is_ascii {
-        FfiSerializedText {
-            ascii: storage.ascii.as_ptr(),
-            utf16: std::ptr::null(),
-            length: storage.ascii.len(),
-            storage: std::ptr::null_mut(),
-        }
+    let string = if sink.is_ascii {
+        // SAFETY: The ASCII representation is valid UTF-8.
+        let text = unsafe { str::from_utf8_unchecked(&sink.ascii) };
+        ak::Utf16String::from_utf8(text)
     } else {
-        FfiSerializedText {
-            ascii: std::ptr::null(),
-            utf16: storage.utf16.as_ptr(),
-            length: storage.utf16.len(),
-            storage: std::ptr::null_mut(),
-        }
+        ak::Utf16String::from_utf16(&sink.utf16)
     };
     FfiSerializedText {
-        storage: Box::into_raw(storage).cast(),
-        ..result
+        raw: string.into_raw(),
+        has_value: true,
     }
 }
 
@@ -272650,14 +273108,6 @@ pub unsafe extern "C" fn rust_style_value_serialize(value: *const c_void, mode: 
         }
         sink_into_ffi(sink)
     })
-}
-
-/// # Safety
-/// `storage` must be a non-null storage returned by a serialization entry point that has not
-/// been released.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_serialized_text_release(storage: *mut c_void) {
-    drop(unsafe { Box::from_raw(storage.cast::<SerializedTextStorage>()) });
 }
 
 #[cfg(test)]
@@ -277941,13 +278391,6 @@ pub extern "C" fn rust_style_compute_context_anchor(_context: *const c_void) {}
 mod ffi_test_stubs {
     #[unsafe(no_mangle)]
     extern "C" fn ladybird_utf16_fly_string_unref(_raw: usize) {}
-    #[unsafe(no_mangle)]
-    extern "C" fn ladybird_utf16_fly_string_view(
-        _raw: usize,
-        _short_buffer: *mut u8,
-    ) -> crate::css::serialize::FfiFlyStringView {
-        crate::css::serialize::FfiFlyStringView::empty()
-    }
     #[unsafe(no_mangle)]
     extern "C" fn ladybird_string_unref(_raw: usize) {}
     #[unsafe(no_mangle)]
@@ -332329,6 +332772,38 @@ impl StyleEngine {
         }
     }
 
+    /// Whether an of-type position kept the same truth across this transaction.
+    fn nth_of_type_truth_unchanged(
+        &mut self,
+        nth: NthPosition,
+        node: StyleNodeID,
+        workspace: &MatchEvaluationWorkspace,
+    ) -> bool {
+        let Some(view) = self
+            .transaction_fact_view
+            .as_ref()
+            .filter(|view| view.before_sibling_relations_available)
+        else {
+            return false;
+        };
+        let resident_facts = self.facts.primary();
+        let old_count = MatchEvaluator::new(&self.tree, resident_facts)
+            .with_transaction_fact_view(view, TransactionFactSide::Before)
+            .with_match_workspace(workspace, MatchEvaluationSide::OldTree)
+            .indexed_sibling_position(nth, node, &mut self.counters)
+            .ok()
+            .flatten();
+        let new_count = MatchEvaluator::new(&self.tree, resident_facts)
+            .with_transaction_fact_view(view, TransactionFactSide::After)
+            .with_match_workspace(workspace, MatchEvaluationSide::Current)
+            .indexed_sibling_position(nth, node, &mut self.counters)
+            .ok()
+            .flatten();
+        old_count
+            .zip(new_count)
+            .is_some_and(|(old, new)| nth.matches_count(old) == nth.matches_count(new))
+    }
+
     /// Name the children whose position in the sequence actually moved.
     ///
     /// A child arriving or leaving at index `i` shifts the count-from-the-start of everything from
@@ -332351,6 +332826,7 @@ impl StyleEngine {
         if children.is_empty() {
             return;
         }
+        let sequence_match_workspace = MatchEvaluationWorkspace::default();
         // Where in the sequence the earliest and the latest change happened. A change nobody could
         // place leaves the whole sequence moved, because that is all that is still provable.
         let (first_moved, last_moved) = match change.span {
@@ -332434,25 +332910,30 @@ impl StyleEngine {
                 // old position, so evaluate the test on both sides and drop the children whose
                 // truth provably did not move. A relative positional input stays routed: it is a
                 // possible witness, and witness truth is judged at its anchors, not here.
-                let truth_unchanged_on_both_sides = counts_this_sequence
-                    && change.arriving_nodes.binary_search(&child).is_err()
-                    && engine.transaction_fact_view.as_ref().is_some_and(|view| {
-                        view.before_sibling_relations_available
-                            && view
-                                .before_sibling_geometry
-                                .sibling_positions(child)
-                                .is_some_and(|old| {
-                                    let new_count = match nth.from_end {
-                                        true => children.len() - at,
-                                        false => at + 1,
-                                    } as i64;
-                                    let old_count = i64::from(match nth.from_end {
-                                        true => old.from_end,
-                                        false => old.from_start,
-                                    });
-                                    nth.matches_count(new_count) == nth.matches_count(old_count)
-                                })
-                    });
+                let truth_unchanged_on_both_sides = change.arriving_nodes.binary_search(&child).is_err()
+                    && match counts_this_sequence {
+                        true => engine.transaction_fact_view.as_ref().is_some_and(|view| {
+                            view.before_sibling_relations_available
+                                && view
+                                    .before_sibling_geometry
+                                    .sibling_positions(child)
+                                    .is_some_and(|old| {
+                                        let new_count = match nth.from_end {
+                                            true => children.len() - at,
+                                            false => at + 1,
+                                        } as i64;
+                                        let old_count = i64::from(match nth.from_end {
+                                            true => old.from_end,
+                                            false => old.from_start,
+                                        });
+                                        nth.matches_count(new_count) == nth.matches_count(old_count)
+                                    })
+                        }),
+                        false if nth.of_type => {
+                            engine.nth_of_type_truth_unchanged(nth, child, &sequence_match_workspace)
+                        }
+                        false => false,
+                    };
                 for &entry_index in candidates {
                     let entry = &entries[entry_index];
                     let point = routing.route(entry.route);
@@ -332541,6 +333022,12 @@ impl StyleEngine {
                 }
             }
         }
+        let sequence_match_workspace_bytes = sequence_match_workspace.capacity_bytes();
+        self.memory
+            .reserve_required(MemoryCategory::BatchScratch, sequence_match_workspace_bytes);
+        drop(sequence_match_workspace);
+        self.memory
+            .release(MemoryCategory::BatchScratch, sequence_match_workspace_bytes);
     }
 
     /// Route a possible relational witness through the anchors whose truth it can flip.
@@ -341693,7 +342180,7 @@ impl<'a> MatchEvaluator<'a> {
     /// sequence length and repeated across rules. Child positions depend only on tree relations;
     /// of-type positions additionally depend on the fact side, so old and new evaluations use
     /// separate caches.
-    fn indexed_sibling_position(
+    pub(super) fn indexed_sibling_position(
         &self,
         position: NthPosition,
         node: StyleNodeID,
@@ -621210,588 +621697,3 @@ private:
     void handle_any_user_prompts(Function<void()> on_dialog_closed);
 
     void maximize_the_window();
-    void iconify_the_window(GC::Ref<GC::Function<void()>>);
-    void restore_the_window(GC::Ref<GC::Function<void()>>);
-    void wait_for_visibility_state(GC::Ref<GC::Function<void()>>, Web::HTML::VisibilityState);
-    u64 register_window_rect_request();
-
-    using OnNavigationComplete = GC::Ref<GC::Function<void(Web::WebDriver::Response)>>;
-    void wait_for_navigation_to_complete(OnNavigationComplete);
-
-    Gfx::IntPoint calculate_absolute_position_of_element(Web::CSSPixelRect);
-    Gfx::IntRect calculate_absolute_rect_of_element(Web::DOM::Element const& element);
-
-    using GetStartNode = GC::Ref<GC::Function<ErrorOr<GC::Ref<Web::DOM::ParentNode>, Web::WebDriver::Error>()>>;
-    using OnFindComplete = GC::Ref<GC::Function<void(Web::WebDriver::Response)>>;
-    void find(Web::WebDriver::LocationStrategy, String, GetStartNode, OnFindComplete);
-
-    struct ScriptArguments {
-        String script;
-        GC::RootVector<JS::Value> arguments;
-    };
-    ErrorOr<ScriptArguments, Web::WebDriver::Error> extract_the_script_arguments_from_a_request(JsonValue const& payload);
-    void handle_script_response(Web::WebDriver::ExecutionResult, size_t script_execution_id);
-
-    void delete_cookies(Optional<StringView> const& name = {});
-
-    GC::Ref<PageClient> m_page_client;
-
-    Optional<u64> m_current_command_id;
-
-    // https://w3c.github.io/webdriver/#dfn-page-load-strategy
-    Web::WebDriver::PageLoadStrategy m_page_load_strategy { Web::WebDriver::PageLoadStrategy::Normal };
-
-    // https://w3c.github.io/webdriver/#dfn-strict-file-interactability
-    bool m_strict_file_interactability { false };
-
-    // https://w3c.github.io/webdriver/#dfn-session-script-timeout
-    Web::WebDriver::TimeoutsConfiguration m_timeouts_configuration;
-
-    // https://w3c.github.io/webdriver/#dfn-current-browsing-context
-    GC::Ptr<Web::HTML::BrowsingContext> m_current_browsing_context;
-
-    // https://w3c.github.io/webdriver/#dfn-current-parent-browsing-context
-    GC::Ptr<Web::HTML::BrowsingContext> m_current_parent_browsing_context;
-
-    // https://w3c.github.io/webdriver/#dfn-current-top-level-browsing-context
-    GC::Ptr<Web::HTML::BrowsingContext> m_current_top_level_browsing_context;
-
-    HashTable<u64> m_pending_window_rect_requests;
-    u64 m_next_window_rect_request_id { 1 };
-
-    size_t m_script_execution_id_counter { 0 };
-    Optional<size_t> m_current_script_execution_id;
-
-    friend class ElementLocator;
-    GC::Ptr<ElementLocator> m_element_locator;
-
-    GC::Ptr<JS::Cell> m_action_executor;
-
-    GC::Ptr<Web::DOM::DocumentObserver> m_document_observer;
-    GC::Ptr<Web::HTML::NavigationObserver> m_navigation_observer;
-    GC::Ptr<GC::Timer> m_navigation_timer;
-};
-
-}
-
-FILE: Services/WebContent/WebUIClient.ipc
-endpoint WebUIClient {
-    received_message(String name, JsonValue data) =|
-}
-
-FILE: Services/WebContent/WebUIConnection.cpp
-/*
- * Copyright (c) 2025, Tim Flynn <trflynn89@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <AK/JsonObject.h>
-#include <AK/NeverDestroyed.h>
-#include <LibGC/Heap.h>
-#include <LibWeb/Bindings/PlatformObject.h>
-#include <LibWeb/Bindings/Wrappable.h>
-#include <LibWeb/Bindings/WrapperWorld.h>
-#include <LibWeb/DOM/CustomEvent.h>
-#include <LibWeb/DOM/Document.h>
-#include <LibWeb/DOM/Event.h>
-#include <LibWeb/HTML/Scripting/Environments.h>
-#include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
-#include <LibWeb/HTML/Window.h>
-#include <LibWeb/Internals/WebUI.h>
-#include <LibWeb/WebDriver/JSON.h>
-#include <WebContent/WebUIConnection.h>
-
-namespace WebContent {
-
-static JS::PropertyKey const& ladybird_property()
-{
-    static NeverDestroyed<JS::PropertyKey> property { "ladybird"_utf16_fly_string };
-    return *property;
-}
-
-static Utf16FlyString const& web_ui_loaded_event()
-{
-    static NeverDestroyed<Utf16FlyString> event { "WebUILoaded"_utf16_fly_string };
-    return *event;
-}
-
-static FlyString const& web_ui_message_event()
-{
-    static NeverDestroyed<FlyString> event { "WebUIMessage"_fly_string };
-    return *event;
-}
-
-ErrorOr<NonnullRefPtr<WebUIConnection>> WebUIConnection::connect(IPC::TransportHandle handle, Web::DOM::Document& document)
-{
-    auto transport = TRY(handle.create_transport());
-    return adopt_ref(*new WebUIConnection(move(transport), document));
-}
-
-WebUIConnection::WebUIConnection(NonnullOwnPtr<IPC::Transport> transport, Web::DOM::Document& document)
-    : IPC::ConnectionFromClient<WebUIClientEndpoint, WebUIServerEndpoint>(*this, move(transport), 1)
-    , m_document(document)
-{
-    auto& realm = m_document->relevant_settings_object().realm();
-    auto& window = Web::HTML::relevant_window(realm.global_object());
-    realm.global_object().define_direct_property(ladybird_property(), Web::Bindings::wrap(Web::Bindings::host_defined_wrapper_world(realm), realm, Web::Internals::WebUI::create(window)), JS::default_attributes);
-
-    Web::HTML::queue_a_task(Web::HTML::Task::Source::Unspecified, nullptr, m_document, GC::create_function(GC::Heap::the(), [&document = *m_document]() {
-        document.dispatch_event(Web::DOM::Event::create(Web::HTML::relevant_global_object(document), web_ui_loaded_event()));
-    }));
-}
-
-WebUIConnection::~WebUIConnection()
-{
-    if (!m_document->window())
-        return;
-
-    (void)m_document->relevant_settings_object().realm().global_object().internal_delete(ladybird_property());
-}
-
-void WebUIConnection::visit_edges(JS::Cell::Visitor& visitor)
-{
-    visitor.visit(m_document);
-}
-
-void WebUIConnection::send_message(String name, JsonValue data)
-{
-    if (!m_document->browsing_context())
-        return;
-
-    JsonObject detail;
-    detail.set("name"sv, move(name));
-    detail.set("data"sv, move(data));
-
-    auto& realm = m_document->relevant_settings_object().realm();
-    Web::HTML::TemporaryExecutionContext context { realm };
-
-    auto serialized_detail = Web::WebDriver::json_deserialize(*m_document->browsing_context(), detail);
-    if (serialized_detail.is_error()) {
-        warnln("Unable to serialize JSON data from browser: {}", serialized_detail.error());
-        return;
-    }
-
-    Web::DOM::CustomEventInit event_init {};
-    event_init.detail = serialized_detail.value();
-
-    m_document->dispatch_event(Web::DOM::CustomEvent::create(realm.global_object(), web_ui_message_event(), event_init));
-}
-
-void WebUIConnection::received_message_from_web_ui(Utf16String const& name, JS::Value data)
-{
-    if (!m_document->browsing_context())
-        return;
-
-    auto deserialized_data = Web::WebDriver::json_clone(*m_document->browsing_context(), data);
-    if (deserialized_data.is_error()) {
-        warnln("Unable to deserialize JS data from WebUI: {}", deserialized_data.error());
-        return;
-    }
-
-    async_received_message(name.to_utf8(), deserialized_data.value());
-}
-
-}
-
-FILE: Services/WebContent/WebUIConnection.h
-/*
- * Copyright (c) 2025, Tim Flynn <trflynn89@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/JsonValue.h>
-#include <AK/NonnullRefPtr.h>
-#include <AK/Utf16String.h>
-#include <LibGC/Ptr.h>
-#include <LibIPC/ConnectionFromClient.h>
-#include <LibIPC/Transport.h>
-#include <LibIPC/TransportHandle.h>
-#include <LibJS/Heap/Cell.h>
-#include <LibWeb/Forward.h>
-#include <WebContent/WebUIClientEndpoint.h>
-#include <WebContent/WebUIServerEndpoint.h>
-
-namespace WebContent {
-
-class WebUIConnection final : public IPC::ConnectionFromClient<WebUIClientEndpoint, WebUIServerEndpoint> {
-public:
-    static ErrorOr<NonnullRefPtr<WebUIConnection>> connect(IPC::TransportHandle, Web::DOM::Document&);
-    virtual ~WebUIConnection() override;
-
-    void visit_edges(JS::Cell::Visitor&);
-
-    void received_message_from_web_ui(Utf16String const& name, JS::Value data);
-
-    Web::DOM::Document const& document() const { return m_document; }
-
-private:
-    WebUIConnection(NonnullOwnPtr<IPC::Transport>, Web::DOM::Document&);
-
-    virtual void die() override { }
-    virtual void send_message(String name, JsonValue data) override;
-
-    GC::Ref<Web::DOM::Document> m_document;
-};
-
-}
-
-FILE: Services/WebContent/WebUIServer.ipc
-endpoint WebUIServer {
-    send_message(String name, JsonValue data) =|
-}
-
-FILE: Services/WebDriver/BrowserConnection.cpp
-/*
- * Copyright (c) 2026, Shannon Booth <shannon@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <WebDriver/BrowserConnection.h>
-
-namespace WebDriver {
-
-BrowserConnection::BrowserConnection(NonnullOwnPtr<IPC::Transport> transport)
-    : IPC::ConnectionFromClient<WebDriverBrowserClientEndpoint, WebDriverBrowserServerEndpoint>(*this, move(transport), 1)
-{
-}
-
-void BrowserConnection::die()
-{
-    auto protector = NonnullRefPtr { *this };
-
-    if (on_close)
-        on_close();
-}
-
-void BrowserConnection::did_create_window(String handle)
-{
-    if (on_did_create_window)
-        on_did_create_window(move(handle));
-}
-
-void BrowserConnection::did_close_window(String handle)
-{
-    if (on_did_close_window)
-        on_did_close_window(move(handle));
-}
-
-void BrowserConnection::command_complete(u64 command_id, Web::WebDriver::Response response)
-{
-    if (on_command_complete)
-        on_command_complete(command_id, move(response));
-}
-
-}
-
-FILE: Services/WebDriver/BrowserConnection.h
-/*
- * Copyright (c) 2026, Shannon Booth <shannon@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/Function.h>
-#include <LibIPC/ConnectionFromClient.h>
-#include <LibIPC/Transport.h>
-#include <LibWeb/WebDriver/Response.h>
-#include <WebDriver/WebDriverBrowserClientEndpoint.h>
-#include <WebDriver/WebDriverBrowserServerEndpoint.h>
-
-namespace WebDriver {
-
-class BrowserConnection
-    : public IPC::ConnectionFromClient<WebDriverBrowserClientEndpoint, WebDriverBrowserServerEndpoint> {
-    C_OBJECT_ABSTRACT(BrowserConnection)
-public:
-    explicit BrowserConnection(NonnullOwnPtr<IPC::Transport>);
-
-    Function<void()> on_close;
-    Function<void(String)> on_did_create_window;
-    Function<void(String)> on_did_close_window;
-    Function<void(u64, Web::WebDriver::Response)> on_command_complete;
-
-private:
-    virtual void die() override;
-
-    virtual void did_create_window(String) override;
-    virtual void did_close_window(String) override;
-    virtual void command_complete(u64 command_id, Web::WebDriver::Response) override;
-};
-
-}
-
-FILE: Services/WebDriver/Client.cpp
-/*
- * Copyright (c) 2022, Florent Castelli <florent.castelli@gmail.com>
- * Copyright (c) 2022, Sam Atkins <atkinssj@serenityos.org>
- * Copyright (c) 2022, Tobias Christiansen <tobyase@serenityos.org>
- * Copyright (c) 2022, Linus Groh <linusg@serenityos.org>
- * Copyright (c) 2022-2025, Tim Flynn <trflynn89@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <AK/Debug.h>
-#include <AK/JsonObject.h>
-#include <AK/JsonValue.h>
-#include <LibCore/EventLoop.h>
-#include <LibCore/Timer.h>
-#include <LibURL/Parser.h>
-#include <LibWeb/WebDriver/Capabilities.h>
-#include <LibWeb/WebDriver/Error.h>
-#include <LibWeb/WebDriver/UserPrompt.h>
-#include <WebDriver/Client.h>
-#include <WebDriver/Session.h>
-
-// Failures become rejected WebDriverPromises rather than propagated ErrorOr values, so this macro may only be used in
-// functions returning ResponsePromise, not in void-returning callbacks or continuations. Expansions require the
-// WebDriverPromise alias to be visible within namespace WebDriver.
-#define WEBDRIVER_TRY(expression)                                                                    \
-    ({                                                                                               \
-        /* Ignore -Wshadow to allow nesting the macro. */                                            \
-        AK_IGNORE_DIAGNOSTIC("-Wshadow",                                                             \
-            auto&& _temporary_result = (expression));                                                \
-        static_assert(!::AK::Detail::IsLvalueReference<decltype(_temporary_result.release_value())>, \
-            "Do not return a reference from a fallible expression");                                 \
-        if (_temporary_result.is_error()) [[unlikely]] {                                             \
-            return WebDriverPromise::rejected(_temporary_result.release_error());                    \
-        }                                                                                            \
-        _temporary_result.release_value();                                                           \
-    })
-
-namespace WebDriver {
-
-using ResponsePromise = Web::WebDriver::Client::ResponsePromise;
-using WebDriverPromise = ResponsePromise::ElementType;
-
-static ResponsePromise promise_from_response(Web::WebDriver::Response response)
-{
-    if (response.is_error())
-        return WebDriverPromise::rejected(response.release_error());
-    return WebDriverPromise::resolved(response.release_value());
-}
-
-static ErrorOr<NonnullRefPtr<Session>, Web::WebDriver::Error>
-find_session_with_ladybird_test_hooks(Web::WebDriver::Parameters const& parameters)
-{
-    auto session = TRY(Session::find_session(parameters[0]));
-    if (!session->test_hooks_enabled())
-        return Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::UnknownCommand,
-            "Ladybird test hooks are not enabled for this session"sv);
-    return session;
-}
-
-ErrorOr<NonnullRefPtr<Client>> Client::try_create(NonnullOwnPtr<Core::BufferedTCPSocket> socket, LaunchBrowserCallback launch_browser_callback)
-{
-    if (!launch_browser_callback)
-        return Error::from_string_literal("The callback to launch the browser must be provided");
-
-    TRY(socket->set_blocking(true));
-    return adopt_nonnull_ref_or_enomem(new (nothrow) Client(move(socket), move(launch_browser_callback)));
-}
-
-Client::Client(NonnullOwnPtr<Core::BufferedTCPSocket> socket, LaunchBrowserCallback launch_browser_callback)
-    : Web::WebDriver::Client(move(socket))
-    , m_launch_browser_callback(move(launch_browser_callback))
-{
-}
-
-Client::~Client() = default;
-
-ResponsePromise Client::enqueue_session_request(StringView session_id, SessionRequestHandler handler)
-{
-    auto session = Session::find_session(session_id, Web::WebDriver::SessionFlags::Http, Session::AllowInvalidWindowHandle::Yes);
-    if (session.is_error())
-        return WebDriverPromise::rejected(session.release_error());
-    return session.release_value()->enqueue_http_request(move(handler));
-}
-
-// 8.1 New Session, https://w3c.github.io/webdriver/#dfn-new-sessions
-// POST /session
-ResponsePromise Client::new_session(Web::WebDriver::Parameters, JsonValue payload)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling POST /session");
-
-    // 1. If the implementation is an endpoint node, and the list of active HTTP sessions is not empty, or otherwise if
-    //    the implementation is unable to start an additional session, return error with error code session not created.
-    if (Session::session_count(Web::WebDriver::SessionFlags::Http) > 0 || Session::has_pending_http_session_creation())
-        return promise_from_response(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::SessionNotCreated, "There is already an active HTTP session"sv));
-
-    // FIXME: 2. If the remote end is an intermediary node, take implementation-defined steps that either result in returning
-    //           an error with error code session not created, or in returning a success with data that is isomorphic to that
-    //           returned by remote ends according to the rest of this algorithm. If an error is not returned, the intermediary
-    //           node must retain a reference to the session created on the upstream node as the associated session such that
-    //           commands may be forwarded to this associated session on subsequent commands.
-
-    // 3. Let flags be a set containing "http".
-    static constexpr auto flags = Web::WebDriver::SessionFlags::Http;
-
-    // 4. Let capabilities be the result of trying to process capabilities with parameters and flags.
-    auto capabilities = WEBDRIVER_TRY(Web::WebDriver::process_capabilities(payload, flags));
-
-    // 5. If capabilities's is null, return error with error code session not created.
-    if (capabilities.is_null())
-        return promise_from_response(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::SessionNotCreated, "Could not match capabilities"sv));
-
-    // 6. Let session be the result of create a session, with capabilities, and flags.
-    auto maybe_session_promise = Session::create(*this, move(capabilities), flags);
-    if (maybe_session_promise.is_error())
-        return promise_from_response(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::SessionNotCreated, MUST(String::formatted("Failed to start session: {}", maybe_session_promise.error()))));
-
-    auto promise = WebDriverPromise::construct();
-    auto session_promise = maybe_session_promise.release_value();
-    promise->add_child(session_promise);
-    session_promise->when_resolved([promise](Session::NewSession& new_session) mutable {
-                       // 7. Let body be a JSON Object initialized with:
-                       JsonObject body;
-                       // "sessionId"
-                       //     session's session ID.
-                       body.set("sessionId"sv, JsonValue { new_session.session->session_id() });
-                       // "capabilities"
-                       //     capabilities
-                       body.set("capabilities"sv, move(new_session.capabilities));
-
-                       // 8. Set session' current top-level browsing context to one of the endpoint node's top-level browsing contexts,
-                       //    preferring the top-level browsing context that has system focus, or otherwise preferring any top-level
-                       //    browsing context whose visibility state is visible.
-                       // NOTE: This happens in the WebContent process.
-
-                       // 9. Set the request queue to a new queue.
-                       // NB: The request queue is initialized when the Session is constructed.
-
-                       // 10. Return success with data body.
-                       promise->resolve(JsonValue { move(body) });
-                   })
-        .when_rejected([promise](Web::WebDriver::Error& error) {
-            promise->reject(Web::WebDriver::Error(error));
-        });
-    return promise;
-}
-
-// 8.2 Delete Session, https://w3c.github.io/webdriver/#dfn-delete-session
-// DELETE /session/{session id}
-ResponsePromise Client::delete_session(Web::WebDriver::Parameters parameters, JsonValue)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling DELETE /session/<session_id>");
-
-    // 1. If session is an active HTTP session, try to close the session with session.
-    if (auto session = Session::find_session(parameters[0], Web::WebDriver::SessionFlags::Http, Session::AllowInvalidWindowHandle::Yes); !session.is_error())
-        session.value()->close();
-
-    // 2. Return success with data null.
-    return WebDriverPromise::resolved(JsonValue {});
-}
-
-// https://w3c.github.io/webdriver/#dfn-readiness-state
-static bool readiness_state()
-{
-    // The readiness state of a remote end indicates whether it is free to accept new connections. It must be false if
-    // the implementation is an endpoint node and the list of active HTTP sessions is not empty, or otherwise if the
-    // remote end is known to be in a state in which attempting to create new sessions would fail. In all other cases it
-    // must be true.
-    return Session::session_count(Web::WebDriver::SessionFlags::Http) == 0 && !Session::has_pending_http_session_creation();
-}
-
-// 8.3 Status, https://w3c.github.io/webdriver/#dfn-status
-// GET /status
-ResponsePromise Client::get_status(Web::WebDriver::Parameters, JsonValue)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling GET /status");
-
-    auto readiness_state = WebDriver::readiness_state();
-
-    // 1. Let body be a new JSON Object with the following properties:
-    //    "ready"
-    //        The remote end's readiness state.
-    //    "message"
-    //        An implementation-defined string explaining the remote end's readiness state.
-    JsonObject body;
-    body.set("ready"sv, readiness_state);
-    body.set("message"sv, MUST(String::formatted("{} to accept a new session", readiness_state ? "Ready"sv : "Not ready"sv)));
-
-    // 2. Return success with data body.
-    return WebDriverPromise::resolved(JsonValue { body });
-}
-
-// 9.1 Get Timeouts, https://w3c.github.io/webdriver/#dfn-get-timeouts
-// GET /session/{session id}/timeouts
-ResponsePromise Client::get_timeouts(Web::WebDriver::Parameters parameters, JsonValue)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling GET /session/<session id>/timeouts");
-    auto session = WEBDRIVER_TRY(Session::find_session(parameters[0]));
-    return promise_from_response(session->get_timeouts());
-}
-
-// 9.2 Set Timeouts, https://w3c.github.io/webdriver/#dfn-set-timeouts
-// POST /session/{session id}/timeouts
-ResponsePromise Client::set_timeouts(Web::WebDriver::Parameters parameters, JsonValue payload)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling POST /session/<session id>/timeouts");
-    auto session = WEBDRIVER_TRY(Session::find_session(parameters[0]));
-    return promise_from_response(session->set_timeouts(move(payload)));
-}
-
-// 10.1 Navigate To, https://w3c.github.io/webdriver/#dfn-navigate-to
-// POST /session/{session id}/url
-ResponsePromise Client::navigate_to(Web::WebDriver::Parameters parameters, JsonValue payload)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling POST /session/<session_id>/url");
-    auto session = WEBDRIVER_TRY(Session::find_session(parameters[0]));
-
-    // 2. Let url be the result of getting the property url from the parameters argument.
-    if (!payload.is_object() || !payload.as_object().has_string("url"sv))
-        return promise_from_response(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::InvalidArgument, "Payload doesn't have a string `url`"sv));
-    auto url = URL::Parser::basic_parse(payload.as_object().get_string("url"sv).value());
-    if (!url.has_value())
-        return promise_from_response(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::InvalidArgument, "Payload has an invalid `url`"sv));
-
-    // FIXME: 3. If url is not an absolute URL or is not an absolute URL with fragment or not a local scheme, return error with error code invalid argument.
-
-    return session->navigate_to(url.release_value());
-}
-
-// 10.2 Get Current URL, https://w3c.github.io/webdriver/#dfn-get-current-url
-// GET /session/{session id}/url
-ResponsePromise Client::get_current_url(Web::WebDriver::Parameters parameters, JsonValue)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling GET /session/<session_id>/url");
-    auto session = WEBDRIVER_TRY(Session::find_session(parameters[0]));
-
-    return session->run_content_command("get_current_url"sv);
-}
-
-// 10.3 Back, https://w3c.github.io/webdriver/#dfn-back
-// POST /session/{session id}/back
-ResponsePromise Client::back(Web::WebDriver::Parameters parameters, JsonValue)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling POST /session/<session_id>/back");
-    auto session = WEBDRIVER_TRY(Session::find_session(parameters[0]));
-
-    return continue_with_promise(session->traverse_history(-1, Session::HandleUserPrompts::Yes), [session] {
-        return session->wait_for_navigation_completion();
-    });
-}
-
-// 10.4 Forward, https://w3c.github.io/webdriver/#dfn-forward
-// POST /session/{session id}/forward
-ResponsePromise Client::forward(Web::WebDriver::Parameters parameters, JsonValue)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling POST /session/<session_id>/forward");
-    auto session = WEBDRIVER_TRY(Session::find_session(parameters[0]));
-
-    return continue_with_promise(session->traverse_history(1, Session::HandleUserPrompts::Yes), [session] {
-        return session->wait_for_navigation_completion();
-    });
-}
-
-// 10.5 Refresh, https://w3c.github.io/webdriver/#dfn-refresh
-// POST /session/{session id}/refresh
-ResponsePromise Client::refresh(Web::WebDriver::Parameters parameters, JsonValue)
-{

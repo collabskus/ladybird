@@ -13379,6 +13379,9 @@ FILE: AK/FFIHelpers.cpp
 #include <AK/String.h>
 #include <AK/StringView.h>
 #include <AK/Try.h>
+#include <AK/Utf16FlyString.h>
+#include <AK/Utf16String.h>
+#include <AK/Utf16View.h>
 
 namespace AK {
 
@@ -13402,6 +13405,35 @@ StringView ffi_string_view(u8 const* ptr, size_t len)
 
 }
 
+extern "C" FlatPtr ladybird_utf16_string_create_uninitialized(size_t length, bool has_ascii_storage)
+{
+    auto storage_type = has_ascii_storage
+        ? AK::Detail::Utf16StringData::StorageType::ASCII
+        : AK::Detail::Utf16StringData::StorageType::UTF16;
+    auto data = AK::Detail::Utf16StringData::create_uninitialized_for_ffi(storage_type, length);
+    return reinterpret_cast<FlatPtr>(&data.leak_ref());
+}
+
+extern "C" FlatPtr ladybird_utf16_fly_string_from_utf8(u8 const* data, size_t length)
+{
+    VERIFY(data != nullptr || length == 0);
+    return AK::Utf16FlyString::from_utf8(AK::ffi_string_view(data, length)).into_raw();
+}
+
+extern "C" FlatPtr ladybird_utf16_fly_string_from_utf16(u16 const* data, size_t length)
+{
+    if (data == nullptr) {
+        VERIFY(length == 0);
+        return AK::Utf16FlyString {}.into_raw();
+    }
+    return AK::Utf16FlyString::from_utf16({ reinterpret_cast<char16_t const*>(data), length }).into_raw();
+}
+
+extern "C" void ladybird_utf16_string_unref(FlatPtr raw)
+{
+    AK::Utf16String::unref_raw(raw);
+}
+
 FILE: AK/FFIHelpers.h
 /*
  * Copyright (c) 2026-present, the Ladybird developers.
@@ -13421,6 +13453,14 @@ String ffi_string(u8 const* ptr, size_t len);
 
 StringView ffi_string_view(u8 const* ptr, size_t len);
 
+}
+
+extern "C" {
+
+FlatPtr ladybird_utf16_string_create_uninitialized(size_t, bool has_ascii_storage);
+FlatPtr ladybird_utf16_fly_string_from_utf8(u8 const*, size_t);
+FlatPtr ladybird_utf16_fly_string_from_utf16(u16 const*, size_t);
+void ladybird_utf16_string_unref(FlatPtr);
 }
 
 #ifdef USING_AK_GLOBALLY
@@ -29973,6 +30013,453 @@ ReverseWrapper<Container> in_reverse(Container&& container) { return { container
 
 }
 
+FILE: AK/Rust/Cargo.toml
+[package]
+name = "ak"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["rlib"]
+
+[lints]
+workspace = true
+
+FILE: AK/Rust/src/lib.rs
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+//! Rust views of shared AK data structures.
+
+use std::sync::atomic::{AtomicU32, Ordering};
+
+const SHORT_STRING_FLAG: usize = 1;
+const SHORT_STRING_BYTE_COUNT_SHIFT: u32 = 2;
+const HAS_UTF16_STORAGE: u32 = 1;
+const UNKNOWN_CODE_POINT_LENGTH: u32 = u32::MAX;
+
+/// Mirrors `AK::Detail::Utf16StringDataHeader`.
+#[repr(C, align(8))]
+struct Utf16StringDataHeader {
+    reference_count: AtomicU32,
+    length_in_code_units: u32,
+    length_in_code_points: AtomicU32,
+    hash: AtomicU32,
+    flags: AtomicU32,
+}
+
+const _: () = assert!(size_of::<Utf16StringDataHeader>() == 24);
+const _: () = assert!(align_of::<Utf16StringDataHeader>() == 8);
+const _: () = assert!(std::mem::offset_of!(Utf16StringDataHeader, reference_count) == 0);
+const _: () = assert!(std::mem::offset_of!(Utf16StringDataHeader, length_in_code_units) == 4);
+const _: () = assert!(std::mem::offset_of!(Utf16StringDataHeader, length_in_code_points) == 8);
+const _: () = assert!(std::mem::offset_of!(Utf16StringDataHeader, hash) == 12);
+const _: () = assert!(std::mem::offset_of!(Utf16StringDataHeader, flags) == 16);
+
+/// A borrowed view of an `AK::Utf16String` or `AK::Utf16FlyString`.
+pub enum Utf16StringUnits<'a> {
+    Ascii(&'a [u8]),
+    Utf16(&'a [u16]),
+}
+
+unsafe extern "C" {
+    fn ladybird_utf16_string_create_uninitialized(length: usize, has_ascii_storage: bool) -> usize;
+    fn ladybird_utf16_fly_string_from_utf8(data: *const u8, length: usize) -> usize;
+    fn ladybird_utf16_fly_string_from_utf16(data: *const u16, length: usize) -> usize;
+    fn ladybird_utf16_string_unref(raw: usize);
+}
+
+#[repr(transparent)]
+struct OwnedUtf16String {
+    raw: usize,
+    _not_send_or_sync: std::marker::PhantomData<*const ()>,
+}
+
+impl OwnedUtf16String {
+    const fn empty() -> Self {
+        Self {
+            raw: SHORT_STRING_FLAG,
+            _not_send_or_sync: std::marker::PhantomData,
+        }
+    }
+
+    unsafe fn from_raw(raw: usize) -> Self {
+        Self {
+            raw,
+            _not_send_or_sync: std::marker::PhantomData,
+        }
+    }
+
+    fn into_raw(self) -> usize {
+        let this = std::mem::ManuallyDrop::new(self);
+        this.raw
+    }
+
+    fn as_units(&self) -> Utf16StringUnits<'_> {
+        // SAFETY: This owner keeps the raw string alive for the returned lifetime.
+        unsafe { utf16_string_units(&self.raw) }
+    }
+}
+
+impl Clone for OwnedUtf16String {
+    fn clone(&self) -> Self {
+        // SAFETY: This owner keeps the raw string alive while adding a reference.
+        unsafe { reference_utf16_string(self.raw) };
+        // SAFETY: The new reference is transferred to the returned owner.
+        unsafe { Self::from_raw(self.raw) }
+    }
+}
+
+impl Drop for OwnedUtf16String {
+    fn drop(&mut self) {
+        // SAFETY: This object owns one reference to its raw string.
+        unsafe {
+            release_utf16_string_with(self.raw, |raw| ladybird_utf16_string_unref(raw));
+        }
+    }
+}
+
+/// A one-word Rust owner for the same storage as `AK::Utf16String`.
+#[repr(transparent)]
+pub struct Utf16String(OwnedUtf16String);
+
+/// A one-word Rust owner for the same interned storage as `AK::Utf16FlyString`.
+#[repr(transparent)]
+pub struct Utf16FlyString(OwnedUtf16String);
+
+const _: () = assert!(size_of::<OwnedUtf16String>() == size_of::<usize>());
+const _: () = assert!(align_of::<OwnedUtf16String>() == align_of::<usize>());
+const _: () = assert!(size_of::<Utf16String>() == size_of::<usize>());
+const _: () = assert!(align_of::<Utf16String>() == align_of::<usize>());
+const _: () = assert!(size_of::<Utf16FlyString>() == size_of::<usize>());
+const _: () = assert!(align_of::<Utf16FlyString>() == align_of::<usize>());
+
+macro_rules! impl_utf16_string_owner {
+    ($name:ident) => {
+        impl $name {
+            /// Adopts an existing C++ ownership reference without changing its count.
+            ///
+            /// # Safety
+            ///
+            /// `raw` must be a valid `AK::Utf16String` raw representation for which
+            /// the caller owns one reference. The reference must not be released
+            /// separately after this call.
+            pub unsafe fn from_raw_owned(raw: usize) -> Self {
+                // SAFETY: The caller transfers a valid ownership reference.
+                Self(unsafe { OwnedUtf16String::from_raw(raw) })
+            }
+
+            /// Transfers this owner's existing reference to the caller.
+            pub fn into_raw(self) -> usize {
+                self.0.into_raw()
+            }
+
+            /// Returns the shared one-word identity without transferring ownership.
+            pub fn raw_identity(&self) -> usize {
+                self.0.raw
+            }
+
+            /// Borrows the shared ASCII or UTF-16 character storage directly.
+            pub fn as_units(&self) -> Utf16StringUnits<'_> {
+                self.0.as_units()
+            }
+
+            /// Returns whether the string has no code units.
+            pub fn is_empty(&self) -> bool {
+                match self.as_units() {
+                    Utf16StringUnits::Ascii(units) => units.is_empty(),
+                    Utf16StringUnits::Utf16(units) => units.is_empty(),
+                }
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self(OwnedUtf16String::empty())
+            }
+        }
+
+        impl Clone for $name {
+            fn clone(&self) -> Self {
+                Self(self.0.clone())
+            }
+        }
+    };
+}
+
+impl_utf16_string_owner!(Utf16String);
+impl_utf16_string_owner!(Utf16FlyString);
+
+impl Utf16String {
+    /// Creates a string in AK's native representation and initializes its storage from UTF-8.
+    pub fn from_utf8(string: &str) -> Self {
+        if string.is_ascii() {
+            return Self::from_ascii(string.as_bytes());
+        }
+
+        let length = string.encode_utf16().count();
+        let result = Self::create_uninitialized(length, false);
+        let storage = result.long_storage().cast::<u16>();
+        for (index, code_unit) in string.encode_utf16().enumerate() {
+            // SAFETY: The allocation has space for exactly `length` UTF-16 code units.
+            unsafe { storage.add(index).write(code_unit) };
+        }
+        result
+    }
+
+    /// Creates a string in AK's native representation and initializes its storage from UTF-16.
+    pub fn from_utf16(string: &[u16]) -> Self {
+        if string.iter().all(|code_unit| *code_unit <= 0x7f) {
+            if string.len() < size_of::<usize>() {
+                let mut bytes = [0; size_of::<usize>() - 1];
+                for (index, code_unit) in string.iter().enumerate() {
+                    bytes[index] = *code_unit as u8;
+                }
+                return Self::from_short_ascii(&bytes[..string.len()]);
+            }
+
+            let result = Self::create_uninitialized(string.len(), true);
+            let storage = result.long_storage();
+            for (index, code_unit) in string.iter().enumerate() {
+                // SAFETY: The allocation has space for exactly `string.len()` ASCII bytes.
+                unsafe { storage.add(index).write(*code_unit as u8) };
+            }
+            return result;
+        }
+
+        let result = Self::create_uninitialized(string.len(), false);
+        // SAFETY: The source and destination are non-overlapping and the allocation has space for
+        // exactly `string.len()` UTF-16 code units.
+        unsafe { std::ptr::copy_nonoverlapping(string.as_ptr(), result.long_storage().cast(), string.len()) };
+        result
+    }
+
+    fn from_ascii(string: &[u8]) -> Self {
+        if string.len() < size_of::<usize>() {
+            return Self::from_short_ascii(string);
+        }
+
+        let result = Self::create_uninitialized(string.len(), true);
+        // SAFETY: The source and destination are non-overlapping and the allocation has space for
+        // exactly `string.len()` ASCII bytes.
+        unsafe { std::ptr::copy_nonoverlapping(string.as_ptr(), result.long_storage(), string.len()) };
+        result
+    }
+
+    fn from_short_ascii(string: &[u8]) -> Self {
+        assert!(string.len() < size_of::<usize>());
+        let mut bytes = [0; size_of::<usize>()];
+        let tag = ((string.len() as u8) << SHORT_STRING_BYTE_COUNT_SHIFT) | SHORT_STRING_FLAG as u8;
+        #[cfg(target_endian = "little")]
+        {
+            bytes[0] = tag;
+            bytes[1..][..string.len()].copy_from_slice(string);
+        }
+        #[cfg(target_endian = "big")]
+        {
+            bytes[size_of::<usize>() - 1] = tag;
+            bytes[..string.len()].copy_from_slice(string);
+        }
+        // SAFETY: The constructed word is AK's short-string representation and owns no allocation.
+        unsafe { Self::from_raw_owned(usize::from_ne_bytes(bytes)) }
+    }
+
+    fn create_uninitialized(length: usize, has_ascii_storage: bool) -> Self {
+        assert!(length < UNKNOWN_CODE_POINT_LENGTH as usize);
+        let unit_size = if has_ascii_storage { 1 } else { size_of::<u16>() };
+        assert!(
+            size_of::<Utf16StringDataHeader>()
+                .checked_add(
+                    length
+                        .checked_mul(unit_size)
+                        .expect("UTF-16 string allocation size overflow")
+                )
+                .is_some()
+        );
+        // SAFETY: C++ returns a fully initialized native string owner with trailing storage sized
+        // for `length` units. The caller initializes that storage before publishing the owner.
+        let raw = unsafe { ladybird_utf16_string_create_uninitialized(length, has_ascii_storage) };
+        // SAFETY: The allocator transfers one ownership reference.
+        unsafe { Self::from_raw_owned(raw) }
+    }
+
+    fn long_storage(&self) -> *mut u8 {
+        assert!(has_long_storage(self.raw_identity()));
+        std::ptr::with_exposed_provenance_mut::<u8>(self.raw_identity())
+            .wrapping_add(size_of::<Utf16StringDataHeader>())
+    }
+}
+
+impl Utf16FlyString {
+    /// Creates a string through AK's authoritative UTF-8 fly-string table.
+    pub fn from_utf8(string: &str) -> Self {
+        // SAFETY: The string's storage remains alive for the duration of the call.
+        let raw = unsafe { ladybird_utf16_fly_string_from_utf8(string.as_ptr(), string.len()) };
+        // SAFETY: The constructor transfers one ownership reference.
+        unsafe { Self::from_raw_owned(raw) }
+    }
+
+    /// Creates a string through AK's authoritative UTF-16 fly-string table.
+    pub fn from_utf16(string: &[u16]) -> Self {
+        // SAFETY: The slice remains alive for the duration of the call.
+        let raw = unsafe { ladybird_utf16_fly_string_from_utf16(string.as_ptr(), string.len()) };
+        // SAFETY: The constructor transfers one ownership reference.
+        unsafe { Self::from_raw_owned(raw) }
+    }
+}
+
+impl PartialEq for Utf16String {
+    fn eq(&self, other: &Self) -> bool {
+        match (self.as_units(), other.as_units()) {
+            (Utf16StringUnits::Ascii(left), Utf16StringUnits::Ascii(right)) => left == right,
+            (Utf16StringUnits::Utf16(left), Utf16StringUnits::Utf16(right)) => left == right,
+            (Utf16StringUnits::Ascii(left), Utf16StringUnits::Utf16(right))
+            | (Utf16StringUnits::Utf16(right), Utf16StringUnits::Ascii(left)) => {
+                left.len() == right.len() && left.iter().zip(right).all(|(left, right)| u16::from(*left) == *right)
+            }
+        }
+    }
+}
+
+impl Eq for Utf16String {}
+
+impl PartialEq for Utf16FlyString {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw_identity() == other.raw_identity() || (self.is_empty() && other.is_empty())
+    }
+}
+
+impl Eq for Utf16FlyString {}
+
+impl From<Utf16FlyString> for Utf16String {
+    fn from(string: Utf16FlyString) -> Self {
+        // SAFETY: `into_raw` transfers the existing reference to this owner.
+        unsafe { Self::from_raw_owned(string.into_raw()) }
+    }
+}
+
+impl From<&Utf16FlyString> for Utf16String {
+    fn from(string: &Utf16FlyString) -> Self {
+        // SAFETY: The source owner keeps the raw string alive while adding a reference.
+        unsafe { reference_utf16_string(string.raw_identity()) };
+        // SAFETY: The new reference is transferred to this owner.
+        unsafe { Self::from_raw_owned(string.raw_identity()) }
+    }
+}
+
+#[inline]
+fn has_long_storage(raw: usize) -> bool {
+    raw != 0 && raw & SHORT_STRING_FLAG == 0
+}
+
+/// Adds an ownership reference to a raw `AK::Utf16String` representation.
+///
+/// # Safety
+///
+/// `raw` must be zero, a valid short string, or a live long string allocation.
+pub unsafe fn reference_utf16_string(raw: usize) {
+    if !has_long_storage(raw) {
+        return;
+    }
+
+    // SAFETY: The caller guarantees that `raw` points to a live long string allocation.
+    let header = unsafe { &*std::ptr::with_exposed_provenance::<Utf16StringDataHeader>(raw) };
+    let result = header
+        .reference_count
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            (count != 0).then(|| count.checked_add(1)).flatten()
+        });
+    assert!(result.is_ok(), "invalid UTF-16 string reference count");
+}
+
+/// Releases an ownership reference to a raw `AK::Utf16String` representation.
+/// Calls `release_last` when C++ must perform the potentially final release.
+///
+/// # Safety
+///
+/// `raw` must be zero, a valid short string, or a live long string allocation
+/// for which the caller owns one reference. `release_last` must perform the
+/// release-ordered decrement and acquire fence required before destruction.
+pub unsafe fn release_utf16_string_with(raw: usize, release_last: impl FnOnce(usize)) {
+    if !has_long_storage(raw) {
+        return;
+    }
+
+    // SAFETY: The caller guarantees that `raw` points to a live long string allocation.
+    let header = unsafe { &*std::ptr::with_exposed_provenance::<Utf16StringDataHeader>(raw) };
+    loop {
+        let reference_count = header.reference_count.load(Ordering::Relaxed);
+        assert!(reference_count != 0, "invalid UTF-16 string reference count");
+        if reference_count == 1 {
+            // The callback performs the final release decrement and acquire fence.
+            release_last(raw);
+            return;
+        }
+        if header
+            .reference_count
+            .compare_exchange_weak(
+                reference_count,
+                reference_count - 1,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+/// Decodes the storage referenced by a raw `AK::Utf16String` representation.
+///
+/// # Safety
+///
+/// `raw` must remain at a stable address for the returned lifetime. Its value
+/// must be zero, a valid short string, or a live long string allocation that
+/// remains alive for the returned lifetime.
+pub unsafe fn utf16_string_units(raw: &usize) -> Utf16StringUnits<'_> {
+    if *raw == 0 {
+        return Utf16StringUnits::Ascii(&[]);
+    }
+
+    if !has_long_storage(*raw) {
+        let bytes = raw.to_ne_bytes();
+        #[cfg(target_endian = "little")]
+        let tag = bytes[0];
+        #[cfg(target_endian = "big")]
+        let tag = bytes[size_of::<usize>() - 1];
+        let length = usize::from(tag >> SHORT_STRING_BYTE_COUNT_SHIFT);
+        assert!(length < size_of::<usize>());
+
+        let pointer = std::ptr::from_ref(raw).cast::<u8>();
+        #[cfg(target_endian = "little")]
+        // SAFETY: A short string stores its bytes after the tag byte.
+        let pointer = unsafe { pointer.add(1) };
+
+        // SAFETY: The short-string bytes are stored inline in `raw` and `length`
+        // is constrained to the remaining bytes in the word.
+        return Utf16StringUnits::Ascii(unsafe { std::slice::from_raw_parts(pointer, length) });
+    }
+
+    // SAFETY: The caller guarantees that `raw` points to a live long string allocation.
+    let header = unsafe { &*std::ptr::with_exposed_provenance::<Utf16StringDataHeader>(*raw) };
+    let length = header.length_in_code_units as usize;
+    let storage = std::ptr::from_ref(header)
+        .cast::<u8>()
+        .wrapping_add(size_of::<Utf16StringDataHeader>());
+    if header.flags.load(Ordering::Acquire) & HAS_UTF16_STORAGE == 0 {
+        // SAFETY: Long ASCII storage starts immediately after the header and contains `length` bytes.
+        Utf16StringUnits::Ascii(unsafe { std::slice::from_raw_parts(storage, length) })
+    } else {
+        // SAFETY: Long UTF-16 storage starts immediately after the aligned header and contains
+        // `length` u16 code units.
+        Utf16StringUnits::Utf16(unsafe { std::slice::from_raw_parts(storage.cast::<u16>(), length) })
+    }
+}
+
 FILE: AK/SaturatingMath.h
 /*
  * Copyright (c) 2026-present, the Ladybird developers.
@@ -41582,11 +42069,18 @@ public:
         return m_data.raw({});
     }
 
+    // Transfer this string's existing ownership reference to an FFI caller. The caller must
+    // eventually pass the raw value to adopt_raw() or unref_raw().
+    [[nodiscard]] FlatPtr into_raw() &&
+    {
+        return m_data.leak_raw(Badge<Utf16FlyString> {});
+    }
+
     [[nodiscard]] FlatPtr raw_identity() const { return m_data.raw({}); }
 
     [[nodiscard]] static Utf16FlyString from_raw(FlatPtr raw)
     {
-        auto base = Detail::Utf16StringBase::adopt_raw({}, raw);
+        auto base = Detail::Utf16StringBase::adopt_raw(Badge<Utf16FlyString> {}, raw);
         if (base.has_long_storage())
             base.data({})->ref();
 
@@ -41595,10 +42089,24 @@ public:
         return string;
     }
 
+    // Adopt a raw value produced by into_raw() without changing its reference count.
+    [[nodiscard]] static Utf16FlyString adopt_raw(FlatPtr raw)
+    {
+        return Utf16FlyString { Detail::Utf16StringBase::adopt_raw(Badge<Utf16FlyString> {}, raw) };
+    }
+
+    static void ref_raw(FlatPtr raw)
+    {
+        auto string = adopt_raw(raw);
+        if (string.m_data.has_long_storage())
+            string.m_data.data({})->ref();
+        (void)move(string).into_raw();
+    }
+
     static void unref_raw(FlatPtr raw)
     {
         // Adopt the bridge's reference and let it drop.
-        auto base = Detail::Utf16StringBase::adopt_raw({}, raw);
+        auto string = adopt_raw(raw);
     }
 
     template<typename T>
@@ -42095,6 +42603,13 @@ public:
         return raw();
     }
 
+    // Transfer this string's existing ownership reference to an FFI caller. The caller must
+    // eventually pass the raw value to adopt_raw() or unref_raw().
+    [[nodiscard]] FlatPtr into_raw() &&
+    {
+        return leak_raw(Badge<Utf16String> {});
+    }
+
     [[nodiscard]] static Utf16String from_raw(FlatPtr raw)
     {
         Utf16String string;
@@ -42103,6 +42618,19 @@ public:
         if (string.has_long_storage())
             string.data_without_union_member_assertion()->ref();
         return string;
+    }
+
+    // Adopt a raw value produced by into_raw() without changing its reference count. This consumes
+    // the caller's reference. Use from_raw() when the caller keeps its own reference.
+    [[nodiscard]] static Utf16String adopt_raw(FlatPtr raw)
+    {
+        return Utf16String { Detail::Utf16StringBase::adopt_raw(Badge<Utf16String> {}, raw) };
+    }
+
+    static void unref_raw(FlatPtr raw)
+    {
+        // Adopt the bridge's reference and let it drop.
+        auto string = adopt_raw(raw);
     }
 
     template<typename T>
@@ -42775,10 +43303,19 @@ public:
 
     [[nodiscard]] constexpr FlatPtr raw(Badge<Utf16FlyString>) const { return raw(); }
 
+    template<OneOf<Utf16String, Utf16FlyString> T>
+    [[nodiscard]] constexpr FlatPtr leak_raw(Badge<T>)
+    {
+        auto raw_value = raw();
+        m_value = { .short_ascii_string = ShortString::create_empty() };
+        return raw_value;
+    }
+
     // NB: Adopts a raw value previously produced by raw(), together with ownership of one
     //     reference to its data if it has long storage. For FFI bridges that retain the raw
     //     representation of a string.
-    [[nodiscard]] ALWAYS_INLINE static Utf16StringBase adopt_raw(Badge<Utf16FlyString>, FlatPtr raw)
+    template<OneOf<Utf16String, Utf16FlyString> T>
+    [[nodiscard]] ALWAYS_INLINE static Utf16StringBase adopt_raw(Badge<T>, FlatPtr raw)
     {
         Utf16StringBase string;
         auto const** data = __builtin_launder(&string.m_value.data);
@@ -43451,8 +43988,8 @@ FILE: AK/Utf16StringData.cpp
 
 namespace AK::Detail {
 
-// Due to internal optimizations, we have an explicit maximum string length of 2**63 - 1.
-#define VERIFY_UTF16_LENGTH(length) VERIFY(length >> Detail::UTF16_FLAG == 0);
+// The shared C++/Rust representation uses fixed-width lengths.
+#define VERIFY_UTF16_LENGTH(length) VERIFY(length < NumericLimits<u32>::max());
 
 NonnullRefPtr<Utf16StringData> Utf16StringData::create_uninitialized(StorageType storage_type, size_t code_unit_length)
 {
@@ -43478,13 +44015,13 @@ NonnullRefPtr<Utf16StringData> Utf16StringData::create_from_code_point_iterable(
     VERIFY_UTF16_LENGTH(code_unit_length);
 
     auto string = create_uninitialized(StorageType::UTF16, code_unit_length);
-    string->m_length_in_code_points = code_point_length;
+    string->m_header.length_in_code_points = static_cast<u32>(code_point_length);
 
     size_t code_unit_index = 0;
 
     for (auto code_point : view) {
         (void)UnicodeUtils::code_point_to_utf16(code_point, [&](auto code_unit) {
-            string->m_utf16_data[code_unit_index++] = code_unit;
+            string->utf16_data()[code_unit_index++] = code_unit;
         });
     }
 
@@ -43495,7 +44032,7 @@ NonnullRefPtr<Utf16StringData> Utf16StringData::from_ascii(ReadonlyBytes ascii_s
 {
     VERIFY_UTF16_LENGTH(ascii_string.size());
     auto string = create_uninitialized(StorageType::ASCII, ascii_string.size());
-    TypedTransfer<char>::copy(string->m_ascii_data, reinterpret_cast<char const*>(ascii_string.data()), ascii_string.size());
+    TypedTransfer<char>::copy(string->ascii_data(), reinterpret_cast<char const*>(ascii_string.data()), ascii_string.size());
     return string;
 }
 
@@ -43504,7 +44041,7 @@ NonnullRefPtr<Utf16StringData> Utf16StringData::create_uninitialized_ascii(size_
     VERIFY_UTF16_LENGTH(length_in_code_units);
 
     auto string = create_uninitialized(StorageType::ASCII, length_in_code_units);
-    buffer = { string->m_ascii_data, length_in_code_units };
+    buffer = { string->ascii_data(), length_in_code_units };
     return string;
 }
 
@@ -43516,14 +44053,14 @@ NonnullRefPtr<Utf16StringData> Utf16StringData::from_utf8(StringView utf8_string
         VERIFY_UTF16_LENGTH(utf8_string.length());
 
         string = create_uninitialized(StorageType::ASCII, utf8_string.length());
-        TypedTransfer<char>::copy(string->m_ascii_data, utf8_string.characters_without_null_termination(), utf8_string.length());
+        TypedTransfer<char>::copy(string->ascii_data(), utf8_string.characters_without_null_termination(), utf8_string.length());
     } else if (Utf8View view { utf8_string }; view.validate(AllowLonelySurrogates::No)) {
         auto code_unit_length = simdutf::utf16_length_from_utf8(utf8_string.characters_without_null_termination(), utf8_string.length());
         VERIFY_UTF16_LENGTH(code_unit_length);
 
         string = create_uninitialized(StorageType::UTF16, code_unit_length);
 
-        auto result = simdutf::convert_utf8_to_utf16(utf8_string.characters_without_null_termination(), utf8_string.length(), string->m_utf16_data);
+        auto result = simdutf::convert_utf8_to_utf16(utf8_string.characters_without_null_termination(), utf8_string.length(), string->utf16_data());
         VERIFY(result == code_unit_length);
     } else {
         string = create_from_code_point_iterable(view);
@@ -43539,17 +44076,18 @@ NonnullRefPtr<Utf16StringData> Utf16StringData::from_utf16(Utf16View const& utf1
 
     if (utf16_string.has_ascii_storage()) {
         string = create_uninitialized(StorageType::ASCII, utf16_string.length_in_code_units());
-        TypedTransfer<char>::copy(string->m_ascii_data, utf16_string.ascii_span().data(), utf16_string.length_in_code_units());
+        TypedTransfer<char>::copy(string->ascii_data(), utf16_string.ascii_span().data(), utf16_string.length_in_code_units());
     } else if (utf16_string.is_ascii()) {
         string = create_uninitialized(StorageType::ASCII, utf16_string.length_in_code_units());
 
-        auto result = simdutf::convert_utf16_to_utf8(utf16_string.utf16_span().data(), utf16_string.length_in_code_units(), string->m_ascii_data);
+        auto result = simdutf::convert_utf16_to_utf8(utf16_string.utf16_span().data(), utf16_string.length_in_code_units(), string->ascii_data());
         VERIFY(result == utf16_string.length_in_code_units());
     } else {
         string = create_uninitialized(StorageType::UTF16, utf16_string.length_in_code_units());
-        TypedTransfer<char16_t>::copy(string->m_utf16_data, utf16_string.utf16_span().data(), utf16_string.length_in_code_units());
+        TypedTransfer<char16_t>::copy(string->utf16_data(), utf16_string.utf16_span().data(), utf16_string.length_in_code_units());
 
-        string->m_length_in_code_points = utf16_string.m_length_in_code_points;
+        if (utf16_string.m_length_in_code_points != NumericLimits<size_t>::max())
+            string->m_header.length_in_code_points = static_cast<u32>(utf16_string.m_length_in_code_points);
     }
 
     return string.release_nonnull();
@@ -43570,12 +44108,13 @@ NonnullRefPtr<Utf16StringData> Utf16StringData::from_string_builder(Utf16StringB
     } else {
         if (view.has_ascii_storage()) {
             string = create_uninitialized(StorageType::ASCII, code_unit_length);
-            TypedTransfer<char>::copy(string->m_ascii_data, view.ascii_span().data(), code_unit_length);
+            TypedTransfer<char>::copy(string->ascii_data(), view.ascii_span().data(), code_unit_length);
         } else {
             string = create_uninitialized(StorageType::UTF16, code_unit_length);
-            TypedTransfer<char16_t>::copy(string->m_utf16_data, view.utf16_span().data(), code_unit_length);
+            TypedTransfer<char16_t>::copy(string->utf16_data(), view.utf16_span().data(), code_unit_length);
 
-            string->m_length_in_code_points = view.m_length_in_code_points;
+            if (view.m_length_in_code_points != NumericLimits<size_t>::max())
+                string->m_header.length_in_code_points = static_cast<u32>(view.m_length_in_code_points);
         }
     }
 
@@ -43589,7 +44128,7 @@ ErrorOr<NonnullRefPtr<Utf16StringData>> Utf16StringData::from_ipc_stream(Stream&
     if (is_ascii) {
         string = create_uninitialized(StorageType::ASCII, length_in_code_units);
 
-        Bytes bytes { string->m_ascii_data, length_in_code_units };
+        Bytes bytes { string->ascii_data(), length_in_code_units };
         TRY(stream.read_until_filled(bytes));
 
         if (!string->ascii_view().is_ascii())
@@ -43597,7 +44136,7 @@ ErrorOr<NonnullRefPtr<Utf16StringData>> Utf16StringData::from_ipc_stream(Stream&
     } else {
         string = create_uninitialized(StorageType::UTF16, length_in_code_units);
 
-        Bytes bytes { reinterpret_cast<u8*>(string->m_utf16_data), length_in_code_units * sizeof(char16_t) };
+        Bytes bytes { reinterpret_cast<u8*>(string->utf16_data()), length_in_code_units * sizeof(char16_t) };
         TRY(stream.read_until_filled(bytes));
     }
 
@@ -43609,7 +44148,7 @@ NonnullRefPtr<Utf16StringData> Utf16StringData::to_well_formed(Utf16View const& 
     VERIFY(!utf16_string.has_ascii_storage());
 
     auto string = create_uninitialized(StorageType::UTF16, utf16_string.length_in_code_units());
-    simdutf::to_well_formed_utf16(utf16_string.utf16_span().data(), utf16_string.length_in_code_units(), string->m_utf16_data);
+    simdutf::to_well_formed_utf16(utf16_string.utf16_span().data(), utf16_string.length_in_code_units(), string->utf16_data());
 
     return string;
 }
@@ -43618,8 +44157,8 @@ size_t Utf16StringData::calculate_code_point_length() const
 {
     ASSERT(!has_ascii_storage());
 
-    if (simdutf::validate_utf16(m_utf16_data, length_in_code_units()))
-        return simdutf::count_utf16(m_utf16_data, length_in_code_units());
+    if (simdutf::validate_utf16(utf16_data(), length_in_code_units()))
+        return simdutf::count_utf16(utf16_data(), length_in_code_units());
 
     size_t code_points = 0;
     for ([[maybe_unused]] auto code_point : utf16_view())
@@ -43638,9 +44177,10 @@ FILE: AK/Utf16StringData.h
 
 #pragma once
 
+#include <AK/Atomic.h>
+#include <AK/Checked.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/NumericLimits.h>
-#include <AK/RefCounted.h>
 #include <AK/Span.h>
 #include <AK/StringView.h>
 #include <AK/Types.h>
@@ -43657,8 +44197,32 @@ namespace AK::Detail {
 
 void did_destroy_utf16_fly_string_data(Badge<Detail::Utf16StringData>, Detail::Utf16StringData const&);
 
-class Utf16StringData final : public RefCounted<Utf16StringData> {
+// This is an intentionally stable representation shared with Rust. Keep all fields fixed-width,
+// and update the corresponding Rust layout assertions when changing it.
+struct alignas(8) Utf16StringDataHeader {
+    mutable u32 reference_count { 1 };
+    u32 length_in_code_units { 0 };
+    mutable u32 length_in_code_points { NumericLimits<u32>::max() };
+    mutable u32 hash { 0 };
+    mutable u32 flags { 0 };
+};
+
+static_assert(sizeof(Utf16StringDataHeader) == 24);
+static_assert(alignof(Utf16StringDataHeader) == 8);
+static_assert(offsetof(Utf16StringDataHeader, reference_count) == 0);
+static_assert(offsetof(Utf16StringDataHeader, length_in_code_units) == 4);
+static_assert(offsetof(Utf16StringDataHeader, length_in_code_points) == 8);
+static_assert(offsetof(Utf16StringDataHeader, hash) == 12);
+static_assert(offsetof(Utf16StringDataHeader, flags) == 16);
+
+class Utf16StringData final {
+    AK_MAKE_NONCOPYABLE(Utf16StringData);
+    AK_MAKE_NONMOVABLE(Utf16StringData);
+
 public:
+    using RefCountType = u32;
+    using AllowOwnPtr = FalseType;
+
     enum class StorageType : u8 {
         ASCII,
         UTF16,
@@ -43669,23 +44233,74 @@ public:
         Yes,
     };
 
+    enum Flag : u32 {
+        HasUtf16Storage = 1 << 0,
+        HasHash = 1 << 1,
+        IsFlyString = 1 << 2,
+    };
+
+    static_assert(HasUtf16Storage == 1);
+    static_assert(HasHash == 2);
+    static_assert(IsFlyString == 4);
+
     static NonnullRefPtr<Utf16StringData> from_utf8(StringView, AllowASCIIStorage);
     static NonnullRefPtr<Utf16StringData> from_ascii(ReadonlyBytes);
     static NonnullRefPtr<Utf16StringData> from_utf16(Utf16View const&);
     static NonnullRefPtr<Utf16StringData> from_string_builder(Utf16StringBuilder&);
     static ErrorOr<NonnullRefPtr<Utf16StringData>> from_ipc_stream(Stream&, size_t length_in_code_units, bool is_ascii);
 
+    // Creates the stable shared header and reserves trailing character storage for an FFI caller
+    // to initialize before publishing the resulting string.
+    static NonnullRefPtr<Utf16StringData> create_uninitialized_for_ffi(StorageType storage_type, size_t code_unit_length)
+    {
+        return create_uninitialized(storage_type, code_unit_length);
+    }
+
     static NonnullRefPtr<Utf16StringData> to_well_formed(Utf16View const&);
 
     ~Utf16StringData()
     {
+        VERIFY(ref_count() == 0);
         if (is_fly_string())
             did_destroy_utf16_fly_string_data({}, *this);
     }
 
+    ALWAYS_INLINE void ref() const
+    {
+        auto old_reference_count = atomic_fetch_add(&m_header.reference_count, 1u, memory_order_relaxed);
+        VERIFY(old_reference_count > 0);
+        VERIFY(!Checked<RefCountType>::addition_would_overflow(old_reference_count, 1));
+    }
+
+    [[nodiscard]] bool try_ref() const
+    {
+        auto expected = atomic_load(&m_header.reference_count, memory_order_relaxed);
+        for (;;) {
+            if (expected == 0)
+                return false;
+            VERIFY(!Checked<RefCountType>::addition_would_overflow(expected, 1));
+            if (atomic_compare_exchange_strong(&m_header.reference_count, expected, expected + 1, memory_order_acquire))
+                return true;
+        }
+    }
+
+    ALWAYS_INLINE bool unref() const
+    {
+        auto old_reference_count = atomic_fetch_sub(&m_header.reference_count, 1u, memory_order_release);
+        VERIFY(old_reference_count > 0);
+        if (old_reference_count != 1)
+            return false;
+
+        atomic_thread_fence(memory_order_acquire);
+        delete this;
+        return true;
+    }
+
+    [[nodiscard]] RefCountType ref_count() const { return atomic_load(&m_header.reference_count, memory_order_relaxed); }
+
     [[nodiscard]] static constexpr size_t offset_of_string_storage()
     {
-        return offsetof(Utf16StringData, m_ascii_data);
+        return sizeof(Utf16StringDataHeader);
     }
 
     void operator delete(void* ptr)
@@ -43712,57 +44327,71 @@ public:
         return utf16_view() == Utf16View { other.characters_without_null_termination(), other.length() };
     }
 
-    [[nodiscard]] ALWAYS_INLINE bool has_ascii_storage() const { return m_length_in_code_units >> Detail::UTF16_FLAG == 0; }
-    [[nodiscard]] ALWAYS_INLINE bool has_utf16_storage() const { return m_length_in_code_units >> Detail::UTF16_FLAG != 0; }
+    [[nodiscard]] ALWAYS_INLINE bool has_ascii_storage() const { return !has_flag(HasUtf16Storage); }
+    [[nodiscard]] ALWAYS_INLINE bool has_utf16_storage() const { return has_flag(HasUtf16Storage); }
 
     ALWAYS_INLINE u32 hash() const
     {
-        if (!m_has_hash) {
-            m_hash = utf16_view().hash();
-            m_has_hash = true;
+        if (!has_flag(HasHash)) {
+            auto hash = utf16_view().hash();
+            atomic_store(&m_header.hash, hash, memory_order_relaxed);
+            atomic_fetch_or(&m_header.flags, static_cast<u32>(HasHash), memory_order_release);
+            return hash;
         }
 
-        return m_hash;
+        return atomic_load(&m_header.hash, memory_order_relaxed);
     }
 
-    [[nodiscard]] ALWAYS_INLINE size_t length_in_code_units() const { return m_length_in_code_units & ~(1uz << Detail::UTF16_FLAG); }
+    [[nodiscard]] ALWAYS_INLINE size_t length_in_code_units() const { return m_header.length_in_code_units; }
     [[nodiscard]] ALWAYS_INLINE size_t length_in_code_points() const
     {
         if (has_ascii_storage())
             return length_in_code_units();
-        if (m_length_in_code_points == NumericLimits<size_t>::max())
-            m_length_in_code_points = calculate_code_point_length();
-        return m_length_in_code_points;
+
+        auto length_in_code_points = atomic_load(&m_header.length_in_code_points, memory_order_acquire);
+        if (length_in_code_points != NumericLimits<u32>::max())
+            return length_in_code_points;
+
+        auto calculated_length = calculate_code_point_length();
+        VERIFY(calculated_length < NumericLimits<u32>::max());
+
+        auto expected = NumericLimits<u32>::max();
+        if (atomic_compare_exchange_strong(&m_header.length_in_code_points, expected, static_cast<u32>(calculated_length), memory_order_acq_rel))
+            return calculated_length;
+        return expected;
     }
 
     [[nodiscard]] ALWAYS_INLINE StringView ascii_view() const LIFETIME_BOUND
     {
         ASSERT(has_ascii_storage());
-        return { m_ascii_data, length_in_code_units() };
+        return { ascii_data(), length_in_code_units() };
     }
 
     [[nodiscard]] ALWAYS_INLINE Utf16View utf16_view() const LIFETIME_BOUND
     {
         if (has_ascii_storage())
-            return { m_ascii_data, length_in_code_units() };
+            return { ascii_data(), length_in_code_units() };
 
-        Utf16View view { m_utf16_data, length_in_code_units() };
-        view.m_length_in_code_points = m_length_in_code_points;
+        Utf16View view { utf16_data(), length_in_code_units() };
+        auto length_in_code_points = atomic_load(&m_header.length_in_code_points, memory_order_acquire);
+        if (length_in_code_points != NumericLimits<u32>::max())
+            view.m_length_in_code_points = length_in_code_points;
 
         return view;
     }
 
-    ALWAYS_INLINE void mark_as_fly_string(Badge<Utf16FlyString>) const { m_is_fly_string = true; }
-    [[nodiscard]] ALWAYS_INLINE bool is_fly_string() const { return m_is_fly_string; }
+    ALWAYS_INLINE void mark_as_fly_string(Badge<Utf16FlyString>) const { atomic_fetch_or(&m_header.flags, static_cast<u32>(IsFlyString), memory_order_release); }
+    [[nodiscard]] ALWAYS_INLINE bool is_fly_string() const { return has_flag(IsFlyString); }
 
 private:
     friend class AK::Utf16String;
 
     ALWAYS_INLINE Utf16StringData(StorageType storage_type, size_t code_unit_length)
-        : m_length_in_code_units(code_unit_length)
     {
+        VERIFY(code_unit_length < NumericLimits<u32>::max());
+        m_header.length_in_code_units = static_cast<u32>(code_unit_length);
         if (storage_type == StorageType::UTF16)
-            m_length_in_code_units |= 1uz << Detail::UTF16_FLAG;
+            m_header.flags = HasUtf16Storage;
     }
 
     static NonnullRefPtr<Utf16StringData> create_uninitialized(StorageType storage_type, size_t code_unit_length);
@@ -43780,22 +44409,37 @@ private:
 
     [[nodiscard]] size_t calculate_code_point_length() const;
 
-    // We store whether this string has ASCII or UTF-16 storage by setting the most significant bit of m_length_in_code_units
-    // to 1 for UTF-16 storage. This shrinks the size of most UTF-16 string related classes, at the cost of not being
-    // allowed to create a string larger than 2**63 - 1.
-    size_t m_length_in_code_units { 0 };
-    mutable size_t m_length_in_code_points { NumericLimits<size_t>::max() };
+    [[nodiscard]] ALWAYS_INLINE bool has_flag(Flag flag) const
+    {
+        return atomic_load(&m_header.flags, memory_order_acquire) & static_cast<u32>(flag);
+    }
 
-    mutable u32 m_hash { 0 };
-    mutable bool m_has_hash { false };
+    [[nodiscard]] ALWAYS_INLINE char* ascii_data()
+    {
+        return reinterpret_cast<char*>(this) + offset_of_string_storage();
+    }
 
-    mutable bool m_is_fly_string { false };
+    [[nodiscard]] ALWAYS_INLINE char const* ascii_data() const
+    {
+        return reinterpret_cast<char const*>(this) + offset_of_string_storage();
+    }
 
-    union alignas(8) {
-        char m_ascii_data[0];
-        char16_t m_utf16_data[0];
-    };
+    [[nodiscard]] ALWAYS_INLINE char16_t* utf16_data()
+    {
+        return reinterpret_cast<char16_t*>(reinterpret_cast<char*>(this) + offset_of_string_storage());
+    }
+
+    [[nodiscard]] ALWAYS_INLINE char16_t const* utf16_data() const
+    {
+        return reinterpret_cast<char16_t const*>(reinterpret_cast<char const*>(this) + offset_of_string_storage());
+    }
+
+    Utf16StringDataHeader m_header;
 };
+
+static_assert(Utf16StringData::offset_of_string_storage() == sizeof(Utf16StringDataHeader));
+static_assert(sizeof(Utf16StringData) == sizeof(Utf16StringDataHeader));
+static_assert(alignof(Utf16StringData) == alignof(Utf16StringDataHeader));
 
 }
 
@@ -53220,6 +53864,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ak"
+version = "0.1.0"
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -53911,6 +54559,7 @@ dependencies = [
 name = "libjs_rust"
 version = "0.1.0"
 dependencies = [
+ "ak",
  "cbindgen",
  "fARM64",
  "flapc",
@@ -53998,6 +54647,7 @@ dependencies = [
 name = "libweb_rust"
 version = "0.1.0"
 dependencies = [
+ "ak",
  "cbindgen",
  "chardetng",
  "foldhash 0.1.5",
@@ -54721,6 +55371,7 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 FILE: Cargo.toml
 [workspace]
 members = [
+    "AK/Rust",
     "Libraries/LibGfx/Rust",
     "Libraries/LibJS/Rust",
     "Libraries/LibRegex/Rust",
@@ -210119,19 +210770,16 @@ asm_handler_CallBuiltinStringPrototypeCharCodeAt:
     cbz x1, .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_2
     ldrb w3, [x2, #16]
     tbnz x3, #0, .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_14
-    ldr x2, [x1, #8]
-    tbz x2, #63, .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_17
-    lsl x2, x2, #1
-    lsr x2, x2, #1
+    ldr w2, [x1, #4]
     cmp x2, x0
     b.ls .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_1
-    add x1, x1, #32
+    ldr w2, [x1, #16]
+    tbz x2, #0, .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_19
+    add x1, x1, #24
     ldrh w0, [x1, x0, lsl #1]
     b .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_15
-.Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_17:
-    cmp x2, x0
-    b.ls .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_1
-    add x1, x1, #32
+.Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_19:
+    add x1, x1, #24
     ldrb w0, [x1, x0]
     b .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_15
 .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_14:
@@ -210186,19 +210834,16 @@ asm_handler_CallBuiltinStringPrototypeCharAt:
     cbz x1, .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_1
     ldrb w3, [x2, #16]
     tbnz x3, #0, .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_14
-    ldr x2, [x1, #8]
-    tbz x2, #63, .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_17
-    lsl x2, x2, #1
-    lsr x2, x2, #1
+    ldr w2, [x1, #4]
     cmp x2, x0
     b.ls .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_2
-    add x1, x1, #32
+    ldr w2, [x1, #16]
+    tbz x2, #0, .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_19
+    add x1, x1, #24
     ldrh w0, [x1, x0, lsl #1]
     b .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_15
-.Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_17:
-    cmp x2, x0
-    b.ls .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_2
-    add x1, x1, #32
+.Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_19:
+    add x1, x1, #24
     ldrb w0, [x1, x0]
     b .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_15
 .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_14:
@@ -222432,20 +223077,17 @@ asm_handler_CallBuiltinStringPrototypeCharCodeAt:
     movzx esi, BYTE PTR [rdx + 16]
     test esi, 1
     jnz .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_14
-    mov rdx, QWORD PTR [rcx + 8]
-    test rdx, rdx
-    jns .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_17
-    shl rdx, 1
-    shr rdx, 1
+    mov edx, DWORD PTR [rcx + 4]
     cmp rdx, rax
     jbe .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_1
-    lea rcx, [rcx + 32]
+    mov edx, DWORD PTR [rcx + 16]
+    test edx, 1
+    jz .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_19
+    lea rcx, [rcx + 24]
     movzx eax, WORD PTR [rcx + rax * 2]
     jmp .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_15
-.Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_17:
-    cmp rdx, rax
-    jbe .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_1
-    lea rcx, [rcx + 32]
+.Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_19:
+    lea rcx, [rcx + 24]
     movzx eax, BYTE PTR [rcx + rax]
     jmp .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_15
 .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_14:
@@ -222505,20 +223147,17 @@ asm_handler_CallBuiltinStringPrototypeCharAt:
     movzx esi, BYTE PTR [rdx + 16]
     test esi, 1
     jnz .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_14
-    mov rdx, QWORD PTR [rcx + 8]
-    test rdx, rdx
-    jns .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_17
-    shl rdx, 1
-    shr rdx, 1
+    mov edx, DWORD PTR [rcx + 4]
     cmp rdx, rax
     jbe .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_2
-    lea rcx, [rcx + 32]
+    mov edx, DWORD PTR [rcx + 16]
+    test edx, 1
+    jz .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_19
+    lea rcx, [rcx + 24]
     movzx ecx, WORD PTR [rcx + rax * 2]
     jmp .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_15
-.Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_17:
-    cmp rdx, rax
-    jbe .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_2
-    lea rcx, [rcx + 32]
+.Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_19:
+    lea rcx, [rcx + 24]
     movzx ecx, BYTE PTR [rcx + rax]
     jmp .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_15
 .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_14:
@@ -229874,9 +230513,12 @@ field PrimitiveString.utf16_short_string_byte_count_and_flag u8 PRIMITIVE_STRING
 field PrimitiveString.utf16_short_string_storage Sequence<u8> PRIMITIVE_STRING_UTF16_SHORT_STRING_STORAGE embedded scalar
 
 # Utf16StringData layout
-const UTF16_STRING_DATA_LENGTH_IN_CODE_UNITS = 8
-const UTF16_STRING_DATA_STRING_STORAGE = 32
-field Utf16StringData.length_in_code_units u64 UTF16_STRING_DATA_LENGTH_IN_CODE_UNITS nullable scalar
+const UTF16_STRING_DATA_LENGTH_IN_CODE_UNITS = 4
+const UTF16_STRING_DATA_FLAGS = 16
+const UTF16_STRING_DATA_STRING_STORAGE = 24
+const UTF16_STRING_DATA_HAS_UTF16_STORAGE = 1
+field Utf16StringData.length_in_code_units u32 UTF16_STRING_DATA_LENGTH_IN_CODE_UNITS nullable scalar
+field Utf16StringData.flags u32 UTF16_STRING_DATA_FLAGS nullable scalar
 field Utf16StringData.string_storage Sequence<u8> UTF16_STRING_DATA_STRING_STORAGE embedded scalar
 
 # Environment layout
@@ -230783,9 +231425,12 @@ int main()
 
     // Utf16StringData layout
     outln("\n# Utf16StringData layout");
-    EMIT_OFFSET(UTF16_STRING_DATA_LENGTH_IN_CODE_UNITS, AK::Detail::Utf16StringData, m_length_in_code_units);
+    EMIT_OFFSET(UTF16_STRING_DATA_LENGTH_IN_CODE_UNITS, AK::Detail::Utf16StringData, m_header.length_in_code_units);
+    EMIT_OFFSET(UTF16_STRING_DATA_FLAGS, AK::Detail::Utf16StringData, m_header.flags);
     outln("const UTF16_STRING_DATA_STRING_STORAGE = {}", AK::Detail::Utf16StringData::offset_of_string_storage());
-    outln("field Utf16StringData.length_in_code_units u64 UTF16_STRING_DATA_LENGTH_IN_CODE_UNITS nullable scalar");
+    outln("const UTF16_STRING_DATA_HAS_UTF16_STORAGE = {}", static_cast<u32>(AK::Detail::Utf16StringData::HasUtf16Storage));
+    outln("field Utf16StringData.length_in_code_units u32 UTF16_STRING_DATA_LENGTH_IN_CODE_UNITS nullable scalar");
+    outln("field Utf16StringData.flags u32 UTF16_STRING_DATA_FLAGS nullable scalar");
     outln("field Utf16StringData.string_storage Sequence<u8> UTF16_STRING_DATA_STRING_STORAGE embedded scalar");
 
     // Environment layout
@@ -232105,16 +232750,13 @@ inline fn load_primitive_string_utf16_code_unit(
 
     let short_string_info = string.utf16_short_string_byte_count_and_flag;
     if short_string_info lacks UTF16_SHORT_STRING_FLAG {
-        let encoded_length = utf16_data.length_in_code_units;
-        let signed_length: i64 = alias(encoded_length);
-        if signed_length < 0 {
-            let length = encoded_length << 1 >> 1;
-            guard length > alias(index) else out_of_bounds;
+        let length = utf16_data.length_in_code_units;
+        guard length > index else out_of_bounds;
+        if utf16_data.flags has UTF16_STRING_DATA_HAS_UTF16_STORAGE {
             let utf16_storage: Sequence<u16> = alias(utf16_data.string_storage);
             let code_unit: u32 = alias(utf16_storage[index]);
             code_unit
         } else {
-            guard encoded_length > alias(index) else out_of_bounds;
             let code_unit: u32 = alias(utf16_data.string_storage[index]);
             code_unit
         }
@@ -336128,6 +336770,7 @@ crate-type = ["staticlib"]
 # After changing dependencies, regenerate the Flatpak sources:
 #   python3 Meta/CMake/flatpak/generate-cargo-sources.py
 [dependencies]
+ak = { path = "../../../AK/Rust" }
 libunicode_rust = { path = "../../LibUnicode/Rust", default-features = false }
 num-bigint = "0.4"
 num-traits = "0.2"
@@ -354447,7 +355090,8 @@ pub struct FFIExecutableData {
     pub identifier_count: usize,
     pub property_key_table: *const FFIUtf16Slice,
     pub property_key_count: usize,
-    pub string_table: *const FFIUtf16Slice,
+    /// Raw `AK::Utf16String` owners transferred to C++ by `rust_create_executable`.
+    pub owned_string_table: *const usize,
     pub string_count: usize,
     pub constants_data: *const u8,
     pub constants_data_length: usize,
@@ -355017,6 +355661,60 @@ pub struct ExecutableSlices<'a> {
     pub compiled_regexes: &'a [*mut c_void],
 }
 
+struct NativeUtf16StringTable {
+    strings: Vec<usize>,
+    transferred: bool,
+}
+
+impl NativeUtf16StringTable {
+    /// Creates native AK string owners from borrowed FFI slices.
+    ///
+    /// # Safety
+    /// Every slice must point to valid UTF-16 storage for the duration of this call.
+    unsafe fn new(slices: &[FFIUtf16Slice]) -> Self {
+        let mut table = Self {
+            strings: Vec::with_capacity(slices.len()),
+            transferred: false,
+        };
+        for slice in slices {
+            let units = if slice.length == 0 {
+                &[]
+            } else {
+                assert!(!slice.data.is_null());
+                // SAFETY: The caller guarantees that every FFI slice is valid for this call.
+                unsafe { std::slice::from_raw_parts(slice.data, slice.length) }
+            };
+            table.strings.push(ak::Utf16String::from_utf16(units).into_raw());
+        }
+        table
+    }
+
+    fn as_ptr(&self) -> *const usize {
+        self.strings.as_ptr()
+    }
+
+    fn len(&self) -> usize {
+        self.strings.len()
+    }
+
+    fn mark_transferred(&mut self) {
+        self.transferred = true;
+    }
+}
+
+impl Drop for NativeUtf16StringTable {
+    fn drop(&mut self) {
+        if self.transferred {
+            return;
+        }
+
+        for raw in self.strings.drain(..) {
+            // SAFETY: Until the table is marked transferred, it owns every raw reference.
+            drop(unsafe { ak::Utf16String::from_raw_owned(raw) });
+        }
+    }
+}
+
 /// Create a C++ Executable from borrowed FFI slices.
 ///
 /// This is the lowest-level executable constructor wrapper. It lets cache
@@ -355058,6 +355756,10 @@ pub unsafe fn create_executable_from_slices(
             })
             .collect();
 
+        // Materialize ordinary strings directly in AK's stable representation. C++ adopts these
+        // owners below without copying character data or changing their reference counts.
+        let mut native_string_table = NativeUtf16StringTable::new(slices.string_table);
+
         let ffi_data = FFIExecutableData {
             bytecode: parts.bytecode.as_ptr(),
             bytecode_length: parts.bytecode.len(),
@@ -355066,8 +355768,8 @@ pub unsafe fn create_executable_from_slices(
             identifier_count: slices.identifier_table.len(),
             property_key_table: slices.property_key_table.as_ptr(),
             property_key_count: slices.property_key_table.len(),
-            string_table: slices.string_table.as_ptr(),
-            string_count: slices.string_table.len(),
+            owned_string_table: native_string_table.as_ptr(),
+            string_count: native_string_table.len(),
             constants_data: slices.constants_data.as_ptr(),
             constants_data_length: slices.constants_data.len(),
             constants_count: slices.constants_count,
@@ -355097,7 +355799,10 @@ pub unsafe fn create_executable_from_slices(
             regex_count: slices.compiled_regexes.len(),
         };
 
-        rust_create_executable(vm_ptr, source_code_ptr, &raw const ffi_data)
+        let executable = rust_create_executable(vm_ptr, source_code_ptr, &raw const ffi_data);
+        // C++ adopts all string_count owners before returning, including on validation failure.
+        native_string_table.mark_transferred();
+        executable
     }
 }
 
@@ -374595,11 +375300,6 @@ static Utf16View view_from_ffi(FFIUtf16Slice slice)
     return JS::RustIntegration::utf16_view_from_bytes(slice.data, slice.length);
 }
 
-static Utf16String utf16_from_ffi(FFIUtf16Slice slice)
-{
-    return Utf16String::from_utf16(view_from_ffi(slice));
-}
-
 static Utf16FlyString utf16_fly_from_ffi(FFIUtf16Slice slice)
 {
     return Utf16FlyString::from_utf16(view_from_ffi(slice));
@@ -374765,7 +375465,7 @@ extern "C" void* rust_create_executable(
     auto str_table = make<JS::Bytecode::StringTable>();
     str_table->ensure_capacity(data->string_count);
     for (size_t i = 0; i < data->string_count; ++i) {
-        str_table->insert(utf16_from_ffi(data->string_table[i]));
+        str_table->insert(Utf16String::adopt_raw(data->owned_string_table[i]));
     }
 
     // Build regex table from pre-compiled regex objects.
@@ -485038,6 +485738,7 @@ AnimationUpdateContext::~AnimationUpdateContext()
             return target->document().style_computer().build_computed_values(*style, element, element.style_scope());
         }();
         if (animated_properties_after_update && !animated_properties_after_update->values().is_empty()
+            && target->document().is_in_style_stabilization_epoch()
             && (target->document().style_stabilization_has_style_reactions() || animated_property_invalidation.requires_base_style_recomputation)) {
             target->document().style_computer().record_transition_stabilization_baseline(element);
         }
@@ -534683,7 +535384,7 @@ public:
         {
             static_assert(sizeof(Utf16FlyString) == sizeof(size_t));
             static_assert(alignof(Utf16FlyString) == alignof(size_t));
-            return { reinterpret_cast<Utf16FlyString const*>(color_schemes.raw_pointer), color_schemes.length };
+            return { reinterpret_cast<Utf16FlyString const*>(color_schemes.pointer), color_schemes.length };
         }
 
         bool operator==(InheritedUIValues const& other) const
@@ -534962,7 +535663,7 @@ public:
         {
             static_assert(sizeof(Utf16FlyString) == sizeof(size_t));
             static_assert(alignof(Utf16FlyString) == alignof(size_t));
-            return { reinterpret_cast<Utf16FlyString const*>(values.raw_pointer), values.length };
+            return { reinterpret_cast<Utf16FlyString const*>(values.pointer), values.length };
         }
         static Vector<Utf16FlyString> materialize_fly_strings(ComputedValuesFFI::RetainedUtf16FlyStringList const& values)
         {
@@ -551225,15 +551926,9 @@ static bool property_computed_value_may_be_stored_as_style_value_handle(Property
 static Optional<Utf16String> serialize_style_value_handle(RustStyleValueHandle const& handle, SerializationMode mode)
 {
     auto text = StyleValueFFI::rust_style_value_serialize(handle.data(), to_underlying(mode));
-    if (!text.storage)
+    if (!text.has_value)
         return {};
-    Utf16StringBuilder builder;
-    if (text.ascii)
-        builder.append_ascii(StringView { reinterpret_cast<char const*>(text.ascii), text.length });
-    else
-        builder.append(Utf16View { reinterpret_cast<char16_t const*>(text.utf16), text.length });
-    StyleValueFFI::rust_serialized_text_release(text.storage);
-    return builder.to_string();
+    return Utf16String::adopt_raw(text.raw);
 }
 
 Optional<Utf16String> CSSStyleProperties::serialized_computed_value_from_stored_handle(PropertyID property_id) const
@@ -614077,8 +614772,7 @@ extern "C" void ladybird_animated_properties_ref(void const*);
 
 static void ladybird_utf16_fly_string_ref_raw(size_t raw)
 {
-    auto string = Utf16FlyString::from_raw(static_cast<FlatPtr>(raw));
-    (void)string.to_raw_leaked();
+    Utf16FlyString::ref_raw(static_cast<FlatPtr>(raw));
 }
 
 static void ladybird_utf16_fly_string_unref_raw(size_t raw)
@@ -625534,7 +626228,7 @@ private:
         ffi_definitions.ensure_capacity(counter_definitions.size());
         for (auto const& definition : counter_definitions) {
             auto const* value_data = definition.value ? StyleValueFFI::rust_style_value_retain(definition.value->rust_style_value_data()) : nullptr;
-            ffi_definitions.unchecked_append({ { definition.name.to_raw_leaked(), nullptr }, definition.is_reversed, { value_data } });
+            ffi_definitions.unchecked_append({ { definition.name.to_raw_leaked() }, definition.is_reversed, { value_data } });
         }
         return StyleValueFFI::rust_style_value_create_counter_definitions(ffi_definitions.data(), ffi_definitions.size());
     }
@@ -627819,9 +628513,9 @@ private:
             auto implicit_start_name = implicit_grid_line_name(name, "-start"sv);
             auto implicit_end_name = implicit_grid_line_name(name, "-end"sv);
             areas.unchecked_append({
-                { name.to_raw_leaked(), nullptr },
-                { implicit_start_name.to_raw_leaked(), nullptr },
-                { implicit_end_name.to_raw_leaked(), nullptr },
+                { name.to_raw_leaked() },
+                { implicit_start_name.to_raw_leaked() },
+                { implicit_end_name.to_raw_leaked() },
                 area.row_start,
                 area.row_end,
                 area.column_start,
@@ -628236,7 +628930,7 @@ StyleValueFFI::StyleValueData const* ImageSetStyleValue::make_image_set_data(Vec
             { StyleValueFFI::rust_style_value_retain(option.image->rust_style_value_data()) },
             { StyleValueFFI::rust_style_value_retain(option.resolution->rust_style_value_data()) },
             option.type.has_value(),
-            { option.type.has_value() ? option.type->to_raw_leaked() : 0, nullptr },
+            { option.type.has_value() ? option.type->to_raw_leaked() : 0 },
         });
     }
     return StyleValueFFI::rust_style_value_create_image_set(ffi_options.data(), ffi_options.size());
@@ -632555,8 +633249,14 @@ FILE: Libraries/LibWeb/CSS/StyleValues/StyleValue.cpp
 #include <LibWeb/Layout/Node.h>
 
 extern "C" void ladybird_utf16_fly_string_unref(size_t);
-extern "C" Web::CSS::StyleValueFFI::FfiFlyStringView ladybird_utf16_fly_string_view(size_t, u8*);
 extern "C" void ladybird_string_unref(size_t);
+
+static_assert(sizeof(Web::CSS::StyleValueFFI::RetainedUtf16FlyString) == sizeof(Utf16FlyString));
+static_assert(alignof(Web::CSS::StyleValueFFI::RetainedUtf16FlyString) == alignof(Utf16FlyString));
+static_assert(offsetof(Web::CSS::StyleValueFFI::RetainedUtf16FlyString, raw) == 0);
+static_assert(sizeof(Web::CSS::ComputedValuesFFI::RetainedUtf16FlyString) == sizeof(Utf16FlyString));
+static_assert(alignof(Web::CSS::ComputedValuesFFI::RetainedUtf16FlyString) == alignof(Utf16FlyString));
+static_assert(offsetof(Web::CSS::ComputedValuesFFI::RetainedUtf16FlyString, raw) == 0);
 
 namespace Web::CSS {
 
@@ -632803,12 +633503,12 @@ void StyleValue::serialize(StringBuilder& builder, SerializationMode mode) const
 {
     // The Rust serializer covers the ported types; everything else falls back to the
     // per-class C++ serializers until the port is complete.
-    if (auto text = StyleValueFFI::rust_style_value_serialize(m_value.operator->(), to_underlying(mode)); text.storage) {
-        if (text.ascii)
-            builder.append(StringView { reinterpret_cast<char const*>(text.ascii), text.length });
+    if (auto text = StyleValueFFI::rust_style_value_serialize(m_value.operator->(), to_underlying(mode)); text.has_value) {
+        auto string = Utf16String::adopt_raw(text.raw);
+        if (string.has_ascii_storage())
+            builder.append(string.ascii_view());
         else
-            builder.append(Utf16View { reinterpret_cast<char16_t const*>(text.utf16), text.length });
-        StyleValueFFI::rust_serialized_text_release(text.storage);
+            builder.append(string.utf16_view());
         return;
     }
 
@@ -632896,12 +633596,9 @@ void StyleValue::serialize(Utf16StringBuilder& builder, SerializationMode mode) 
 {
     // Rust serializes natively into ASCII-or-UTF-16, so ported types never round-trip
     // through UTF-8 here.
-    if (auto text = StyleValueFFI::rust_style_value_serialize(m_value.operator->(), to_underlying(mode)); text.storage) {
-        if (text.ascii)
-            builder.append_ascii(StringView { reinterpret_cast<char const*>(text.ascii), text.length });
-        else
-            builder.append(Utf16View { reinterpret_cast<char16_t const*>(text.utf16), text.length });
-        StyleValueFFI::rust_serialized_text_release(text.storage);
+    if (auto text = StyleValueFFI::rust_style_value_serialize(m_value.operator->(), to_underlying(mode)); text.has_value) {
+        auto string = Utf16String::adopt_raw(text.raw);
+        builder.append(string.utf16_view());
         return;
     }
 
@@ -633128,25 +633825,6 @@ Keyword StyleValue::to_keyword() const
 extern "C" void ladybird_utf16_fly_string_unref(size_t raw)
 {
     Utf16FlyString::unref_raw(raw);
-}
-
-// Called when the Rust serializer reads a retained Utf16FlyString's contents. Short strings are
-// decoded into the caller-provided buffer (which must hold at least 16 bytes); long strings
-// return their heap storage, which the retained reference keeps alive across the call.
-extern "C" Web::CSS::StyleValueFFI::FfiFlyStringView ladybird_utf16_fly_string_view(size_t raw, u8* short_buffer)
-{
-    auto string = Utf16FlyString::from_raw(raw);
-    auto view = string.view();
-    if (view.has_ascii_storage()) {
-        auto span = view.ascii_span();
-        if (span.size() <= AK::Detail::MAX_SHORT_STRING_BYTE_COUNT) {
-            __builtin_memcpy(short_buffer, span.data(), span.size());
-            return { short_buffer, span.size(), true };
-        }
-        return { span.data(), span.size(), true };
-    }
-    auto span = view.utf16_span();
-    return { span.data(), span.size(), false };
 }
 
 // Called when Rust-owned style value data drops a retained String.
@@ -635363,7 +636041,7 @@ inline Vector<StyleValueFFI::RetainedRequestUrlModifier> retain_url_modifiers_fo
     Vector<StyleValueFFI::RetainedRequestUrlModifier> modifiers;
     modifiers.ensure_capacity(url.request_url_modifiers().size());
     for (auto const& modifier : url.request_url_modifiers()) {
-        StyleValueFFI::RetainedRequestUrlModifier ffi_modifier { to_underlying(modifier.type()), 0, { 0, nullptr } };
+        StyleValueFFI::RetainedRequestUrlModifier ffi_modifier { to_underlying(modifier.type()), 0, { 0 } };
         modifier.value().visit(
             [&](CrossOriginModifierValue value) { ffi_modifier.enum_value = to_underlying(value); },
             [&](ReferrerPolicyModifierValue value) { ffi_modifier.enum_value = to_underlying(value); },
@@ -666062,561 +666740,3 @@ EventTarget::EventTarget()
 EventTarget::~EventTarget() = default;
 
 // https://dom.spec.whatwg.org/#dom-eventtarget-eventtarget
-GC::Ref<EventTarget> EventTarget::create()
-{
-    // The new EventTarget() constructor steps are to do nothing.
-    return GC::Heap::the().allocate<EventTarget>();
-}
-
-void EventTarget::visit_edges(Cell::Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-
-    if (auto const* data = m_data.ptr()) {
-        visitor.visit(data->event_listener_list);
-        visitor.visit(data->event_handler_map);
-    }
-}
-
-size_t EventTarget::external_memory_size() const
-{
-    auto size = Base::external_memory_size();
-    if (!m_data)
-        return size;
-
-    size = JS::saturating_add_external_memory_size(size, JS::vector_external_memory_size(m_data->event_listener_list));
-    size = JS::saturating_add_external_memory_size(size, JS::hash_map_external_memory_size(m_data->event_handler_map));
-    return size;
-}
-
-Vector<GC::Root<DOMEventListener>> EventTarget::event_listener_list() const
-{
-    Vector<GC::Root<DOMEventListener>> list;
-    if (!m_data)
-        return list;
-    for (auto& listener : m_data->event_listener_list)
-        list.append(*listener);
-    return list;
-}
-
-// https://dom.spec.whatwg.org/#default-passive-value
-static bool default_passive_value(Utf16FlyString const& type, EventTarget* event_target)
-{
-    // 1. Return true if all of the following are true:
-    //    - type is one of "touchstart", "touchmove", "wheel", or "mousewheel".
-    //    - eventTarget is a Window object, or is a node whose node document is eventTarget, or is a node whose node document’s document element is eventTarget,
-    //      or is a node whose node document’s body element is eventTarget.
-    if (AK::first_is_one_of(type, u"touchstart"sv, u"touchmove"sv, u"wheel"sv, u"mousewheel"sv)) {
-        if (is<HTML::Window>(event_target))
-            return true;
-
-        if (auto* node = as_if<Node>(event_target)) {
-            if (&node->document() == event_target || node->document().document_element() == event_target || node->document().body() == event_target)
-                return true;
-        }
-    }
-
-    // 2. Return false.
-    return false;
-}
-
-static bool is_blocking_wheel_event_listener(DOMEventListener const& listener)
-{
-    return AK::first_is_one_of(listener.type, u"wheel"sv, u"mousewheel"sv) && listener.passive != true;
-}
-
-static void invalidate_compositor_wheel_event_listener_state(EventTarget& event_target, DOMEventListener const& listener)
-{
-    if (!is_blocking_wheel_event_listener(listener))
-        return;
-
-    if (auto* window = as_if<HTML::Window>(event_target)) {
-        auto& document = window->associated_document();
-        document.set_needs_to_record_display_list();
-        document.page().invalidate_compositor_wheel_event_listener_state();
-        return;
-    }
-
-    if (auto* node = as_if<Node>(event_target)) {
-        node->update_inside_blocking_wheel_event_handler_state_for_subtree();
-        node->set_needs_repaint();
-        node->document().page().invalidate_compositor_wheel_event_listener_state();
-    }
-}
-
-static void update_needs_beforeunload_check(EventTarget& event_target, DOMEventListener const& listener)
-{
-    if (listener.type != HTML::EventNames::beforeunload)
-        return;
-
-    auto* window = as_if<HTML::Window>(event_target);
-    if (!window)
-        return;
-
-    auto navigable = window->associated_document().navigable();
-    if (!navigable)
-        return;
-
-    if (auto traversable = navigable->traversable_navigable())
-        traversable->page().update_needs_beforeunload_check();
-}
-
-// https://dom.spec.whatwg.org/#dom-eventtarget-addeventlistener
-void EventTarget::add_event_listener(FlyString const& type, GC::Ptr<IDLEventListener> callback, AddEventListenerOptions const& options)
-{
-    // 1. Let capture, passive, once, and signal be the result of flattening more options.
-
-    // 2. Add an event listener with this and an event listener whose type is type, callback is callback, capture is capture, passive is passive,
-    //    once is once, and signal is signal.
-
-    auto event_listener = GC::Heap::the().allocate<DOMEventListener>();
-    event_listener->type = Utf16FlyString::from_fly_string(type);
-    event_listener->callback = callback;
-    event_listener->signal = options.signal;
-    event_listener->capture = options.capture;
-    event_listener->passive = options.passive;
-    event_listener->once = options.once;
-    add_an_event_listener(*event_listener);
-}
-
-void EventTarget::add_event_listener(Utf16FlyString const& type, GC::Ptr<IDLEventListener> callback, AddEventListenerOptions const& options)
-{
-    auto event_listener = GC::Heap::the().allocate<DOMEventListener>();
-    event_listener->type = type;
-    event_listener->callback = callback;
-    event_listener->signal = options.signal;
-    event_listener->capture = options.capture;
-    event_listener->passive = options.passive;
-    event_listener->once = options.once;
-    add_an_event_listener(*event_listener);
-}
-
-void EventTarget::add_event_listener_without_options(Utf16FlyString const& type, IDLEventListener& callback)
-{
-    auto utf8_type = type.to_utf16_string().to_utf8();
-    add_event_listener(MUST(FlyString::from_utf8(utf8_type.bytes_as_string_view())), &callback, {});
-}
-
-// https://dom.spec.whatwg.org/#add-an-event-listener
-void EventTarget::add_an_event_listener(DOMEventListener& listener)
-{
-    // FIXME: 1. If eventTarget is a ServiceWorkerGlobalScope object, its service worker’s script resource’s has ever been evaluated flag is set,
-    //           and listener’s type matches the type attribute value of any of the service worker events, then report a warning to the console
-    //           that this might not give the expected results. [SERVICE-WORKERS]
-
-    auto& event_listener_list = ensure_data().event_listener_list;
-
-    // 2. If listener’s signal is not null and is aborted, then return.
-    if (listener.signal && listener.signal->aborted())
-        return;
-
-    // 3. If listener’s callback is null, then return.
-    if (!listener.callback)
-        return;
-
-    // 4. If listener’s passive is null, then set it to the default passive value given listener’s type and eventTarget.
-    if (!listener.passive.has_value()) {
-        listener.passive = default_passive_value(listener.type, this);
-    }
-
-    // 5. If eventTarget’s event listener list does not contain an event listener whose type is listener’s type, callback is listener’s callback,
-    //    and capture is listener’s capture, then append listener to eventTarget’s event listener list.
-    auto it = event_listener_list.find_if([&](auto& entry) {
-        return entry->type == listener.type
-            && entry->callback->callback().callback == listener.callback->callback().callback
-            && entry->capture == listener.capture;
-    });
-    if (it == event_listener_list.end()) {
-        event_listener_list.append(listener);
-        invalidate_compositor_wheel_event_listener_state(*this, listener);
-        update_needs_beforeunload_check(*this, listener);
-        event_listener_list_changed();
-    }
-
-    // 6. If listener’s signal is not null, then add the following abort steps to it:
-    if (listener.signal) {
-        // NOTE: `this` and `listener` are protected by AbortSignal using GC::HeapFunction.
-        (void)listener.signal->add_abort_algorithm([this, &listener] {
-            // 1. Remove an event listener with eventTarget and listener.
-            remove_an_event_listener(listener);
-        });
-    }
-}
-
-// https://dom.spec.whatwg.org/#dom-eventtarget-removeeventlistener
-void EventTarget::remove_event_listener(FlyString const& type, GC::Ptr<IDLEventListener> callback, EventListenerOptions const& options)
-{
-    auto& event_listener_list = ensure_data().event_listener_list;
-
-    // 1. Let capture be the result of flattening options.
-    bool capture = options.capture;
-
-    // 2. If this’s event listener list contains an event listener whose type is type, callback is callback, and capture is capture,
-    //    then remove an event listener with this and that event listener.
-    auto callbacks_match = [&](DOMEventListener& entry) {
-        if (!entry.callback && !callback)
-            return true;
-        if (!entry.callback || !callback)
-            return false;
-        return entry.callback->callback().callback == callback->callback().callback;
-    };
-    auto utf16_type = Utf16FlyString::from_fly_string(type);
-    auto it = event_listener_list.find_if([&](auto& entry) {
-        return entry->type == utf16_type
-            && callbacks_match(*entry)
-            && entry->capture == capture;
-    });
-    if (it != event_listener_list.end())
-        remove_an_event_listener(**it);
-}
-
-void EventTarget::remove_event_listener(Utf16FlyString const& type, GC::Ptr<IDLEventListener> callback, EventListenerOptions const& options)
-{
-    remove_event_listener(FlyString { type.to_utf16_string().to_utf8() }, callback, options);
-}
-
-void EventTarget::remove_event_listener_without_options(Utf16FlyString const& type, IDLEventListener& callback)
-{
-    auto utf8_type = type.to_utf16_string().to_utf8();
-    remove_event_listener(MUST(FlyString::from_utf8(utf8_type.bytes_as_string_view())), &callback, {});
-}
-
-// https://dom.spec.whatwg.org/#remove-an-event-listener
-void EventTarget::remove_an_event_listener(DOMEventListener& listener)
-{
-    // FIXME: 1. If eventTarget is a ServiceWorkerGlobalScope object and its service worker’s set of event types to handle contains type,
-    //           then report a warning to the console that this might not give the expected results. [SERVICE-WORKERS]
-
-    // 2. Set listener’s removed to true and remove listener from eventTarget’s event listener list.
-    listener.removed = true;
-    VERIFY(m_data);
-    auto did_remove = m_data->event_listener_list.remove_first_matching([&](auto& entry) { return entry.ptr() == &listener; });
-    if (did_remove) {
-        invalidate_compositor_wheel_event_listener_state(*this, listener);
-        update_needs_beforeunload_check(*this, listener);
-        event_listener_list_changed();
-    }
-}
-
-// https://dom.spec.whatwg.org/#dom-eventtarget-dispatchevent
-WebIDL::ExceptionOr<bool> EventTarget::dispatch_event_for_bindings(Event& event)
-{
-    // 1. If event’s dispatch flag is set, or if its initialized flag is not set, then throw an "InvalidStateError" DOMException.
-    if (event.dispatched())
-        return WebIDL::InvalidStateError::create("The event is already being dispatched."_utf16);
-
-    if (!event.initialized())
-        return WebIDL::InvalidStateError::create("Cannot dispatch an uninitialized event."_utf16);
-
-    // 2. Initialize event’s isTrusted attribute to false.
-    event.set_is_trusted(false);
-
-    // 3. Return the result of dispatching event to this.
-    return dispatch_event(event);
-}
-
-// https://html.spec.whatwg.org/multipage/webappapis.html#window-reflecting-body-element-event-handler-set
-bool is_window_reflecting_body_element_event_handler(Utf16FlyString const& name)
-{
-    return name.is_one_of(
-        HTML::EventNames::blur,
-        HTML::EventNames::error,
-        HTML::EventNames::focus,
-        HTML::EventNames::load,
-        UIEvents::EventNames::resize,
-        HTML::EventNames::scroll);
-}
-
-// https://html.spec.whatwg.org/multipage/webappapis.html#windoweventhandlers
-static bool is_window_event_handler(Utf16FlyString const& name)
-{
-    return name.is_one_of(
-        HTML::EventNames::afterprint,
-        HTML::EventNames::beforeprint,
-        HTML::EventNames::beforeunload,
-        HTML::EventNames::hashchange,
-        HTML::EventNames::languagechange,
-        HTML::EventNames::message,
-        HTML::EventNames::messageerror,
-        HTML::EventNames::offline,
-        HTML::EventNames::online,
-        HTML::EventNames::pagehide,
-        HTML::EventNames::pageshow,
-        HTML::EventNames::popstate,
-        HTML::EventNames::rejectionhandled,
-        HTML::EventNames::storage,
-        HTML::EventNames::unhandledrejection,
-        HTML::EventNames::unload);
-}
-
-// https://html.spec.whatwg.org/multipage/webappapis.html#determining-the-target-of-an-event-handler
-static EventTarget* determine_target_of_event_handler(EventTarget& event_target, Utf16FlyString const& name)
-{
-    // To determine the target of an event handler, given an EventTarget object eventTarget on which the event handler is exposed,
-    // and an event handler name name, the following steps are taken:
-
-    // 1. If eventTarget is not a body element or a frameset element, then return eventTarget.
-    if (!is<HTML::HTMLBodyElement>(event_target) && !is<HTML::HTMLFrameSetElement>(event_target))
-        return &event_target;
-
-    auto& event_target_element = static_cast<HTML::HTMLElement&>(event_target);
-
-    // 2. If name is not the name of an attribute member of the WindowEventHandlers interface mixin and the Window-reflecting
-    //    body element event handler set does not contain name, then return eventTarget.
-    if (!is_window_event_handler(name) && !is_window_reflecting_body_element_event_handler(name))
-        return &event_target;
-
-    // 3. If eventTarget's node document is not an active document, then return null.
-    if (!event_target_element.document().is_active())
-        return nullptr;
-
-    // 4. Return eventTarget's node document's relevant global object.
-    return event_target_element.document().window().ptr();
-}
-
-static Optional<Utf16FlyString> event_name_from_event_handler_attribute_local_name(Utf16FlyString const& local_name)
-{
-#undef __ENUMERATE
-#define __ENUMERATE(attribute_name, event_name)             \
-    if (local_name == HTML::AttributeNames::attribute_name) \
-        return event_name;
-    ENUMERATE_GLOBAL_EVENT_HANDLERS(__ENUMERATE)
-    ENUMERATE_WINDOW_EVENT_HANDLERS(__ENUMERATE)
-#undef __ENUMERATE
-
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-attributes:event-handler-idl-attributes-2
-WebIDL::CallbackType* EventTarget::event_handler_attribute(Utf16FlyString const& name)
-{
-    // 1. Let eventTarget be the result of determining the target of an event handler given this object and name.
-    auto target = determine_target_of_event_handler(*this, name);
-
-    // 2. If eventTarget is null, then return null.
-    if (!target)
-        return nullptr;
-
-    // 3. Return the result of getting the current value of the event handler given eventTarget and name.
-    return target->get_current_value_of_event_handler(name);
-}
-
-// https://html.spec.whatwg.org/multipage/webappapis.html#getting-the-current-value-of-the-event-handler
-WebIDL::CallbackType* EventTarget::get_current_value_of_event_handler(Utf16FlyString const& name)
-{
-    // 1. Let handlerMap be eventTarget's event handler map. (NOTE: Not necessary)
-    auto& handler_map = ensure_data().event_handler_map;
-
-    // 2. Let eventHandler be handlerMap[name].
-    auto event_handler_iterator = handler_map.find(name);
-
-    // Optimization: The spec creates all the event handlers exposed on an object up front and has the initial value of the handler set to null.
-    //               If the event handler hasn't been set, null would be returned in step 4.
-    //               However, this would be very allocation heavy. For example, each DOM::Element includes GlobalEventHandlers, which defines 60+(!) event handler attributes.
-    //               Plus, the vast majority of these allocations would be likely wasted, as I imagine web content will only use a handful of these attributes on certain elements, if any at all.
-    //               Thus, we treat the event handler not being in the event handler map as being equivalent to an event handler with an initial null value.
-    if (event_handler_iterator == handler_map.end())
-        return nullptr;
-
-    auto& event_handler = event_handler_iterator->value;
-
-    // 3. If eventHandler's value is an internal raw uncompiled handler, then:
-    if (event_handler->value.has<Utf16String>()) {
-        // 1. If eventTarget is an element, then let element be eventTarget, and document be element's node document.
-        //    Otherwise, eventTarget is a Window object, let element be null, and document be eventTarget's associated Document.
-        GC::Ptr<Element> element;
-        GC::Ptr<Document> document;
-
-        if (auto* element_event_target = as_if<Element>(this)) {
-            element = element_event_target;
-            document = &element_event_target->document();
-        } else {
-            auto& window_event_target = as<HTML::Window>(*this);
-            document = window_event_target.associated_document();
-        }
-
-        VERIFY(document);
-
-        // 2. If scripting is disabled for document, then return null.
-        if (document->is_scripting_disabled())
-            return nullptr;
-
-        // 3. Let body be the uncompiled script body in eventHandler's value.
-        auto const& body = event_handler->value.get<Utf16String>();
-
-        // FIXME: 4. Let location be the location where the script body originated, as given by eventHandler's value.
-
-        // 5. If element is not null and element has a form owner, let form owner be that form owner. Otherwise, let form owner be null.
-        GC::Ptr<HTML::HTMLFormElement> form_owner;
-        if (auto* form_associated_element = as_if<HTML::FormAssociatedElement>(element.ptr())) {
-            if (auto* form = form_associated_element->form())
-                form_owner = form;
-        }
-
-        // 6. Let settings object be the relevant settings object of document.
-        auto& settings_object = document->relevant_settings_object();
-
-        // Build source text and parameter strings for the event handler function.
-        Utf16StringBuilder source_builder;
-        Utf16View parameters_string;
-
-        // sourceText / ParameterList
-        if (name == HTML::EventNames::error && is<HTML::Window>(this)) {
-            //  -> If name is onerror and eventTarget is a Window object
-            //      Let the function have five arguments, named event, source, lineno, colno, and error.
-            source_builder.appendff("function on{}(event, source, lineno, colno, error) {{\n{}\n}}", name, body);
-            parameters_string = u"event, source, lineno, colno, error"sv;
-        } else {
-            //  -> Otherwise
-            //      Let the function have a single argument called event.
-            source_builder.appendff("function on{}(event) {{\n{}\n}}", name, body);
-            parameters_string = u"event"sv;
-        }
-
-        auto source_text = source_builder.to_string();
-
-        auto& vm = Bindings::main_thread_vm();
-
-        auto rust_compilation = JS::RustIntegration::compile_dynamic_function(
-            vm, source_text, parameters_string, body, JS::FunctionKind::Normal);
-
-        // 7. If body is not parsable as FunctionBody or if parsing detects an early error, then follow these substeps:
-        if (!rust_compilation.has_value() || rust_compilation->is_error()) {
-            // 1. Set eventHandler's value to null.
-            event_handler->value = GC::Ptr<WebIDL::CallbackType> {};
-
-            // FIXME: 2. Report the error for the appropriate script and with the appropriate position (line number and column number) given by location, using settings object's global object.
-
-            // 3. Return null.
-            return nullptr;
-        }
-
-        // 8. Push settings object's realm execution context onto the JavaScript execution context stack; it is now the running JavaScript execution context.
-        vm.push_execution_context(settings_object.realm_execution_context());
-
-        // scope
-        //  1. Let realm be settings object's Realm.
-        auto& realm = settings_object.realm();
-
-        //  2. Let scope be realm.[[GlobalEnv]].
-        auto scope = GC::Ref<JS::Environment> { realm.global_environment() };
-
-        // 3. If eventHandler is an element's event handler, then set scope to NewObjectEnvironment(document, true, scope).
-        //    (Otherwise, eventHandler is a Window object's event handler.)
-        if (is<Element>(this))
-            scope = Bindings::new_event_handler_object_environment(realm, GC::Ref { *document }, scope);
-
-        //  4. If form owner is not null, then set scope to NewObjectEnvironment(form owner, true, scope).
-        if (form_owner)
-            scope = Bindings::new_event_handler_object_environment(realm, GC::Ref { *form_owner }, scope);
-
-        //  5. If element is not null, then set scope to NewObjectEnvironment(element, true, scope).
-        if (element)
-            scope = Bindings::new_event_handler_object_environment(realm, GC::Ref { *element }, scope);
-
-        // 9. Let function be the result of calling OrdinaryFunctionCreate.
-        auto function = JS::ECMAScriptFunctionObject::create_from_function_data(
-            realm,
-            rust_compilation->value(),
-            scope,
-            nullptr);
-
-        // 10. Remove settings object's realm execution context from the JavaScript execution context stack.
-        auto* popped_execution_context = vm.pop_execution_context();
-        VERIFY(popped_execution_context == &settings_object.realm_execution_context());
-
-        // 11. Set function.[[ScriptOrModule]] to null.
-        function->set_script_or_module({});
-
-        // 12. Set eventHandler's value to the result of creating a Web IDL EventHandler callback function object whose object reference is function and whose callback context is settings object.
-        // FIXME: Update this comment once the ShadowRealm proposal is merged to pass realm.
-        event_handler->value = GC::Ptr(GC::Heap::the().allocate<WebIDL::CallbackType>(*function, realm));
-    }
-
-    // 4. Return eventHandler's value.
-    VERIFY(event_handler->value.has<GC::Ptr<WebIDL::CallbackType>>());
-    return event_handler->value.get_pointer<GC::Ptr<WebIDL::CallbackType>>()->ptr();
-}
-
-// https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-attributes:event-handler-idl-attributes-3
-void EventTarget::set_event_handler_attribute(Utf16FlyString const& name, GC::Ptr<WebIDL::CallbackType> value)
-{
-    // 1. Let eventTarget be the result of determining the target of an event handler given this object and name.
-    auto event_target = determine_target_of_event_handler(*this, name);
-
-    // 2. If eventTarget is null, then return.
-    if (!event_target)
-        return;
-
-    // 3. If the given value is null, then deactivate an event handler given eventTarget and name.
-    if (!value) {
-        event_target->deactivate_event_handler(name);
-        return;
-    }
-
-    // 4. Otherwise:
-    //  1. Let handlerMap be eventTarget's event handler map.
-    auto& handler_map = event_target->ensure_data().event_handler_map;
-
-    //  2. Let eventHandler be handlerMap[name].
-    auto event_handler_iterator = handler_map.find(name);
-
-    //  3. Set eventHandler's value to the given value.
-    if (event_handler_iterator == handler_map.end()) {
-        // NOTE: See the optimization comment in get_current_value_of_event_handler about why this is done.
-        auto new_event_handler = GC::Heap::the().allocate<HTML::EventHandler>(*value);
-
-        //  4. Activate an event handler given eventTarget and name.
-        // Optimization: We pass in the event handler here instead of having activate_event_handler do another hash map lookup just to get the same object.
-        //               This handles a new event handler while the other path handles an existing event handler. As such, both paths must have their own
-        //               unique call to activate_event_handler.
-        event_target->activate_event_handler(name, *new_event_handler);
-
-        handler_map.set(name, new_event_handler);
-        return;
-    }
-
-    auto& event_handler = event_handler_iterator->value;
-
-    event_handler->value = GC::Ptr(value);
-
-    //  4. Activate an event handler given eventTarget and name.
-    //  NOTE: See the optimization comment above.
-    event_target->activate_event_handler(name, *event_handler);
-}
-
-// https://html.spec.whatwg.org/multipage/webappapis.html#activate-an-event-handler
-static JS::Realm& event_handler_listener_realm(EventTarget& event_target, HTML::EventHandler& event_handler)
-{
-    if (auto* callback = event_handler.value.get_pointer<GC::Ptr<WebIDL::CallbackType>>()) {
-        if (auto* realm = Bindings::callback_realm(callback->ptr()))
-            return *realm;
-    }
-
-    if (auto* node = as_if<Node>(&event_target))
-        return node->document().relevant_settings_object().realm();
-
-    if (auto* window = as_if<HTML::Window>(&event_target))
-        return window->associated_document().relevant_settings_object().realm();
-
-    VERIFY_NOT_REACHED();
-}
-
-void EventTarget::activate_event_handler(Utf16FlyString const& name, HTML::EventHandler& event_handler)
-{
-    // 1. Let handlerMap be eventTarget's event handler map.
-    // 2. Let eventHandler be handlerMap[name].
-    // NOTE: These are achieved by using the passed in event handler.
-
-    // 3. If eventHandler's listener is not null, then return.
-    if (event_handler.listener)
-        return;
-
-    JS::Realm& realm = event_handler_listener_realm(*this, event_handler);
-
-    // 4. Let callback be the result of creating a Web IDL EventListener instance representing a reference to a function of one argument that executes the steps of the event handler processing algorithm, given eventTarget, name, and its argument.
-    //    The EventListener's callback context can be arbitrary; it does not impact the steps of the event handler processing algorithm. [DOM]
-
-    // NOTE: The callback must keep `this` alive. For example:
-    //          document.body.onunload = () => { console.log("onunload called!"); }
-    //          document.body.remove();
