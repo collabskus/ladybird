@@ -1,4 +1,226 @@
-﻿        handler_map.set(*event_name, new_event_handler);
+﻿    event_handler->value = GC::Ptr(value);
+
+    //  4. Activate an event handler given eventTarget and name.
+    //  NOTE: See the optimization comment above.
+    event_target->activate_event_handler(name, *event_handler);
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#activate-an-event-handler
+static JS::Realm& event_handler_listener_realm(EventTarget& event_target, HTML::EventHandler& event_handler)
+{
+    if (auto* callback = event_handler.value.get_pointer<GC::Ptr<WebIDL::CallbackType>>()) {
+        if (auto* realm = Bindings::callback_realm(callback->ptr()))
+            return *realm;
+    }
+
+    if (auto* node = as_if<Node>(&event_target))
+        return node->document().relevant_settings_object().realm();
+
+    if (auto* window = as_if<HTML::Window>(&event_target))
+        return window->associated_document().relevant_settings_object().realm();
+
+    VERIFY_NOT_REACHED();
+}
+
+void EventTarget::activate_event_handler(Utf16FlyString const& name, HTML::EventHandler& event_handler)
+{
+    // 1. Let handlerMap be eventTarget's event handler map.
+    // 2. Let eventHandler be handlerMap[name].
+    // NOTE: These are achieved by using the passed in event handler.
+
+    // 3. If eventHandler's listener is not null, then return.
+    if (event_handler.listener)
+        return;
+
+    JS::Realm& realm = event_handler_listener_realm(*this, event_handler);
+
+    // 4. Let callback be the result of creating a Web IDL EventListener instance representing a reference to a function of one argument that executes the steps of the event handler processing algorithm, given eventTarget, name, and its argument.
+    //    The EventListener's callback context can be arbitrary; it does not impact the steps of the event handler processing algorithm. [DOM]
+
+    // NOTE: The callback must keep `this` alive. For example:
+    //          document.body.onunload = () => { console.log("onunload called!"); }
+    //          document.body.remove();
+    //          location.reload();
+    //       The body element is no longer in the DOM and there is no variable holding onto it. However, the onunload handler is still called, meaning the callback keeps the body element alive.
+    auto callback_function = JS::NativeFunction::create(
+        realm, [event_target = this, name](JS::VM& vm) mutable -> JS::ThrowCompletionOr<JS::Value> {
+            // The event dispatcher should only call this with one argument.
+            VERIFY(vm.argument_count() == 1);
+
+            // The argument must be an object and it must be an Event.
+            auto* event = Bindings::event_from_callback_argument(vm);
+            VERIFY(event);
+
+            TRY(event_target->process_event_handler_for_event(name, *event));
+            return JS::js_undefined();
+        },
+        0, Utf16FlyString {}, &realm);
+
+    // NOTE: As per the spec, the callback context is arbitrary.
+    auto callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*callback_function, realm);
+
+    // 5. Let listener be a new event listener whose type is the event handler event type corresponding to eventHandler and callback is callback.
+    auto listener = GC::Heap::the().allocate<DOMEventListener>();
+    listener->type = name;
+    listener->callback = IDLEventListener::create(*callback);
+
+    // 6. Add an event listener with eventTarget and listener.
+    add_an_event_listener(*listener);
+
+    // 7. Set eventHandler's listener to listener.
+    event_handler.listener = listener;
+}
+
+void EventTarget::deactivate_event_handler(Utf16FlyString const& name)
+{
+    // 1. Let handlerMap be eventTarget's event handler map.
+    auto& handler_map = ensure_data().event_handler_map;
+
+    // 2. Let eventHandler be handlerMap[name].
+    auto event_handler_iterator = handler_map.find(name);
+
+    // NOTE: See the optimization comment in get_current_value_of_event_handler about why this is done.
+    if (event_handler_iterator == handler_map.end())
+        return;
+
+    auto& event_handler = event_handler_iterator->value;
+
+    // 4. Let listener be eventHandler's listener. (NOTE: Not necessary)
+
+    // 5. If listener is not null, then remove an event listener with eventTarget and listener.
+    if (event_handler->listener) {
+        remove_an_event_listener(*event_handler->listener);
+    }
+
+    // 6. Set eventHandler's listener to null.
+    event_handler->listener = nullptr;
+
+    // 3. Set eventHandler's value to null.
+    // NOTE: This is done out of order since our equivalent of setting value to null is removing the event handler from the map.
+    //       Given that event_handler is a reference to an entry, this would invalidate event_handler if we did it in order.
+    handler_map.remove(event_handler_iterator);
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#the-event-handler-processing-algorithm
+JS::ThrowCompletionOr<void> EventTarget::process_event_handler_for_event(Utf16FlyString const& name, Event& event)
+{
+    // 1. Let callback be the result of getting the current value of the event handler given eventTarget and name.
+    auto* callback = get_current_value_of_event_handler(name);
+
+    // 2. If callback is null, then return.
+    if (!callback)
+        return {};
+
+    // 3. Let special error event handling be true if event is an ErrorEvent object, event's type is error, and event's currentTarget implements the WindowOrWorkerGlobalScope mixin.
+    //    Otherwise, let special error event handling be false.
+    bool special_error_event_handling = is<HTML::ErrorEvent>(event) && event.type() == HTML::EventNames::error && is<HTML::WindowOrWorkerGlobalScopeMixin>(event.current_target().ptr());
+
+    // 4. Process the Event object event as follows:
+    JS::Completion return_value_or_error;
+
+    return_value_or_error = Bindings::invoke_event_handler(*callback, event, special_error_event_handling);
+
+    // If an exception gets thrown by the callback, end these steps and allow the exception to propagate. (It will propagate to the DOM event dispatch logic, which will then report the exception.)
+    if (return_value_or_error.is_error())
+        return return_value_or_error.release_error();
+
+    // FIXME: Ideally, invoke_callback would convert JS::Value to the appropriate return type for us as per the spec, but it doesn't currently.
+    auto return_value = return_value_or_error.value();
+
+    auto is_beforeunload = event.type() == HTML::EventNames::beforeunload;
+
+    // 5. Process return value as follows:
+    if (is<HTML::BeforeUnloadEvent>(event) && is_beforeunload) {
+        // ->  If event is a BeforeUnloadEvent object and event's type is "beforeunload"
+        //         If return value is not null, then:
+        if (!return_value.is_nullish()) {
+            // 1. Set event's canceled flag.
+            event.set_cancelled(true);
+
+            // 2. If event's returnValue attribute's value is the empty string, then set event's returnValue attribute's value to return value.
+            auto& before_unload_event = static_cast<HTML::BeforeUnloadEvent&>(event);
+            if (before_unload_event.return_value().is_empty())
+                before_unload_event.set_return_value(TRY(return_value.to_utf16_string(vm())));
+        }
+    }
+
+    if (special_error_event_handling) {
+        // -> If special error event handling is true
+        //      If return value is true, then set event's canceled flag.
+        // NB: the return type of EventHandler is `any`, so no coercion happens, meaning we have to check if it's a
+        //     boolean first.
+        if (return_value.is_boolean() && return_value.as_bool())
+            event.set_cancelled(true);
+    } else {
+        // -> Otherwise
+        //      If return value is false, then set event's canceled flag.
+        // NB: the return type of EventHandler is `any`, so no coercion happens, meaning we have to check if it's a
+        //     boolean first.
+        // NOTE: If we've gotten to this "Otherwise" clause because event's type is "beforeunload" but event is not a
+        //       BeforeUnloadEvent object, then return value will never be false, since in such cases return value will
+        //       have been coerced into either null or a DOMString.
+        if (return_value.is_boolean() && !return_value.as_bool() && !is_beforeunload)
+            event.set_cancelled(true);
+    }
+
+    return {};
+}
+
+// https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-attributes:concept-element-attributes-change-ext
+void EventTarget::element_event_handler_attribute_changed(Utf16FlyString const& local_name, Optional<Utf16String> const& value)
+{
+    // NOTE: Step 1 of this algorithm was handled in HTMLElement::attribute_changed.
+
+    auto event_name = event_name_from_event_handler_attribute_local_name(local_name);
+    if (!event_name.has_value())
+        return;
+
+    // 2. Let eventTarget be the result of determining the target of an event handler given element and localName.
+    // NOTE: element is `this`.
+    auto* event_target = determine_target_of_event_handler(*this, *event_name);
+
+    // 3. If eventTarget is null, then return.
+    if (!event_target)
+        return;
+
+    // 4. If value is null, then deactivate an event handler given eventTarget and localName.
+    if (!value.has_value()) {
+        event_target->deactivate_event_handler(*event_name);
+        return;
+    }
+
+    // 5. Otherwise:
+    //  1. If the Should element's inline behavior be blocked by Content Security Policy? algorithm returns "Blocked" when executed upon element, "script attribute", and value, then return. [CSP]
+    auto& this_as_element = as<DOM::Element>(*this);
+    if (ContentSecurityPolicy::should_elements_inline_type_behavior_be_blocked_by_content_security_policy(
+            this_as_element,
+            ContentSecurityPolicy::Directives::Directive::InlineType::ScriptAttribute,
+            value.value())
+        == ContentSecurityPolicy::Directives::Directive::Result::Blocked) {
+        dbgln("EventTarget: Refusing to add inline event handler as it violates the Content Security Policy.");
+        return;
+    }
+
+    //  2. Let handlerMap be eventTarget's event handler map.
+    auto& handler_map = event_target->ensure_data().event_handler_map;
+
+    //  3. Let eventHandler be handlerMap[localName].
+    auto event_handler_iterator = handler_map.find(*event_name);
+
+    //  FIXME: 4. Let location be the script location that triggered the execution of these steps.
+
+    //  FIXME: 5. Set eventHandler's value to the internal raw uncompiled handler value/location.
+    //            (This currently sets the value to the uncompiled source code instead of the named struct)
+
+    // NOTE: See the optimization comments in set_event_handler_attribute.
+
+    if (event_handler_iterator == handler_map.end()) {
+        auto new_event_handler = GC::Heap::the().allocate<HTML::EventHandler>(*value);
+
+        //  6. Activate an event handler given eventTarget and name.
+        event_target->activate_event_handler(*event_name, *new_event_handler);
+
+        handler_map.set(*event_name, new_event_handler);
         return;
     }
 
@@ -2919,6 +3141,13 @@ void Node::insert_before(GC::Ref<Node> node, GC::Ptr<Node> child, bool suppress_
     if (count == 0)
         return;
 
+    // OPTIMIZATION: Geometry reads defer replayable selector facts, but a tree mutation changes
+    //               authoritative relationships. Consume that style-change boundary while the old
+    //               tree is still intact.
+    document().flush_deferred_style_change_event();
+    if (&node->document() != &document())
+        node->document().flush_deferred_style_change_event();
+
     auto affects_elements = ChildrenChangedMetadata::AffectsElements::No;
     if (document().has_valid_html_collection_caches())
         affects_elements = mutation_affects_elements(nodes.span());
@@ -3262,6 +3491,8 @@ void Node::remove(bool suppress_observers)
 
     // 2. Assert: parent is non-null.
     VERIFY(parent);
+
+    document().flush_deferred_style_change_event();
 
     // 3. Run the live range pre-remove steps, given node.
     live_range_pre_remove();
@@ -3628,6 +3859,8 @@ WebIDL::ExceptionOr<void> Node::move_node(Node& new_parent, Node* child)
 
     // 8. Assert: oldParent is non-null.
     VERIFY(old_parent);
+
+    document().flush_deferred_style_change_event();
 
     auto affects_elements = ChildrenChangedMetadata::AffectsElements::No;
     if (document().has_valid_html_collection_caches())
@@ -233080,6 +233313,7 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
 
     let mut levels = vec![0u8; (last_longhand - first_longhand + 1) as usize];
     let mut animation_types = vec![0u8; levels.len()];
+    let mut layout_geometry_effects = vec![false; levels.len()];
     let mut numeric_range_rows = vec![String::new(); levels.len()];
     let value_types = [
         "anchor",
@@ -233148,6 +233382,24 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
             "none" => 4,
             other => return Err(format!("unknown animation-type '{other}' for {name}").into()),
         };
+
+        let metadata_flag = |field: &str, default| {
+            property_field(name, field)
+                .and_then(|value| value.as_bool())
+                .unwrap_or(default)
+        };
+        // Animation controls can select or retime an animation of any property, so their own
+        // direct layout metadata cannot bound the geometry they expose. Likewise, container-name
+        // can change which descendant container queries apply without changing its own box, and
+        // color can change SVG bounds when stroke resolves currentColor.
+        let may_affect_layout_geometry_indirectly = property_field(name, "style-group")
+            .is_some_and(|value| value.as_str() == Some("AnimationValues"))
+            || matches!(name.as_str(), "color" | "container-name");
+        layout_geometry_effects[index] = metadata_flag("affects-layout", true)
+            || metadata_flag("affects-accumulated-visual-contexts", false)
+            || metadata_flag("affects-scrollable-overflow", false)
+            || metadata_flag("affects-stacking-context", false)
+            || may_affect_layout_geometry_indirectly;
 
         let mut ranges = Vec::new();
         if let Some(valid_types) = property_field(name, "valid-types").and_then(|value| value.as_array().cloned()) {
@@ -233349,6 +233601,11 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         "pub(crate) static PROPERTY_ANIMATION_TYPES: [u8; {}] = {:?};\n",
         animation_types.len(),
         animation_types
+    ));
+    output.push_str(&format!(
+        "pub(crate) static PROPERTY_MAY_AFFECT_LAYOUT_GEOMETRY: [bool; {}] = {:?};\n",
+        layout_geometry_effects.len(),
+        layout_geometry_effects
     ));
     output.push_str(&format!(
         "pub(crate) static PROPERTY_NUMERIC_RANGES: [&[FfiPropertyNumericRange]; {}] = [\n{}\n];\n",
@@ -265426,6 +265683,21 @@ pub fn property_animation_type(property_id: u16) -> u8 {
     PROPERTY_ANIMATION_TYPES[longhand_index(property_id)]
 }
 
+/// Whether changing a property may invalidate geometry exposed by synchronous layout APIs.
+///
+/// Besides properties which directly affect layout, this includes properties which can change the
+/// accumulated visual context, scrollable overflow, or stacking-context structure, and properties
+/// which can indirectly expose geometry changes through animations, container queries, or SVG
+/// currentColor strokes.
+/// Value-aware callers can refine this conservative property-level answer when both sides are
+/// available.
+pub fn property_may_affect_layout_geometry(property_id: u16) -> bool {
+    if !(FIRST_LONGHAND_PROPERTY_ID..=LAST_LONGHAND_PROPERTY_ID).contains(&property_id) {
+        return true;
+    }
+    PROPERTY_MAY_AFFECT_LAYOUT_GEOMETRY[longhand_index(property_id)]
+}
+
 pub(crate) fn pseudo_element_supports_property(pseudo_element: u8, property_id: u16) -> bool {
     if PSEUDO_ELEMENT_ALWAYS_ALLOWED_PROPERTIES
         .binary_search(&property_id)
@@ -265479,6 +265751,28 @@ pub extern "C" fn rust_property_metadata_requires_computation_level(property_id:
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_property_metadata_animation_type(property_id: u16) -> u8 {
     property_animation_type(property_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_geometry_effects_include_direct_and_indirect_effects() {
+        assert!(!property_may_affect_layout_geometry(property_id::BACKGROUND_COLOR));
+        assert!(property_may_affect_layout_geometry(property_id::COLOR));
+        assert!(property_may_affect_layout_geometry(property_id::WIDTH));
+        assert!(property_may_affect_layout_geometry(property_id::TRANSFORM));
+        assert!(property_may_affect_layout_geometry(property_id::OPACITY));
+        assert!(property_may_affect_layout_geometry(property_id::TEXT_RENDERING));
+        assert!(property_may_affect_layout_geometry(property_id::STROKE));
+        assert!(property_may_affect_layout_geometry(property_id::STROKE_WIDTH));
+        assert!(property_may_affect_layout_geometry(property_id::ANIMATION_NAME));
+        assert!(property_may_affect_layout_geometry(property_id::TRANSITION_PROPERTY));
+        assert!(property_may_affect_layout_geometry(property_id::SCROLL_TIMELINE_NAME));
+        assert!(property_may_affect_layout_geometry(property_id::CONTAINER_NAME));
+        assert!(property_may_affect_layout_geometry(property_id::CUSTOM));
+    }
 }
 
 /// # Safety
@@ -309010,6 +309304,8 @@ impl StyleEngine {
             tree,
             program: StyleSheetProgram::new(),
             journal: NormalizationJournal::new(),
+            deferred_geometry_journal: NormalizationJournal::new(),
+            flushing_deferred_geometry_journal: false,
             deferred_element_style_inputs: Vec::new(),
             deferred_element_style_input_memory: MemoryLease::new(MemoryCategory::NormalizationJournal),
             initial_tree_batch_applied: false,
@@ -309664,9 +309960,161 @@ impl StyleEngine {
     #[must_use]
     pub fn has_pending_transaction(&self) -> bool {
         !self.journal.is_empty()
+            || (!self.flushing_deferred_geometry_journal && !self.deferred_geometry_journal.is_empty())
             || !self.tree_staging.is_empty()
             || self.program_staging.is_dirty()
             || self.sheet_rule_replacement.is_some()
+    }
+
+    #[must_use]
+    pub fn has_deferred_geometry_transaction(&self) -> bool {
+        !self.flushing_deferred_geometry_journal && !self.deferred_geometry_journal.is_empty()
+    }
+
+    /// Whether settling the pending selector inputs can change geometry derived from the committed
+    /// layout. This is deliberately a proof of independence rather than a list of properties which
+    /// usually avoid layout: anything not explicitly known to preserve geometry remains observable.
+    #[must_use]
+    pub fn pending_transaction_may_affect_layout_geometry(&self) -> bool {
+        if self.journal.is_empty() {
+            return !self.tree_staging.is_empty()
+                || self.program_staging.is_dirty()
+                || self.sheet_rule_replacement.is_some()
+                || !self.deferred_element_style_inputs.is_empty()
+                || self.initial_tree_bulk_load_is_pending;
+        }
+        if !self.journal.markers().is_empty()
+            || !self.tree_staging.is_empty()
+            || self.program_staging.is_dirty()
+            || self.sheet_rule_replacement.is_some()
+            || !self.deferred_element_style_inputs.is_empty()
+            || self.initial_tree_bulk_load_is_pending
+        {
+            return true;
+        }
+
+        let route_liveness = self.routing.route_liveness(&self.program, &self.programs);
+        self.journal.inputs().any(|input| {
+            let mut keys = match input.key {
+                InputKey::LocalFeature(_, LocalFeatureKey::PartExposure | LocalFeatureKey::ArrivingFacts) => {
+                    return true;
+                }
+                InputKey::LocalFeature(_, LocalFeatureKey::Attribute(name)) => {
+                    let mut keys = routing_keys_for_input(&input);
+                    for other in self.facts.attribute_name_keys(name) {
+                        if other != name {
+                            keys.push(RoutingKey::AttributeName(other));
+                        }
+                    }
+                    keys
+                }
+                InputKey::LocalFeature(..) | InputKey::State(..) => routing_keys_for_input(&input),
+                _ => return true,
+            };
+            keys.sort_unstable();
+            keys.dedup();
+            keys.into_iter().any(|key| {
+                self.routing.routes_for(key).iter().copied().any(|route| {
+                    if !route_liveness.contains(route.index()) {
+                        return false;
+                    }
+                    let rule = self.routing.rule_of(route);
+                    !self.program.declarations_are_complete_for(rule)
+                        || self.program.declared_properties_of(rule).iter().any(|declared| {
+                            crate::css::property_metadata::property_may_affect_layout_geometry(declared.property)
+                        })
+                })
+            })
+        })
+    }
+
+    /// Preserve the pending paint-only selector facts as the style change event established by a
+    /// geometry read. Repeated reads advance the same boundary to the latest observed facts.
+    /// Returning false means exact journalling coarsened while combining the facts, so the caller
+    /// must settle style instead of reusing layout.
+    pub fn defer_pending_transaction_for_geometry_read(&mut self) -> bool {
+        debug_assert!(!self.flushing_deferred_geometry_journal);
+        debug_assert!(self.tree_staging.is_empty());
+        debug_assert!(!self.program_staging.is_dirty());
+        debug_assert!(self.sheet_rule_replacement.is_none());
+        debug_assert!(self.deferred_element_style_inputs.is_empty());
+        debug_assert!(!self.initial_tree_bulk_load_is_pending);
+        debug_assert!(self.journal.markers().is_empty());
+        debug_assert!(
+            self.journal
+                .inputs()
+                .all(|input| matches!(input.key, InputKey::LocalFeature(..) | InputKey::State(..)))
+        );
+
+        if self.journal.is_empty() {
+            return true;
+        }
+        if self.deferred_geometry_journal.is_empty() {
+            std::mem::swap(&mut self.journal, &mut self.deferred_geometry_journal);
+        } else {
+            self.deferred_geometry_journal
+                .absorb_newer(&mut self.journal, &mut self.memory, &mut self.counters);
+        }
+        self.deferred_geometry_journal.markers().is_empty()
+    }
+
+    /// Make the style transaction sealed by a geometry read current while preserving local facts
+    /// recorded after it for the following style change event.
+    pub fn begin_deferred_geometry_transaction_flush(&mut self) -> bool {
+        debug_assert!(!self.flushing_deferred_geometry_journal);
+        if self.deferred_geometry_journal.is_empty()
+            || !self.journal.markers().is_empty()
+            || !self.tree_staging.is_empty()
+            || self.program_staging.is_dirty()
+            || self.sheet_rule_replacement.is_some()
+            || !self.deferred_element_style_inputs.is_empty()
+            || self.initial_tree_bulk_load_is_pending
+            || !self
+                .journal
+                .inputs()
+                .all(|input| matches!(input.key, InputKey::LocalFeature(..) | InputKey::State(..)))
+        {
+            return false;
+        }
+
+        let later_inputs: Vec<NormalizedInput> = self.journal.inputs().collect();
+        for input in &later_inputs {
+            self.apply_to_facts_without_settling(input.key, input.old);
+        }
+        std::mem::swap(&mut self.journal, &mut self.deferred_geometry_journal);
+        self.flushing_deferred_geometry_journal = true;
+        true
+    }
+
+    /// Restore the local facts recorded after the geometry boundary once its transaction has been
+    /// consumed.
+    pub fn end_deferred_geometry_transaction_flush(&mut self) {
+        assert!(self.flushing_deferred_geometry_journal);
+        assert!(self.journal.is_empty());
+        assert!(self.tree_staging.is_empty());
+        assert!(!self.program_staging.is_dirty());
+        assert!(self.sheet_rule_replacement.is_none());
+        assert!(self.deferred_element_style_inputs.is_empty());
+
+        std::mem::swap(&mut self.journal, &mut self.deferred_geometry_journal);
+        let later_inputs: Vec<NormalizedInput> = self.journal.inputs().collect();
+        for input in later_inputs {
+            self.apply_to_facts_without_settling(input.key, input.new);
+        }
+        self.flushing_deferred_geometry_journal = false;
+    }
+
+    pub(super) fn merge_deferred_geometry_transaction(&mut self) {
+        if self.flushing_deferred_geometry_journal || self.deferred_geometry_journal.is_empty() {
+            return;
+        }
+        if self.journal.is_empty() {
+            std::mem::swap(&mut self.journal, &mut self.deferred_geometry_journal);
+            return;
+        }
+        self.deferred_geometry_journal
+            .absorb_newer(&mut self.journal, &mut self.memory, &mut self.counters);
+        std::mem::swap(&mut self.journal, &mut self.deferred_geometry_journal);
     }
 
     /// Record one member of a flat FFI batch without repeatedly settling the fact-store capacity.
@@ -310040,6 +310488,19 @@ impl StyleEngine {
         self.settle_tree_staging_memory();
     }
 
+    pub(super) fn depth_recompute_nodes(
+        &self,
+        staged_rows: &[(StyleNodeID, Option<TreeRelations>, Option<TreeRelations>)],
+    ) -> HashSet<StyleNodeID> {
+        staged_rows
+            .iter()
+            .filter_map(|&(node, before, relations)| {
+                let relations = relations?;
+                (before.is_none() || self.tree.parent(node) != relations.parent).then_some(node)
+            })
+            .collect()
+    }
+
     /// Install final staged relation rows at the transaction barrier.
     pub(super) fn apply_staged_tree_deltas(&mut self) {
         if self.tree_staging.is_empty() || self.tree_staging.is_applied() {
@@ -310051,13 +310512,7 @@ impl StyleEngine {
         // read before installation: the frozen before-side parent misses a move that a mid-transaction
         // application already installed, and a sibling-only row must not count as a moved parent.
         // A moved parent's subtree walk covers its moved descendants, so those are skipped below.
-        let depth_recompute_nodes = staged_rows
-            .iter()
-            .filter_map(|&(node, before, relations)| {
-                let relations = relations?;
-                (before.is_none() || self.tree.parent(node) != relations.parent).then_some(node)
-            })
-            .collect::<Vec<_>>();
+        let depth_recompute_nodes = self.depth_recompute_nodes(&staged_rows);
 
         for &(node, _, relations) in &staged_rows {
             let Some(relations) = relations else {
@@ -310083,11 +310538,14 @@ impl StyleEngine {
         for (parent, _, child) in &staged_first_children {
             self.tree.set_first_element_child(*parent, *child);
         }
-        for &node in &depth_recompute_nodes {
+        for &(node, _, _) in &staged_rows {
+            if !depth_recompute_nodes.contains(&node) {
+                continue;
+            }
             let parent_is_recomputed = self
                 .tree
                 .parent(node)
-                .is_some_and(|parent| depth_recompute_nodes.binary_search(&parent).is_ok());
+                .is_some_and(|parent| depth_recompute_nodes.contains(&parent));
             if !parent_is_recomputed {
                 self.tree.recompute_subtree_depth(node);
             }
@@ -317265,6 +317723,11 @@ pub struct StyleEngine {
     tree: StyleNodeTree,
     program: StyleSheetProgram,
     journal: NormalizationJournal,
+    /// Local selector facts through the latest geometry read which reused committed layout. A
+    /// normal style observation merges this into `journal`; a newly introduced transition can
+    /// instead consume it as the preceding style change event.
+    deferred_geometry_journal: NormalizationJournal,
+    flushing_deferred_geometry_journal: bool,
     /// Exact element reactions retained across rootless flushes until a style root can consume them.
     deferred_element_style_inputs: Vec<NormalizedInput>,
     deferred_element_style_input_memory: MemoryLease,
@@ -318887,6 +319350,7 @@ impl StyleEngine {
 
     /// Normalize the pending inputs without advancing the committed snapshot.
     pub(super) fn drain_transaction(&mut self) -> StyleTransaction {
+        self.merge_deferred_geometry_transaction();
         self.initial_tree_bulk_load_is_pending = false;
         self.finalize_staged_sheet_rule_replacements();
         // A diagnostic or retained planning snapshot may still hold this exact immutable routing
@@ -326658,6 +327122,8 @@ impl StyleEngine {
         self.retain_prefix_states();
         self.discard_prepared_batch_matching_traversal();
         self.discard_published_match_answers();
+        // Published matching scratch is the last owner that may name a retired identity.
+        self.tree.release_retired_identities(&mut self.memory);
     }
 }
 
@@ -344420,6 +344886,7 @@ FILE: Libraries/LibWeb/Rust/src/css/style/tests.rs
  */
 
 use super::batch_matcher::insert_scope_rule;
+use super::capacity::ShallowCapacityBytes;
 use super::index::CandidateEntries;
 use super::index::ParentDispatchFacts;
 use super::index::SelectorPostingKey;
@@ -344431,6 +344898,7 @@ use super::transaction::InputKind;
 use super::tree::PseudoElementKind;
 use super::tree::PseudoElementTarget;
 use super::*;
+use crate::css::property_metadata::property_id;
 
 #[test]
 fn dense_program_staging_freezes_before_until_release() {
@@ -344455,6 +344923,38 @@ fn dense_program_staging_freezes_before_until_release() {
     assert_eq!(staged.current(rule, || 50), 50);
     assert_eq!(staged.rows.capacity(), 0);
     assert_eq!(staged.touched.capacity(), 0);
+}
+
+#[test]
+fn pending_paint_only_local_inputs_preserve_layout_geometry() {
+    let (mut engine, nodes) = linear_document();
+    let paint_only = StyleAtomID(200);
+    let rule = add_target_rule(&mut engine, StyleSheetObjectID(1), paint_only);
+    engine.set_rule_declared_properties(rule, &[(property_id::BACKGROUND_COLOR, false)], true);
+    discard_transaction(&mut engine);
+
+    add_feature(&mut engine, nodes[1], LocalFeatureKey::Class(paint_only));
+    assert!(!engine.pending_transaction_may_affect_layout_geometry());
+    assert!(engine.has_pending_transaction());
+}
+
+#[test]
+fn pending_layout_and_incomplete_local_inputs_may_change_geometry() {
+    for (property, declarations_are_complete) in [
+        (property_id::WIDTH, true),
+        (property_id::TRANSFORM, true),
+        (property_id::COLOR, true),
+        (property_id::BACKGROUND_COLOR, false),
+    ] {
+        let (mut engine, nodes) = linear_document();
+        let target = StyleAtomID(200);
+        let rule = add_target_rule(&mut engine, StyleSheetObjectID(1), target);
+        engine.set_rule_declared_properties(rule, &[(property, false)], declarations_are_complete);
+        discard_transaction(&mut engine);
+
+        add_feature(&mut engine, nodes[1], LocalFeatureKey::Class(target));
+        assert!(engine.pending_transaction_may_affect_layout_geometry());
+    }
 }
 
 fn test_nth_position(argument: &str, of_type: bool) -> selector::NthPosition {
@@ -346153,6 +346653,27 @@ fn sibling_only_tree_staging_does_not_recompute_the_sibling_subtree_depth() {
 
     assert_eq!(engine.tree.take_depth_recompute_visits(), 1);
     assert_eq!(engine.tree.depth(nodes[3]), 3);
+}
+
+#[test]
+fn depth_recompute_membership_is_sparse_for_high_node_identities() {
+    let engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let relations = Some(TreeRelations::detached(TreeScopeID::DOCUMENT));
+    let low_rows = [
+        (StyleNodeID::element(1), None, relations),
+        (StyleNodeID::element(2), None, relations),
+    ];
+    let high_rows = [
+        (StyleNodeID::element(1_000_000), None, relations),
+        (StyleNodeID::element(u32::MAX), None, relations),
+    ];
+    let low_nodes = engine.depth_recompute_nodes(&low_rows);
+    let high_nodes = engine.depth_recompute_nodes(&high_rows);
+
+    assert_eq!(high_nodes.len(), 2);
+    assert!(high_nodes.contains(&StyleNodeID::element(1_000_000)));
+    assert!(high_nodes.contains(&StyleNodeID::element(u32::MAX)));
+    assert_eq!(high_nodes.shallow_capacity_bytes(), low_nodes.shallow_capacity_bytes());
 }
 
 #[test]
@@ -349789,7 +350310,6 @@ fn reused_element_identity_does_not_inherit_a_prefix_transition() {
     let mut planned = Vec::new();
     assert!(engine.take_style_transaction_nodes(nodes[0], |nodes| planned.extend_from_slice(nodes)));
 
-    engine.tree.release_retired_identities(&mut engine.memory);
     let mut reused_raw = [0_u32; 1];
     engine.allocate_style_nodes(&mut reused_raw);
     assert_eq!(reused_raw[0], nodes[3].raw());
@@ -354149,6 +354669,45 @@ impl NormalizationJournal {
         &self.markers
     }
 
+    /// The normalized view of the fine-grained inputs which are still pending.
+    pub(super) fn inputs(&self) -> impl Iterator<Item = NormalizedInput> + '_ {
+        self.entries
+            .iter()
+            .map(|(&key, &(old, new))| NormalizedInput { key, old, new })
+    }
+
+    /// Fold a newer journal into this one without counting its already-recorded inputs a second
+    /// time. This retains the original value before either journal and the final value after both.
+    pub(super) fn absorb_newer(&mut self, newer: &mut Self, memory: &mut MemoryController, counters: &mut Counters) {
+        debug_assert!(self.markers.is_empty());
+        debug_assert!(newer.markers.is_empty());
+        let newer_entries = std::mem::take(&mut newer.entries);
+        memory.release(MemoryCategory::NormalizationJournal, u64::from(newer.charged_bytes));
+        newer.charged_bytes = 0;
+        newer.covered = [false; INPUT_KIND_COUNT];
+
+        for (key, (old, new)) in newer_entries {
+            if self.covered[key.kind().index()] {
+                continue;
+            }
+            if let Some(entry) = self.entries.get_mut(&key) {
+                if entry.0 == new {
+                    self.entries.remove(&key);
+                    counters.bump(Counter::JournalCancellations);
+                } else {
+                    entry.1 = new;
+                }
+                continue;
+            }
+            if old == new || !self.make_room_for_one(key.kind(), memory, counters) {
+                continue;
+            }
+            self.entries.insert(key, (old, new));
+            self.settle(memory, counters);
+        }
+        self.settle(memory, counters);
+    }
+
     #[must_use]
     pub fn contains_only_element_style_inputs(&self) -> bool {
         self.markers.is_empty()
@@ -354594,6 +355153,48 @@ mod tests {
     }
 
     #[test]
+    fn absorbing_a_newer_journal_accepts_non_local_inputs() {
+        let mut fixture = JournalFixture::new();
+        fixture.class(1, 10, false, true);
+
+        let mut newer = NormalizationJournal::new();
+        newer.record(
+            InputKey::ElementStyleInput(StyleNodeID::element(1)),
+            InputValue::ElementStyleInput {
+                reaction: 0,
+                inherited_style_groups: 0,
+            },
+            InputValue::ElementStyleInput {
+                reaction: STYLE_REACTION_RECOMPUTE_STYLE,
+                inherited_style_groups: 0,
+            },
+            &mut fixture.memory,
+            &mut fixture.counters,
+        );
+
+        fixture
+            .journal
+            .absorb_newer(&mut newer, &mut fixture.memory, &mut fixture.counters);
+        assert!(newer.is_empty());
+
+        let transaction = fixture.take();
+        assert_eq!(transaction.inputs.len(), 2);
+        assert!(
+            transaction
+                .inputs
+                .iter()
+                .any(|input| matches!(input.key, InputKey::LocalFeature(..)))
+        );
+        assert!(
+            transaction
+                .inputs
+                .iter()
+                .any(|input| matches!(input.key, InputKey::ElementStyleInput(..)))
+        );
+        transaction.release(&mut fixture.memory);
+    }
+
+    #[test]
     fn repeated_declaration_edits_retain_only_the_old_and_final_blocks() {
         let mut fixture = JournalFixture::new();
         let key = InputKey::ElementDeclaration(StyleNodeID::element(1), ElementDeclarationKind::InlineStyle);
@@ -355022,6 +355623,33 @@ pub(super) struct TreeRelationStaging {
 type StagedTreeRows = Vec<(StyleNodeID, Option<TreeRelations>, Option<TreeRelations>)>;
 type StagedFirstChildren = Vec<(StyleNodeID, Option<StyleNodeID>, Option<StyleNodeID>)>;
 
+fn radix_sort_style_node_ids(mut nodes: Vec<StyleNodeID>) -> Vec<StyleNodeID> {
+    if nodes.len() < 2 {
+        return nodes;
+    }
+    let mut scratch = vec![nodes[0]; nodes.len()];
+    let significant_bits = u32::BITS - nodes.iter().map(|node| node.raw()).max().unwrap().leading_zeros();
+    for shift in (0..significant_bits).step_by(u8::BITS as usize) {
+        let mut offsets = [0_usize; 1 << u8::BITS];
+        for node in &nodes {
+            offsets[((node.raw() >> shift) & u8::MAX as u32) as usize] += 1;
+        }
+        let mut offset = 0;
+        for count in &mut offsets {
+            let next_offset = offset + *count;
+            *count = offset;
+            offset = next_offset;
+        }
+        for &node in &nodes {
+            let bucket = ((node.raw() >> shift) & u8::MAX as u32) as usize;
+            scratch[offsets[bucket]] = node;
+            offsets[bucket] += 1;
+        }
+        std::mem::swap(&mut nodes, &mut scratch);
+    }
+    nodes
+}
+
 impl TreeRelationStaging {
     pub(super) fn is_empty(&self) -> bool {
         self.touched_rows.is_empty() && self.touched_first_children.is_empty()
@@ -355118,17 +355746,13 @@ impl TreeRelationStaging {
     }
 
     pub(super) fn dirty_rows(&self) -> StagedTreeRows {
-        let mut rows: StagedTreeRows = self
-            .dirty_rows
-            .iter()
-            .copied()
+        radix_sort_style_node_ids(self.dirty_rows.clone())
+            .into_iter()
             .map(|node| {
                 let pair = self.rows.get(node).expect("dirty tree row must be staged");
                 (node, pair.before, pair.after)
             })
-            .collect();
-        rows.sort_unstable_by_key(|&(node, _, _)| node);
-        rows
+            .collect()
     }
 
     pub(super) fn dirty_first_children(&self) -> StagedFirstChildren {
@@ -355910,6 +356534,30 @@ impl Iterator for Preorder<'_> {
 mod tests {
     use super::super::memory::DeviceClass;
     use super::*;
+
+    #[test]
+    fn radix_sorts_style_node_identities() {
+        let mut nodes = vec![
+            StyleNodeID::element(u32::MAX),
+            StyleNodeID::element(256),
+            StyleNodeID::element(65_536),
+            StyleNodeID::element(255),
+            StyleNodeID::element(1),
+        ];
+
+        nodes = radix_sort_style_node_ids(nodes);
+
+        assert_eq!(
+            nodes,
+            vec![
+                StyleNodeID::element(1),
+                StyleNodeID::element(255),
+                StyleNodeID::element(256),
+                StyleNodeID::element(65_536),
+                StyleNodeID::element(u32::MAX),
+            ]
+        );
+    }
 
     #[test]
     fn tree_staging_keeps_exact_before_and_after_rows_across_apply() {
@@ -422949,7 +423597,12 @@ FILE: Libraries/LibWeb/Rust/StyleEngineBoundary.json
     [79, "PrepareSelectorQuery"],
     [80, "AddCounterStyleRule"],
     [81, "AttributeValueTextRequirementsVersion"],
-    [82, "AttributeNameRequiresValueText"]
+    [82, "AttributeNameRequiresValueText"],
+    [83, "PendingTransactionMayAffectLayoutGeometry"],
+    [84, "DeferPendingTransactionForGeometryRead"],
+    [85, "BeginDeferredGeometryTransactionFlush"],
+    [86, "EndDeferredGeometryTransactionFlush"],
+    [87, "HasDeferredGeometryTransaction"]
   ],
   "operations": [
     { "event": "SetFoldIdAndClassNameCase", "ffi": "style_engine_set_fold_id_and_class_name_case", "cpp": "set_fold_id_and_class_name_case", "return": "void", "args": [["fold", "bool"]], "body": "engine.set_fold_id_and_class_name_case(fold);" },
@@ -422971,6 +423624,11 @@ FILE: Libraries/LibWeb/Rust/StyleEngineBoundary.json
     { "event": "SetElementCustomStates", "ffi": "style_engine_set_element_custom_states", "cpp": "set_element_custom_states", "return": "void", "args": [["node", "style_node"], ["states", "style_atom_slice"]], "body": "let Some(node) = StyleNodeID::from_raw(node) else { return; }; let states = states.iter().copied().map(StyleAtomID).collect::<Vec<_>>(); engine.set_element_custom_states(node, &states);" },
     { "event": "ConnectedElementCount", "ffi": "style_engine_connected_element_count", "cpp": "connected_element_count", "return": "u32", "receiver": "const", "args": [], "body": "let result = engine.connected_element_count();" },
     { "event": "HasPendingTransaction", "ffi": "style_engine_has_pending_transaction", "return": "bool", "receiver": "const", "args": [], "body": "let result = engine.has_pending_transaction();" },
+    { "event": "PendingTransactionMayAffectLayoutGeometry", "ffi": "style_engine_pending_transaction_may_affect_layout_geometry", "return": "bool", "receiver": "const", "replay": false, "args": [], "body": "let result = engine.pending_transaction_may_affect_layout_geometry();" },
+    { "event": "DeferPendingTransactionForGeometryRead", "ffi": "style_engine_defer_pending_transaction_for_geometry_read", "return": "bool", "replay": false, "args": [], "body": "let result = engine.defer_pending_transaction_for_geometry_read();" },
+    { "event": "BeginDeferredGeometryTransactionFlush", "ffi": "style_engine_begin_deferred_geometry_transaction_flush", "return": "bool", "replay": false, "args": [], "body": "let result = engine.begin_deferred_geometry_transaction_flush();" },
+    { "event": "EndDeferredGeometryTransactionFlush", "ffi": "style_engine_end_deferred_geometry_transaction_flush", "return": "void", "replay": false, "args": [], "body": "engine.end_deferred_geometry_transaction_flush();" },
+    { "event": "HasDeferredGeometryTransaction", "ffi": "style_engine_has_deferred_geometry_transaction", "return": "bool", "receiver": "const", "replay": false, "args": [], "body": "let result = engine.has_deferred_geometry_transaction();" },
     { "event": "MatchDocument", "ffi": "style_engine_match_document", "cpp": "match_document", "return": "usize_u64", "replay": false, "args": [["root", "style_node"]], "body": "let Some(root) = StyleNodeID::from_raw(root) else { return usize::MAX; }; let result = engine.match_document(root).unwrap_or(usize::MAX);" },
     { "event": "BeginColdMatchingBatch", "ffi": "style_engine_begin_cold_matching_batch", "cpp": "begin_cold_matching_batch", "return": "bool", "replay": false, "args": [["root", "style_node"]], "body": "let Some(root) = StyleNodeID::from_raw(root) else { return false; }; let result = engine.begin_cold_matching_batch(root);" },
     { "event": "BeginAdaptiveColdMatchingBatch", "ffi": "style_engine_begin_adaptive_cold_matching_batch", "cpp": "begin_adaptive_cold_matching_batch", "return": "void", "replay": false, "args": [["root", "style_node"]], "body": "let Some(root) = StyleNodeID::from_raw(root) else { return; }; engine.begin_adaptive_cold_matching_batch(root);" },
@@ -451842,6 +452500,9 @@ public:
 
     float visible_stroke_width() const
     {
+        // NB: CSS geometry-effect metadata relies on this reading only stroke color and width.
+        //     If SVG bounds begin accounting for caps, joins, miter limits, or stroke opacity,
+        //     mark those properties as affecting layout geometry as well.
         if (auto color = stroke_color(); color.has_value() && color->alpha() > 0)
             return stroke_width().value_or(0);
         return 0;
@@ -620901,691 +621562,4 @@ WebUIConnection::~WebUIConnection()
 
     (void)m_document->relevant_settings_object().realm().global_object().internal_delete(ladybird_property());
 }
-
-void WebUIConnection::visit_edges(JS::Cell::Visitor& visitor)
-{
-    visitor.visit(m_document);
-}
-
-void WebUIConnection::send_message(String name, JsonValue data)
-{
-    if (!m_document->browsing_context())
-        return;
-
-    JsonObject detail;
-    detail.set("name"sv, move(name));
-    detail.set("data"sv, move(data));
-
-    auto& realm = m_document->relevant_settings_object().realm();
-    Web::HTML::TemporaryExecutionContext context { realm };
-
-    auto serialized_detail = Web::WebDriver::json_deserialize(*m_document->browsing_context(), detail);
-    if (serialized_detail.is_error()) {
-        warnln("Unable to serialize JSON data from browser: {}", serialized_detail.error());
-        return;
-    }
-
-    Web::DOM::CustomEventInit event_init {};
-    event_init.detail = serialized_detail.value();
-
-    m_document->dispatch_event(Web::DOM::CustomEvent::create(realm.global_object(), web_ui_message_event(), event_init));
-}
-
-void WebUIConnection::received_message_from_web_ui(Utf16String const& name, JS::Value data)
-{
-    if (!m_document->browsing_context())
-        return;
-
-    auto deserialized_data = Web::WebDriver::json_clone(*m_document->browsing_context(), data);
-    if (deserialized_data.is_error()) {
-        warnln("Unable to deserialize JS data from WebUI: {}", deserialized_data.error());
-        return;
-    }
-
-    async_received_message(name.to_utf8(), deserialized_data.value());
-}
-
-}
-
-FILE: Services/WebContent/WebUIConnection.h
-/*
- * Copyright (c) 2025, Tim Flynn <trflynn89@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/JsonValue.h>
-#include <AK/NonnullRefPtr.h>
-#include <AK/Utf16String.h>
-#include <LibGC/Ptr.h>
-#include <LibIPC/ConnectionFromClient.h>
-#include <LibIPC/Transport.h>
-#include <LibIPC/TransportHandle.h>
-#include <LibJS/Heap/Cell.h>
-#include <LibWeb/Forward.h>
-#include <WebContent/WebUIClientEndpoint.h>
-#include <WebContent/WebUIServerEndpoint.h>
-
-namespace WebContent {
-
-class WebUIConnection final : public IPC::ConnectionFromClient<WebUIClientEndpoint, WebUIServerEndpoint> {
-public:
-    static ErrorOr<NonnullRefPtr<WebUIConnection>> connect(IPC::TransportHandle, Web::DOM::Document&);
-    virtual ~WebUIConnection() override;
-
-    void visit_edges(JS::Cell::Visitor&);
-
-    void received_message_from_web_ui(Utf16String const& name, JS::Value data);
-
-    Web::DOM::Document const& document() const { return m_document; }
-
-private:
-    WebUIConnection(NonnullOwnPtr<IPC::Transport>, Web::DOM::Document&);
-
-    virtual void die() override { }
-    virtual void send_message(String name, JsonValue data) override;
-
-    GC::Ref<Web::DOM::Document> m_document;
-};
-
-}
-
-FILE: Services/WebContent/WebUIServer.ipc
-endpoint WebUIServer {
-    send_message(String name, JsonValue data) =|
-}
-
-FILE: Services/WebDriver/BrowserConnection.cpp
-/*
- * Copyright (c) 2026, Shannon Booth <shannon@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <WebDriver/BrowserConnection.h>
-
-namespace WebDriver {
-
-BrowserConnection::BrowserConnection(NonnullOwnPtr<IPC::Transport> transport)
-    : IPC::ConnectionFromClient<WebDriverBrowserClientEndpoint, WebDriverBrowserServerEndpoint>(*this, move(transport), 1)
-{
-}
-
-void BrowserConnection::die()
-{
-    auto protector = NonnullRefPtr { *this };
-
-    if (on_close)
-        on_close();
-}
-
-void BrowserConnection::did_create_window(String handle)
-{
-    if (on_did_create_window)
-        on_did_create_window(move(handle));
-}
-
-void BrowserConnection::did_close_window(String handle)
-{
-    if (on_did_close_window)
-        on_did_close_window(move(handle));
-}
-
-void BrowserConnection::command_complete(u64 command_id, Web::WebDriver::Response response)
-{
-    if (on_command_complete)
-        on_command_complete(command_id, move(response));
-}
-
-}
-
-FILE: Services/WebDriver/BrowserConnection.h
-/*
- * Copyright (c) 2026, Shannon Booth <shannon@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/Function.h>
-#include <LibIPC/ConnectionFromClient.h>
-#include <LibIPC/Transport.h>
-#include <LibWeb/WebDriver/Response.h>
-#include <WebDriver/WebDriverBrowserClientEndpoint.h>
-#include <WebDriver/WebDriverBrowserServerEndpoint.h>
-
-namespace WebDriver {
-
-class BrowserConnection
-    : public IPC::ConnectionFromClient<WebDriverBrowserClientEndpoint, WebDriverBrowserServerEndpoint> {
-    C_OBJECT_ABSTRACT(BrowserConnection)
-public:
-    explicit BrowserConnection(NonnullOwnPtr<IPC::Transport>);
-
-    Function<void()> on_close;
-    Function<void(String)> on_did_create_window;
-    Function<void(String)> on_did_close_window;
-    Function<void(u64, Web::WebDriver::Response)> on_command_complete;
-
-private:
-    virtual void die() override;
-
-    virtual void did_create_window(String) override;
-    virtual void did_close_window(String) override;
-    virtual void command_complete(u64 command_id, Web::WebDriver::Response) override;
-};
-
-}
-
-FILE: Services/WebDriver/Client.cpp
-/*
- * Copyright (c) 2022, Florent Castelli <florent.castelli@gmail.com>
- * Copyright (c) 2022, Sam Atkins <atkinssj@serenityos.org>
- * Copyright (c) 2022, Tobias Christiansen <tobyase@serenityos.org>
- * Copyright (c) 2022, Linus Groh <linusg@serenityos.org>
- * Copyright (c) 2022-2025, Tim Flynn <trflynn89@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <AK/Debug.h>
-#include <AK/JsonObject.h>
-#include <AK/JsonValue.h>
-#include <LibCore/EventLoop.h>
-#include <LibCore/Timer.h>
-#include <LibURL/Parser.h>
-#include <LibWeb/WebDriver/Capabilities.h>
-#include <LibWeb/WebDriver/Error.h>
-#include <LibWeb/WebDriver/UserPrompt.h>
-#include <WebDriver/Client.h>
-#include <WebDriver/Session.h>
-
-// Failures become rejected WebDriverPromises rather than propagated ErrorOr values, so this macro may only be used in
-// functions returning ResponsePromise, not in void-returning callbacks or continuations. Expansions require the
-// WebDriverPromise alias to be visible within namespace WebDriver.
-#define WEBDRIVER_TRY(expression)                                                                    \
-    ({                                                                                               \
-        /* Ignore -Wshadow to allow nesting the macro. */                                            \
-        AK_IGNORE_DIAGNOSTIC("-Wshadow",                                                             \
-            auto&& _temporary_result = (expression));                                                \
-        static_assert(!::AK::Detail::IsLvalueReference<decltype(_temporary_result.release_value())>, \
-            "Do not return a reference from a fallible expression");                                 \
-        if (_temporary_result.is_error()) [[unlikely]] {                                             \
-            return WebDriverPromise::rejected(_temporary_result.release_error());                    \
-        }                                                                                            \
-        _temporary_result.release_value();                                                           \
-    })
-
-namespace WebDriver {
-
-using ResponsePromise = Web::WebDriver::Client::ResponsePromise;
-using WebDriverPromise = ResponsePromise::ElementType;
-
-static ResponsePromise promise_from_response(Web::WebDriver::Response response)
-{
-    if (response.is_error())
-        return WebDriverPromise::rejected(response.release_error());
-    return WebDriverPromise::resolved(response.release_value());
-}
-
-static ErrorOr<NonnullRefPtr<Session>, Web::WebDriver::Error>
-find_session_with_ladybird_test_hooks(Web::WebDriver::Parameters const& parameters)
-{
-    auto session = TRY(Session::find_session(parameters[0]));
-    if (!session->test_hooks_enabled())
-        return Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::UnknownCommand,
-            "Ladybird test hooks are not enabled for this session"sv);
-    return session;
-}
-
-ErrorOr<NonnullRefPtr<Client>> Client::try_create(NonnullOwnPtr<Core::BufferedTCPSocket> socket, LaunchBrowserCallback launch_browser_callback)
-{
-    if (!launch_browser_callback)
-        return Error::from_string_literal("The callback to launch the browser must be provided");
-
-    TRY(socket->set_blocking(true));
-    return adopt_nonnull_ref_or_enomem(new (nothrow) Client(move(socket), move(launch_browser_callback)));
-}
-
-Client::Client(NonnullOwnPtr<Core::BufferedTCPSocket> socket, LaunchBrowserCallback launch_browser_callback)
-    : Web::WebDriver::Client(move(socket))
-    , m_launch_browser_callback(move(launch_browser_callback))
-{
-}
-
-Client::~Client() = default;
-
-ResponsePromise Client::enqueue_session_request(StringView session_id, SessionRequestHandler handler)
-{
-    auto session = Session::find_session(session_id, Web::WebDriver::SessionFlags::Http, Session::AllowInvalidWindowHandle::Yes);
-    if (session.is_error())
-        return WebDriverPromise::rejected(session.release_error());
-    return session.release_value()->enqueue_http_request(move(handler));
-}
-
-// 8.1 New Session, https://w3c.github.io/webdriver/#dfn-new-sessions
-// POST /session
-ResponsePromise Client::new_session(Web::WebDriver::Parameters, JsonValue payload)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling POST /session");
-
-    // 1. If the implementation is an endpoint node, and the list of active HTTP sessions is not empty, or otherwise if
-    //    the implementation is unable to start an additional session, return error with error code session not created.
-    if (Session::session_count(Web::WebDriver::SessionFlags::Http) > 0 || Session::has_pending_http_session_creation())
-        return promise_from_response(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::SessionNotCreated, "There is already an active HTTP session"sv));
-
-    // FIXME: 2. If the remote end is an intermediary node, take implementation-defined steps that either result in returning
-    //           an error with error code session not created, or in returning a success with data that is isomorphic to that
-    //           returned by remote ends according to the rest of this algorithm. If an error is not returned, the intermediary
-    //           node must retain a reference to the session created on the upstream node as the associated session such that
-    //           commands may be forwarded to this associated session on subsequent commands.
-
-    // 3. Let flags be a set containing "http".
-    static constexpr auto flags = Web::WebDriver::SessionFlags::Http;
-
-    // 4. Let capabilities be the result of trying to process capabilities with parameters and flags.
-    auto capabilities = WEBDRIVER_TRY(Web::WebDriver::process_capabilities(payload, flags));
-
-    // 5. If capabilities's is null, return error with error code session not created.
-    if (capabilities.is_null())
-        return promise_from_response(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::SessionNotCreated, "Could not match capabilities"sv));
-
-    // 6. Let session be the result of create a session, with capabilities, and flags.
-    auto maybe_session_promise = Session::create(*this, move(capabilities), flags);
-    if (maybe_session_promise.is_error())
-        return promise_from_response(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::SessionNotCreated, MUST(String::formatted("Failed to start session: {}", maybe_session_promise.error()))));
-
-    auto promise = WebDriverPromise::construct();
-    auto session_promise = maybe_session_promise.release_value();
-    promise->add_child(session_promise);
-    session_promise->when_resolved([promise](Session::NewSession& new_session) mutable {
-                       // 7. Let body be a JSON Object initialized with:
-                       JsonObject body;
-                       // "sessionId"
-                       //     session's session ID.
-                       body.set("sessionId"sv, JsonValue { new_session.session->session_id() });
-                       // "capabilities"
-                       //     capabilities
-                       body.set("capabilities"sv, move(new_session.capabilities));
-
-                       // 8. Set session' current top-level browsing context to one of the endpoint node's top-level browsing contexts,
-                       //    preferring the top-level browsing context that has system focus, or otherwise preferring any top-level
-                       //    browsing context whose visibility state is visible.
-                       // NOTE: This happens in the WebContent process.
-
-                       // 9. Set the request queue to a new queue.
-                       // NB: The request queue is initialized when the Session is constructed.
-
-                       // 10. Return success with data body.
-                       promise->resolve(JsonValue { move(body) });
-                   })
-        .when_rejected([promise](Web::WebDriver::Error& error) {
-            promise->reject(Web::WebDriver::Error(error));
-        });
-    return promise;
-}
-
-// 8.2 Delete Session, https://w3c.github.io/webdriver/#dfn-delete-session
-// DELETE /session/{session id}
-ResponsePromise Client::delete_session(Web::WebDriver::Parameters parameters, JsonValue)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling DELETE /session/<session_id>");
-
-    // 1. If session is an active HTTP session, try to close the session with session.
-    if (auto session = Session::find_session(parameters[0], Web::WebDriver::SessionFlags::Http, Session::AllowInvalidWindowHandle::Yes); !session.is_error())
-        session.value()->close();
-
-    // 2. Return success with data null.
-    return WebDriverPromise::resolved(JsonValue {});
-}
-
-// https://w3c.github.io/webdriver/#dfn-readiness-state
-static bool readiness_state()
-{
-    // The readiness state of a remote end indicates whether it is free to accept new connections. It must be false if
-    // the implementation is an endpoint node and the list of active HTTP sessions is not empty, or otherwise if the
-    // remote end is known to be in a state in which attempting to create new sessions would fail. In all other cases it
-    // must be true.
-    return Session::session_count(Web::WebDriver::SessionFlags::Http) == 0 && !Session::has_pending_http_session_creation();
-}
-
-// 8.3 Status, https://w3c.github.io/webdriver/#dfn-status
-// GET /status
-ResponsePromise Client::get_status(Web::WebDriver::Parameters, JsonValue)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling GET /status");
-
-    auto readiness_state = WebDriver::readiness_state();
-
-    // 1. Let body be a new JSON Object with the following properties:
-    //    "ready"
-    //        The remote end's readiness state.
-    //    "message"
-    //        An implementation-defined string explaining the remote end's readiness state.
-    JsonObject body;
-    body.set("ready"sv, readiness_state);
-    body.set("message"sv, MUST(String::formatted("{} to accept a new session", readiness_state ? "Ready"sv : "Not ready"sv)));
-
-    // 2. Return success with data body.
-    return WebDriverPromise::resolved(JsonValue { body });
-}
-
-// 9.1 Get Timeouts, https://w3c.github.io/webdriver/#dfn-get-timeouts
-// GET /session/{session id}/timeouts
-ResponsePromise Client::get_timeouts(Web::WebDriver::Parameters parameters, JsonValue)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling GET /session/<session id>/timeouts");
-    auto session = WEBDRIVER_TRY(Session::find_session(parameters[0]));
-    return promise_from_response(session->get_timeouts());
-}
-
-// 9.2 Set Timeouts, https://w3c.github.io/webdriver/#dfn-set-timeouts
-// POST /session/{session id}/timeouts
-ResponsePromise Client::set_timeouts(Web::WebDriver::Parameters parameters, JsonValue payload)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling POST /session/<session id>/timeouts");
-    auto session = WEBDRIVER_TRY(Session::find_session(parameters[0]));
-    return promise_from_response(session->set_timeouts(move(payload)));
-}
-
-// 10.1 Navigate To, https://w3c.github.io/webdriver/#dfn-navigate-to
-// POST /session/{session id}/url
-ResponsePromise Client::navigate_to(Web::WebDriver::Parameters parameters, JsonValue payload)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling POST /session/<session_id>/url");
-    auto session = WEBDRIVER_TRY(Session::find_session(parameters[0]));
-
-    // 2. Let url be the result of getting the property url from the parameters argument.
-    if (!payload.is_object() || !payload.as_object().has_string("url"sv))
-        return promise_from_response(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::InvalidArgument, "Payload doesn't have a string `url`"sv));
-    auto url = URL::Parser::basic_parse(payload.as_object().get_string("url"sv).value());
-    if (!url.has_value())
-        return promise_from_response(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::InvalidArgument, "Payload has an invalid `url`"sv));
-
-    // FIXME: 3. If url is not an absolute URL or is not an absolute URL with fragment or not a local scheme, return error with error code invalid argument.
-
-    return session->navigate_to(url.release_value());
-}
-
-// 10.2 Get Current URL, https://w3c.github.io/webdriver/#dfn-get-current-url
-// GET /session/{session id}/url
-ResponsePromise Client::get_current_url(Web::WebDriver::Parameters parameters, JsonValue)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling GET /session/<session_id>/url");
-    auto session = WEBDRIVER_TRY(Session::find_session(parameters[0]));
-
-    return session->run_content_command("get_current_url"sv);
-}
-
-// 10.3 Back, https://w3c.github.io/webdriver/#dfn-back
-// POST /session/{session id}/back
-ResponsePromise Client::back(Web::WebDriver::Parameters parameters, JsonValue)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling POST /session/<session_id>/back");
-    auto session = WEBDRIVER_TRY(Session::find_session(parameters[0]));
-
-    return continue_with_promise(session->traverse_history(-1, Session::HandleUserPrompts::Yes), [session] {
-        return session->wait_for_navigation_completion();
-    });
-}
-
-// 10.4 Forward, https://w3c.github.io/webdriver/#dfn-forward
-// POST /session/{session id}/forward
-ResponsePromise Client::forward(Web::WebDriver::Parameters parameters, JsonValue)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling POST /session/<session_id>/forward");
-    auto session = WEBDRIVER_TRY(Session::find_session(parameters[0]));
-
-    return continue_with_promise(session->traverse_history(1, Session::HandleUserPrompts::Yes), [session] {
-        return session->wait_for_navigation_completion();
-    });
-}
-
-// 10.5 Refresh, https://w3c.github.io/webdriver/#dfn-refresh
-// POST /session/{session id}/refresh
-ResponsePromise Client::refresh(Web::WebDriver::Parameters parameters, JsonValue)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling POST /session/<session_id>/refresh");
-    auto session = WEBDRIVER_TRY(Session::find_session(parameters[0]));
-
-    return session->refresh();
-}
-
-// 10.6 Get Title, https://w3c.github.io/webdriver/#dfn-get-title
-// GET /session/{session id}/title
-ResponsePromise Client::get_title(Web::WebDriver::Parameters parameters, JsonValue)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling GET /session/<session_id>/title");
-    auto session = WEBDRIVER_TRY(Session::find_session(parameters[0]));
-
-    return session->run_content_command("get_title"sv);
-}
-
-// Extension: POST /session/{session id}/ladybird/crash-current-page
-ResponsePromise Client::crash_current_page(Web::WebDriver::Parameters parameters, JsonValue payload)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling POST /session/<session_id>/ladybird/crash-current-page");
-    auto session = WEBDRIVER_TRY(find_session_with_ladybird_test_hooks(parameters));
-
-    auto wait_for_navigation_completion = true;
-    if (payload.is_object())
-        wait_for_navigation_completion = payload.as_object().get_bool("waitForNavigationCompletion"sv).value_or(true);
-
-    auto crash_promise = session->run_content_command("crash_current_page"sv);
-    if (!wait_for_navigation_completion)
-        return crash_promise;
-
-    return continue_with_promise(move(crash_promise), [session] {
-        return session->wait_for_navigation_completion();
-    });
-}
-
-// Extension: POST /session/{session id}/ladybird/load-url-from-ui
-ResponsePromise Client::load_url_from_ui(Web::WebDriver::Parameters parameters, JsonValue payload)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling POST /session/<session_id>/ladybird/load-url-from-ui");
-    auto session = WEBDRIVER_TRY(find_session_with_ladybird_test_hooks(parameters));
-
-    if (!payload.is_object() || !payload.as_object().has_string("url"sv))
-        return promise_from_response(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::InvalidArgument, "Payload doesn't have a string `url`"sv));
-    auto url = URL::Parser::basic_parse(payload.as_object().get_string("url"sv).value());
-    if (!url.has_value())
-        return promise_from_response(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::InvalidArgument, "Payload has an invalid `url`"sv));
-
-    return continue_with_promise(session->load_url(url.release_value()), [session] {
-        return session->wait_for_navigation_completion();
-    });
-}
-
-// Extension: POST /session/{session id}/ladybird/traverse-history-from-ui
-ResponsePromise Client::traverse_history_from_ui(Web::WebDriver::Parameters parameters, JsonValue payload)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling POST /session/<session_id>/ladybird/traverse-history-from-ui");
-    auto session = WEBDRIVER_TRY(find_session_with_ladybird_test_hooks(parameters));
-
-    auto wait_for_navigation_completion = true;
-    if (payload.is_object())
-        wait_for_navigation_completion = payload.as_object().get_bool("waitForNavigationCompletion"sv).value_or(true);
-
-    if (!payload.is_object() || !payload.as_object().has_i32("delta"sv))
-        return promise_from_response(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::InvalidArgument, "Payload doesn't have an integer `delta`"sv));
-
-    auto traversal_promise = session->traverse_history(payload.as_object().get_i32("delta"sv).value(), Session::HandleUserPrompts::No);
-
-    if (!wait_for_navigation_completion)
-        return traversal_promise;
-
-    return continue_with_promise(move(traversal_promise), [session] {
-        return session->wait_for_navigation_completion();
-    });
-}
-
-// Extension: GET /session/{session id}/ladybird/session-history
-ResponsePromise Client::get_session_history(Web::WebDriver::Parameters parameters, JsonValue)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling GET /session/<session_id>/ladybird/session-history");
-    auto session = WEBDRIVER_TRY(find_session_with_ladybird_test_hooks(parameters));
-
-    return session->session_history();
-}
-
-// 11.1 Get Window Handle, https://w3c.github.io/webdriver/#get-window-handle
-// GET /session/{session id}/window
-ResponsePromise Client::get_window_handle(Web::WebDriver::Parameters parameters, JsonValue)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling GET /session/<session_id>/window");
-    auto session = WEBDRIVER_TRY(Session::find_session(parameters[0]));
-
-    // 1. If the current top-level browsing context is no longer open, return error with error code no such window.
-    auto promise = WebDriverPromise::construct();
-    auto ensure_open_promise = session->run_content_command("ensure_top_level_browsing_context_is_open"sv);
-    promise->add_child(ensure_open_promise);
-    ensure_open_promise->when_resolved([session, promise](JsonValue&) {
-                           // 2. Return success with data being the window handle associated with the current top-level browsing context.
-                           promise->resolve(JsonValue { session->current_window_handle() });
-                       })
-        .when_rejected([promise](Web::WebDriver::Error& error) {
-            promise->reject(Web::WebDriver::Error(error));
-        });
-    return promise;
-}
-
-// 11.2 Close Window, https://w3c.github.io/webdriver/#dfn-close-window
-// DELETE /session/{session id}/window
-ResponsePromise Client::close_window(Web::WebDriver::Parameters parameters, JsonValue)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling DELETE /session/<session_id>/window");
-    auto session = WEBDRIVER_TRY(Session::find_session(parameters[0]));
-    return session->close_window();
-}
-
-// 11.3 Switch to Window, https://w3c.github.io/webdriver/#dfn-switch-to-window
-// POST /session/{session id}/window
-ResponsePromise Client::switch_to_window(Web::WebDriver::Parameters parameters, AK::JsonValue payload)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling POST /session/<session_id>/window");
-    auto session = WEBDRIVER_TRY(Session::find_session(parameters[0], Web::WebDriver::SessionFlags::Default, Session::AllowInvalidWindowHandle::Yes));
-
-    if (!payload.is_object())
-        return promise_from_response(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::InvalidArgument, "Payload is not a JSON object"sv));
-
-    // 1. Let handle be the result of getting the property "handle" from the parameters argument.
-    auto handle = payload.as_object().get("handle"sv);
-
-    // 2. If handle is undefined, return error with error code invalid argument.
-    if (!handle.has_value())
-        return promise_from_response(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::InvalidArgument, "No property called 'handle' present"sv));
-    if (!handle->is_string())
-        return promise_from_response(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::InvalidArgument, "Property 'handle' is not a string"sv));
-
-    return session->switch_to_window(handle->as_string());
-}
-
-// 11.4 Get Window Handles, https://w3c.github.io/webdriver/#dfn-get-window-handles
-// GET /session/{session id}/window/handles
-ResponsePromise Client::get_window_handles(Web::WebDriver::Parameters parameters, JsonValue)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling GET /session/<session_id>/window/handles");
-    auto session = WEBDRIVER_TRY(Session::find_session(parameters[0], Web::WebDriver::SessionFlags::Default, Session::AllowInvalidWindowHandle::Yes));
-    return promise_from_response(session->get_window_handles());
-}
-
-// 11.5 New Window, https://w3c.github.io/webdriver/#dfn-new-window
-// POST /session/{session id}/window/new
-ResponsePromise Client::new_window(Web::WebDriver::Parameters parameters, JsonValue payload)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling POST /session/<session_id>/window/new");
-    auto session = WEBDRIVER_TRY(Session::find_session(parameters[0]));
-
-    auto promise = WebDriverPromise::construct();
-    auto new_window_promise = session->run_content_command("new_window"sv, move(payload));
-    promise->add_child(new_window_promise);
-    new_window_promise->when_resolved([promise, session](JsonValue& handle_value) {
-                          if (!handle_value.is_object()) {
-                              promise->reject(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::UnknownError, "New Window response is not a JSON object"sv));
-                              return;
-                          }
-
-                          auto handle_member = handle_value.as_object().get("handle"sv);
-                          if (!handle_member.has_value() || !handle_member->is_string()) {
-                              promise->reject(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::UnknownError, "New Window response does not contain a string 'handle' property"sv));
-                              return;
-                          }
-
-                          auto handle = handle_member->as_string();
-                          if (session->has_window_handle(handle)) {
-                              promise->resolve(handle_value);
-                              return;
-                          }
-
-                          static constexpr u32 CONNECTION_TIMEOUT_MS = 5000;
-                          struct WaitState : public RefCounted<WaitState> {
-                              Session::WindowHandleBecameAvailableCallbackID callback_id { 0 };
-                              RefPtr<Core::Timer> timer;
-                              bool settled { false };
-                          };
-                          auto wait_state = adopt_ref(*new WaitState);
-                          wait_state->timer = Core::Timer::create_single_shot(CONNECTION_TIMEOUT_MS, [promise, session, handle, wait_state] {
-                              if (wait_state->settled)
-                                  return;
-                              wait_state->settled = true;
-                              Core::deferred_invoke([session, handle, wait_state] {
-                                  session->remove_window_handle_became_available_callback(handle, wait_state->callback_id);
-                                  wait_state->timer = nullptr;
-                              });
-                              promise->reject(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::Timeout, "Timed out waiting for window handle"sv));
-                          });
-
-                          auto handle_response = handle_value;
-                          wait_state->callback_id = session->add_window_handle_became_available_callback(handle, [promise, handle_response = move(handle_response), wait_state]() mutable {
-                              if (wait_state->settled)
-                                  return;
-                              auto timer = move(wait_state->timer);
-                              wait_state->settled = true;
-                              if (timer)
-                                  timer->stop();
-                              promise->resolve(move(handle_response)); }, [promise, wait_state] {
-                              if (wait_state->settled)
-                                  return;
-                              wait_state->settled = true;
-                              if (auto timer = move(wait_state->timer))
-                                  timer->stop();
-                              promise->reject(Web::WebDriver::Error::from_code(Web::WebDriver::ErrorCode::UnknownError, "Browser connection lost"sv)); });
-                          wait_state->timer->start();
-                      })
-        .when_rejected([promise](Web::WebDriver::Error& error) {
-            promise->reject(Web::WebDriver::Error(error));
-        });
-    return promise;
-}
-
-// 11.6 Switch To Frame, https://w3c.github.io/webdriver/#dfn-switch-to-frame
-// POST /session/{session id}/frame
-ResponsePromise Client::switch_to_frame(Web::WebDriver::Parameters parameters, JsonValue payload)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling POST /session/<session_id>/frame");
-    auto session = WEBDRIVER_TRY(Session::find_session(parameters[0]));
-
-    return session->run_content_command("switch_to_frame"sv, move(payload));
-}
-
-// 11.7 Switch To Parent Frame, https://w3c.github.io/webdriver/#dfn-switch-to-parent-frame
-// POST /session/{session id}/frame/parent
-ResponsePromise Client::switch_to_parent_frame(Web::WebDriver::Parameters parameters, JsonValue payload)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling POST /session/<session_id>/frame/parent");
-    auto session = WEBDRIVER_TRY(Session::find_session(parameters[0]));
-
-    return session->run_content_command("switch_to_parent_frame"sv, move(payload));
-}
-
-// 11.8.1 Get Window Rect, https://w3c.github.io/webdriver/#dfn-get-window-rect
-// GET /session/{session id}/window/rect
-ResponsePromise Client::get_window_rect(Web::WebDriver::Parameters parameters, JsonValue)
-{
-    dbgln_if(WEBDRIVER_DEBUG, "Handling GET /session/<session_id>/window/rect");
-    auto session = WEBDRIVER_TRY(Session::find_session(parameters[0]));
 
