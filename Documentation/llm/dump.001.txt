@@ -44468,6 +44468,24 @@ ErrorOr<ByteString> Utf16View::to_byte_string(AllowLonelySurrogates allow_lonely
     return TRY(to_utf8(allow_lonely_surrogates)).to_byte_string();
 }
 
+Optional<size_t> Utf16View::to_utf8_with_replacement_into(Bytes output) const
+{
+    if (has_ascii_storage()) {
+        if (output.size() < bytes().size())
+            return {};
+        return bytes().copy_to(output);
+    }
+
+    auto utf16 = utf16_span();
+    auto utf8_length = simdutf::utf8_length_from_utf16_with_replacement(utf16.data(), utf16.size()).count;
+    if (output.size() < utf8_length)
+        return {};
+
+    auto bytes_written = simdutf::convert_utf16_to_utf8_with_replacement(utf16.data(), utf16.size(), reinterpret_cast<char*>(output.data()));
+    VERIFY(bytes_written == utf8_length);
+    return bytes_written;
+}
+
 Utf16String Utf16View::to_ascii_lowercase() const
 {
     Utf16StringBuilder builder(length_in_code_units());
@@ -44935,6 +44953,7 @@ public:
 
     ErrorOr<String> to_utf8(AllowLonelySurrogates = AllowLonelySurrogates::Yes) const;
     ErrorOr<ByteString> to_byte_string(AllowLonelySurrogates = AllowLonelySurrogates::Yes) const;
+    [[nodiscard]] Optional<size_t> to_utf8_with_replacement_into(Bytes output) const;
 
     ALWAYS_INLINE String to_utf8_but_should_be_ported_to_utf16(AllowLonelySurrogates allow_lonely_surrogates = AllowLonelySurrogates::Yes) const
     {
@@ -106084,6 +106103,7 @@ FILE: Libraries/LibGC/BlockAllocator.cpp
 #include <LibCore/System.h>
 #include <LibGC/BlockAllocator.h>
 #include <LibGC/HeapBlock.h>
+#include <LibGC/HeapRegion.h>
 #include <LibThreading/Thread.h>
 #include <sys/mman.h>
 
@@ -106099,6 +106119,10 @@ FILE: Libraries/LibGC/BlockAllocator.cpp
 #    include <sched.h>
 #    include <unistd.h>
 #endif
+
+extern "C" {
+GC_API FlatPtr js_heap_region_base = 0;
+}
 
 namespace GC {
 
@@ -106116,18 +106140,37 @@ static_assert(BLOCKS_PER_CHUNK == 128);
 
 class HeapRegion {
 public:
-    static constexpr size_t size = 4ull * TiB;
+    static constexpr size_t size = HEAP_REGION_SIZE;
 
     HeapRegion()
     {
         static_assert(sizeof(FlatPtr) >= sizeof(u64));
         Checked<size_t> reservation_size = size;
-        reservation_size += HeapBlock::BLOCK_SIZE;
+        reservation_size += size;
         VERIFY(!reservation_size.has_overflow());
 
         auto* reservation = MUST(Core::System::reserve_address_space(reservation_size.value()));
-        m_base = reinterpret_cast<u8*>(align_up_to(reinterpret_cast<FlatPtr>(reservation), HeapBlock::BLOCK_SIZE));
-        VERIFY(reinterpret_cast<FlatPtr>(m_base) % HeapBlock::BLOCK_SIZE == 0);
+        auto reservation_start = reinterpret_cast<FlatPtr>(reservation);
+        auto aligned_start = align_up_to(reservation_start, size);
+        auto reservation_end = reservation_start + reservation_size.value();
+        auto head_size = aligned_start - reservation_start;
+        auto tail_size = reservation_end - (aligned_start + size);
+
+#if !defined(AK_OS_WINDOWS)
+        if (head_size != 0)
+            MUST(Core::System::release_address_space(reservation, head_size));
+        if (tail_size != 0)
+            MUST(Core::System::release_address_space(reinterpret_cast<void*>(aligned_start + size), tail_size));
+#else
+        // VirtualFree with MEM_RELEASE can only release the complete
+        // reservation, so keep the inaccessible head and tail on Windows.
+        (void)head_size;
+        (void)tail_size;
+#endif
+
+        m_base = reinterpret_cast<u8*>(aligned_start);
+        VERIFY(reinterpret_cast<FlatPtr>(m_base) % size == 0);
+        js_heap_region_base = reinterpret_cast<FlatPtr>(m_base);
     }
 
     void* allocate_chunk()
@@ -108277,12 +108320,12 @@ void Heap::update_gc_bytes_threshold(size_t live_cell_bytes, size_t live_externa
 
 static void add_possible_value(HashMap<FlatPtr, HeapRoot>& possible_pointers, FlatPtr data, HeapRoot origin, FlatPtr heap_region_start, FlatPtr heap_region_end)
 {
-    // Because NanBoxedValue stores pointers in non-canonical form we have to check if the top bytes
-    // match any pointer-backed tag, in that case we have to extract the pointer to its
-    // canonical form and add that as a possible pointer.
+    // Because NanBoxedValue stores heap offsets in the payload, decode
+    // pointer-backed values relative to the heap region before checking the
+    // resulting address.
     FlatPtr possible_pointer;
     if ((data & SHIFTED_IS_CELL_PATTERN) == SHIFTED_IS_CELL_PATTERN)
-        possible_pointer = NanBoxedValue::extract_pointer_bits(data);
+        possible_pointer = heap_region_start + (data & HEAP_REGION_OFFSET_MASK);
     else
         possible_pointer = data;
     if (possible_pointer < heap_region_start || possible_pointer >= heap_region_end)
@@ -110139,6 +110182,42 @@ GC_DEFINE_ALLOCATOR(HeapHashTable<T>);
 
 }
 
+FILE: Libraries/LibGC/HeapRegion.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Platform.h>
+#include <AK/StdLibExtras.h>
+#include <AK/Types.h>
+#include <LibGC/Export.h>
+
+namespace GC {
+
+#if AK_IS_ARCH_RISCV64()
+// Sv39 provides 256 GiB of user virtual address space after splitting the
+// address space between userspace and the kernel. Keep room for the second
+// region-sized reservation used to align the cage base.
+static constexpr size_t HEAP_REGION_SIZE = 64ull * GiB;
+#elif AK_IS_ARCH_AARCH64() && !defined(AK_OS_MACOS)
+// Some AArch64 systems provide only 39 or 42 bits of user virtual address
+// space. Keep the cage small enough to fit those systems, including the
+// second region-sized reservation used to align its base.
+static constexpr size_t HEAP_REGION_SIZE = 128ull * GiB;
+#else
+static constexpr size_t HEAP_REGION_SIZE = 4ull * TiB;
+#endif
+static_assert(is_power_of_two(HEAP_REGION_SIZE));
+static constexpr size_t HEAP_REGION_OFFSET_MASK = HEAP_REGION_SIZE - 1;
+
+}
+
+extern "C" GC_API FlatPtr js_heap_region_base;
+
 FILE: Libraries/LibGC/HeapRoot.h
 /*
  * Copyright (c) 2023-2025, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
@@ -110343,11 +110422,12 @@ FILE: Libraries/LibGC/NanBoxedValue.h
 #include <AK/BitCast.h>
 #include <AK/Types.h>
 #include <LibGC/Cell.h>
+#include <LibGC/HeapRegion.h>
 
 namespace GC {
 
 static_assert(sizeof(double) == 8);
-static_assert(sizeof(void*) == sizeof(double) || sizeof(void*) == sizeof(u32));
+static_assert(sizeof(void*) == sizeof(u64));
 // To make our Value representation compact we can use the fact that IEEE
 // doubles have a lot (2^52 - 2) of NaN bit patterns. The canonical form being
 // just 0x7FF8000000000000 i.e. sign = 0 exponent is all ones and the top most
@@ -110378,40 +110458,30 @@ static constexpr u64 BASE_TAG = 0x7FF8;
 // and make stack scanning easier we use the sign bit (top most bit) of 1 to
 // signify that it is a pointer backed type.
 static constexpr u64 IS_CELL_BIT = 0x8000 | BASE_TAG;
-// On all current 64-bit systems this code runs pointer actually only use the
-// lowest 6 bytes which fits neatly into our NaN payload with the top two bytes
-// left over for marking it as a NaN and tagging the type.
-// Note that we do need to take care when extracting the pointer value but this
-// is explained in the extract_pointer method.
+// The payload stores an offset from the process-wide heap region base. The
+// region is aligned to its size so masking the offset keeps the decoded
+// pointer inside the region.
 
 static constexpr u64 IS_CELL_PATTERN = 0xFFF8ULL;
 static constexpr u64 TAG_SHIFT = 48;
 static constexpr u64 TAG_EXTRACTION = 0xFFFF000000000000;
+static_assert((HEAP_REGION_OFFSET_MASK & TAG_EXTRACTION) == 0);
 static constexpr u64 SHIFTED_IS_CELL_PATTERN = IS_CELL_PATTERN << TAG_SHIFT;
 
 class GC_API NanBoxedValue {
 public:
     bool is_cell() const { return (m_value.tag & IS_CELL_PATTERN) == IS_CELL_PATTERN; }
 
-    static constexpr FlatPtr extract_pointer_bits(u64 encoded)
+    static FlatPtr encode_pointer_bits(void const* pointer)
     {
-#ifdef AK_ARCH_32_BIT
-        // For 32-bit system the pointer fully fits so we can just return it directly.
-        static_assert(sizeof(void*) == sizeof(u32));
-        return static_cast<FlatPtr>(encoded & 0xffff'ffff);
-#elif ARCH(X86_64) || ARCH(RISCV64)
-        // For x86_64 and riscv64 the top 16 bits should be sign extending the "real" top bit (47th).
-        // So first shift the top 16 bits away then using the right shift it sign extends the top 16 bits.
-        return static_cast<FlatPtr>((static_cast<i64>(encoded << 16)) >> 16);
-#elif ARCH(AARCH64) || ARCH(PPC64) || ARCH(PPC64LE)
-        // For AArch64 the top 16 bits of the pointer should be zero.
-        // For PPC64: all 64 bits can be used for pointers, however on Linux only
-        //            the lower 43 bits are used for user-space addresses, so
-        //            masking off the top 16 bits should match the rest of LibGC.
-        return static_cast<FlatPtr>(encoded & 0xffff'ffff'ffffULL);
-#else
-#    error "Unknown architecture. Don't know whether pointers need to be sign-extended."
-#endif
+        auto pointer_bits = reinterpret_cast<FlatPtr>(pointer);
+        ASSERT((pointer_bits & ~HEAP_REGION_OFFSET_MASK) == js_heap_region_base);
+        return pointer_bits & HEAP_REGION_OFFSET_MASK;
+    }
+
+    static FlatPtr extract_pointer_bits(u64 encoded)
+    {
+        return js_heap_region_base + (encoded & HEAP_REGION_OFFSET_MASK);
     }
 
     template<typename PointerType>
@@ -160471,12 +160541,14 @@ define_known_layout_constants! {
     NullValue => "NULL_VALUE";
     ShiftedIsCellPattern => "SHIFTED_IS_CELL_PATTERN";
     VmRunningExecutionContext => "VM_RUNNING_EXECUTION_CONTEXT";
+    VmHeapRegionBase => "VM_HEAP_REGION_BASE";
     VmBreakpointController => "VM_BREAKPOINT_CONTROLLER";
     ExecutionContextExecutable => "EXECUTION_CONTEXT_EXECUTABLE";
     ExecutionContextProgramCounter => "EXECUTION_CONTEXT_PROGRAM_COUNTER";
     ExecutableBytecodeData => "EXECUTABLE_BYTECODE_DATA";
     SizeOfExecutionContext => "SIZEOF_EXECUTION_CONTEXT";
     CanonicalNanBits => "CANON_NAN_BITS";
+    HeapRegionOffsetMask => "HEAP_REGION_OFFSET_MASK";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -171164,6 +171236,8 @@ const BOOLEAN_TAG = 0x7FF9
 const INT32_TAG_SHIFTED = 0x7FFA000000000000
 const NAN_BASE_TAG = 0x7FF8
 const CANON_NAN_BITS = 0x7FF8000000000000
+const VM_HEAP_REGION_BASE = 16664
+const HEAP_REGION_OFFSET_MASK = 0x3FFFFFFFFFF
 "#;
 
     fn compiler(architecture: Architecture) -> Compiler {
@@ -171500,7 +171574,7 @@ specialize Clear(dst: Undefined);
         assert!(
             emission_error
                 .message
-                .contains("required runtime constant 'INT32_TAG_SHIFTED'")
+                .contains("required runtime constant 'VM_RUNNING_EXECUTION_CONTEXT'")
         );
     }
 
@@ -189723,9 +189797,9 @@ fn evaluate_value_operation(operation: ValueOperation, inputs: &[IntegerFacts], 
             | ValueOperation::ReinterpretUint64AsValue,
             [input],
         ) => exact_unary(*input, result, |value| value),
-        (ValueOperation::UnboxObject, [input]) => {
-            exact_unary(*input, result, |value| value & ((1 << VALUE_TAG_SHIFT) - 1))
-        }
+        // Cell payloads are offsets from a runtime heap-region base, so
+        // unboxing requires a dynamic base load and cannot be constant-folded.
+        (ValueOperation::UnboxObject, [_]) => result,
         (ValueOperation::LogicalNot, [input]) => exact_unary(*input, result, |value| u64::from(value == 0)),
         // A value's tag is the top of its bits, so knowing a value is knowing
         // its type. This is what lets the type check on a known value fold, and
@@ -191589,7 +191663,7 @@ fn generate_entry_point(out: &mut String, program: &Program, fmt: ObjectFormat) 
     // Pinned: x19(dispatch), x20(vm), x21(ip), x26(pb), x27(values), x28(exec_ctx)
     // x21 = ip (instruction pointer = pb + pc), the primary dispatch register.
     // x25 is only used when DSL code writes to pc directly (rare).
-    // x22 = INT32_TAG, x23 = BOOLEAN_TAG, x24 = NAN_BASE_TAG (pinned constants).
+    // x22 = INT32_TAG, x23 = BOOLEAN_TAG, x24 = heap region base.
     // d8 is pinned to hold CANON_NAN_BITS (callee-saved FP register).
     let frame_size = frame_size_for_format(fmt);
     w!(out, "    stp x29, x30, [sp, #-{frame_size}]!");
@@ -191620,10 +191694,12 @@ fn generate_entry_point(out: &mut String, program: &Program, fmt: ObjectFormat) 
     let runtime = runtime(program);
     let interp_ctx = runtime[KnownLayoutConstant::VmRunningExecutionContext];
     let canon_nan = runtime[KnownLayoutConstant::CanonicalNanBits];
+    let heap_region_base = runtime[KnownLayoutConstant::VmHeapRegionBase];
     w!(out, "    mov x26, x0              // pb = bytecode base");
     w!(out, "    mov x27, x2              // values = values array");
     // Store VM* in x20 (callee-saved) for C++ calls, pin exec_ctx in x28
     w!(out, "    mov x20, x3              // vm = VM*");
+    emit_ldr64(out, "x24", "x3", heap_region_base);
     emit_ldr64(out, "x28", "x3", interp_ctx);
     w!(out, "    // x28 = exec_ctx");
     let vm_breakpoint_controller = runtime[KnownLayoutConstant::VmBreakpointController];
@@ -191642,13 +191718,11 @@ fn generate_entry_point(out: &mut String, program: &Program, fmt: ObjectFormat) 
     // Pin frequently-compared tag constants in callee-saved registers.
     let int32_tag = runtime[KnownLayoutConstant::Int32Tag];
     let boolean_tag = runtime[KnownLayoutConstant::BooleanTag];
-    let nan_base_tag = runtime[KnownLayoutConstant::NanBaseTag];
     emit_mov_imm(out, registers::X22, int32_tag);
     w!(out, "    // x22 = INT32_TAG");
     emit_mov_imm(out, registers::X23, boolean_tag);
     w!(out, "    // x23 = BOOLEAN_TAG");
-    emit_mov_imm(out, registers::X24, nan_base_tag);
-    w!(out, "    // x24 = NAN_BASE_TAG");
+    w!(out, "    // x24 = heap region base");
 
     // Dispatch to first instruction (x21 = pb + entry_point)
     w!(out, "    add x21, x26, w1, uxtw   // x21 = pb + entry_point");
@@ -191995,6 +192069,7 @@ mod tests {
                 &crate::frontend::layout::LayoutConstants::from_values([
                     ("VM_RUNNING_EXECUTION_CONTEXT".into(), 8),
                     ("VM_BREAKPOINT_CONTROLLER".into(), 16),
+                    ("VM_HEAP_REGION_BASE".into(), 24),
                     ("CANON_NAN_BITS".into(), 0x7ff8_0000_0000_0000u64 as i64),
                     ("INT32_TAG".into(), 0xfffau64 as i64),
                     ("BOOLEAN_TAG".into(), 0xfffbu64 as i64),
@@ -192399,7 +192474,6 @@ pub(crate) fn pinned_constant(runtime: &RuntimeConstants, value: i64) -> Option<
     [
         (runtime.get(KnownLayoutConstant::Int32Tag), X22),
         (runtime.get(KnownLayoutConstant::BooleanTag), X23),
-        (runtime.get(KnownLayoutConstant::NanBaseTag), X24),
     ]
     .into_iter()
     .find_map(|(constant, register)| (constant == Some(value)).then_some(register))
@@ -193386,8 +193460,23 @@ impl Backend for Aarch64Backend {
         );
     }
 
-    fn unbox_object(&self, emit: &mut Emit<'_>, destination: PhysicalRegister, source: PhysicalRegister) {
-        emit!(emit.output, Aarch64; Opcode::And64Immediate => [register destination, register source, immediate 0xffff_ffff_ffff];);
+    fn unbox_object(
+        &self,
+        emit: &mut Emit<'_>,
+        destination: PhysicalRegister,
+        source: PhysicalRegister,
+    ) -> Result<(), CompileError> {
+        let heap_region_offset_mask = emit.constant(KnownLayoutConstant::HeapRegionOffsetMask)?;
+        emit!(emit.output, Aarch64;
+            Opcode::And64Immediate => [register destination, register source, immediate heap_region_offset_mask];
+        );
+        emit!(emit.output, Aarch64;
+            Opcode::AddSubtractRegister {
+                operation: AddSubtractOperation::Add,
+                flags: FlagUpdate::Preserve,
+            } => [register destination, register destination, register X24];
+        );
+        Ok(())
     }
 
     fn float_operation(
@@ -196051,27 +196140,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn rejects_unavailable_interpreter_register_during_allocation() {
-        let error = build(
-            vec![instruction!(
-                Operation::Move(IntegerWidth::U64),
-                SourceOperand::InterpreterRegister(InterpreterRegister::Int32TagShifted,),
-                immediate(0)
-            )],
-            Architecture::Aarch64,
-        )
-        .unwrap_err();
-
-        assert_eq!(error.stage, CompileStage::Allocation);
-        assert_eq!(error.handler.as_deref(), Some("Test"));
-        assert!(
-            error
-                .message
-                .contains("interpreter register 'int32_tag_shifted' is unavailable on Aarch64")
-        );
-    }
-
     fn build(
         instructions: Vec<SourceInstruction>,
         arch: Architecture,
@@ -197305,7 +197373,12 @@ pub(crate) trait Backend: Sync {
 
     fn extract_tag(&self, emit: &mut Emit<'_>, destination: PhysicalRegister, source: PhysicalRegister);
 
-    fn unbox_object(&self, emit: &mut Emit<'_>, destination: PhysicalRegister, source: PhysicalRegister);
+    fn unbox_object(
+        &self,
+        emit: &mut Emit<'_>,
+        destination: PhysicalRegister,
+        source: PhysicalRegister,
+    ) -> Result<(), CompileError>;
 
     fn float_operation(
         &self,
@@ -197559,8 +197632,9 @@ FILE: Libraries/LibJS/Flap/src/target/description.rs
 //! These are the registers an `is_call=true` instruction kills (in addition
 //! to any explicitly listed clobbers). Pinned registers survive calls
 //! because they live in callee-saved slots. AArch64 pins its values base,
-//! x21 (ip cache), and x22-x24 (tag constants); x86-64 pins values and the
-//! shifted Int32 tag, and derives exec_ctx from values.
+//! x21 (ip cache), and x22-x23 (tag constants), plus x24 for the heap region
+//! base; x86-64 pins values and the heap region base, and derives exec_ctx
+//! from values.
 //!
 //! - x86_64: rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11, xmm0-xmm5
 //! - aarch64: x0-x17, d0-d7
@@ -198391,10 +198465,13 @@ fn lookup_operation(operation: Operation) -> &'static InstructionDescription {
             }
         }
         Operation::Move(U32) => &const { plain(&[GprOut, GprInOrImm]) },
-        Operation::ExtractTag | Operation::UnboxObject | Operation::BoxInt32 { clean: true } => {
-            &const { plain(&[GprOut, GprIn]).coalesces(&[(0, 1)]) }
+        Operation::ExtractTag => &const { plain(&[GprOut, GprIn]).coalesces(&[(0, 1)]) },
+        Operation::BoxInt32 { clean: true } => {
+            &const { plain(&[GprOut, GprIn]).coalesces(&[(0, 1)]).scratches(&[R11], &[]) }
         }
-        Operation::UnboxInt32 | Operation::BoxInt32 { clean: false } => &const { plain(&[GprOut, GprIn]) },
+        Operation::UnboxObject => &const { plain(&[GprOut, GprIn]).coalesces(&[(0, 1)]).scratches(&[R11], &[]) },
+        Operation::UnboxInt32 => &const { plain(&[GprOut, GprIn]) },
+        Operation::BoxInt32 { clean: false } => &const { plain(&[GprOut, GprIn]).scratches(&[R11], &[]) },
         Operation::IntegerBinary {
             operation: IntegerBinaryOperation::Binary(Add | Subtract | Or),
             width: U64,
@@ -198596,13 +198673,17 @@ mod tests {
     }
 
     #[test]
-    fn direct_value_operations_have_no_scratch_registers() {
+    fn direct_value_operations_declare_their_scratch_registers() {
         for operation in [
             Operation::BoxInt32 { clean: false },
             Operation::BoxInt32 { clean: true },
-            Operation::ToggleBit,
-            Operation::ClearBit,
         ] {
+            let info = lookup_operation(operation);
+            assert_eq!(info.x86_64.trailing_scratch_registers, &[R11]);
+            assert!(info.aarch64.trailing_scratch_registers.is_empty());
+        }
+
+        for operation in [Operation::ToggleBit, Operation::ClearBit] {
             let info = lookup_operation(operation);
             assert!(info.x86_64.trailing_scratch_registers.is_empty());
             assert!(info.aarch64.trailing_scratch_registers.is_empty());
@@ -199637,7 +199718,7 @@ fn finalize_value_operation(
         }
         Operation::UnboxObject => {
             let [destination, source] = operands.physical_registers();
-            backend.unbox_object(emit, destination, source);
+            backend.unbox_object(emit, destination, source)?;
         }
         _ => unreachable!(),
     }
@@ -200423,8 +200504,8 @@ impl MachineProgram {
         use KnownLayoutConstant::*;
 
         let architecture_constants: &[KnownLayoutConstant] = match self.target.architecture {
-            Architecture::X86_64 => &[Int32TagShifted],
-            Architecture::Aarch64 => &[Int32Tag, BooleanTag, NanBaseTag],
+            Architecture::X86_64 => &[],
+            Architecture::Aarch64 => &[Int32Tag, BooleanTag],
         };
         architecture_constants
             .iter()
@@ -200432,6 +200513,7 @@ impl MachineProgram {
                 [
                     VmRunningExecutionContext,
                     VmBreakpointController,
+                    VmHeapRegionBase,
                     ExecutionContextExecutable,
                     ExecutionContextProgramCounter,
                     ExecutableBytecodeData,
@@ -201244,8 +201326,9 @@ pub(crate) mod aarch64 {
 /// Interpreter register conventions and allocatable target registers.
 ///
 /// All pinned registers are callee-saved so they survive C++ calls. On
-/// x86-64, rbx holds `values`, `exec_ctx` is derived by subtracting the fixed
-/// execution-context size, and r15 holds the shifted Int32 tag.
+/// x86-64, rbx holds `values`, r15 holds the heap region base, and `exec_ctx`
+/// is derived by subtracting the fixed execution-context size. AArch64 keeps
+/// the heap region base in x24.
 ///
 /// `temporaries` and `fp_temporaries` are the allocatable register pools.
 /// Registers used as hidden instruction-expansion scratch are deliberately
@@ -201258,8 +201341,9 @@ pub(crate) mod aarch64 {
 /// - aarch64: x9, x10 are universal scratch in the codegen (large-imm
 ///   materialization, dispatch tail, pair-memory base computation), and
 ///   d16 is FPR scratch for double-to-int32 round-trip checks. x21
-///   caches `pb + pc` for fast dispatch; x22/x23/x24 hold pinned tag
-///   constants. None of these are addressable by DSL name.
+///   caches `pb + pc` for fast dispatch; x22/x23 hold pinned tag constants,
+///   and x24 holds the heap region base. None of these are addressable by DSL
+///   name.
 pub(crate) struct TargetRegisterInfo {
     pub(crate) interpreter: [Option<PhysicalRegister>; InterpreterRegister::COUNT],
     pub(crate) temporaries: &'static [PhysicalRegister],
@@ -201319,7 +201403,7 @@ pub(crate) const AARCH64_REGS: TargetRegisterInfo = TargetRegisterInfo {
         Some(aarch64::X27),
         Some(aarch64::X28),
         Some(aarch64::X19),
-        None,
+        Some(aarch64::X24),
         Some(aarch64::SP),
         Some(aarch64::X29),
     ],
@@ -201402,7 +201486,9 @@ pub(crate) fn physical_register_named(name: &str, arch: Architecture) -> Option<
 
 #[cfg(test)]
 mod tests {
-    use super::{aarch64, x86_64};
+    use super::{aarch64, resolve_interpreter_register, x86_64};
+    use crate::Architecture;
+    use crate::types::InterpreterRegister;
 
     #[test]
     fn keeps_allocation_costs_on_typed_registers() {
@@ -201412,6 +201498,18 @@ mod tests {
         assert_eq!(x86_64::XMM0.allocation_cost(), 2);
         assert_eq!(aarch64::X0.allocation_cost(), 0);
         assert_eq!(aarch64::D0.allocation_cost(), 0);
+    }
+
+    #[test]
+    fn pins_heap_region_base_in_a_callee_saved_register() {
+        assert_eq!(
+            resolve_interpreter_register(InterpreterRegister::HeapRegionBase, Architecture::X86_64),
+            Some(x86_64::R15)
+        );
+        assert_eq!(
+            resolve_interpreter_register(InterpreterRegister::HeapRegionBase, Architecture::Aarch64),
+            Some(aarch64::X24)
+        );
     }
 }
 
@@ -202085,7 +202183,6 @@ use super::ir::{
     MachineOperand as Operand, MachineProgram as Program, RuntimeConstants,
 };
 use super::machine_verify::{define_machine_opcodes, operands_match};
-use super::registers::x86_64 as registers;
 use crate::frontend::layout::KnownLayoutConstant;
 use crate::{Architecture, CompileOptions, ObjectFormat};
 use std::fmt::Write;
@@ -202569,8 +202666,8 @@ fn emit_restored_registers(out: &mut String, fmt: ObjectFormat, abi: X86_64Abi) 
     }
 }
 
-const SYSV_VM_SLOT: &str = "[rbp - 48]";
-const WIN64_VM_SLOT: &str = "[rbp - 64]";
+pub(crate) const SYSV_VM_SLOT_OFFSET: i32 = -48;
+pub(crate) const WIN64_VM_SLOT_OFFSET: i32 = -64;
 pub(crate) const WIN64_RAW_NATIVE_RETURN_SLOT: i64 = -80;
 pub(crate) const WIN64_RAW_NATIVE_VARIANT_SLOT: i64 = -72;
 
@@ -202654,11 +202751,10 @@ fn generate_entry_point(out: &mut String, program: &Program, abi: X86_64Abi) {
     w!(out, "    mov r13d, {entry_point}         # pc = entry_point");
     let values_padding = if abi.is_win64() { "           " } else { "          " };
     w!(out, "    mov rbx, {values}{values_padding}# values");
-    let int32_tag_shifted = runtime(program)[KnownLayoutConstant::Int32TagShifted];
-    let int32_tag_shifted_register = int32_tag_shifted_register();
+    let heap_region_base = runtime(program)[KnownLayoutConstant::VmHeapRegionBase];
     w!(
         out,
-        "    movabs {int32_tag_shifted_register}, {int32_tag_shifted}  # INT32_TAG_SHIFTED"
+        "    mov r15, QWORD PTR [{vm} + {heap_region_base}]  # heap region base"
     );
     w!(out, "    mov QWORD PTR {}, {vm}  # save VM*", vm_slot(abi));
     let vm_breakpoint_controller = runtime(program)[KnownLayoutConstant::VmBreakpointController];
@@ -202736,8 +202832,13 @@ fn emit_state_reload(out: &mut String, program: &Program, abi: X86_64Abi) {
     w!(out, "    mov r14, QWORD PTR [rcx + {exec_bytecode}]");
 }
 
-fn vm_slot(abi: X86_64Abi) -> &'static str {
-    if abi.is_win64() { WIN64_VM_SLOT } else { SYSV_VM_SLOT }
+fn vm_slot(abi: X86_64Abi) -> String {
+    let offset = if abi.is_win64() {
+        WIN64_VM_SLOT_OFFSET
+    } else {
+        SYSV_VM_SLOT_OFFSET
+    };
+    format!("[rbp - {}]", -offset)
 }
 
 fn emit_load_vm(out: &mut String, dst: &str, abi: X86_64Abi) {
@@ -202793,10 +202894,6 @@ fn resolve_op(op: &Operand, _handler: &Handler, _program: &Program) -> String {
 
 fn values_offset(program: &Program) -> i64 {
     runtime(program)[KnownLayoutConstant::SizeOfExecutionContext]
-}
-
-fn int32_tag_shifted_register() -> &'static str {
-    registers::R15.as_str()
 }
 
 fn format_x86_address(terms: &str, offset: i64) -> String {
@@ -202881,7 +202978,7 @@ mod tests {
     fn test_program() -> Program {
         Program {
             runtime: RuntimeConstants::from_values([
-                (KnownLayoutConstant::Int32TagShifted, 0x7ffa_0000_0000_0000u64 as i64),
+                (KnownLayoutConstant::VmHeapRegionBase, 16664),
                 (KnownLayoutConstant::SizeOfExecutionContext, 120),
             ]),
             dispatch_handlers: Vec::new(),
@@ -202977,7 +203074,7 @@ mod tests {
     }
 
     #[test]
-    fn boxes_clean_int32_values_with_the_pinned_tag() {
+    fn formats_or_with_a_physical_register() {
         let output = emit([instruction(
             Opcode::Or64Register,
             vec![
@@ -203205,7 +203302,10 @@ use crate::target::finalize_support::{
 use crate::target::finalize_support::{memory_branch, push_plain_move};
 use crate::target::ir::{AllocatedOperand, MachineInstruction, MachineMemoryAddress, MachineOpcode, MachineOperand};
 use crate::target::machine_verify::emit_machine_instructions as emit;
-use crate::target::registers::{PhysicalRegister, x86_64::R15};
+use crate::target::registers::{
+    PhysicalRegister,
+    x86_64::{R11, R15},
+};
 use crate::{CompileError, ObjectFormat};
 
 fn machine_instruction(opcode: Opcode, operands: Vec<MachineOperand>) -> MachineInstruction {
@@ -203638,14 +203738,14 @@ fn vm_load(emit: &mut Emit<'_>, destination: PhysicalRegister) {
     use crate::target::registers::x86_64::RBP;
 
     let displacement = match emit.object_format {
-        ObjectFormat::Coff => -64,
-        ObjectFormat::Elf | ObjectFormat::MachO => -48,
+        ObjectFormat::Coff => super::WIN64_VM_SLOT_OFFSET,
+        ObjectFormat::Elf | ObjectFormat::MachO => super::SYSV_VM_SLOT_OFFSET,
     };
     emit!(emit.output, X86_64;
         Opcode::Load {
         width: MemoryWidth::DoubleWord,
         signed: false,
-    } => [register destination, address MachineMemoryAddress::offset(RBP, displacement)];
+    } => [register destination, address MachineMemoryAddress::offset(RBP, i64::from(displacement))];
     );
 }
 
@@ -203962,10 +204062,14 @@ impl Backend for X86_64Backend {
         source: PhysicalRegister,
         clean: bool,
     ) -> Result<(), CompileError> {
+        let int32_tag_shifted = emit.constant(KnownLayoutConstant::Int32TagShifted)?;
         if !clean || destination != source {
             emit!(emit.output, X86_64; if clean { Opcode::Move64Register } else { Opcode::Move32Register } => [register destination, register source];);
         }
-        emit!(emit.output, X86_64; Opcode::Or64Register => [register destination, register R15];);
+        emit!(emit.output, X86_64;
+            Opcode::MoveAbsolute64Immediate => [register R11, immediate int32_tag_shifted];
+            Opcode::Or64Register => [register destination, register R11];
+        );
         Ok(())
     }
 
@@ -203980,13 +204084,24 @@ impl Backend for X86_64Backend {
         emit!(emit.output, X86_64; Opcode::ShiftImmediate { operation: ShiftOperation::RightLogical, width: IntegerWidth::U64 } => [register destination, immediate 48];);
     }
 
-    fn unbox_object(&self, emit: &mut Emit<'_>, destination: PhysicalRegister, source: PhysicalRegister) {
+    fn unbox_object(
+        &self,
+        emit: &mut Emit<'_>,
+        destination: PhysicalRegister,
+        source: PhysicalRegister,
+    ) -> Result<(), CompileError> {
         if destination != source {
             emit!(emit.output, X86_64; Opcode::Move64Register => [register destination, register source];);
         }
-        for operation in [ShiftOperation::Left, ShiftOperation::RightLogical] {
-            emit!(emit.output, X86_64; Opcode::ShiftImmediate { operation, width: IntegerWidth::U64 } => [register destination, immediate 16];);
-        }
+        let heap_region_offset_mask = emit.constant(KnownLayoutConstant::HeapRegionOffsetMask)?;
+        emit!(emit.output, X86_64;
+            Opcode::MoveAbsolute64Immediate => [register R11, immediate heap_region_offset_mask];
+            Opcode::AluRegister { operation: super::AluOperation::And, width: IntegerWidth::U64 } => [register destination, register R11];
+        );
+        emit!(emit.output, X86_64;
+            Opcode::AluRegister { operation: super::AluOperation::Add, width: IntegerWidth::U64 } => [register destination, register R15];
+        );
+        Ok(())
     }
 
     fn float_operation(
@@ -205119,7 +205234,7 @@ define_interpreter_registers! {
     Values => "values", Type::Sequence(Box::new(Type::Value)), true;
     ExecutionContext => "exec_ctx", Type::ExecutionContext, true;
     DispatchTable => "dispatch", Type::U64, true;
-    Int32TagShifted => "int32_tag_shifted", Type::U64, false;
+    HeapRegionBase => "heap_region_base", Type::U64, false;
     StackPointer => "sp", Type::U64, true;
     FramePointer => "fp", Type::U64, true;
 }
@@ -205391,7 +205506,7 @@ mod tests {
         );
         assert_eq!(InterpreterRegister::from_name("pc").unwrap().value_type(), Type::U32);
         assert_eq!(InterpreterRegister::ProgramBase.as_str(), "pb");
-        assert_eq!(InterpreterRegister::Int32TagShifted.source_value_type(), None);
+        assert_eq!(InterpreterRegister::HeapRegionBase.source_value_type(), None);
         assert_eq!(InterpreterRegister::from_name("temporary"), None);
         assert_eq!(
             RegisterReference::new("pb"),
@@ -207061,9 +207176,10 @@ CSYM(js_interpreter):
     mov x26, x0              // pb = bytecode base
     mov x27, x2              // values = values array
     mov x20, x3              // vm = VM*
+    ldr x24, [x3, #16664]
     ldr x28, [x3, #15288]
     // x28 = exec_ctx
-    ldr x9, [x3, #16712]
+    ldr x9, [x3, #16720]
     cbz x9, .Lnormal_dispatch_table
     adrp x19, asm_debug_dispatch_table
     add x19, x19, :lo12:asm_debug_dispatch_table
@@ -207079,8 +207195,7 @@ CSYM(js_interpreter):
     // x22 = INT32_TAG
     mov w23, #32761
     // x23 = BOOLEAN_TAG
-    mov w24, #32760
-    // x24 = NAN_BASE_TAG
+    // x24 = heap region base
     add x21, x26, w1, uxtw   // x21 = pb + entry_point
     ldrb w9, [x21]           // w9 = opcode byte
     ldr x10, [x19, x9, lsl #3]
@@ -207521,10 +207636,12 @@ asm_handler_JumpLooselyEquals:
     cmp w4, w9
     b.eq .Lasm_JumpLooselyEquals.ssa_block_10
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_JumpLooselyEquals.ssa_block_1
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_JumpLooselyEquals.ssa_block_1
     b .Lasm_JumpLooselyEquals.ssa_block_4
 .Lasm_JumpLooselyEquals.ssa_block_10:
@@ -207605,10 +207722,12 @@ asm_handler_JumpLooselyInequals:
     cmp w4, w9
     b.eq .Lasm_JumpLooselyInequals.ssa_block_10
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_JumpLooselyInequals.ssa_block_1
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_JumpLooselyInequals.ssa_block_1
     b .Lasm_JumpLooselyInequals.ssa_block_4
 .Lasm_JumpLooselyInequals.ssa_block_10:
@@ -207686,7 +207805,8 @@ asm_handler_JumpStrictlyEquals:
     cmp x2, x22
     b.ne .Lasm_JumpStrictlyEquals.ssa_block_10
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_JumpStrictlyEquals.ssa_block_3
     sxtw x0, w0
     scvtf d0, w0
@@ -207696,10 +207816,12 @@ asm_handler_JumpStrictlyEquals:
     b .Lasm_JumpStrictlyEquals.ssa_block_3
 .Lasm_JumpStrictlyEquals.ssa_block_10:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_JumpStrictlyEquals.ssa_block_3
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_JumpStrictlyEquals.ssa_block_3
     b .Lasm_JumpStrictlyEquals.ssa_block_4
 .Lasm_JumpStrictlyEquals.ssa_block_9:
@@ -207771,7 +207893,8 @@ asm_handler_JumpStrictlyInequals:
     cmp x2, x22
     b.ne .Lasm_JumpStrictlyInequals.ssa_block_10
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_JumpStrictlyInequals.ssa_block_2
     sxtw x0, w0
     scvtf d0, w0
@@ -207781,10 +207904,12 @@ asm_handler_JumpStrictlyInequals:
     b .Lasm_JumpStrictlyInequals.ssa_block_2
 .Lasm_JumpStrictlyInequals.ssa_block_10:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_JumpStrictlyInequals.ssa_block_2
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_JumpStrictlyInequals.ssa_block_2
     b .Lasm_JumpStrictlyInequals.ssa_block_4
 .Lasm_JumpStrictlyInequals.ssa_block_9:
@@ -208005,6 +208130,7 @@ asm_handler_End_hot_end:
 .p2align 4
 asm_handler_GetLexicalEnvironment:
     ldr x0, [x28, #32]
+    and x0, x0, #0x3ffffffffff
     movz x1, #0xfff8, lsl #48
     orr x0, x0, x1
     ldr w9, [x21, #4]
@@ -208019,7 +208145,8 @@ asm_handler_GetLexicalEnvironment_hot_end:
 asm_handler_SetLexicalEnvironment:
     ldr w0, [x21, #4]
     ldr x0, [x27, x0, lsl #3]
-    and x0, x0, #0xffffffffffff
+    and x0, x0, #0x3ffffffffff
+    add x0, x0, x24
     str x0, [x28, #32]
     ldrb w9, [x21, #8]
     add x21, x21, #8
@@ -208507,7 +208634,8 @@ asm_handler_Div:
     b .Lasm_Div.ssa_block_11
 .Lasm_Div.ssa_block_12:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_Div.ssa_block_1
     fmov d0, x1
 .Lasm_Div.ssa_block_11:
@@ -208519,7 +208647,8 @@ asm_handler_Div:
     b .Lasm_Div.ssa_block_16
 .Lasm_Div.ssa_block_17:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_Div.ssa_block_1
     fmov d1, x0
 .Lasm_Div.ssa_block_16:
@@ -208933,7 +209062,8 @@ asm_handler_StrictlyEquals:
     cmp x2, x22
     b.ne .Lasm_StrictlyEquals.ssa_block_10
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_StrictlyEquals.ssa_block_3
     sxtw x0, w0
     scvtf d0, w0
@@ -208943,10 +209073,12 @@ asm_handler_StrictlyEquals:
     b .Lasm_StrictlyEquals.ssa_block_3
 .Lasm_StrictlyEquals.ssa_block_10:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_StrictlyEquals.ssa_block_3
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_StrictlyEquals.ssa_block_3
     b .Lasm_StrictlyEquals.ssa_block_4
 .Lasm_StrictlyEquals.ssa_block_9:
@@ -209023,7 +209155,8 @@ asm_handler_StrictlyInequals:
     cmp x2, x22
     b.ne .Lasm_StrictlyInequals.ssa_block_10
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_StrictlyInequals.ssa_block_2
     sxtw x0, w0
     scvtf d0, w0
@@ -209033,10 +209166,12 @@ asm_handler_StrictlyInequals:
     b .Lasm_StrictlyInequals.ssa_block_2
 .Lasm_StrictlyInequals.ssa_block_10:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_StrictlyInequals.ssa_block_2
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_StrictlyInequals.ssa_block_2
     b .Lasm_StrictlyInequals.ssa_block_4
 .Lasm_StrictlyInequals.ssa_block_9:
@@ -209185,10 +209320,12 @@ asm_handler_LooselyEquals:
     cmp w4, w9
     b.eq .Lasm_LooselyEquals.ssa_block_10
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_LooselyEquals.ssa_block_1
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_LooselyEquals.ssa_block_1
     b .Lasm_LooselyEquals.ssa_block_4
 .Lasm_LooselyEquals.ssa_block_10:
@@ -209274,10 +209411,12 @@ asm_handler_LooselyInequals:
     cmp w4, w9
     b.eq .Lasm_LooselyInequals.ssa_block_10
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_LooselyInequals.ssa_block_1
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_LooselyInequals.ssa_block_1
     b .Lasm_LooselyInequals.ssa_block_4
 .Lasm_LooselyInequals.ssa_block_10:
@@ -209406,7 +209545,8 @@ asm_handler_PutByValue:
     cmp x9, x22
     b.ne .Lasm_PutByValue.ssa_block_1
     mov w0, w0
-    and x3, x3, #0xffffffffffff
+    and x3, x3, #0x3ffffffffff
+    add x3, x3, x24
     ldrh w1, [x3, #10]
     tbnz x1, #3, .Lasm_PutByValue.ssa_block_7
     tbnz x1, #4, .Lasm_PutByValue.ssa_block_1
@@ -209548,7 +209688,8 @@ asm_handler_PutByValue:
     cmp x3, #10
     b.ne .Lasm_PutByValue.ssa_switch_4_after_preferred
     and w5, w5, #0x7ff8
-    cmp w5, w24
+    mov w9, #32760
+    cmp w5, w9
     b.eq .Lasm_PutByValue.ssa_block_3
     add x0, x2, x0, lsl #2
     and x0, x0, #0x3ffffffffff
@@ -209575,7 +209716,8 @@ asm_handler_PutByValue:
     b .Lasm_PutByValue.ssa_block_3
 .Lasm_PutByValue.ssa_block_23:
     and w5, w5, #0x7ff8
-    cmp w5, w24
+    mov w9, #32760
+    cmp w5, w9
     b.eq .Lasm_PutByValue.ssa_block_3
     add x0, x2, x0, lsl #3
     and x0, x0, #0x3ffffffffff
@@ -209590,7 +209732,8 @@ asm_handler_PutByValue:
     ccmp x5, x23, #4, ne
     b.eq .Lasm_PutByValue.ssa_block_30
     and w5, w5, #0x7ff8
-    cmp w5, w24
+    mov w9, #32760
+    cmp w5, w9
     b.ne .Lasm_PutByValue.ssa_block_31
     b .Lasm_PutByValue.ssa_block_3
 .Lasm_PutByValue.ssa_block_30:
@@ -209609,7 +209752,8 @@ asm_handler_PutByValue:
     ccmp x5, x23, #4, ne
     b.eq .Lasm_PutByValue.ssa_block_35
     and w5, w5, #0x7ff8
-    cmp w5, w24
+    mov w9, #32760
+    cmp w5, w9
     b.ne .Lasm_PutByValue.ssa_block_36
     b .Lasm_PutByValue.ssa_block_3
 .Lasm_PutByValue.ssa_block_35:
@@ -209628,7 +209772,8 @@ asm_handler_PutByValue:
     ccmp x5, x23, #4, ne
     b.eq .Lasm_PutByValue.ssa_block_40
     and w5, w5, #0x7ff8
-    cmp w5, w24
+    mov w9, #32760
+    cmp w5, w9
     b.ne .Lasm_PutByValue.ssa_block_41
     b .Lasm_PutByValue.ssa_block_3
 .Lasm_PutByValue.ssa_block_40:
@@ -209652,7 +209797,8 @@ asm_handler_GetById:
     mov w10, #65529
     cmp x9, x10
     b.ne .Lasm_GetById.ssa_block_1
-    and x2, x2, #0xffffffffffff
+    and x2, x2, #0x3ffffffffff
+    add x2, x2, x24
     ldr x1, [x2, #24]
     ldr x0, [x28, #80]
     ldr x0, [x0, #112]
@@ -209716,8 +209862,7 @@ asm_handler_GetById:
     cbz x0, .Lasm_GetById.ssa_block_3
     ldrh w1, [x0, #10]
     tbnz x1, #11, .Lasm_GetById.ssa_block_3
-    lsl x0, x0, #16
-    lsr x0, x0, #16
+    and x0, x0, #0x3ffffffffff
     movz x1, #0xfff9, lsl #48
     orr x0, x0, x1
 .Lasm_GetById.ssa_block_26:
@@ -209730,7 +209875,7 @@ asm_handler_GetById:
 .Lasm_GetById.ssa_block_14:
     ldr w3, [x1, #104]
     mov x0, x20
-    ldr x0, [x0, #16688]
+    ldr x0, [x0, #16696]
     lsl x3, x3, #4
     adds x3, x3, x0
     ldr w4, [x3, #8]
@@ -209757,8 +209902,7 @@ asm_handler_GetById:
     stp x1, x4, [x0, #32]
     ldr x1, [x28, #48]
     str x1, [x0, #48]
-    lsl x2, x2, #16
-    lsr x2, x2, #16
+    and x2, x2, #0x3ffffffffff
     movz x1, #0xfff9, lsl #48
     orr x2, x2, x1
     str x2, [x0, #72]
@@ -209834,7 +209978,8 @@ asm_handler_PutById:
     mov w10, #65529
     cmp x9, x10
     b.ne .Lasm_PutById.ssa_block_2
-    and x2, x2, #0xffffffffffff
+    and x2, x2, #0x3ffffffffff
+    add x2, x2, x24
     ldr x1, [x2, #24]
     ldr x0, [x28, #80]
     ldr x0, [x0, #112]
@@ -209879,7 +210024,8 @@ asm_handler_GetByValue:
     cmp x9, x22
     b.ne .Lasm_GetByValue.ssa_block_1
     mov w0, w0
-    and x3, x3, #0xffffffffffff
+    and x3, x3, #0x3ffffffffff
+    add x3, x3, x24
     ldrh w1, [x3, #10]
     tbnz x1, #3, .Lasm_GetByValue.ssa_block_13
     tbnz x1, #4, .Lasm_GetByValue.ssa_block_1
@@ -210052,7 +210198,8 @@ asm_handler_GetLength:
     mov w10, #65529
     cmp x9, x10
     b.ne .Lasm_GetLength.ssa_block_1
-    and x1, x1, #0xffffffffffff
+    and x1, x1, #0x3ffffffffff
+    add x1, x1, x24
     ldrh w0, [x1, #10]
     tbz x0, #2, .Lasm_GetLength.ssa_block_5
     ldr w0, [x1, #16]
@@ -210229,7 +210376,8 @@ asm_handler_Call:
     mov w10, #65529
     cmp x9, x10
     b.ne .Lasm_Call.ssa_block_1
-    and x1, x1, #0xffffffffffff
+    and x1, x1, #0x3ffffffffff
+    add x1, x1, x24
     ldrh w0, [x1, #10]
     tbz x0, #7, .Lasm_Call.ssa_block_1
     tbz x0, #6, .Lasm_Call.ssa_block_3
@@ -210252,8 +210400,7 @@ asm_handler_Call:
     ldr x3, [x3, #16]
     ldr x3, [x3, #40]
     ldr x6, [x3, #32]
-    lsl x6, x6, #16
-    lsr x6, x6, #16
+    and x6, x6, #0x3ffffffffff
     movz x3, #0xfff9, lsl #48
     orr x6, x6, x3
     b .Lasm_Call.ssa_block_9
@@ -210445,7 +210592,7 @@ asm_handler_Call:
     mov x28, x0
     add x27, x28, #120
     ldr w0, [x1, #104]
-    ldr x1, [x2, #16688]
+    ldr x1, [x2, #16696]
     lsl x0, x0, #4
     adds x0, x0, x1
     ldr w1, [x0, #8]
@@ -210494,7 +210641,8 @@ asm_handler_CallBuiltinMathAbs:
     mov w10, #65529
     cmp x9, x10
     b.ne .Lasm_CallBuiltinMathAbs.ssa_block_1
-    and x0, x0, #0xffffffffffff
+    and x0, x0, #0x3ffffffffff
+    add x0, x0, x24
     ldrh w1, [x0, #10]
     tbz x1, #7, .Lasm_CallBuiltinMathAbs.ssa_block_1
     ldrb w9, [x0, #73]
@@ -210506,7 +210654,8 @@ asm_handler_CallBuiltinMathAbs:
     lsr x1, x0, #48
     mov x2, x1
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_CallBuiltinMathAbs.ssa_block_5
     bic x0, x0, #0x8000000000000000
     ldr w9, [x21, #4]
@@ -210540,7 +210689,8 @@ asm_handler_CallBuiltinMathFloor:
     mov w10, #65529
     cmp x9, x10
     b.ne .Lasm_CallBuiltinMathFloor.ssa_block_1
-    and x0, x0, #0xffffffffffff
+    and x0, x0, #0x3ffffffffff
+    add x0, x0, x24
     ldrh w1, [x0, #10]
     tbz x1, #7, .Lasm_CallBuiltinMathFloor.ssa_block_1
     ldrb w9, [x0, #73]
@@ -210552,7 +210702,8 @@ asm_handler_CallBuiltinMathFloor:
     ldr x0, [x27, x0, lsl #3]
     lsr x1, x0, #48
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_CallBuiltinMathFloor.ssa_block_1
     fmov d0, x0
     frintm d0, d0
@@ -210592,7 +210743,8 @@ asm_handler_CallBuiltinMathCeil:
     mov w10, #65529
     cmp x9, x10
     b.ne .Lasm_CallBuiltinMathCeil.ssa_block_1
-    and x0, x0, #0xffffffffffff
+    and x0, x0, #0x3ffffffffff
+    add x0, x0, x24
     ldrh w1, [x0, #10]
     tbz x1, #7, .Lasm_CallBuiltinMathCeil.ssa_block_1
     ldrb w9, [x0, #73]
@@ -210604,7 +210756,8 @@ asm_handler_CallBuiltinMathCeil:
     ldr x0, [x27, x0, lsl #3]
     lsr x1, x0, #48
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_CallBuiltinMathCeil.ssa_block_1
     fmov d0, x0
     frintp d0, d0
@@ -210644,7 +210797,8 @@ asm_handler_CallBuiltinMathSqrt:
     mov w10, #65529
     cmp x9, x10
     b.ne .Lasm_CallBuiltinMathSqrt.ssa_block_1
-    and x0, x0, #0xffffffffffff
+    and x0, x0, #0x3ffffffffff
+    add x0, x0, x24
     ldrh w1, [x0, #10]
     tbz x1, #7, .Lasm_CallBuiltinMathSqrt.ssa_block_1
     ldrb w9, [x0, #73]
@@ -210656,7 +210810,8 @@ asm_handler_CallBuiltinMathSqrt:
     ldr x0, [x27, x0, lsl #3]
     lsr x1, x0, #48
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_CallBuiltinMathSqrt.ssa_block_1
     fmov d0, x0
     fsqrt d0, d0
@@ -210696,7 +210851,8 @@ asm_handler_CallBuiltinMathExp:
     mov w10, #65529
     cmp x9, x10
     b.ne .Lasm_CallBuiltinMathExp.ssa_block_1
-    and x0, x0, #0xffffffffffff
+    and x0, x0, #0x3ffffffffff
+    add x0, x0, x24
     ldrh w1, [x0, #10]
     tbz x1, #7, .Lasm_CallBuiltinMathExp.ssa_block_1
     ldrb w9, [x0, #73]
@@ -210708,7 +210864,8 @@ asm_handler_CallBuiltinMathExp:
     ldr x0, [x27, x0, lsl #3]
     lsr x1, x0, #48
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_CallBuiltinMathExp.ssa_block_1
     bl CSYM(asm_helper_math_exp)
     ldr w9, [x21, #4]
@@ -210727,7 +210884,8 @@ asm_handler_CallBuiltinStringFromCharCode:
     mov w10, #65529
     cmp x9, x10
     b.ne .Lasm_CallBuiltinStringFromCharCode.ssa_block_1
-    and x0, x0, #0xffffffffffff
+    and x0, x0, #0x3ffffffffff
+    add x0, x0, x24
     ldrh w1, [x0, #10]
     tbz x1, #7, .Lasm_CallBuiltinStringFromCharCode.ssa_block_1
     ldrb w9, [x0, #73]
@@ -210770,7 +210928,8 @@ asm_handler_CallBuiltinStringPrototypeCharCodeAt:
     mov w10, #65529
     cmp x9, x10
     b.ne .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_2
-    and x0, x0, #0xffffffffffff
+    and x0, x0, #0x3ffffffffff
+    add x0, x0, x24
     ldrh w1, [x0, #10]
     tbz x1, #7, .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_2
     ldrb w9, [x0, #73]
@@ -210791,7 +210950,8 @@ asm_handler_CallBuiltinStringPrototypeCharCodeAt:
     b.ne .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_2
     sxtw x0, w0
     tbnz w0, #31, .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_1
-    and x2, x2, #0xffffffffffff
+    and x2, x2, #0x3ffffffffff
+    add x2, x2, x24
     ldrb w9, [x2, #10]
     cbnz w9, .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_2
     ldr x1, [x2, #16]
@@ -210834,7 +210994,8 @@ asm_handler_CallBuiltinStringPrototypeCharAt:
     mov w10, #65529
     cmp x9, x10
     b.ne .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_1
-    and x0, x0, #0xffffffffffff
+    and x0, x0, #0x3ffffffffff
+    add x0, x0, x24
     ldrh w1, [x0, #10]
     tbz x1, #7, .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_1
     ldrb w9, [x0, #73]
@@ -210855,7 +211016,8 @@ asm_handler_CallBuiltinStringPrototypeCharAt:
     b.ne .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_1
     sxtw x0, w0
     tbnz w0, #31, .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_2
-    and x2, x2, #0xffffffffffff
+    and x2, x2, #0x3ffffffffff
+    add x2, x2, x24
     ldrb w9, [x2, #10]
     cbnz w9, .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_1
     ldr x1, [x2, #16]
@@ -210900,7 +211062,8 @@ asm_handler_ObjectPropertyIteratorNext:
     mov w10, #65529
     cmp x9, x10
     b.ne .Lasm_ObjectPropertyIteratorNext.ssa_block_1
-    and x0, x0, #0xffffffffffff
+    and x0, x0, #0x3ffffffffff
+    add x0, x0, x24
     ldrb w4, [x0, #168]
     cmp x4, #0
     b.eq .Lasm_ObjectPropertyIteratorNext.ssa_block_1
@@ -210992,7 +211155,8 @@ asm_handler_IsCallable:
     mov w10, #65529
     cmp x9, x10
     b.ne .Lasm_IsCallable.ssa_block_1
-    and x0, x0, #0xffffffffffff
+    and x0, x0, #0x3ffffffffff
+    add x0, x0, x24
     ldrh w0, [x0, #10]
     tbz x0, #7, .Lasm_IsCallable.ssa_block_1
     ldr w9, [x21, #4]
@@ -211229,7 +211393,8 @@ asm_handler_DivRhsInt32:
     b .Lasm_DivRhsInt32.ssa_block_14
 .Lasm_DivRhsInt32.ssa_block_12:
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_DivRhsInt32.ssa_block_1
     fmov d0, x0
 .Lasm_DivRhsInt32.ssa_block_14:
@@ -211628,7 +211793,8 @@ asm_handler_StrictlyEqualsRhsInt32:
     b.ne .Lasm_StrictlyEqualsRhsInt32.ssa_block_10
     mov w1, #32762
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_StrictlyEqualsRhsInt32.ssa_block_3
     sxtw x0, w0
     scvtf d0, w0
@@ -211638,11 +211804,13 @@ asm_handler_StrictlyEqualsRhsInt32:
     b .Lasm_StrictlyEqualsRhsInt32.ssa_block_3
 .Lasm_StrictlyEqualsRhsInt32.ssa_block_10:
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_StrictlyEqualsRhsInt32.ssa_block_3
     mov w1, #32762
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_StrictlyEqualsRhsInt32.ssa_block_3
     b .Lasm_StrictlyEqualsRhsInt32.ssa_block_4
 .Lasm_StrictlyEqualsRhsInt32.ssa_block_9:
@@ -211718,7 +211886,8 @@ asm_handler_StrictlyInequalsRhsInt32:
     b.ne .Lasm_StrictlyInequalsRhsInt32.ssa_block_10
     mov w1, #32762
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_StrictlyInequalsRhsInt32.ssa_block_2
     sxtw x0, w0
     scvtf d0, w0
@@ -211728,11 +211897,13 @@ asm_handler_StrictlyInequalsRhsInt32:
     b .Lasm_StrictlyInequalsRhsInt32.ssa_block_2
 .Lasm_StrictlyInequalsRhsInt32.ssa_block_10:
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_StrictlyInequalsRhsInt32.ssa_block_2
     mov w1, #32762
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_StrictlyInequalsRhsInt32.ssa_block_2
     b .Lasm_StrictlyInequalsRhsInt32.ssa_block_4
 .Lasm_StrictlyInequalsRhsInt32.ssa_block_9:
@@ -211810,11 +211981,13 @@ asm_handler_LooselyEqualsRhsInt32:
     cmp w3, w9
     b.eq .Lasm_LooselyEqualsRhsInt32.ssa_block_10
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_LooselyEqualsRhsInt32.ssa_block_1
     lsr x1, x2, #48
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_LooselyEqualsRhsInt32.ssa_block_1
     b .Lasm_LooselyEqualsRhsInt32.ssa_block_4
 .Lasm_LooselyEqualsRhsInt32.ssa_block_10:
@@ -211894,11 +212067,13 @@ asm_handler_LooselyInequalsRhsInt32:
     cmp w3, w9
     b.eq .Lasm_LooselyInequalsRhsInt32.ssa_block_10
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_LooselyInequalsRhsInt32.ssa_block_1
     lsr x1, x2, #48
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_LooselyInequalsRhsInt32.ssa_block_1
     b .Lasm_LooselyInequalsRhsInt32.ssa_block_4
 .Lasm_LooselyInequalsRhsInt32.ssa_block_10:
@@ -211976,7 +212151,8 @@ asm_handler_JumpStrictlyEqualsRhsInt32:
     b.ne .Lasm_JumpStrictlyEqualsRhsInt32.ssa_block_10
     mov w1, #32762
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_JumpStrictlyEqualsRhsInt32.ssa_block_3
     sxtw x0, w0
     scvtf d0, w0
@@ -211986,11 +212162,13 @@ asm_handler_JumpStrictlyEqualsRhsInt32:
     b .Lasm_JumpStrictlyEqualsRhsInt32.ssa_block_3
 .Lasm_JumpStrictlyEqualsRhsInt32.ssa_block_10:
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_JumpStrictlyEqualsRhsInt32.ssa_block_3
     mov w1, #32762
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_JumpStrictlyEqualsRhsInt32.ssa_block_3
     b .Lasm_JumpStrictlyEqualsRhsInt32.ssa_block_4
 .Lasm_JumpStrictlyEqualsRhsInt32.ssa_block_9:
@@ -212061,7 +212239,8 @@ asm_handler_JumpStrictlyInequalsRhsInt32:
     b.ne .Lasm_JumpStrictlyInequalsRhsInt32.ssa_block_10
     mov w1, #32762
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_JumpStrictlyInequalsRhsInt32.ssa_block_2
     sxtw x0, w0
     scvtf d0, w0
@@ -212071,11 +212250,13 @@ asm_handler_JumpStrictlyInequalsRhsInt32:
     b .Lasm_JumpStrictlyInequalsRhsInt32.ssa_block_2
 .Lasm_JumpStrictlyInequalsRhsInt32.ssa_block_10:
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_JumpStrictlyInequalsRhsInt32.ssa_block_2
     mov w1, #32762
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_JumpStrictlyInequalsRhsInt32.ssa_block_2
     b .Lasm_JumpStrictlyInequalsRhsInt32.ssa_block_4
 .Lasm_JumpStrictlyInequalsRhsInt32.ssa_block_9:
@@ -212148,11 +212329,13 @@ asm_handler_JumpLooselyEqualsRhsInt32:
     cmp w3, w9
     b.eq .Lasm_JumpLooselyEqualsRhsInt32.ssa_block_10
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_JumpLooselyEqualsRhsInt32.ssa_block_1
     lsr x1, x2, #48
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_JumpLooselyEqualsRhsInt32.ssa_block_1
     b .Lasm_JumpLooselyEqualsRhsInt32.ssa_block_4
 .Lasm_JumpLooselyEqualsRhsInt32.ssa_block_10:
@@ -212227,11 +212410,13 @@ asm_handler_JumpLooselyInequalsRhsInt32:
     cmp w3, w9
     b.eq .Lasm_JumpLooselyInequalsRhsInt32.ssa_block_10
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_JumpLooselyInequalsRhsInt32.ssa_block_1
     lsr x1, x2, #48
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_JumpLooselyInequalsRhsInt32.ssa_block_1
     b .Lasm_JumpLooselyInequalsRhsInt32.ssa_block_4
 .Lasm_JumpLooselyInequalsRhsInt32.ssa_block_10:
@@ -212306,7 +212491,8 @@ asm_handler_Add_cold:
     br x10
 .Lasm_Add.ssa_block_8:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_Add.ssa_block_1
     sxtw x1, w1
     fmov d1, x0
@@ -212314,7 +212500,8 @@ asm_handler_Add_cold:
     b .Lasm_Add.ssa_block_2
 .Lasm_Add.ssa_block_5:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_Add.ssa_block_1
     lsr x2, x0, #48
     fmov d0, x1
@@ -212325,7 +212512,8 @@ asm_handler_Add_cold:
     b .Lasm_Add.ssa_block_2
 .Lasm_Add.ssa_block_13:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_Add.ssa_block_1
     fmov d1, x0
 .Lasm_Add.ssa_block_2:
@@ -212395,7 +212583,8 @@ asm_handler_Sub_cold:
     br x10
 .Lasm_Sub.ssa_block_8:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_Sub.ssa_block_1
     sxtw x1, w1
     fmov d1, x0
@@ -212403,7 +212592,8 @@ asm_handler_Sub_cold:
     b .Lasm_Sub.ssa_block_2
 .Lasm_Sub.ssa_block_5:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_Sub.ssa_block_1
     lsr x2, x0, #48
     fmov d0, x1
@@ -212414,7 +212604,8 @@ asm_handler_Sub_cold:
     b .Lasm_Sub.ssa_block_2
 .Lasm_Sub.ssa_block_13:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_Sub.ssa_block_1
     fmov d1, x0
 .Lasm_Sub.ssa_block_2:
@@ -212483,7 +212674,8 @@ asm_handler_Mul_cold:
     br x10
 .Lasm_Mul.ssa_block_9:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_Mul.ssa_block_1
     sxtw x1, w1
     fmov d1, x0
@@ -212491,7 +212683,8 @@ asm_handler_Mul_cold:
     b .Lasm_Mul.ssa_block_2
 .Lasm_Mul.ssa_block_6:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_Mul.ssa_block_1
     lsr x2, x0, #48
     fmov d0, x1
@@ -212502,7 +212695,8 @@ asm_handler_Mul_cold:
     b .Lasm_Mul.ssa_block_2
 .Lasm_Mul.ssa_block_16:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_Mul.ssa_block_1
     fmov d1, x0
 .Lasm_Mul.ssa_block_2:
@@ -212660,14 +212854,16 @@ asm_handler_JumpLessThan_cold:
 // Cold paths for JumpLessThan
 .Lasm_JumpLessThan.ssa_block_11:
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_JumpLessThan.ssa_block_1
     fmov d1, x0
     scvtf d0, w2
     b .Lasm_JumpLessThan.ssa_block_4
 .Lasm_JumpLessThan.ssa_block_8:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_JumpLessThan.ssa_block_1
     lsr x2, x0, #48
     fmov d0, x1
@@ -212678,7 +212874,8 @@ asm_handler_JumpLessThan_cold:
     b .Lasm_JumpLessThan.ssa_block_4
 .Lasm_JumpLessThan.ssa_block_18:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_JumpLessThan.ssa_block_1
     fmov d1, x0
 .Lasm_JumpLessThan.ssa_block_4:
@@ -212711,14 +212908,16 @@ asm_handler_JumpGreaterThan_cold:
 // Cold paths for JumpGreaterThan
 .Lasm_JumpGreaterThan.ssa_block_11:
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_JumpGreaterThan.ssa_block_1
     fmov d1, x0
     scvtf d0, w2
     b .Lasm_JumpGreaterThan.ssa_block_4
 .Lasm_JumpGreaterThan.ssa_block_8:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_JumpGreaterThan.ssa_block_1
     lsr x2, x0, #48
     fmov d0, x1
@@ -212729,7 +212928,8 @@ asm_handler_JumpGreaterThan_cold:
     b .Lasm_JumpGreaterThan.ssa_block_4
 .Lasm_JumpGreaterThan.ssa_block_18:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_JumpGreaterThan.ssa_block_1
     fmov d1, x0
 .Lasm_JumpGreaterThan.ssa_block_4:
@@ -212762,14 +212962,16 @@ asm_handler_JumpLessThanEquals_cold:
 // Cold paths for JumpLessThanEquals
 .Lasm_JumpLessThanEquals.ssa_block_11:
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_JumpLessThanEquals.ssa_block_1
     fmov d1, x0
     scvtf d0, w2
     b .Lasm_JumpLessThanEquals.ssa_block_4
 .Lasm_JumpLessThanEquals.ssa_block_8:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_JumpLessThanEquals.ssa_block_1
     lsr x2, x0, #48
     fmov d0, x1
@@ -212780,7 +212982,8 @@ asm_handler_JumpLessThanEquals_cold:
     b .Lasm_JumpLessThanEquals.ssa_block_4
 .Lasm_JumpLessThanEquals.ssa_block_18:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_JumpLessThanEquals.ssa_block_1
     fmov d1, x0
 .Lasm_JumpLessThanEquals.ssa_block_4:
@@ -212813,14 +213016,16 @@ asm_handler_JumpGreaterThanEquals_cold:
 // Cold paths for JumpGreaterThanEquals
 .Lasm_JumpGreaterThanEquals.ssa_block_11:
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_JumpGreaterThanEquals.ssa_block_1
     fmov d1, x0
     scvtf d0, w2
     b .Lasm_JumpGreaterThanEquals.ssa_block_4
 .Lasm_JumpGreaterThanEquals.ssa_block_8:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_JumpGreaterThanEquals.ssa_block_1
     lsr x2, x0, #48
     fmov d0, x1
@@ -212831,7 +213036,8 @@ asm_handler_JumpGreaterThanEquals_cold:
     b .Lasm_JumpGreaterThanEquals.ssa_block_4
 .Lasm_JumpGreaterThanEquals.ssa_block_18:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_JumpGreaterThanEquals.ssa_block_1
     fmov d1, x0
 .Lasm_JumpGreaterThanEquals.ssa_block_4:
@@ -212864,7 +213070,8 @@ asm_handler_JumpLooselyEquals_cold:
 // Cold paths for JumpLooselyEquals
 .Lasm_JumpLooselyEquals.ssa_block_19:
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_JumpLooselyEquals.ssa_block_1
     fmov d0, x0
     scvtf d1, w1
@@ -212897,7 +213104,8 @@ asm_handler_JumpLooselyInequals_cold:
 // Cold paths for JumpLooselyInequals
 .Lasm_JumpLooselyInequals.ssa_block_19:
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_JumpLooselyInequals.ssa_block_1
     fmov d0, x0
     scvtf d1, w1
@@ -212930,7 +213138,8 @@ asm_handler_JumpStrictlyEquals_cold:
 // Cold paths for JumpStrictlyEquals
 .Lasm_JumpStrictlyEquals.ssa_block_17:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_JumpStrictlyEquals.ssa_block_3
     fmov d0, x0
     scvtf d1, w1
@@ -212963,7 +213172,8 @@ asm_handler_JumpStrictlyInequals_cold:
 // Cold paths for JumpStrictlyInequals
 .Lasm_JumpStrictlyInequals.ssa_block_17:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_JumpStrictlyInequals.ssa_block_2
     fmov d0, x0
     scvtf d1, w1
@@ -213577,14 +213787,16 @@ asm_handler_LessThan_cold:
 // Cold paths for LessThan
 .Lasm_LessThan.ssa_block_11:
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_LessThan.ssa_block_3
     fmov d1, x0
     scvtf d0, w2
     b .Lasm_LessThan.ssa_block_4
 .Lasm_LessThan.ssa_block_8:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_LessThan.ssa_block_3
     lsr x2, x0, #48
     fmov d0, x1
@@ -213595,7 +213807,8 @@ asm_handler_LessThan_cold:
     b .Lasm_LessThan.ssa_block_4
 .Lasm_LessThan.ssa_block_18:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_LessThan.ssa_block_3
     fmov d1, x0
 .Lasm_LessThan.ssa_block_4:
@@ -213625,14 +213838,16 @@ asm_handler_LessThanEquals_cold:
 // Cold paths for LessThanEquals
 .Lasm_LessThanEquals.ssa_block_11:
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_LessThanEquals.ssa_block_3
     fmov d1, x0
     scvtf d0, w2
     b .Lasm_LessThanEquals.ssa_block_4
 .Lasm_LessThanEquals.ssa_block_8:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_LessThanEquals.ssa_block_3
     lsr x2, x0, #48
     fmov d0, x1
@@ -213643,7 +213858,8 @@ asm_handler_LessThanEquals_cold:
     b .Lasm_LessThanEquals.ssa_block_4
 .Lasm_LessThanEquals.ssa_block_18:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_LessThanEquals.ssa_block_3
     fmov d1, x0
 .Lasm_LessThanEquals.ssa_block_4:
@@ -213673,14 +213889,16 @@ asm_handler_GreaterThan_cold:
 // Cold paths for GreaterThan
 .Lasm_GreaterThan.ssa_block_11:
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_GreaterThan.ssa_block_3
     fmov d1, x0
     scvtf d0, w2
     b .Lasm_GreaterThan.ssa_block_4
 .Lasm_GreaterThan.ssa_block_8:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_GreaterThan.ssa_block_3
     lsr x2, x0, #48
     fmov d0, x1
@@ -213691,7 +213909,8 @@ asm_handler_GreaterThan_cold:
     b .Lasm_GreaterThan.ssa_block_4
 .Lasm_GreaterThan.ssa_block_18:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_GreaterThan.ssa_block_3
     fmov d1, x0
 .Lasm_GreaterThan.ssa_block_4:
@@ -213721,14 +213940,16 @@ asm_handler_GreaterThanEquals_cold:
 // Cold paths for GreaterThanEquals
 .Lasm_GreaterThanEquals.ssa_block_11:
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_GreaterThanEquals.ssa_block_3
     fmov d1, x0
     scvtf d0, w2
     b .Lasm_GreaterThanEquals.ssa_block_4
 .Lasm_GreaterThanEquals.ssa_block_8:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_GreaterThanEquals.ssa_block_3
     lsr x2, x0, #48
     fmov d0, x1
@@ -213739,7 +213960,8 @@ asm_handler_GreaterThanEquals_cold:
     b .Lasm_GreaterThanEquals.ssa_block_4
 .Lasm_GreaterThanEquals.ssa_block_18:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_GreaterThanEquals.ssa_block_3
     fmov d1, x0
 .Lasm_GreaterThanEquals.ssa_block_4:
@@ -213772,7 +213994,8 @@ asm_handler_BitwiseXor_cold:
     ccmp x2, x23, #4, ne
     b.eq .Lasm_BitwiseXor.ssa_block_5
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_BitwiseXor.ssa_block_1
     fmov d0, x1
     fcvtzs w2, d0
@@ -213788,7 +214011,8 @@ asm_handler_BitwiseXor_cold:
     ccmp x3, x23, #4, ne
     b.eq .Lasm_BitwiseXor.ssa_block_10
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_BitwiseXor.ssa_block_1
     fmov d0, x0
     fcvtzs w3, d0
@@ -213829,7 +214053,8 @@ asm_handler_UnaryPlus_cold:
 // Cold paths for UnaryPlus
 .Lasm_UnaryPlus.ssa_block_4:
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.ne .Lasm_UnaryPlus.ssa_block_2
     mov x0, x20
     sub w1, w21, w26
@@ -214132,7 +214357,8 @@ asm_handler_BitwiseAnd_cold:
     ccmp x2, x23, #4, ne
     b.eq .Lasm_BitwiseAnd.ssa_block_5
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_BitwiseAnd.ssa_block_1
     fmov d0, x1
     fcvtzs w2, d0
@@ -214148,7 +214374,8 @@ asm_handler_BitwiseAnd_cold:
     ccmp x3, x23, #4, ne
     b.eq .Lasm_BitwiseAnd.ssa_block_10
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_BitwiseAnd.ssa_block_1
     fmov d0, x0
     fcvtzs w3, d0
@@ -214192,7 +214419,8 @@ asm_handler_BitwiseOr_cold:
     ccmp x2, x23, #4, ne
     b.eq .Lasm_BitwiseOr.ssa_block_5
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_BitwiseOr.ssa_block_1
     fmov d0, x1
     fcvtzs w2, d0
@@ -214208,7 +214436,8 @@ asm_handler_BitwiseOr_cold:
     ccmp x3, x23, #4, ne
     b.eq .Lasm_BitwiseOr.ssa_block_10
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_BitwiseOr.ssa_block_1
     fmov d0, x0
     fcvtzs w3, d0
@@ -214338,7 +214567,8 @@ asm_handler_StrictlyEquals_cold:
 // Cold paths for StrictlyEquals
 .Lasm_StrictlyEquals.ssa_block_17:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_StrictlyEquals.ssa_block_3
     fmov d0, x0
     scvtf d1, w1
@@ -214368,7 +214598,8 @@ asm_handler_StrictlyInequals_cold:
 // Cold paths for StrictlyInequals
 .Lasm_StrictlyInequals.ssa_block_17:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_StrictlyInequals.ssa_block_2
     fmov d0, x0
     scvtf d1, w1
@@ -214434,7 +214665,8 @@ asm_handler_LooselyEquals_cold:
 // Cold paths for LooselyEquals
 .Lasm_LooselyEquals.ssa_block_19:
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_LooselyEquals.ssa_block_1
     fmov d0, x0
     scvtf d1, w1
@@ -214465,7 +214697,8 @@ asm_handler_LooselyInequals_cold:
 // Cold paths for LooselyInequals
 .Lasm_LooselyInequals.ssa_block_19:
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_LooselyInequals.ssa_block_1
     fmov d0, x0
     scvtf d1, w1
@@ -214507,7 +214740,8 @@ asm_handler_UnaryMinus_cold:
     br x10
 .Lasm_UnaryMinus.ssa_block_6:
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_UnaryMinus.ssa_block_5
     eor x0, x0, #0x8000000000000000
     ldr w9, [x21, #4]
@@ -214580,7 +214814,8 @@ asm_handler_ToInt32_cold:
     ccmp x1, x23, #4, ne
     b.eq .Lasm_ToInt32.ssa_block_4
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_ToInt32.ssa_block_1
     fmov d0, x0
     fcvtzs w0, d0
@@ -214676,7 +214911,8 @@ asm_handler_PutByValue_cold_end:
 asm_handler_GetById_cold:
 // Cold paths for GetById
 .Lasm_GetById.ssa_block_8:
-    and x1, x1, #0xffffffffffff
+    and x1, x1, #0x3ffffffffff
+    add x1, x1, x24
     ldr x1, [x1, #16]
     cbz x1, .Lasm_GetById.ssa_block_5
     ldrh w3, [x1, #10]
@@ -216499,7 +216735,8 @@ asm_handler_AddLhsInt32_cold:
 // Cold paths for AddLhsInt32
 .Lasm_AddLhsInt32.ssa_block_6:
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.ne .Lasm_AddLhsInt32.ssa_block_5
     ldr w1, [x21, #8]
     movk x1, #0x7ffa, lsl #48
@@ -216586,7 +216823,8 @@ asm_handler_AddRhsInt32_cold:
     br x10
 .Lasm_AddRhsInt32.ssa_block_5:
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_AddRhsInt32.ssa_block_1
     fmov d0, x0
     ldr w0, [x21, #12]
@@ -216660,7 +216898,8 @@ asm_handler_SubRhsInt32_cold:
     br x10
 .Lasm_SubRhsInt32.ssa_block_5:
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.eq .Lasm_SubRhsInt32.ssa_block_1
     fmov d0, x0
     ldr w0, [x21, #12]
@@ -216719,7 +216958,8 @@ asm_handler_MulRhsInt32_cold:
 // Cold paths for MulRhsInt32
 .Lasm_MulRhsInt32.ssa_block_6:
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.ne .Lasm_MulRhsInt32.ssa_block_12
     ldr w1, [x21, #12]
     movk x1, #0x7ffa, lsl #48
@@ -216832,7 +217072,8 @@ asm_handler_BitwiseXorRhsInt32_cold:
     ccmp x2, x23, #4, ne
     b.eq .Lasm_BitwiseXorRhsInt32.ssa_block_5
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_BitwiseXorRhsInt32.ssa_block_1
     fmov d0, x0
     fcvtzs w2, d0
@@ -216848,7 +217089,8 @@ asm_handler_BitwiseXorRhsInt32_cold:
     ccmp x3, x23, #4, ne
     b.eq .Lasm_BitwiseXorRhsInt32.ssa_block_10
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_BitwiseXorRhsInt32.ssa_block_1
     fmov d0, x1
     fcvtzs w3, d0
@@ -216895,7 +217137,8 @@ asm_handler_BitwiseAndRhsInt32_cold:
     ccmp x2, x23, #4, ne
     b.eq .Lasm_BitwiseAndRhsInt32.ssa_block_5
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_BitwiseAndRhsInt32.ssa_block_1
     fmov d0, x0
     fcvtzs w2, d0
@@ -216911,7 +217154,8 @@ asm_handler_BitwiseAndRhsInt32_cold:
     ccmp x3, x23, #4, ne
     b.eq .Lasm_BitwiseAndRhsInt32.ssa_block_10
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_BitwiseAndRhsInt32.ssa_block_1
     fmov d0, x1
     fcvtzs w3, d0
@@ -216958,7 +217202,8 @@ asm_handler_BitwiseOrRhsInt32_cold:
     ccmp x2, x23, #4, ne
     b.eq .Lasm_BitwiseOrRhsInt32.ssa_block_5
     and w2, w2, #0x7ff8
-    cmp w2, w24
+    mov w9, #32760
+    cmp w2, w9
     b.eq .Lasm_BitwiseOrRhsInt32.ssa_block_1
     fmov d0, x0
     fcvtzs w2, d0
@@ -216974,7 +217219,8 @@ asm_handler_BitwiseOrRhsInt32_cold:
     ccmp x3, x23, #4, ne
     b.eq .Lasm_BitwiseOrRhsInt32.ssa_block_10
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_BitwiseOrRhsInt32.ssa_block_1
     fmov d0, x1
     fcvtzs w3, d0
@@ -217112,7 +217358,8 @@ asm_handler_LessThanRhsInt32_cold:
 // Cold paths for LessThanRhsInt32
 .Lasm_LessThanRhsInt32.ssa_block_8:
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.ne .Lasm_LessThanRhsInt32.ssa_block_14
     ldr w1, [x21, #12]
     movk x1, #0x7ffa, lsl #48
@@ -217145,7 +217392,8 @@ asm_handler_LessThanEqualsRhsInt32_cold:
 // Cold paths for LessThanEqualsRhsInt32
 .Lasm_LessThanEqualsRhsInt32.ssa_block_8:
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.ne .Lasm_LessThanEqualsRhsInt32.ssa_block_14
     ldr w1, [x21, #12]
     movk x1, #0x7ffa, lsl #48
@@ -217178,7 +217426,8 @@ asm_handler_GreaterThanRhsInt32_cold:
 // Cold paths for GreaterThanRhsInt32
 .Lasm_GreaterThanRhsInt32.ssa_block_8:
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.ne .Lasm_GreaterThanRhsInt32.ssa_block_14
     ldr w1, [x21, #12]
     movk x1, #0x7ffa, lsl #48
@@ -217211,7 +217460,8 @@ asm_handler_GreaterThanEqualsRhsInt32_cold:
 // Cold paths for GreaterThanEqualsRhsInt32
 .Lasm_GreaterThanEqualsRhsInt32.ssa_block_8:
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.ne .Lasm_GreaterThanEqualsRhsInt32.ssa_block_14
     ldr w1, [x21, #12]
     movk x1, #0x7ffa, lsl #48
@@ -217244,7 +217494,8 @@ asm_handler_JumpLessThanRhsInt32_cold:
 // Cold paths for JumpLessThanRhsInt32
 .Lasm_JumpLessThanRhsInt32.ssa_block_8:
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.ne .Lasm_JumpLessThanRhsInt32.ssa_block_14
     ldr w1, [x21, #8]
     ldr w2, [x21, #12]
@@ -217280,7 +217531,8 @@ asm_handler_JumpLessThanEqualsRhsInt32_cold:
 // Cold paths for JumpLessThanEqualsRhsInt32
 .Lasm_JumpLessThanEqualsRhsInt32.ssa_block_8:
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.ne .Lasm_JumpLessThanEqualsRhsInt32.ssa_block_14
     ldr w1, [x21, #8]
     ldr w2, [x21, #12]
@@ -217316,7 +217568,8 @@ asm_handler_JumpGreaterThanRhsInt32_cold:
 // Cold paths for JumpGreaterThanRhsInt32
 .Lasm_JumpGreaterThanRhsInt32.ssa_block_8:
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.ne .Lasm_JumpGreaterThanRhsInt32.ssa_block_14
     ldr w1, [x21, #8]
     ldr w2, [x21, #12]
@@ -217352,7 +217605,8 @@ asm_handler_JumpGreaterThanEqualsRhsInt32_cold:
 // Cold paths for JumpGreaterThanEqualsRhsInt32
 .Lasm_JumpGreaterThanEqualsRhsInt32.ssa_block_8:
     and w1, w1, #0x7ff8
-    cmp w1, w24
+    mov w9, #32760
+    cmp w1, w9
     b.ne .Lasm_JumpGreaterThanEqualsRhsInt32.ssa_block_14
     ldr w1, [x21, #8]
     ldr w2, [x21, #12]
@@ -217388,7 +217642,8 @@ asm_handler_StrictlyEqualsRhsInt32_cold:
 // Cold paths for StrictlyEqualsRhsInt32
 .Lasm_StrictlyEqualsRhsInt32.ssa_block_17:
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_StrictlyEqualsRhsInt32.ssa_block_3
     fmov d0, x0
     scvtf d1, w1
@@ -217419,7 +217674,8 @@ asm_handler_StrictlyInequalsRhsInt32_cold:
 // Cold paths for StrictlyInequalsRhsInt32
 .Lasm_StrictlyInequalsRhsInt32.ssa_block_17:
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_StrictlyInequalsRhsInt32.ssa_block_2
     fmov d0, x0
     scvtf d1, w1
@@ -217450,7 +217706,8 @@ asm_handler_LooselyEqualsRhsInt32_cold:
 // Cold paths for LooselyEqualsRhsInt32
 .Lasm_LooselyEqualsRhsInt32.ssa_block_19:
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_LooselyEqualsRhsInt32.ssa_block_1
     fmov d0, x0
     scvtf d1, w1
@@ -217481,7 +217738,8 @@ asm_handler_LooselyInequalsRhsInt32_cold:
 // Cold paths for LooselyInequalsRhsInt32
 .Lasm_LooselyInequalsRhsInt32.ssa_block_19:
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_LooselyInequalsRhsInt32.ssa_block_1
     fmov d0, x0
     scvtf d1, w1
@@ -217512,7 +217770,8 @@ asm_handler_JumpStrictlyEqualsRhsInt32_cold:
 // Cold paths for JumpStrictlyEqualsRhsInt32
 .Lasm_JumpStrictlyEqualsRhsInt32.ssa_block_17:
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_JumpStrictlyEqualsRhsInt32.ssa_block_3
     fmov d0, x0
     scvtf d1, w1
@@ -217545,7 +217804,8 @@ asm_handler_JumpStrictlyInequalsRhsInt32_cold:
 // Cold paths for JumpStrictlyInequalsRhsInt32
 .Lasm_JumpStrictlyInequalsRhsInt32.ssa_block_17:
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_JumpStrictlyInequalsRhsInt32.ssa_block_2
     fmov d0, x0
     scvtf d1, w1
@@ -217578,7 +217838,8 @@ asm_handler_JumpLooselyEqualsRhsInt32_cold:
 // Cold paths for JumpLooselyEqualsRhsInt32
 .Lasm_JumpLooselyEqualsRhsInt32.ssa_block_19:
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_JumpLooselyEqualsRhsInt32.ssa_block_1
     fmov d0, x0
     scvtf d1, w1
@@ -217611,7 +217872,8 @@ asm_handler_JumpLooselyInequalsRhsInt32_cold:
 // Cold paths for JumpLooselyInequalsRhsInt32
 .Lasm_JumpLooselyInequalsRhsInt32.ssa_block_19:
     and w3, w3, #0x7ff8
-    cmp w3, w24
+    mov w9, #32760
+    cmp w3, w9
     b.eq .Lasm_JumpLooselyInequalsRhsInt32.ssa_block_1
     fmov d0, x0
     scvtf d1, w1
@@ -219251,9 +219513,9 @@ CSYM(js_interpreter):
     mov r14, rdi          # pb = bytecode base
     mov r13d, esi         # pc = entry_point
     mov rbx, rdx          # values
-    movabs r15, 9221683186994511872  # INT32_TAG_SHIFTED
+    mov r15, QWORD PTR [rcx + 16664]  # heap region base
     mov QWORD PTR [rbp - 48], rcx  # save VM*
-    cmp QWORD PTR [rcx + 16712], 0
+    cmp QWORD PTR [rcx + 16720], 0
     lea r12, [rip + asm_dispatch_table]
     je .Ldispatch_table_ready
     lea r12, [rip + asm_debug_dispatch_table]
@@ -219327,7 +219589,8 @@ asm_handler_Add:
     jne .Lasm_Add.ssa_block_8
     add edx, ecx
     jo .Lasm_Add.ssa_checked_6_failure
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -219351,7 +219614,8 @@ asm_handler_Sub:
     jne .Lasm_Sub.ssa_block_8
     sub edx, ecx
     jo .Lasm_Sub.ssa_checked_6_failure
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -219381,7 +219645,8 @@ asm_handler_Mul:
     or ecx, edx
     js .Lasm_Mul.ssa_block_3
 .Lasm_Mul.ssa_block_13:
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
@@ -219999,7 +220264,8 @@ asm_handler_Increment:
     jne .Lasm_Increment.ssa_block_2
     inc ecx
     jo .Lasm_Increment.ssa_block_1
-    or rcx, r15
+    movabs r11, 9221683186994511872
+    or rcx, r11
     mov QWORD PTR [rbx + rax * 8], rcx
     add r13d, 8
     movzx eax, BYTE PTR [r14 + r13]
@@ -220016,7 +220282,8 @@ asm_handler_Decrement:
     jne .Lasm_Decrement.ssa_block_2
     dec ecx
     jo .Lasm_Decrement.ssa_block_1
-    or rcx, r15
+    movabs r11, 9221683186994511872
+    or rcx, r11
     mov QWORD PTR [rbx + rax * 8], rcx
     add r13d, 8
     movzx eax, BYTE PTR [r14 + r13]
@@ -220152,11 +220419,13 @@ asm_handler_End_hot_end:
 
 .p2align 6
 asm_handler_GetLexicalEnvironment:
-    mov rax, QWORD PTR [rbx - 88]
-    movabs rcx, -2251799813685248
-    or rax, rcx
+    mov rcx, QWORD PTR [rbx - 88]
+    movabs rax, 4398046511103
+    and rcx, rax
+    movabs rax, -2251799813685248
+    or rcx, rax
     mov r11d, DWORD PTR [r14 + r13 + 4]
-    mov QWORD PTR [rbx + r11 * 8], rax
+    mov QWORD PTR [rbx + r11 * 8], rcx
     add r13d, 8
     movzx eax, BYTE PTR [r14 + r13]
     jmp [r12 + rax * 8]
@@ -220166,8 +220435,9 @@ asm_handler_GetLexicalEnvironment_hot_end:
 asm_handler_SetLexicalEnvironment:
     mov eax, DWORD PTR [r14 + r13 + 4]
     mov rax, QWORD PTR [rbx + rax * 8]
-    shl rax, 16
-    shr rax, 16
+    movabs r11, 4398046511103
+    and rax, r11
+    add rax, r15
     mov QWORD PTR [rbx - 88], rax
     add r13d, 8
     movzx eax, BYTE PTR [r14 + r13]
@@ -220672,7 +220942,8 @@ asm_handler_PostfixIncrement:
     mov QWORD PTR [rbx + r11 * 8], rcx
     inc ecx
     jo .Lasm_PostfixIncrement.ssa_block_1
-    or rcx, r15
+    movabs r11, 9221683186994511872
+    or rcx, r11
     mov QWORD PTR [rbx + rax * 8], rcx
     add r13d, 16
     movzx eax, BYTE PTR [r14 + r13]
@@ -220721,7 +220992,8 @@ asm_handler_Div:
     test eax, eax
     jz .Lasm_Div.ssa_block_2
 .Lasm_Div.ssa_block_3:
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
@@ -220890,7 +221162,8 @@ asm_handler_BitwiseXor:
     cmp r11w, 32762
     jne .Lasm_BitwiseXor.ssa_block_2
     xor esi, edx
-    or rsi, r15
+    movabs r11, 9221683186994511872
+    or rsi, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rsi
     add r13d, 16
@@ -220961,7 +221234,8 @@ asm_handler_BitwiseNot:
     cmp r11w, 32762
     jne .Lasm_BitwiseNot.ssa_block_2
     not eax
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
@@ -220984,7 +221258,8 @@ asm_handler_BitwiseAnd:
     cmp r11w, 32762
     jne .Lasm_BitwiseAnd.ssa_block_2
     and esi, edx
-    or rsi, r15
+    movabs r11, 9221683186994511872
+    or rsi, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rsi
     add r13d, 16
@@ -221007,7 +221282,8 @@ asm_handler_BitwiseOr:
     cmp r11w, 32762
     jne .Lasm_BitwiseOr.ssa_block_2
     or esi, edx
-    or rsi, r15
+    movabs r11, 9221683186994511872
+    or rsi, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rsi
     add r13d, 16
@@ -221030,7 +221306,8 @@ asm_handler_LeftShift:
     cmp r11w, 32762
     jne .Lasm_LeftShift.ssa_block_1
     shl edx, cl
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -221053,7 +221330,8 @@ asm_handler_RightShift:
     cmp r11w, 32762
     jne .Lasm_RightShift.ssa_block_1
     sar edx, cl
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -221078,7 +221356,8 @@ asm_handler_UnsignedRightShift:
     shr edx, cl
     test edx, edx
     js .Lasm_UnsignedRightShift.ssa_block_2
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -221107,7 +221386,8 @@ asm_handler_Mod:
     mov eax, ecx
     cdq
     idiv esi
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -221552,7 +221832,8 @@ asm_handler_UnaryMinus:
     jz .Lasm_UnaryMinus.ssa_block_1
     neg eax
     jo .Lasm_UnaryMinus.ssa_block_2
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
@@ -221572,7 +221853,8 @@ asm_handler_PostfixDecrement:
     mov QWORD PTR [rbx + r11 * 8], rcx
     dec ecx
     jo .Lasm_PostfixDecrement.ssa_block_1
-    or rcx, r15
+    movabs r11, 9221683186994511872
+    or rcx, r11
     mov QWORD PTR [rbx + rax * 8], rcx
     add r13d, 16
     movzx eax, BYTE PTR [r14 + r13]
@@ -221611,8 +221893,9 @@ asm_handler_PutByValue:
     cmp r11w, 32762
     jne .Lasm_PutByValue.ssa_block_1
     mov eax, eax
-    shl rcx, 16
-    shr rcx, 16
+    movabs r11, 4398046511103
+    and rcx, r11
+    add rcx, r15
     movzx edx, WORD PTR [rcx + 10]
     test edx, 8
     jnz .Lasm_PutByValue.ssa_block_7
@@ -221866,42 +222149,43 @@ asm_handler_PutByValue_hot_end:
 .p2align 6
 asm_handler_GetById:
     mov eax, DWORD PTR [r14 + r13 + 8]
-    mov rsi, QWORD PTR [rbx + rax * 8]
-    mov r11, rsi
+    mov rdx, QWORD PTR [rbx + rax * 8]
+    mov r11, rdx
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_GetById.ssa_block_1
-    shl rsi, 16
-    shr rsi, 16
-    mov rcx, QWORD PTR [rsi + 24]
+    movabs r11, 4398046511103
+    and rdx, r11
+    add rdx, r15
+    mov rsi, QWORD PTR [rdx + 24]
     mov rax, QWORD PTR [rbx - 40]
     mov rax, QWORD PTR [rax + 112]
-    mov edx, DWORD PTR [r14 + r13 + 20]
-    mov rdx, QWORD PTR [rax + rdx * 8]
-    test rdx, rdx
+    mov ecx, DWORD PTR [r14 + r13 + 20]
+    mov rcx, QWORD PTR [rax + rcx * 8]
+    test rcx, rcx
     jz .Lasm_GetById.ssa_block_1
-    and rdx, -4
-    mov rdi, QWORD PTR [rdx + 24]
-    mov rax, QWORD PTR [rdx + 32]
-    cmp rdi, rcx
+    and rcx, -4
+    mov rdi, QWORD PTR [rcx + 24]
+    mov rax, QWORD PTR [rcx + 32]
+    cmp rdi, rsi
     jne .Lasm_GetById.ssa_block_1
-    mov edi, DWORD PTR [rdx]
+    mov edi, DWORD PTR [rcx]
     cmp edi, 6
     je .Lasm_GetById.ssa_block_1
     test rax, rax
     jnz .Lasm_GetById.ssa_block_10
-    mov rax, rsi
+    mov rax, rdx
     jmp .Lasm_GetById.ssa_block_11
 .Lasm_GetById.ssa_block_10:
-    mov rdi, QWORD PTR [rdx + 40]
+    mov rdi, QWORD PTR [rcx + 40]
     test rdi, rdi
     jz .Lasm_GetById.ssa_block_1
     cmp BYTE PTR [rdi + 10], 0
     jz .Lasm_GetById.ssa_block_1
 .Lasm_GetById.ssa_block_11:
-    mov edi, DWORD PTR [rdx + 4]
-    mov r8d, DWORD PTR [rdx + 8]
-    cmp DWORD PTR [rcx + 92], r8d
+    mov edi, DWORD PTR [rcx + 4]
+    mov r8d, DWORD PTR [rcx + 8]
+    cmp DWORD PTR [rsi + 92], r8d
     jne .Lasm_GetById.ssa_block_1
     mov rax, QWORD PTR [rax + 32]
     mov rax, QWORD PTR [rax + rdi * 8]
@@ -221915,57 +222199,57 @@ asm_handler_GetById:
     movzx eax, BYTE PTR [r14 + r13]
     jmp [r12 + rax * 8]
 .Lasm_GetById.ssa_block_13:
-    cmp BYTE PTR [rdx + 12], 0
+    cmp BYTE PTR [rcx + 12], 0
     jz .Lasm_GetById.ssa_block_3
-    mov eax, DWORD PTR [rcx + 108]
-    mov rax, QWORD PTR [rsi + rax * 8]
-    test rax, rax
+    mov ecx, DWORD PTR [rax + 108]
+    mov rcx, QWORD PTR [rdx + rcx * 8]
+    test rcx, rcx
     jz .Lasm_GetById.ssa_block_3
-    mov edx, DWORD PTR [rcx + 116]
-    mov r8, QWORD PTR [rax + rdx * 8]
+    mov esi, DWORD PTR [rax + 116]
+    mov r8, QWORD PTR [rcx + rsi * 8]
     test r8, r8
     jz .Lasm_GetById.ssa_block_3
-    mov edi, DWORD PTR [rcx + 120]
+    mov edi, DWORD PTR [rax + 120]
     mov r8, QWORD PTR [r8 + rdi * 8]
-    cmp r8, rsi
+    cmp r8, rdx
     jne .Lasm_GetById.ssa_block_3
-    mov ecx, DWORD PTR [rcx + 112]
-    mov rax, QWORD PTR [rax + rcx * 8]
+    mov eax, DWORD PTR [rax + 112]
+    mov rax, QWORD PTR [rcx + rax * 8]
     test rax, rax
     jnz .Lasm_GetById.ssa_block_25
-    movabs rax, 9223090561878065152
+    movabs rcx, 9223090561878065152
     jmp .Lasm_GetById.ssa_block_26
 .Lasm_GetById.ssa_block_25:
-    mov rax, QWORD PTR [rax + rdx * 8]
+    mov rax, QWORD PTR [rax + rsi * 8]
     test rax, rax
     jz .Lasm_GetById.ssa_block_3
-    mov rax, QWORD PTR [rax + rdi * 8]
-    test rax, rax
+    mov rcx, QWORD PTR [rax + rdi * 8]
+    test rcx, rcx
     jz .Lasm_GetById.ssa_block_3
-    movzx ecx, WORD PTR [rax + 10]
-    test ecx, 2048
+    movzx eax, WORD PTR [rcx + 10]
+    test eax, 2048
     jnz .Lasm_GetById.ssa_block_3
-    shl rax, 16
-    shr rax, 16
-    movabs rcx, -1970324836974592
-    or rax, rcx
+    movabs rax, 4398046511103
+    and rcx, rax
+    movabs rax, -1970324836974592
+    or rcx, rax
 .Lasm_GetById.ssa_block_26:
     mov r11d, DWORD PTR [r14 + r13 + 4]
-    mov QWORD PTR [rbx + r11 * 8], rax
+    mov QWORD PTR [rbx + r11 * 8], rcx
     add r13d, 24
     movzx eax, BYTE PTR [r14 + r13]
     jmp [r12 + rax * 8]
 .Lasm_GetById.ssa_block_14:
-    mov edx, DWORD PTR [rcx + 104]
-    mov rax, QWORD PTR [rbp - 48]
-    mov rax, QWORD PTR [rax + 16688]
-    shl rdx, 4
-    add rdx, rax
-    mov edi, DWORD PTR [rdx + 8]
-    mov rax, QWORD PTR [rbp - 48]
-    mov r9, QWORD PTR [rax + 15376]
-    mov rax, QWORD PTR [rax + 15368]
-    lea r8, [rax + 120]
+    mov esi, DWORD PTR [rax + 104]
+    mov rcx, QWORD PTR [rbp - 48]
+    mov rcx, QWORD PTR [rcx + 16696]
+    shl rsi, 4
+    add rsi, rcx
+    mov edi, DWORD PTR [rsi + 8]
+    mov rcx, QWORD PTR [rbp - 48]
+    mov r9, QWORD PTR [rcx + 15376]
+    mov rcx, QWORD PTR [rcx + 15368]
+    lea r8, [rcx + 120]
     cmp r8, r9
     ja .Lasm_GetById.ssa_block_3
     mov r9, QWORD PTR [rbp - 48]
@@ -221976,48 +222260,48 @@ asm_handler_GetById:
     ja .Lasm_GetById.ssa_block_3
     mov r9, QWORD PTR [rbp - 48]
     mov QWORD PTR [r9 + 15368], r8
-    mov DWORD PTR [rax + 108], edi
-    mov DWORD PTR [rax + 112], edi
-    mov DWORD PTR [rax + 96], 0
-    mov rdi, QWORD PTR [rcx + 24]
+    mov DWORD PTR [rcx + 108], edi
+    mov DWORD PTR [rcx + 112], edi
+    mov DWORD PTR [rcx + 96], 0
+    mov rdi, QWORD PTR [rax + 24]
     mov rdi, QWORD PTR [rdi + 16]
-    mov QWORD PTR [rax], rcx
-    mov QWORD PTR [rax + 8], rdi
-    mov rcx, QWORD PTR [rbx - 88]
+    mov QWORD PTR [rcx], rax
+    mov QWORD PTR [rcx + 8], rdi
+    mov rax, QWORD PTR [rbx - 88]
     mov rdi, QWORD PTR [rbx - 80]
-    mov QWORD PTR [rax + 32], rcx
-    mov QWORD PTR [rax + 40], rdi
-    mov rcx, QWORD PTR [rbx - 72]
-    mov QWORD PTR [rax + 48], rcx
-    shl rsi, 16
-    shr rsi, 16
-    movabs rcx, -1970324836974592
-    or rsi, rcx
-    mov QWORD PTR [rax + 72], rsi
-    xor rcx, rcx
-    lea rsi, [rax + 16]
-    mov QWORD PTR [rsi], rcx
-    mov QWORD PTR [rsi + 8], rcx
-    mov QWORD PTR [rax + 80], 0
-    mov DWORD PTR [rax + 56], 0
-    mov DWORD PTR [rax + 60], 0
-    mov DWORD PTR [rax + 64], 4294967295
-    mov BYTE PTR [rax + 68], 0
-    mov BYTE PTR [rax + 69], 0
-    mov BYTE PTR [rax + 70], 0
-    mov ecx, r13d
-    mov esi, DWORD PTR [r14 + r13 + 4]
+    mov QWORD PTR [rcx + 32], rax
+    mov QWORD PTR [rcx + 40], rdi
+    mov rax, QWORD PTR [rbx - 72]
+    mov QWORD PTR [rcx + 48], rax
+    movabs rax, 4398046511103
+    and rdx, rax
+    movabs rax, -1970324836974592
+    or rdx, rax
+    mov QWORD PTR [rcx + 72], rdx
+    xor rax, rax
+    lea rdx, [rcx + 16]
+    mov QWORD PTR [rdx], rax
+    mov QWORD PTR [rdx + 8], rax
+    mov QWORD PTR [rcx + 80], 0
+    mov DWORD PTR [rcx + 56], 0
+    mov DWORD PTR [rcx + 60], 0
+    mov DWORD PTR [rcx + 64], 4294967295
+    mov BYTE PTR [rcx + 68], 0
+    mov BYTE PTR [rcx + 69], 0
+    mov BYTE PTR [rcx + 70], 0
+    mov eax, r13d
+    mov edx, DWORD PTR [r14 + r13 + 4]
     mov edi, DWORD PTR [r14 + r13 + 8]
-    mov DWORD PTR [rbx - 64], ecx
+    mov DWORD PTR [rbx - 64], eax
     lea r11, [rbx - 120]
-    mov QWORD PTR [rax + 88], r11
-    lea rcx, [rcx + 1]
-    mov DWORD PTR [rax + 100], ecx
-    mov DWORD PTR [rax + 104], esi
-    mov rcx, QWORD PTR [rbp - 48]
-    mov QWORD PTR [rcx + 15288], rax
-    lea rbx, [rax + 120]
-    mov rdx, QWORD PTR [rdx]
+    mov QWORD PTR [rcx + 88], r11
+    lea rax, [rax + 1]
+    mov DWORD PTR [rcx + 100], eax
+    mov DWORD PTR [rcx + 104], edx
+    mov rax, QWORD PTR [rbp - 48]
+    mov QWORD PTR [rax + 15288], rcx
+    lea rbx, [rcx + 120]
+    mov rdx, QWORD PTR [rsi]
     mov r11, rdx
     mov rdi, QWORD PTR [rbp - 48]
     call r11
@@ -222070,8 +222354,9 @@ asm_handler_PutById:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_PutById.ssa_block_2
-    shl rsi, 16
-    shr rsi, 16
+    movabs r11, 4398046511103
+    and rsi, r11
+    add rsi, r15
     mov rdx, QWORD PTR [rsi + 24]
     mov rax, QWORD PTR [rbx - 40]
     mov rax, QWORD PTR [rax + 112]
@@ -222119,8 +222404,9 @@ asm_handler_GetByValue:
     cmp r11w, 32762
     jne .Lasm_GetByValue.ssa_block_1
     mov eax, eax
-    shl rsi, 16
-    shr rsi, 16
+    movabs r11, 4398046511103
+    and rsi, r11
+    add rsi, r15
     movzx ecx, WORD PTR [rsi + 10]
     test ecx, 8
     jnz .Lasm_GetByValue.ssa_block_13
@@ -222178,7 +222464,8 @@ asm_handler_GetByValue:
     and rdx, rax
     add rdx, rcx
     movzx eax, BYTE PTR [rdx]
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 24
@@ -222237,7 +222524,8 @@ asm_handler_GetByValue:
     test eax, eax
     js .Lasm_GetByValue.ssa_block_6
 .Lasm_GetByValue.ssa_block_5:
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 24
@@ -222278,7 +222566,8 @@ asm_handler_GetByValue:
     jp .Lasm_GetByValue.ssa_block_4
     jne .Lasm_GetByValue.ssa_block_4
 .Lasm_GetByValue.ssa_block_3:
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 24
@@ -222304,15 +222593,17 @@ asm_handler_GetLength:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_GetLength.ssa_block_1
-    shl rdx, 16
-    shr rdx, 16
+    movabs r11, 4398046511103
+    and rdx, r11
+    add rdx, r15
     movzx eax, WORD PTR [rdx + 10]
     test eax, 4
     jz .Lasm_GetLength.ssa_block_5
     mov eax, DWORD PTR [rdx + 16]
     test eax, eax
     js .Lasm_GetLength.ssa_block_2
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 24
@@ -222483,54 +222774,55 @@ asm_handler_Call:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_Call.ssa_block_1
-    shl rcx, 16
-    shr rcx, 16
+    movabs r11, 4398046511103
+    and rcx, r11
+    add rcx, r15
     movzx eax, WORD PTR [rcx + 10]
     test eax, 128
     jz .Lasm_Call.ssa_block_1
     test eax, 64
     jz .Lasm_Call.ssa_block_3
     mov rax, QWORD PTR [rcx + 80]
-    mov rdx, QWORD PTR [rax + 48]
-    mov rax, QWORD PTR [rax + 56]
-    bt rax, 32
+    mov r8, QWORD PTR [rax + 48]
+    mov rdx, QWORD PTR [rax + 56]
+    bt rdx, 32
     jnc .Lasm_Call.ssa_block_1
-    bt rax, 33
+    bt rdx, 33
     jc .Lasm_Call.ssa_block_2
     movabs r9, 9221964661971222528
-    bt rax, 34
+    bt rdx, 34
     jnc .Lasm_Call.ssa_block_9
-    mov esi, DWORD PTR [r14 + r13 + 16]
-    mov r9, QWORD PTR [rbx + rsi * 8]
-    bt rax, 35
+    mov eax, DWORD PTR [r14 + r13 + 16]
+    mov r9, QWORD PTR [rbx + rax * 8]
+    bt rdx, 35
     jc .Lasm_Call.ssa_block_9
-    mov rsi, r9
-    shr rsi, 48
-    mov rdi, rsi
-    and di, 65534
-    cmp di, 32766
+    mov rax, r9
+    shr rax, 48
+    mov rsi, rax
+    and si, 65534
+    cmp si, 32766
     jne .Lasm_Call.ssa_block_13
-    mov rsi, QWORD PTR [rcx + 24]
-    mov rsi, QWORD PTR [rsi + 16]
-    mov rsi, QWORD PTR [rsi + 40]
-    mov r9, QWORD PTR [rsi + 32]
-    shl r9, 16
-    shr r9, 16
-    movabs rsi, -1970324836974592
-    or r9, rsi
+    mov rax, QWORD PTR [rcx + 24]
+    mov rax, QWORD PTR [rax + 16]
+    mov rax, QWORD PTR [rax + 40]
+    mov r9, QWORD PTR [rax + 32]
+    movabs rax, 4398046511103
+    and r9, rax
+    movabs rax, -1970324836974592
+    or r9, rax
     jmp .Lasm_Call.ssa_block_9
 .Lasm_Call.ssa_block_13:
-    cmp si, 65529
+    cmp ax, 65529
     jne .Lasm_Call.ssa_block_2
 .Lasm_Call.ssa_block_9:
-    mov edi, DWORD PTR [r14 + r13 + 20]
-    mov esi, eax
-    cmp rsi, rdi
+    mov eax, DWORD PTR [r14 + r13 + 20]
+    mov esi, edx
+    cmp rsi, rax
     jae .Lasm_Call.ssa_block_35
-    mov rsi, rdi
+    mov rsi, rax
 .Lasm_Call.ssa_block_35:
-    mov edi, DWORD PTR [rdx + 364]
-    mov r10d, DWORD PTR [rdx + 368]
+    mov edi, DWORD PTR [r8 + 364]
+    mov r10d, DWORD PTR [r8 + 368]
     mov eax, 4294967295
     sub rax, r10
     cmp rax, rsi
@@ -222539,29 +222831,29 @@ asm_handler_Call:
     mov r11, QWORD PTR [rax + 15376]
     mov rax, QWORD PTR [rax + 15368]
     add r10, rsi
-    mov r8, r10
-    shl r8, 3
-    lea r8, [r8 + 120]
-    add r8, rax
-    cmp r8, r11
+    mov rdx, r10
+    shl rdx, 3
+    lea rdx, [rdx + 120]
+    add rdx, rax
+    cmp rdx, r11
     ja .Lasm_Call.ssa_block_1
     mov r11, QWORD PTR [rbp - 48]
-    mov QWORD PTR [r11 + 15368], r8
+    mov QWORD PTR [r11 + 15368], rdx
     mov DWORD PTR [rax + 108], r10d
     mov DWORD PTR [rax + 112], esi
-    mov r8d, DWORD PTR [r14 + r13 + 20]
-    mov DWORD PTR [rax + 96], r8d
-    mov r8, QWORD PTR [rcx + 24]
-    mov r8, QWORD PTR [r8 + 16]
+    mov edx, DWORD PTR [r14 + r13 + 20]
+    mov DWORD PTR [rax + 96], edx
+    mov rdx, QWORD PTR [rcx + 24]
+    mov rdx, QWORD PTR [rdx + 16]
     mov QWORD PTR [rax], rcx
-    mov QWORD PTR [rax + 8], r8
-    mov r8, QWORD PTR [rcx + 104]
+    mov QWORD PTR [rax + 8], rdx
+    mov rdx, QWORD PTR [rcx + 104]
     mov r10, QWORD PTR [rcx + 112]
-    mov QWORD PTR [rax + 32], r8
-    mov QWORD PTR [rax + 40], r8
+    mov QWORD PTR [rax + 32], rdx
+    mov QWORD PTR [rax + 40], rdx
     mov QWORD PTR [rax + 48], r10
     mov QWORD PTR [rax + 72], r9
-    mov QWORD PTR [rax + 80], rdx
+    mov QWORD PTR [rax + 80], r8
     movabs rdx, 9221964661971222528
     mov QWORD PTR [rax + 120], rdx
     mov QWORD PTR [rax + 128], rdx
@@ -222724,7 +223016,7 @@ asm_handler_Call:
     mov QWORD PTR [rdx + 15288], rax
     lea rbx, [rax + 120]
     mov eax, DWORD PTR [rcx + 104]
-    mov rcx, QWORD PTR [rdx + 16688]
+    mov rcx, QWORD PTR [rdx + 16696]
     shl rax, 4
     add rax, rcx
     mov ecx, DWORD PTR [rax + 8]
@@ -222774,8 +223066,9 @@ asm_handler_CallBuiltinMathAbs:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_CallBuiltinMathAbs.ssa_block_1
-    shl rax, 16
-    shr rax, 16
+    movabs r11, 4398046511103
+    and rax, r11
+    add rax, r15
     movzx ecx, WORD PTR [rax + 10]
     test ecx, 128
     jz .Lasm_CallBuiltinMathAbs.ssa_block_1
@@ -222806,7 +223099,8 @@ asm_handler_CallBuiltinMathAbs:
     neg ecx
     jo .Lasm_CallBuiltinMathAbs.ssa_block_2
 .Lasm_CallBuiltinMathAbs.ssa_block_7:
-    or rcx, r15
+    movabs r11, 9221683186994511872
+    or rcx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rcx
     add r13d, 24
@@ -222822,8 +223116,9 @@ asm_handler_CallBuiltinMathFloor:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_CallBuiltinMathFloor.ssa_block_1
-    shl rax, 16
-    shr rax, 16
+    movabs r11, 4398046511103
+    and rax, r11
+    add rax, r15
     movzx ecx, WORD PTR [rax + 10]
     test ecx, 128
     jz .Lasm_CallBuiltinMathFloor.ssa_block_1
@@ -222849,14 +223144,16 @@ asm_handler_CallBuiltinMathFloor:
     test rdx, rdx
     jz .Lasm_CallBuiltinMathFloor.ssa_box_number_7_check_negative_zero
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_CallBuiltinMathFloor.ssa_box_number_7_done
 .Lasm_CallBuiltinMathFloor.ssa_box_number_7_check_negative_zero:
     movq rax, xmm0
     test rax, rax
     js .Lasm_CallBuiltinMathFloor.ssa_box_number_7_not_integer
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_CallBuiltinMathFloor.ssa_box_number_7_done
 .Lasm_CallBuiltinMathFloor.ssa_box_number_7_not_integer:
     movq rax, xmm0
@@ -222879,8 +223176,9 @@ asm_handler_CallBuiltinMathCeil:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_CallBuiltinMathCeil.ssa_block_1
-    shl rax, 16
-    shr rax, 16
+    movabs r11, 4398046511103
+    and rax, r11
+    add rax, r15
     movzx ecx, WORD PTR [rax + 10]
     test ecx, 128
     jz .Lasm_CallBuiltinMathCeil.ssa_block_1
@@ -222906,14 +223204,16 @@ asm_handler_CallBuiltinMathCeil:
     test rdx, rdx
     jz .Lasm_CallBuiltinMathCeil.ssa_box_number_7_check_negative_zero
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_CallBuiltinMathCeil.ssa_box_number_7_done
 .Lasm_CallBuiltinMathCeil.ssa_box_number_7_check_negative_zero:
     movq rax, xmm0
     test rax, rax
     js .Lasm_CallBuiltinMathCeil.ssa_box_number_7_not_integer
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_CallBuiltinMathCeil.ssa_box_number_7_done
 .Lasm_CallBuiltinMathCeil.ssa_box_number_7_not_integer:
     movq rax, xmm0
@@ -222936,8 +223236,9 @@ asm_handler_CallBuiltinMathSqrt:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_CallBuiltinMathSqrt.ssa_block_1
-    shl rax, 16
-    shr rax, 16
+    movabs r11, 4398046511103
+    and rax, r11
+    add rax, r15
     movzx ecx, WORD PTR [rax + 10]
     test ecx, 128
     jz .Lasm_CallBuiltinMathSqrt.ssa_block_1
@@ -222963,14 +223264,16 @@ asm_handler_CallBuiltinMathSqrt:
     test rdx, rdx
     jz .Lasm_CallBuiltinMathSqrt.ssa_box_number_7_check_negative_zero
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_CallBuiltinMathSqrt.ssa_box_number_7_done
 .Lasm_CallBuiltinMathSqrt.ssa_box_number_7_check_negative_zero:
     movq rax, xmm0
     test rax, rax
     js .Lasm_CallBuiltinMathSqrt.ssa_box_number_7_not_integer
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_CallBuiltinMathSqrt.ssa_box_number_7_done
 .Lasm_CallBuiltinMathSqrt.ssa_box_number_7_not_integer:
     movq rax, xmm0
@@ -222993,8 +223296,9 @@ asm_handler_CallBuiltinMathExp:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_CallBuiltinMathExp.ssa_block_1
-    shl rax, 16
-    shr rax, 16
+    movabs r11, 4398046511103
+    and rax, r11
+    add rax, r15
     movzx ecx, WORD PTR [rax + 10]
     test ecx, 128
     jz .Lasm_CallBuiltinMathExp.ssa_block_1
@@ -223026,8 +223330,9 @@ asm_handler_CallBuiltinStringFromCharCode:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_CallBuiltinStringFromCharCode.ssa_block_1
-    shl rax, 16
-    shr rax, 16
+    movabs r11, 4398046511103
+    and rax, r11
+    add rax, r15
     movzx ecx, WORD PTR [rax + 10]
     test ecx, 128
     jz .Lasm_CallBuiltinStringFromCharCode.ssa_block_1
@@ -223071,8 +223376,9 @@ asm_handler_CallBuiltinStringPrototypeCharCodeAt:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_2
-    shl rax, 16
-    shr rax, 16
+    movabs r11, 4398046511103
+    and rax, r11
+    add rax, r15
     movzx ecx, WORD PTR [rax + 10]
     test ecx, 128
     jz .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_2
@@ -223095,8 +223401,9 @@ asm_handler_CallBuiltinStringPrototypeCharCodeAt:
     movsxd rax, eax
     test eax, eax
     js .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_1
-    shl rdx, 16
-    shr rdx, 16
+    movabs r11, 4398046511103
+    and rdx, r11
+    add rdx, r15
     cmp BYTE PTR [rdx + 10], 0
     jnz .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_2
     mov rcx, QWORD PTR [rdx + 16]
@@ -223125,7 +223432,8 @@ asm_handler_CallBuiltinStringPrototypeCharCodeAt:
     lea rcx, [rdx + 17]
     movzx eax, BYTE PTR [rcx + rax]
 .Lasm_CallBuiltinStringPrototypeCharCodeAt.ssa_block_15:
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 24
@@ -223141,8 +223449,9 @@ asm_handler_CallBuiltinStringPrototypeCharAt:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_1
-    shl rax, 16
-    shr rax, 16
+    movabs r11, 4398046511103
+    and rax, r11
+    add rax, r15
     movzx ecx, WORD PTR [rax + 10]
     test ecx, 128
     jz .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_1
@@ -223165,8 +223474,9 @@ asm_handler_CallBuiltinStringPrototypeCharAt:
     movsxd rax, eax
     test eax, eax
     js .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_2
-    shl rdx, 16
-    shr rdx, 16
+    movabs r11, 4398046511103
+    and rdx, r11
+    add rdx, r15
     cmp BYTE PTR [rdx + 10], 0
     jnz .Lasm_CallBuiltinStringPrototypeCharAt.ssa_block_1
     mov rcx, QWORD PTR [rdx + 16]
@@ -223214,8 +223524,9 @@ asm_handler_ObjectPropertyIteratorNext:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_ObjectPropertyIteratorNext.ssa_block_1
-    shl rax, 16
-    shr rax, 16
+    movabs r11, 4398046511103
+    and rax, r11
+    add rax, r15
     movzx edi, BYTE PTR [rax + 168]
     cmp rdi, 0
     je .Lasm_ObjectPropertyIteratorNext.ssa_block_1
@@ -223304,8 +223615,9 @@ asm_handler_IsCallable:
     shr r11, 48
     cmp r11w, 65529
     jne .Lasm_IsCallable.ssa_block_1
-    shl rax, 16
-    shr rax, 16
+    movabs r11, 4398046511103
+    and rax, r11
+    add rax, r15
     movzx eax, WORD PTR [rax + 10]
     test eax, 128
     jz .Lasm_IsCallable.ssa_block_1
@@ -223430,7 +223742,8 @@ asm_handler_AddLhsInt32:
     jne .Lasm_AddLhsInt32.ssa_block_6
     add edx, ecx
     jo .Lasm_AddLhsInt32.ssa_block_8
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -223448,7 +223761,8 @@ asm_handler_AddRhsInt32:
     jne .Lasm_AddRhsInt32.ssa_block_5
     add ecx, DWORD PTR [r14 + r13 + 12]
     jo .Lasm_AddRhsInt32.ssa_checked_6_failure
-    or rcx, r15
+    movabs r11, 9221683186994511872
+    or rcx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rcx
     add r13d, 16
@@ -223466,7 +223780,8 @@ asm_handler_SubRhsInt32:
     jne .Lasm_SubRhsInt32.ssa_block_5
     sub ecx, DWORD PTR [r14 + r13 + 12]
     jo .Lasm_SubRhsInt32.ssa_checked_6_failure
-    or rcx, r15
+    movabs r11, 9221683186994511872
+    or rcx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rcx
     add r13d, 16
@@ -223491,7 +223806,8 @@ asm_handler_MulRhsInt32:
     or eax, ecx
     js .Lasm_MulRhsInt32.ssa_block_3
 .Lasm_MulRhsInt32.ssa_block_11:
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -223504,7 +223820,8 @@ asm_handler_ExpRhsInt32:
     mov eax, DWORD PTR [r14 + r13 + 8]
     mov rcx, QWORD PTR [rbx + rax * 8]
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rdx
@@ -223553,7 +223870,8 @@ asm_handler_DivRhsInt32:
     test eax, eax
     jz .Lasm_DivRhsInt32.ssa_block_2
 .Lasm_DivRhsInt32.ssa_block_3:
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
@@ -223585,7 +223903,8 @@ asm_handler_BitwiseXorRhsInt32:
     cmp r11w, 32762
     jne .Lasm_BitwiseXorRhsInt32.ssa_block_2
     xor edx, eax
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -223603,7 +223922,8 @@ asm_handler_BitwiseAndRhsInt32:
     cmp r11w, 32762
     jne .Lasm_BitwiseAndRhsInt32.ssa_block_2
     and edx, eax
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -223621,7 +223941,8 @@ asm_handler_BitwiseOrRhsInt32:
     cmp r11w, 32762
     jne .Lasm_BitwiseOrRhsInt32.ssa_block_2
     or edx, eax
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -223639,7 +223960,8 @@ asm_handler_LeftShiftRhsInt32:
     cmp r11w, 32762
     jne .Lasm_LeftShiftRhsInt32.ssa_block_1
     shl edx, cl
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -223657,7 +223979,8 @@ asm_handler_RightShiftRhsInt32:
     cmp r11w, 32762
     jne .Lasm_RightShiftRhsInt32.ssa_block_1
     sar edx, cl
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -223677,7 +224000,8 @@ asm_handler_UnsignedRightShiftRhsInt32:
     shr edx, cl
     test edx, edx
     js .Lasm_UnsignedRightShiftRhsInt32.ssa_block_2
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -223701,7 +224025,8 @@ asm_handler_ModRhsInt32:
     mov eax, ecx
     cdq
     idiv esi
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rdx
     add r13d, 16
@@ -223906,7 +224231,8 @@ asm_handler_StrictlyEqualsRhsInt32:
     mov eax, DWORD PTR [r14 + r13 + 8]
     mov rcx, QWORD PTR [rbx + rax * 8]
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov rsi, rcx
     shr rsi, 48
     movsxd rax, edx
@@ -223993,7 +224319,8 @@ asm_handler_StrictlyInequalsRhsInt32:
     mov eax, DWORD PTR [r14 + r13 + 8]
     mov rcx, QWORD PTR [rbx + rax * 8]
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov rsi, rcx
     shr rsi, 48
     movsxd rax, edx
@@ -224080,7 +224407,8 @@ asm_handler_LooselyEqualsRhsInt32:
     mov eax, DWORD PTR [r14 + r13 + 8]
     mov rcx, QWORD PTR [rbx + rax * 8]
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov rsi, rcx
     shr rsi, 48
     movsxd rax, edx
@@ -224161,7 +224489,8 @@ asm_handler_LooselyInequalsRhsInt32:
     mov eax, DWORD PTR [r14 + r13 + 8]
     mov rcx, QWORD PTR [rbx + rax * 8]
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov rsi, rcx
     shr rsi, 48
     movsxd rax, edx
@@ -224242,7 +224571,8 @@ asm_handler_JumpStrictlyEqualsRhsInt32:
     mov eax, DWORD PTR [r14 + r13 + 4]
     mov rcx, QWORD PTR [rbx + rax * 8]
     mov edx, DWORD PTR [r14 + r13 + 8]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov rsi, rcx
     shr rsi, 48
     movsxd rax, edx
@@ -224323,7 +224653,8 @@ asm_handler_JumpStrictlyInequalsRhsInt32:
     mov eax, DWORD PTR [r14 + r13 + 4]
     mov rcx, QWORD PTR [rbx + rax * 8]
     mov edx, DWORD PTR [r14 + r13 + 8]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov rsi, rcx
     shr rsi, 48
     movsxd rax, edx
@@ -224404,7 +224735,8 @@ asm_handler_JumpLooselyEqualsRhsInt32:
     mov eax, DWORD PTR [r14 + r13 + 4]
     mov rcx, QWORD PTR [rbx + rax * 8]
     mov edx, DWORD PTR [r14 + r13 + 8]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov rsi, rcx
     shr rsi, 48
     movsxd rax, edx
@@ -224479,7 +224811,8 @@ asm_handler_JumpLooselyInequalsRhsInt32:
     mov eax, DWORD PTR [r14 + r13 + 4]
     mov rcx, QWORD PTR [rbx + rax * 8]
     mov edx, DWORD PTR [r14 + r13 + 8]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov rsi, rcx
     shr rsi, 48
     movsxd rax, edx
@@ -224604,14 +224937,16 @@ asm_handler_Add_cold:
     test rdx, rdx
     jz .Lasm_Add.ssa_box_number_37_check_negative_zero
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_Add.ssa_box_number_37_done
 .Lasm_Add.ssa_box_number_37_check_negative_zero:
     movq rax, xmm0
     test rax, rax
     js .Lasm_Add.ssa_box_number_37_not_integer
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_Add.ssa_box_number_37_done
 .Lasm_Add.ssa_box_number_37_not_integer:
     movq rax, xmm0
@@ -224698,14 +225033,16 @@ asm_handler_Sub_cold:
     test rdx, rdx
     jz .Lasm_Sub.ssa_box_number_37_check_negative_zero
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_Sub.ssa_box_number_37_done
 .Lasm_Sub.ssa_box_number_37_check_negative_zero:
     movq rax, xmm0
     test rax, rax
     js .Lasm_Sub.ssa_box_number_37_not_integer
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_Sub.ssa_box_number_37_done
 .Lasm_Sub.ssa_box_number_37_not_integer:
     movq rax, xmm0
@@ -224791,14 +225128,16 @@ asm_handler_Mul_cold:
     test rdx, rdx
     jz .Lasm_Mul.ssa_box_number_41_check_negative_zero
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_Mul.ssa_box_number_41_done
 .Lasm_Mul.ssa_box_number_41_check_negative_zero:
     movq rax, xmm0
     test rax, rax
     js .Lasm_Mul.ssa_box_number_41_not_integer
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_Mul.ssa_box_number_41_done
 .Lasm_Mul.ssa_box_number_41_not_integer:
     movq rax, xmm0
@@ -226152,7 +226491,8 @@ asm_handler_BitwiseXor_cold:
     movsxd rdi, edx
 .Lasm_BitwiseXor.ssa_block_13:
     xor eax, edi
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
@@ -226532,7 +226872,8 @@ asm_handler_BitwiseAnd_cold:
     movsxd rdi, edx
 .Lasm_BitwiseAnd.ssa_block_13:
     and eax, edi
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
@@ -226598,7 +226939,8 @@ asm_handler_BitwiseOr_cold:
     movsxd rdi, edx
 .Lasm_BitwiseOr.ssa_block_13:
     or eax, edi
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
@@ -226977,7 +227319,8 @@ asm_handler_ToInt32_cold:
 .Lasm_ToInt32.ssa_block_4:
     movsxd rax, eax
 .Lasm_ToInt32.ssa_block_7:
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
@@ -227050,15 +227393,16 @@ asm_handler_PutByValue_cold_end:
 asm_handler_GetById_cold:
 # Cold paths for GetById
 .Lasm_GetById.ssa_block_8:
-    shl rax, 16
-    shr rax, 16
-    mov rcx, QWORD PTR [rax + 16]
-    test rcx, rcx
+    movabs r11, 4398046511103
+    and rax, r11
+    add rax, r15
+    mov rax, QWORD PTR [rax + 16]
+    test rax, rax
     jz .Lasm_GetById.ssa_block_5
-    movzx eax, WORD PTR [rcx + 10]
-    test eax, 2
+    movzx esi, WORD PTR [rax + 10]
+    test esi, 2
     jz .Lasm_GetById.ssa_block_3
-    test eax, 1024
+    test esi, 1024
     jz .Lasm_GetById.ssa_block_14
     jmp .Lasm_GetById.ssa_block_13
 .Lasm_GetById.ssa_block_3:
@@ -228961,7 +229305,8 @@ asm_handler_AddLhsInt32_cold:
     cmp ax, 32760
     jne .Lasm_AddLhsInt32.ssa_block_5
     mov edx, DWORD PTR [r14 + r13 + 8]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rcx
@@ -228994,14 +229339,16 @@ asm_handler_AddLhsInt32_cold:
     test rdx, rdx
     jz .Lasm_AddLhsInt32.ssa_box_number_6_check_negative_zero
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_AddLhsInt32.ssa_box_number_6_done
 .Lasm_AddLhsInt32.ssa_box_number_6_check_negative_zero:
     movq rax, xmm0
     test rax, rax
     js .Lasm_AddLhsInt32.ssa_box_number_6_not_integer
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_AddLhsInt32.ssa_box_number_6_done
 .Lasm_AddLhsInt32.ssa_box_number_6_not_integer:
     movq rax, xmm0
@@ -229062,14 +229409,16 @@ asm_handler_AddRhsInt32_cold:
     test rdx, rdx
     jz .Lasm_AddRhsInt32.ssa_box_number_8_check_negative_zero
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_AddRhsInt32.ssa_box_number_8_done
 .Lasm_AddRhsInt32.ssa_box_number_8_check_negative_zero:
     movq rax, xmm0
     test rax, rax
     js .Lasm_AddRhsInt32.ssa_box_number_8_not_integer
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_AddRhsInt32.ssa_box_number_8_done
 .Lasm_AddRhsInt32.ssa_box_number_8_not_integer:
     movq rax, xmm0
@@ -229084,7 +229433,8 @@ asm_handler_AddRhsInt32_cold:
     jmp [r12 + rax * 8]
 .Lasm_AddRhsInt32.ssa_block_1:
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rdx
@@ -229138,14 +229488,16 @@ asm_handler_SubRhsInt32_cold:
     test rdx, rdx
     jz .Lasm_SubRhsInt32.ssa_box_number_8_check_negative_zero
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_SubRhsInt32.ssa_box_number_8_done
 .Lasm_SubRhsInt32.ssa_box_number_8_check_negative_zero:
     movq rax, xmm0
     test rax, rax
     js .Lasm_SubRhsInt32.ssa_box_number_8_not_integer
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_SubRhsInt32.ssa_box_number_8_done
 .Lasm_SubRhsInt32.ssa_box_number_8_not_integer:
     movq rax, xmm0
@@ -229160,7 +229512,8 @@ asm_handler_SubRhsInt32_cold:
     jmp [r12 + rax * 8]
 .Lasm_SubRhsInt32.ssa_block_1:
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rdx
@@ -229189,7 +229542,8 @@ asm_handler_MulRhsInt32_cold:
     cmp dx, 32760
     jne .Lasm_MulRhsInt32.ssa_block_12
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rdx
@@ -229221,14 +229575,16 @@ asm_handler_MulRhsInt32_cold:
     test rdx, rdx
     jz .Lasm_MulRhsInt32.ssa_box_number_8_check_negative_zero
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_MulRhsInt32.ssa_box_number_8_done
 .Lasm_MulRhsInt32.ssa_box_number_8_check_negative_zero:
     movq rax, xmm0
     test rax, rax
     js .Lasm_MulRhsInt32.ssa_box_number_8_not_integer
     mov eax, edx
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     jmp .Lasm_MulRhsInt32.ssa_box_number_8_done
 .Lasm_MulRhsInt32.ssa_box_number_8_not_integer:
     movq rax, xmm0
@@ -229270,7 +229626,8 @@ asm_handler_DivRhsInt32_cold:
 # Cold paths for DivRhsInt32
 .Lasm_DivRhsInt32.ssa_block_1:
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rdx
@@ -229298,7 +229655,8 @@ asm_handler_BitwiseXorRhsInt32_cold:
     mov esi, DWORD PTR [r14 + r13 + 12]
     mov rax, rdx
     shr rax, 48
-    or rsi, r15
+    movabs r11, 9221683186994511872
+    or rsi, r11
     cmp rax, 32762
     je .Lasm_BitwiseXorRhsInt32.ssa_block_5
     cmp rax, 32761
@@ -229356,7 +229714,8 @@ asm_handler_BitwiseXorRhsInt32_cold:
     movsxd rdi, esi
 .Lasm_BitwiseXorRhsInt32.ssa_block_13:
     xor eax, edi
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
@@ -229369,7 +229728,8 @@ asm_handler_BitwiseAndRhsInt32_cold:
     mov esi, DWORD PTR [r14 + r13 + 12]
     mov rax, rdx
     shr rax, 48
-    or rsi, r15
+    movabs r11, 9221683186994511872
+    or rsi, r11
     cmp rax, 32762
     je .Lasm_BitwiseAndRhsInt32.ssa_block_5
     cmp rax, 32761
@@ -229427,7 +229787,8 @@ asm_handler_BitwiseAndRhsInt32_cold:
     movsxd rdi, esi
 .Lasm_BitwiseAndRhsInt32.ssa_block_13:
     and eax, edi
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
@@ -229440,7 +229801,8 @@ asm_handler_BitwiseOrRhsInt32_cold:
     mov esi, DWORD PTR [r14 + r13 + 12]
     mov rax, rdx
     shr rax, 48
-    or rsi, r15
+    movabs r11, 9221683186994511872
+    or rsi, r11
     cmp rax, 32762
     je .Lasm_BitwiseOrRhsInt32.ssa_block_5
     cmp rax, 32761
@@ -229498,7 +229860,8 @@ asm_handler_BitwiseOrRhsInt32_cold:
     movsxd rdi, esi
 .Lasm_BitwiseOrRhsInt32.ssa_block_13:
     or eax, edi
-    or rax, r15
+    movabs r11, 9221683186994511872
+    or rax, r11
     mov r11d, DWORD PTR [r14 + r13 + 4]
     mov QWORD PTR [rbx + r11 * 8], rax
     add r13d, 16
@@ -229509,7 +229872,8 @@ asm_handler_LeftShiftRhsInt32_cold:
 # Cold paths for LeftShiftRhsInt32
 .Lasm_LeftShiftRhsInt32.ssa_block_1:
     mov ecx, DWORD PTR [r14 + r13 + 12]
-    or rcx, r15
+    movabs r11, 9221683186994511872
+    or rcx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rcx
@@ -229533,7 +229897,8 @@ asm_handler_RightShiftRhsInt32_cold:
 # Cold paths for RightShiftRhsInt32
 .Lasm_RightShiftRhsInt32.ssa_block_1:
     mov ecx, DWORD PTR [r14 + r13 + 12]
-    or rcx, r15
+    movabs r11, 9221683186994511872
+    or rcx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rcx
@@ -229565,7 +229930,8 @@ asm_handler_UnsignedRightShiftRhsInt32_cold:
     jmp [r12 + rax * 8]
 .Lasm_UnsignedRightShiftRhsInt32.ssa_block_1:
     mov ecx, DWORD PTR [r14 + r13 + 12]
-    or rcx, r15
+    movabs r11, 9221683186994511872
+    or rcx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rcx
@@ -229589,7 +229955,8 @@ asm_handler_ModRhsInt32_cold:
 # Cold paths for ModRhsInt32
 .Lasm_ModRhsInt32.ssa_block_1:
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rdx
@@ -229615,7 +229982,8 @@ asm_handler_LessThanRhsInt32_cold:
     cmp ax, 32760
     jne .Lasm_LessThanRhsInt32.ssa_block_14
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rdx
@@ -229649,7 +230017,8 @@ asm_handler_LessThanEqualsRhsInt32_cold:
     cmp ax, 32760
     jne .Lasm_LessThanEqualsRhsInt32.ssa_block_14
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rdx
@@ -229683,7 +230052,8 @@ asm_handler_GreaterThanRhsInt32_cold:
     cmp ax, 32760
     jne .Lasm_GreaterThanRhsInt32.ssa_block_14
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rdx
@@ -229717,7 +230087,8 @@ asm_handler_GreaterThanEqualsRhsInt32_cold:
     cmp ax, 32760
     jne .Lasm_GreaterThanEqualsRhsInt32.ssa_block_14
     mov edx, DWORD PTR [r14 + r13 + 12]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov esi, DWORD PTR [r14 + r13 + 4]
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rdx
@@ -229753,7 +230124,8 @@ asm_handler_JumpLessThanRhsInt32_cold:
     mov edx, DWORD PTR [r14 + r13 + 8]
     mov esi, DWORD PTR [r14 + r13 + 12]
     mov edi, DWORD PTR [r14 + r13 + 16]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rsi
     mov r9, rdi
@@ -229791,7 +230163,8 @@ asm_handler_JumpLessThanEqualsRhsInt32_cold:
     mov edx, DWORD PTR [r14 + r13 + 8]
     mov esi, DWORD PTR [r14 + r13 + 12]
     mov edi, DWORD PTR [r14 + r13 + 16]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rsi
     mov r9, rdi
@@ -229829,7 +230202,8 @@ asm_handler_JumpGreaterThanRhsInt32_cold:
     mov edx, DWORD PTR [r14 + r13 + 8]
     mov esi, DWORD PTR [r14 + r13 + 12]
     mov edi, DWORD PTR [r14 + r13 + 16]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rsi
     mov r9, rdi
@@ -229867,7 +230241,8 @@ asm_handler_JumpGreaterThanEqualsRhsInt32_cold:
     mov edx, DWORD PTR [r14 + r13 + 8]
     mov esi, DWORD PTR [r14 + r13 + 12]
     mov edi, DWORD PTR [r14 + r13 + 16]
-    or rdx, r15
+    movabs r11, 9221683186994511872
+    or rdx, r11
     mov DWORD PTR [rbx + -64], r13d
     mov r8, rsi
     mov r9, rdi
@@ -230379,9 +230754,11 @@ const VM_INTERPRETER_STACK = 15360
 const VM_STACK_INFO = 15336
 const VM_EXECUTION_GENERATION = 16648
 const VM_PRIMITIVE_STORAGE_CAGE_BASE = 16656
-const VM_NATIVE_FUNCTION_TABLE_DATA = 16688
-const VM_BREAKPOINT_CONTROLLER = 16712
+const VM_HEAP_REGION_BASE = 16664
+const VM_NATIVE_FUNCTION_TABLE_DATA = 16696
+const VM_BREAKPOINT_CONTROLLER = 16720
 field VM.primitive_storage_cage_base u64 VM_PRIMITIVE_STORAGE_CAGE_BASE nonnull scalar
+field VM.heap_region_base u64 VM_HEAP_REGION_BASE nonnull scalar
 field VM.native_function_table Sequence<NativeFunctionTableEntry> VM_NATIVE_FUNCTION_TABLE_DATA nonnull scalar
 const VM_INTERPRETER_STACK_TOP = 15368
 const VM_INTERPRETER_STACK_LIMIT = 15376
@@ -230595,6 +230972,7 @@ const TYPED_ARRAY_CACHED_DATA_OFFSET = 136
 field Object.typed_array_cached_data_offset u64 TYPED_ARRAY_CACHED_DATA_OFFSET nullable scalar
 const TYPED_ARRAY_CACHED_DATA_OFFSET_INVALID = 0xFFFFFFFFFFFFFFFF
 const PRIMITIVE_STORAGE_CAGE_OFFSET_MASK = 0x3FFFFFFFFFF
+const HEAP_REGION_OFFSET_MASK = 0x3FFFFFFFFFF
 
 # ByteLength layout
 const BYTE_LENGTH_U32_INDEX = 2
@@ -231042,6 +231420,7 @@ FILE: Libraries/LibJS/Interpreter/GenerateLayout.cpp
 #include <AK/Format.h>
 #include <AK/StringBase.h>
 #include <AK/Utf16StringData.h>
+#include <LibGC/HeapRegion.h>
 #include <LibGC/PrimitiveStorage.h>
 #include <LibJS/Bytecode/Builtins.h>
 #include <LibJS/Bytecode/Executable.h>
@@ -231263,9 +231642,11 @@ int main()
     EMIT_OFFSET(VM_STACK_INFO, VM, m_stack_info);
     EMIT_OFFSET(VM_EXECUTION_GENERATION, VM, m_execution_generation);
     EMIT_OFFSET(VM_PRIMITIVE_STORAGE_CAGE_BASE, VM, m_primitive_storage_cage_base);
+    EMIT_OFFSET(VM_HEAP_REGION_BASE, VM, m_heap_region_base);
     EMIT_OFFSET(VM_NATIVE_FUNCTION_TABLE_DATA, VM, m_native_function_table_data);
     EMIT_OFFSET(VM_BREAKPOINT_CONTROLLER, VM, m_debugger);
     outln("field VM.primitive_storage_cage_base u64 VM_PRIMITIVE_STORAGE_CAGE_BASE nonnull scalar");
+    outln("field VM.heap_region_base u64 VM_HEAP_REGION_BASE nonnull scalar");
     outln("field VM.native_function_table Sequence<NativeFunctionTableEntry> VM_NATIVE_FUNCTION_TABLE_DATA nonnull scalar");
     outln("const VM_INTERPRETER_STACK_TOP = {}", offsetof(VM, m_interpreter_stack) + offsetof(InterpreterStack, m_top));
     outln("const VM_INTERPRETER_STACK_LIMIT = {}", offsetof(VM, m_interpreter_stack) + offsetof(InterpreterStack, m_limit));
@@ -231510,6 +231891,7 @@ int main()
     EMIT_FIELD(TYPED_ARRAY_CACHED_DATA_OFFSET, Object, typed_array_cached_data_offset, u64, TypedArrayBase, m_cached_data_offset, 8, nullable, scalar);
     outln("const TYPED_ARRAY_CACHED_DATA_OFFSET_INVALID = 0x{:X}", static_cast<size_t>(TypedArrayBase::invalid_cached_data_offset));
     outln("const PRIMITIVE_STORAGE_CAGE_OFFSET_MASK = 0x{:X}", static_cast<size_t>(GC::PrimitiveStorage::cage_offset_mask));
+    outln("const HEAP_REGION_OFFSET_MASK = 0x{:X}", static_cast<size_t>(GC::HEAP_REGION_OFFSET_MASK));
 
     // ByteLength (Variant<Auto, Detached, u32>) layout
     outln("\n# ByteLength layout");
@@ -231961,6 +232343,7 @@ inline fn check_tag_is_double(tag: inout ValueTag, else failure: Label) {
 
 inline fn box_cell(cell: Environment) -> Value {
     let bits: u64 = alias(cell);
+    bits = heap_region_offset(bits);
     bits = bits | SHIFTED_IS_CELL_PATTERN;
     # FIXME: Use a representation alias once it can coalesce with an inline
     #        function return without leaving its result uninitialized.
@@ -231971,8 +232354,7 @@ inline fn box_cell(cell: Environment) -> Value {
 
 inline fn box_object(object: Object) -> Value<Object> {
     let pointer: u64 = alias(object);
-    pointer = pointer << 16;
-    pointer = pointer >> 16;
+    pointer = heap_region_offset(pointer);
     pointer = pointer | OBJECT_TAG_SHIFTED;
     # FIXME: Use a representation alias once it can coalesce with an inline
     #        function return without leaving its result uninitialized.
@@ -232201,6 +232583,10 @@ inline fn caged_primitive_storage_address(
     scale: u8
 ) -> u64 {
     cage_base + ((cached_offset + alias(index) * alias(scale)) & PRIMITIVE_STORAGE_CAGE_OFFSET_MASK)
+}
+
+inline fn heap_region_offset(pointer: u64) -> u64 {
+    pointer & HEAP_REGION_OFFSET_MASK
 }
 
 inline fn load_caged_u8(cage_base: u64, cached_offset: u64, index: u32) -> u8 {
@@ -332167,24 +332553,12 @@ private:
     Value(u64 tag, PointerType const* ptr)
     {
         if (!ptr) {
-            // Make sure all nullptrs are null
             m_value.tag = NULL_TAG;
             return;
         }
 
         ASSERT((tag & 0x8000000000000000ul) == 0x8000000000000000ul);
-
-        if constexpr (sizeof(PointerType*) < sizeof(u64)) {
-            m_value.encoded = tag | reinterpret_cast<u32>(ptr);
-        } else {
-            // NOTE: Pointers in x86-64 use just 48 bits however are supposed to be
-            //       sign extended up from the 47th bit.
-            //       This means that all bits above the 47th should be the same as
-            //       the 47th. When storing a pointer we thus drop the top 16 bits as
-            //       we can recover it when extracting the pointer again.
-            //       See also: NanBoxedValue::extract_pointer.
-            m_value.encoded = tag | (reinterpret_cast<u64>(ptr) & 0x0000ffffffffffffULL);
-        }
+        m_value.encoded = tag | GC::NanBoxedValue::encode_pointer_bits(ptr);
     }
 
     [[nodiscard]] ThrowCompletionOr<Value> invoke_internal(VM&, PropertyKey const&, Optional<GC::RootVector<Value>> arguments);
@@ -332489,6 +332863,7 @@ FILE: Libraries/LibJS/Runtime/VM.cpp
 #include <AK/Time.h>
 #include <LibCore/ImmutableBytes.h>
 #include <LibFileSystem/FileSystem.h>
+#include <LibGC/BlockAllocator.h>
 #include <LibGC/Heap.h>
 #include <LibGC/PrimitiveStorage.h>
 #include <LibJS/Bytecode/Executable.h>
@@ -332561,6 +332936,8 @@ VM::VM(ErrorMessages error_messages)
     MUST(GC::PrimitiveStorage::the().ensure_cage());
     m_primitive_storage_cage_base = js_primitive_storage_cage_base;
     VERIFY(m_primitive_storage_cage_base != 0);
+    m_heap_region_base = GC::BlockAllocator::heap_region_start();
+    VERIFY(m_heap_region_base != 0);
 
     m_heap.register_sweep_callback([] {
         Bytecode::StaticPropertyLookupCache::sweep_all();
@@ -333787,7 +334164,6 @@ public:
     u32 execution_generation() const { return m_execution_generation; }
     void finish_execution_generation() { ++m_execution_generation; }
     FlatPtr primitive_storage_cage_base() const { return m_primitive_storage_cage_base; }
-
     u32 register_native_function(NativeFunctionPointer, NativeFunctionType);
     NativeFunctionPointer native_function(u32 index, NativeFunctionType expected_type) const;
 
@@ -334063,6 +334439,7 @@ private:
 
     u32 m_execution_generation { 0 };
     FlatPtr m_primitive_storage_cage_base { 0 };
+    FlatPtr m_heap_region_base { 0 };
     Vector<NativeFunctionTableEntry> m_native_function_table;
     NativeFunctionTableEntry const* m_native_function_table_data { nullptr };
     u32 m_run_executable_depth { 0 };
@@ -424929,9 +425306,9 @@ ErrorOr<String> StreamingDecoder::to_utf8(ReadonlyBytes input)
     return rust_streaming_decode_to_utf8(static_cast<FFI::TextCodecRustStreamingDecoder*>(m_decoder), input, false, m_error_mode);
 }
 
-ErrorOr<Utf16String> StreamingDecoder::to_utf16(ReadonlyBytes input)
+ErrorOr<Utf16String> StreamingDecoder::to_utf16(ReadonlyBytes input, Flush flush)
 {
-    return rust_streaming_decode_to_utf16(static_cast<FFI::TextCodecRustStreamingDecoder*>(m_decoder), input, false, m_error_mode);
+    return rust_streaming_decode_to_utf16(static_cast<FFI::TextCodecRustStreamingDecoder*>(m_decoder), input, flush == Flush::Yes, m_error_mode);
 }
 
 ErrorOr<String> StreamingDecoder::finish()
@@ -425046,6 +425423,11 @@ enum class IgnoreBOM {
     No,
 };
 
+enum class Flush {
+    No,
+    Yes,
+};
+
 // https://encoding.spec.whatwg.org/#concept-encoding-error-mode
 enum class ErrorMode {
     Replacement,
@@ -425072,7 +425454,7 @@ public:
     ~StreamingDecoder();
 
     ErrorOr<String> to_utf8(ReadonlyBytes);
-    ErrorOr<Utf16String> to_utf16(ReadonlyBytes);
+    ErrorOr<Utf16String> to_utf16(ReadonlyBytes, Flush = Flush::No);
     ErrorOr<String> finish();
     ErrorOr<Utf16String> finish_to_utf16();
 
@@ -641012,38 +641394,31 @@ WebIDL::ExceptionOr<void> CharacterData::replace_data(size_t offset, size_t coun
 
     // 8. For each live range whose start node is node and start offset is greater than offset but less than or equal to
     //    offset plus count, set its start offset to offset.
-    for (auto* range : Range::live_ranges()) {
-        if (range == selection_range_to_preserve.ptr())
-            continue;
-        if (range->start_container().ptr() == this && range->start_offset() > offset && range->start_offset() <= (offset + count))
-            range->set_start_offset(offset);
-    }
-
     // 9. For each live range whose end node is node and end offset is greater than offset but less than or equal to
     //    offset plus count, set its end offset to offset.
-    for (auto* range : Range::live_ranges()) {
-        if (range == selection_range_to_preserve.ptr())
-            continue;
-        if (range->end_container().ptr() == this && range->end_offset() > offset && range->end_offset() <= (offset + count))
-            range->set_end_offset(offset);
-    }
-
     // 10. For each live range whose start node is node and start offset is greater than offset plus count, increase its
     //     start offset by data’s length and decrease it by count.
-    for (auto* range : Range::live_ranges()) {
-        if (range == selection_range_to_preserve.ptr())
-            continue;
-        if (range->start_container().ptr() == this && range->start_offset() > (offset + count))
-            range->set_start_offset(range->start_offset() + data.length_in_code_units() - count);
-    }
-
     // 11. For each live range whose end node is node and end offset is greater than offset plus count, increase its end
     //     offset by data’s length and decrease it by count.
+    // OPTIMIZATION: These steps are independent between ranges, so traverse the live ranges only once.
+    auto replaced_data_end_offset = offset + count;
+    auto replacement_data_length = data.length_in_code_units();
     for (auto* range : Range::live_ranges()) {
         if (range == selection_range_to_preserve.ptr())
             continue;
-        if (range->end_container().ptr() == this && range->end_offset() > (offset + count))
-            range->set_end_offset(range->end_offset() + data.length_in_code_units() - count);
+
+        if (range->start_container().ptr() == this) {
+            if (range->start_offset() > offset && range->start_offset() <= replaced_data_end_offset)
+                range->set_start_offset(offset);
+            else if (range->start_offset() > replaced_data_end_offset)
+                range->set_start_offset(range->start_offset() + replacement_data_length - count);
+        }
+        if (range->end_container().ptr() == this) {
+            if (range->end_offset() > offset && range->end_offset() <= replaced_data_end_offset)
+                range->set_end_offset(offset);
+            else if (range->end_offset() > replaced_data_end_offset)
+                range->set_end_offset(range->end_offset() + replacement_data_length - count);
+        }
     }
 
     // 12. If node’s parent is non-null, then run the children changed steps for node’s parent.
@@ -666795,222 +667170,3 @@ void EventTarget::add_an_event_listener(DOMEventListener& listener)
     if (listener.signal && listener.signal->aborted())
         return;
 
-    // 3. If listener’s callback is null, then return.
-    if (!listener.callback)
-        return;
-
-    // 4. If listener’s passive is null, then set it to the default passive value given listener’s type and eventTarget.
-    if (!listener.passive.has_value()) {
-        listener.passive = default_passive_value(listener.type, this);
-    }
-
-    // 5. If eventTarget’s event listener list does not contain an event listener whose type is listener’s type, callback is listener’s callback,
-    //    and capture is listener’s capture, then append listener to eventTarget’s event listener list.
-    auto it = event_listener_list.find_if([&](auto& entry) {
-        return entry->type == listener.type
-            && entry->callback->callback().callback == listener.callback->callback().callback
-            && entry->capture == listener.capture;
-    });
-    if (it == event_listener_list.end()) {
-        event_listener_list.append(listener);
-        invalidate_compositor_wheel_event_listener_state(*this, listener);
-        update_needs_beforeunload_check(*this, listener);
-        event_listener_list_changed();
-    }
-
-    // 6. If listener’s signal is not null, then add the following abort steps to it:
-    if (listener.signal) {
-        // NOTE: `this` and `listener` are protected by AbortSignal using GC::HeapFunction.
-        (void)listener.signal->add_abort_algorithm([this, &listener] {
-            // 1. Remove an event listener with eventTarget and listener.
-            remove_an_event_listener(listener);
-        });
-    }
-}
-
-// https://dom.spec.whatwg.org/#dom-eventtarget-removeeventlistener
-void EventTarget::remove_event_listener(FlyString const& type, GC::Ptr<IDLEventListener> callback, EventListenerOptions const& options)
-{
-    auto& event_listener_list = ensure_data().event_listener_list;
-
-    // 1. Let capture be the result of flattening options.
-    bool capture = options.capture;
-
-    // 2. If this’s event listener list contains an event listener whose type is type, callback is callback, and capture is capture,
-    //    then remove an event listener with this and that event listener.
-    auto callbacks_match = [&](DOMEventListener& entry) {
-        if (!entry.callback && !callback)
-            return true;
-        if (!entry.callback || !callback)
-            return false;
-        return entry.callback->callback().callback == callback->callback().callback;
-    };
-    auto utf16_type = Utf16FlyString::from_fly_string(type);
-    auto it = event_listener_list.find_if([&](auto& entry) {
-        return entry->type == utf16_type
-            && callbacks_match(*entry)
-            && entry->capture == capture;
-    });
-    if (it != event_listener_list.end())
-        remove_an_event_listener(**it);
-}
-
-void EventTarget::remove_event_listener(Utf16FlyString const& type, GC::Ptr<IDLEventListener> callback, EventListenerOptions const& options)
-{
-    remove_event_listener(FlyString { type.to_utf16_string().to_utf8() }, callback, options);
-}
-
-void EventTarget::remove_event_listener_without_options(Utf16FlyString const& type, IDLEventListener& callback)
-{
-    auto utf8_type = type.to_utf16_string().to_utf8();
-    remove_event_listener(MUST(FlyString::from_utf8(utf8_type.bytes_as_string_view())), &callback, {});
-}
-
-// https://dom.spec.whatwg.org/#remove-an-event-listener
-void EventTarget::remove_an_event_listener(DOMEventListener& listener)
-{
-    // FIXME: 1. If eventTarget is a ServiceWorkerGlobalScope object and its service worker’s set of event types to handle contains type,
-    //           then report a warning to the console that this might not give the expected results. [SERVICE-WORKERS]
-
-    // 2. Set listener’s removed to true and remove listener from eventTarget’s event listener list.
-    listener.removed = true;
-    VERIFY(m_data);
-    auto did_remove = m_data->event_listener_list.remove_first_matching([&](auto& entry) { return entry.ptr() == &listener; });
-    if (did_remove) {
-        invalidate_compositor_wheel_event_listener_state(*this, listener);
-        update_needs_beforeunload_check(*this, listener);
-        event_listener_list_changed();
-    }
-}
-
-// https://dom.spec.whatwg.org/#dom-eventtarget-dispatchevent
-WebIDL::ExceptionOr<bool> EventTarget::dispatch_event_for_bindings(Event& event)
-{
-    // 1. If event’s dispatch flag is set, or if its initialized flag is not set, then throw an "InvalidStateError" DOMException.
-    if (event.dispatched())
-        return WebIDL::InvalidStateError::create("The event is already being dispatched."_utf16);
-
-    if (!event.initialized())
-        return WebIDL::InvalidStateError::create("Cannot dispatch an uninitialized event."_utf16);
-
-    // 2. Initialize event’s isTrusted attribute to false.
-    event.set_is_trusted(false);
-
-    // 3. Return the result of dispatching event to this.
-    return dispatch_event(event);
-}
-
-// https://html.spec.whatwg.org/multipage/webappapis.html#window-reflecting-body-element-event-handler-set
-bool is_window_reflecting_body_element_event_handler(Utf16FlyString const& name)
-{
-    return name.is_one_of(
-        HTML::EventNames::blur,
-        HTML::EventNames::error,
-        HTML::EventNames::focus,
-        HTML::EventNames::load,
-        UIEvents::EventNames::resize,
-        HTML::EventNames::scroll);
-}
-
-// https://html.spec.whatwg.org/multipage/webappapis.html#windoweventhandlers
-static bool is_window_event_handler(Utf16FlyString const& name)
-{
-    return name.is_one_of(
-        HTML::EventNames::afterprint,
-        HTML::EventNames::beforeprint,
-        HTML::EventNames::beforeunload,
-        HTML::EventNames::hashchange,
-        HTML::EventNames::languagechange,
-        HTML::EventNames::message,
-        HTML::EventNames::messageerror,
-        HTML::EventNames::offline,
-        HTML::EventNames::online,
-        HTML::EventNames::pagehide,
-        HTML::EventNames::pageshow,
-        HTML::EventNames::popstate,
-        HTML::EventNames::rejectionhandled,
-        HTML::EventNames::storage,
-        HTML::EventNames::unhandledrejection,
-        HTML::EventNames::unload);
-}
-
-// https://html.spec.whatwg.org/multipage/webappapis.html#determining-the-target-of-an-event-handler
-static EventTarget* determine_target_of_event_handler(EventTarget& event_target, Utf16FlyString const& name)
-{
-    // To determine the target of an event handler, given an EventTarget object eventTarget on which the event handler is exposed,
-    // and an event handler name name, the following steps are taken:
-
-    // 1. If eventTarget is not a body element or a frameset element, then return eventTarget.
-    if (!is<HTML::HTMLBodyElement>(event_target) && !is<HTML::HTMLFrameSetElement>(event_target))
-        return &event_target;
-
-    auto& event_target_element = static_cast<HTML::HTMLElement&>(event_target);
-
-    // 2. If name is not the name of an attribute member of the WindowEventHandlers interface mixin and the Window-reflecting
-    //    body element event handler set does not contain name, then return eventTarget.
-    if (!is_window_event_handler(name) && !is_window_reflecting_body_element_event_handler(name))
-        return &event_target;
-
-    // 3. If eventTarget's node document is not an active document, then return null.
-    if (!event_target_element.document().is_active())
-        return nullptr;
-
-    // 4. Return eventTarget's node document's relevant global object.
-    return event_target_element.document().window().ptr();
-}
-
-static Optional<Utf16FlyString> event_name_from_event_handler_attribute_local_name(Utf16FlyString const& local_name)
-{
-#undef __ENUMERATE
-#define __ENUMERATE(attribute_name, event_name)             \
-    if (local_name == HTML::AttributeNames::attribute_name) \
-        return event_name;
-    ENUMERATE_GLOBAL_EVENT_HANDLERS(__ENUMERATE)
-    ENUMERATE_WINDOW_EVENT_HANDLERS(__ENUMERATE)
-#undef __ENUMERATE
-
-    return {};
-}
-
-// https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-attributes:event-handler-idl-attributes-2
-WebIDL::CallbackType* EventTarget::event_handler_attribute(Utf16FlyString const& name)
-{
-    // 1. Let eventTarget be the result of determining the target of an event handler given this object and name.
-    auto target = determine_target_of_event_handler(*this, name);
-
-    // 2. If eventTarget is null, then return null.
-    if (!target)
-        return nullptr;
-
-    // 3. Return the result of getting the current value of the event handler given eventTarget and name.
-    return target->get_current_value_of_event_handler(name);
-}
-
-// https://html.spec.whatwg.org/multipage/webappapis.html#getting-the-current-value-of-the-event-handler
-WebIDL::CallbackType* EventTarget::get_current_value_of_event_handler(Utf16FlyString const& name)
-{
-    // 1. Let handlerMap be eventTarget's event handler map. (NOTE: Not necessary)
-    auto& handler_map = ensure_data().event_handler_map;
-
-    // 2. Let eventHandler be handlerMap[name].
-    auto event_handler_iterator = handler_map.find(name);
-
-    // Optimization: The spec creates all the event handlers exposed on an object up front and has the initial value of the handler set to null.
-    //               If the event handler hasn't been set, null would be returned in step 4.
-    //               However, this would be very allocation heavy. For example, each DOM::Element includes GlobalEventHandlers, which defines 60+(!) event handler attributes.
-    //               Plus, the vast majority of these allocations would be likely wasted, as I imagine web content will only use a handful of these attributes on certain elements, if any at all.
-    //               Thus, we treat the event handler not being in the event handler map as being equivalent to an event handler with an initial null value.
-    if (event_handler_iterator == handler_map.end())
-        return nullptr;
-
-    auto& event_handler = event_handler_iterator->value;
-
-    // 3. If eventHandler's value is an internal raw uncompiled handler, then:
-    if (event_handler->value.has<Utf16String>()) {
-        // 1. If eventTarget is an element, then let element be eventTarget, and document be element's node document.
-        //    Otherwise, eventTarget is a Window object, let element be null, and document be eventTarget's associated Document.
-        GC::Ptr<Element> element;
-        GC::Ptr<Document> document;
-
-        if (auto* element_event_target = as_if<Element>(this)) {
-            element = element_event_target;
