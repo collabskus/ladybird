@@ -2613,8 +2613,6 @@ jobs:
           cargo fmt --manifest-path Libraries/LibJS/Flap/Cargo.toml -- --check
           cargo clippy --manifest-path Libraries/LibJS/Flap/Cargo.toml \
             --all-targets -- -D clippy::all
-          cargo test --manifest-path Libraries/LibJS/Flap/Cargo.toml \
-            --all-targets
 
       - name: Generate and assemble the Flap interpreter
         run: |
@@ -32444,8 +32442,20 @@ public:
         if (other.is_empty())
             return start_offset;
 
-        for (size_t index = start_offset; index <= size() - other.size(); ++index) {
-            if (TypedTransfer<T>::compare(data() + index, other.data(), other.size()))
+        auto last_possible_index = size() - other.size();
+        for (size_t index = start_offset; index <= last_possible_index; ++index) {
+            if constexpr (sizeof(T) == 1 && Traits<RemoveConst<T>>::is_trivial()) {
+                auto remaining_candidate_count = last_possible_index - index + 1;
+                auto first_byte = *reinterpret_cast<u8 const*>(other.data());
+                auto* candidate = static_cast<T const*>(__builtin_memchr(data() + index, first_byte, remaining_candidate_count));
+                if (!candidate)
+                    return {};
+                index = candidate - data();
+            } else if (!TypedTransfer<T>::compare(data() + index, other.data(), 1)) {
+                continue;
+            }
+
+            if (TypedTransfer<T>::compare(data() + index + 1, other.data() + 1, other.size() - 1))
                 return index;
         }
 
@@ -482088,17 +482098,11 @@ void CompilerState::install_compiler_callback()
     });
 }
 
-static ErrorOr<NonnullRefPtr<ThreadedClient>> connect_to_wasm_compiler(IPC::TransportHandle const& handle)
-{
-    auto transport = TRY(handle.create_transport());
-    return ThreadedClient::create(move(transport));
-}
-
-void CompilerState::replace_connection(IPC::TransportHandle const& handle)
+void CompilerState::replace_connection(IPC::TransportHandle handle)
 {
     RefPtr<ThreadedClient> new_client;
 
-    if (auto result = connect_to_wasm_compiler(handle); result.is_error())
+    if (auto result = ThreadedClient::create(move(handle)); result.is_error())
         dbgln("Failed to connect to WebAssembly compiler: {}", result.error());
     else
         new_client = result.release_value();
@@ -482138,7 +482142,7 @@ namespace WasmCompilerClient {
 class CompilerState {
 public:
     void install_compiler_callback();
-    void replace_connection(IPC::TransportHandle const&);
+    void replace_connection(IPC::TransportHandle);
 
 private:
     RefPtr<ThreadedClient> m_client;
@@ -482159,15 +482163,16 @@ FILE: Libraries/LibWasmCompilerClient/ThreadedClient.cpp
 #include <AK/ScopeGuard.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/System.h>
+#include <LibIPC/TransportHandle.h>
 #include <LibThreading/Thread.h>
 #include <LibWasmCompilerClient/Client.h>
 #include <LibWasmCompilerClient/ThreadedClient.h>
 
 namespace WasmCompilerClient {
 
-ErrorOr<NonnullRefPtr<ThreadedClient>> ThreadedClient::create(NonnullOwnPtr<IPC::Transport> transport)
+ErrorOr<NonnullRefPtr<ThreadedClient>> ThreadedClient::create(IPC::TransportHandle handle)
 {
-    auto client = adopt_ref(*new ThreadedClient(move(transport)));
+    auto client = adopt_ref(*new ThreadedClient(move(handle)));
 
     Optional<Error> initialization_error;
     {
@@ -482182,9 +482187,9 @@ ErrorOr<NonnullRefPtr<ThreadedClient>> ThreadedClient::create(NonnullOwnPtr<IPC:
     return client;
 }
 
-ThreadedClient::ThreadedClient(NonnullOwnPtr<IPC::Transport> transport)
-    : m_thread(Threading::Thread::construct("WasmCompiler IPC"sv, [this, transport = move(transport)]() mutable {
-        return thread_main(move(transport));
+ThreadedClient::ThreadedClient(IPC::TransportHandle handle)
+    : m_thread(Threading::Thread::construct("WasmCompiler IPC"sv, [this, handle = move(handle)]() {
+        return thread_main(handle);
     }))
 {
     m_thread->start();
@@ -482232,10 +482237,27 @@ Core::AnonymousBuffer ThreadedClient::compile(Core::AnonymousBuffer const& buffe
     return client->compile(buffer);
 }
 
-intptr_t ThreadedClient::thread_main(NonnullOwnPtr<IPC::Transport> transport)
+// This must run on the IPC thread. On Windows, the socket's notifier is bound to the event loop of the thread that
+// creates the socket, and the connection must be serviced by that same thread.
+static ErrorOr<NonnullRefPtr<Client>> create_client(IPC::TransportHandle const& handle)
+{
+    auto transport = TRY(handle.create_transport());
+    auto client = TRY(try_make_ref_counted<Client>(move(transport)));
+
+#ifdef AK_OS_WINDOWS
+    if (auto response = client->send_sync_but_allow_failure<Client::InitTransport>(Core::System::getpid()))
+        client->transport().set_peer_pid(response->peer_pid());
+    else
+        return Error::from_string_literal("Failed to initialize WebAssembly compiler transport");
+#endif
+
+    return client;
+}
+
+intptr_t ThreadedClient::thread_main(IPC::TransportHandle const& handle)
 {
     Core::EventLoop event_loop;
-    auto client_or_error = try_make_ref_counted<Client>(move(transport));
+    auto client_or_error = create_client(handle);
 
     if (client_or_error.is_error()) {
         Sync::MutexLocker locker(m_mutex);
@@ -482246,18 +482268,6 @@ intptr_t ThreadedClient::thread_main(NonnullOwnPtr<IPC::Transport> transport)
     }
 
     auto client = client_or_error.release_value();
-
-#ifdef AK_OS_WINDOWS
-    auto response = client->send_sync_but_allow_failure<Client::InitTransport>(Core::System::getpid());
-    if (!response) {
-        Sync::MutexLocker locker(m_mutex);
-        m_initialization_error = Error::from_string_literal("Failed to initialize WebAssembly compiler transport");
-        m_initialized = true;
-        m_initialization_condition.broadcast();
-        return 1;
-    }
-    client->transport().set_peer_pid(response->peer_pid());
-#endif
 
     {
         Sync::MutexLocker locker(m_mutex);
@@ -482319,15 +482329,15 @@ class ThreadedClient final : public AtomicRefCounted<ThreadedClient> {
     AK_MAKE_NONMOVABLE(ThreadedClient);
 
 public:
-    static ErrorOr<NonnullRefPtr<ThreadedClient>> create(NonnullOwnPtr<IPC::Transport>);
+    static ErrorOr<NonnullRefPtr<ThreadedClient>> create(IPC::TransportHandle);
     ~ThreadedClient();
 
     Core::AnonymousBuffer compile(Core::AnonymousBuffer const&);
 
 private:
-    explicit ThreadedClient(NonnullOwnPtr<IPC::Transport>);
+    explicit ThreadedClient(IPC::TransportHandle);
 
-    intptr_t thread_main(NonnullOwnPtr<IPC::Transport>);
+    intptr_t thread_main(IPC::TransportHandle const&);
 
     NonnullRefPtr<Threading::Thread> m_thread;
 
@@ -567523,6 +567533,11 @@ void invalidate_style_after_placeholder_shown_change(DOM::Element& element)
 // now has, which is what lets a change that moved nothing publish nothing.
 static void record_validity_states(DOM::Element& element)
 {
+    // An element whose initial features are pending will publish its current state when those
+    // features are recorded. Computing that state here would be discarded by the style engine.
+    if (!can_record_element_state_change(element))
+        return;
+
     auto validity = SelectorMatching::element_validity_state(element);
     record_element_state_changed(element, PseudoClass::Valid, validity == SelectorMatching::ValidityState::Valid);
     record_element_state_changed(element, PseudoClass::Invalid, validity == SelectorMatching::ValidityState::Invalid);
@@ -567688,6 +567703,22 @@ void invalidate_style_after_slot_assignment_change(HTML::HTMLSlotElement& slot)
 // resolves to, for its whole subtree, because a directionality inherits.
 void invalidate_style_after_text_change_under(DOM::Element& parent_of_text)
 {
+    bool ancestor_chain_has_assigned_slot = false;
+    for (auto ancestor = GC::Ptr<DOM::Element> { parent_of_text }; ancestor; ancestor = ancestor->parent_element()) {
+        if (ancestor->assigned_slot_internal()) {
+            ancestor_chain_has_assigned_slot = true;
+            break;
+        }
+    }
+
+    if (!ancestor_chain_has_assigned_slot) {
+        for (auto ancestor = GC::Ptr<DOM::Element> { parent_of_text }; ancestor; ancestor = ancestor->parent_element()) {
+            if (ancestor->has_auto_directionality())
+                publish_language_and_directionality(*ancestor, true);
+        }
+        return;
+    }
+
     HashTable<DOM::Element*> visited;
     publish_directionality_dependent_ancestors(parent_of_text, visited);
 }
@@ -617634,6 +617665,17 @@ void record_stylesheet_detached(CSSStyleSheet& sheet, DOM::Node& document_or_sha
 // inputs the engine already routes, not with a state transition published here.
 #include <LibWeb/StyleEngineStateFactsGenerated.inc>
 
+bool can_record_element_state_change(DOM::Element& element)
+{
+    auto* style_engine = style_engine_for(element);
+    if (!style_engine)
+        return false;
+    auto node = element.style_node_id();
+    if (node == no_style_node || has_pending_initial_features(element))
+        return false;
+    return true;
+}
+
 void record_element_state_changed(DOM::Element& element, PseudoClass pseudo_class, bool new_value)
 {
     auto* style_engine = style_engine_for(element);
@@ -617878,6 +617920,7 @@ WEB_API void record_element_emptiness_changed(DOM::Element&, DOM::Node const& ch
 
 // Called for each element whose pseudo-class state actually changed, with the value it changed to.
 // Only the states StyleEngine models as facts are recorded; the rest arrive when it models them.
+WEB_API bool can_record_element_state_change(DOM::Element&);
 WEB_API void record_element_state_changed(DOM::Element&, PseudoClass, bool new_value);
 
 // Called before each style flush. The user-agent and user origins have no sheet list to announce
@@ -666971,41 +667014,3 @@ WebIDL::CallbackType* EventTarget::get_current_value_of_event_handler(Utf16FlySt
 
         if (auto* element_event_target = as_if<Element>(this)) {
             element = element_event_target;
-            document = &element_event_target->document();
-        } else {
-            auto& window_event_target = as<HTML::Window>(*this);
-            document = window_event_target.associated_document();
-        }
-
-        VERIFY(document);
-
-        // 2. If scripting is disabled for document, then return null.
-        if (document->is_scripting_disabled())
-            return nullptr;
-
-        // 3. Let body be the uncompiled script body in eventHandler's value.
-        auto const& body = event_handler->value.get<Utf16String>();
-
-        // FIXME: 4. Let location be the location where the script body originated, as given by eventHandler's value.
-
-        // 5. If element is not null and element has a form owner, let form owner be that form owner. Otherwise, let form owner be null.
-        GC::Ptr<HTML::HTMLFormElement> form_owner;
-        if (auto* form_associated_element = as_if<HTML::FormAssociatedElement>(element.ptr())) {
-            if (auto* form = form_associated_element->form())
-                form_owner = form;
-        }
-
-        // 6. Let settings object be the relevant settings object of document.
-        auto& settings_object = document->relevant_settings_object();
-
-        // Build source text and parameter strings for the event handler function.
-        Utf16StringBuilder source_builder;
-        Utf16View parameters_string;
-
-        // sourceText / ParameterList
-        if (name == HTML::EventNames::error && is<HTML::Window>(this)) {
-            //  -> If name is onerror and eventTarget is a Window object
-            //      Let the function have five arguments, named event, source, lineno, colno, and error.
-            source_builder.appendff("function on{}(event, source, lineno, colno, error) {{\n{}\n}}", name, body);
-            parameters_string = u"event, source, lineno, colno, error"sv;
-        } else {
