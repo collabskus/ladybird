@@ -1042,6 +1042,8 @@ ErrorOr<void> Application::try_register_compositor_context(WebContentClient& web
 {
     if (!m_compositor_client)
         return Error::from_string_literal("Compositor process is not available");
+    if (!web_content_client.is_open())
+        return {};
 
     auto web_content_connection_id = web_content_client.compositor_connection_id({});
     if (!web_content_connection_id.has_value()) {
@@ -2104,16 +2106,18 @@ void Application::initialize_actions()
     });
     update_editing_history_actions();
     m_copy_selection_action = Action::create("Copy"sv, ActionID::CopySelection, [this]() {
-        if (auto view = active_web_view(); view.has_value()) {
-            if (auto text = view->selected_text(); !text.is_empty())
-                insert_clipboard_entry({ move(text), "text/plain"_string });
-        }
+        if (auto view = active_web_view(); view.has_value())
+            view->selected_text()->when_resolved([this](auto& text) {
+                if (!text.is_empty())
+                    insert_clipboard_entry({ text, "text/plain"_string });
+            });
     });
     m_cut_selection_action = Action::create("Cut"sv, ActionID::CutSelection, [this]() {
-        if (auto view = active_web_view(); view.has_value()) {
-            if (auto text = view->cut_selected_text(); !text.is_empty())
-                insert_clipboard_entry({ move(text), "text/plain"_string });
-        }
+        if (auto view = active_web_view(); view.has_value())
+            view->cut_selected_text()->when_resolved([this](auto& text) {
+                if (!text.is_empty())
+                    insert_clipboard_entry({ text, "text/plain"_string });
+            });
     });
     m_paste_action = Action::create("Paste"sv, ActionID::Paste, [this]() {
         if (auto view = active_web_view(); view.has_value())
