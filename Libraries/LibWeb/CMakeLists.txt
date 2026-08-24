@@ -206,23 +206,19 @@ set(SOURCES
     CSS/NumericType.cpp
     CSS/PageSelector.cpp
     CSS/ParsedFontFace.cpp
-    CSS/Parser/ArbitrarySubstitutionFunctions.cpp
-    CSS/Parser/ComponentValue.cpp
     CSS/Parser/DescriptorParsing.cpp
     CSS/Parser/ErrorReporter.cpp
     CSS/Parser/FastColorParsing.cpp
     CSS/Parser/Helpers.cpp
-    CSS/Parser/MediaParsing.cpp
     CSS/Parser/Parser.cpp
     CSS/Parser/RustTokenizer.cpp
+    CSS/Parser/RustQueryParsing.cpp
     CSS/Parser/RustValueParsing.cpp
     CSS/Parser/RustSyntaxParsing.cpp
     CSS/Parser/RuleContext.cpp
     CSS/Parser/RuleParsing.cpp
     CSS/Parser/SelectorParsing.cpp
     CSS/Parser/Syntax.cpp
-    CSS/Parser/Token.cpp
-    CSS/Parser/Types.cpp
     CSS/Percentage.cpp
     CSS/PreferredColorScheme.cpp
     CSS/Ratio.cpp
@@ -690,6 +686,7 @@ set(SOURCES
     HTML/PotentialCORSRequest.cpp
     HTML/PreloadEntry.cpp
     HTML/PromiseRejectionEvent.cpp
+    HTML/RadioButtonGroupRegistry.cpp
     HTML/RadioNodeList.cpp
     HTML/ReplicatedNavigableState.cpp
     HTML/SandboxingFlagSet.cpp
@@ -1228,7 +1225,6 @@ set(GENERATED_SOURCES
     CSS/GeneratedCSSStyleProperties.idl
     CSS/Keyword.cpp
     CSS/MediaFeatureID.cpp
-    CSS/Parser/GeneratedValueTypesParsing.cpp
     CSS/PropertyID.cpp
     CSS/PseudoClass.h
     CSS/PseudoElement.cpp

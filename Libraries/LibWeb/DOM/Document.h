@@ -1037,6 +1037,8 @@ public:
     void add_form_associated_element_with_form_attribute(HTML::FormAssociatedElement&);
     void remove_form_associated_element_with_form_attribute(HTML::FormAssociatedElement&);
 
+    HTML::RadioButtonGroupRegistry& ensure_radio_button_group_registry();
+
     bool design_mode_enabled_state() const { return m_design_mode_enabled; }
     void set_design_mode_enabled_state(bool);
     Utf16FlyString design_mode() const;
@@ -1380,8 +1382,6 @@ public:
 
     Utf16String dump_display_list();
     Utf16String dump_stacking_context_tree();
-
-    Optional<Vector<CSS::Parser::ComponentValue>> environment_variable_value(CSS::EnvironmentVariable, Span<i32> indices = {}) const;
 
     // https://www.w3.org/TR/css-properties-values-api-1/#dom-window-registeredpropertyset-slot
     HashMap<Utf16FlyString, CSS::CustomPropertyRegistration>& registered_property_set();
@@ -1820,6 +1820,8 @@ private:
     GC::Ptr<GC::Function<void()>> m_deferred_parser_start;
 
     Vector<HTML::FormAssociatedElement*> m_form_associated_elements_with_form_attribute;
+
+    GC::Ptr<HTML::RadioButtonGroupRegistry> m_radio_button_group_registry;
 
     Vector<GC::Ref<DOM::Element>> m_potentially_named_elements;
 

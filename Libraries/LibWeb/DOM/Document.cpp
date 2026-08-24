@@ -171,6 +171,7 @@
 #include <LibWeb/HTML/Parser/HTMLParser.h>
 #include <LibWeb/HTML/PolicyContainers.h>
 #include <LibWeb/HTML/PopStateEvent.h>
+#include <LibWeb/HTML/RadioButtonGroupRegistry.h>
 #include <LibWeb/HTML/Scripting/Agent.h>
 #include <LibWeb/HTML/Scripting/ClassicScript.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
@@ -814,6 +815,8 @@ void Document::visit_edges(Cell::Visitor& visitor)
 
     for (auto* form_associated_element : m_form_associated_elements_with_form_attribute)
         visitor.visit(form_associated_element->form_associated_element_to_html_element());
+
+    visitor.visit(m_radio_button_group_registry);
 
     visitor.visit(m_potentially_named_elements);
     m_anchor_name_map.visit_edges(visitor);
@@ -7636,6 +7639,13 @@ GC::Ptr<Element> Document::element_by_anchor_name(Utf16FlyString const& name, No
     return m_anchor_name_map.last_element_by_name_matching(name, is_acceptable);
 }
 
+HTML::RadioButtonGroupRegistry& Document::ensure_radio_button_group_registry()
+{
+    if (!m_radio_button_group_registry)
+        m_radio_button_group_registry = heap().allocate<HTML::RadioButtonGroupRegistry>();
+    return *m_radio_button_group_registry;
+}
+
 void Document::add_form_associated_element_with_form_attribute(HTML::FormAssociatedElement& form_associated_element)
 {
     m_form_associated_elements_with_form_attribute.append(&form_associated_element);
@@ -9757,49 +9767,6 @@ Utf16String Document::dump_stacking_context_tree()
     return Utf16String::from_utf8_without_validation(builder.string_view());
 }
 
-Optional<Vector<CSS::Parser::ComponentValue>> Document::environment_variable_value(CSS::EnvironmentVariable environment_variable, Span<i32> indices) const
-{
-    auto invalid = [] {
-        return Vector { CSS::Parser::ComponentValue { CSS::Parser::GuaranteedInvalidValue {} } };
-    };
-
-    switch (environment_variable) {
-    case CSS::EnvironmentVariable::PreferredTextScale:
-        // FIXME: Report the user's preferred text scale, once we have that as a setting.
-        if (!indices.is_empty())
-            return invalid();
-        return Vector {
-            CSS::Parser::ComponentValue {
-                CSS::Parser::Token::create_number(CSS::Number { CSS::Number::Type::Number, 1 }) }
-        };
-    case CSS::EnvironmentVariable::SafeAreaInsetBottom:
-    case CSS::EnvironmentVariable::SafeAreaInsetLeft:
-    case CSS::EnvironmentVariable::SafeAreaInsetRight:
-    case CSS::EnvironmentVariable::SafeAreaInsetTop:
-    case CSS::EnvironmentVariable::SafeAreaMaxInsetBottom:
-    case CSS::EnvironmentVariable::SafeAreaMaxInsetLeft:
-    case CSS::EnvironmentVariable::SafeAreaMaxInsetRight:
-    case CSS::EnvironmentVariable::SafeAreaMaxInsetTop:
-        // FIXME: Report the safe area, once we can detect our display's shape (and it's not rectangular).
-        if (!indices.is_empty())
-            return invalid();
-        return Vector {
-            CSS::Parser::ComponentValue { CSS::Parser::Token::create_dimension(0, "px"_utf16_fly_string) }
-        };
-    case CSS::EnvironmentVariable::ViewportSegmentBottom:
-    case CSS::EnvironmentVariable::ViewportSegmentHeight:
-    case CSS::EnvironmentVariable::ViewportSegmentLeft:
-    case CSS::EnvironmentVariable::ViewportSegmentRight:
-    case CSS::EnvironmentVariable::ViewportSegmentTop:
-    case CSS::EnvironmentVariable::ViewportSegmentWidth:
-        // "These variables are only defined when there are at least two such segments."
-        // https://drafts.csswg.org/css-env/#viewport-segments
-        // FIXME: Report the viewport segment areas, once we can detect that and there are multiple of them.
-        return Vector { CSS::Parser::ComponentValue { CSS::Parser::GuaranteedInvalidValue {} } };
-    }
-    VERIFY_NOT_REACHED();
-}
-
 HashMap<Utf16FlyString, CSS::CustomPropertyRegistration>& Document::registered_property_set()
 {
     return m_registered_property_set;
@@ -9869,7 +9836,7 @@ void Document::sync_custom_property_registrations_to_rust()
         names.unchecked_append(name.to_utf16_string());
         syntaxes.unchecked_append(registration->syntax->to_string());
         initial_values.unchecked_append(registration->initial_value
-                ? Optional<Utf16String> { registration->initial_value->to_utf16_string(CSS::SerializationMode::Normal) }
+                ? Optional<Utf16String> { registration->initial_value->to_utf16_string(CSS::SerializationMode::ResolvedValueForReparse) }
                 : Optional<Utf16String> {});
         auto const& name_string = names.last();
         auto const& syntax = syntaxes.last();

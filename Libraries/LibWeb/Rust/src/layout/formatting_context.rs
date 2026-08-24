@@ -807,12 +807,6 @@ pub(crate) enum ChildLayoutOutcome {
     ReenterCurrent,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct MeasuredCellContent {
-    pub content_block_size: CssPixels,
-    pub first_baseline: CssPixels,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SizingAxis {
     Inline,
@@ -1001,6 +995,10 @@ impl FfiLayoutFcCallbacks {
 
     pub(crate) fn set_committed_fragment_link(&self, node: Node, link: crate::layout::FragmentLink) {
         self.arena().set_committed_fragment_link(self.arena().data(node), link);
+    }
+
+    pub(crate) fn has_committed_fragment_link(&self, node: Node) -> bool {
+        self.node_data(node).flags & NodeFlag::HasCommittedFragmentLink as u32 != 0
     }
 
     pub(crate) fn set_saved_abspos_layout_inputs(&self, node: Node, inputs: Option<crate::layout::AbsposLayoutInputs>) {

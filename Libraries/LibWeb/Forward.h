@@ -434,8 +434,6 @@ class TextUnderlinePositionStyleValue;
 class Time;
 class TimePercentage;
 class TimeStyleValue;
-template<typename T>
-class TokenStream;
 class TransformationStyleValue;
 class TreeCountingFunctionStyleValue;
 class TupleStyleValue;
@@ -536,21 +534,14 @@ namespace Web::CSS::Invalidation {
 
 namespace Web::CSS::Parser {
 
-class ComponentValue;
-class GuardedSubstitutionContexts;
 class Parser;
 class RustTokenizer;
 class SyntaxNode;
-class Token;
 
-struct ArbitrarySubstitutionReplacementContext;
 struct AtRule;
 struct Declaration;
-struct Function;
-struct GuaranteedInvalidValue;
 struct ParsingParams;
 struct QualifiedRule;
-struct SimpleBlock;
 
 }
 
@@ -881,6 +872,7 @@ class PopoverTargetAttributes;
 class PreloadEntry;
 struct PreloadKey;
 class PromiseRejectionEvent;
+class RadioButtonGroupRegistry;
 class RadioNodeList;
 class ScriptRegistry;
 class SelectedFile;
