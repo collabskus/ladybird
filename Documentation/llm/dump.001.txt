@@ -529238,6 +529238,7 @@ WEB_API GC::Ref<JS::Set> setlike_entries(JS::Realm&, WrapperWorld const&, CSS::F
 WEB_API bool setlike_has(CSS::FontFaceSet const&, JS::Value);
 WEB_API void did_add_font_face(CSS::FontFaceSet const&, GC::Ref<CSS::FontFace>);
 WEB_API void did_remove_font_face(CSS::FontFaceSet const&, GC::Ref<CSS::FontFace>);
+WEB_API void did_reorder_font_faces(CSS::FontFaceSet const&, Vector<GC::Ref<CSS::FontFace>> const&);
 
 }
 
@@ -541258,6 +541259,7 @@ FILE: Libraries/LibWeb/CSS/CSSFontFaceRule.cpp
 #include <LibGfx/Font/FontStyleMapping.h>
 #include <LibWeb/CSS/CSSFontFaceRule.h>
 #include <LibWeb/CSS/CSSStyleSheet.h>
+#include <LibWeb/CSS/FontComputer.h>
 #include <LibWeb/CSS/FontFace.h>
 #include <LibWeb/CSS/FontFaceSet.h>
 #include <LibWeb/CSS/Serialize.h>
@@ -541406,12 +541408,31 @@ void CSSFontFaceRule::handle_descriptor_change(Utf16FlyString const& property)
         return;
     }
 
-    if (property.equals_ignoring_ascii_case("src"_utf16_fly_string))
+    if (property.equals_ignoring_ascii_case("src"_utf16_fly_string)) {
         handle_src_descriptor_change();
+        return;
+    }
+
+    auto descriptor_affects_font_matching = property.equals_ignoring_ascii_case("font-family"_utf16_fly_string)
+        || property.equals_ignoring_ascii_case("font-weight"_utf16_fly_string)
+        || property.equals_ignoring_ascii_case("font-style"_utf16_fly_string)
+        || property.equals_ignoring_ascii_case("font-width"_utf16_fly_string)
+        || property.equals_ignoring_ascii_case("font-stretch"_utf16_fly_string);
+
+    FontComputer* font_computer = nullptr;
+    if (descriptor_affects_font_matching) {
+        if (auto document = parent_style_sheet() ? parent_style_sheet()->owning_document() : nullptr) {
+            font_computer = &document->font_computer();
+            font_computer->unregister_font_face(*m_css_connected_font_face);
+        }
+    }
 
     // https://drafts.csswg.org/css-font-loading/#font-face-css-connection
     // any change made to a @font-face descriptor is immediately reflected in the corresponding FontFace attribute
     m_css_connected_font_face->reparse_connected_css_font_face_rule_descriptors();
+
+    if (font_computer)
+        font_computer->register_font_face(*m_css_connected_font_face);
 }
 
 // https://drafts.csswg.org/css-font-loading/#font-face-css-connection
@@ -541438,6 +541459,10 @@ void CSSFontFaceRule::handle_src_descriptor_change()
     document->fonts()->add_css_connected_font(new_font_face);
 }
 
+// https://drafts.csswg.org/css-font-loading/#font-face-css-connection
+// If a @font-face rule is removed from the document, its corresponding FontFace object is no longer CSS-connected.
+// The connection is not restorable by any means (but adding the @font-face back to the stylesheet will create a
+// brand new FontFace object which is CSS-connected).
 void CSSFontFaceRule::disconnect_font_face()
 {
     if (!m_css_connected_font_face)
@@ -542652,6 +542677,7 @@ WebIDL::ExceptionOr<u32> CSSGroupingRule::insert_rule(Utf16View rule, u32 index)
     if (auto* sheet = parent_style_sheet()) {
         record_style_rule_inserted(*m_rules->item(index));
         sheet->invalidate_owners();
+        sheet->synchronize_fonts_after_rule_change();
     }
     return index;
 }
@@ -542664,6 +542690,7 @@ WebIDL::ExceptionOr<void> CSSGroupingRule::delete_rule(u32 index)
         if (removed_rule)
             record_style_rule_removed(*sheet, *removed_rule);
         sheet->invalidate_owners();
+        sheet->synchronize_fonts_after_rule_change();
     }
     return {};
 }
@@ -548695,6 +548722,7 @@ FILE: Libraries/LibWeb/CSS/CSSRuleList.cpp
 #include <LibWeb/CSS/CSSFontFaceRule.h>
 #include <LibWeb/CSS/CSSFontFeatureValuesRule.h>
 #include <LibWeb/CSS/CSSFunctionRule.h>
+#include <LibWeb/CSS/CSSGroupingRule.h>
 #include <LibWeb/CSS/CSSImportRule.h>
 #include <LibWeb/CSS/CSSKeyframesRule.h>
 #include <LibWeb/CSS/CSSLayerBlockRule.h>
@@ -548721,6 +548749,31 @@ GC::Ref<CSSRuleList> CSSRuleList::create(ReadonlySpan<GC::Ref<CSSRule>> rules)
 
 CSSRuleList::CSSRuleList()
 {
+}
+
+static void disconnect_font_faces_in_rule(CSSRule& rule)
+{
+    if (auto* font_face_rule = as_if<CSSFontFaceRule>(rule))
+        font_face_rule->disconnect_font_face();
+
+    if (auto* grouping_rule = as_if<CSSGroupingRule>(rule)) {
+        for (auto& child_rule : grouping_rule->css_rules())
+            disconnect_font_faces_in_rule(child_rule);
+    }
+}
+
+void CSSRuleList::set_rules(Badge<CSSStyleSheet>, Vector<GC::Ref<CSSRule>> rules)
+{
+    // https://drafts.csswg.org/css-font-loading/#font-face-css-connection
+    // If a @font-face rule is removed from the document, its corresponding FontFace object is no longer CSS-connected.
+    // The connection is not restorable by any means (but adding the @font-face back to the stylesheet will create a
+    // brand new FontFace object which is CSS-connected).
+    for (auto& rule : m_rules) {
+        disconnect_font_faces_in_rule(rule);
+        rule->set_parent_style_sheet(nullptr);
+    }
+
+    m_rules = move(rules);
 }
 
 void CSSRuleList::visit_edges(GC::Cell::Visitor& visitor)
@@ -548852,8 +548905,6 @@ WebIDL::ExceptionOr<unsigned> CSSRuleList::insert_a_css_rule(Variant<Utf16View, 
     // 8. Insert new rule into list at the zero-indexed position index.
     m_rules.insert(index, *new_rule);
 
-    // FIXME: Load font faces for inserted @font-face rules
-
     // 9. Return index.
     if (on_change)
         on_change();
@@ -548897,9 +548948,10 @@ void CSSRuleList::remove_a_css_rule_without_validation(u32 index)
     CSSRule& old_rule = m_rules[index];
 
     // https://drafts.csswg.org/css-font-loading/#font-face-css-connection
-    // If a @font-face rule is removed from the document, its connected FontFace object is no longer CSS-connected.
-    if (auto* font_face_rule = as_if<CSSFontFaceRule>(old_rule))
-        font_face_rule->disconnect_font_face();
+    // If a @font-face rule is removed from the document, its corresponding FontFace object is no longer CSS-connected.
+    // The connection is not restorable by any means (but adding the @font-face back to the stylesheet will create a
+    // brand new FontFace object which is CSS-connected).
+    disconnect_font_faces_in_rule(old_rule);
 
     // 5. Remove rule old rule from list at the zero-indexed position index.
     m_rules.remove(index);
@@ -549124,7 +549176,7 @@ public:
     bool evaluate_media_queries(DOM::Document const&, Function<void(CSSRule const&)> const& changed_rule_callback);
 
     void set_owner_rule(GC::Ref<CSSRule> owner_rule) { m_owner_rule = owner_rule; }
-    void set_rules(Badge<CSSStyleSheet>, Vector<GC::Ref<CSSRule>> rules) { m_rules = move(rules); }
+    void set_rules(Badge<CSSStyleSheet>, Vector<GC::Ref<CSSRule>> rules);
 
     Function<void()> on_change;
 
@@ -552311,6 +552363,8 @@ void CSSStyleProperties::invalidate_owners()
                 return;
 
             sheet->invalidate_owners();
+            if (rule->type() == CSSRule::Type::FontFace)
+                sheet->synchronize_fonts_after_rule_change();
         }
     }
 }
@@ -553054,6 +553108,8 @@ WebIDL::ExceptionOr<unsigned> CSSStyleSheet::insert_rule(Utf16View rule, unsigne
             invalidate_rule_cache_for_style_sheet_owners(*this);
         else
             invalidate_owners();
+
+        synchronize_fonts_after_rule_change();
     }
 
     return result;
@@ -553075,6 +553131,7 @@ WebIDL::ExceptionOr<void> CSSStyleSheet::delete_rule(unsigned index)
         if (removed_rule)
             record_style_rule_removed(*this, *removed_rule);
         invalidate_owners();
+        synchronize_fonts_after_rule_change();
     }
     return result;
 }
@@ -553114,6 +553171,7 @@ GC::Ref<WebIDL::Promise> CSSStyleSheet::replace(Utf16String text)
         m_rules->set_rules({}, rules_without_import);
         record_stylesheet_rules_replaced(*this);
         invalidate_owners();
+        synchronize_fonts_after_rule_change();
 
         // 4. Unset sheet’s disallow modification flag.
         set_disallow_modification(false);
@@ -553150,6 +553208,7 @@ WebIDL::ExceptionOr<void> CSSStyleSheet::replace_sync(Utf16View text)
     m_rules->set_rules({}, rules_without_import);
     record_stylesheet_rules_replaced(*this);
     invalidate_owners();
+    synchronize_fonts_after_rule_change();
 
     return {};
 }
@@ -553355,10 +553414,20 @@ void CSSStyleSheet::invalidate_owners()
 
 void CSSStyleSheet::reload_fonts_after_media_query_change()
 {
-    if (auto document = owning_document(); document && has_document_owner()) {
-        document->font_computer().unload_fonts_from_sheet(*this);
+    synchronize_fonts_after_rule_change();
+}
+
+// https://drafts.csswg.org/css-font-loading/#document-font-face-set
+// As @font-face rules are added or removed from a stylesheet, or stylesheets containing @font-face rules are added or
+// removed, the corresponding CSS-connected FontFace objects must be added or removed from the document's font source,
+// and maintain this ordering.
+void CSSStyleSheet::synchronize_fonts_after_rule_change()
+{
+    if (!has_document_owner())
+        return;
+
+    if (auto document = owning_document())
         document->font_computer().load_fonts_from_sheet(*this);
-    }
 }
 
 bool CSSStyleSheet::has_document_owner() const
@@ -553712,6 +553781,7 @@ public:
     bool evaluate_media_queries(DOM::Document const&);
     bool evaluate_media_queries(DOM::Document const&, Function<void(CSSRule const&)> const& changed_rule_callback);
     void reload_fonts_after_media_query_change();
+    void synchronize_fonts_after_rule_change();
     void record_conditions_for_owners();
     void for_each_effective_keyframes_at_rule(Function<void(CSSKeyframesRule const&)> const& callback) const;
     void for_each_effective_counter_style_at_rule(Function<void(CSSCounterStyleRule const&)> const& callback) const;
@@ -562519,6 +562589,36 @@ void FontComputer::unregister_font_face(GC::Ref<FontFace> face)
     did_load_font(key.family_name);
 }
 
+void FontComputer::synchronize_font_face_order(Vector<GC::Ref<FontFace>> const& font_source_order)
+{
+    for (auto& entry : m_font_faces) {
+        Vector<GC::Ref<FontFace>> ordered_faces;
+        for (auto& font_face : font_source_order) {
+            if (entry.value.contains_slow(font_face))
+                ordered_faces.append(font_face);
+        }
+        for (auto& font_face : entry.value) {
+            if (!ordered_faces.contains_slow(font_face))
+                ordered_faces.append(font_face);
+        }
+
+        bool order_changed = ordered_faces.size() != entry.value.size();
+        if (!order_changed) {
+            for (size_t index = 0; index < entry.value.size(); ++index) {
+                if (ordered_faces[index] != entry.value[index]) {
+                    order_changed = true;
+                    break;
+                }
+            }
+        }
+        if (!order_changed)
+            continue;
+
+        entry.value = move(ordered_faces);
+        did_load_font(entry.key.family_name);
+    }
+}
+
 GC::Ptr<FontLoader> FontComputer::load_font_face(ParsedFontFace const& font_face, GC::Ptr<GC::Function<void(RefPtr<Gfx::Typeface const>)>> on_load)
 {
     if (font_face.sources().is_empty()) {
@@ -562577,21 +562677,6 @@ static void for_each_nested_font_rule(CSSRuleList& rules, Function<void(CSSRule&
     }
 }
 
-static void for_each_effective_font_rule(CSSStyleSheet& sheet, Function<void(CSSRule&)> const& callback)
-{
-    GC::RootHashTable<CSSRule const*> effective_font_rules;
-    sheet.for_each_effective_rule(TraversalOrder::Preorder, [&](CSSRule const& rule) {
-        // Imported sheets are attached and load their fonts separately.
-        if (rule.parent_style_sheet() == &sheet && is_font_rule(rule))
-            effective_font_rules.set(&rule);
-    });
-
-    for_each_nested_font_rule(sheet.rules(), [&](CSSRule& rule) {
-        if (effective_font_rules.contains(&rule))
-            callback(rule);
-    });
-}
-
 void FontComputer::load_fonts_from_sheet(CSSStyleSheet& sheet)
 {
     begin_font_face_change_batch();
@@ -562599,11 +562684,29 @@ void FontComputer::load_fonts_from_sheet(CSSStyleSheet& sheet)
         end_font_face_change_batch();
     };
 
-    for_each_effective_font_rule(sheet, [&](auto& rule) {
+    GC::RootHashTable<CSSRule const*> effective_font_rules;
+    if (!sheet.disabled()) {
+        sheet.for_each_effective_rule(TraversalOrder::Preorder, [&](CSSRule const& effective_rule) {
+            // Imported sheets are attached and synchronize their fonts separately.
+            if (effective_rule.parent_style_sheet() == &sheet && is_font_rule(effective_rule))
+                effective_font_rules.set(&effective_rule);
+        });
+    }
+
+    for_each_nested_font_rule(sheet.rules(), [&](auto& rule) {
         if (auto* font_face_rule = as_if<CSSFontFaceRule>(rule)) {
-            if (!font_face_rule->is_valid())
+            auto should_be_css_connected = effective_font_rules.contains(font_face_rule) && font_face_rule->is_valid();
+            if (!should_be_css_connected) {
+                font_face_rule->disconnect_font_face();
+                return;
+            }
+
+            if (font_face_rule->css_connected_font_face())
                 return;
 
+            // https://drafts.csswg.org/css-font-loading/#font-face-css-connection
+            // A CSS @font-face rule automatically defines a corresponding FontFace object, which is automatically
+            // placed in the document's font source when the rule is parsed. This FontFace object is CSS-connected.
             auto font_face = FontFace::create_css_connected(HTML::relevant_realm(document()), *font_face_rule);
             document().fonts()->add_css_connected_font(font_face);
         }
@@ -562611,6 +562714,8 @@ void FontComputer::load_fonts_from_sheet(CSSStyleSheet& sheet)
         if (auto* font_feature_values_rule = as_if<CSSFontFeatureValuesRule>(rule))
             font_feature_values_rule->clear_caches();
     });
+
+    document().fonts()->synchronize_css_connected_font_order();
 }
 
 void FontComputer::unload_fonts_from_sheet(CSSStyleSheet& sheet)
@@ -562623,9 +562728,8 @@ void FontComputer::unload_fonts_from_sheet(CSSStyleSheet& sheet)
     // https://drafts.csswg.org/css-font-loading/#font-face-css-connection
     // If a @font-face rule is removed from the document, its connected FontFace object is no longer CSS-connected.
     for_each_nested_font_rule(sheet.rules(), [&](auto& rule) {
-        if (auto* font_face_rule = as_if<CSSFontFaceRule>(rule)) {
+        if (auto* font_face_rule = as_if<CSSFontFaceRule>(rule))
             font_face_rule->disconnect_font_face();
-        }
 
         if (auto* font_feature_values_rule = as_if<CSSFontFeatureValuesRule>(rule))
             font_feature_values_rule->clear_caches();
@@ -562774,6 +562878,7 @@ public:
 
     void register_font_face(GC::Ref<FontFace>);
     void unregister_font_face(GC::Ref<FontFace>);
+    void synchronize_font_face_order(Vector<GC::Ref<FontFace>> const&);
 
     GC::Ptr<FontLoader> load_font_face(ParsedFontFace const&, GC::Ptr<GC::Function<void(RefPtr<Gfx::Typeface const>)>> on_load = {});
 
@@ -563999,6 +564104,8 @@ FILE: Libraries/LibWeb/CSS/FontFaceSet.cpp
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/CSS/BindingsGlue.h>
+#include <LibWeb/CSS/CSSFontFaceRule.h>
+#include <LibWeb/CSS/CSSStyleSheet.h>
 #include <LibWeb/CSS/FontComputer.h>
 #include <LibWeb/CSS/FontFace.h>
 #include <LibWeb/CSS/FontFaceSet.h>
@@ -564093,6 +564200,61 @@ void FontFaceSet::add_css_connected_font(GC::Ref<FontFace> face)
         // 2. Append font to the FontFaceSet’s [[LoadingFonts]] list.
         m_loading_fonts.append(*face);
     }
+}
+
+// https://drafts.csswg.org/css-font-loading/#document-font-face-set
+// The FontFaceSet entries for a document's font source must be initially populated with all the CSS-connected FontFace
+// objects from all of the CSS @font-face rules in the document or shadow root CSS style sheets, in document order. As
+// @font-face rules are added or removed, the corresponding objects must be added or removed and maintain this ordering.
+// Any manually-added FontFace objects must be ordered after the CSS-connected ones.
+void FontFaceSet::synchronize_css_connected_font_order()
+{
+    auto* window = HTML::window_from_global_object(relevant_settings_object().global_object());
+    if (!window)
+        return;
+
+    Vector<GC::Ref<FontFace>> ordered_font_faces;
+    Function<void(CSSStyleSheet&)> append_fonts_from_sheet = [&](CSSStyleSheet& sheet) {
+        sheet.for_each_effective_rule(TraversalOrder::Preorder, [&](CSSRule const& rule) {
+            auto const* font_face_rule = as_if<CSSFontFaceRule>(rule);
+            if (!font_face_rule)
+                return;
+            auto font_face = font_face_rule->css_connected_font_face();
+            if (!font_face)
+                return;
+            GC::Ref<FontFace> font_face_ref { *font_face };
+            if (!ordered_font_faces.contains_slow(font_face_ref))
+                ordered_font_faces.append(font_face_ref);
+        });
+    };
+
+    auto& document = window->associated_document();
+    document.for_each_active_css_style_sheet(append_fonts_from_sheet);
+
+    for (auto& font_face : m_font_faces) {
+        if (font_face->is_css_connected() && !ordered_font_faces.contains_slow(font_face))
+            ordered_font_faces.append(font_face);
+    }
+    for (auto& font_face : m_font_faces) {
+        if (!font_face->is_css_connected())
+            ordered_font_faces.append(font_face);
+    }
+
+    bool order_changed = ordered_font_faces.size() != m_font_faces.size();
+    if (!order_changed) {
+        for (size_t index = 0; index < m_font_faces.size(); ++index) {
+            if (ordered_font_faces[index] != m_font_faces[index]) {
+                order_changed = true;
+                break;
+            }
+        }
+    }
+    if (!order_changed)
+        return;
+
+    m_font_faces = move(ordered_font_faces);
+    Bindings::did_reorder_font_faces(*this, m_font_faces);
+    document.font_computer().synchronize_font_face_order(m_font_faces);
 }
 
 // https://drafts.csswg.org/css-font-loading/#dom-fontfaceset-delete
@@ -564555,6 +564717,15 @@ void did_remove_font_face(CSS::FontFaceSet const& font_face_set, GC::Ref<CSS::Fo
     });
 }
 
+void did_reorder_font_faces(CSS::FontFaceSet const& font_face_set, Vector<GC::Ref<CSS::FontFace>> const& font_faces)
+{
+    font_face_set_cache_for(font_face_set).for_each([&](auto& set_entries) {
+        set_entries.set_clear();
+        for (auto& font_face : font_faces)
+            add_font_face_to_set(set_entries, font_face);
+    });
+}
+
 }
 
 FILE: Libraries/LibWeb/CSS/FontFaceSet.h
@@ -564603,6 +564774,7 @@ public:
 
     void add_css_connected_font(GC::Ref<FontFace>);
     void remove_css_connected_font(GC::Ref<FontFace>);
+    void synchronize_css_connected_font_order();
 
     void set_onloading(WebIDL::CallbackType*);
     WebIDL::CallbackType* onloading();
@@ -570417,6 +570589,7 @@ void MediaList::invalidate_owners_for_media_change()
     if (!sheet)
         return;
     sheet->invalidate_owners();
+    sheet->synchronize_fonts_after_rule_change();
 
     // Which of the sheet's rules are gated is published from here rather than from the transition
     // `evaluate_media_queries` reports, because a list that has just been reparsed has evaluated
@@ -575066,7 +575239,8 @@ GC::Ptr<CSSFontFaceRule> Parser::convert_to_font_face_rule(AtRule const& rule)
         }
     });
 
-    return CSSFontFaceRule::create(CSSFontFaceDescriptors::create(descriptors.release_descriptors()));
+    auto font_face_descriptors = CSSFontFaceDescriptors::create(descriptors.release_descriptors());
+    return CSSFontFaceRule::create(font_face_descriptors);
 }
 
 GC::Ptr<CSSFontFeatureValuesRule> Parser::convert_to_font_feature_values_rule(AtRule const& rule)
@@ -600911,6 +601085,7 @@ FILE: Libraries/LibWeb/CSS/StyleSheetList.cpp
  */
 
 #include <LibGC/Heap.h>
+#include <LibWeb/CSS/FontFaceSet.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/StyleEngineInput.h>
 #include <LibWeb/CSS/StyleSheetInvalidation.h>
@@ -600998,6 +601173,7 @@ void StyleSheetList::add_sheet(CSSStyleSheet& sheet, StyleEngineUpdate style_eng
     sheet.load_pending_image_resources(document());
 
     insert_sheet_in_tree_order(sheet);
+    document().fonts()->synchronize_css_connected_font_order();
 
     if (style_engine_update == StyleEngineUpdate::Record)
         record_stylesheet_attached(sheet, document_or_shadow_root(), following_sheet(sheet));
@@ -601083,6 +601259,7 @@ void StyleSheetList::move_sheet(CSSStyleSheet& sheet, StyleSheetList& destinatio
     VERIFY(position.has_value());
     m_sheets.remove(*position);
     insert_sheet_in_tree_order(sheet);
+    document().fonts()->synchronize_css_connected_font_order();
     record_stylesheet_attached(sheet, document_or_shadow_root(), following_sheet(sheet));
     invalidate_rule_cache_after_style_sheet_change(document_or_shadow_root(), sheet);
 }
@@ -667107,172 +667284,3 @@ private:
 // reverse and replay itself, together with the selections to restore around it. Only mutations
 // performed by editing commands enter the history; script-driven DOM mutation is invisible to it.
 class EditingHistory final : public JS::Cell {
-    GC_CELL(EditingHistory, JS::Cell);
-    GC_DECLARE_ALLOCATOR(EditingHistory);
-
-public:
-    [[nodiscard]] static GC::Ref<EditingHistory> create();
-
-    // The undo step for the editing command currently executing, if any. DOM mutations made
-    // through the Editing proxy functions are recorded onto this step.
-    GC::Ptr<UndoStep> undo_step_being_recorded() { return m_undo_step_being_recorded; }
-
-    // Brackets one user editing action: begin_recording() creates the step and captures the
-    // starting selection, the Editing proxy functions add commands to it while the action runs,
-    // and end_recording() captures the ending selection and merges or pushes the step. A step
-    // that recorded no commands leaves no trace. end_recording() is idempotent, so callers may
-    // invoke it from a scope guard as well as before dispatching their input event.
-    void begin_recording(DOM::Node& editing_host, UndoStep::Category);
-    void end_recording();
-
-    // Editing code must perform DOM mutations through the Editing proxy functions while a
-    // command is being recorded, or the mutation silently escapes undo. The proxy brackets its
-    // mutations with this scope, and the DOM primitives report mutations so bypasses are
-    // diagnosed during development instead of surfacing as broken undo.
-    class ProxyMutationScope {
-    public:
-        explicit ProxyMutationScope(DOM::Node&);
-        ~ProxyMutationScope();
-
-    private:
-        GC::Ptr<EditingHistory> m_history;
-    };
-    void notify_dom_mutation();
-
-    bool can_undo();
-    bool can_redo();
-    bool undo(DOM::Document&);
-    bool redo(DOM::Document&);
-
-    GC::Ptr<UndoStep> next_undo_step();
-    GC::Ptr<UndoStep> next_redo_step();
-
-    // Called whenever the document selection changes; ends typing coalescence unless the change
-    // came from an editing command or from history application itself.
-    void selection_changed();
-
-private:
-    EditingHistory() = default;
-
-    virtual void visit_edges(Cell::Visitor&) override;
-
-    void prune_steps_for_disconnected_hosts();
-    void restore_selection(DOM::Document&, SelectionSnapshot const&);
-    void notify_state_if_changed(DOM::Document&);
-
-    GC::Ptr<UndoStep> m_undo_step_being_recorded;
-    GC::Ptr<UndoStep> m_open_step;
-    Vector<GC::Ref<UndoStep>> m_undo_stack;
-    Vector<GC::Ref<UndoStep>> m_redo_stack;
-    bool m_applying_history_step { false };
-    bool m_last_notified_can_undo { false };
-    bool m_last_notified_can_redo { false };
-    u32 m_proxy_mutation_depth { 0 };
-};
-
-enum class HistoryAction : u8 {
-    Undo,
-    Redo,
-};
-
-// The user-initiated (keyboard shortcut) entry point for undo and redo. Unlike execCommand(),
-// this dispatches a cancelable beforeinput event first; canceling it leaves both the DOM and the
-// history untouched.
-EventResult perform_history_action(DOM::Document&, HistoryAction);
-
-}
-
-FILE: Libraries/LibWeb/Editing/ExecCommand.cpp
-/*
- * Copyright (c) 2024-2025, Jelle Raaijmakers <jelle@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <AK/ScopeGuard.h>
-#include <AK/TemporaryChange.h>
-#include <LibWeb/DOM/Document.h>
-#include <LibWeb/DOM/Event.h>
-#include <LibWeb/DOM/Range.h>
-#include <LibWeb/DOM/Text.h>
-#include <LibWeb/Editing/CommandNames.h>
-#include <LibWeb/Editing/Commands.h>
-#include <LibWeb/Editing/EditingHistory.h>
-#include <LibWeb/Editing/Internal/Algorithms.h>
-#include <LibWeb/HTML/HTMLLIElement.h>
-#include <LibWeb/HTML/Scripting/Environments.h>
-#include <LibWeb/HighResolutionTime/TimeOrigin.h>
-#include <LibWeb/Selection/Selection.h>
-#include <LibWeb/UIEvents/InputEvent.h>
-#include <LibWeb/UIEvents/InputTypes.h>
-
-namespace Web::DOM {
-
-GC::Ref<Editing::EditingHistory> Document::editing_history()
-{
-    if (!m_editing_history)
-        m_editing_history = Editing::EditingHistory::create();
-    return *m_editing_history;
-}
-
-// https://w3c.github.io/editing/docs/execCommand/#execcommand()
-WebIDL::ExceptionOr<bool> Document::exec_command(Utf16FlyString const& command, [[maybe_unused]] bool show_ui, Utf16View value)
-{
-    return exec_command_internal(command, show_ui, value, DispatchInputEvent::Yes);
-}
-
-WebIDL::ExceptionOr<bool> Document::exec_command_internal(Utf16FlyString const& command, [[maybe_unused]] bool show_ui, Utf16View value, DispatchInputEvent dispatch_input_event, Optional<Utf16FlyString> const& user_input_type)
-{
-    // AD-HOC: This is not directly mentioned in the spec, but all major browsers limit editing API calls to HTML documents
-    if (!is_html_document())
-        return WebIDL::InvalidStateError::create("execCommand is only supported on HTML documents"_utf16);
-
-    // AD-HOC: All major browsers refuse to recursively execute execCommand() (e.g. inside input event handlers).
-    if (m_inside_exec_command)
-        return false;
-    TemporaryChange guard_recursion { m_inside_exec_command, true };
-
-    // 1. If only one argument was provided, let show UI be false.
-    // 2. If only one or two arguments were provided, let value be the empty string.
-    // NOTE: these steps are dealt by the default values for both show_ui and value
-
-    // 3. If command is not supported or not enabled, return false.
-    // NOTE: query_command_enabled() also checks if command is supported
-    if (!MUST(query_command_enabled(command)))
-        return false;
-
-    // 4. If command is not in the Miscellaneous commands section:
-    //
-    //    We don't fire events for copy/cut/paste/undo/redo/selectAll because they should all have their own events. We
-    //    don't fire events for styleWithCSS/useCSS because it's not obvious where to fire them, or why anyone would
-    //    want them. We don't fire events for unsupported commands, because then if they became supported and were
-    //    classified with the miscellaneous events, we'd have to stop firing events for consistency's sake.
-    //
-    // AD-HOC: The defaultParagraphSeparator command is also in the Miscellaneous commands section
-    auto optional_command = Editing::find_command_definition(command);
-    VERIFY(optional_command.has_value());
-    auto const& command_definition = optional_command.release_value();
-    GC::Ptr<Node> affected_editing_host;
-    if (!command_definition.command.is_one_of(Editing::CommandNames::copy, Editing::CommandNames::cut,
-            Editing::CommandNames::defaultParagraphSeparator, Editing::CommandNames::paste, Editing::CommandNames::redo,
-            Editing::CommandNames::selectAll, Editing::CommandNames::styleWithCSS, Editing::CommandNames::undo,
-            Editing::CommandNames::useCSS)) {
-        // 1. Let affected editing host be the editing host that is an inclusive ancestor of the active range's start
-        //    node and end node, and is not the ancestor of any editing host that is an inclusive ancestor of the active
-        //    range's start node and end node.
-        //
-        // NOTE: Because either the start or end node of the range could be inside an editing host that is part of the
-        //       other node's editing host, we can probe both and see if either one is the other's ancestor.
-        // NOTE: We can reuse ->editing_host() here since query_command_enabled() above already checked that both the
-        //       start and end nodes are either editable or an editing host.
-        auto range = Editing::active_range(*this);
-        auto& start_node_editing_host = *range->start_container()->editing_host();
-        auto& end_node_editing_host = *range->end_container()->editing_host();
-        affected_editing_host = start_node_editing_host.is_ancestor_of(end_node_editing_host)
-            ? end_node_editing_host
-            : start_node_editing_host;
-
-        // 2. Fire an event named "beforeinput" at affected editing host using InputEvent, with its
-        //    bubbles and cancelable attributes initialized to true, and its data attribute
-        //    initialized to null.
-        // 3. If the value returned by the previous step is false, return false.
