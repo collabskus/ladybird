@@ -1,4 +1,24 @@
-﻿    // when a node near the selection is removed.
+﻿// A single reversible DOM mutation performed by an editing command, modeled after the simple
+// edit command hierarchies in WebKit and Blink. The mutation itself happens when the command is
+// created and applied through one of the proxy functions below; unapply() and reapply() replay
+// it through the editing history. Scripts may have rearranged the DOM since the command first
+// ran, so both re-validate their preconditions and become no-ops when the mutation no longer
+// makes sense. Commands keep strong references to their nodes so the original objects survive
+// on the undo stack and undo can reinsert the very same nodes.
+class EditCommand : public JS::Cell {
+    GC_CELL(EditCommand, JS::Cell);
+
+public:
+    virtual ~EditCommand() override = default;
+
+    // Both return whether the mutation was actually performed; a command declines when scripts
+    // have since rearranged the DOM in a way that makes its replay meaningless.
+    virtual bool unapply() = 0;
+    virtual bool reapply() = 0;
+
+    // Whether this command removed a node from the document that the rest of its editing action
+    // did not put back. Used to end typing coalescence, since Blink closes an open typing unit
+    // when a node near the selection is removed.
     virtual bool is_lasting_node_removal() const { return false; }
 };
 
@@ -166050,6 +166070,11 @@ WebIDL::UnsignedLongLong Internals::table_cell_measurement_cache_miss_count()
     return window().associated_document().layout_node_arena().table_cell_measurement_cache_miss_count();
 }
 
+WebIDL::UnsignedLongLong Internals::intrinsic_measurement_count()
+{
+    return window().associated_document().layout_node_arena().intrinsic_measurement_count();
+}
+
 WebIDL::UnsignedLongLong Internals::accumulated_visual_context_tree_build_count()
 {
     auto& document = window().associated_document();
@@ -167242,6 +167267,7 @@ public:
     WebIDL::UnsignedLongLong full_layout_count();
     WebIDL::UnsignedLongLong layout_run_cache_hit_count();
     WebIDL::UnsignedLongLong table_cell_measurement_cache_miss_count();
+    WebIDL::UnsignedLongLong intrinsic_measurement_count();
     WebIDL::UnsignedLongLong accumulated_visual_context_tree_build_count();
     void set_autoplay_policy(Utf16String const& policy);
 
@@ -167454,6 +167480,7 @@ interface Internals {
     unsigned long long fullLayoutCount();
     unsigned long long layoutRunCacheHitCount();
     unsigned long long tableCellMeasurementCacheMissCount();
+    unsigned long long intrinsicMeasurementCount();
     unsigned long long accumulatedVisualContextTreeBuildCount();
     undefined setAutoplayPolicy(Utf16DOMString policy);
 
@@ -172484,6 +172511,11 @@ u64 NodeArena::table_cell_measurement_cache_miss_count() const
     return RustFFI::layout_arena_table_cell_measurement_cache_miss_count(m_handle);
 }
 
+u64 NodeArena::intrinsic_measurement_count() const
+{
+    return RustFFI::layout_arena_intrinsic_measurement_count(m_handle);
+}
+
 void NodeArena::drop_intrinsic_size_cache(RustFFI::NodeData const& node_data) const
 {
     RustFFI::layout_arena_drop_intrinsic_size_cache(m_handle, &node_data);
@@ -172595,6 +172627,7 @@ public:
     void* handle() const { return m_handle; }
     u64 formatting_context_run_cache_hit_count() const;
     u64 table_cell_measurement_cache_miss_count() const;
+    u64 intrinsic_measurement_count() const;
     void drop_intrinsic_size_cache(RustFFI::NodeData const&) const;
 
     void enroll_text_node_for_content_sync(TextNode const&);
@@ -173799,6 +173832,126 @@ static bool may_reuse_layout_node_for_child_list_insertion(DOM::Node const& node
     if (!element || !layout_node || element->shadow_root() || is<HTML::HTMLSlotElement>(*element))
         return false;
 
+    auto collapsing_whitespace_can_be_inserted = [&](DOM::Text const& text) {
+        enum class SiblingDirection {
+            Previous,
+            Next,
+        };
+
+        Node const* last_layout_child = nullptr;
+        for (auto layout_child = layout_node->first_child(); layout_child; layout_child = layout_child->next_sibling())
+            last_layout_child = layout_child.ptr();
+        auto const* trailing_inline_wrapper = last_layout_child && last_layout_child->is_anonymous() && last_layout_child->children_are_inline()
+                && !last_layout_child->is_generated_for_pseudo_element()
+            ? last_layout_child
+            : nullptr;
+        bool will_join_trailing_inline_wrapper = false;
+
+        auto can_place_next_to_layout_node = [&](Node const* sibling_layout_node, SiblingDirection direction, Optional<CSS::PseudoElement> pseudo_element) {
+            if (!sibling_layout_node)
+                return true;
+            if (auto const* node_with_style = as_if<NodeWithStyle>(*sibling_layout_node); node_with_style && node_with_style->is_out_of_flow()) {
+                if (pseudo_element.has_value() || direction == SiblingDirection::Next)
+                    return false;
+            }
+
+            while (sibling_layout_node->parent() && sibling_layout_node->parent() != layout_node)
+                sibling_layout_node = sibling_layout_node->parent();
+            if (sibling_layout_node->parent() != layout_node)
+                return false;
+            if (pseudo_element.has_value()) {
+                // ::after cannot anchor a newly appended anonymous wrapper. In normal flow,
+                // inline ::before content also has to remain in its existing inline run, while
+                // blockified flex/grid pseudo-elements remain separate items.
+                if (direction == SiblingDirection::Next)
+                    return layout_node->children_are_inline();
+
+                auto pseudo_style = element->computed_style(*pseudo_element);
+                auto parent_display = layout_node->display();
+                auto pseudo_belongs_to_inline_run = pseudo_style
+                    && (pseudo_style->display().is_inline_outside() || pseudo_style->display().is_contents())
+                    && !parent_display.is_flex_inside() && !parent_display.is_grid_inside();
+                return layout_node->children_are_inline() || !pseudo_belongs_to_inline_run;
+            }
+            if (sibling_layout_node->is_anonymous()) {
+                if (sibling_layout_node != trailing_inline_wrapper)
+                    return false;
+                will_join_trailing_inline_wrapper = true;
+            }
+            return true;
+        };
+
+        auto can_place_next_to_sibling = [&](DOM::Node const* sibling, SiblingDirection direction) {
+            for (; sibling; sibling = direction == SiblingDirection::Next ? sibling->next_sibling() : sibling->previous_sibling()) {
+                if (auto const* sibling_element = as_if<DOM::Element>(*sibling)) {
+                    auto computed_style = sibling_element->computed_style();
+                    if (computed_style && computed_style->display().is_contents())
+                        return false;
+                }
+
+                auto const* sibling_layout_node = sibling->unsafe_layout_node();
+                if (!sibling_layout_node)
+                    continue;
+                return can_place_next_to_layout_node(sibling_layout_node, direction, {});
+            }
+
+            auto pseudo_element = direction == SiblingDirection::Previous
+                ? CSS::PseudoElement::Before
+                : CSS::PseudoElement::After;
+            return can_place_next_to_layout_node(element->pseudo_element_unsafe_layout_node(pseudo_element), direction, pseudo_element);
+        };
+
+        if (!can_place_next_to_sibling(text.previous_sibling(), SiblingDirection::Previous)
+            || !can_place_next_to_sibling(text.next_sibling(), SiblingDirection::Next)) {
+            return false;
+        }
+
+        // Incremental inline insertion always reuses a trailing anonymous inline wrapper. If the
+        // whitespace belongs to a different run, only a full rebuild can place it correctly.
+        return !trailing_inline_wrapper || will_join_trailing_inline_wrapper;
+    };
+
+    auto const* first_letter_owner = node.first_letter_owner_for_layout_subtree_from(node);
+
+    bool has_pending_collapsing_whitespace_since_layout_node = false;
+    bool pending_children_can_preserve_parent = true;
+    for (auto const* child = node.first_child(); child; child = child->next_sibling()) {
+        if (child->unsafe_layout_node()) {
+            has_pending_collapsing_whitespace_since_layout_node = false;
+            if (child->needs_layout_tree_update() || child->child_needs_layout_tree_update()) {
+                pending_children_can_preserve_parent = false;
+            }
+            continue;
+        }
+        if (!child->needs_layout_tree_update())
+            continue;
+        if (auto const* text = as_if<DOM::Text>(*child); text && text->data().is_ascii_whitespace()
+            && layout_node->white_space_collapse() == CSS::WhiteSpaceCollapse::Collapse
+            && !first_letter_owner
+            && collapsing_whitespace_can_be_inserted(*text)) {
+            if (has_pending_collapsing_whitespace_since_layout_node) {
+                pending_children_can_preserve_parent = false;
+                break;
+            }
+            has_pending_collapsing_whitespace_since_layout_node = true;
+            continue;
+        }
+        auto const* child_element = as_if<DOM::Element>(*child);
+        if (!child_element) {
+            pending_children_can_preserve_parent = false;
+            break;
+        }
+        auto computed_style = child_element->computed_style();
+        if (!computed_style || !computed_style->display().is_none()) {
+            pending_children_can_preserve_parent = false;
+            break;
+        }
+    }
+    // An empty set means every insertion was canceled before layout. Moves are marked dirty at
+    // their destination, so they still enter one of the rejection paths above.
+    if (pending_children_can_preserve_parent)
+        return true;
+
     auto parent_display = layout_node->display();
     auto parent_has_children = layout_node->has_children();
     auto parent_lays_out_flex_or_grid_children = parent_display.is_flex_inside() || parent_display.is_grid_inside();
@@ -173809,7 +173962,7 @@ static bool may_reuse_layout_node_for_child_list_insertion(DOM::Node const& node
     if (!parent_lays_out_flex_or_grid_children && !parent_lays_out_inline_children && !parent_lays_out_block_children) {
         return false;
     }
-    if (node.first_letter_owner_for_layout_subtree_from(node))
+    if (first_letter_owner)
         return false;
 
     bool will_insert_inline_child = false;
@@ -175149,6 +175302,25 @@ static void ffi_insert_child(void*, void* parent_pointer, void* child_pointer, R
     VERIFY(mode == RustFFI::FfiInsertionMode::InDomOrder);
     auto* dom_node = child->dom_node();
     VERIFY(dom_node);
+
+    // An inline child of a block container with block children is placed in a newly appended
+    // anonymous wrapper. Move that empty wrapper to the child's DOM position before filling it.
+    if (parent.is_anonymous() && !parent.has_children()) {
+        if (auto* wrapper_parent = parent.parent()) {
+            for (auto* sibling = dom_node->next_sibling(); sibling; sibling = sibling->next_sibling()) {
+                auto* sibling_layout_node = sibling->unsafe_layout_node();
+                while (sibling_layout_node && sibling_layout_node->parent() != wrapper_parent)
+                    sibling_layout_node = sibling_layout_node->parent();
+                if (!sibling_layout_node || sibling_layout_node == &parent)
+                    continue;
+                NonnullRefPtr wrapper = parent;
+                wrapper_parent->remove_child(parent);
+                wrapper_parent->insert_before(move(wrapper), sibling_layout_node);
+                break;
+            }
+        }
+    }
+
     for (auto* sibling = dom_node->next_sibling(); sibling; sibling = sibling->next_sibling()) {
         auto* sibling_layout_node = sibling->unsafe_layout_node();
         if (sibling_layout_node && sibling_layout_node->parent() == &parent) {
@@ -316739,7 +316911,6 @@ impl StyleEngine {
         }
         let routing = Rc::get_mut(&mut self.routing).expect("routing program is shared outside a planning epoch");
         routing.add_rule(rule, program, &self.programs);
-        routing.settle_memory(&mut self.memory);
     }
 
     /// The process-global atom for one interned name identity.
@@ -316818,8 +316989,8 @@ impl StyleEngine {
         let previous_program = self
             .replacement_rule(rule)
             .and_then(|replacement| replacement.version.selector_program);
-        let (program, inserted) = self.programs.add_with_status(selector_program, &mut self.memory);
-        self.selector_programs_need_sweep |= inserted;
+        let (program, _) = self.programs.add_with_status(selector_program, &mut self.memory);
+        self.selector_programs_need_sweep |= previous_program.is_some();
         self.programs.settle_memory(&mut self.memory);
         if previous_program != Some(program) {
             self.add_routing_rule(rule, program);
@@ -316833,8 +317004,8 @@ impl StyleEngine {
 
     #[cfg(feature = "style-recording")]
     pub(crate) fn replace_replayed_style_rule_selectors(&mut self, rule: RuleID, selector_program: SelectorProgram) {
-        let (program, inserted) = self.programs.add_with_status(selector_program, &mut self.memory);
-        self.selector_programs_need_sweep |= inserted;
+        let (program, _) = self.programs.add_with_status(selector_program, &mut self.memory);
+        self.selector_programs_need_sweep = true;
         self.programs.settle_memory(&mut self.memory);
         self.add_routing_rule(rule, program);
         let mut version = self.current_rule_version(rule);
@@ -316993,8 +317164,8 @@ impl StyleEngine {
         {
             return reusable;
         }
-        let (program, inserted) = self.programs.add_with_status(compiled, &mut self.memory);
-        self.selector_programs_need_sweep |= inserted;
+        let (program, _) = self.programs.add_with_status(compiled, &mut self.memory);
+        self.selector_programs_need_sweep |= reusable.is_some();
         self.programs.settle_memory(&mut self.memory);
         program
     }
@@ -324658,39 +324829,17 @@ fn for_each_matching_scope(
     Ok(())
 }
 
-trait DenseStagingID: Copy + Ord {
-    fn index(self) -> usize;
-}
-
-impl DenseStagingID for RuleID {
-    fn index(self) -> usize {
-        self.0 as usize
-    }
-}
-
-impl DenseStagingID for SheetID {
-    fn index(self) -> usize {
-        self.0 as usize
-    }
-}
-
-impl DenseStagingID for TreeScopeID {
-    fn index(self) -> usize {
-        self.0 as usize
-    }
-}
-
 struct StagedFieldRow<V> {
     before: V,
     after: V,
     dirty: bool,
 }
 
-/// Dense staging for one program field. The first write freezes `before`, later writes replace
+/// Sparse staging for one program field. The first write freezes `before`, later writes replace
 /// `after`, and `take_dirty()` applies only the last write while retaining both sides for
-/// `ProgramStaging::delta()`. `clear()` releases the dense columns after the transaction.
+/// `ProgramStaging::delta()`.
 struct StagedField<K, V> {
-    rows: Column<Option<StagedFieldRow<V>>>,
+    rows: HashMap<K, StagedFieldRow<V>>,
     touched: Vec<K>,
     dirty_count: usize,
 }
@@ -324698,27 +324847,24 @@ struct StagedField<K, V> {
 impl<K, V> Default for StagedField<K, V> {
     fn default() -> Self {
         Self {
-            rows: Column::default(),
+            rows: HashMap::default(),
             touched: Vec::new(),
             dirty_count: 0,
         }
     }
 }
 
-impl<K: DenseStagingID, V: Clone> StagedField<K, V> {
+impl<K: Copy + Eq + Hash + Ord, V: Clone> StagedField<K, V> {
     fn current(&self, key: K, committed: impl FnOnce() -> V) -> V {
         self.side(key, TransactionFactSide::After, committed)
     }
 
     fn after(&self, key: K) -> Option<&V> {
-        self.rows
-            .get(key.index())
-            .and_then(Option::as_ref)
-            .map(|row| &row.after)
+        self.rows.get(&key).map(|row| &row.after)
     }
 
     fn side(&self, key: K, side: TransactionFactSide, resident: impl FnOnce() -> V) -> V {
-        let row = self.rows.get(key.index()).and_then(Option::as_ref);
+        let row = self.rows.get(&key);
         match (side, row) {
             (TransactionFactSide::Before, Some(row)) => row.before.clone(),
             (TransactionFactSide::After, Some(row)) => row.after.clone(),
@@ -324727,8 +324873,7 @@ impl<K: DenseStagingID, V: Clone> StagedField<K, V> {
     }
 
     fn stage(&mut self, key: K, before: V, after: V) {
-        let slot = self.rows.entry(key.index());
-        if let Some(row) = slot {
+        if let Some(row) = self.rows.get_mut(&key) {
             row.after = after;
             if !row.dirty {
                 row.dirty = true;
@@ -324736,11 +324881,14 @@ impl<K: DenseStagingID, V: Clone> StagedField<K, V> {
             }
             return;
         }
-        *slot = Some(StagedFieldRow {
-            before,
-            after,
-            dirty: true,
-        });
+        self.rows.insert(
+            key,
+            StagedFieldRow {
+                before,
+                after,
+                dirty: true,
+            },
+        );
         self.touched.push(key);
         self.dirty_count += 1;
     }
@@ -324748,7 +324896,7 @@ impl<K: DenseStagingID, V: Clone> StagedField<K, V> {
     fn take_dirty(&mut self) -> Vec<(K, V)> {
         let mut dirty = Vec::with_capacity(self.dirty_count);
         for &key in &self.touched {
-            let row = self.rows[key.index()].as_mut().unwrap();
+            let row = self.rows.get_mut(&key).unwrap();
             if row.dirty {
                 dirty.push((key, row.after.clone()));
                 row.dirty = false;
@@ -324764,20 +324912,18 @@ impl<K: DenseStagingID, V: Clone> StagedField<K, V> {
     }
 
     fn clear(&mut self) {
-        self.rows = Column::default();
-        self.touched = Vec::new();
+        self.rows.clear();
+        self.touched.clear();
         self.dirty_count = 0;
     }
 
     fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
-        self.touched
-            .iter()
-            .map(|key| (key, &self.rows[key.index()].as_ref().unwrap().after))
+        self.touched.iter().map(|key| (key, &self.rows.get(key).unwrap().after))
     }
 
     fn pairs(&self) -> impl Iterator<Item = (K, &V, &V)> {
         self.touched.iter().map(|&key| {
-            let row = self.rows[key.index()].as_ref().unwrap();
+            let row = self.rows.get(&key).unwrap();
             (key, &row.before, &row.after)
         })
     }
@@ -326751,11 +326897,12 @@ impl StyleEngine {
             return;
         }
         self.routing_needs_detachment_sweep = false;
-        let live_rules = self.program.live_selector_programs().collect::<Vec<_>>();
         let mut excluded_sheets = BitColumn::default();
-        for &(rule, _) in &live_rules {
-            let sheet = self.program.rule_sheet(rule);
-            if !self.program.sheet_is_attached_somewhere(sheet) {
+        let mut attached_sheets = Vec::new();
+        for (sheet, attached) in self.program.sheets_with_attachment_state() {
+            if attached {
+                attached_sheets.push(sheet);
+            } else {
                 excluded_sheets.set(sheet.0 as usize, true);
             }
         }
@@ -326763,11 +326910,17 @@ impl StyleEngine {
             return;
         }
         let mut rebuilt_routing = RoutingRegistry::new();
-        for &(rule, program) in &live_rules {
-            if excluded_sheets.contains(self.program.rule_sheet(rule).0 as usize) {
-                continue;
+        for sheet in attached_sheets {
+            for rule in self
+                .program
+                .rules_in_sheet(sheet)
+                .into_iter()
+                .filter(|&rule| self.program.rule_is_live(rule))
+            {
+                if let Some(program) = self.program.rule_version(rule).selector_program {
+                    rebuilt_routing.add_rule(rule, program, &self.programs);
+                }
             }
-            rebuilt_routing.add_rule(rule, program, &self.programs);
         }
         let mut previous_routing = std::mem::replace(&mut self.routing, Rc::new(rebuilt_routing));
         Rc::get_mut(&mut previous_routing)
@@ -335075,6 +335228,15 @@ impl StyleSheetProgram {
         !self.sheets[sheet.0 as usize].attachments.is_empty()
     }
 
+    pub fn sheets_with_attachment_state(&self) -> impl Iterator<Item = (SheetID, bool)> + '_ {
+        self.sheets.iter().enumerate().map(|(index, sheet)| {
+            (
+                SheetID(u32::try_from(index).expect("sheet identity space exhausted")),
+                !sheet.attachments.is_empty(),
+            )
+        })
+    }
+
     pub fn live_selector_programs(&self) -> impl Iterator<Item = (RuleID, SelectorProgramID)> + '_ {
         self.rules.iter().enumerate().filter_map(|(index, rule)| {
             let version = self.rule_versions[rule.version_slot as usize];
@@ -335238,8 +335400,20 @@ impl StyleSheetProgram {
     /// Every live style rule of a sheet, in cascade order within that sheet.
     #[must_use]
     pub fn rules_in_sheet(&self, sheet: SheetID) -> Vec<RuleID> {
+        let top_level_rules = &self.sheets[sheet.0 as usize].rules;
+        if top_level_rules
+            .iter()
+            .all(|rule| self.rules[rule.0 as usize].children.is_empty())
+        {
+            return top_level_rules
+                .iter()
+                .copied()
+                .filter(|rule| self.rules[rule.0 as usize].live)
+                .collect();
+        }
+
         let mut rules: Vec<RuleID> = Vec::new();
-        for &top_level in &self.sheets[sheet.0 as usize].rules {
+        for &top_level in top_level_rules {
             self.collect_live_subtree(top_level, &mut rules);
         }
         rules.sort_by(|first, second| {
@@ -335392,7 +335566,9 @@ impl StyleSheetProgram {
         declared: Vec<DeclaredProperty>,
         declarations_are_complete: bool,
     ) {
-        self.invalidate_semantic_declarations();
+        if self.rules[rule.0 as usize].semantic_declaration != SemanticDeclarationID::default() {
+            self.invalidate_semantic_declarations();
+        }
         let entry = &mut self.rules[rule.0 as usize];
         let previous_capacity = (entry.declared_properties.capacity() * size_of::<DeclaredProperty>()) as u64;
         entry.declared_properties = declared;
@@ -335724,6 +335900,7 @@ mod tests {
         let first = program.append_rule(sheet, None, RuleKind::Style);
         let second = program.append_rule(sheet, None, RuleKind::Style);
         let third = program.append_rule(sheet, None, RuleKind::Style);
+        let never_interned = program.append_rule(sheet, None, RuleKind::Style);
         let declared = |value| DeclaredProperty {
             property: 1,
             important: false,
@@ -335741,6 +335918,9 @@ mod tests {
         assert_ne!(first_identity, SemanticDeclarationID::default());
         assert_eq!(first_identity, second_identity);
         assert_ne!(first_identity, third_identity);
+
+        program.set_rule_declared_properties(never_interned, vec![declared(30)], true);
+        assert_eq!(program.ensure_semantic_declaration(first), first_identity);
 
         program.set_rule_declared_properties(second, vec![declared(10)], false);
         assert_eq!(
@@ -352088,7 +352268,7 @@ use super::*;
 use crate::css::property_metadata::property_id;
 
 #[test]
-fn dense_program_staging_freezes_before_until_release() {
+fn sparse_program_staging_freezes_before_until_release() {
     let rule = RuleID(7);
     let mut staged = StagedField::default();
     staged.stage(rule, 10_u32, 20);
@@ -352108,8 +352288,8 @@ fn dense_program_staging_freezes_before_until_release() {
 
     staged.clear();
     assert_eq!(staged.current(rule, || 50), 50);
-    assert_eq!(staged.rows.capacity(), 0);
-    assert_eq!(staged.touched.capacity(), 0);
+    assert!(staged.rows.is_empty());
+    assert!(staged.touched.is_empty());
 }
 
 #[test]
@@ -360199,6 +360379,43 @@ fn adding_a_live_selector_program_keeps_existing_routing() {
         assert!(Rc::ptr_eq(&routing_before_sweep, &engine.routing));
     }
     assert_eq!(engine.routing.len(), 2);
+}
+
+#[test]
+fn detachment_routing_rebuild_excludes_retired_rules() {
+    let mut engine = StyleEngine::new(DeviceClass::ForegroundDesktop);
+    let retained_sheet = engine.add_sheet(StyleSheetObjectID(1), CascadeOrigin::Author);
+    let detached_sheet = engine.add_sheet(StyleSheetObjectID(2), CascadeOrigin::Author);
+    engine.attach_sheet(retained_sheet, TreeScopeID::DOCUMENT);
+    engine.attach_sheet(detached_sheet, TreeScopeID::DOCUMENT);
+    let program = engine
+        .programs
+        .add(test_selector_program(".target", &[("target", StyleAtomID(1))]));
+
+    let retained_rule = engine.append_rule(retained_sheet, None, RuleKind::Style);
+    let group = engine.append_rule(retained_sheet, None, RuleKind::Media);
+    let retired_rule = engine.append_rule(retained_sheet, Some(group), RuleKind::Style);
+    let detached_rule = engine.append_rule(detached_sheet, None, RuleKind::Style);
+    for rule in [retained_rule, retired_rule, detached_rule] {
+        engine.add_routing_rule(rule, program);
+        let mut version = engine.program.rule_version(rule);
+        version.selector_program = Some(program);
+        engine.replace_rule_version(rule, version);
+    }
+    discard_transaction(&mut engine);
+    assert_eq!(engine.routing.len(), 3);
+
+    engine.remove_rule(group);
+    engine.detach_sheet(detached_sheet, TreeScopeID::DOCUMENT);
+    discard_transaction(&mut engine);
+
+    assert_eq!(engine.routing.len(), 1);
+    assert_eq!(
+        engine
+            .routing
+            .rule_of(engine.routing.routes_for(RoutingKey::Class(StyleAtomID(1)))[0]),
+        retained_rule
+    );
 }
 
 #[test]
@@ -371896,6 +372113,12 @@ impl BlockFormattingContext {
             // Keep the C++ behavior: diagnose and skip this unsupported box after its
             // vertical metrics have been resolved.
             eprintln!("FIXME: Block-level box is not BlockContainer but does not create formatting context");
+            crate::layout::propagate_percentage_block_size_dependency_to_containing_block(
+                &run.records,
+                &self.callbacks,
+                node,
+                self.sizing().resolve_percentage_block_size_dependency(node),
+            );
             return;
         }
 
@@ -372161,6 +372384,16 @@ impl BlockFormattingContext {
                 node,
                 inline_space_used_before_children_formatted,
                 list_item_first_baseline,
+            );
+        }
+
+        let dependency_was_not_reported_by_a_child_run = !has_independent_formatting_context;
+        if dependency_was_not_reported_by_a_child_run {
+            crate::layout::propagate_percentage_block_size_dependency_to_containing_block(
+                &run.records,
+                &self.callbacks,
+                node,
+                self.sizing().resolve_percentage_block_size_dependency(node),
             );
         }
 
@@ -373436,6 +373669,78 @@ struct FcRunCacheKey {
     root_cells: UsedValuesCellState,
 }
 
+impl FcRunCacheKey {
+    fn matches(&self, probe: &Self, entry_depends_on_percentage_block_size: bool) -> bool {
+        if self == probe {
+            return true;
+        }
+        if entry_depends_on_percentage_block_size {
+            return false;
+        }
+        self.fc_type == probe.fc_type
+            && self.root_cells == probe.root_cells
+            && layout_inputs_match_ignoring_percentage_block_size(&self.input, &probe.input)
+    }
+}
+
+fn available_block_sizes_are_interchangeable(a: AvailableSize, b: AvailableSize) -> bool {
+    let is_definite_or_indefinite = |size: AvailableSize| matches!(size, AvailableSize::Definite(_) | AvailableSize::Indefinite);
+    a == b || (is_definite_or_indefinite(a) && is_definite_or_indefinite(b))
+}
+
+fn layout_inputs_match_ignoring_percentage_block_size(a: &LayoutInput, b: &LayoutInput) -> bool {
+    let LayoutInput {
+        available_space,
+        containing_block_constraints,
+        content_box_position_in_bfc_root,
+        sizing,
+        participation,
+    } = *a;
+    let ContainingBlockConstraints {
+        percentage_basis_inline_size,
+        percentage_basis_block_size: _,
+        quirks_mode_percentage_basis_block_size: _,
+    } = containing_block_constraints;
+    available_space.inline_size == b.available_space.inline_size
+        && available_block_sizes_are_interchangeable(available_space.block_size, b.available_space.block_size)
+        && percentage_basis_inline_size == b.containing_block_constraints.percentage_basis_inline_size
+        && content_box_position_in_bfc_root == b.content_box_position_in_bfc_root
+        && participation == b.participation
+        && sizing_directives_match_ignoring_percentage_block_size(&sizing, &b.sizing)
+}
+
+fn sizing_directives_match_ignoring_percentage_block_size(a: &RootSizingDirectives, b: &RootSizingDirectives) -> bool {
+    let RootSizingDirectives {
+        forced_content_inline_size,
+        forced_content_block_size,
+        forced_min_border_box_block_size,
+        table_cell_intrinsic_block_padding,
+        table_box_content_block_offset_in_wrapper,
+        adopt_automatic_content_block_size,
+        flex_self_block_size_resolution_space,
+        float_avoidance_inline_size,
+        outer_float_intrusion_before_list_item_children,
+        treat_block_axis_percentage_insets_as_auto_beyond_root,
+    } = *a;
+    forced_content_inline_size == b.forced_content_inline_size
+        && forced_content_block_size == b.forced_content_block_size
+        && forced_min_border_box_block_size == b.forced_min_border_box_block_size
+        && table_cell_intrinsic_block_padding == b.table_cell_intrinsic_block_padding
+        && table_box_content_block_offset_in_wrapper == b.table_box_content_block_offset_in_wrapper
+        && adopt_automatic_content_block_size == b.adopt_automatic_content_block_size
+        && float_avoidance_inline_size == b.float_avoidance_inline_size
+        && outer_float_intrusion_before_list_item_children == b.outer_float_intrusion_before_list_item_children
+        && treat_block_axis_percentage_insets_as_auto_beyond_root == b.treat_block_axis_percentage_insets_as_auto_beyond_root
+        && match (flex_self_block_size_resolution_space, b.flex_self_block_size_resolution_space) {
+            (None, None) => true,
+            (Some(a_space), Some(b_space)) => {
+                a_space.inline_size == b_space.inline_size
+                    && available_block_sizes_are_interchangeable(a_space.block_size, b_space.block_size)
+            }
+            _ => false,
+        }
+}
+
 /// What must still be true for a stored entry to be replayed: the slot
 /// holds the same box (generation), nothing in its subtree was invalidated
 /// (the fragment cache epoch, whose bump walk has no propagation boundary).
@@ -373576,7 +373881,7 @@ impl FcRunCacheArenaStore {
         if entry.validity != validity {
             return None;
         }
-        if entry.key != *key {
+        if !entry.key.matches(key, entry.outputs.result.depends_on_percentage_block_size) {
             return None;
         }
         Some(entry.clone())
@@ -373595,7 +373900,7 @@ impl FcRunCacheArenaStore {
         let entries = self.entries.borrow();
         let entry = entries.get(slot as usize)?.as_ref()?;
         if entry.validity.slot_generation != validity.slot_generation
-            || entry.key != *key
+            || !entry.key.matches(key, entry.outputs.result.depends_on_percentage_block_size)
             // Each child-list edit bumps once when topology changes and once
             // when the parent is marked for layout-tree-update layout.
             || validity
@@ -373845,6 +374150,10 @@ impl FcRunCacheAttempt {
 }
 
 fn verify_cached_entry_against_fresh_run(root_slot: u32, cached: &FcRunCacheEntry, fresh: &FcRunCacheEntry) {
+    assert!(
+        cached.outputs.result.depends_on_percentage_block_size == fresh.outputs.result.depends_on_percentage_block_size,
+        "run cache shadow: percentage block-size dependency diverged for slot {root_slot}"
+    );
     assert!(
         cached.outputs.result == fresh.outputs.result,
         "run cache shadow: child layout result diverged for slot {root_slot}"
@@ -378108,6 +378417,7 @@ pub(crate) struct ChildLayoutResult {
     pub automatic_content_block_size: CssPixels,
     pub baselines: DerivedBaselines,
     pub table_box_in_wrapper_border_box_block_size: Option<CssPixels>,
+    pub depends_on_percentage_block_size: bool,
 }
 
 #[derive(Clone)]
@@ -378989,7 +379299,7 @@ fn execute_formatting_context_run(
         None
     };
     let mut implementation = None;
-    let result = if let Some((cached_block_size, cached_baselines)) = cached_atomic_block_size {
+    let mut result = if let Some((cached_block_size, cached_baselines)) = cached_atomic_block_size {
         ChildLayoutResult {
             automatic_content_block_size: cached_block_size,
             baselines: cached_baselines,
@@ -379018,6 +379328,7 @@ fn execute_formatting_context_run(
                     automatic_content_block_size: context.automatic_content_block_size(),
                     baselines,
                     table_box_in_wrapper_border_box_block_size: context.table_box_in_wrapper_border_box_block_size(),
+                    depends_on_percentage_block_size: false,
                 }
             }
             FormattingContextImplementation::Flex(context) => {
@@ -379098,6 +379409,7 @@ fn execute_formatting_context_run(
         }
         ParticipationInParentFormattingContext::Root => {}
     }
+    result.depends_on_percentage_block_size = run.sizing().resolve_percentage_block_size_dependency(run.box_);
 
     let take_run_fragments = || {
         run.fragments
@@ -379181,6 +379493,38 @@ fn finalize_atomic_root_block_size(
     }
 }
 
+pub(crate) fn propagate_percentage_block_size_dependency_to_containing_block(
+    records: &RunRecords,
+    callbacks: &FfiLayoutFcCallbacks,
+    child: Node,
+    child_depends_on_percentage_block_size: bool,
+) {
+    let run_root_reports_its_dependency_through_its_run_result = child == records.root();
+    if run_root_reports_its_dependency_through_its_run_result {
+        return;
+    }
+    let facts = NodeFacts::new(callbacks, child);
+    let resolves_against_containing_blocks_final_size = facts.is_absolutely_positioned();
+    if resolves_against_containing_blocks_final_size {
+        return;
+    }
+    let relative_block_insets_resolve_against_containing_block = facts.is_relatively_positioned() && {
+        let style = StyleValues::for_node(callbacks, child);
+        style.inset_top().contains_percentage() || style.inset_bottom().contains_percentage()
+    };
+    if !child_depends_on_percentage_block_size && !relative_block_insets_resolve_against_containing_block {
+        return;
+    }
+    let containing_block = callbacks.containing_block(child);
+    let containing_block_record_or_run_root_that_forwarded_the_basis = (!containing_block.is_invalid())
+        .then(|| records.used_values_if_owned(containing_block))
+        .flatten()
+        .unwrap_or_else(|| records.used_values(records.root()));
+    containing_block_record_or_run_root_that_forwarded_the_basis
+        .has_descendant_that_depends_on_percentage_block_size
+        .set(true);
+}
+
 pub(crate) fn layout_inside_child(
     run: &FormattingContextRun,
     parent_block: Option<&BlockFormattingContext>,
@@ -379198,6 +379542,14 @@ pub(crate) fn layout_inside_child(
         used.padding_top.set(used.padding_top.get() + padding_top);
         used.padding_bottom.set(used.padding_bottom.get() + padding_bottom);
     }
+    let note_skipped_child_dependency = || {
+        propagate_percentage_block_size_dependency_to_containing_block(
+            &run.records,
+            &run.callbacks,
+            child,
+            run.sizing().skipped_child_depends_on_percentage_block_size(child),
+        );
+    };
     if !force_independent_context_run
         && layout_mode == LayoutMode::IntrinsicSizing
         && matches!(input.participation, ParticipationInParentFormattingContext::AtomicInline)
@@ -379220,6 +379572,7 @@ pub(crate) fn layout_inside_child(
             Some(CssPixels::default()),
             || unreachable!("an empty atomic block has a zero automatic content block size"),
         );
+        note_skipped_child_dependency();
         return ChildLayoutOutcome::Skipped;
     }
     if !force_independent_context_run
@@ -379231,6 +379584,7 @@ pub(crate) fn layout_inside_child(
         && used.has_definite_block_size()
     {
         size_skipped_independent_root(run, parent_block, child, &input);
+        note_skipped_child_dependency();
         return ChildLayoutOutcome::Skipped;
     }
     let creates_replaced_context = matches!(
@@ -379239,6 +379593,7 @@ pub(crate) fn layout_inside_child(
     );
     if !facts.can_have_children() && !creates_replaced_context {
         size_skipped_independent_root(run, parent_block, child, &input);
+        note_skipped_child_dependency();
         return ChildLayoutOutcome::Skipped;
     }
 
@@ -379247,6 +379602,7 @@ pub(crate) fn layout_inside_child(
     });
     let Some(fc_type) = fc_type else {
         if force_independent_context_run {
+            note_skipped_child_dependency();
             return ChildLayoutOutcome::Skipped;
         }
         return ChildLayoutOutcome::ReenterCurrent;
@@ -379265,7 +379621,7 @@ pub(crate) fn layout_inside_child(
         &input,
         layout_mode == LayoutMode::Normal && !run.purpose.is_measurement(),
     );
-    ChildLayoutOutcome::Created(run_formatting_context(
+    let result = run_formatting_context(
         run.purpose,
         run.fragments.as_deref(),
         &used,
@@ -379277,7 +379633,14 @@ pub(crate) fn layout_inside_child(
         run.callbacks,
         input,
         parent_block,
-    ))
+    );
+    propagate_percentage_block_size_dependency_to_containing_block(
+        &run.records,
+        &run.callbacks,
+        child,
+        result.depends_on_percentage_block_size,
+    );
+    ChildLayoutOutcome::Created(result)
 }
 
 fn absorb_run_outputs(
@@ -387874,6 +388237,87 @@ pub(crate) struct IntrinsicSizeCacheKey {
     pub(crate) quirks_mode_percentage_basis_block_size: Option<CssPixels>,
 }
 
+impl IntrinsicSizeCacheKey {
+    fn with_percentage_block_bases_masked(self) -> Self {
+        Self {
+            percentage_basis_block_size: None,
+            quirks_mode_percentage_basis_block_size: None,
+            ..self
+        }
+    }
+
+    fn with_percentage_inline_basis_masked(self) -> Self {
+        Self {
+            percentage_basis_inline_size: None,
+            ..self
+        }
+    }
+
+    fn masked_for(self, dependencies: IntrinsicMeasurementDependencies) -> Self {
+        let mut key = self;
+        if !dependencies.percentage_block_size {
+            key = key.with_percentage_block_bases_masked();
+        }
+        if !dependencies.percentage_inline_basis {
+            key = key.with_percentage_inline_basis_masked();
+        }
+        key
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct IntrinsicMeasurementDependencies {
+    pub(crate) percentage_block_size: bool,
+    pub(crate) percentage_inline_basis: bool,
+}
+
+pub(crate) trait IntrinsicMeasurement: Copy {
+    fn dependencies(&self) -> IntrinsicMeasurementDependencies;
+}
+
+// Measurements are stored under their key with every basis they never observed masked out. A
+// probe that had to mask a basis must skip entries that observed it: a measurement made without
+// that basis shares the masked key's shape.
+fn intrinsic_cache_lookup<V: IntrinsicMeasurement>(
+    map: &HashMap<IntrinsicSizeCacheKey, V>,
+    key: IntrinsicSizeCacheKey,
+) -> Option<V> {
+    if let Some(value) = map.get(&key) {
+        return Some(*value);
+    }
+    let block_masked = key.with_percentage_block_bases_masked();
+    let inline_masked = key.with_percentage_inline_basis_masked();
+    let masking_block_changes_key = block_masked != key;
+    let masking_inline_changes_key = inline_masked != key;
+    let candidates = [
+        (block_masked, masking_block_changes_key, true, false),
+        (inline_masked, masking_inline_changes_key, false, true),
+        (
+            block_masked.with_percentage_inline_basis_masked(),
+            masking_block_changes_key && masking_inline_changes_key,
+            true,
+            true,
+        ),
+    ];
+    candidates.into_iter().filter(|(_, applies, _, _)| *applies).find_map(
+        |(candidate, _, block_was_masked, inline_was_masked)| {
+            let value = *map.get(&candidate)?;
+            let dependencies = value.dependencies();
+            let observed_a_masked_basis = (block_was_masked && dependencies.percentage_block_size)
+                || (inline_was_masked && dependencies.percentage_inline_basis);
+            (!observed_a_masked_basis).then_some(value)
+        },
+    )
+}
+
+fn intrinsic_cache_store<V: IntrinsicMeasurement>(
+    map: &mut HashMap<IntrinsicSizeCacheKey, V>,
+    key: IntrinsicSizeCacheKey,
+    value: V,
+) {
+    map.insert(key.masked_for(value.dependencies()), value);
+}
+
 impl Hash for IntrinsicSizeCacheKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         fn hash_optional<H: Hasher>(value: Option<CssPixels>, state: &mut H) {
@@ -387963,6 +388407,33 @@ pub(crate) struct IntrinsicInlineSizeMeasurement {
     pub(crate) first_baseline: CssPixels,
     pub(crate) has_last_baseline: bool,
     pub(crate) last_baseline: CssPixels,
+    pub(crate) depends_on_percentage_block_size: bool,
+    pub(crate) depends_on_percentage_inline_basis: bool,
+}
+
+impl IntrinsicMeasurement for IntrinsicInlineSizeMeasurement {
+    fn dependencies(&self) -> IntrinsicMeasurementDependencies {
+        IntrinsicMeasurementDependencies {
+            percentage_block_size: self.depends_on_percentage_block_size,
+            percentage_inline_basis: self.depends_on_percentage_inline_basis,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IntrinsicBlockSizeMeasurement {
+    pub(crate) size: CssPixels,
+    pub(crate) depends_on_percentage_block_size: bool,
+    pub(crate) depends_on_percentage_inline_basis: bool,
+}
+
+impl IntrinsicMeasurement for IntrinsicBlockSizeMeasurement {
+    fn dependencies(&self) -> IntrinsicMeasurementDependencies {
+        IntrinsicMeasurementDependencies {
+            percentage_block_size: self.depends_on_percentage_block_size,
+            percentage_inline_basis: self.depends_on_percentage_inline_basis,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -387971,13 +388442,16 @@ struct IntrinsicSizeMaps {
     inline_size_depends_on_block_size: Option<bool>,
     min_content_inline_size: HashMap<IntrinsicSizeCacheKey, IntrinsicInlineSizeMeasurement>,
     max_content_inline_size: HashMap<IntrinsicSizeCacheKey, IntrinsicInlineSizeMeasurement>,
-    min_content_block_size: HashMap<IntrinsicSizeCacheKey, CssPixels>,
-    max_content_block_size: HashMap<IntrinsicSizeCacheKey, CssPixels>,
+    min_content_block_size: HashMap<IntrinsicSizeCacheKey, IntrinsicBlockSizeMeasurement>,
+    max_content_block_size: HashMap<IntrinsicSizeCacheKey, IntrinsicBlockSizeMeasurement>,
     table_cell_measurements: HashMap<TableCellMeasurementKey, TableCellMeasurement>,
 }
 
 impl IntrinsicSizeMaps {
-    fn block_sizes(&self, kind: IntrinsicSizeCacheKind) -> Option<&HashMap<IntrinsicSizeCacheKey, CssPixels>> {
+    fn block_sizes(
+        &self,
+        kind: IntrinsicSizeCacheKind,
+    ) -> Option<&HashMap<IntrinsicSizeCacheKey, IntrinsicBlockSizeMeasurement>> {
         match kind {
             IntrinsicSizeCacheKind::MinContentInline | IntrinsicSizeCacheKind::MaxContentInline => None,
             IntrinsicSizeCacheKind::MinContentBlock => Some(&self.min_content_block_size),
@@ -387988,7 +388462,7 @@ impl IntrinsicSizeMaps {
     fn block_sizes_mut(
         &mut self,
         kind: IntrinsicSizeCacheKind,
-    ) -> Option<&mut HashMap<IntrinsicSizeCacheKey, CssPixels>> {
+    ) -> Option<&mut HashMap<IntrinsicSizeCacheKey, IntrinsicBlockSizeMeasurement>> {
         match kind {
             IntrinsicSizeCacheKind::MinContentInline | IntrinsicSizeCacheKind::MaxContentInline => None,
             IntrinsicSizeCacheKind::MinContentBlock => Some(&mut self.min_content_block_size),
@@ -388130,6 +388604,7 @@ pub(crate) struct LayoutNodeArena {
     live_count: u32,
     intrinsic_size_caches: RefCell<Vec<IntrinsicSizeCacheSlot>>,
     table_cell_measurement_cache_misses: Cell<u64>,
+    intrinsic_measurements: Cell<u64>,
     saved_abspos_layout_inputs: RefCell<Vec<SavedAbsposLayoutInputsSlot>>,
     text_contents: Vec<TextContentSlot>,
     text_chunk_caches: RefCell<Vec<TextChunkCacheSlot>>,
@@ -388155,6 +388630,7 @@ impl LayoutNodeArena {
             live_count: 0,
             intrinsic_size_caches: RefCell::new(Vec::new()),
             table_cell_measurement_cache_misses: Cell::new(0),
+            intrinsic_measurements: Cell::new(0),
             saved_abspos_layout_inputs: RefCell::new(Vec::new()),
             text_contents: Vec::new(),
             text_chunk_caches: RefCell::new(Vec::new()),
@@ -388739,7 +389215,7 @@ impl LayoutNodeArena {
         data: &NodeData,
         kind: IntrinsicSizeCacheKind,
         key: IntrinsicSizeCacheKey,
-    ) -> Option<CssPixels> {
+    ) -> Option<IntrinsicBlockSizeMeasurement> {
         assert!(
             matches!(
                 kind,
@@ -388754,12 +389230,12 @@ impl LayoutNodeArena {
         if slot.generation != metadata.generation || slot.epoch != data.intrinsic_cache_epoch {
             return None;
         }
-        slot.sizes
+        let map = slot
+            .sizes
             .as_ref()?
             .block_sizes(kind)
-            .expect("block size cache kind must use the block axis")
-            .get(&key)
-            .copied()
+            .expect("block size cache kind must use the block axis");
+        intrinsic_cache_lookup(map, key)
     }
 
     fn with_intrinsic_size_maps_mut(&self, data: &NodeData, callback: impl FnOnce(&mut IntrinsicSizeMaps)) {
@@ -388784,12 +389260,13 @@ impl LayoutNodeArena {
         data: &NodeData,
         kind: IntrinsicSizeCacheKind,
         key: IntrinsicSizeCacheKey,
-        value: CssPixels,
+        value: IntrinsicBlockSizeMeasurement,
     ) {
         self.with_intrinsic_size_maps_mut(data, |maps| {
-            maps.block_sizes_mut(kind)
-                .expect("block size cache kind must use the block axis")
-                .insert(key, value);
+            let map = maps
+                .block_sizes_mut(kind)
+                .expect("block size cache kind must use the block axis");
+            intrinsic_cache_store(map, key, value);
         });
     }
 
@@ -388813,12 +389290,12 @@ impl LayoutNodeArena {
         if slot.generation != metadata.generation || slot.epoch != data.intrinsic_cache_epoch {
             return None;
         }
-        slot.sizes
+        let map = slot
+            .sizes
             .as_ref()?
             .inline_measurements(kind)
-            .expect("inline measurement cache kind must use the inline axis")
-            .get(&key)
-            .copied()
+            .expect("inline measurement cache kind must use the inline axis");
+        intrinsic_cache_lookup(map, key)
     }
 
     pub(crate) fn intrinsic_inline_size_depends_on_block_size(
@@ -388856,9 +389333,10 @@ impl LayoutNodeArena {
         value: IntrinsicInlineSizeMeasurement,
     ) {
         self.with_intrinsic_size_maps_mut(data, |maps| {
-            maps.inline_measurements_mut(kind)
-                .expect("inline measurement cache kind must use the inline axis")
-                .insert(key, value);
+            let map = maps
+                .inline_measurements_mut(kind)
+                .expect("inline measurement cache kind must use the inline axis");
+            intrinsic_cache_store(map, key, value);
         });
     }
 
@@ -388894,6 +389372,14 @@ impl LayoutNodeArena {
 
     pub(crate) fn table_cell_measurement_cache_miss_count(&self) -> u64 {
         self.table_cell_measurement_cache_misses.get()
+    }
+
+    pub(crate) fn note_intrinsic_measurement(&self) {
+        self.intrinsic_measurements.set(self.intrinsic_measurements.get() + 1);
+    }
+
+    pub(crate) fn intrinsic_measurement_count(&self) -> u64 {
+        self.intrinsic_measurements.get()
     }
 
     pub(crate) fn saved_abspos_layout_inputs(&self, data: *const NodeData) -> Option<AbsposLayoutInputs> {
@@ -389652,6 +390138,19 @@ pub unsafe extern "C" fn layout_arena_table_cell_measurement_cache_miss_count(ar
 
 /// # Safety
 ///
+/// The arena must remain valid for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn layout_arena_intrinsic_measurement_count(arena: *mut c_void) -> u64 {
+    abort_on_panic(|| {
+        assert!(!arena.is_null(), "layout node arena handle is null");
+        // SAFETY: The C++ wrapper keeps the arena alive for this call and
+        // serializes all access on the document thread.
+        unsafe { &*arena.cast::<LayoutNodeArena>() }.intrinsic_measurement_count()
+    })
+}
+
+/// # Safety
+///
 /// The arena must remain valid for the duration of the call, and `id` must
 /// name a live node in this arena.
 #[unsafe(no_mangle)]
@@ -389810,8 +390309,8 @@ mod tests {
     use std::cell::Cell;
 
     use crate::layout::layout_node_arena::{
-        Chunk, IntrinsicInlineSizeMeasurement, IntrinsicSizeCacheKey, IntrinsicSizeCacheKind, LayoutNodeArena,
-        SLOTS_PER_CHUNK, TableCellMeasurement, TableCellMeasurementKey,
+        Chunk, IntrinsicBlockSizeMeasurement, IntrinsicInlineSizeMeasurement, IntrinsicSizeCacheKey,
+        IntrinsicSizeCacheKind, LayoutNodeArena, SLOTS_PER_CHUNK, TableCellMeasurement, TableCellMeasurementKey,
     };
     use crate::layout::node_data::{NodeFlag, NodeSlotId};
     use crate::layout::{
@@ -389997,7 +390496,11 @@ mod tests {
             measured_at_inline_size: Some(CssPixels::from_raw(64)),
             ..Default::default()
         };
-        let value = CssPixels::from_raw(128);
+        let value = IntrinsicBlockSizeMeasurement {
+            size: CssPixels::from_raw(128),
+            depends_on_percentage_block_size: false,
+            depends_on_percentage_inline_basis: false,
+        };
         let inline_measurement = IntrinsicInlineSizeMeasurement {
             automatic_content_inline_size: CssPixels::from_raw(192),
             min_content_inline_size_from_max_content_layout: Some(CssPixels::from_raw(96)),
@@ -390010,6 +390513,8 @@ mod tests {
             first_baseline: CssPixels::from_raw(64),
             has_last_baseline: true,
             last_baseline: CssPixels::from_raw(128),
+            depends_on_percentage_block_size: false,
+            depends_on_percentage_inline_basis: false,
         };
         let dependency_computations = Cell::new(0);
 
@@ -390079,6 +390584,106 @@ mod tests {
             None
         );
         arena.free(second.slot, second.generation);
+    }
+
+    #[test]
+    fn intrinsic_size_cache_answers_masked_probes_only_from_independent_measurements() {
+        let mut arena = LayoutNodeArena::new();
+        let allocation = arena.allocate();
+        // SAFETY: The allocation remains live until it is explicitly freed below.
+        let data = unsafe { &mut *allocation.data };
+        let key_with_basis = |basis: i32| IntrinsicSizeCacheKey {
+            measured_at_inline_size: Some(CssPixels::from_raw(64)),
+            percentage_basis_block_size: Some(CssPixels::from_raw(basis)),
+            quirks_mode_percentage_basis_block_size: Some(CssPixels::from_raw(basis)),
+            ..Default::default()
+        };
+        let key_without_basis = IntrinsicSizeCacheKey {
+            measured_at_inline_size: Some(CssPixels::from_raw(64)),
+            ..Default::default()
+        };
+        let max_content = IntrinsicSizeCacheKind::MaxContentBlock;
+        let min_content = IntrinsicSizeCacheKind::MinContentBlock;
+
+        let independent = IntrinsicBlockSizeMeasurement {
+            size: CssPixels::from_raw(128),
+            depends_on_percentage_block_size: false,
+            depends_on_percentage_inline_basis: false,
+        };
+        arena.intrinsic_block_size_cache_put(data, max_content, key_with_basis(100), independent);
+        assert_eq!(
+            arena.intrinsic_block_size_cache_get(data, max_content, key_with_basis(100)),
+            Some(independent)
+        );
+        assert_eq!(
+            arena.intrinsic_block_size_cache_get(data, max_content, key_with_basis(200)),
+            Some(independent)
+        );
+        assert_eq!(
+            arena.intrinsic_block_size_cache_get(data, max_content, key_without_basis),
+            Some(independent)
+        );
+
+        let dependent = IntrinsicBlockSizeMeasurement {
+            size: CssPixels::from_raw(256),
+            depends_on_percentage_block_size: true,
+            depends_on_percentage_inline_basis: false,
+        };
+        arena.intrinsic_block_size_cache_put(data, min_content, key_without_basis, dependent);
+        assert_eq!(
+            arena.intrinsic_block_size_cache_get(data, min_content, key_without_basis),
+            Some(dependent)
+        );
+        assert_eq!(
+            arena.intrinsic_block_size_cache_get(data, min_content, key_with_basis(100)),
+            None
+        );
+        arena.intrinsic_block_size_cache_put(data, min_content, key_with_basis(100), dependent);
+        assert_eq!(
+            arena.intrinsic_block_size_cache_get(data, min_content, key_with_basis(100)),
+            Some(dependent)
+        );
+        assert_eq!(
+            arena.intrinsic_block_size_cache_get(data, min_content, key_with_basis(200)),
+            None
+        );
+
+        let key_at_another_inline_size_with_inline_basis = |basis: i32| IntrinsicSizeCacheKey {
+            measured_at_inline_size: Some(CssPixels::from_raw(96)),
+            percentage_basis_inline_size: Some(CssPixels::from_raw(basis)),
+            ..key_with_basis(100)
+        };
+        let observes_inline_basis = IntrinsicBlockSizeMeasurement {
+            size: CssPixels::from_raw(512),
+            depends_on_percentage_block_size: false,
+            depends_on_percentage_inline_basis: true,
+        };
+        arena.intrinsic_block_size_cache_put(
+            data,
+            max_content,
+            key_at_another_inline_size_with_inline_basis(300),
+            observes_inline_basis,
+        );
+        assert_eq!(
+            arena.intrinsic_block_size_cache_get(data, max_content, key_at_another_inline_size_with_inline_basis(300)),
+            Some(observes_inline_basis)
+        );
+        assert_eq!(
+            arena.intrinsic_block_size_cache_get(
+                data,
+                max_content,
+                IntrinsicSizeCacheKey {
+                    percentage_basis_block_size: Some(CssPixels::from_raw(200)),
+                    ..key_at_another_inline_size_with_inline_basis(300)
+                }
+            ),
+            Some(observes_inline_basis)
+        );
+        assert_eq!(
+            arena.intrinsic_block_size_cache_get(data, max_content, key_at_another_inline_size_with_inline_basis(400)),
+            None
+        );
+        arena.free(allocation.slot, allocation.generation);
     }
 
     #[test]
@@ -391787,6 +392392,7 @@ mod tree_builder;
 
 include!("used_values.rs");
 
+use crate::layout::layout_node_arena::IntrinsicBlockSizeMeasurement;
 use crate::layout::layout_node_arena::IntrinsicInlineSizeMeasurement;
 use crate::layout::layout_node_arena::IntrinsicSizeCacheKey;
 use crate::layout::layout_node_arena::IntrinsicSizeCacheKind;
@@ -392920,6 +393526,12 @@ fn layout_replaced_with_children(run: &FormattingContextRun, layout_input: Layou
         },
         None,
     );
+    crate::layout::propagate_percentage_block_size_dependency_to_containing_block(
+        &run.records,
+        &run.callbacks,
+        wrapper,
+        wrapper_result.depends_on_percentage_block_size,
+    );
     crate::layout::place_child(run, wrapper, FfiCssPixelPoint::default(), None);
 
     ChildLayoutResult {
@@ -393015,6 +393627,10 @@ impl RunRecords {
 
     pub(crate) fn used_values_if_owned(&self, node: Node) -> Option<std::rc::Rc<UsedValues>> {
         self.arena().run_record(node.slot_index(), self.nonce)
+    }
+
+    pub(crate) fn root(&self) -> Node {
+        self.root
     }
 }
 
@@ -393794,7 +394410,9 @@ impl SizingContext {
         // 5. Jump to the first step.
         // NOTE: Evaluated incrementally: in-flow auto-height block containers pass the basis they
         //       inherited from their own containing block through to their children.
-        let quirks_block = if facts.is_viewport() {
+        let quirks_block = if !facts.document_in_quirks_mode() {
+            None
+        } else if facts.is_viewport() {
             Some(used.content_block_size.get())
         } else if facts.is_table_cell() {
             Some(CssPixels::default())
@@ -393808,11 +394426,132 @@ impl SizingContext {
             constraints.quirks_mode_percentage_basis_block_size
         };
 
+        let forwarded_a_block_basis = (!used.has_definite_block_size()
+            && should_forward_indefinite_basis
+            && constraints.percentage_basis_block_size.is_some())
+            || (quirks_block.is_some()
+                && quirks_block == constraints.quirks_mode_percentage_basis_block_size
+                && facts.document_in_quirks_mode()
+                && !facts.is_viewport()
+                && !facts.is_table_cell()
+                && style.height().is_auto()
+                && !facts.is_absolutely_positioned()
+                && facts.is_block_container()
+                && !facts.is_table_wrapper());
+        debug_assert!(
+            !forwarded_a_block_basis || self.passes_percentage_block_size_through_to_children(containing_block),
+            "a containing block that forwards a percentage block basis must report it to dependency tracking"
+        );
+
         ContainingBlockConstraints {
             percentage_basis_inline_size: inline,
             percentage_basis_block_size: block,
             quirks_mode_percentage_basis_block_size: quirks_block,
         }
+    }
+
+    pub(crate) fn own_style_depends_on_percentage_block_size(&self, node: Node) -> bool {
+        let facts = self.facts(node);
+        if facts.is_text_node() {
+            return false;
+        }
+        let style = self.style(node);
+        let size_reads_block_axis_input = |size: &ComputedSize| size.contains_percentage() || size.is_fit_content();
+        let quirks_fill_viewport_rule_reads_block_basis = facts.document_in_quirks_mode()
+            && style.height().is_auto()
+            && (facts.is_html_html_element() || facts.is_html_body_element());
+        let table_cell_vertical_padding_resolves_against_block_basis = facts.is_table_cell()
+            && (style.padding_top().contains_percentage() || style.padding_bottom().contains_percentage());
+        size_reads_block_axis_input(style.height())
+            || size_reads_block_axis_input(style.min_height())
+            || size_reads_block_axis_input(style.max_height())
+            || quirks_fill_viewport_rule_reads_block_basis
+            || table_cell_vertical_padding_resolves_against_block_basis
+    }
+
+    pub(crate) fn passes_percentage_block_size_through_to_children(&self, node: Node) -> bool {
+        let facts = self.facts(node);
+        if facts.is_text_node() {
+            return false;
+        }
+        let table_formatting_context_resolves_participants_against_its_input_basis =
+            facts.is_table_wrapper() || facts.is_table_box();
+        if table_formatting_context_resolves_participants_against_its_input_basis {
+            return true;
+        }
+        let style = self.style(node);
+        let in_quirks_mode = facts.document_in_quirks_mode();
+        let svg_root_forwards_quirks_basis = facts.is_svg_svg_box() && in_quirks_mode;
+        let forwards_block_basis_as_anonymous_box = facts.is_box()
+            && facts.is_anonymous()
+            && !facts.is_table_cell()
+            && !facts.has_auto_content_box_size()
+            && self.records.used_values_if_owned(node).is_some_and(|used| {
+                used.inline_size_constraint.get() == SizeConstraint::None
+                    && used.block_size_constraint.get() == SizeConstraint::None
+            });
+        let forwards_quirks_basis_as_auto_height_block_container = in_quirks_mode
+            && !facts.is_viewport()
+            && !facts.is_table_cell()
+            && style.height().is_auto()
+            && !facts.is_absolutely_positioned()
+            && facts.is_block_container()
+            && !facts.is_table_wrapper();
+        svg_root_forwards_quirks_basis
+            || forwards_block_basis_as_anonymous_box
+            || forwards_quirks_basis_as_auto_height_block_container
+    }
+
+    pub(crate) fn resolve_percentage_block_size_dependency(&self, node: Node) -> bool {
+        let used = self.used(node);
+        let depends_on_percentage_block_size = used.depends_on_percentage_block_size.get()
+            || self.own_style_depends_on_percentage_block_size(node)
+            || (used.has_descendant_that_depends_on_percentage_block_size.get()
+                && self.passes_percentage_block_size_through_to_children(node));
+        used.depends_on_percentage_block_size.set(depends_on_percentage_block_size);
+        depends_on_percentage_block_size
+    }
+
+    pub(crate) fn skipped_child_depends_on_percentage_block_size(&self, node: Node) -> bool {
+        let unvisited_content_below_a_forwarding_box_is_assumed_dependent =
+            self.has_children(node) && self.passes_percentage_block_size_through_to_children(node);
+        self.own_style_depends_on_percentage_block_size(node)
+            || unvisited_content_below_a_forwarding_box_is_assumed_dependent
+    }
+
+    // Descendants resolve percentages against the measured box itself, so only the box's own style
+    // can reach its containing block's inline basis.
+    fn measurement_root_observes_percentage_inline_basis(&self, node: Node) -> bool {
+        let facts = self.facts(node);
+        if facts.is_anonymous() || facts.is_replaced_box() || facts.has_auto_content_box_size() {
+            return true;
+        }
+        let style = self.style(node);
+        style.width().contains_percentage()
+            || style.min_width().contains_percentage()
+            || style.max_width().contains_percentage()
+            || style.padding_left().contains_percentage()
+            || style.padding_right().contains_percentage()
+            || style.padding_top().contains_percentage()
+            || style.padding_bottom().contains_percentage()
+            || style.margin_left().contains_percentage()
+            || style.margin_right().contains_percentage()
+            || style.margin_top().contains_percentage()
+            || style.margin_bottom().contains_percentage()
+    }
+
+    pub(crate) fn charge_measurement_dependency_to_measured_box_and_containing_block(
+        &self,
+        node: Node,
+        depends_on_percentage_block_size: bool,
+    ) {
+        if !depends_on_percentage_block_size {
+            return;
+        }
+        if let Some(record) = self.records.used_values_if_owned(node) {
+            record.depends_on_percentage_block_size.set(true);
+        }
+        propagate_percentage_block_size_dependency_to_containing_block(&self.records, &self.callbacks, node, true);
     }
 
     pub(crate) fn should_treat_inline_size_as_auto(&self, node: Node, available_space: AvailableSpace) -> bool {
@@ -394308,10 +395047,16 @@ impl SizingContext {
         node: Node,
         kind: IntrinsicSizeCacheKind,
         key: IntrinsicSizeCacheKey,
-    ) -> Option<CssPixels> {
-        self.callbacks
+    ) -> Option<IntrinsicBlockSizeMeasurement> {
+        let measurement = self
+            .callbacks
             .arena()
-            .intrinsic_block_size_cache_get(self.callbacks.node_data(node), kind, key)
+            .intrinsic_block_size_cache_get(self.callbacks.node_data(node), kind, key)?;
+        self.charge_measurement_dependency_to_measured_box_and_containing_block(
+            node,
+            measurement.depends_on_percentage_block_size,
+        );
+        Some(measurement)
     }
 
     fn intrinsic_block_cache_put(
@@ -394319,7 +395064,7 @@ impl SizingContext {
         node: Node,
         kind: IntrinsicSizeCacheKind,
         key: IntrinsicSizeCacheKey,
-        value: CssPixels,
+        value: IntrinsicBlockSizeMeasurement,
     ) {
         self.callbacks
             .arena()
@@ -394332,11 +395077,16 @@ impl SizingContext {
         kind: IntrinsicSizeCacheKind,
         key: IntrinsicSizeCacheKey,
     ) -> Option<IntrinsicInlineSizeMeasurement> {
-        self.callbacks.arena().intrinsic_inline_size_measurement_cache_get(
+        let measurement = self.callbacks.arena().intrinsic_inline_size_measurement_cache_get(
             self.callbacks.node_data(node),
             kind,
             key,
-        )
+        )?;
+        self.charge_measurement_dependency_to_measured_box_and_containing_block(
+            node,
+            measurement.depends_on_percentage_block_size,
+        );
+        Some(measurement)
     }
 
     fn intrinsic_inline_measurement_cache_put(
@@ -394382,6 +395132,8 @@ impl SizingContext {
                 first_baseline: used.first_baseline.get(),
                 has_last_baseline: used.has_last_baseline.get(),
                 last_baseline: used.last_baseline.get(),
+                depends_on_percentage_block_size: result.depends_on_percentage_block_size,
+                depends_on_percentage_inline_basis: self.measurement_root_observes_percentage_inline_basis(node),
             },
         );
     }
@@ -394771,6 +395523,7 @@ impl SizingContext {
             return cached.automatic_content_inline_size;
         }
 
+        self.callbacks.arena().note_intrinsic_measurement();
         let measurement = MeasurementState::create(self.callbacks);
         let root = measurement.create_used_values(node, constraints);
         // NB: A parent layout can assign a definite block size that is not present in computed style,
@@ -394804,6 +395557,10 @@ impl SizingContext {
             .min_content_inline_size_from_max_content_layout
             .map(clamp_to_max_dimension_value);
         let value = result.automatic_content_inline_size;
+        self.charge_measurement_dependency_to_measured_box_and_containing_block(
+            node,
+            result.depends_on_percentage_block_size,
+        );
         self.cache_intrinsic_inline_measurement(node, kind, key, &root, result, block_size);
         value
     }
@@ -394823,9 +395580,10 @@ impl SizingContext {
         };
         let key = cache_key(Some(inline_size), None, constraints);
         if let Some(cached) = self.intrinsic_block_cache_get(node, kind, key) {
-            return cached;
+            return cached.size;
         }
 
+        self.callbacks.arena().note_intrinsic_measurement();
         let measurement = MeasurementState::create(self.callbacks);
         let root = measurement.create_used_values(node, constraints);
         root.block_size_constraint.set(size_constraint);
@@ -394844,7 +395602,20 @@ impl SizingContext {
             ),
         );
         let value = clamp_to_max_dimension_value(result.automatic_content_block_size);
-        self.intrinsic_block_cache_put(node, kind, key, value);
+        self.charge_measurement_dependency_to_measured_box_and_containing_block(
+            node,
+            result.depends_on_percentage_block_size,
+        );
+        self.intrinsic_block_cache_put(
+            node,
+            kind,
+            key,
+            IntrinsicBlockSizeMeasurement {
+                size: value,
+                depends_on_percentage_block_size: result.depends_on_percentage_block_size,
+                depends_on_percentage_inline_basis: self.measurement_root_observes_percentage_inline_basis(node),
+            },
+        );
         value
     }
 
@@ -397645,15 +398416,24 @@ impl TableFormattingContext {
             }));
     }
 
+    // Participants resolve percentages against the table's input basis inside this context, so
+    // their dependency is charged here rather than through child runs.
     fn seed_table_participant_used_values(&mut self) {
-        for group in self.matching_children(self.table_box, |display| display.is_table_row_group_kind()) {
-            self.create_used_values(group, self.participant_constraints);
-        }
-        for row in &self.rows {
-            self.create_used_values(row.box_, self.participant_constraints);
-        }
-        for cell in &self.cells {
-            self.create_used_values(cell.box_, self.participant_constraints);
+        let participants: Vec<Node> = self
+            .matching_children(self.table_box, |display| display.is_table_row_group_kind())
+            .into_iter()
+            .chain(self.rows.iter().map(|row| row.box_))
+            .chain(self.cells.iter().map(|cell| cell.box_))
+            .collect();
+        let sizing = self.sizing();
+        let table_record = self.used_values(self.table_box);
+        for participant in participants {
+            self.create_used_values(participant, self.participant_constraints);
+            if sizing.own_style_depends_on_percentage_block_size(participant) {
+                table_record
+                    .has_descendant_that_depends_on_percentage_block_size
+                    .set(true);
+            }
         }
     }
 
@@ -403782,6 +404562,9 @@ pub(crate) struct UsedValues {
     pub has_last_baseline: Cell<bool>,
     pub last_baseline: Cell<CssPixels>,
 
+    // Layout outputs, deliberately outside the cell state.
+    pub depends_on_percentage_block_size: Cell<bool>,
+    pub has_descendant_that_depends_on_percentage_block_size: Cell<bool>,
 
     pub(crate) line_data: LazyRefCell<std::rc::Rc<LineData>>,
     pub(crate) rare_data: LazyRefCell<UsedValuesRareData>,
@@ -403820,6 +404603,8 @@ impl Default for UsedValues {
             first_baseline: Cell::new(zero),
             has_last_baseline: Cell::new(false),
             last_baseline: Cell::new(zero),
+            depends_on_percentage_block_size: Cell::new(false),
+            has_descendant_that_depends_on_percentage_block_size: Cell::new(false),
             line_data: LazyRefCell::new(),
             rare_data: LazyRefCell::new(),
         }
@@ -623750,929 +624535,3 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     auto config_path = WebView::s_ladybird_resource_root;
     StringView cache_path;
     StringView mach_server_name {};
-    Vector<ByteString> certificates;
-    bool enable_test_mode = false;
-    bool expose_experimental_interfaces = false;
-    bool expose_internals_object = false;
-    bool wait_for_debugger = false;
-    bool log_all_js_exceptions = false;
-    auto site_isolation_mode = WebView::SiteIsolationMode::TopLevel;
-    bool enable_http_memory_cache = false;
-    bool force_fontconfig = false;
-    bool collect_garbage_on_every_allocation = false;
-    bool is_headless = false;
-    bool disable_scrollbar_painting = false;
-    bool disable_async_scrolling = false;
-    bool disable_sandbox = false;
-    StringView echo_server_port_string_view {};
-    StringView default_time_zone {};
-    bool file_origins_are_tuple_origins = false;
-
-    Core::ArgsParser args_parser;
-    args_parser.add_option(config_path, "Ladybird configuration path", "config-path", 0, "config_path");
-    args_parser.add_option(cache_path, "Path to the profile cache", "cache-path", 0, "path");
-    args_parser.add_option(enable_test_mode, "Enable test mode", "test-mode");
-    args_parser.add_option(expose_experimental_interfaces, "Expose experimental IDL interfaces", "expose-experimental-interfaces");
-    args_parser.add_option(expose_internals_object, "Expose internals object", "expose-internals-object");
-    args_parser.add_option(certificates, "Path to a certificate file", "certificate", 'C', "certificate");
-    args_parser.add_option(wait_for_debugger, "Wait for debugger", "wait-for-debugger");
-    args_parser.add_option(mach_server_name, "Mach server name", "mach-server-name", 0, "mach_server_name");
-    args_parser.add_option(log_all_js_exceptions, "Log all JavaScript exceptions", "log-all-js-exceptions");
-    args_parser.add_option(Core::ArgsParser::Option {
-        .argument_mode = Core::ArgsParser::OptionArgumentMode::Required,
-        .help_string = "Set site isolation mode. Mode may be 'disable', 'top-level' (default), or 'iframe'.",
-        .long_name = "site-isolation",
-        .value_name = "mode",
-        .accept_value = [&](StringView value) {
-            auto parsed_mode = WebView::site_isolation_mode_from_string(value);
-            if (!parsed_mode.has_value())
-                return false;
-
-            site_isolation_mode = *parsed_mode;
-            return true;
-        },
-    });
-    args_parser.add_option(enable_http_memory_cache, "Enable HTTP cache", "enable-http-memory-cache");
-    args_parser.add_option(force_fontconfig, "Force using fontconfig for font loading", "force-fontconfig");
-    args_parser.add_option(collect_garbage_on_every_allocation, "Collect garbage after every JS heap allocation", "collect-garbage-on-every-allocation");
-    args_parser.add_option(disable_scrollbar_painting, "Don't paint horizontal or vertical viewport scrollbars", "disable-scrollbar-painting");
-    args_parser.add_option(disable_async_scrolling, "Disable async scrolling", "disable-async-scrolling");
-    args_parser.add_option(disable_sandbox, "Disable process sandboxing", "disable-sandbox");
-    args_parser.add_option(echo_server_port_string_view, "Echo server port used in test internals", "echo-server-port", 0, "echo_server_port");
-    args_parser.add_option(is_headless, "Report that the browser is running in headless mode", "headless");
-    args_parser.add_option(default_time_zone, "Default time zone", "default-time-zone", 0, "time-zone-id");
-    args_parser.add_option(file_origins_are_tuple_origins, "Treat file:// URLs as having tuple origins", "tuple-file-origins");
-
-    args_parser.parse(arguments);
-
-    if (wait_for_debugger) {
-        Core::Process::wait_for_debugger_and_break();
-    }
-
-    if (!default_time_zone.is_empty()) {
-        if (auto result = Core::TimeZone::set_current_time_zone(default_time_zone); result.is_error())
-            dbgln("Failed to set default time zone: {}", result.error());
-    }
-
-    if (file_origins_are_tuple_origins)
-        URL::set_file_scheme_urls_have_tuple_origins();
-
-    auto& font_provider = static_cast<Gfx::PathFontProvider&>(Gfx::FontDatabase::the().install_system_font_provider(make<Gfx::PathFontProvider>()));
-    if (force_fontconfig) {
-        font_provider.set_name_but_fixme_should_create_custom_system_font_provider("FontConfig"_string);
-        Gfx::FontDatabase::the().set_force_freetype_rasterization(true);
-    }
-    font_provider.load_all_fonts_from_uri("resource://fonts"sv);
-
-    WebContent::PageClient::set_is_headless(is_headless);
-
-    WebView::set_site_isolation_mode(site_isolation_mode);
-
-    if (enable_http_memory_cache)
-        Web::Fetch::Fetching::set_http_memory_cache_enabled(true);
-
-    Web::Painting::set_paint_viewport_scrollbars(!disable_scrollbar_painting);
-    WebContent::PageClient::set_async_scrolling_enabled(!disable_async_scrolling);
-
-    if (!echo_server_port_string_view.is_empty()) {
-        if (auto maybe_echo_server_port = echo_server_port_string_view.to_number<u16>(); maybe_echo_server_port.has_value())
-            Web::Internals::Internals::set_echo_server_port(maybe_echo_server_port.value());
-        else
-            VERIFY_NOT_REACHED();
-    }
-
-    OPENSSL_TRY(OSSL_set_max_threads(nullptr, Core::System::hardware_concurrency()));
-
-    Web::HTML::Window::set_enable_test_mode(enable_test_mode);
-    Web::HTML::Window::set_internals_object_exposed(expose_internals_object);
-    Web::HTML::UniversalGlobalScopeMixin::set_experimental_interfaces_exposed(expose_experimental_interfaces);
-
-    Web::Platform::FontPlugin::install(*new Web::Platform::FontPlugin(enable_test_mode, &font_provider));
-
-    Web::Bindings::initialize_main_thread_vm(Web::HTML::AgentType::SimilarOriginWindow);
-
-    if (collect_garbage_on_every_allocation)
-        Web::Bindings::main_thread_vm().heap().set_should_collect_on_every_allocation(true);
-
-    if (log_all_js_exceptions) {
-        JS::set_log_all_js_exceptions(true);
-    }
-
-    if (!disable_sandbox)
-        TRY(RendererSandbox::apply_sandbox(config_path, cache_path));
-
-#if defined(AK_OS_MACOS)
-    auto browser_port = TRY(Core::MachPort::look_up_from_bootstrap_server(ByteString { mach_server_name }));
-    auto transport_ports = TRY(IPC::bootstrap_transport_from_server_port(browser_port));
-    auto webcontent_client = WebContent::ConnectionFromClient::construct(
-        make<IPC::Transport>(move(transport_ports.receive_right), move(transport_ports.send_right)));
-#else
-    auto webcontent_client = TRY(IPC::take_over_accepted_client_from_system_server<WebContent::ConnectionFromClient>(mach_server_name));
-#endif
-
-    auto& heap = Web::Bindings::main_thread_vm().heap();
-    webcontent_client->on_request_server_connection = [&heap](auto const& handle) {
-        if (auto result = connect_to_resource_loader(heap, handle); result.is_error())
-            dbgln("Failed to connect to resource loader: {}", result.error());
-    };
-    webcontent_client->on_image_decoder_connection = [](auto const& handle) {
-        if (auto result = connect_to_image_decoder(handle); result.is_error())
-            dbgln("Failed to connect to image decoder: {}", result.error());
-    };
-
-#if defined(HAVE_WASM_COMPILER_SERVICE)
-    WasmCompilerClient::compiler_state().install_compiler_callback();
-
-    webcontent_client->on_wasm_compiler_connection = [](auto handle) {
-        WasmCompilerClient::compiler_state().replace_connection(move(handle));
-    };
-#endif
-
-    return event_loop.exec();
-}
-
-ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle)
-{
-    auto transport = TRY(handle.create_transport());
-    auto request_client = TRY(try_make_ref_counted<Requests::RequestClient>(move(transport)));
-#ifdef AK_OS_WINDOWS
-    auto response = request_client->send_sync<Messages::RequestServer::InitTransport>(Core::System::getpid());
-    request_client->transport().set_peer_pid(response->peer_pid());
-#endif
-    if (Web::ResourceLoader::is_initialized())
-        Web::ResourceLoader::the().set_client(move(request_client));
-    else
-        Web::ResourceLoader::initialize(heap, move(request_client));
-    return {};
-}
-
-ErrorOr<void> connect_to_image_decoder(IPC::TransportHandle const& handle)
-{
-    auto transport = TRY(handle.create_transport());
-    auto new_client = TRY(try_make_ref_counted<ImageDecoderClient::Client>(move(transport)));
-#ifdef AK_OS_WINDOWS
-    auto response = new_client->send_sync<Messages::ImageDecoderServer::InitTransport>(Core::System::getpid());
-    new_client->transport().set_peer_pid(response->peer_pid());
-#endif
-    if (Web::Platform::ImageCodecPlugin::is_initialized())
-        static_cast<WebView::ImageCodecPlugin&>(Web::Platform::ImageCodecPlugin::the()).set_client(move(new_client));
-    else
-        Web::Platform::ImageCodecPlugin::install(*new WebView::ImageCodecPlugin(move(new_client)));
-    return {};
-}
-
-FILE: Services/WebContent/PageClient.cpp
-/*
- * Copyright (c) 2020-2023, Andreas Kling <andreas@ladybird.org>
- * Copyright (c) 2021-2022, Linus Groh <linusg@serenityos.org>
- * Copyright (c) 2023, Andrew Kaster <akaster@serenityos.org>
- * Copyright (c) 2024, Sam Atkins <sam@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <AK/JsonObjectSerializer.h>
-#include <AK/JsonValue.h>
-#include <AK/Math.h>
-#include <AK/Utf16FlyString.h>
-#include <AK/Utf16String.h>
-#include <AK/Utf16StringBuilder.h>
-#include <LibCore/Process.h>
-#include <LibCore/Timer.h>
-#include <LibDevTools/IndexedDBSerialization.h>
-#include <LibGC/Heap.h>
-#include <LibGfx/Bitmap.h>
-#include <LibGfx/ShareableBitmap.h>
-#include <LibHTTP/Cookie/ParsedCookie.h>
-#include <LibIPC/TransportHandle.h>
-#include <LibJS/Console.h>
-#include <LibJS/Runtime/ConsoleObject.h>
-#include <LibWeb/CSS/CSSImportRule.h>
-#include <LibWeb/CSS/StyleScope.h>
-#include <LibWeb/CSS/StyleSheetIdentifier.h>
-#include <LibWeb/CSS/StyleSheetList.h>
-#include <LibWeb/Compositor/CompositorHost.h>
-#include <LibWeb/DOM/CharacterData.h>
-#include <LibWeb/DOM/Document.h>
-#include <LibWeb/DOM/Element.h>
-#include <LibWeb/DOM/MutationType.h>
-#include <LibWeb/DOM/Node.h>
-#include <LibWeb/DOM/NodeList.h>
-#include <LibWeb/Fetch/Infrastructure/FetchController.h>
-#include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
-#include <LibWeb/Geolocation/GeolocationCoordinates.h>
-#include <LibWeb/Geolocation/GeolocationPositionError.h>
-#include <LibWeb/HTML/BrowsingContext.h>
-#include <LibWeb/HTML/EventLoop/EventLoop.h>
-#include <LibWeb/HTML/HTMLIFrameElement.h>
-#include <LibWeb/HTML/LocalNavigable.h>
-#include <LibWeb/HTML/LocalTraversableNavigable.h>
-#include <LibWeb/HTML/Scripting/ClassicScript.h>
-#include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
-#include <LibWeb/HTML/Window.h>
-#include <LibWeb/HighResolutionTime/TimeOrigin.h>
-#include <LibWeb/InvalidateDisplayList.h>
-#include <LibWeb/Layout/Viewport.h>
-#include <LibWeb/Painting/BoxViews.h>
-#include <LibWeb/Painting/DocumentPaintState.h>
-#include <LibWeb/Streams/ReadableStreamDefaultReader.h>
-#include <LibWeb/WebIDL/Promise.h>
-#include <LibWebView/ViewImplementation.h>
-#include <WebContent/ConnectionFromClient.h>
-#include <WebContent/DevToolsConsoleClient.h>
-#include <WebContent/PageClient.h>
-#include <WebContent/PageHost.h>
-#include <WebContent/WebContentClientEndpoint.h>
-#include <WebContent/WebDriverConnection.h>
-#include <WebContent/WebUIConnection.h>
-
-namespace WebContent {
-
-static bool s_is_headless { false };
-static bool s_async_scrolling_enabled { false };
-static constexpr size_t s_max_download_data_ipc_chunk_size = 16 * MiB;
-
-GC_DEFINE_ALLOCATOR(PageClient);
-
-static Web::Geolocation::GeolocationPositionError::ErrorCode geolocation_position_error_code_from_ipc(u16 error_code)
-{
-    using ErrorCode = Web::Geolocation::GeolocationPositionError::ErrorCode;
-
-    switch (error_code) {
-    case to_underlying(ErrorCode::PermissionDenied):
-        return ErrorCode::PermissionDenied;
-    case to_underlying(ErrorCode::PositionUnavailable):
-        return ErrorCode::PositionUnavailable;
-    case to_underlying(ErrorCode::Timeout):
-        return ErrorCode::Timeout;
-    default:
-        return ErrorCode::PositionUnavailable;
-    }
-}
-
-static Optional<Web::Geolocation::CoordinatesData> geolocation_coordinates_from_ipc(WebView::GeolocationPositionData const& position)
-{
-    if (!position.latitude.has_value() || !position.longitude.has_value() || !position.accuracy.has_value())
-        return {};
-
-    return Web::Geolocation::CoordinatesData {
-        .accuracy = *position.accuracy,
-        .latitude = *position.latitude,
-        .longitude = *position.longitude,
-        .altitude = position.altitude,
-        .altitude_accuracy = position.altitude_accuracy,
-        .heading = position.heading,
-        .speed = position.speed,
-    };
-}
-
-static String serialize_dom_mutation_target(Web::DOM::Node const& target)
-{
-    Utf16StringBuilder builder;
-    auto serializer = MUST(JsonObjectSerializer<>::try_create(builder));
-    target.serialize_tree_as_json(serializer);
-    MUST(serializer.finish());
-    auto json = builder.to_string();
-    return MUST(json.utf16_view().to_utf8());
-}
-
-bool PageClient::is_headless() const
-{
-    return s_is_headless;
-}
-
-void PageClient::set_is_headless(bool is_headless)
-{
-    s_is_headless = is_headless;
-}
-
-void PageClient::set_async_scrolling_enabled(bool enabled)
-{
-    s_async_scrolling_enabled = enabled;
-}
-
-GC::Ref<PageClient> PageClient::create(PageHost& page_host, u64 id, Optional<Web::HTML::CrossProcessId> pending_root_navigable_id)
-{
-    return GC::Heap::the().allocate<PageClient>(page_host, id, pending_root_navigable_id);
-}
-
-PageClient::PageClient(PageHost& owner, u64 id, Optional<Web::HTML::CrossProcessId> pending_root_navigable_id)
-    : m_owner(owner)
-    , m_page(Web::Page::create(*this))
-    , m_id(id)
-    , m_pending_root_navigable_id(pending_root_navigable_id)
-{
-    m_page->set_async_scrolling_enabled(s_async_scrolling_enabled);
-    setup_palette();
-
-    m_frame_timer = Core::Timer::create_single_shot(0, [] {
-        Web::HTML::main_thread_event_loop().queue_task_to_update_the_rendering();
-    });
-}
-
-PageClient::~PageClient() = default;
-
-void PageClient::visit_edges(JS::Cell::Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-    visitor.visit(m_page);
-    visitor.visit(m_top_level_document_console_client);
-    for (auto& promise : m_pending_delete_all_cookies_promises)
-        visitor.visit(promise.value);
-    for (auto& controller : m_download_controllers)
-        visitor.visit(controller.value);
-    for (auto& reader : m_download_readers)
-        visitor.visit(reader.value);
-    m_pending_dom_mutations.for_each([&](auto& pending_mutation) {
-        visitor.visit(pending_mutation.target);
-    });
-
-    if (m_webdriver)
-        m_webdriver->visit_edges(visitor);
-    if (m_web_ui)
-        m_web_ui->visit_edges(visitor);
-}
-
-ConnectionFromClient& PageClient::client() const
-{
-    return m_owner.client();
-}
-
-void PageClient::set_has_focus(bool has_focus)
-{
-    if (m_has_focus == has_focus)
-        return;
-
-    m_has_focus = has_focus;
-
-    if (auto document = page().top_level_traversable()->active_document(); document && has_focus)
-        document->reset_cursor_blink_cycle();
-
-    // The focus ring, the text caret, and selection highlight colors all depend on the window focus state, so
-    // nothing painted before the change can be reused; repaint every document in the traversable.
-    Function<void(Web::HTML::LocalNavigable&)> invalidate_cached_paint_recursively = [&](Web::HTML::LocalNavigable& navigable) {
-        if (auto navigable_document = navigable.active_document()) {
-            // Focus changes can arrive while layout is invalidated. We only need to invalidate cached paint
-            // on the current paintable tree here, without requiring layout to be up to date first.
-            if (navigable_document->has_committed_viewport_box())
-                navigable_document->paint_state().invalidate_all_cached_paint(*navigable_document);
-        }
-        for (auto& child_navigable : navigable.child_navigables())
-            invalidate_cached_paint_recursively(*child_navigable);
-    };
-    invalidate_cached_paint_recursively(page().top_level_traversable());
-}
-
-void PageClient::set_window_handle(Utf16String window_handle)
-{
-    page().top_level_traversable()->set_window_handle(move(window_handle));
-}
-
-void PageClient::setup_palette()
-{
-    // FIXME: Get the proper palette from our peer somehow
-    auto buffer_or_error = Core::AnonymousBuffer::create_with_size(sizeof(Gfx::SystemTheme));
-    VERIFY(!buffer_or_error.is_error());
-    auto buffer = buffer_or_error.release_value();
-    auto* theme = buffer.data<Gfx::SystemTheme>();
-    theme->color[to_underlying(Gfx::ColorRole::Window)] = Color(Color::Magenta).value();
-    theme->color[to_underlying(Gfx::ColorRole::WindowText)] = Color(Color::Cyan).value();
-    m_palette_impl = Gfx::PaletteImpl::create_with_anonymous_buffer(buffer);
-}
-
-bool PageClient::is_connection_open() const
-{
-    return client().is_open();
-}
-
-Web::HTML::CrossProcessId PageClient::allocate_cross_process_id()
-{
-    return m_owner.allocate_cross_process_id();
-}
-
-Web::HTML::CrossProcessId PageClient::allocate_navigable_id()
-{
-    if (m_pending_root_navigable_id.has_value()) {
-        auto id = *m_pending_root_navigable_id;
-        m_pending_root_navigable_id.clear();
-        return id;
-    }
-
-    return allocate_cross_process_id();
-}
-
-Web::NavigationProcessDecision PageClient::decide_navigation_process(URL::URL const& current_url, URL::URL const& target_url, Web::NavigationTarget target, Optional<Web::HTML::CrossProcessId> frame_id) const
-{
-    return client().decide_navigation_process(m_id, move(frame_id), current_url, target_url, target);
-}
-
-void PageClient::request_new_process_for_navigation(URL::URL const& url, Web::HTML::DocumentResource document_resource, Web::Bindings::NavigationHistoryBehavior history_handling, Optional<Web::HTML::NavigationSourceSnapshot> const& source_snapshot)
-{
-    client().async_did_request_new_process_for_navigation(m_id, url, move(document_resource), history_handling, source_snapshot);
-}
-
-void PageClient::request_new_process_for_child_frame_navigation(Web::HTML::CrossProcessId frame_id, URL::URL const& url, Web::HTML::DocumentResource document_resource, Web::Bindings::NavigationHistoryBehavior history_handling, Optional<Web::HTML::NavigationSourceSnapshot> const& source_snapshot)
-{
-    client().async_did_request_new_process_for_child_frame_navigation(m_id, frame_id, url, move(document_resource), history_handling, source_snapshot);
-}
-
-void PageClient::page_did_create_child_frame(Web::HTML::CrossProcessId parent_frame_id, Web::HTML::CrossProcessId frame_id, Web::HTML::ReplicatedNavigableState const& replicated_state)
-{
-    client().async_did_create_child_frame(m_id, parent_frame_id, frame_id, replicated_state);
-}
-
-void PageClient::page_did_update_child_frame_viewport(Web::HTML::CrossProcessId frame_id, Web::CSSPixelRect viewport_rect)
-{
-    client().async_did_update_child_frame_viewport(m_id, frame_id, page().css_to_device_rect(viewport_rect), page().client().device_pixel_ratio());
-}
-
-void PageClient::page_did_destroy_child_frame(Web::HTML::CrossProcessId frame_id)
-{
-    m_remote_child_frame_compositor_contexts.remove(frame_id);
-    client().async_did_destroy_child_frame(m_id, frame_id);
-}
-
-void PageClient::set_remote_child_frame_compositor_context(Web::HTML::CrossProcessId frame_id, Optional<Web::Compositor::CompositorContextId> context_id)
-{
-    if (context_id.has_value())
-        m_remote_child_frame_compositor_contexts.set(frame_id, *context_id);
-    else
-        m_remote_child_frame_compositor_contexts.remove(frame_id);
-    request_frame();
-}
-
-Optional<Web::Compositor::CompositorContextId> PageClient::compositor_context_id_for_remote_child_frame(Web::HTML::CrossProcessId frame_id) const
-{
-    return m_remote_child_frame_compositor_contexts.get(frame_id);
-}
-
-void PageClient::run_iframe_load_event_steps(Web::HTML::CrossProcessId frame_id)
-{
-    auto active_document = page().top_level_traversable()->active_document();
-    if (!active_document)
-        return;
-
-    for (auto const& navigable : active_document->inclusive_descendant_navigables()) {
-        if (navigable->id() != frame_id)
-            continue;
-
-        auto container = GC::make_root(navigable->container());
-        if (!container || !is<Web::HTML::HTMLIFrameElement>(*container))
-            return;
-
-        container->queue_an_element_task(Web::HTML::Task::Source::DOMManipulation, [container] {
-            Web::HTML::run_iframe_load_event_steps(as<Web::HTML::HTMLIFrameElement>(*container));
-        });
-        container->document().schedule_html_parser_end_check();
-        return;
-    }
-}
-
-Gfx::Palette PageClient::palette() const
-{
-    return Gfx::Palette(*m_palette_impl);
-}
-
-void PageClient::set_palette_impl(Gfx::PaletteImpl& impl)
-{
-    m_palette_impl = impl;
-    page().invalidate_style_for_preference_change();
-    request_frame();
-}
-
-void PageClient::set_preferred_color_scheme(Web::CSS::PreferredColorScheme color_scheme)
-{
-    m_preferred_color_scheme = color_scheme;
-    page().invalidate_style_for_preference_change();
-}
-
-void PageClient::set_preferred_contrast(Web::CSS::PreferredContrast contrast)
-{
-    m_preferred_contrast = contrast;
-    page().invalidate_style_for_preference_change();
-}
-
-void PageClient::set_preferred_motion(Web::CSS::PreferredMotion motion)
-{
-    m_preferred_motion = motion;
-    page().invalidate_style_for_preference_change();
-}
-
-void PageClient::set_is_scripting_enabled(bool is_scripting_enabled)
-{
-    page().set_is_scripting_enabled(is_scripting_enabled);
-}
-
-void PageClient::set_window_position(Web::DevicePixelPoint position)
-{
-    page().set_window_position(position);
-}
-
-void PageClient::set_window_size(Web::DevicePixelSize size)
-{
-    page().set_window_size(size);
-}
-
-void PageClient::compositor_process_lost()
-{
-    page().notify_all_webgl_contexts_lost();
-    page().detach_all_media_element_video_sinks_after_compositor_lost();
-}
-
-void PageClient::compositor_process_reconnected()
-{
-    // Drop canvas commands recorded for the previous Compositor process: the
-    // new process allocates canvas ids from scratch, so flushing stale
-    // segments could target the wrong canvas.
-    if (auto* compositor_host = m_owner.compositor_host())
-        compositor_host->discard_canvas_2d_stream();
-
-    page().top_level_traversable()->repaint_after_compositor_process_reconnect();
-    page().notify_all_canvas_elements_of_lost_backing_storage();
-    page().prepare_canvas_contexts_for_compositing();
-    page().restore_all_media_element_video_sinks();
-    Web::HTML::main_thread_event_loop().queue_task_to_update_the_rendering();
-}
-
-Queue<Web::QueuedInputEvent>& PageClient::input_event_queue()
-{
-    return client().input_event_queue();
-}
-
-void PageClient::did_handle_input_event(u64 page_id, Web::InputEvent const& event)
-{
-    auto should_update_input_method_state = event.visit(
-        [](Web::KeyEvent const&) {
-            return true;
-        },
-        [](Web::MouseEvent const& mouse_event) {
-            switch (mouse_event.type) {
-            case Web::MouseEvent::Type::MouseDown:
-            case Web::MouseEvent::Type::MouseUp:
-                return true;
-            case Web::MouseEvent::Type::MouseMove:
-                return mouse_event.buttons != Web::UIEvents::MouseButton::None;
-            case Web::MouseEvent::Type::MouseLeave:
-            case Web::MouseEvent::Type::MouseWheel:
-                return false;
-            }
-            VERIFY_NOT_REACHED();
-        },
-        [](auto const&) {
-            return false;
-        });
-
-    if (should_update_input_method_state)
-        client().update_input_method_state(page_id);
-}
-
-void PageClient::report_finished_handling_input_event(u64 page_id, Web::EventResult event_was_handled)
-{
-    client().async_did_finish_handling_input_event(page_id, event_was_handled);
-}
-
-Web::Compositor::CompositorContextId PageClient::allocate_compositor_context_id(Web::Compositor::PagePresentationRegistration page_presentation_registration)
-{
-    return client().allocate_compositor_context_id(m_id, page_presentation_registration);
-}
-
-void PageClient::set_viewport(Web::DevicePixelSize const& size, double device_pixel_ratio)
-{
-    auto invalidate = m_device_pixel_ratio != device_pixel_ratio
-        ? Web::InvalidateDisplayList::Yes
-        : Web::InvalidateDisplayList::No;
-
-    m_viewport_size = size;
-    m_device_pixel_ratio = device_pixel_ratio;
-
-    page().top_level_traversable()->set_viewport_size(page().device_to_css_size(size), invalidate);
-}
-
-void PageClient::set_zoom_level(double zoom_level)
-{
-    m_zoom_level = zoom_level;
-    page().top_level_traversable()->set_viewport_size(page().device_to_css_size(m_viewport_size), Web::InvalidateDisplayList::Yes);
-}
-
-void PageClient::request_frame()
-{
-    if (m_frame_timer->is_active())
-        return;
-
-    auto delay = 0.0;
-    auto now = Web::HighResolutionTime::unsafe_shared_current_time();
-    if (m_last_scheduled_frame_dispatch_time.has_value()) {
-        auto minimum_frame_interval = 1000.0 / m_maximum_frames_per_second;
-        auto next_frame_dispatch_time = *m_last_scheduled_frame_dispatch_time + minimum_frame_interval;
-        m_last_scheduled_frame_dispatch_time = max(now, next_frame_dispatch_time);
-        delay = *m_last_scheduled_frame_dispatch_time - now;
-    } else {
-        m_last_scheduled_frame_dispatch_time = now;
-    }
-
-    m_frame_timer->restart(static_cast<int>(AK::ceil(delay)));
-}
-
-void PageClient::set_maximum_frames_per_second(double maximum_frames_per_second)
-{
-    m_maximum_frames_per_second = maximum_frames_per_second;
-}
-
-void PageClient::page_did_request_cursor_change(Gfx::Cursor const& cursor)
-{
-    client().async_did_request_cursor_change(m_id, cursor);
-}
-
-void PageClient::page_did_change_title(Utf16String const& title)
-{
-    client().async_did_change_title(m_id, title);
-}
-
-void PageClient::page_did_update_editing_history_state(bool can_undo, bool can_redo)
-{
-    client().async_did_update_editing_history_state(m_id, can_undo, can_redo);
-}
-
-void PageClient::page_did_request_refresh()
-{
-    client().async_did_request_refresh(m_id);
-}
-
-void PageClient::page_did_request_resize_window(Gfx::IntSize size, u64 completion_id)
-{
-    client().async_did_request_resize_window(m_id, size, completion_id);
-}
-
-void PageClient::page_did_request_reposition_window(Gfx::IntPoint position, u64 completion_id)
-{
-    client().async_did_request_reposition_window(m_id, position, completion_id);
-}
-
-void PageClient::page_did_request_restore_window()
-{
-    client().async_did_request_restore_window(m_id);
-}
-
-void PageClient::page_did_request_maximize_window(u64 completion_id)
-{
-    client().async_did_request_maximize_window(m_id, completion_id);
-}
-
-void PageClient::page_did_request_minimize_window()
-{
-    client().async_did_request_minimize_window(m_id);
-}
-
-void PageClient::page_did_request_fullscreen_window()
-{
-    client().async_did_request_fullscreen_window(m_id);
-}
-
-void PageClient::page_did_request_exit_fullscreen()
-{
-    client().async_did_request_exit_fullscreen(m_id);
-}
-
-void PageClient::page_did_request_tooltip_override(Web::CSSPixelPoint position, ByteString const& title)
-{
-    auto device_position = page().css_to_device_point(position);
-    client().async_did_request_tooltip_override(m_id, { device_position.x(), device_position.y() }, title);
-}
-
-void PageClient::page_did_stop_tooltip_override()
-{
-    client().async_did_leave_tooltip_area(m_id);
-}
-
-void PageClient::page_did_enter_tooltip_area(ByteString const& title)
-{
-    client().async_did_enter_tooltip_area(m_id, title);
-}
-
-void PageClient::page_did_leave_tooltip_area()
-{
-    client().async_did_leave_tooltip_area(m_id);
-}
-
-void PageClient::page_did_hover_link(URL::URL const& url)
-{
-    client().async_did_hover_link(m_id, url);
-}
-
-void PageClient::page_did_unhover_link()
-{
-    client().async_did_unhover_link(m_id);
-}
-
-void PageClient::page_did_click_link(URL::URL const& url, ByteString const& target, unsigned modifiers)
-{
-    client().async_did_click_link(m_id, url, target, modifiers);
-}
-
-void PageClient::page_did_middle_click_link(URL::URL const& url, ByteString const& target, unsigned modifiers)
-{
-    client().async_did_middle_click_link(m_id, url, target, modifiers);
-}
-
-void PageClient::page_did_request_external_url(URL::URL const& url, URL::Origin const& initiator_origin, bool has_transient_activation)
-{
-    client().async_did_request_external_url(m_id, url, initiator_origin, has_transient_activation);
-}
-
-void PageClient::page_did_start_loading(Optional<Utf16String> const& navigation_id, URL::URL const& url, bool is_redirect)
-{
-    client().async_did_start_loading(m_id, navigation_id, url, is_redirect);
-}
-
-void PageClient::page_did_cancel_loading(Optional<Utf16String> const& navigation_id, URL::URL const&)
-{
-    client().async_did_cancel_loading(m_id, navigation_id);
-}
-
-void PageClient::page_did_create_new_document(Web::DOM::Document& document)
-{
-    initialize_js_console(document);
-    apply_pending_geolocation_emulated_position();
-}
-
-void PageClient::page_did_change_active_document_in_top_level_browsing_context(Web::DOM::Document& document)
-{
-    auto& realm = document.relevant_settings_object().realm();
-
-    clear_pending_dom_mutations();
-
-    if (m_web_ui && &m_web_ui->document() != &document)
-        m_web_ui.clear();
-
-    if (auto console_client = document.console_client()) {
-        auto& web_content_console_client = as<WebContentConsoleClient>(*console_client);
-        m_top_level_document_console_client = web_content_console_client;
-
-        auto console_object = realm.intrinsics().console_object();
-        console_object->console().set_client(*console_client);
-    }
-}
-
-void PageClient::page_did_finish_loading(Optional<Utf16String> const& navigation_id, URL::URL const& url)
-{
-    client().async_did_finish_loading(m_id, navigation_id, url);
-}
-
-Optional<u64> PageClient::page_did_start_download(URL::URL const& url, ByteString const& suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data)
-{
-    auto response = client().send_sync<Messages::WebContentClient::DidStartDownload>(m_id, url, suggested_filename, total_size, request_server_client_id, request_server_request_id, move(initial_data));
-    return response->download_id();
-}
-
-Optional<u64> PageClient::page_did_start_download(URL::URL const& url, ByteString const& suggested_filename, Optional<u64> total_size)
-{
-    auto response = client().send_sync<Messages::WebContentClient::DidStartDownloadWithoutRequest>(m_id, url, suggested_filename, total_size);
-    return response->download_id();
-}
-
-void PageClient::page_did_receive_download_data(u64 download_id, ByteBuffer data)
-{
-    if (m_canceled_downloads.contains(download_id))
-        return;
-
-    auto bytes = data.bytes();
-    for (size_t offset = 0; offset < bytes.size(); offset += s_max_download_data_ipc_chunk_size) {
-        auto chunk_size = min(bytes.size() - offset, s_max_download_data_ipc_chunk_size);
-        client().async_did_receive_download_data(m_id, download_id, bytes.slice(offset, chunk_size));
-    }
-}
-
-void PageClient::page_did_finish_download(u64 download_id)
-{
-    page_did_unregister_download(download_id);
-    client().async_did_finish_download(m_id, download_id);
-}
-
-void PageClient::page_did_fail_download(u64 download_id, String const& error)
-{
-    page_did_unregister_download(download_id);
-    client().async_did_fail_download(m_id, download_id, error);
-}
-
-void PageClient::page_did_register_download_controller(u64 download_id, GC::Ref<Web::Fetch::Infrastructure::FetchController> controller)
-{
-    m_download_controllers.set(download_id, controller);
-}
-
-void PageClient::page_did_register_download_reader(u64 download_id, GC::Ref<Web::Streams::ReadableStreamDefaultReader> reader)
-{
-    m_download_readers.set(download_id, reader);
-}
-
-void PageClient::page_did_unregister_download(u64 download_id)
-{
-    m_download_controllers.remove(download_id);
-    m_download_readers.remove(download_id);
-    m_canceled_downloads.remove(download_id);
-}
-
-bool PageClient::page_is_download_canceled(u64 download_id) const
-{
-    return m_canceled_downloads.contains(download_id);
-}
-
-void PageClient::cancel_download(u64 download_id)
-{
-    auto controller = m_download_controllers.take(download_id);
-    auto reader = m_download_readers.take(download_id);
-    if (!controller.has_value() && !reader.has_value())
-        return;
-
-    m_canceled_downloads.set(download_id);
-
-    if (controller.has_value())
-        controller.value()->stop_fetch();
-
-    if (reader.has_value())
-        Web::Fetch::Infrastructure::cancel_incremental_read(*reader.value());
-}
-
-void PageClient::page_did_finish_test(Utf16String const& text)
-{
-    client().async_did_finish_test(m_id, text.to_utf8());
-}
-
-void PageClient::page_did_set_test_timeout(double milliseconds)
-{
-    client().async_did_set_test_timeout(m_id, milliseconds);
-}
-
-void PageClient::page_did_receive_reference_test_metadata(JsonValue metadata)
-{
-    client().async_did_receive_reference_test_metadata(m_id, metadata);
-}
-
-void PageClient::page_did_set_browser_zoom(double factor)
-{
-    auto traversable = page().top_level_traversable();
-    traversable->set_pending_set_browser_zoom_request(true);
-    client().async_did_set_browser_zoom(m_id, factor);
-    auto& event_loop = Web::HTML::main_thread_event_loop();
-    event_loop.spin_until(GC::create_function(GC::Heap::the(), [this, traversable]() {
-        return !traversable->pending_set_browser_zoom_request() || !is_connection_open();
-    }));
-}
-
-void PageClient::page_did_set_device_pixel_ratio_for_testing(double ratio)
-{
-    set_viewport(m_viewport_size, ratio);
-}
-
-void PageClient::page_did_request_context_menu(Web::CSSPixelPoint content_position, Web::ContextMenuForInputEventsTarget for_input_events_target)
-{
-    client().async_did_request_context_menu(m_id, page().css_to_device_point(content_position).to_type<int>(), for_input_events_target);
-}
-
-void PageClient::page_did_request_link_context_menu(Web::CSSPixelPoint content_position, URL::URL const& url, ByteString const& target, unsigned modifiers)
-{
-    client().async_did_request_link_context_menu(m_id, page().css_to_device_point(content_position).to_type<int>(), url, target, modifiers);
-}
-
-void PageClient::page_did_request_image_context_menu(Web::CSSPixelPoint content_position, URL::URL const& url, ByteString const& target, unsigned modifiers, Optional<Gfx::Bitmap const*> bitmap_pointer)
-{
-    Optional<Gfx::ShareableBitmap> bitmap;
-    if (bitmap_pointer.has_value() && bitmap_pointer.value())
-        bitmap = bitmap_pointer.value()->to_shareable_bitmap();
-
-    client().async_did_request_image_context_menu(m_id, page().css_to_device_point(content_position).to_type<int>(), url, target, modifiers, bitmap);
-}
-
-void PageClient::page_did_request_media_context_menu(Web::CSSPixelPoint content_position, ByteString const& target, unsigned modifiers, Web::Page::MediaContextMenu const& menu)
-{
-    client().async_did_request_media_context_menu(m_id, page().css_to_device_point(content_position).to_type<int>(), target, modifiers, menu);
-}
-
-void PageClient::set_geolocation_emulated_position(WebView::GeolocationPositionData const& position, Optional<u16> error_code)
-{
-    m_pending_geolocation_emulated_position = PendingGeolocationEmulatedPosition {
-        .position = position,
-        .error_code = error_code,
-    };
-    apply_pending_geolocation_emulated_position();
-}
-
-void PageClient::apply_pending_geolocation_emulated_position()
-{
-    if (!m_pending_geolocation_emulated_position.has_value() || !page().top_level_traversable_is_initialized())
-        return;
-
-    auto const& pending = *m_pending_geolocation_emulated_position;
-    auto const& position = pending.position;
-    auto traversable = page().top_level_traversable();
-
-    if (pending.error_code.has_value())
-        traversable->set_emulated_position_data(geolocation_position_error_code_from_ipc(*pending.error_code));
-    else if (auto coordinates = geolocation_coordinates_from_ipc(position); coordinates.has_value())
-        traversable->set_emulated_position_data(*coordinates);
-    else
-        traversable->set_emulated_position_data(Empty {});
-}
-
-void PageClient::geolocation_position_response(u64 request_id, WebView::GeolocationPositionData const& position, Optional<u16> error_code)
-{
-    if (error_code.has_value())
