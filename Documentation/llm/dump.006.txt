@@ -1,4 +1,487 @@
-﻿static JS::ThrowCompletionOr<JS::Value> load_json_impl(JS::VM& vm)
+﻿FILE: Utilities/js.cpp
+/*
+ * Copyright (c) 2020-2023, Andreas Kling <andreas@ladybird.org>
+ * Copyright (c) 2020-2023, Linus Groh <linusg@serenityos.org>
+ * Copyright (c) 2020-2022, Ali Mohammad Pur <mpfard@serenityos.org>
+ * Copyright (c) 2025, Ryszard Goc <ryszardgoc@gmail.com>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/LexicalPath.h>
+#include <AK/NeverDestroyed.h>
+#include <AK/Platform.h>
+#include <AK/QuickSort.h>
+#include <AK/ScopeGuard.h>
+#include <AK/StringBuilder.h>
+#include <AK/Utf16String.h>
+#include <LibCore/ArgsParser.h>
+#include <LibCore/ConfigFile.h>
+#include <LibCore/StandardPaths.h>
+#include <LibCrypto/Hash/SHA2.h>
+#include <LibJS/Bytecode/Debug.h>
+#include <LibJS/Console.h>
+#include <LibJS/Contrib/Test262/GlobalObject.h>
+#include <LibJS/Debugger.h>
+#include <LibJS/Print.h>
+#include <LibJS/Runtime/ConsoleObject.h>
+#include <LibJS/Runtime/DeclarativeEnvironment.h>
+#include <LibJS/Runtime/GlobalEnvironment.h>
+#include <LibJS/Runtime/JSONObject.h>
+#include <LibJS/Runtime/Reference.h>
+#include <LibJS/Runtime/StringPrototype.h>
+#include <LibJS/Runtime/VM.h>
+#include <LibJS/Runtime/ValueInlines.h>
+#include <LibJS/RustFFI.h>
+#include <LibJS/Script.h>
+#include <LibJS/SourceCode.h>
+#include <LibJS/SourceTextModule.h>
+#include <LibJS/Token.h>
+#include <LibMain/Main.h>
+#include <LibTextCodec/Decoder.h>
+
+#if !defined(AK_OS_WINDOWS) && !defined(AK_OS_ANDROID)
+#    include <editline/readline.h>
+#endif
+#include <stdlib.h>
+#include <string.h>
+
+// FIXME: https://github.com/LadybirdBrowser/ladybird/issues/2412
+//    We should be able to destroy the VM on process exit.
+NeverDestroyed<RefPtr<JS::VM>> g_vm_storage;
+JS::VM* g_vm;
+Vector<String> g_repl_statements;
+GC::Root<JS::Value> g_last_value = GC::make_root(JS::js_undefined());
+
+class ReplObject final : public JS::GlobalObject {
+    JS_OBJECT(ReplObject, JS::GlobalObject);
+    GC_DECLARE_ALLOCATOR(ReplObject);
+
+public:
+    ReplObject(JS::Realm& realm)
+        : GlobalObject(realm)
+    {
+    }
+    virtual void initialize(JS::Realm&) override;
+    virtual ~ReplObject() override = default;
+
+private:
+    JS_DECLARE_NATIVE_FUNCTION(exit_interpreter);
+    JS_DECLARE_NATIVE_FUNCTION(repl_help);
+    JS_DECLARE_NATIVE_FUNCTION(save_to_file);
+    JS_DECLARE_NATIVE_FUNCTION(load_ini);
+    JS_DECLARE_NATIVE_FUNCTION(load_json);
+    JS_DECLARE_NATIVE_FUNCTION(last_value_getter);
+    JS_DECLARE_NATIVE_FUNCTION(print);
+    JS_DECLARE_NATIVE_FUNCTION(gc);
+};
+
+GC_DEFINE_ALLOCATOR(ReplObject);
+
+class ScriptObject final : public JS::GlobalObject {
+    JS_OBJECT(ScriptObject, JS::GlobalObject);
+    GC_DECLARE_ALLOCATOR(ScriptObject);
+
+public:
+    ScriptObject(JS::Realm& realm)
+        : JS::GlobalObject(realm)
+    {
+    }
+    virtual void initialize(JS::Realm&) override;
+    virtual ~ScriptObject() override = default;
+
+private:
+    JS_DECLARE_NATIVE_FUNCTION(load_ini);
+    JS_DECLARE_NATIVE_FUNCTION(load_json);
+    JS_DECLARE_NATIVE_FUNCTION(print);
+    JS_DECLARE_NATIVE_FUNCTION(gc);
+};
+
+GC_DEFINE_ALLOCATOR(ScriptObject);
+
+static bool s_dump_ast = false;
+static bool s_as_module = false;
+static bool s_print_last_result = false;
+static bool s_strip_ansi = false;
+static bool s_raw_strings = false;
+static bool s_disable_source_location_hints = false;
+#if !defined(AK_OS_WINDOWS) && !defined(AK_OS_ANDROID)
+static JS::Realm* s_repl_realm;
+static JS::GlobalEnvironment* s_repl_global_environment;
+#endif
+static String s_history_path = String {};
+[[maybe_unused]] static int s_repl_line_level = 0;
+[[maybe_unused]] static bool s_keep_running_repl = true;
+static int s_exit_code = 0;
+
+static StringView debugger_pause_reason(JS::Debugger::PauseReason reason)
+{
+    switch (reason) {
+    case JS::Debugger::PauseReason::Entry:
+        return "entry"sv;
+    case JS::Debugger::PauseReason::Breakpoint:
+        return "breakpoint"sv;
+    case JS::Debugger::PauseReason::DebuggerStatement:
+        return "debugger statement"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+struct BreakpointLocation {
+    Utf16String filename;
+    u32 line { 0 };
+    Optional<u32> column;
+};
+
+static Utf16String breakpoint_filename(StringView filename, Utf16View current_filename)
+{
+    if (!current_filename.is_empty()) {
+        auto canonical_filename = LexicalPath::canonicalized_path(filename);
+        auto canonical_current_filename = LexicalPath::canonicalized_path(current_filename.to_utf8_but_should_be_ported_to_utf16().to_byte_string());
+        if (canonical_filename == canonical_current_filename)
+            return Utf16String::from_utf16(current_filename);
+    }
+    return Utf16String::from_utf8_with_replacement_character(filename);
+}
+
+static Optional<BreakpointLocation> parse_breakpoint_location(StringView input, Utf16View current_filename)
+{
+    input = input.trim_whitespace();
+    if (auto line = input.to_number<u32>(); line.has_value()) {
+        if (*line == 0)
+            return {};
+        return BreakpointLocation { Utf16String::from_utf16(current_filename), *line, {} };
+    }
+
+    auto last_colon = input.find_last(':');
+    if (!last_colon.has_value())
+        return {};
+
+    auto final_component = input.substring_view(*last_colon + 1).to_number<u32>();
+    if (!final_component.has_value())
+        return {};
+
+    auto prefix = input.substring_view(0, *last_colon);
+    if (auto line = prefix.to_number<u32>(); line.has_value()) {
+        if (*line == 0)
+            return {};
+        return BreakpointLocation { Utf16String::from_utf16(current_filename), *line, *final_component };
+    }
+
+    if (auto preceding_colon = prefix.find_last(':'); preceding_colon.has_value()) {
+        if (auto line = prefix.substring_view(*preceding_colon + 1).to_number<u32>(); line.has_value()) {
+            auto filename = prefix.substring_view(0, *preceding_colon);
+            if (filename.is_empty() || *line == 0)
+                return {};
+            return BreakpointLocation { breakpoint_filename(filename, current_filename), *line, *final_component };
+        }
+    }
+
+    if (prefix.is_empty() || *final_component == 0)
+        return {};
+    return BreakpointLocation { breakpoint_filename(prefix, current_filename), *final_component, {} };
+}
+
+static void print_breakpoint(JS::Breakpoint const& breakpoint)
+{
+    auto const* state = g_vm->debugger()->is_breakpoint_resolved(breakpoint.id) ? "resolved" : "pending";
+    if (breakpoint.column.has_value())
+        outln("{}: {}:{}:{} ({})", breakpoint.id, breakpoint.filename, breakpoint.line, *breakpoint.column, state);
+    else
+        outln("{}: {}:{} ({})", breakpoint.id, breakpoint.filename, breakpoint.line, state);
+}
+
+static void print_debugger_help()
+{
+    outln("Debugger commands:");
+    outln("    .break <line>[:column]");
+    outln("    .break <file>:<line>[:column]");
+    outln("    .breakpoints");
+    outln("    .continue");
+    outln("    .delete <id>");
+    outln("    .help");
+}
+
+static void run_debugger_prompt(JS::Debugger::PauseInfo const& pause_info)
+{
+    if (pause_info.source_range.has_value()) {
+        auto const& range = *pause_info.source_range;
+        if (range.start.line > 0)
+            outln("Paused at {}:{}:{} ({})", range.filename(), range.start.line, range.start.column, debugger_pause_reason(pause_info.reason));
+        else
+            outln("Paused in {} ({})", range.filename(), debugger_pause_reason(pause_info.reason));
+    } else {
+        outln("Paused at bytecode offset {} ({})", pause_info.bytecode_offset, debugger_pause_reason(pause_info.reason));
+    }
+
+    for (;;) {
+#if defined(AK_OS_WINDOWS) || defined(AK_OS_ANDROID)
+        out("(debug) ");
+        (void)fflush(stdout);
+
+        Array<char, 4096> buffer;
+        auto* raw_line = fgets(buffer.data(), buffer.size(), stdin);
+        if (!raw_line) {
+            g_vm->debugger()->continue_execution();
+            return;
+        }
+        auto command = StringView { raw_line, strlen(raw_line) }.trim_whitespace();
+#else
+        auto* raw_line = readline("(debug) ");
+        if (!raw_line) {
+            g_vm->debugger()->continue_execution();
+            return;
+        }
+        ArmedScopeGuard free_raw_line = [&] {
+            free(raw_line);
+        };
+        auto command = StringView { raw_line, strlen(raw_line) }.trim_whitespace();
+#endif
+
+        if (command == ".continue"sv) {
+            g_vm->debugger()->continue_execution();
+            return;
+        }
+
+        if (command == ".help"sv) {
+            print_debugger_help();
+            continue;
+        }
+
+        if (command == ".breakpoints"sv) {
+            auto breakpoints = g_vm->debugger()->breakpoints();
+            if (breakpoints.is_empty()) {
+                outln("No breakpoints.");
+                continue;
+            }
+            quick_sort(breakpoints, [](auto const& lhs, auto const& rhs) {
+                return lhs.id < rhs.id;
+            });
+            for (auto const& breakpoint : breakpoints)
+                print_breakpoint(breakpoint);
+            continue;
+        }
+
+        if (command.starts_with(".break "sv)) {
+            Utf16String current_filename;
+            if (pause_info.source_range.has_value())
+                current_filename = pause_info.source_range->filename();
+
+            auto location = parse_breakpoint_location(command.substring_view(7), current_filename);
+            if (!location.has_value() || location->filename.is_empty()) {
+                warnln("Usage: .break <line>[:column] or .break <file>:<line>[:column]");
+                continue;
+            }
+
+            auto breakpoint_id = g_vm->debugger()->add_breakpoint(location->filename, location->line, location->column);
+            if (breakpoint_id.is_error()) {
+                warnln("Unable to set breakpoint: {}", breakpoint_id.error());
+                continue;
+            }
+
+            auto breakpoint = g_vm->debugger()->breakpoints().find_if([&](auto const& breakpoint) {
+                return breakpoint.id == breakpoint_id.value();
+            });
+            VERIFY(!breakpoint.is_end());
+            print_breakpoint(*breakpoint);
+            continue;
+        }
+
+        if (command.starts_with(".delete "sv)) {
+            auto breakpoint_id = command.substring_view(8).trim_whitespace().to_number<JS::BreakpointID>();
+            if (!breakpoint_id.has_value()) {
+                warnln("Usage: .delete <id>");
+                continue;
+            }
+            if (!g_vm->debugger()->remove_breakpoint(*breakpoint_id)) {
+                warnln("No breakpoint with id {}.", *breakpoint_id);
+                continue;
+            }
+            outln("Deleted breakpoint {}.", *breakpoint_id);
+            continue;
+        }
+
+        warnln("Unknown debugger command '{}'. Enter .help for a list of commands.", command);
+    }
+}
+
+static ErrorOr<void> print_inline(JS::Value value, Stream& stream)
+{
+    JS::PrintContext print_context { .vm = *g_vm, .stream = &stream, .strip_ansi = s_strip_ansi, .raw_strings = s_raw_strings };
+    return JS::print(value, print_context);
+}
+
+enum class PrintTarget {
+    StandardError,
+    StandardOutput,
+};
+
+static ErrorOr<NonnullOwnPtr<Stream>> flushed_print_stream(PrintTarget target)
+{
+    if (target == PrintTarget::StandardOutput) {
+        (void)fflush(stdout);
+        return Core::File::standard_output();
+    }
+
+    (void)fflush(stderr);
+    return Core::File::standard_error();
+}
+
+enum class PrintEnd {
+    Newline,
+    None
+};
+
+static ErrorOr<void> print(JS::Value value, PrintTarget target = PrintTarget::StandardOutput, PrintEnd end = PrintEnd::Newline)
+{
+    auto stream = TRY(flushed_print_stream(target));
+
+    TRY(print_inline(value, *stream));
+
+    if (end == PrintEnd::Newline)
+        TRY(stream->write_until_depleted("\n"sv));
+
+    return {};
+}
+
+static ErrorOr<void> print_all_arguments(JS::VM const& vm, PrintTarget target = PrintTarget::StandardOutput, PrintEnd end = PrintEnd::Newline)
+{
+    auto stream = TRY(flushed_print_stream(target));
+
+    for (size_t i = 0; i < vm.argument_count(); i++) {
+        TRY(print_inline(vm.argument(i), *stream));
+
+        if (i < vm.argument_count() - 1) {
+            TRY(stream->write_until_depleted(" "sv));
+        }
+    }
+
+    if (end == PrintEnd::Newline)
+        TRY(stream->write_until_depleted("\n"sv));
+
+    return {};
+}
+
+[[maybe_unused]] static ErrorOr<String> prompt_for_level(int level)
+{
+    static StringBuilder prompt_builder;
+    prompt_builder.clear();
+    prompt_builder.append("> "sv);
+
+    for (auto i = 0; i < level; ++i)
+        prompt_builder.append("    "sv);
+
+    return prompt_builder.to_string();
+}
+
+static ErrorOr<void> write_to_file(String const& path)
+{
+    auto file = TRY(Core::File::open(path, Core::File::OpenMode::Write, 0666));
+    for (size_t i = 0; i < g_repl_statements.size(); i++) {
+        auto line = g_repl_statements[i].bytes();
+        if (line.size() > 0 && i != g_repl_statements.size() - 1) {
+            TRY(file->write_until_depleted(line));
+        }
+        if (i != g_repl_statements.size() - 1) {
+            TRY(file->write_value('\n'));
+        }
+    }
+    file->close();
+    return {};
+}
+
+static ErrorOr<bool> parse_and_run(JS::Realm& realm, StringView source, StringView source_name, bool parse_only = false)
+{
+    auto& vm = realm.vm();
+
+    JS::ThrowCompletionOr<JS::Value> result { JS::js_undefined() };
+    auto utf16_source = Utf16String::from_utf8(source);
+
+    if (!s_as_module) {
+        auto script_or_error = JS::Script::parse(utf16_source.utf16_view(), realm, source_name);
+        if (script_or_error.is_error()) {
+            auto error = script_or_error.error()[0];
+            auto hint = error.source_location_hint(utf16_source);
+            if (!hint.is_empty())
+                outln("{}", hint);
+
+            auto error_string = error.to_utf16_string();
+            outln("{}", error_string);
+            result = vm.throw_completion<JS::SyntaxError>(move(error_string));
+        } else {
+            auto script = script_or_error.release_value();
+
+            if (!parse_only)
+                result = vm.run(*script);
+        }
+    } else {
+        auto module_or_error = JS::SourceTextModule::parse(utf16_source.utf16_view(), realm, source_name);
+        if (module_or_error.is_error()) {
+            auto error = module_or_error.error()[0];
+            auto hint = error.source_location_hint(utf16_source);
+            if (!hint.is_empty())
+                outln("{}", hint);
+
+            auto error_string = error.to_utf16_string();
+            outln("{}", error_string);
+            result = vm.throw_completion<JS::SyntaxError>(move(error_string));
+        } else {
+            auto module = module_or_error.release_value();
+            if (!parse_only)
+                result = vm.run(*module);
+        }
+    }
+
+    auto handle_exception = [&](JS::Value thrown_value) -> ErrorOr<void> {
+        warnln("Uncaught exception: ");
+        TRY(print(thrown_value, PrintTarget::StandardError));
+
+        if (auto error = thrown_value.template as_if<JS::Error>())
+            warnln("{}", error->stack_string(JS::CompactTraceback::Yes));
+        return {};
+    };
+
+    if (!result.is_error())
+        g_last_value = GC::make_root(result.value());
+
+    if (result.is_error()) {
+        TRY(handle_exception(result.release_error().value()));
+        return false;
+    }
+
+    if (s_print_last_result) {
+        TRY(print(result.value()));
+    }
+
+    return true;
+}
+
+static JS::ThrowCompletionOr<JS::Value> load_ini_impl(JS::VM& vm)
+{
+    auto& realm = *vm.current_realm();
+
+    auto filename = TRY(vm.argument(0).to_utf16_string(vm)).to_utf8_but_should_be_ported_to_utf16().to_byte_string();
+    auto file_or_error = Core::File::open(filename, Core::File::OpenMode::Read);
+    if (file_or_error.is_error())
+        return vm.throw_completion<JS::Error>(Utf16String::formatted("Failed to open '{}': {}", filename, file_or_error.error()));
+
+    auto config_file_or_error = Core::ConfigFile::open(filename, file_or_error.release_value());
+    if (config_file_or_error.is_error())
+        return vm.throw_completion<JS::Error>(Utf16String::formatted("Failed to read '{}': {}", filename, config_file_or_error.error()));
+    auto config_file = config_file_or_error.release_value();
+    auto object = JS::Object::create(realm, realm.intrinsics().object_prototype());
+    for (auto const& group : config_file->groups()) {
+        auto group_object = JS::Object::create(realm, realm.intrinsics().object_prototype());
+        for (auto const& key : config_file->keys(group)) {
+            auto entry = config_file->read_entry(group, key);
+            group_object->define_direct_property(Utf16String::from_utf8(key), JS::PrimitiveString::create(vm, Utf16String::from_utf8(entry)), JS::Attribute::Enumerable | JS::Attribute::Configurable | JS::Attribute::Writable);
+        }
+        object->define_direct_property(Utf16String::from_utf8(group), group_object, JS::Attribute::Enumerable | JS::Attribute::Configurable | JS::Attribute::Writable);
+    }
+    return object;
+}
+
+static JS::ThrowCompletionOr<JS::Value> load_json_impl(JS::VM& vm)
 {
     auto filename = TRY(vm.argument(0).to_utf16_string(vm)).to_utf8_but_should_be_ported_to_utf16();
     auto file_or_error = Core::File::open(filename, Core::File::OpenMode::Read);

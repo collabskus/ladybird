@@ -1,4 +1,243 @@
-﻿            Editing::CommandNames::removeFormat,
+﻿        // 4. If command is not enabled, return false.
+        //
+        //    We have to check again whether the command is enabled, because the beforeinput handler might have done
+        //    something annoying like getSelection().removeAllRanges().
+        // 5. Let affected editing host be the editing host that is an inclusive ancestor of the active range's start
+        //    node and end node, and is not the ancestor of any editing host that is an inclusive ancestor of the active
+        //    range's start node and end node.
+        //
+        //    This new affected editing host is what we'll fire the input event at in a couple of lines. We want to
+        //    compute it beforehand just to be safe: bugs in the command action might remove the selection or something
+        //    bad like that, and we don't want to have to handle it later. We recompute it after the beforeinput event
+        //    is handled so that if the handler moves the selection to some other editing host, the input event will be
+        //    fired at the editing host that was actually affected.
+
+        // AD-HOC: No, we don't. Neither Chrome nor Firefox fire the "beforeinput" event for execCommand(). This is an
+        //         open discussion for the spec: https://github.com/w3c/editing/issues/200
+    }
+
+    // https://w3c.github.io/editing/docs/execCommand/#preserves-overrides
+    // If a command preserves overrides, then before taking its action, the user agent must record current overrides.
+    Vector<Editing::RecordedOverride> overrides;
+    if (command_definition.preserves_overrides)
+        overrides = Editing::record_current_overrides(*this);
+
+    // INTEROP: Chromium distinguishes pastes that begin inside text from pastes at an element boundary when deciding
+    //          whether a trailing line break is merely a placeholder. Record this before caret canonicalization can
+    //          turn an element-level boundary into an equivalent text position.
+    auto range_before_command = Editing::active_range(*this);
+    bool paste_started_in_text_node = user_input_type == UIEvents::InputTypes::insertFromPaste
+        && range_before_command && is<DOM::Text>(*range_before_command->start_container())
+        // INTEROP: An Apple-interchange-newline represents an intentional paragraph boundary, not a fragment-ending
+        //          placeholder. Blink and WebKit preserve the destination paragraph's trailing break in this case.
+        && !value.contains(u"Apple-interchange-newline"sv);
+    GC::Root<DOM::Node> paste_start_block;
+    if (paste_started_in_text_node)
+        paste_start_block = Editing::block_node_of_node(*range_before_command->start_container());
+
+    // NOTE: Step 7 below asks us whether the DOM tree was modified, so keep track of the document versions.
+    auto old_dom_tree_version = dom_tree_version();
+    auto old_character_data_version = character_data_version();
+
+    // NB: Canonicalize the caret before the command acts and records its starting selection, so that e.g. typing at an
+    //     element-level caret inserts into the adjacent content like Chromium does. Inline formatting commands with a
+    //     collapsed selection only set overrides, and Chromium does not move the caret for those.
+    bool command_edits_at_caret = command_definition.command.is_one_of(
+        Editing::CommandNames::delete_, Editing::CommandNames::formatBlock, Editing::CommandNames::forwardDelete,
+        Editing::CommandNames::indent, Editing::CommandNames::insertHorizontalRule, Editing::CommandNames::insertHTML,
+        Editing::CommandNames::insertImage, Editing::CommandNames::insertLineBreak,
+        Editing::CommandNames::insertOrderedList, Editing::CommandNames::insertParagraph,
+        Editing::CommandNames::insertText, Editing::CommandNames::insertUnorderedList,
+        Editing::CommandNames::justifyCenter, Editing::CommandNames::justifyFull, Editing::CommandNames::justifyLeft,
+        Editing::CommandNames::justifyRight, Editing::CommandNames::outdent);
+    if (affected_editing_host && m_selection && command_edits_at_caret)
+        Editing::canonicalize_collapsed_selection_for_editing(*m_selection);
+
+    // AD-HOC: Record the mutations performed by the command action on the editing history, so the user can undo them.
+    //         end_recording() is a no-op if the guard below already ended the recording.
+    if (affected_editing_host) {
+        auto category = Editing::UndoStep::Category::Other;
+        // INTEROP: Cut and paste are standalone undo units in Chromium: they never coalesce with typing or deletion
+        //          runs, so they categorize as Other even though they run the delete and insertText commands.
+        bool is_cut_or_paste = user_input_type == UIEvents::InputTypes::deleteByCut || user_input_type == UIEvents::InputTypes::insertFromPaste;
+        if (!is_cut_or_paste) {
+            if (command_definition.command.is_one_of(Editing::CommandNames::insertText, Editing::CommandNames::insertLineBreak, Editing::CommandNames::insertParagraph))
+                category = Editing::UndoStep::Category::Insertion;
+            else if (command_definition.command == Editing::CommandNames::delete_)
+                category = Editing::UndoStep::Category::BackwardDeletion;
+            else if (command_definition.command == Editing::CommandNames::forwardDelete)
+                category = Editing::UndoStep::Category::ForwardDeletion;
+        }
+        editing_history()->begin_recording(*affected_editing_host, category);
+    }
+    ScopeGuard end_recording_guard = [&] {
+        if (auto history = editing_history_if_exists())
+            history->end_recording();
+    };
+
+    // 5. Take the action for command, passing value to the instructions as an argument.
+    auto command_result = command_definition.action(*this, value);
+
+    // INTEROP: Chromium removes the trailing placeholder line break after pasting into an existing text node. The
+    //          execCommand draft only removes it when insertion creates a new text node. Perform this while the paste
+    //          history transaction is still open so undo restores the placeholder and redo removes it again.
+    if (paste_started_in_text_node) {
+        if (auto range = Editing::active_range(*this)) {
+            // INTEROP: A trailing break remains the list item's line terminator after a block fragment is merged into
+            //          that item. Blink removes paragraph placeholders here, but preserves list-item terminators.
+            if (auto block = Editing::block_node_of_node(*range->start_container()); block && block.ptr() == paste_start_block.ptr()
+                && !is<HTML::HTMLLIElement>(*block))
+                Editing::remove_extraneous_line_breaks_at_the_end_of_node(*block);
+        }
+    }
+
+    // https://w3c.github.io/editing/docs/execCommand/#preserves-overrides
+    // After taking the action, if the active range is collapsed, it must restore states and values from the recorded
+    // list.
+    if (!overrides.is_empty() && m_selection && m_selection->is_collapsed())
+        Editing::restore_states_and_values(*this, overrides);
+
+    // NB: Canonicalize the caret the command produced before the ending selection is recorded, but only if the
+    //     command actually performed an edit; Chromium leaves the caret alone otherwise.
+    bool tree_was_modified = dom_tree_version() != old_dom_tree_version
+        || character_data_version() != old_character_data_version;
+    if (affected_editing_host && m_selection && tree_was_modified)
+        Editing::canonicalize_collapsed_selection_for_editing(*m_selection);
+
+    // NB: End the recording before dispatching the input event below, so that the undo step's ending selection is the
+    //     selection produced by the command itself, not whatever an input event handler changed it to.
+    if (auto history = editing_history_if_exists())
+        history->end_recording();
+
+    // 6. If the previous step returned false, return false.
+    if (!command_result)
+        return false;
+
+    // 7. If the action modified DOM tree, then fire an event named "input" at affected editing host using InputEvent,
+    //    with its isTrusted and bubbles attributes initialized to true, inputType attribute initialized to the mapped
+    //    value of command, and its data attribute initialized to null.
+    if (dispatch_input_event == DispatchInputEvent::Yes && tree_was_modified && affected_editing_host) {
+        UIEvents::InputEventInit event_init {};
+        event_init.bubbles = true;
+        // INTEROP: When the command runs on behalf of a user cut or paste, the input event carries the user's input
+        //          type (deleteByCut or insertFromPaste) rather than the command's mapped value, like other browsers.
+        event_init.input_type = user_input_type.value_or(command_definition.mapped_value);
+
+        // AD-HOC: For insertText, we do what other browsers do and set data to value. A paste carries null data even
+        //         though it runs the insertText command.
+        if (event_init.input_type == UIEvents::InputTypes::insertText)
+            event_init.data = Utf16String::from_utf16(value);
+
+        auto event = UIEvents::InputEvent::create_from_platform_event(HTML::EventNames::input, event_init, {}, HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*this)));
+        event->set_is_trusted(true);
+
+        TemporaryChange preserve_selection_offsets { m_preserve_selection_offsets_during_identical_character_data_replacement, true };
+        affected_editing_host->dispatch_event(event);
+    }
+
+    // AD-HOC: Scroll the cursor into view after executing a command.
+    if (auto selection = get_selection())
+        selection->scroll_focus_into_view();
+
+    // 8. Return true.
+    return true;
+}
+
+// https://w3c.github.io/editing/docs/execCommand/#querycommandenabled()
+WebIDL::ExceptionOr<bool> Document::query_command_enabled(Utf16FlyString const& command)
+{
+    // AD-HOC: This is not directly mentioned in the spec, but all major browsers limit editing API calls to HTML documents
+    if (!is_html_document())
+        return WebIDL::InvalidStateError::create("queryCommandEnabled is only supported on HTML documents"_utf16);
+
+    // 2. Return true if command is both supported and enabled, false otherwise.
+    if (!MUST(query_command_supported(command)))
+        return false;
+
+    // https://w3c.github.io/editing/docs/execCommand/#enabled
+    // Among commands defined in this specification, those listed in Miscellaneous commands are always enabled, except
+    // for the cut command and the paste command.
+    // NOTE: cut and paste are actually in the Clipboard commands section
+    if (command.is_one_of_ignoring_ascii_case(
+            Editing::CommandNames::defaultParagraphSeparator,
+            Editing::CommandNames::styleWithCSS,
+            Editing::CommandNames::useCSS))
+        return true;
+
+    // INTEROP: The spec lists undo and redo among the always-enabled miscellaneous commands, but in Chromium
+    //          queryCommandEnabled("undo") is true only when there is a step to undo, and execCommand("undo") on an
+    //          empty history returns false. Redo behaves symmetrically.
+    if (command.equals_ignoring_ascii_case(Editing::CommandNames::undo)) {
+        auto history = editing_history_if_exists();
+        return history && history->can_undo();
+    }
+    if (command.equals_ignoring_ascii_case(Editing::CommandNames::redo)) {
+        auto history = editing_history_if_exists();
+        return history && history->can_redo();
+    }
+
+    // AD-HOC: selectAll requires a selection object to exist.
+    if (command.equals_ignoring_ascii_case(Editing::CommandNames::selectAll))
+        return get_selection() != nullptr;
+
+    // The other commands defined here are enabled if the active range is not null,
+    auto active_range = Editing::active_range(*this);
+    if (!active_range)
+        return false;
+
+    // its start node is either editable or an editing host,
+    auto start_node = active_range->start_container();
+    if (!start_node->is_editable_or_editing_host())
+        return false;
+
+    // FIXME: the editing host of its start node is not an EditContext editing host,
+    [[maybe_unused]] auto start_node_editing_host = start_node->editing_host();
+
+    // its end node is either editable or an editing host,
+    auto& end_node = *active_range->end_container();
+    if (!end_node.is_editable_or_editing_host())
+        return false;
+
+    // FIXME: the editing host of its end node is not an EditContext editing host,
+    [[maybe_unused]] auto end_node_editing_host = end_node.editing_host();
+
+    // and there is some editing host that is an inclusive ancestor of both its start node and its end node.
+    GC::Ptr<Node> inclusive_ancestor_editing_host;
+    start_node->for_each_inclusive_ancestor([&](GC::Ref<Node> ancestor) {
+        if (ancestor->is_editing_host() && ancestor->is_inclusive_ancestor_of(end_node)) {
+            inclusive_ancestor_editing_host = ancestor;
+            return IterationDecision::Break;
+        }
+        return IterationDecision::Continue;
+    });
+    if (!inclusive_ancestor_editing_host)
+        return false;
+
+    // NOTE: Commands can define additional conditions for being enabled, and currently the only condition mentioned in
+    //       the spec is that certain commands must not be enabled if the editing host is in the plaintext-only state.
+    if (auto const* html_element = as_if<HTML::HTMLElement>(inclusive_ancestor_editing_host.ptr()); html_element
+        && html_element->content_editable_state() == HTML::ContentEditableState::PlaintextOnly
+        && command.is_one_of_ignoring_ascii_case(
+            Editing::CommandNames::backColor,
+            Editing::CommandNames::bold,
+            Editing::CommandNames::createLink,
+            Editing::CommandNames::fontName,
+            Editing::CommandNames::fontSize,
+            Editing::CommandNames::foreColor,
+            Editing::CommandNames::formatBlock, // AD-HOC: https://github.com/w3c/editing/issues/478
+            Editing::CommandNames::hiliteColor,
+            Editing::CommandNames::indent,
+            Editing::CommandNames::insertHorizontalRule,
+            Editing::CommandNames::insertImage,
+            Editing::CommandNames::insertOrderedList,
+            Editing::CommandNames::insertUnorderedList,
+            Editing::CommandNames::italic,
+            Editing::CommandNames::justifyCenter,
+            Editing::CommandNames::justifyFull,
+            Editing::CommandNames::justifyLeft,
+            Editing::CommandNames::justifyRight,
+            Editing::CommandNames::outdent,
+            Editing::CommandNames::removeFormat,
             Editing::CommandNames::strikethrough,
             Editing::CommandNames::subscript,
             Editing::CommandNames::superscript,
@@ -2807,8 +3046,19 @@ bool is_block_end_point(DOM::BoundaryPoint boundary_point)
         return true;
 
     // or node has a child with index offset, and that child is a visible block node.
+    // AD-HOC: Test block-ness first. Both conditions are side-effect free, and is_visible_node() resolves style for
+    //         every inclusive ancestor, while is_block_node() rejects a non-Element outright.
     auto offset_child = boundary_point.node->child_at_index(boundary_point.offset);
-    return offset_child && is_visible_node(*offset_child) && is_block_node(*offset_child);
+    return offset_child && is_block_node(*offset_child) && is_visible_node(*offset_child);
+}
+
+// Whether a resolved display qualifies an Element as a block node; see is_block_node() below.
+static bool is_block_display(Optional<CSS::Display> const& display)
+{
+    if (!display.has_value())
+        return true;
+    return !(display->is_inline_outside() && (display->is_flow_inside() || display->is_flow_root_inside() || display->is_table_inside()))
+        && !display->is_none();
 }
 
 // https://w3c.github.io/editing/docs/execCommand/#block-node
@@ -2822,11 +3072,7 @@ bool is_block_node(GC::Ref<DOM::Node> node)
     if (!is<DOM::Element>(*node))
         return false;
 
-    auto display = resolved_display(node);
-    if (!display.has_value())
-        return true;
-    return !(display->is_inline_outside() && (display->is_flow_inside() || display->is_flow_root_inside() || display->is_table_inside()))
-        && !display->is_none();
+    return is_block_display(resolved_display(node));
 }
 
 // https://w3c.github.io/editing/docs/execCommand/#block-start-point
@@ -2837,9 +3083,11 @@ bool is_block_start_point(DOM::BoundaryPoint boundary_point)
         return true;
 
     // or node has a child with index offset − 1, and that child is either a visible block node or a visible br.
+    // AD-HOC: Test block-ness first, as in is_block_end_point().
     auto offset_minus_one_child = boundary_point.node->child_at_index(boundary_point.offset - 1);
-    return offset_minus_one_child && is_visible_node(*offset_minus_one_child)
-        && (is_block_node(*offset_minus_one_child) || is<HTML::HTMLBRElement>(*offset_minus_one_child));
+    return offset_minus_one_child
+        && (is_block_node(*offset_minus_one_child) || is<HTML::HTMLBRElement>(*offset_minus_one_child))
+        && is_visible_node(*offset_minus_one_child);
 }
 
 // https://w3c.github.io/editing/docs/execCommand/#collapsed-block-prop
@@ -3488,9 +3736,18 @@ bool is_visible_node(GC::Ref<DOM::Node> node)
 {
     // excluding any node with an inclusive ancestor Element whose "display" property has resolved
     // value "none".
+    // NB: Only Elements have a display of their own; on any other node, resolved_display() answers
+    //     with the nearest inclusive ancestor Element's display. So, walking the ancestor Elements
+    //     covers every node in between. The display of node itself also feeds the block-node check
+    //     below. So, it's resolved once here — rather than a second time there.
+    Optional<CSS::Display> node_display;
     bool has_display_none = false;
-    node->for_each_inclusive_ancestor([&has_display_none](GC::Ref<DOM::Node> ancestor) {
+    node->for_each_inclusive_ancestor([&](GC::Ref<DOM::Node> ancestor) {
+        if (!is<DOM::Element>(*ancestor))
+            return IterationDecision::Continue;
         auto display = resolved_display(ancestor);
+        if (ancestor.ptr() == node.ptr())
+            node_display = display;
         if (display.has_value() && display->is_none()) {
             has_display_none = true;
             return IterationDecision::Break;
@@ -3501,7 +3758,7 @@ bool is_visible_node(GC::Ref<DOM::Node> node)
         return false;
 
     // Something is visible if it is a node that either is a block node,
-    if (is_block_node(node))
+    if (is<DOM::Element>(*node) ? is_block_display(node_display) : is_block_node(node))
         return true;
 
     // or a Text node that is not a collapsed whitespace node,
@@ -5775,9 +6032,15 @@ RefPtr<CSS::StyleValue const> resolved_value(GC::Ref<DOM::Node> node, CSS::Prope
         element = element->parent();
     if (!element)
         return {};
+    DOM::AbstractElement abstract_element { static_cast<DOM::Element&>(*element) };
+
+    // OPTIMIZATION: For properties whose resolved value is the plain computed value, read it straight off the element's
+    // computed style — instead of materializing a whole resolved-style declaration just to extract a single property.
+    if (auto fast_value = CSS::CSSStyleProperties::resolved_value_read_from_computed_style(abstract_element, property_id); fast_value.has_value())
+        return fast_value.release_value();
 
     // Retrieve resolved style value
-    auto resolved_css_style_declaration = CSS::CSSStyleProperties::create_resolved_style(DOM::AbstractElement { static_cast<DOM::Element&>(*element) });
+    auto resolved_css_style_declaration = CSS::CSSStyleProperties::create_resolved_style(abstract_element);
     auto optional_style_property = resolved_css_style_declaration->get_property(property_id);
     if (!optional_style_property.has_value())
         return {};
@@ -232292,7 +232555,7 @@ struct PrecomputedSvgPath {
     normalized: Option<Vec<u16>>,
 }
 
-struct WorkerParseInput {
+struct CallbackFreeParseInput {
     in_quirks_mode: bool,
     is_svg_presentation_attribute: bool,
     contains_attr_tainted_values: bool,
@@ -232303,23 +232566,18 @@ struct WorkerParseInput {
     svg_paths: Vec<PrecomputedSvgPath>,
 }
 
-struct WorkerParseOutcome {
+struct CallbackFreeParseOutcome {
     outcome: ParseOutcome,
     source: Vec<u16>,
 }
 
-// SAFETY: Worker parsing has no C++ callbacks and cannot create non-zero AK fly-string handles.
-// Parsed values contain immutable Rust-owned data or the zero fly-string sentinel, and the result
-// is transferred without being inspected or destroyed on the worker.
-unsafe impl Send for WorkerParseOutcome {}
-
 #[allow(clippy::arc_with_non_send_sync)]
-fn parse_substituted_on_worker(
+fn parse_substituted_without_callbacks(
     base_context: &ParseContext,
     property_id: u16,
     source: Vec<u16>,
     contains_attr_tainted_values: bool,
-) -> WorkerParseOutcome {
+) -> CallbackFreeParseOutcome {
     let svg_paths = svg_path_strings_from_source(&source)
         .into_iter()
         .map(|path| {
@@ -232340,7 +232598,7 @@ fn parse_substituted_on_worker(
             }
         })
         .collect();
-    let input = WorkerParseInput {
+    let input = CallbackFreeParseInput {
         in_quirks_mode: base_context.in_quirks_mode,
         is_svg_presentation_attribute: base_context.is_svg_presentation_attribute,
         contains_attr_tainted_values,
@@ -232356,71 +232614,65 @@ fn parse_substituted_on_worker(
         source,
         svg_paths,
     };
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    crate::css::worker_pool::run(vec![move || {
-        crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::SubstitutionWorkerParse);
-        let ffi_svg_paths: Vec<_> = input
-            .svg_paths
-            .iter()
-            .map(|path| FfiPrecomputedSvgPath {
-                source: path.source.as_ptr(),
-                source_length: path.source.len(),
-                normalized: path.normalized.as_ref().map_or(std::ptr::null(), |path| path.as_ptr()),
-                normalized_length: path.normalized.as_ref().map_or(0, Vec::len),
-            })
-            .collect();
-        let mut random_function_index = 0;
-        let value_context = FfiValueParsingContext {
-            kind: FfiValueParsingContextKind::Property,
-            value: input.property_id,
-            secondary_value: 0,
-            name: Default::default(),
-        };
-        let context = ParseContext {
-            in_quirks_mode: input.in_quirks_mode,
-            is_svg_presentation_attribute: input.is_svg_presentation_attribute,
-            is_substituted_value: true,
-            contains_attr_tainted_values: input.contains_attr_tainted_values,
-            value_contexts: &raw const value_context,
-            value_context_count: 1,
-            document_url: input.document_url.as_ptr(),
-            document_url_length: input.document_url.len(),
-            document_base_url: input.document_base_url.as_ptr(),
-            document_base_url_length: input.document_base_url.len(),
-            intern_utf16_fly_string: None,
-            normalize_svg_path_data: None,
-            precomputed_svg_paths: ffi_svg_paths.as_ptr(),
-            precomputed_svg_path_count: ffi_svg_paths.len(),
-            font_format_is_supported: None,
-            font_tech_is_supported: None,
-            descriptor_integer_resolution_context: std::ptr::null(),
-            resolve_descriptor_integer: None,
-            random_function_index: &raw mut random_function_index,
-        };
-        let outcome = match parse_css_value_from_source(&context, input.property_id, &input.source) {
-            // A callback-free parse can report Invalid when an Option-returning grammar could not
-            // retain a string. Let the main thread distinguish that from a genuinely invalid value.
-            ParseOutcome::Invalid => ParseOutcome::NotHandled,
-            outcome => outcome,
-        };
-        sender
-            .send(WorkerParseOutcome {
-                outcome,
-                source: input.source,
-            })
-            .unwrap();
-    }]);
-    receiver.recv().unwrap()
+    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::SubstitutionCallbackFreeParse);
+    let ffi_svg_paths: Vec<_> = input
+        .svg_paths
+        .iter()
+        .map(|path| FfiPrecomputedSvgPath {
+            source: path.source.as_ptr(),
+            source_length: path.source.len(),
+            normalized: path.normalized.as_ref().map_or(std::ptr::null(), |path| path.as_ptr()),
+            normalized_length: path.normalized.as_ref().map_or(0, Vec::len),
+        })
+        .collect();
+    let mut random_function_index = 0;
+    let value_context = FfiValueParsingContext {
+        kind: FfiValueParsingContextKind::Property,
+        value: input.property_id,
+        secondary_value: 0,
+        name: Default::default(),
+    };
+    let context = ParseContext {
+        in_quirks_mode: input.in_quirks_mode,
+        is_svg_presentation_attribute: input.is_svg_presentation_attribute,
+        is_substituted_value: true,
+        contains_attr_tainted_values: input.contains_attr_tainted_values,
+        value_contexts: &raw const value_context,
+        value_context_count: 1,
+        document_url: input.document_url.as_ptr(),
+        document_url_length: input.document_url.len(),
+        document_base_url: input.document_base_url.as_ptr(),
+        document_base_url_length: input.document_base_url.len(),
+        intern_utf16_fly_string: None,
+        normalize_svg_path_data: None,
+        precomputed_svg_paths: ffi_svg_paths.as_ptr(),
+        precomputed_svg_path_count: ffi_svg_paths.len(),
+        font_format_is_supported: None,
+        font_tech_is_supported: None,
+        descriptor_integer_resolution_context: std::ptr::null(),
+        resolve_descriptor_integer: None,
+        random_function_index: &raw mut random_function_index,
+    };
+    let outcome = match parse_css_value_from_source(&context, input.property_id, &input.source) {
+        // A callback-free parse can report Invalid when an Option-returning grammar could not
+        // retain a string. Report that as unhandled so the caller can retry with the callbacks.
+        ParseOutcome::Invalid => ParseOutcome::NotHandled,
+        outcome => outcome,
+    };
+    CallbackFreeParseOutcome {
+        outcome,
+        source: input.source,
+    }
 }
 
 #[allow(clippy::arc_with_non_send_sync)]
-fn parse_substituted_on_main_thread(
+fn parse_substituted_with_callbacks(
     base_context: &ParseContext,
     property_id: u16,
     source: &[u16],
     contains_attr_tainted_values: bool,
 ) -> std::sync::Arc<StyleValueData> {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::SubstitutionMainThreadParseRequest);
+    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::SubstitutionCallbackParseRequest);
     let mut random_function_index = 0;
     let value_context = FfiValueParsingContext {
         kind: FfiValueParsingContextKind::Property,
@@ -232945,13 +233197,13 @@ fn resolve_cascade_value(
                         ..
                     }
                 );
-            let WorkerParseOutcome { outcome, source } =
-                parse_substituted_on_worker(base_context, property_id, source, contains_attr_tainted_values);
+            let CallbackFreeParseOutcome { outcome, source } =
+                parse_substituted_without_callbacks(base_context, property_id, source, contains_attr_tainted_values);
             match outcome {
                 ParseOutcome::Parsed(value) => value,
                 ParseOutcome::Invalid => std::sync::Arc::new(StyleValueData::GuaranteedInvalid),
                 ParseOutcome::NotHandled => {
-                    parse_substituted_on_main_thread(base_context, property_id, &source, contains_attr_tainted_values)
+                    parse_substituted_with_callbacks(base_context, property_id, &source, contains_attr_tainted_values)
                 }
             }
         }
@@ -249074,8 +249326,8 @@ define_ffi_ops! {
     StyleGroupFreeEntry => "styleGroupFreeEntries",
     AnimationEvaluationEntry => "animationEvaluationEntries",
     TransitionDecisionEntry => "transitionDecisionEntries",
-    SubstitutionWorkerParse => "substitutionWorkerParses",
-    SubstitutionMainThreadParseRequest => "substitutionMainThreadParseRequests",
+    SubstitutionCallbackFreeParse => "substitutionCallbackFreeParses",
+    SubstitutionCallbackParseRequest => "substitutionCallbackParseRequests",
     // Ownership callbacks: Rust -> C++.
     StringRetainReleaseCallback => "stringRetainReleaseCallbacks",
     AnimatedPropertiesRetainReleaseCallback => "animatedPropertiesRetainReleaseCallbacks",
@@ -249422,7 +249674,6 @@ pub mod style_compute;
 pub(crate) mod style_value;
 pub mod table_group_builder;
 pub mod transition;
-pub(crate) mod worker_pool;
 
 pub use css_tokenizer::CssHashType;
 pub use css_tokenizer::CssNumberType;
@@ -317600,6 +317851,23 @@ impl StyleEngine {
         !self.flushing_deferred_geometry_journal && !self.deferred_geometry_journal.is_empty()
     }
 
+    /// Whether any element style input is still deferred, waiting for the first transaction with a
+    /// document root. A rootless flush drains the journal but preserves these — so an engine that
+    /// reports no pending transaction can still owe an element its recomputation.
+    #[must_use]
+    pub fn has_deferred_element_style_inputs(&self) -> bool {
+        !self.deferred_element_style_inputs.is_empty()
+    }
+
+    /// Whether one element still owes a deferred style input, asked per node the way the recorded
+    /// batch is. The deferred inputs are kept sorted by key, so this is a binary search.
+    #[must_use]
+    pub fn has_deferred_element_style_input(&self, node: StyleNodeID) -> bool {
+        self.deferred_element_style_inputs
+            .binary_search_by_key(&InputKey::ElementStyleInput(node), |pending| pending.key)
+            .is_ok()
+    }
+
     /// Whether settling the pending selector inputs can change geometry derived from the committed
     /// layout. This is deliberately a proof of independence rather than a list of properties which
     /// usually avoid layout: anything not explicitly known to preserve geometry remains observable.
@@ -368482,143 +368750,6 @@ mod tests {
         assert_eq!(action.reversing_shortening_factor, 0.625);
         assert_eq!(action.delay, -12.5);
         assert_eq!(action.active_duration, 62.5);
-    }
-}
-
-FILE: Libraries/LibWeb/Rust/src/css/worker_pool.rs
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-//! Persistent workers for blocking batches of style work.
-//!
-//! A submitted closure may borrow data owned by the caller because [`run`]
-//! does not return until every closure has finished. The lifetime erasure at
-//! the queue boundary recreates the guarantee of `std::thread::scope` while
-//! avoiding an operating-system thread spawn for every substituted value.
-
-use std::any::Any;
-use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::{Condvar, Mutex, OnceLock};
-
-type Job = Box<dyn FnOnce() + Send + 'static>;
-
-struct State {
-    jobs: Vec<Job>,
-    pending: usize,
-    panic: Option<Box<dyn Any + Send>>,
-}
-
-struct Pool {
-    state: Mutex<State>,
-    work_available: Condvar,
-    batch_done: Condvar,
-    submission: Mutex<()>,
-}
-
-impl Pool {
-    fn worker_loop(&self) {
-        loop {
-            let job = {
-                let mut state = self.state.lock().unwrap();
-                while state.jobs.is_empty() {
-                    state = self.work_available.wait(state).unwrap();
-                }
-                state.jobs.pop().unwrap()
-            };
-            let panic = catch_unwind(AssertUnwindSafe(job)).err();
-            let mut state = self.state.lock().unwrap();
-            if state.panic.is_none() {
-                state.panic = panic;
-            }
-            state.pending -= 1;
-            if state.pending == 0 {
-                self.batch_done.notify_one();
-            }
-        }
-    }
-
-    fn run<F: FnOnce() + Send>(&'static self, jobs: Vec<F>) {
-        if jobs.is_empty() {
-            return;
-        }
-        let _submission = self.submission.lock().unwrap();
-        {
-            let mut state = self.state.lock().unwrap();
-            debug_assert_eq!(state.pending, 0);
-            debug_assert!(state.panic.is_none());
-            state.pending = jobs.len();
-            state.jobs.extend(jobs.into_iter().map(|job| {
-                let job: Box<dyn FnOnce() + Send + '_> = Box::new(job);
-                // SAFETY: This function waits for `pending` to reach zero before returning, so
-                // every captured borrow outlives its queued closure.
-                unsafe { std::mem::transmute::<Box<dyn FnOnce() + Send + '_>, Job>(job) }
-            }));
-        }
-        self.work_available.notify_all();
-
-        let mut state = self.state.lock().unwrap();
-        while state.pending != 0 {
-            state = self.batch_done.wait(state).unwrap();
-        }
-        if let Some(panic) = state.panic.take() {
-            drop(state);
-            resume_unwind(panic);
-        }
-    }
-}
-
-fn pool() -> &'static Pool {
-    static POOL: OnceLock<&'static Pool> = OnceLock::new();
-    POOL.get_or_init(|| {
-        let worker_count = std::thread::available_parallelism()
-            .map_or(1, usize::from)
-            .saturating_sub(1)
-            .max(1);
-        let pool: &'static Pool = Box::leak(Box::new(Pool {
-            state: Mutex::new(State {
-                jobs: Vec::new(),
-                pending: 0,
-                panic: None,
-            }),
-            work_available: Condvar::new(),
-            batch_done: Condvar::new(),
-            submission: Mutex::new(()),
-        }));
-        for _ in 0..worker_count {
-            std::thread::Builder::new()
-                .name("StyleWorker".into())
-                .spawn(move || pool.worker_loop())
-                .expect("spawn style worker");
-        }
-        pool
-    })
-}
-
-/// Runs every job on persistent style workers and blocks until all jobs have
-/// finished. Jobs never execute on the calling thread.
-pub(crate) fn run<F: FnOnce() + Send>(jobs: Vec<F>) {
-    pool().run(jobs);
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Mutex;
-
-    use super::*;
-
-    #[test]
-    fn runs_jobs_away_from_the_calling_thread() {
-        let caller = std::thread::current().id();
-        let workers = Mutex::new(Vec::new());
-        run((0..4)
-            .map(|_| || workers.lock().unwrap().push(std::thread::current().id()))
-            .collect());
-        let workers = workers.into_inner().unwrap();
-        assert_eq!(workers.len(), 4);
-        assert!(workers.into_iter().all(|worker| worker != caller));
     }
 }
 
@@ -432975,7 +433106,9 @@ FILE: Libraries/LibWeb/Rust/StyleEngineBoundary.json
     [84, "DeferPendingTransactionForGeometryRead"],
     [85, "BeginDeferredGeometryTransactionFlush"],
     [86, "EndDeferredGeometryTransactionFlush"],
-    [87, "HasDeferredGeometryTransaction"]
+    [87, "HasDeferredGeometryTransaction"],
+    [88, "HasDeferredElementStyleInputs"],
+    [89, "HasDeferredElementStyleInput"]
   ],
   "operations": [
     { "event": "SetFoldIdAndClassNameCase", "ffi": "style_engine_set_fold_id_and_class_name_case", "cpp": "set_fold_id_and_class_name_case", "return": "void", "args": [["fold", "bool"]], "body": "engine.set_fold_id_and_class_name_case(fold);" },
@@ -433002,6 +433135,8 @@ FILE: Libraries/LibWeb/Rust/StyleEngineBoundary.json
     { "event": "BeginDeferredGeometryTransactionFlush", "ffi": "style_engine_begin_deferred_geometry_transaction_flush", "return": "bool", "replay": false, "args": [], "body": "let result = engine.begin_deferred_geometry_transaction_flush();" },
     { "event": "EndDeferredGeometryTransactionFlush", "ffi": "style_engine_end_deferred_geometry_transaction_flush", "return": "void", "replay": false, "args": [], "body": "engine.end_deferred_geometry_transaction_flush();" },
     { "event": "HasDeferredGeometryTransaction", "ffi": "style_engine_has_deferred_geometry_transaction", "return": "bool", "receiver": "const", "replay": false, "args": [], "body": "let result = engine.has_deferred_geometry_transaction();" },
+    { "event": "HasDeferredElementStyleInputs", "ffi": "style_engine_has_deferred_element_style_inputs", "return": "bool", "receiver": "const", "replay": false, "args": [], "body": "let result = engine.has_deferred_element_style_inputs();" },
+    { "event": "HasDeferredElementStyleInput", "ffi": "style_engine_has_deferred_element_style_input", "return": "bool", "receiver": "const", "replay": false, "args": [["node", "style_node"]], "body": "let Some(node) = StyleNodeID::from_raw(node) else { return false; }; let result = engine.has_deferred_element_style_input(node);" },
     { "event": "MatchDocument", "ffi": "style_engine_match_document", "cpp": "match_document", "return": "usize_u64", "replay": false, "args": [["root", "style_node"]], "body": "let Some(root) = StyleNodeID::from_raw(root) else { return usize::MAX; }; let result = engine.match_document(root).unwrap_or(usize::MAX);" },
     { "event": "BeginColdMatchingBatch", "ffi": "style_engine_begin_cold_matching_batch", "cpp": "begin_cold_matching_batch", "return": "bool", "replay": false, "args": [["root", "style_node"]], "body": "let Some(root) = StyleNodeID::from_raw(root) else { return false; }; let result = engine.begin_cold_matching_batch(root);" },
     { "event": "BeginAdaptiveColdMatchingBatch", "ffi": "style_engine_begin_adaptive_cold_matching_batch", "cpp": "begin_adaptive_cold_matching_batch", "return": "void", "replay": false, "args": [["root", "style_node"]], "body": "let Some(root) = StyleNodeID::from_raw(root) else { return; }; engine.begin_adaptive_cold_matching_batch(root);" },
@@ -624487,375 +624622,3 @@ static JsonValue serialize_js_value(JS::Realm& realm, JS::Value value)
         if (value.is_nan())
             return serialize_type("NaN"sv);
         if (value.is_positive_infinity())
-            return serialize_type("Infinity"sv);
-        if (value.is_negative_infinity())
-            return serialize_type("-Infinity"sv);
-        if (value.is_negative_zero())
-            return serialize_type("-0"sv);
-        return value.as_double();
-    }
-
-    if (value.is_bigint()) {
-        auto serialized = serialize_type("BigInt"sv);
-        serialized.set("text"sv, MUST(value.as_bigint().big_integer().to_base(10)));
-        return serialized;
-    }
-
-    if (value.is_symbol())
-        return value.as_symbol().descriptive_string().to_utf8();
-
-    // FIXME: Handle serialization of object grips. For now, we stringify the object.
-    if (value.is_object()) {
-        Web::HTML::TemporaryExecutionContext execution_context { realm };
-        AllocatingMemoryStream stream;
-
-        JS::PrintContext context { .vm = vm, .stream = &stream, .strip_ansi = true };
-        MUST(JS::print(value, context));
-
-        return MUST(String::from_stream(stream, stream.used_buffer_size()));
-    }
-
-    return {};
-}
-
-void DevToolsConsoleClient::handle_result(JS::Value result)
-{
-    auto& settings = Web::HTML::relevant_settings_object(*m_console_global_environment_extensions);
-    m_client->did_execute_js_console_input(serialize_js_value(settings.realm(), result));
-}
-
-void DevToolsConsoleClient::report_exception(Utf16View name, Utf16View message, JS::ErrorData const& error_data, bool in_promise)
-{
-    Vector<WebView::StackFrame> trace;
-    trace.ensure_capacity(error_data.traceback().size());
-
-    for (auto const& frame : error_data.traceback()) {
-        auto const& source_range = frame.source_range();
-        WebView::StackFrame stack_frame;
-
-        if (!frame.function_name.is_empty())
-            stack_frame.function = frame.function_name.to_utf8();
-
-        if (!source_range.filename().is_empty() || source_range.start.line != 0 || source_range.start.column != 0) {
-            stack_frame.file = source_range.filename().to_utf8();
-            stack_frame.line = source_range.start.line;
-            stack_frame.column = source_range.start.column;
-        }
-
-        if (stack_frame.function.has_value() || stack_frame.file.has_value())
-            trace.unchecked_append(move(stack_frame));
-    }
-
-    send_console_output({
-        .timestamp = UnixDateTime::now(),
-        .output = WebView::ConsoleError {
-            .name = MUST(name.to_utf8()),
-            .message = MUST(message.to_utf8()),
-            .trace = move(trace),
-            .inside_promise = in_promise,
-        },
-    });
-}
-
-void DevToolsConsoleClient::send_console_output(WebView::ConsoleOutput console_output)
-{
-    m_client->did_output_js_console_message(move(console_output));
-}
-
-// 2.3. Printer(logLevel, args[, options]), https://console.spec.whatwg.org/#printer
-JS::ThrowCompletionOr<JS::Value> DevToolsConsoleClient::printer(JS::Console::LogLevel log_level, PrinterArguments arguments)
-{
-    if (log_level == JS::Console::LogLevel::Trace) {
-        auto const& trace = arguments.get<JS::Console::Trace>();
-
-        m_console->output_debug_message(log_level, trace.label);
-
-        Vector<WebView::StackFrame> stack_frames;
-        stack_frames.ensure_capacity(trace.stack.size());
-
-        for (auto const& frame : trace.stack) {
-            Optional<String> source_file;
-            if (frame.source_file.has_value())
-                source_file = frame.source_file->to_utf8();
-
-            stack_frames.unchecked_append(WebView::StackFrame {
-                .function = frame.function_name.to_utf8(),
-                .file = move(source_file),
-                .line = frame.line,
-                .column = frame.column,
-            });
-        }
-
-        send_console_output({
-            .timestamp = UnixDateTime::now(),
-            .output = WebView::ConsoleTrace {
-                .label = trace.label.to_utf8(),
-                .stack = move(stack_frames),
-            },
-        });
-
-        return JS::js_undefined();
-    }
-
-    // FIXME: Implement these.
-    if (first_is_one_of(log_level, JS::Console::LogLevel::Table, JS::Console::LogLevel::Group, JS::Console::LogLevel::GroupCollapsed))
-        return JS::js_undefined();
-
-    auto const& argument_values = arguments.get<GC::RootVector<JS::Value>>();
-
-    auto output = TRY(generically_format_values(argument_values));
-    m_console->output_debug_message(log_level, output);
-
-    Vector<JsonValue> serialized_arguments;
-    serialized_arguments.ensure_capacity(argument_values.size());
-
-    for (auto value : argument_values)
-        serialized_arguments.unchecked_append(serialize_js_value(m_console->realm(), value));
-
-    send_console_output({
-        .timestamp = UnixDateTime::now(),
-        .output = WebView::ConsoleLog {
-            .level = log_level,
-            .arguments = move(serialized_arguments),
-        },
-    });
-
-    return JS::js_undefined();
-}
-
-}
-
-FILE: Services/WebContent/DevToolsConsoleClient.h
-/*
- * Copyright (c) 2025, Tim Flynn <trflynn89@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/Time.h>
-#include <LibIPC/Forward.h>
-#include <LibJS/Console.h>
-#include <LibJS/Forward.h>
-#include <LibWeb/Forward.h>
-#include <LibWebView/ConsoleOutput.h>
-#include <WebContent/Forward.h>
-#include <WebContent/WebContentConsoleClient.h>
-
-namespace WebContent {
-
-class DevToolsConsoleClient final : public WebContentConsoleClient {
-    GC_CELL(DevToolsConsoleClient, WebContentConsoleClient);
-    GC_DECLARE_ALLOCATOR(DevToolsConsoleClient);
-
-public:
-    static GC::Ref<DevToolsConsoleClient> create(JS::Realm&, JS::Console&, PageClient&);
-    virtual ~DevToolsConsoleClient() override;
-
-private:
-    DevToolsConsoleClient(JS::Console&, PageClient&, ConsoleGlobalEnvironmentExtensions&);
-
-    virtual void handle_result(JS::Value) override;
-    virtual void report_exception(Utf16View name, Utf16View message, JS::ErrorData const&, bool) override;
-    virtual void end_group() override { }
-    virtual void clear() override { }
-
-    virtual JS::ThrowCompletionOr<JS::Value> printer(JS::Console::LogLevel, PrinterArguments) override;
-
-    void send_console_output(WebView::ConsoleOutput);
-};
-
-}
-
-FILE: Services/WebContent/Forward.h
-/*
- * Copyright (c) 2020, Andreas Kling <andreas@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-namespace WebContent {
-
-class ConnectionFromClient;
-class ConsoleGlobalEnvironmentExtensions;
-class DevToolsConsoleClient;
-class PageHost;
-class PageClient;
-class WebContentConsoleClient;
-class WebDriverConnection;
-class WebUIConnection;
-
-}
-
-FILE: Services/WebContent/main.cpp
-/*
- * Copyright (c) 2020-2024, Andreas Kling <andreas@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <AK/LexicalPath.h>
-#include <LibCore/ArgsParser.h>
-#include <LibCore/EventLoop.h>
-#include <LibCore/LocalServer.h>
-#include <LibCore/Process.h>
-#include <LibCore/Resource.h>
-#include <LibCore/System.h>
-#include <LibCore/TimeZone.h>
-#include <LibCrypto/OpenSSLForward.h>
-#include <LibGfx/Font/FontDatabase.h>
-#include <LibGfx/Font/PathFontProvider.h>
-#include <LibIPC/ConnectionFromClient.h>
-#include <LibIPC/TransportHandle.h>
-#include <LibMain/Main.h>
-#include <LibRequests/RequestClient.h>
-#include <LibUnicode/TimeZone.h>
-#include <LibWeb/Bindings/MainThreadVM.h>
-#include <LibWeb/DOM/Document.h>
-#include <LibWeb/Fetch/Fetching/Fetching.h>
-#include <LibWeb/HTML/UniversalGlobalScope.h>
-#include <LibWeb/HTML/Window.h>
-#include <LibWeb/Internals/Internals.h>
-#include <LibWeb/Loader/GeneratedPagesLoader.h>
-#include <LibWeb/Loader/ResourceLoader.h>
-#include <LibWeb/Painting/BoxViews.h>
-#include <LibWeb/Platform/EventLoopPlugin.h>
-#include <LibWeb/Platform/FontPlugin.h>
-#include <LibWebView/Plugins/ImageCodecPlugin.h>
-#include <LibWebView/SiteIsolation.h>
-#include <LibWebView/Utilities.h>
-#include <Services/RendererSandbox.h>
-#include <WebContent/ConnectionFromClient.h>
-#include <WebContent/PageClient.h>
-#include <WebContent/WebContentCompositorHost.h>
-#include <WebContent/WebDriverConnection.h>
-
-#if defined(HAVE_WASM_COMPILER_SERVICE)
-#    include <LibWasmCompilerClient/State.h>
-#endif
-
-#include <openssl/thread.h>
-
-#if defined(AK_OS_MACOS)
-#    include <LibIPC/Transport.h>
-#    include <LibIPC/TransportBootstrapMach.h>
-#else
-#    include <LibIPC/SingleServer.h>
-#endif
-
-#if defined(AK_OS_WINDOWS)
-#    include <objbase.h>
-#endif
-
-#include <SDL3/SDL_init.h>
-
-#if !defined(AK_OS_WINDOWS)
-#    include <signal.h>
-static void crash_signal_handler(int signo)
-{
-    char const* name;
-    switch (signo) {
-    case SIGSEGV:
-        name = "SIGSEGV";
-        break;
-    case SIGBUS:
-        name = "SIGBUS";
-        break;
-    case SIGFPE:
-        name = "SIGFPE";
-        break;
-    case SIGABRT:
-        name = "SIGABRT";
-        break;
-    case SIGILL:
-        name = "SIGILL";
-        break;
-    default:
-        name = "unknown";
-        break;
-    }
-    warnln("\n\033[31;1mCRASH\033[0m: Received signal {} ({})", name, signo);
-    dump_backtrace(2, 100);
-    Core::Process::terminate_immediately(128 + signo);
-}
-
-static void install_crash_signal_handlers()
-{
-    struct sigaction sa;
-    sa.sa_handler = crash_signal_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESETHAND;
-    sigaction(SIGSEGV, &sa, nullptr);
-    sigaction(SIGBUS, &sa, nullptr);
-    sigaction(SIGFPE, &sa, nullptr);
-    sigaction(SIGABRT, &sa, nullptr);
-    sigaction(SIGILL, &sa, nullptr);
-}
-#endif
-
-static ErrorOr<void> connect_to_resource_loader(GC::Heap& heap, IPC::TransportHandle const& handle);
-static ErrorOr<void> connect_to_image_decoder(IPC::TransportHandle const& handle);
-
-ErrorOr<int> ladybird_main(Main::Arguments arguments)
-{
-    AK::set_rich_debug_enabled(true);
-
-#if !defined(AK_OS_WINDOWS)
-    install_crash_signal_handlers();
-#endif
-
-#if defined(AK_OS_WINDOWS)
-    // NOTE: We need this here otherwise SDL inits COM in the APARTMENTTHREADED model which we don't want as we need to
-    // make calls across threads which would otherwise have a high overhead. It is safe for all the objects we use.
-    HRESULT hr = CoInitializeEx(0, COINIT_MULTITHREADED);
-    VERIFY(SUCCEEDED(hr));
-    ScopeGuard uninitialize_com = []() { CoUninitialize(); };
-#endif
-    // SDL is used for the Gamepad API.
-    if (!SDL_Init(SDL_INIT_GAMEPAD)) {
-        dbgln("Failed to initialize SDL3: {}", SDL_GetError());
-        return -1;
-    }
-
-    auto& event_loop = Core::EventLoop::initialize_for_current_thread();
-
-    WebView::platform_init();
-
-    Web::Platform::EventLoopPlugin::install(*new Web::Platform::EventLoopPlugin);
-
-    auto config_path = WebView::s_ladybird_resource_root;
-    StringView cache_path;
-    StringView mach_server_name {};
-    Vector<ByteString> certificates;
-    bool enable_test_mode = false;
-    bool expose_experimental_interfaces = false;
-    bool expose_internals_object = false;
-    bool wait_for_debugger = false;
-    bool log_all_js_exceptions = false;
-    auto site_isolation_mode = WebView::SiteIsolationMode::TopLevel;
-    bool enable_http_memory_cache = false;
-    bool force_fontconfig = false;
-    bool collect_garbage_on_every_allocation = false;
-    bool is_headless = false;
-    bool disable_scrollbar_painting = false;
-    bool disable_async_scrolling = false;
-    bool disable_sandbox = false;
-    StringView echo_server_port_string_view {};
-    StringView default_time_zone {};
-    bool file_origins_are_tuple_origins = false;
-
-    Core::ArgsParser args_parser;
-    args_parser.add_option(config_path, "Ladybird configuration path", "config-path", 0, "config_path");
-    args_parser.add_option(cache_path, "Path to the profile cache", "cache-path", 0, "path");
-    args_parser.add_option(enable_test_mode, "Enable test mode", "test-mode");
-    args_parser.add_option(expose_experimental_interfaces, "Expose experimental IDL interfaces", "expose-experimental-interfaces");
-    args_parser.add_option(expose_internals_object, "Expose internals object", "expose-internals-object");
-    args_parser.add_option(certificates, "Path to a certificate file", "certificate", 'C', "certificate");
-    args_parser.add_option(wait_for_debugger, "Wait for debugger", "wait-for-debugger");
-    args_parser.add_option(mach_server_name, "Mach server name", "mach-server-name", 0, "mach_server_name");
-    args_parser.add_option(log_all_js_exceptions, "Log all JavaScript exceptions", "log-all-js-exceptions");
-    args_parser.add_option(Core::ArgsParser::Option {
-        .argument_mode = Core::ArgsParser::OptionArgumentMode::Required,
