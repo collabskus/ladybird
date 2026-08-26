@@ -209,14 +209,6 @@ public:
         return false;
     }
 
-    void append_child(NonnullRefPtr<Node>);
-    void prepend_child(NonnullRefPtr<Node>);
-    void insert_before(NonnullRefPtr<Node>, Node* before);
-    void insert_before(NonnullRefPtr<Node> node, Node& before) { insert_before(move(node), &before); }
-    void remove_child(Node&);
-    void replace_child(NonnullRefPtr<Node> new_child, Node& old_child);
-    void remove();
-
     bool is_anonymous() const { return has_flag(RustFFI::NodeFlag::Anonymous); }
     bool insets_use_anchor_functions() const { return has_flag(RustFFI::NodeFlag::InsetsUseAnchorFunctions); }
     DOM::Node const* dom_node() const;
@@ -233,12 +225,11 @@ public:
 
     void bump_fragment_cache_epoch();
 
-    // Any invalidation or restructuring below a node must reach every ancestor's epoch: cached
-    // runs capture subtree structure, and unlike intrinsic-size invalidation there is no
-    // absolutely-positioned or SVG boundary — those descendants' fragments live in ancestor
-    // run trees. Layout tree restructuring in particular never funnels through
-    // set_needs_layout_update (a full pass lays out everything), so the tree mutation
-    // primitives call this on the parent of every structural change.
+    // Any invalidation below a node must reach every ancestor's epoch: cached runs capture
+    // subtree structure, and unlike intrinsic-size invalidation there is no absolutely-positioned
+    // or SVG boundary — those descendants' fragments live in ancestor run trees. The arena runs
+    // the same walk for every structural change; this serves content changes that never
+    // restructure the tree.
     void bump_fragment_cache_epoch_of_self_and_ancestors();
 
     // Set when a style change altered geometry-determining properties of this node itself, so
