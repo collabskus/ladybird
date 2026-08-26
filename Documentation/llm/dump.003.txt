@@ -1,4 +1,752 @@
-﻿void Request::notify_fetch_complete(Badge<ConnectionFromClient>, int result_code)
+﻿// one libcurl would pick. Empty when there is only one address, i.e. nothing to spread over.
+Optional<ByteString> build_curl_connect_to_entry(DNS::LookupResult const& dns_result, StringView host, u16 port, u32 address_index);
+Requests::NetworkError curl_code_to_network_error(int code);
+ErrorOr<void> initialize_libcurl();
+
+}
+
+FILE: Services/RequestServer/Forward.h
+/*
+ * Copyright (c) 2025, Tim Flynn <trflynn89@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+namespace RequestServer {
+
+class ConnectionFromClient;
+class Request;
+class RequestPipe;
+
+struct DNSInfo;
+struct Resolver;
+
+}
+
+FILE: Services/RequestServer/IsPrivate.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Types.h>
+
+namespace RequestServer {
+
+enum class IsPrivate : u8 {
+    No,
+    Yes,
+};
+
+}
+
+FILE: Services/RequestServer/main.cpp
+/*
+ * Copyright (c) 2018-2020, Andreas Kling <andreas@ladybird.org>
+ * Copyright (c) 2023, Andrew Kaster <akaster@serenityos.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/ByteString.h>
+#include <AK/Format.h>
+#include <AK/StringView.h>
+#include <AK/Vector.h>
+#include <LibCore/ArgsParser.h>
+#include <LibCore/EventLoop.h>
+#include <LibCore/Process.h>
+#include <LibCore/System.h>
+#include <LibHTTP/Cache/DiskCache.h>
+#include <LibIPC/SingleServer.h>
+#include <LibMain/Main.h>
+#include <RequestServer/CURL.h>
+#include <RequestServer/ConnectionFromClient.h>
+#include <RequestServer/Resolver.h>
+#include <RequestServer/ResourceSubstitutionMap.h>
+#include <RequestServer/Sandbox.h>
+
+namespace RequestServer {
+
+OwnPtr<ResourceSubstitutionMap> g_resource_substitution_map;
+
+}
+
+#ifndef AK_OS_WINDOWS
+static void handle_signal(int signal)
+{
+    VERIFY(signal == SIGINT || signal == SIGTERM);
+    Core::EventLoop::current().quit(0);
+}
+#endif
+
+ErrorOr<int> ladybird_main(Main::Arguments arguments)
+{
+    AK::set_rich_debug_enabled(true);
+
+    Vector<ByteString> certificates;
+    StringView mach_server_name;
+    StringView http_disk_cache_mode;
+    StringView resource_map_path;
+    StringView cache_path;
+    bool wait_for_debugger = false;
+    bool disable_sandbox = false;
+
+    Core::ArgsParser args_parser;
+    args_parser.add_option(certificates, "Path to a certificate file", "certificate", 'C', "certificate");
+    args_parser.add_option(mach_server_name, "Mach server name", "mach-server-name", 0, "mach_server_name");
+    args_parser.add_option(http_disk_cache_mode, "HTTP disk cache mode", "http-disk-cache-mode", 0, "mode");
+    args_parser.add_option(resource_map_path, "Path to JSON file mapping URLs to local files", "resource-map", 0, "path");
+    args_parser.add_option(cache_path, "Path to the profile cache", "cache-path", 0, "path");
+    args_parser.add_option(wait_for_debugger, "Wait for debugger", "wait-for-debugger");
+    args_parser.add_option(disable_sandbox, "Disable process sandboxing", "disable-sandbox");
+    args_parser.parse(arguments);
+
+    if (wait_for_debugger)
+        Core::Process::wait_for_debugger_and_break();
+
+    // FIXME: Update RequestServer to support multiple custom root certificates.
+    if (!certificates.is_empty())
+        RequestServer::set_default_certificate_path(certificates.first());
+
+    if (!resource_map_path.is_empty()) {
+        auto map = RequestServer::ResourceSubstitutionMap::load_from_file(resource_map_path);
+        if (map.is_error())
+            warnln("Unable to load resource substitution map from '{}': {}", resource_map_path, map.error());
+        else
+            RequestServer::g_resource_substitution_map = map.release_value();
+    }
+
+#if !defined(AK_OS_WINDOWS)
+    MUST(Core::System::signal(SIGPIPE, SIG_IGN));
+#endif
+
+    auto& event_loop = Core::EventLoop::initialize_for_current_thread();
+    // FIXME: Have another way to signal the event loop to gracefully quit on windows.
+#ifndef AK_OS_WINDOWS
+    Core::EventLoop::register_signal(SIGINT, handle_signal);
+    Core::EventLoop::register_signal(SIGTERM, handle_signal);
+#endif
+
+    Optional<HTTP::DiskCache> disk_cache;
+
+    if (http_disk_cache_mode != "disabled"sv) {
+        auto mode = TRY([&]() -> ErrorOr<HTTP::DiskCache::Mode> {
+            if (http_disk_cache_mode == "enabled"sv)
+                return HTTP::DiskCache::Mode::Normal;
+            if (http_disk_cache_mode == "testing"sv)
+                return HTTP::DiskCache::Mode::Testing;
+            return Error::from_string_literal("Unrecognized disk cache mode");
+        }());
+
+        if (auto cache = HTTP::DiskCache::create(mode, LexicalPath { cache_path }); cache.is_error())
+            warnln("Unable to create disk cache: {}", cache.error());
+        else
+            disk_cache = cache.release_value();
+    }
+
+    TRY(RequestServer::initialize_libcurl());
+
+    if (!disable_sandbox)
+        TRY(RequestServer::apply_sandbox(certificates, cache_path));
+
+    // Connections are stored on the stack to ensure they are destroyed before static destruction begins. This prevents
+    // crashes from notifiers trying to unregister from already-destroyed thread data during process exit.
+    RequestServer::ConnectionFromClient::ConnectionMap connections;
+
+    auto client = TRY(IPC::take_over_accepted_client_from_system_server<RequestServer::ConnectionFromClient>(
+        mach_server_name,
+        RequestServer::ConnectionFromClient::IsPrimaryConnection::Yes,
+        RequestServer::IsPrivate::No,
+        connections,
+        disk_cache,
+        LexicalPath::join(cache_path, "alt-svc-cache.txt"sv).string()));
+
+    return event_loop.exec();
+}
+
+FILE: Services/RequestServer/Request.cpp
+/*
+ * Copyright (c) 2024, Andreas Kling <andreas@ladybird.org>
+ * Copyright (c) 2025-2026, Tim Flynn <trflynn89@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/GenericShorthands.h>
+#include <AK/HashMap.h>
+#include <LibCore/File.h>
+#include <LibCore/MimeData.h>
+#include <LibCore/Notifier.h>
+#include <LibCore/System.h>
+#include <LibHTTP/Cache/DiskCache.h>
+#include <LibHTTP/Cache/Utilities.h>
+#include <LibHTTP/Status.h>
+#include <LibTextCodec/Decoder.h>
+#include <RequestServer/CURL.h>
+#include <RequestServer/ConnectionFromClient.h>
+#include <RequestServer/Request.h>
+#include <RequestServer/Resolver.h>
+#include <RequestServer/ResourceSubstitutionMap.h>
+#include <openssl/ssl.h>
+#include <string.h>
+
+namespace RequestServer {
+
+extern OwnPtr<ResourceSubstitutionMap> g_resource_substitution_map;
+
+static long s_connect_timeout_seconds = 90L;
+
+static CURLcode configure_ssl_context(CURL*, [[maybe_unused]] void* ssl_context, void*)
+{
+#if defined(SSL_OP_IGNORE_UNEXPECTED_EOF)
+    // Some HTTPS servers, including the Python server used by WPT, close the connection without sending the
+    // mandatory TLS close-notify alert. Other browsers treat such a post-handshake transport EOF as a clean TLS EOF
+    // for compatibility. Do the same while leaving curl responsible for detecting incomplete HTTP framing.
+    static auto const curl_uses_openssl = [] {
+        auto const* version_info = curl_version_info(CURLVERSION_NOW);
+        VERIFY(version_info);
+        return version_info->ssl_version && StringView { version_info->ssl_version, strlen(version_info->ssl_version) }.starts_with("OpenSSL/"sv);
+    }();
+
+    if (curl_uses_openssl)
+        SSL_CTX_set_options(static_cast<SSL_CTX*>(ssl_context), SSL_OP_IGNORE_UNEXPECTED_EOF);
+#endif
+    return CURLE_OK;
+}
+
+// https://everything.curl.dev/internals/content-encoding.html#supported-content-encodings
+static bool curl_supports_content_encoding(StringView encoding)
+{
+    static auto const* version_info = curl_version_info(CURLVERSION_NOW);
+    VERIFY(version_info);
+
+    if (encoding.is_one_of_ignoring_ascii_case("identity"sv, "none"sv))
+        return true;
+    if ((version_info->features & CURL_VERSION_LIBZ) && encoding.is_one_of_ignoring_ascii_case("deflate"sv, "gzip"sv, "x-gzip"sv))
+        return true;
+
+#ifdef CURL_VERSION_BROTLI
+    if ((version_info->features & CURL_VERSION_BROTLI) && encoding.equals_ignoring_ascii_case("br"sv))
+        return true;
+#endif
+#ifdef CURL_VERSION_ZSTD
+    if ((version_info->features & CURL_VERSION_ZSTD) && encoding.equals_ignoring_ascii_case("zstd"sv))
+        return true;
+#endif
+
+    return false;
+}
+
+static bool response_has_unsupported_content_encoding(HTTP::HeaderList const& headers)
+{
+    auto content_encoding = headers.get("Content-Encoding"sv);
+    if (!content_encoding.has_value())
+        return false;
+
+    for (auto encoding : content_encoding->view().split_view(',')) {
+        encoding = HTTP::normalize_header_value(encoding);
+        if (!encoding.is_empty() && !curl_supports_content_encoding(encoding))
+            return true;
+    }
+
+    return false;
+}
+
+Request::TransferredBodyFile::~TransferredBodyFile()
+{
+    if (fd != -1)
+        (void)Core::System::close(fd);
+}
+
+static void log_network_activity(URL::URL const& url, ByteString const& method, void* curl_easy_handle, int curl_result_code, bool is_revalidation, RequestType type)
+{
+    if constexpr (!REQUESTSERVER_WIRE_DEBUG)
+        return;
+    if (!curl_easy_handle)
+        return;
+
+    auto get_off = [&](auto option) {
+        curl_off_t value = 0;
+        (void)curl_easy_getinfo(curl_easy_handle, option, &value);
+        return value;
+    };
+    auto get_long = [&](auto option) {
+        long value = 0;
+        (void)curl_easy_getinfo(curl_easy_handle, option, &value);
+        return value;
+    };
+
+    long http_status = get_long(CURLINFO_RESPONSE_CODE);
+    long http_version = get_long(CURLINFO_HTTP_VERSION);
+
+    auto queue_us = get_off(CURLINFO_QUEUE_TIME_T);
+    auto namelookup_us = get_off(CURLINFO_NAMELOOKUP_TIME_T);
+    auto connect_us = get_off(CURLINFO_CONNECT_TIME_T);
+    auto appconnect_us = get_off(CURLINFO_APPCONNECT_TIME_T);
+    auto pretransfer_us = get_off(CURLINFO_PRETRANSFER_TIME_T);
+    auto starttransfer_us = get_off(CURLINFO_STARTTRANSFER_TIME_T);
+    auto total_us = get_off(CURLINFO_TOTAL_TIME_T);
+    auto bytes_downloaded = get_off(CURLINFO_SIZE_DOWNLOAD_T);
+    auto bytes_uploaded = get_off(CURLINFO_SIZE_UPLOAD_T);
+    auto download_speed_bps = get_off(CURLINFO_SPEED_DOWNLOAD_T);
+
+    // libcurl phase timings are cumulative from t=0, but skipped phases (e.g. DNS/TCP/TLS on a
+    // reused connection) are reported as 0, breaking the monotonic ordering. Clamp each marker
+    // to the previous one so skipped phases yield a 0-length delta instead of double-counting.
+    auto clamp = [](curl_off_t marker, curl_off_t previous) { return marker > previous ? marker : previous; };
+    auto m_queue = queue_us;
+    auto m_namelookup = clamp(namelookup_us, m_queue);
+    auto m_connect = clamp(connect_us, m_namelookup);
+    auto m_appconnect = clamp(appconnect_us, m_connect);
+    auto m_pretransfer = clamp(pretransfer_us, m_appconnect);
+    auto m_starttransfer = clamp(starttransfer_us, m_pretransfer);
+    auto m_total = clamp(total_us, m_starttransfer);
+
+    auto us_to_ms = [](curl_off_t us) { return static_cast<double>(us) / 1000.0; };
+    auto queue_ms = us_to_ms(m_queue);
+    auto dns_ms = us_to_ms(m_namelookup - m_queue);
+    auto tcp_ms = us_to_ms(m_connect - m_namelookup);
+    auto tls_ms = us_to_ms(m_appconnect - m_connect);
+    auto request_ms = us_to_ms(m_pretransfer - m_appconnect);
+    auto wait_ms = us_to_ms(m_starttransfer - m_pretransfer);
+    auto body_ms = us_to_ms(m_total - m_starttransfer);
+    auto total_ms = us_to_ms(m_total);
+
+    auto kib = [](curl_off_t bytes) { return static_cast<double>(bytes) / 1024.0; };
+
+    StringView http_version_str = "HTTP/?"sv;
+    switch (http_version) {
+    case CURL_HTTP_VERSION_1_0:
+        http_version_str = "HTTP/1.0"sv;
+        break;
+    case CURL_HTTP_VERSION_1_1:
+        http_version_str = "HTTP/1.1"sv;
+        break;
+    case CURL_HTTP_VERSION_2_0:
+        http_version_str = "HTTP/2"sv;
+        break;
+    case CURL_HTTP_VERSION_3:
+        http_version_str = "HTTP/3"sv;
+        break;
+    default:
+        break;
+    }
+
+    StringView kind;
+    if (curl_result_code != CURLE_OK)
+        kind = "FAIL"sv;
+    else if (is_revalidation && http_status == 304)
+        kind = "REVAL-304"sv;
+    else if (is_revalidation)
+        kind = "REVAL-FULL"sv;
+    else
+        kind = "DOWNLOAD"sv;
+
+    StringView background = type == RequestType::BackgroundRevalidation ? " [bg]"sv : ""sv;
+
+    if (curl_result_code != CURLE_OK) {
+        char const* err = curl_easy_strerror(static_cast<CURLcode>(curl_result_code));
+        dbgln_if(REQUESTSERVER_WIRE_DEBUG, "RequestServer wire: {}{} {} {} -> error: {} (after {:.1} ms, wire {:.1} KiB)",
+            kind, background, method, url, err, total_ms, kib(bytes_downloaded));
+        return;
+    }
+
+    auto wire_kibps_during_body = body_ms > 0.0
+        ? kib(bytes_downloaded) / (body_ms / 1000.0)
+        : 0.0;
+
+    dbgln_if(REQUESTSERVER_WIRE_DEBUG, "RequestServer wire: {}{} {} {} {} -> {} | wire {:.1} KiB sent {:.1} KiB | total {:.1} ms = queue {:.1} + dns {:.1} + tcp {:.1} + tls {:.1} + req {:.1} + wait {:.1} + body {:.1} | wire {:.1} KiB/s avg, {:.1} KiB/s during body",
+        kind, background, method, url, http_version_str, http_status,
+        kib(bytes_downloaded), kib(bytes_uploaded),
+        total_ms, queue_ms, dns_ms, tcp_ms, tls_ms, request_ms, wait_ms, body_ms,
+        kib(download_speed_bps), wire_kibps_during_body);
+}
+
+struct WireStats {
+    // Decoded-side (sampled in on_data_received, after curl decompresses)
+    Optional<MonotonicTime> first_chunk_at;
+    Optional<MonotonicTime> last_chunk_at;
+    u64 chunk_count { 0 };
+    u64 total_decoded_bytes { 0 };
+    u64 min_chunk_bytes { NumericLimits<u64>::max() };
+    u64 max_chunk_bytes { 0 };
+    AK::Duration sum_inter_chunk_gaps;
+    AK::Duration max_inter_chunk_gap;
+    u64 stall_count_100ms { 0 };
+    AK::Duration max_stall_started_at;
+    u64 bytes_at_max_stall { 0 };
+
+    // Wire-side (sampled in CURLOPT_XFERINFOFUNCTION, before decompression)
+    Optional<MonotonicTime> first_wire_byte_at;
+    Optional<MonotonicTime> last_wire_byte_at;
+    curl_off_t last_wire_dlnow { 0 };
+    AK::Duration max_wire_gap;
+    AK::Duration max_wire_stall_started_at;
+    curl_off_t wire_bytes_at_max_stall { 0 };
+    u64 wire_stall_count_100ms { 0 };
+
+    // Internal-pipeline lifecycle (set by state-machine handlers).
+    // Lets us see how much wall time we burned in our own code paths
+    // (cache lookup, our DNS resolver, cookie IPC, curl setup) before
+    // libcurl ever saw the request.
+    Optional<MonotonicTime> created_at;
+    Optional<MonotonicTime> dns_started_at;
+    Optional<MonotonicTime> dns_completed_at;
+    Optional<MonotonicTime> cookie_started_at;
+    Optional<MonotonicTime> cookie_completed_at;
+    Optional<MonotonicTime> curl_added_at;
+    Optional<MonotonicTime> complete_observed_at;
+
+    // WebContent-side back-pressure on our outgoing pipe. Updated by
+    // write_queued_bytes_without_blocking when the pipe returns EAGAIN
+    // (WebContent isn't draining fast enough — typically because its main
+    // thread is busy parsing, running JS, etc.). `current_window_started`
+    // is set on entry to a back-pressure window and cleared when we resume
+    // writing successfully.
+    Optional<MonotonicTime> current_pressure_window_started;
+    AK::Duration total_pipe_back_pressure;
+    u64 pipe_back_pressure_events { 0 };
+    u64 max_buffered_bytes { 0 };
+};
+
+static HashMap<Request const*, WireStats>& wire_stats()
+{
+    static HashMap<Request const*, WireStats> map;
+    return map;
+}
+
+static void record_chunk(Request const* request, size_t bytes)
+{
+    if constexpr (!REQUESTSERVER_WIRE_DEBUG)
+        return;
+    auto now = MonotonicTime::now();
+    auto& stats = wire_stats().ensure(request);
+
+    if (stats.chunk_count == 0) {
+        stats.first_chunk_at = now;
+    } else {
+        auto gap = now - *stats.last_chunk_at;
+        stats.sum_inter_chunk_gaps = stats.sum_inter_chunk_gaps + gap;
+        if (gap > stats.max_inter_chunk_gap) {
+            stats.max_inter_chunk_gap = gap;
+            stats.max_stall_started_at = *stats.last_chunk_at - *stats.first_chunk_at;
+            stats.bytes_at_max_stall = stats.total_decoded_bytes;
+        }
+        if (gap > AK::Duration::from_milliseconds(100))
+            stats.stall_count_100ms += 1;
+    }
+
+    stats.last_chunk_at = now;
+    stats.chunk_count += 1;
+    stats.total_decoded_bytes += bytes;
+    if (bytes < stats.min_chunk_bytes)
+        stats.min_chunk_bytes = bytes;
+    if (bytes > stats.max_chunk_bytes)
+        stats.max_chunk_bytes = bytes;
+}
+
+[[maybe_unused]] static int on_xferinfo(void* user_data, curl_off_t /*dltotal*/, curl_off_t dlnow, curl_off_t /*ultotal*/, curl_off_t /*ulnow*/)
+{
+    if constexpr (!REQUESTSERVER_WIRE_DEBUG)
+        return 0;
+    auto* request = static_cast<Request const*>(user_data);
+    if (dlnow <= 0)
+        return 0;
+
+    auto& stats = wire_stats().ensure(request);
+    if (dlnow == stats.last_wire_dlnow)
+        return 0;
+
+    auto now = MonotonicTime::now();
+    if (!stats.first_wire_byte_at.has_value())
+        stats.first_wire_byte_at = now;
+    if (stats.last_wire_byte_at.has_value()) {
+        auto gap = now - *stats.last_wire_byte_at;
+        if (gap > stats.max_wire_gap) {
+            stats.max_wire_gap = gap;
+            stats.max_wire_stall_started_at = *stats.last_wire_byte_at - *stats.first_wire_byte_at;
+            stats.wire_bytes_at_max_stall = stats.last_wire_dlnow;
+        }
+        if (gap > AK::Duration::from_milliseconds(100))
+            stats.wire_stall_count_100ms += 1;
+    }
+    stats.last_wire_byte_at = now;
+    stats.last_wire_dlnow = dlnow;
+    return 0;
+}
+
+static void log_chunk_stats(Request const* request)
+{
+    if constexpr (!REQUESTSERVER_WIRE_DEBUG)
+        return;
+    auto it = wire_stats().find(request);
+    if (it == wire_stats().end())
+        return;
+    auto const& s = it->value;
+    if (s.chunk_count == 0)
+        return;
+
+    auto kib = [](u64 b) { return static_cast<double>(b) / 1024.0; };
+    auto kib_off = [](curl_off_t b) { return static_cast<double>(b) / 1024.0; };
+    auto decoded_span = (s.last_chunk_at.has_value() && s.first_chunk_at.has_value())
+        ? *s.last_chunk_at - *s.first_chunk_at
+        : AK::Duration {};
+    auto decoded_span_ms = decoded_span.to_milliseconds();
+    auto avg_gap_ms = s.chunk_count > 1
+        ? static_cast<double>(s.sum_inter_chunk_gaps.to_microseconds()) / 1000.0 / static_cast<double>(s.chunk_count - 1)
+        : 0.0;
+    auto avg_chunk = s.total_decoded_bytes / s.chunk_count;
+    auto decoded_kibps = decoded_span_ms > 0
+        ? kib(s.total_decoded_bytes) / (static_cast<double>(decoded_span_ms) / 1000.0)
+        : 0.0;
+
+    dbgln_if(REQUESTSERVER_WIRE_DEBUG, "RequestServer wire+:  decoded chunks={} bytes={:.1} KiB span={} ms thru={:.1} KiB/s | gap avg={:.1} ms max={} ms stalls(>100ms)={} | worst gap began at +{} ms after {:.1} KiB decoded | chunk bytes avg={} min={} max={}",
+        s.chunk_count, kib(s.total_decoded_bytes), decoded_span_ms, decoded_kibps,
+        avg_gap_ms, s.max_inter_chunk_gap.to_milliseconds(), s.stall_count_100ms,
+        s.max_stall_started_at.to_milliseconds(), kib(s.bytes_at_max_stall),
+        avg_chunk, s.min_chunk_bytes, s.max_chunk_bytes);
+
+    if (s.first_wire_byte_at.has_value() && s.last_wire_byte_at.has_value()) {
+        auto wire_span = *s.last_wire_byte_at - *s.first_wire_byte_at;
+        auto wire_span_ms = wire_span.to_milliseconds();
+        auto wire_kibps = wire_span_ms > 0
+            ? kib_off(s.last_wire_dlnow) / (static_cast<double>(wire_span_ms) / 1000.0)
+            : 0.0;
+        auto compression_ratio = s.last_wire_dlnow > 0
+            ? static_cast<double>(s.total_decoded_bytes) / static_cast<double>(s.last_wire_dlnow)
+            : 0.0;
+        dbgln_if(REQUESTSERVER_WIRE_DEBUG, "RequestServer wire++: wire bytes={:.1} KiB span={} ms thru={:.1} KiB/s | wire max gap={} ms stalls(>100ms)={} | worst wire gap began at +{} ms after {:.1} KiB on the wire | compression={:.2}x",
+            kib_off(s.last_wire_dlnow), wire_span_ms, wire_kibps,
+            s.max_wire_gap.to_milliseconds(), s.wire_stall_count_100ms,
+            s.max_wire_stall_started_at.to_milliseconds(), kib_off(s.wire_bytes_at_max_stall),
+            compression_ratio);
+    }
+
+    // wire^: pre-network time spent inside RequestServer (cache + our DNS resolver + cookie IPC
+    // + curl setup), and the gap between the wire going quiet and us actually emitting this log
+    // entry. Useful to see if a long "total" was actually our pipeline rather than the network.
+    if (s.created_at.has_value()) {
+        auto delta_ms = [](Optional<MonotonicTime> const& a, Optional<MonotonicTime> const& b) -> i64 {
+            if (!a.has_value() || !b.has_value())
+                return -1;
+            return (*b - *a).to_milliseconds();
+        };
+
+        // Cache + Init + WaitForCache: from creation to start of DNS lookup.
+        auto pre_dns_ms = delta_ms(s.created_at, s.dns_started_at);
+        // Our DNS resolver (note: distinct from libcurl's `dns` field, which is 0 because we
+        // pre-resolve and pass via CURLOPT_RESOLVE).
+        auto our_dns_ms = delta_ms(s.dns_started_at, s.dns_completed_at);
+        // Cookie IPC round-trip to the UI process.
+        auto cookie_ms = delta_ms(s.cookie_started_at, s.cookie_completed_at);
+        // Time from the last completed pre-network step to curl_multi_add_handle.
+        auto curl_setup_ms = [&]() -> i64 {
+            Optional<MonotonicTime> last_pre_curl;
+            if (s.cookie_completed_at.has_value())
+                last_pre_curl = s.cookie_completed_at;
+            else if (s.dns_completed_at.has_value())
+                last_pre_curl = s.dns_completed_at;
+            else
+                last_pre_curl = s.created_at;
+            return delta_ms(last_pre_curl, s.curl_added_at);
+        }();
+        auto pre_curl_total_ms = delta_ms(s.created_at, s.curl_added_at);
+
+        // Drain delay: time between the last byte arriving and check_active_requests draining
+        // the completion. Non-zero would mean we noticed completion later than curl did.
+        Optional<MonotonicTime> last_activity;
+        if (s.last_wire_byte_at.has_value())
+            last_activity = s.last_wire_byte_at;
+        else if (s.last_chunk_at.has_value())
+            last_activity = s.last_chunk_at;
+        auto drain_delay_ms = delta_ms(last_activity, s.complete_observed_at);
+
+        auto fmt_ms = [](i64 ms) -> ByteString {
+            return ms < 0 ? ByteString { "-" } : ByteString::formatted("{}", ms);
+        };
+
+        ByteString back_pressure_summary;
+        if (s.pipe_back_pressure_events > 0) {
+            back_pressure_summary = ByteString::formatted(
+                " | pipe back-pressure events={} total={} ms peak-buffered={} bytes",
+                s.pipe_back_pressure_events,
+                s.total_pipe_back_pressure.to_milliseconds(),
+                s.max_buffered_bytes);
+        }
+
+        dbgln_if(REQUESTSERVER_WIRE_DEBUG, "RequestServer wire^:  internal pre-curl={} ms = cache+init {} + our-dns {} + cookie {} + curl-setup {} | drain delay {} ms{}",
+            fmt_ms(pre_curl_total_ms), fmt_ms(pre_dns_ms), fmt_ms(our_dns_ms),
+            fmt_ms(cookie_ms), fmt_ms(curl_setup_ms), fmt_ms(drain_delay_ms),
+            back_pressure_summary);
+    }
+}
+
+static void mark_lifecycle_event(Request const* request, Optional<MonotonicTime> WireStats::* field)
+{
+    if constexpr (!REQUESTSERVER_WIRE_DEBUG)
+        return;
+    wire_stats().ensure(request).*field = MonotonicTime::now();
+}
+
+NonnullOwnPtr<Request> Request::fetch(
+    u64 request_id,
+    Optional<HTTP::DiskCache&> disk_cache,
+    HTTP::CacheMode cache_mode,
+    ConnectionFromClient& client,
+    void* curl_multi,
+    Resolver& resolver,
+    URL::URL url,
+    ByteString method,
+    NonnullRefPtr<HTTP::HeaderList> request_headers,
+    ByteBuffer request_body,
+    HTTP::Cookie::IncludeCredentials include_credentials,
+    Optional<ByteString> alt_svc_cache_path,
+    Core::ProxyData proxy_data,
+    bool keep_alive_for_transfer,
+    Optional<u32> address_selection_hint)
+{
+    auto request = adopt_own(*new Request { request_id, RequestType::Fetch, disk_cache, cache_mode, client, curl_multi, resolver, move(url), move(method), move(request_headers), move(request_body), include_credentials, move(alt_svc_cache_path), proxy_data, keep_alive_for_transfer });
+    request->m_address_selection_hint = address_selection_hint;
+    request->process();
+
+    return request;
+}
+
+NonnullOwnPtr<Request> Request::connect(
+    u64 request_id,
+    ConnectionFromClient& client,
+    void* curl_multi,
+    Resolver& resolver,
+    URL::URL url,
+    CacheLevel cache_level)
+{
+    auto request = adopt_own(*new Request { request_id, client, curl_multi, resolver, move(url) });
+    request->m_connect_cache_level = cache_level;
+    request->transition_to_state(State::DNSLookup);
+    return request;
+}
+
+NonnullOwnPtr<Request> Request::revalidate(
+    u64 request_id,
+    Optional<HTTP::DiskCache&> disk_cache,
+    ConnectionFromClient& client,
+    void* curl_multi,
+    Resolver& resolver,
+    URL::URL url,
+    ByteString method,
+    NonnullRefPtr<HTTP::HeaderList> request_headers,
+    ByteBuffer request_body,
+    HTTP::Cookie::IncludeCredentials include_credentials,
+    Optional<ByteString> alt_svc_cache_path,
+    Core::ProxyData proxy_data)
+{
+    auto request = adopt_own(*new Request { request_id, RequestType::BackgroundRevalidation, disk_cache, HTTP::CacheMode::Default, client, curl_multi, resolver, move(url), move(method), move(request_headers), move(request_body), include_credentials, move(alt_svc_cache_path), proxy_data });
+    request->process();
+
+    return request;
+}
+
+Request::Request(
+    u64 request_id,
+    RequestType type,
+    Optional<HTTP::DiskCache&> disk_cache,
+    HTTP::CacheMode cache_mode,
+    ConnectionFromClient& client,
+    void* curl_multi,
+    Resolver& resolver,
+    URL::URL url,
+    ByteString method,
+    NonnullRefPtr<HTTP::HeaderList> request_headers,
+    ByteBuffer request_body,
+    HTTP::Cookie::IncludeCredentials include_credentials,
+    Optional<ByteString> alt_svc_cache_path,
+    Core::ProxyData proxy_data,
+    bool keep_alive_for_transfer)
+    : m_request_id(request_id)
+    , m_type(type)
+    , m_disk_cache(disk_cache)
+    , m_cache_mode(cache_mode)
+    , m_client(&client)
+    , m_curl_multi_handle(curl_multi)
+    , m_resolver(resolver)
+    , m_url(move(url))
+    , m_method(move(method))
+    , m_request_headers(move(request_headers))
+    , m_request_body(move(request_body))
+    , m_include_credentials(include_credentials)
+    , m_alt_svc_cache_path(move(alt_svc_cache_path))
+    , m_proxy_data(proxy_data)
+    , m_response_headers(HTTP::HeaderList::create())
+    , m_keep_alive_for_transfer(keep_alive_for_transfer)
+{
+    if constexpr (REQUESTSERVER_WIRE_DEBUG)
+        wire_stats().ensure(this).created_at = MonotonicTime::now();
+}
+
+Request::Request(
+    u64 request_id,
+    ConnectionFromClient& client,
+    void* curl_multi,
+    Resolver& resolver,
+    URL::URL url)
+    : m_request_id(request_id)
+    , m_type(RequestType::Connect)
+    , m_client(&client)
+    , m_curl_multi_handle(curl_multi)
+    , m_resolver(resolver)
+    , m_url(move(url))
+    , m_request_headers(HTTP::HeaderList::create())
+    , m_response_headers(HTTP::HeaderList::create())
+{
+    if constexpr (REQUESTSERVER_WIRE_DEBUG)
+        wire_stats().ensure(this).created_at = MonotonicTime::now();
+}
+
+Request::~Request()
+{
+    if constexpr (REQUESTSERVER_DEBUG) {
+        if (!m_response_buffer.is_eof())
+            dbgln("Warning: Request destroyed with buffered data (it's likely that the client disappeared or the request was cancelled)");
+    }
+
+    MUST(free_curl_structs());
+
+    if (m_cache_entry_writer.has_value()) {
+        if (m_state == State::Complete)
+            (void)m_cache_entry_writer->flush(m_request_headers, m_response_headers);
+        else
+            m_cache_entry_writer->remove_incomplete_entry();
+    }
+
+    if constexpr (REQUESTSERVER_WIRE_DEBUG)
+        wire_stats().remove(this);
+}
+
+void Request::notify_request_unblocked(Badge<HTTP::DiskCache>)
+{
+    // FIXME: We may want a timer to limit how long we are waiting for a request before proceeding with a network
+    //        request that skips the disk cache.
+    transition_to_state(State::Init);
+}
+
+void Request::notify_retrieved_http_cookie(Badge<ConnectionFromClient>, StringView cookie)
+{
+    mark_lifecycle_event(this, &WireStats::cookie_completed_at);
+
+    if (!cookie.is_empty()) {
+        auto header = HTTP::Header::isomorphic_encode("Cookie"sv, cookie);
+        m_request_headers->append(move(header));
+    }
+
+    transition_to_state(State::Fetch);
+}
+
+void Request::notify_fetch_complete(Badge<ConnectionFromClient>, int result_code)
 {
     mark_lifecycle_event(this, &WireStats::complete_observed_at);
 
@@ -129165,6 +129913,144 @@ describe("normal behavior", () => {
         runQueuedPromiseJobs();
         expect(rejectionReason).toBe("foo");
         expect(wasResolved).toBeFalse();
+    });
+
+    test("invokes an overridden then method", () => {
+        const promise = Promise.resolve(42);
+        const originalThen = promise.then;
+        let callCount = 0;
+        let resolvedValues = null;
+
+        promise.then = function (...args) {
+            ++callCount;
+            return originalThen.apply(this, args);
+        };
+
+        Promise.all([promise]).then(values => {
+            resolvedValues = values;
+        });
+
+        runQueuedPromiseJobs();
+        expect(callCount).toBe(1);
+        expect(resolvedValues).toEqual([42]);
+    });
+
+    test("invokes a then getter that returns the original method", () => {
+        const promise = Promise.resolve(42);
+        const originalThen = promise.then;
+        let callCount = 0;
+        let resolvedValues = null;
+
+        Object.defineProperty(promise, "then", {
+            configurable: true,
+            get() {
+                ++callCount;
+                return originalThen;
+            },
+        });
+
+        Promise.all([promise]).then(values => {
+            resolvedValues = values;
+        });
+
+        runQueuedPromiseJobs();
+        expect(callCount).toBe(1);
+        expect(resolvedValues).toEqual([42]);
+    });
+
+    test("observes the promise constructor when invoking then", () => {
+        const promise = Promise.resolve(42);
+        let constructorCallCount = 0;
+
+        Object.defineProperty(promise, "constructor", {
+            configurable: true,
+            get() {
+                ++constructorCallCount;
+                return Promise;
+            },
+        });
+
+        Promise.all([promise]);
+        expect(constructorCallCount).toBe(2);
+        runQueuedPromiseJobs();
+        expect(constructorCallCount).toBe(2);
+    });
+
+    test("resolves the result array through an inherited then getter", () => {
+        const originalThen = Object.getOwnPropertyDescriptor(Array.prototype, "then");
+        const marker = {};
+        let thenCallCount = 0;
+        let resolvedValues = null;
+
+        Object.defineProperty(Array.prototype, "then", {
+            configurable: true,
+            get() {
+                if (this.length === 1 && this[0] === marker) ++thenCallCount;
+                return undefined;
+            },
+        });
+
+        try {
+            Promise.all([Promise.resolve(marker)]).then(values => {
+                resolvedValues = values;
+            });
+
+            runQueuedPromiseJobs();
+        } finally {
+            if (originalThen) Object.defineProperty(Array.prototype, "then", originalThen);
+            else delete Array.prototype.then;
+        }
+
+        expect(thenCallCount).toBe(1);
+        expect(resolvedValues).toEqual([marker]);
+    });
+
+    test("observes Symbol.species when invoking then", () => {
+        const originalSpecies = Object.getOwnPropertyDescriptor(Promise, Symbol.species);
+        let speciesCallCount = 0;
+
+        Object.defineProperty(Promise, Symbol.species, {
+            configurable: true,
+            get() {
+                ++speciesCallCount;
+                return Promise;
+            },
+        });
+
+        try {
+            Promise.all([Promise.resolve(42)]);
+            expect(speciesCallCount).toBe(1);
+            runQueuedPromiseJobs();
+            expect(speciesCallCount).toBe(1);
+        } finally {
+            Object.defineProperty(Promise, Symbol.species, originalSpecies);
+        }
+    });
+
+    test("constructs a custom Symbol.species promise when invoking then", () => {
+        const originalSpecies = Object.getOwnPropertyDescriptor(Promise, Symbol.species);
+        let constructionCount = 0;
+
+        class SpeciesPromise extends Promise {
+            constructor(executor) {
+                super(executor);
+                ++constructionCount;
+            }
+        }
+
+        Object.defineProperty(Promise, Symbol.species, {
+            configurable: true,
+            value: SpeciesPromise,
+        });
+
+        try {
+            Promise.all([Promise.resolve(42)]);
+            expect(constructionCount).toBe(1);
+            runQueuedPromiseJobs();
+            expect(constructionCount).toBe(1);
+        } finally {
+            Object.defineProperty(Promise, Symbol.species, originalSpecies);
+        }
     });
 });
 
@@ -381210,6 +382096,7 @@ moved results use tree order: true
 old value removed from index: true
 new value added to index: true
 old value posting is removed: true
+value restored before commit stays indexed: true
 shared value remains indexed: true
 shadow-root query stays scoped: true
 
@@ -480381,370 +481268,3 @@ RECREATED: content none -> normal on flex in block flow | target
 RECREATED: content none -> normal on flex in block flow | target descendant
 PRESERVED: content none -> normal on flex in block flow | following sibling
 PRESERVED: content none -> normal on flex in block flow | following sibling descendant
-STATS: content none -> normal on flex in block flow | rebuilt subtree roots=1, escaped=false
-PASS: content none -> normal on flex in block flow | incremental tree matches full rebuild
-PRESERVED: content-visibility visible -> hidden on inline-flex in block flow list-item | fixture ancestor
-PRESERVED: content-visibility visible -> hidden on inline-flex in block flow list-item | distant sibling
-PRESERVED: content-visibility visible -> hidden on inline-flex in block flow list-item | distant sibling descendant
-RECREATED: content-visibility visible -> hidden on inline-flex in block flow list-item | DOM parent
-RECREATED: content-visibility visible -> hidden on inline-flex in block flow list-item | preceding sibling
-RECREATED: content-visibility visible -> hidden on inline-flex in block flow list-item | preceding sibling descendant
-RECREATED: content-visibility visible -> hidden on inline-flex in block flow list-item | target
-REMOVED: content-visibility visible -> hidden on inline-flex in block flow list-item | target descendant
-RECREATED: content-visibility visible -> hidden on inline-flex in block flow list-item | following sibling
-RECREATED: content-visibility visible -> hidden on inline-flex in block flow list-item | following sibling descendant
-STATS: content-visibility visible -> hidden on inline-flex in block flow list-item | rebuilt subtree roots=1, escaped=false
-PASS: content-visibility visible -> hidden on inline-flex in block flow list-item | incremental tree matches full rebuild
-PRESERVED: overflow-x hidden -> clip on inline-flex in flex | fixture ancestor
-PRESERVED: overflow-x hidden -> clip on inline-flex in flex | distant sibling
-PRESERVED: overflow-x hidden -> clip on inline-flex in flex | distant sibling descendant
-PRESERVED: overflow-x hidden -> clip on inline-flex in flex | DOM parent
-PRESERVED: overflow-x hidden -> clip on inline-flex in flex | preceding sibling
-PRESERVED: overflow-x hidden -> clip on inline-flex in flex | preceding sibling descendant
-RECREATED: overflow-x hidden -> clip on inline-flex in flex | target
-RECREATED: overflow-x hidden -> clip on inline-flex in flex | target descendant
-PRESERVED: overflow-x hidden -> clip on inline-flex in flex | following sibling
-PRESERVED: overflow-x hidden -> clip on inline-flex in flex | following sibling descendant
-STATS: overflow-x hidden -> clip on inline-flex in flex | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x hidden -> clip on inline-flex in flex | incremental tree matches full rebuild
-RECREATED: overflow-x scroll -> auto on inline-flex in table-header-group | fixture ancestor
-RECREATED: overflow-x scroll -> auto on inline-flex in table-header-group | distant sibling
-RECREATED: overflow-x scroll -> auto on inline-flex in table-header-group | distant sibling descendant
-RECREATED: overflow-x scroll -> auto on inline-flex in table-header-group | DOM parent
-RECREATED: overflow-x scroll -> auto on inline-flex in table-header-group | preceding sibling
-RECREATED: overflow-x scroll -> auto on inline-flex in table-header-group | preceding sibling descendant
-RECREATED: overflow-x scroll -> auto on inline-flex in table-header-group | target
-RECREATED: overflow-x scroll -> auto on inline-flex in table-header-group | target descendant
-RECREATED: overflow-x scroll -> auto on inline-flex in table-header-group | following sibling
-RECREATED: overflow-x scroll -> auto on inline-flex in table-header-group | following sibling descendant
-STATS: overflow-x scroll -> auto on inline-flex in table-header-group | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x scroll -> auto on inline-flex in table-header-group | incremental tree matches full rebuild
-RECREATED: overflow-y hidden -> clip on inline-flex in inline flow-root | fixture ancestor
-RECREATED: overflow-y hidden -> clip on inline-flex in inline flow-root | distant sibling
-RECREATED: overflow-y hidden -> clip on inline-flex in inline flow-root | distant sibling descendant
-RECREATED: overflow-y hidden -> clip on inline-flex in inline flow-root | DOM parent
-RECREATED: overflow-y hidden -> clip on inline-flex in inline flow-root | preceding sibling
-RECREATED: overflow-y hidden -> clip on inline-flex in inline flow-root | preceding sibling descendant
-RECREATED: overflow-y hidden -> clip on inline-flex in inline flow-root | target
-RECREATED: overflow-y hidden -> clip on inline-flex in inline flow-root | target descendant
-RECREATED: overflow-y hidden -> clip on inline-flex in inline flow-root | following sibling
-RECREATED: overflow-y hidden -> clip on inline-flex in inline flow-root | following sibling descendant
-STATS: overflow-y hidden -> clip on inline-flex in inline flow-root | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y hidden -> clip on inline-flex in inline flow-root | incremental tree matches full rebuild
-PRESERVED: overflow-y scroll -> auto on inline-flex in block | fixture ancestor
-PRESERVED: overflow-y scroll -> auto on inline-flex in block | distant sibling
-PRESERVED: overflow-y scroll -> auto on inline-flex in block | distant sibling descendant
-RECREATED: overflow-y scroll -> auto on inline-flex in block | DOM parent
-RECREATED: overflow-y scroll -> auto on inline-flex in block | preceding sibling
-RECREATED: overflow-y scroll -> auto on inline-flex in block | preceding sibling descendant
-RECREATED: overflow-y scroll -> auto on inline-flex in block | target
-RECREATED: overflow-y scroll -> auto on inline-flex in block | target descendant
-RECREATED: overflow-y scroll -> auto on inline-flex in block | following sibling
-RECREATED: overflow-y scroll -> auto on inline-flex in block | following sibling descendant
-STATS: overflow-y scroll -> auto on inline-flex in block | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y scroll -> auto on inline-flex in block | incremental tree matches full rebuild
-PRESERVED: text-transform uppercase -> capitalize on inline-flex in inline-grid | fixture ancestor
-PRESERVED: text-transform uppercase -> capitalize on inline-flex in inline-grid | distant sibling
-PRESERVED: text-transform uppercase -> capitalize on inline-flex in inline-grid | distant sibling descendant
-PRESERVED: text-transform uppercase -> capitalize on inline-flex in inline-grid | DOM parent
-PRESERVED: text-transform uppercase -> capitalize on inline-flex in inline-grid | preceding sibling
-PRESERVED: text-transform uppercase -> capitalize on inline-flex in inline-grid | preceding sibling descendant
-RECREATED: text-transform uppercase -> capitalize on inline-flex in inline-grid | target
-RECREATED: text-transform uppercase -> capitalize on inline-flex in inline-grid | target descendant
-PRESERVED: text-transform uppercase -> capitalize on inline-flex in inline-grid | following sibling
-PRESERVED: text-transform uppercase -> capitalize on inline-flex in inline-grid | following sibling descendant
-STATS: text-transform uppercase -> capitalize on inline-flex in inline-grid | rebuilt subtree roots=1, escaped=false
-PASS: text-transform uppercase -> capitalize on inline-flex in inline-grid | incremental tree matches full rebuild
-RECREATED: content none -> normal on inline-flex in table-cell | fixture ancestor
-RECREATED: content none -> normal on inline-flex in table-cell | distant sibling
-RECREATED: content none -> normal on inline-flex in table-cell | distant sibling descendant
-RECREATED: content none -> normal on inline-flex in table-cell | DOM parent
-RECREATED: content none -> normal on inline-flex in table-cell | preceding sibling
-RECREATED: content none -> normal on inline-flex in table-cell | preceding sibling descendant
-RECREATED: content none -> normal on inline-flex in table-cell | target
-RECREATED: content none -> normal on inline-flex in table-cell | target descendant
-RECREATED: content none -> normal on inline-flex in table-cell | following sibling
-RECREATED: content none -> normal on inline-flex in table-cell | following sibling descendant
-STATS: content none -> normal on inline-flex in table-cell | rebuilt subtree roots=1, escaped=false
-PASS: content none -> normal on inline-flex in table-cell | incremental tree matches full rebuild
-PRESERVED: content-visibility visible -> hidden on grid in block grid | fixture ancestor
-PRESERVED: content-visibility visible -> hidden on grid in block grid | distant sibling
-PRESERVED: content-visibility visible -> hidden on grid in block grid | distant sibling descendant
-PRESERVED: content-visibility visible -> hidden on grid in block grid | DOM parent
-PRESERVED: content-visibility visible -> hidden on grid in block grid | preceding sibling
-PRESERVED: content-visibility visible -> hidden on grid in block grid | preceding sibling descendant
-RECREATED: content-visibility visible -> hidden on grid in block grid | target
-REMOVED: content-visibility visible -> hidden on grid in block grid | target descendant
-PRESERVED: content-visibility visible -> hidden on grid in block grid | following sibling
-PRESERVED: content-visibility visible -> hidden on grid in block grid | following sibling descendant
-STATS: content-visibility visible -> hidden on grid in block grid | rebuilt subtree roots=1, escaped=false
-PASS: content-visibility visible -> hidden on grid in block grid | incremental tree matches full rebuild
-PRESERVED: overflow-x hidden -> clip on grid in inline-block | fixture ancestor
-PRESERVED: overflow-x hidden -> clip on grid in inline-block | distant sibling
-PRESERVED: overflow-x hidden -> clip on grid in inline-block | distant sibling descendant
-PRESERVED: overflow-x hidden -> clip on grid in inline-block | DOM parent
-PRESERVED: overflow-x hidden -> clip on grid in inline-block | preceding sibling
-PRESERVED: overflow-x hidden -> clip on grid in inline-block | preceding sibling descendant
-RECREATED: overflow-x hidden -> clip on grid in inline-block | target
-RECREATED: overflow-x hidden -> clip on grid in inline-block | target descendant
-PRESERVED: overflow-x hidden -> clip on grid in inline-block | following sibling
-PRESERVED: overflow-x hidden -> clip on grid in inline-block | following sibling descendant
-STATS: overflow-x hidden -> clip on grid in inline-block | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x hidden -> clip on grid in inline-block | incremental tree matches full rebuild
-PRESERVED: overflow-x scroll -> auto on grid in math | fixture ancestor
-PRESERVED: overflow-x scroll -> auto on grid in math | distant sibling
-PRESERVED: overflow-x scroll -> auto on grid in math | distant sibling descendant
-PRESERVED: overflow-x scroll -> auto on grid in math | DOM parent
-PRESERVED: overflow-x scroll -> auto on grid in math | preceding sibling
-PRESERVED: overflow-x scroll -> auto on grid in math | preceding sibling descendant
-RECREATED: overflow-x scroll -> auto on grid in math | target
-RECREATED: overflow-x scroll -> auto on grid in math | target descendant
-PRESERVED: overflow-x scroll -> auto on grid in math | following sibling
-PRESERVED: overflow-x scroll -> auto on grid in math | following sibling descendant
-STATS: overflow-x scroll -> auto on grid in math | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x scroll -> auto on grid in math | incremental tree matches full rebuild
-PRESERVED: overflow-y hidden -> clip on grid in table-caption | fixture ancestor
-PRESERVED: overflow-y hidden -> clip on grid in table-caption | distant sibling
-PRESERVED: overflow-y hidden -> clip on grid in table-caption | distant sibling descendant
-PRESERVED: overflow-y hidden -> clip on grid in table-caption | DOM parent
-PRESERVED: overflow-y hidden -> clip on grid in table-caption | preceding sibling
-PRESERVED: overflow-y hidden -> clip on grid in table-caption | preceding sibling descendant
-RECREATED: overflow-y hidden -> clip on grid in table-caption | target
-RECREATED: overflow-y hidden -> clip on grid in table-caption | target descendant
-PRESERVED: overflow-y hidden -> clip on grid in table-caption | following sibling
-PRESERVED: overflow-y hidden -> clip on grid in table-caption | following sibling descendant
-STATS: overflow-y hidden -> clip on grid in table-caption | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y hidden -> clip on grid in table-caption | incremental tree matches full rebuild
-RECREATED: overflow-y scroll -> auto on grid in inline table | fixture ancestor
-RECREATED: overflow-y scroll -> auto on grid in inline table | distant sibling
-RECREATED: overflow-y scroll -> auto on grid in inline table | distant sibling descendant
-RECREATED: overflow-y scroll -> auto on grid in inline table | DOM parent
-RECREATED: overflow-y scroll -> auto on grid in inline table | preceding sibling
-RECREATED: overflow-y scroll -> auto on grid in inline table | preceding sibling descendant
-RECREATED: overflow-y scroll -> auto on grid in inline table | target
-RECREATED: overflow-y scroll -> auto on grid in inline table | target descendant
-RECREATED: overflow-y scroll -> auto on grid in inline table | following sibling
-RECREATED: overflow-y scroll -> auto on grid in inline table | following sibling descendant
-STATS: overflow-y scroll -> auto on grid in inline table | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y scroll -> auto on grid in inline table | incremental tree matches full rebuild
-PRESERVED: text-transform uppercase -> capitalize on grid in inline list-item | fixture ancestor
-PRESERVED: text-transform uppercase -> capitalize on grid in inline list-item | distant sibling
-PRESERVED: text-transform uppercase -> capitalize on grid in inline list-item | distant sibling descendant
-PRESERVED: text-transform uppercase -> capitalize on grid in inline list-item | DOM parent
-PRESERVED: text-transform uppercase -> capitalize on grid in inline list-item | preceding sibling
-PRESERVED: text-transform uppercase -> capitalize on grid in inline list-item | preceding sibling descendant
-RECREATED: text-transform uppercase -> capitalize on grid in inline list-item | target
-RECREATED: text-transform uppercase -> capitalize on grid in inline list-item | target descendant
-PRESERVED: text-transform uppercase -> capitalize on grid in inline list-item | following sibling
-PRESERVED: text-transform uppercase -> capitalize on grid in inline list-item | following sibling descendant
-STATS: text-transform uppercase -> capitalize on grid in inline list-item | rebuilt subtree roots=1, escaped=false
-PASS: text-transform uppercase -> capitalize on grid in inline list-item | incremental tree matches full rebuild
-RECREATED: content none -> normal on grid in table-row-group | fixture ancestor
-RECREATED: content none -> normal on grid in table-row-group | distant sibling
-RECREATED: content none -> normal on grid in table-row-group | distant sibling descendant
-RECREATED: content none -> normal on grid in table-row-group | DOM parent
-RECREATED: content none -> normal on grid in table-row-group | preceding sibling
-RECREATED: content none -> normal on grid in table-row-group | preceding sibling descendant
-RECREATED: content none -> normal on grid in table-row-group | target
-RECREATED: content none -> normal on grid in table-row-group | target descendant
-RECREATED: content none -> normal on grid in table-row-group | following sibling
-RECREATED: content none -> normal on grid in table-row-group | following sibling descendant
-STATS: content none -> normal on grid in table-row-group | rebuilt subtree roots=1, escaped=false
-PASS: content none -> normal on grid in table-row-group | incremental tree matches full rebuild
-PRESERVED: content-visibility visible -> hidden on inline-grid in block flow-root | fixture ancestor
-PRESERVED: content-visibility visible -> hidden on inline-grid in block flow-root | distant sibling
-PRESERVED: content-visibility visible -> hidden on inline-grid in block flow-root | distant sibling descendant
-RECREATED: content-visibility visible -> hidden on inline-grid in block flow-root | DOM parent
-RECREATED: content-visibility visible -> hidden on inline-grid in block flow-root | preceding sibling
-RECREATED: content-visibility visible -> hidden on inline-grid in block flow-root | preceding sibling descendant
-RECREATED: content-visibility visible -> hidden on inline-grid in block flow-root | target
-REMOVED: content-visibility visible -> hidden on inline-grid in block flow-root | target descendant
-RECREATED: content-visibility visible -> hidden on inline-grid in block flow-root | following sibling
-RECREATED: content-visibility visible -> hidden on inline-grid in block flow-root | following sibling descendant
-STATS: content-visibility visible -> hidden on inline-grid in block flow-root | rebuilt subtree roots=1, escaped=false
-PASS: content-visibility visible -> hidden on inline-grid in block flow-root | incremental tree matches full rebuild
-RECREATED: overflow-x hidden -> clip on inline-grid in contents | fixture ancestor
-RECREATED: overflow-x hidden -> clip on inline-grid in contents | distant sibling
-RECREATED: overflow-x hidden -> clip on inline-grid in contents | distant sibling descendant
-ABSENT: overflow-x hidden -> clip on inline-grid in contents | DOM parent
-RECREATED: overflow-x hidden -> clip on inline-grid in contents | preceding sibling
-RECREATED: overflow-x hidden -> clip on inline-grid in contents | preceding sibling descendant
-RECREATED: overflow-x hidden -> clip on inline-grid in contents | target
-RECREATED: overflow-x hidden -> clip on inline-grid in contents | target descendant
-RECREATED: overflow-x hidden -> clip on inline-grid in contents | following sibling
-RECREATED: overflow-x hidden -> clip on inline-grid in contents | following sibling descendant
-STATS: overflow-x hidden -> clip on inline-grid in contents | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x hidden -> clip on inline-grid in contents | incremental tree matches full rebuild
-PRESERVED: overflow-x scroll -> auto on inline-grid in grid | fixture ancestor
-PRESERVED: overflow-x scroll -> auto on inline-grid in grid | distant sibling
-PRESERVED: overflow-x scroll -> auto on inline-grid in grid | distant sibling descendant
-PRESERVED: overflow-x scroll -> auto on inline-grid in grid | DOM parent
-PRESERVED: overflow-x scroll -> auto on inline-grid in grid | preceding sibling
-PRESERVED: overflow-x scroll -> auto on inline-grid in grid | preceding sibling descendant
-RECREATED: overflow-x scroll -> auto on inline-grid in grid | target
-RECREATED: overflow-x scroll -> auto on inline-grid in grid | target descendant
-PRESERVED: overflow-x scroll -> auto on inline-grid in grid | following sibling
-PRESERVED: overflow-x scroll -> auto on inline-grid in grid | following sibling descendant
-STATS: overflow-x scroll -> auto on inline-grid in grid | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x scroll -> auto on inline-grid in grid | incremental tree matches full rebuild
-RECREATED: overflow-y hidden -> clip on inline-grid in table-row | fixture ancestor
-RECREATED: overflow-y hidden -> clip on inline-grid in table-row | distant sibling
-RECREATED: overflow-y hidden -> clip on inline-grid in table-row | distant sibling descendant
-RECREATED: overflow-y hidden -> clip on inline-grid in table-row | DOM parent
-RECREATED: overflow-y hidden -> clip on inline-grid in table-row | preceding sibling
-RECREATED: overflow-y hidden -> clip on inline-grid in table-row | preceding sibling descendant
-RECREATED: overflow-y hidden -> clip on inline-grid in table-row | target
-RECREATED: overflow-y hidden -> clip on inline-grid in table-row | target descendant
-RECREATED: overflow-y hidden -> clip on inline-grid in table-row | following sibling
-RECREATED: overflow-y hidden -> clip on inline-grid in table-row | following sibling descendant
-STATS: overflow-y hidden -> clip on inline-grid in table-row | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y hidden -> clip on inline-grid in table-row | incremental tree matches full rebuild
-PRESERVED: overflow-y scroll -> auto on inline-grid in inline flex | fixture ancestor
-PRESERVED: overflow-y scroll -> auto on inline-grid in inline flex | distant sibling
-PRESERVED: overflow-y scroll -> auto on inline-grid in inline flex | distant sibling descendant
-PRESERVED: overflow-y scroll -> auto on inline-grid in inline flex | DOM parent
-PRESERVED: overflow-y scroll -> auto on inline-grid in inline flex | preceding sibling
-PRESERVED: overflow-y scroll -> auto on inline-grid in inline flex | preceding sibling descendant
-RECREATED: overflow-y scroll -> auto on inline-grid in inline flex | target
-RECREATED: overflow-y scroll -> auto on inline-grid in inline flex | target descendant
-PRESERVED: overflow-y scroll -> auto on inline-grid in inline flex | following sibling
-PRESERVED: overflow-y scroll -> auto on inline-grid in inline flex | following sibling descendant
-STATS: overflow-y scroll -> auto on inline-grid in inline flex | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y scroll -> auto on inline-grid in inline flex | incremental tree matches full rebuild
-PRESERVED: text-transform uppercase -> capitalize on inline-grid in flow-root | fixture ancestor
-PRESERVED: text-transform uppercase -> capitalize on inline-grid in flow-root | distant sibling
-PRESERVED: text-transform uppercase -> capitalize on inline-grid in flow-root | distant sibling descendant
-RECREATED: text-transform uppercase -> capitalize on inline-grid in flow-root | DOM parent
-RECREATED: text-transform uppercase -> capitalize on inline-grid in flow-root | preceding sibling
-RECREATED: text-transform uppercase -> capitalize on inline-grid in flow-root | preceding sibling descendant
-RECREATED: text-transform uppercase -> capitalize on inline-grid in flow-root | target
-RECREATED: text-transform uppercase -> capitalize on inline-grid in flow-root | target descendant
-RECREATED: text-transform uppercase -> capitalize on inline-grid in flow-root | following sibling
-RECREATED: text-transform uppercase -> capitalize on inline-grid in flow-root | following sibling descendant
-STATS: text-transform uppercase -> capitalize on inline-grid in flow-root | rebuilt subtree roots=1, escaped=false
-PASS: text-transform uppercase -> capitalize on inline-grid in flow-root | incremental tree matches full rebuild
-RECREATED: content none -> normal on inline-grid in inline-table | fixture ancestor
-RECREATED: content none -> normal on inline-grid in inline-table | distant sibling
-RECREATED: content none -> normal on inline-grid in inline-table | distant sibling descendant
-RECREATED: content none -> normal on inline-grid in inline-table | DOM parent
-RECREATED: content none -> normal on inline-grid in inline-table | preceding sibling
-RECREATED: content none -> normal on inline-grid in inline-table | preceding sibling descendant
-RECREATED: content none -> normal on inline-grid in inline-table | target
-RECREATED: content none -> normal on inline-grid in inline-table | target descendant
-RECREATED: content none -> normal on inline-grid in inline-table | following sibling
-RECREATED: content none -> normal on inline-grid in inline-table | following sibling descendant
-STATS: content none -> normal on inline-grid in inline-table | rebuilt subtree roots=1, escaped=false
-PASS: content none -> normal on inline-grid in inline-table | incremental tree matches full rebuild
-PRESERVED: content-visibility visible -> hidden on table in table-column | fixture ancestor
-PRESERVED: content-visibility visible -> hidden on table in table-column | distant sibling
-PRESERVED: content-visibility visible -> hidden on table in table-column | distant sibling descendant
-PRESERVED: content-visibility visible -> hidden on table in table-column | DOM parent
-ABSENT: content-visibility visible -> hidden on table in table-column | preceding sibling
-ABSENT: content-visibility visible -> hidden on table in table-column | preceding sibling descendant
-ABSENT: content-visibility visible -> hidden on table in table-column | target
-ABSENT: content-visibility visible -> hidden on table in table-column | target descendant
-ABSENT: content-visibility visible -> hidden on table in table-column | following sibling
-ABSENT: content-visibility visible -> hidden on table in table-column | following sibling descendant
-STATS: content-visibility visible -> hidden on table in table-column | rebuilt subtree roots=0, escaped=true
-PASS: content-visibility visible -> hidden on table in table-column | incremental tree matches full rebuild
-RECREATED: overflow-x hidden -> clip on table in block table | fixture ancestor
-RECREATED: overflow-x hidden -> clip on table in block table | distant sibling
-RECREATED: overflow-x hidden -> clip on table in block table | distant sibling descendant
-RECREATED: overflow-x hidden -> clip on table in block table | DOM parent
-RECREATED: overflow-x hidden -> clip on table in block table | preceding sibling
-RECREATED: overflow-x hidden -> clip on table in block table | preceding sibling descendant
-RECREATED: overflow-x hidden -> clip on table in block table | target
-RECREATED: overflow-x hidden -> clip on table in block table | target descendant
-RECREATED: overflow-x hidden -> clip on table in block table | following sibling
-RECREATED: overflow-x hidden -> clip on table in block table | following sibling descendant
-STATS: overflow-x hidden -> clip on table in block table | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x hidden -> clip on table in block table | incremental tree matches full rebuild
-PRESERVED: overflow-x scroll -> auto on table in list-item | fixture ancestor
-PRESERVED: overflow-x scroll -> auto on table in list-item | distant sibling
-PRESERVED: overflow-x scroll -> auto on table in list-item | distant sibling descendant
-RECREATED: overflow-x scroll -> auto on table in list-item | DOM parent
-RECREATED: overflow-x scroll -> auto on table in list-item | preceding sibling
-RECREATED: overflow-x scroll -> auto on table in list-item | preceding sibling descendant
-RECREATED: overflow-x scroll -> auto on table in list-item | target
-RECREATED: overflow-x scroll -> auto on table in list-item | target descendant
-RECREATED: overflow-x scroll -> auto on table in list-item | following sibling
-RECREATED: overflow-x scroll -> auto on table in list-item | following sibling descendant
-STATS: overflow-x scroll -> auto on table in list-item | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x scroll -> auto on table in list-item | incremental tree matches full rebuild
-RECREATED: overflow-y hidden -> clip on table in -webkit-inline-box | fixture ancestor
-RECREATED: overflow-y hidden -> clip on table in -webkit-inline-box | distant sibling
-RECREATED: overflow-y hidden -> clip on table in -webkit-inline-box | distant sibling descendant
-RECREATED: overflow-y hidden -> clip on table in -webkit-inline-box | DOM parent
-RECREATED: overflow-y hidden -> clip on table in -webkit-inline-box | preceding sibling
-RECREATED: overflow-y hidden -> clip on table in -webkit-inline-box | preceding sibling descendant
-RECREATED: overflow-y hidden -> clip on table in -webkit-inline-box | target
-RECREATED: overflow-y hidden -> clip on table in -webkit-inline-box | target descendant
-RECREATED: overflow-y hidden -> clip on table in -webkit-inline-box | following sibling
-RECREATED: overflow-y hidden -> clip on table in -webkit-inline-box | following sibling descendant
-STATS: overflow-y hidden -> clip on table in -webkit-inline-box | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y hidden -> clip on table in -webkit-inline-box | incremental tree matches full rebuild
-RECREATED: overflow-y scroll -> auto on table in inline flow | fixture ancestor
-RECREATED: overflow-y scroll -> auto on table in inline flow | distant sibling
-RECREATED: overflow-y scroll -> auto on table in inline flow | distant sibling descendant
-RECREATED: overflow-y scroll -> auto on table in inline flow | DOM parent
-RECREATED: overflow-y scroll -> auto on table in inline flow | preceding sibling
-RECREATED: overflow-y scroll -> auto on table in inline flow | preceding sibling descendant
-RECREATED: overflow-y scroll -> auto on table in inline flow | target
-RECREATED: overflow-y scroll -> auto on table in inline flow | target descendant
-RECREATED: overflow-y scroll -> auto on table in inline flow | following sibling
-RECREATED: overflow-y scroll -> auto on table in inline flow | following sibling descendant
-STATS: overflow-y scroll -> auto on table in inline flow | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y scroll -> auto on table in inline flow | incremental tree matches full rebuild
-RECREATED: text-transform uppercase -> capitalize on table in inline flow list-item | fixture ancestor
-RECREATED: text-transform uppercase -> capitalize on table in inline flow list-item | distant sibling
-RECREATED: text-transform uppercase -> capitalize on table in inline flow list-item | distant sibling descendant
-RECREATED: text-transform uppercase -> capitalize on table in inline flow list-item | DOM parent
-RECREATED: text-transform uppercase -> capitalize on table in inline flow list-item | preceding sibling
-RECREATED: text-transform uppercase -> capitalize on table in inline flow list-item | preceding sibling descendant
-RECREATED: text-transform uppercase -> capitalize on table in inline flow list-item | target
-RECREATED: text-transform uppercase -> capitalize on table in inline flow list-item | target descendant
-RECREATED: text-transform uppercase -> capitalize on table in inline flow list-item | following sibling
-RECREATED: text-transform uppercase -> capitalize on table in inline flow list-item | following sibling descendant
-STATS: text-transform uppercase -> capitalize on table in inline flow list-item | rebuilt subtree roots=1, escaped=false
-PASS: text-transform uppercase -> capitalize on table in inline flow list-item | incremental tree matches full rebuild
-RECREATED: content none -> normal on table in inline-flex | fixture ancestor
-RECREATED: content none -> normal on table in inline-flex | distant sibling
-RECREATED: content none -> normal on table in inline-flex | distant sibling descendant
-RECREATED: content none -> normal on table in inline-flex | DOM parent
-RECREATED: content none -> normal on table in inline-flex | preceding sibling
-RECREATED: content none -> normal on table in inline-flex | preceding sibling descendant
-RECREATED: content none -> normal on table in inline-flex | target
-RECREATED: content none -> normal on table in inline-flex | target descendant
-RECREATED: content none -> normal on table in inline-flex | following sibling
-RECREATED: content none -> normal on table in inline-flex | following sibling descendant
-STATS: content none -> normal on table in inline-flex | rebuilt subtree roots=1, escaped=false
-PASS: content none -> normal on table in inline-flex | incremental tree matches full rebuild
-RECREATED: content-visibility visible -> hidden on inline-table in table-footer-group | fixture ancestor
-RECREATED: content-visibility visible -> hidden on inline-table in table-footer-group | distant sibling
-RECREATED: content-visibility visible -> hidden on inline-table in table-footer-group | distant sibling descendant
-RECREATED: content-visibility visible -> hidden on inline-table in table-footer-group | DOM parent
-RECREATED: content-visibility visible -> hidden on inline-table in table-footer-group | preceding sibling
-RECREATED: content-visibility visible -> hidden on inline-table in table-footer-group | preceding sibling descendant
-RECREATED: content-visibility visible -> hidden on inline-table in table-footer-group | target
-REMOVED: content-visibility visible -> hidden on inline-table in table-footer-group | target descendant
-RECREATED: content-visibility visible -> hidden on inline-table in table-footer-group | following sibling
-RECREATED: content-visibility visible -> hidden on inline-table in table-footer-group | following sibling descendant
-STATS: content-visibility visible -> hidden on inline-table in table-footer-group | rebuilt subtree roots=1, escaped=false
-PASS: content-visibility visible -> hidden on inline-table in table-footer-group | incremental tree matches full rebuild
-PRESERVED: overflow-x hidden -> clip on inline-table in block flex | fixture ancestor
-PRESERVED: overflow-x hidden -> clip on inline-table in block flex | distant sibling
-PRESERVED: overflow-x hidden -> clip on inline-table in block flex | distant sibling descendant
-RECREATED: overflow-x hidden -> clip on inline-table in block flex | DOM parent
-RECREATED: overflow-x hidden -> clip on inline-table in block flex | preceding sibling
-RECREATED: overflow-x hidden -> clip on inline-table in block flex | preceding sibling descendant
-RECREATED: overflow-x hidden -> clip on inline-table in block flex | target
-RECREATED: overflow-x hidden -> clip on inline-table in block flex | target descendant
-RECREATED: overflow-x hidden -> clip on inline-table in block flex | following sibling
-RECREATED: overflow-x hidden -> clip on inline-table in block flex | following sibling descendant
-STATS: overflow-x hidden -> clip on inline-table in block flex | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x hidden -> clip on inline-table in block flex | incremental tree matches full rebuild
-RECREATED: overflow-x scroll -> auto on inline-table in inline | fixture ancestor
-RECREATED: overflow-x scroll -> auto on inline-table in inline | distant sibling
-RECREATED: overflow-x scroll -> auto on inline-table in inline | distant sibling descendant
-RECREATED: overflow-x scroll -> auto on inline-table in inline | DOM parent
-RECREATED: overflow-x scroll -> auto on inline-table in inline | preceding sibling
