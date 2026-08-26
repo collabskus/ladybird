@@ -25,7 +25,6 @@
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleInvalidation.h>
 #include <LibWeb/CSS/StyleValues/DisplayStyleValue.h>
-#include <LibWeb/CSS/StyleValues/ImageSetStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
@@ -335,33 +334,14 @@ public:
 
     virtual GC::Ptr<HTML::DecodedImageData> decoded_image_data() const override
     {
-        if (auto document = m_document.ptr()) {
-            if (auto const* image = selected_image_style_value())
-                return image->image_data(*document);
-        }
-        return nullptr;
+        if (!m_image_client)
+            return nullptr;
+        return m_image_client->decoded_image_data();
     }
 
-    virtual Optional<CSSPixels> intrinsic_width() const override
-    {
-        if (auto document = m_document.ptr())
-            return m_image->natural_width(*document);
-        return {};
-    }
-
-    virtual Optional<CSSPixels> intrinsic_height() const override
-    {
-        if (auto document = m_document.ptr())
-            return m_image->natural_height(*document);
-        return {};
-    }
-
-    virtual Optional<CSSPixelFraction> intrinsic_aspect_ratio() const override
-    {
-        if (auto document = m_document.ptr())
-            return m_image->natural_aspect_ratio(*document);
-        return {};
-    }
+    virtual Optional<CSSPixels> intrinsic_width() const override { return natural_size().width; }
+    virtual Optional<CSSPixels> intrinsic_height() const override { return natural_size().height; }
+    virtual Optional<CSSPixelFraction> intrinsic_aspect_ratio() const override { return natural_size().aspect_ratio; }
 
 private:
     class ImageClient final : public CSS::ImageStyleValue::Client {
@@ -389,27 +369,20 @@ private:
     };
 
     GeneratedContentImageProvider(DOM::Document& document, NonnullRefPtr<CSS::AbstractImageStyleValue> image)
-        : m_document(document)
-        , m_image(move(image))
+        : m_image(move(image))
     {
-        if (auto const* image = selected_image_style_value())
+        if (auto const* image = m_image->selected_image_style_value())
             m_image_client = make<ImageClient>(*this, document, *image);
     }
 
-    CSS::ImageStyleValue const* selected_image_style_value() const
+    CSS::SizeWithAspectRatio natural_size() const
     {
-        if (m_image->is_image())
-            return &m_image->as_image();
-
-        if (m_image->is_image_set()) {
-            if (auto const* selected_image = m_image->as_image_set().selected_image(); selected_image && selected_image->is_image())
-                return &selected_image->as_image();
-        }
-
-        return nullptr;
+        auto decoded_image_data = this->decoded_image_data();
+        if (!decoded_image_data)
+            return {};
+        return m_image->natural_size(*decoded_image_data);
     }
 
-    GC::Weak<DOM::Document> m_document;
     mutable WeakPtr<Layout::Node> m_layout_node;
     NonnullRefPtr<CSS::AbstractImageStyleValue> m_image;
     mutable OwnPtr<ImageClient> m_image_client;
