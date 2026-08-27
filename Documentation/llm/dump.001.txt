@@ -416283,9 +416283,10 @@ ErrorOr<NonnullOwnPtr<ReadStream>> ReadStream::create(int reader_fd)
 #endif
 }
 
-Request::Request(RequestClient& client, u64 request_id)
+Request::Request(RequestClient& client, u64 request_id, Optional<RequestTransferLeaseKey> transfer_lease)
     : m_client(client)
     , m_request_id(request_id)
+    , m_transfer_lease(move(transfer_lease))
 {
 }
 
@@ -416307,6 +416308,8 @@ bool Request::stop()
     // The client may already be gone if the RequestServer connection was lost while this request was in flight.
     auto client = m_client.strong_ref();
     auto had_active_request = client && client->stop_request({}, *this);
+    if (!had_active_request)
+        release_transfer_lease();
     auto on_stop = move(m_on_stop);
 
     defer_teardown();
@@ -416340,10 +416343,13 @@ void Request::resume_body_delivery_up_to(size_t byte_count)
     set_body_delivery_paused(false);
 }
 
-void Request::release_for_transfer()
+void Request::release_transfer_lease()
 {
+    if (!m_transfer_lease.has_value())
+        return;
+
     if (auto client = m_client.strong_ref())
-        client->release_request_for_transfer({}, *this);
+        client->release_request_transfer_lease({}, m_transfer_lease.release_value());
 }
 
 bool Request::has_file_backed_response_body() const
@@ -416507,6 +416513,7 @@ void Request::did_request_certificates(Badge<RequestClient>)
 
 void Request::did_transfer(Badge<RequestClient>)
 {
+    m_transfer_lease.clear();
     auto on_stop = move(m_on_stop);
 
     defer_teardown();
@@ -416644,6 +416651,7 @@ FILE: Libraries/LibRequests/Request.h
 #include <LibRequests/CameFromCache.h>
 #include <LibRequests/NetworkError.h>
 #include <LibRequests/RequestTimingInfo.h>
+#include <LibRequests/RequestTransferLease.h>
 
 namespace Requests {
 
@@ -416706,9 +416714,9 @@ public:
         ByteString key;
     };
 
-    static NonnullRefPtr<Request> create_from_id(Badge<RequestClient>, RequestClient& client, u64 request_id)
+    static NonnullRefPtr<Request> create_from_id(Badge<RequestClient>, RequestClient& client, u64 request_id, Optional<RequestTransferLeaseKey> transfer_lease = {})
     {
-        return adopt_ref(*new Request(client, request_id));
+        return adopt_ref(*new Request(client, request_id, move(transfer_lease)));
     }
 
     ~Request();
@@ -416720,7 +416728,7 @@ public:
     void set_body_delivery_paused(bool);
     void resume_body_delivery();
     void resume_body_delivery_up_to(size_t);
-    void release_for_transfer();
+    void release_transfer_lease();
     [[nodiscard]] bool has_file_backed_response_body() const;
 
     using BufferedRequestFinished = Function<void(u64 total_size, RequestTimingInfo const& timing_info, Optional<NetworkError> const& network_error, NonnullRefPtr<HTTP::HeaderList> response_headers, Optional<u32> response_code, Optional<String> reason_phrase, Optional<Core::ImmutableBytes> javascript_bytecode, Optional<u64> javascript_bytecode_cache_vary_key, CameFromCache came_from_cache, Core::ImmutableBytes payload)>;
@@ -416753,7 +416761,7 @@ public:
     void set_request_cached_body_file(Badge<RequestClient>, int fd, u64 offset, u64 size);
 
 private:
-    Request(RequestClient&, u64 request_id);
+    Request(RequestClient&, u64 request_id, Optional<RequestTransferLeaseKey>);
 
     void attach_read_stream();
     void set_up_internal_stream_data(DataReceived on_data_available);
@@ -416761,6 +416769,7 @@ private:
 
     WeakPtr<RequestClient> m_client;
     u64 m_request_id { 0 };
+    Optional<RequestTransferLeaseKey> m_transfer_lease;
     RefPtr<Core::Notifier> m_write_notifier;
     int m_fd { -1 };
     bool m_fd_is_owned_by_read_stream { false };
@@ -416899,23 +416908,29 @@ void RequestClient::die()
     }
 }
 
-RefPtr<Request> RequestClient::start_request(ByteString const& method, URL::URL const& url, Optional<HTTP::HeaderList const&> request_headers, ReadonlyBytes request_body, HTTP::CacheMode cache_mode, HTTP::Cookie::IncludeCredentials include_credentials, Core::ProxyData const& proxy_data, KeepAliveForTransfer keep_alive_for_transfer, Optional<u32> address_selection_hint)
+RefPtr<Request> RequestClient::start_request(ByteString const& method, URL::URL const& url, Optional<HTTP::HeaderList const&> request_headers, ReadonlyBytes request_body, HTTP::CacheMode cache_mode, HTTP::Cookie::IncludeCredentials include_credentials, Core::ProxyData const& proxy_data, TransferLease transfer_lease, Optional<u32> address_selection_hint)
 {
     auto request_id = m_next_request_id++;
     auto headers = request_headers.map([](auto const& headers) { return headers.headers().span(); }).value_or({});
 
-    IPCProxy::async_start_request(request_id, method, url, headers, request_body, cache_mode, include_credentials, proxy_data, keep_alive_for_transfer == KeepAliveForTransfer::Yes, address_selection_hint);
-    auto request = Request::create_from_id({}, *this, request_id);
+    auto transfer_lease_key = transfer_lease == TransferLease::Yes
+        ? Optional<RequestTransferLeaseKey> { { m_request_server_client_id, request_id } }
+        : Optional<RequestTransferLeaseKey> {};
+    IPCProxy::async_start_request(request_id, method, url, headers, request_body, cache_mode, include_credentials, proxy_data, transfer_lease_key.has_value(), address_selection_hint);
+    auto request = Request::create_from_id({}, *this, request_id, move(transfer_lease_key));
     m_requests.set(request_id, request);
     return request;
 }
 
-RefPtr<Request> RequestClient::adopt_request(int source_client_id, u64 source_request_id)
+RefPtr<Request> RequestClient::adopt_request(int source_client_id, u64 source_request_id, TransferLease transfer_lease)
 {
     auto request_id = m_next_request_id++;
 
-    IPCProxy::async_adopt_request(source_client_id, source_request_id, request_id);
-    auto request = Request::create_from_id({}, *this, request_id);
+    auto transfer_lease_key = transfer_lease == TransferLease::Yes
+        ? Optional<RequestTransferLeaseKey> { { source_client_id, source_request_id } }
+        : Optional<RequestTransferLeaseKey> {};
+    IPCProxy::async_adopt_request(source_client_id, source_request_id, request_id, transfer_lease_key.has_value());
+    auto request = Request::create_from_id({}, *this, request_id, move(transfer_lease_key));
     m_requests.set(request_id, request);
     return request;
 }
@@ -416952,9 +416967,14 @@ bool RequestClient::stop_request(Badge<Request>, Request& request)
     return true;
 }
 
-void RequestClient::release_request_for_transfer(Badge<Request>, Request& request)
+void RequestClient::release_request_transfer_lease(Badge<Request>, RequestTransferLeaseKey transfer_lease)
 {
-    async_release_request_for_transfer(request.id());
+    release_request_transfer_lease(transfer_lease);
+}
+
+void RequestClient::release_request_transfer_lease(RequestTransferLeaseKey transfer_lease)
+{
+    async_release_request_transfer_lease(transfer_lease.source_client_id, transfer_lease.source_request_id);
 }
 
 void RequestClient::ensure_connection(URL::URL const& url, RequestServer::CacheLevel cache_level)
@@ -417164,6 +417184,7 @@ FILE: Libraries/LibRequests/RequestClient.h
 #include <LibRequests/CacheSizes.h>
 #include <LibRequests/CameFromCache.h>
 #include <LibRequests/RequestTimingInfo.h>
+#include <LibRequests/RequestTransferLease.h>
 #include <LibRequests/WebSocket.h>
 #include <LibWebSocket/WebSocket.h>
 #include <RequestServer/IsPrivate.h>
@@ -417182,7 +417203,7 @@ class RequestClient final
 public:
     using InitTransport = Messages::RequestServer::InitTransport;
 
-    enum class KeepAliveForTransfer : u8 {
+    enum class TransferLease : u8 {
         No,
         Yes,
     };
@@ -417191,10 +417212,11 @@ public:
     virtual ~RequestClient() override;
 
     // Best-effort index into the resolved address pool.
-    RefPtr<Request> start_request(ByteString const& method, URL::URL const&, Optional<HTTP::HeaderList const&> request_headers = {}, ReadonlyBytes request_body = {}, HTTP::CacheMode = HTTP::CacheMode::Default, HTTP::Cookie::IncludeCredentials = HTTP::Cookie::IncludeCredentials::Yes, Core::ProxyData const& = {}, KeepAliveForTransfer = KeepAliveForTransfer::No, Optional<u32> address_selection_hint = {});
-    RefPtr<Request> adopt_request(int source_client_id, u64 source_request_id);
+    RefPtr<Request> start_request(ByteString const& method, URL::URL const&, Optional<HTTP::HeaderList const&> request_headers = {}, ReadonlyBytes request_body = {}, HTTP::CacheMode = HTTP::CacheMode::Default, HTTP::Cookie::IncludeCredentials = HTTP::Cookie::IncludeCredentials::Yes, Core::ProxyData const& = {}, TransferLease = TransferLease::No, Optional<u32> address_selection_hint = {});
+    RefPtr<Request> adopt_request(int source_client_id, u64 source_request_id, TransferLease = TransferLease::No);
     bool stop_request(Badge<Request>, Request&);
-    void release_request_for_transfer(Badge<Request>, Request&);
+    void release_request_transfer_lease(Badge<Request>, RequestTransferLeaseKey);
+    void release_request_transfer_lease(RequestTransferLeaseKey);
     void ensure_connection(URL::URL const&, RequestServer::CacheLevel);
     int request_server_client_id() const { return m_request_server_client_id; }
 
@@ -417349,6 +417371,42 @@ ErrorOr<void> encode(Encoder&, Requests::RequestTimingInfo const&);
 
 template<>
 ErrorOr<Requests::RequestTimingInfo> decode(Decoder&);
+
+}
+
+FILE: Libraries/LibRequests/RequestTransferLease.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/HashFunctions.h>
+#include <AK/Traits.h>
+#include <AK/Types.h>
+
+namespace Requests {
+
+struct RequestTransferLeaseKey {
+    int source_client_id { -1 };
+    u64 source_request_id { 0 };
+
+    bool operator==(RequestTransferLeaseKey const&) const = default;
+};
+
+}
+
+namespace AK {
+
+template<>
+struct Traits<Requests::RequestTransferLeaseKey> : public DefaultTraits<Requests::RequestTransferLeaseKey> {
+    static unsigned hash(Requests::RequestTransferLeaseKey const& key)
+    {
+        return pair_int_hash(Traits<int>::hash(key.source_client_id), Traits<u64>::hash(key.source_request_id));
+    }
+};
 
 }
 
@@ -502624,9 +502682,11 @@ set(SOURCES
     HTML/NavigationCurrentEntryChangeEvent.cpp
     HTML/NavigationDestination.cpp
     HTML/NavigationHistoryEntry.cpp
+    HTML/NavigationPopulationRequest.cpp
     HTML/NavigationSourceSnapshot.cpp
     HTML/NavigationObserver.cpp
     HTML/NavigationParams.cpp
+    HTML/NavigationParamsDescriptor.cpp
     HTML/NavigationTransition.cpp
     HTML/Navigator.cpp
     HTML/NavigatorBeacon.cpp
@@ -600417,6 +600477,9 @@ FILE: Libraries/LibWeb/CSS/StyleValues/AbstractImageStyleValue.cpp
 
 #include "AbstractImageStyleValue.h"
 #include <LibWeb/CSS/CSSImageValue.h>
+#include <LibWeb/CSS/StyleValues/ImageSetStyleValue.h>
+#include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
+#include <LibWeb/HTML/DecodedImageData.h>
 #include <LibWeb/Layout/Node.h>
 
 namespace Web::CSS {
@@ -600478,6 +600541,26 @@ void AbstractImageStyleValue::load_any_resources(Layout::NodeWithStyle const& la
     load_any_resources(const_cast<DOM::Document&>(layout_node.document()));
 }
 
+ImageStyleValue const* AbstractImageStyleValue::selected_image_style_value() const
+{
+    if (is_image())
+        return &as_image();
+    if (is_image_set()) {
+        if (auto const* selected_image = as_image_set().selected_image(); selected_image && selected_image->is_image())
+            return &selected_image->as_image();
+    }
+    return nullptr;
+}
+
+SizeWithAspectRatio AbstractImageStyleValue::natural_size(HTML::DecodedImageData const& decoded_image_data) const
+{
+    return {
+        .width = decoded_image_data.intrinsic_width(),
+        .height = decoded_image_data.intrinsic_height(),
+        .aspect_ratio = decoded_image_data.intrinsic_aspect_ratio(),
+    };
+}
+
 Optional<Painting::ImagePaint> AbstractImageStyleValue::image_paint(Painting::ImagePaintRequest const&, ResolvedImage const& resolved) const
 {
     return resolved.visit(
@@ -600519,6 +600602,7 @@ FILE: Libraries/LibWeb/CSS/StyleValues/AbstractImageStyleValue.h
 
 #include <AK/Variant.h>
 #include <LibWeb/CSS/PercentageOr.h>
+#include <LibWeb/CSS/Sizing.h>
 #include <LibWeb/CSS/StyleValues/ColorStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StyleValue.h>
 #include <LibWeb/Export.h>
@@ -600536,26 +600620,15 @@ class WEB_API AbstractImageStyleValue : public StyleValue {
 public:
     using StyleValue::StyleValue;
 
-    virtual Optional<CSSPixels> natural_width(DOM::Document const&) const { return {}; }
-    virtual Optional<CSSPixels> natural_height(DOM::Document const&) const { return {}; }
-
-    virtual Optional<CSSPixelFraction> natural_aspect_ratio(DOM::Document const& document) const
-    {
-        auto width = natural_width(document);
-        auto height = natural_height(document);
-        if (width.has_value() && height.has_value() && *height != 0)
-            return *width / *height;
-        return {};
-    }
-
     virtual void load_any_resources(DOM::Document&) { }
     virtual void load_any_resources(Layout::NodeWithStyle const&);
     virtual ResolvedImage resolve_for_size(Layout::NodeWithStyle const&, CSSPixelSize) const { return Empty {}; }
 
-    virtual bool is_paintable(DOM::Document const&) const = 0;
+    virtual bool is_paintable(GC::Ptr<HTML::DecodedImageData>) const = 0;
+    virtual SizeWithAspectRatio natural_size(HTML::DecodedImageData const&) const;
     virtual Optional<Painting::ImagePaint> image_paint(Painting::ImagePaintRequest const&, ResolvedImage const&) const;
 
-    virtual Optional<Gfx::Color> color_if_single_pixel_bitmap(DOM::Document const&) const { return {}; }
+    ImageStyleValue const* selected_image_style_value() const;
 
     GC::Ref<CSSStyleValue> reify(Utf16FlyString const& associated_property) const;
 };
@@ -604410,7 +604483,7 @@ public:
         return color_stops_from_rust_data(list.pointer, list.length);
     }
 
-    bool is_paintable(DOM::Document const&) const override { return true; }
+    bool is_paintable(GC::Ptr<HTML::DecodedImageData>) const override { return true; }
 
     ResolvedImage resolve_for_size(Layout::NodeWithStyle const&, CSSPixelSize) const override;
 
@@ -605251,6 +605324,7 @@ FILE: Libraries/LibWeb/CSS/StyleValues/CursorStyleValue.cpp
 #include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
 #include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/HTML/DecodedImageData.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/DisplayListPlayerSkia.h>
@@ -605292,11 +605366,11 @@ ValueComparingNonnullRefPtr<StyleValue const> CursorStyleValue::absolutized(Comp
     return CursorStyleValue::create(image().absolutized(computation_context)->as_abstract_image(), absolutized_x, absolutized_y);
 }
 
-Optional<Gfx::ImageCursor> CursorStyleValue::make_image_cursor(Layout::NodeWithStyle const& layout_node) const
+Optional<Gfx::ImageCursor> CursorStyleValue::make_image_cursor(Layout::NodeWithStyle const& layout_node, GC::Ptr<HTML::DecodedImageData> decoded_image_data) const
 {
     auto const& image = this->image();
     auto const& document = layout_node.document();
-    if (!image.is_paintable(document))
+    if (!image.is_paintable(decoded_image_data))
         return {};
 
     auto current_color = layout_node.color();
@@ -605317,7 +605391,8 @@ Optional<Gfx::ImageCursor> CursorStyleValue::make_image_cursor(Layout::NodeWithS
         // 32x32 is selected arbitrarily.
         // FIXME: Ask the OS for the default size?
         CSSPixelSize const default_cursor_size { 32, 32 };
-        auto cursor_css_size = run_default_sizing_algorithm({}, {}, { image.natural_width(document), image.natural_height(document), image.natural_aspect_ratio(document) }, default_cursor_size);
+        auto natural_size = decoded_image_data ? image.natural_size(*decoded_image_data) : SizeWithAspectRatio {};
+        auto cursor_css_size = run_default_sizing_algorithm({}, {}, natural_size, default_cursor_size);
         // FIXME: How do we determine what cursor sizes the OS allows?
         // We don't multiply by the pixel ratio, because we want to use the image's actual pixel size.
         DevicePixelSize cursor_device_size { cursor_css_size.to_type<double>().to_rounded<int>() };
@@ -605355,7 +605430,8 @@ Optional<Gfx::ImageCursor> CursorStyleValue::make_image_cursor(Layout::NodeWithS
             .accumulated_scale = { 1, 1 },
             .resource_storage = resource_storage,
         };
-        if (auto image_paint = image.image_paint(request, resolved_image); image_paint.has_value()) {
+        auto image_paint = decoded_image_data ? decoded_image_data->image_paint(request) : image.image_paint(request, resolved_image);
+        if (image_paint.has_value()) {
             auto display_list = Painting::record_image_paint_display_list(*image_paint, request.dest_rect, ImageRendering::Auto, document.page().client().device_pixels_per_css_pixel(), visual_context_tree, resource_storage);
             auto painting_surface = Gfx::PaintingSurface::wrap_bitmap(bitmap);
             Painting::DisplayListPlayerSkia display_list_player;
@@ -605412,7 +605488,7 @@ public:
 
     AbstractImageStyleValue const& image() const { return m_image; }
 
-    Optional<Gfx::ImageCursor> make_image_cursor(Layout::NodeWithStyle const&) const;
+    Optional<Gfx::ImageCursor> make_image_cursor(Layout::NodeWithStyle const&, GC::Ptr<HTML::DecodedImageData>) const;
 
     ValueComparingNonnullRefPtr<StyleValue const> absolutized(ComputationContext const&) const;
 
@@ -607266,6 +607342,7 @@ FILE: Libraries/LibWeb/CSS/StyleValues/ImageSetStyleValue.cpp
 #include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOM/Element.h>
+#include <LibWeb/HTML/DecodedImageData.h>
 #include <LibWeb/HTML/SupportedImageTypes.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/Page/Page.h>
@@ -607348,31 +607425,18 @@ void ImageSetStyleValue::load_any_resources(DOM::Document& document)
         const_cast<AbstractImageStyleValue&>(*m_selected_image).load_any_resources(document);
 }
 
-Optional<CSSPixels> ImageSetStyleValue::natural_width(DOM::Document const& document) const
+SizeWithAspectRatio ImageSetStyleValue::natural_size(HTML::DecodedImageData const& decoded_image_data) const
 {
-    if (!m_selected_image)
-        return {};
-    auto natural_width = m_selected_image->natural_width(document);
-    if (!natural_width.has_value())
-        return {};
-    return CSSPixels { natural_width->to_double() / m_selected_resolution };
-}
-
-Optional<CSSPixels> ImageSetStyleValue::natural_height(DOM::Document const& document) const
-{
-    if (!m_selected_image)
-        return {};
-    auto natural_height = m_selected_image->natural_height(document);
-    if (!natural_height.has_value())
-        return {};
-    return CSSPixels { natural_height->to_double() / m_selected_resolution };
-}
-
-Optional<CSSPixelFraction> ImageSetStyleValue::natural_aspect_ratio(DOM::Document const& document) const
-{
-    if (m_selected_image)
-        return m_selected_image->natural_aspect_ratio(document);
-    return {};
+    auto scaled_by_selected_resolution = [&](Optional<CSSPixels> length) -> Optional<CSSPixels> {
+        if (!length.has_value())
+            return {};
+        return CSSPixels { length->to_double() / m_selected_resolution };
+    };
+    return {
+        .width = scaled_by_selected_resolution(decoded_image_data.intrinsic_width()),
+        .height = scaled_by_selected_resolution(decoded_image_data.intrinsic_height()),
+        .aspect_ratio = decoded_image_data.intrinsic_aspect_ratio(),
+    };
 }
 
 ResolvedImage ImageSetStyleValue::resolve_for_size(Layout::NodeWithStyle const& layout_node, CSSPixelSize size) const
@@ -607382,25 +607446,11 @@ ResolvedImage ImageSetStyleValue::resolve_for_size(Layout::NodeWithStyle const& 
     return Empty {};
 }
 
-bool ImageSetStyleValue::is_paintable(DOM::Document const& document) const
+bool ImageSetStyleValue::is_paintable(GC::Ptr<HTML::DecodedImageData> decoded_image_data) const
 {
     if (m_selected_image)
-        return m_selected_image->is_paintable(document);
+        return m_selected_image->is_paintable(decoded_image_data);
     return false;
-}
-
-Optional<Painting::ImagePaint> ImageSetStyleValue::image_paint(Painting::ImagePaintRequest const& request, ResolvedImage const& resolved_image) const
-{
-    if (m_selected_image)
-        return m_selected_image->image_paint(request, resolved_image);
-    return {};
-}
-
-Optional<Gfx::Color> ImageSetStyleValue::color_if_single_pixel_bitmap(DOM::Document const& document) const
-{
-    if (m_selected_image)
-        return m_selected_image->color_if_single_pixel_bitmap(document);
-    return {};
 }
 
 void ImageSetStyleValue::set_style_sheet(GC::Ptr<CSSStyleSheet> style_sheet)
@@ -607466,14 +607516,9 @@ public:
 
     virtual void load_any_resources(DOM::Document&) override;
 
-    virtual Optional<CSSPixels> natural_width(DOM::Document const&) const override;
-    virtual Optional<CSSPixels> natural_height(DOM::Document const&) const override;
-    virtual Optional<CSSPixelFraction> natural_aspect_ratio(DOM::Document const&) const override;
-
     virtual ResolvedImage resolve_for_size(Layout::NodeWithStyle const&, CSSPixelSize) const override;
-    virtual bool is_paintable(DOM::Document const&) const override;
-    virtual Optional<Painting::ImagePaint> image_paint(Painting::ImagePaintRequest const&, ResolvedImage const&) const override;
-    virtual Optional<Gfx::Color> color_if_single_pixel_bitmap(DOM::Document const&) const override;
+    virtual bool is_paintable(GC::Ptr<HTML::DecodedImageData>) const override;
+    virtual SizeWithAspectRatio natural_size(HTML::DecodedImageData const&) const override;
 
     AbstractImageStyleValue const* selected_image() const { return m_selected_image; }
 
@@ -607532,17 +607577,13 @@ FILE: Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.cpp
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/AnyOf.h>
 #include <LibGC/Weak.h>
-#include <LibGfx/DecodedImageFrame.h>
 #include <LibWeb/CSS/CSSStyleSheet.h>
 #include <LibWeb/CSS/Fetch.h>
 #include <LibWeb/CSS/StyleValues/ImageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/URLStyleValue.h>
 #include <LibWeb/DOM/Document.h>
 #include <LibWeb/DOMURL/DOMURL.h>
-#include <LibWeb/HTML/AnimatedBitmapDecodedImageData.h>
-#include <LibWeb/HTML/BitmapDecodedImageData.h>
 #include <LibWeb/HTML/DecodedImageData.h>
 #include <LibWeb/HTML/PotentialCORSRequest.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
@@ -607586,7 +607627,7 @@ ImageStyleValueResource::ImageStyleValueResource(GC::Ref<HTML::SharedResourceReq
 
 ImageStyleValueResource::~ImageStyleValueResource()
 {
-    VERIFY(m_image_style_values.is_empty());
+    VERIFY(m_registration_counts_by_image_style_value.is_empty());
     unregister_with_decoded_image_data_if_needed();
 }
 
@@ -607597,15 +607638,23 @@ void ImageStyleValueResource::visit_edges(JS::Cell::Visitor& visitor)
 
 void ImageStyleValueResource::register_image_style_value(ImageStyleValue const& image_style_value)
 {
-    m_image_style_values.set(&image_style_value);
+    ++m_registration_counts_by_image_style_value.ensure(&image_style_value);
     register_with_decoded_image_data_if_needed();
 }
 
 void ImageStyleValueResource::unregister_image_style_value(ImageStyleValue const& image_style_value)
 {
-    m_image_style_values.remove(&image_style_value);
-    if (m_image_style_values.is_empty())
+    auto it = m_registration_counts_by_image_style_value.find(&image_style_value);
+    VERIFY(it != m_registration_counts_by_image_style_value.end());
+    if (--it->value == 0)
+        m_registration_counts_by_image_style_value.remove(it);
+    if (m_registration_counts_by_image_style_value.is_empty())
         unregister_with_decoded_image_data_if_needed();
+}
+
+::URL::URL const& ImageStyleValueResource::url() const
+{
+    return m_resource_request->url();
 }
 
 GC::Ptr<HTML::DecodedImageData> ImageStyleValueResource::decoded_image_data() const
@@ -607616,14 +607665,14 @@ GC::Ptr<HTML::DecodedImageData> ImageStyleValueResource::decoded_image_data() co
 void ImageStyleValueResource::on_decoded_image_data_loaded()
 {
     notify_image_style_values_did_update();
-    if (!m_image_style_values.is_empty())
+    if (!m_registration_counts_by_image_style_value.is_empty())
         register_with_decoded_image_data_if_needed();
 }
 
 void ImageStyleValueResource::notify_image_style_values_did_update()
 {
-    for (auto const* image_style_value : m_image_style_values)
-        image_style_value->notify_clients_did_update();
+    for (auto const& registration : m_registration_counts_by_image_style_value)
+        registration.key->notify_clients_did_update();
 }
 
 ValueComparingNonnullRefPtr<ImageStyleValue const> ImageStyleValue::create(URL const& url)
@@ -607679,94 +607728,6 @@ GC::Ptr<HTML::SharedResourceRequest> ImageStyleValue::fetch_image(DOM::Document&
 void ImageStyleValue::load_any_resources(DOM::Document& document)
 {
     fetch_image(document);
-}
-
-Optional<CSSPixels> ImageStyleValue::natural_width(DOM::Document const& document) const
-{
-    if (auto image_data = this->image_data(document))
-        return image_data->intrinsic_width();
-    return {};
-}
-
-Optional<CSSPixels> ImageStyleValue::natural_height(DOM::Document const& document) const
-{
-    if (auto image_data = this->image_data(document))
-        return image_data->intrinsic_height();
-    return {};
-}
-
-Optional<CSSPixelFraction> ImageStyleValue::natural_aspect_ratio(DOM::Document const& document) const
-{
-    if (auto image_data = this->image_data(document))
-        return image_data->intrinsic_aspect_ratio();
-    return {};
-}
-
-bool ImageStyleValue::is_paintable(DOM::Document const& document) const
-{
-    return !!image_data(document);
-}
-
-Optional<Painting::ImagePaint> ImageStyleValue::image_paint(Painting::ImagePaintRequest const& request, ResolvedImage const&) const
-{
-    auto image_data = this->image_data(request.document);
-    if (!image_data)
-        return {};
-
-    auto integer_request = request;
-    integer_request.dest_rect = request.dest_rect.to_type<int>().to_type<float>();
-    return image_data->image_paint(integer_request);
-}
-
-Optional<Painting::DisplayListResource> ImageStyleValue::record_display_list(Painting::DisplayListResourceStorage& resource_storage, DOM::Document const& document, DevicePixelRect const& dest_rect, PreferredColorScheme color_scheme) const
-{
-    auto image_data = this->image_data(document);
-    if (!image_data)
-        return {};
-
-    return image_data->record_display_list(dest_rect.size().to_type<int>(), color_scheme, resource_storage);
-}
-
-Optional<Gfx::DecodedImageFrame> ImageStyleValue::current_frame(DOM::Document const& document, DevicePixelRect const& dest_rect) const
-{
-    if (auto image_data = this->image_data(document))
-        return image_data->current_frame(dest_rect.size().to_type<int>());
-    return {};
-}
-
-GC::Ptr<HTML::DecodedImageData> ImageStyleValue::image_data(DOM::Document const& document) const
-{
-    auto resolved_url = this->resolved_url(document);
-    if (!resolved_url.has_value())
-        return nullptr;
-
-    auto const* resource = document.css_image_resource(*resolved_url);
-
-    // NB: We should have registered a client for this before now which ensures a resource exists if we have a valid
-    //     resolved URL.
-    VERIFY(resource);
-
-    return resource->decoded_image_data();
-}
-
-Optional<Gfx::Color> ImageStyleValue::color_if_single_pixel_bitmap(DOM::Document const& document) const
-{
-    auto image_data = this->image_data(document);
-    if (!image_data)
-        return {};
-
-    if (!is<HTML::BitmapDecodedImageData>(*image_data) && !is<HTML::AnimatedBitmapDecodedImageData>(*image_data))
-        return {};
-
-    auto decoded_frame = image_data->current_frame();
-    if (!decoded_frame.has_value())
-        return {};
-
-    auto const& bitmap = decoded_frame->bitmap();
-    if (bitmap.width() == 1 && bitmap.height() == 1)
-        return bitmap.get_pixel(0, 0);
-
-    return {};
 }
 
 void ImageStyleValue::set_style_sheet(GC::Ptr<CSSStyleSheet> style_sheet)
@@ -607844,49 +607805,38 @@ void ImageStyleValue::register_client(Client& client) const
     if (!resolved_url.has_value())
         return;
 
-    // NB: Store the resolved URL so that we can unregister from the resource later even if the document's base URL
-    //     changes in the interim.
-    client.m_registered_url = *resolved_url;
-
-    GC::Ptr<CSS::ImageStyleValueResource> resource;
-
-    if (auto* existing_resource = document->css_image_resource(*resolved_url)) {
-        resource = existing_resource;
-    } else {
+    ImageStyleValueResource* resource = document->css_image_resource(*resolved_url);
+    if (!resource) {
         auto resource_request = fetch_image(*document);
 
         // NB: This can only fail if the URL is invalid or ResourceLoader is not initialized, neither of which should be
         //     the case here.
         VERIFY(resource_request);
 
-        resource = document->create_css_image_resource(*resource_request);
+        resource = &document->create_css_image_resource(*resource_request);
     }
 
     resource->register_image_style_value(*this);
+    client.m_resource = resource;
 }
 
 void ImageStyleValue::unregister_client(Client& client) const
 {
-    auto document = client.document();
-    auto registered_url = move(client.m_registered_url);
-    client.m_registered_url.clear();
-
     auto did_remove = m_clients.remove(&client);
     VERIFY(did_remove);
 
-    if (!document || !registered_url.has_value())
+    auto* resource = exchange(client.m_resource, nullptr);
+    if (!resource)
         return;
 
-    if (any_of(m_clients, [&](auto const* remaining_client) {
-            return remaining_client->document() == document
-                && remaining_client->m_registered_url.has_value()
-                && *remaining_client->m_registered_url == *registered_url;
-        }))
+    // The document owns the resource, so a collected document has already destroyed it.
+    auto document = client.document();
+    if (!document)
         return;
 
-    if (auto* resource = document->css_image_resource(*registered_url))
-        resource->unregister_image_style_value(*this);
-    document->remove_css_image_resource_if_unused(*registered_url);
+    auto url = resource->url();
+    resource->unregister_image_style_value(*this);
+    document->remove_css_image_resource_if_unused(url);
 }
 
 void ImageStyleValue::notify_clients_did_update() const
@@ -607927,6 +607877,13 @@ void ImageStyleValue::Client::image_style_value_finalize()
     m_image_style_value.unregister_client(*this);
 }
 
+GC::Ptr<HTML::DecodedImageData> ImageStyleValue::Client::decoded_image_data() const
+{
+    if (!m_resource)
+        return nullptr;
+    return m_resource->decoded_image_data();
+}
+
 }
 
 FILE: Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.h
@@ -607941,10 +607898,10 @@ FILE: Libraries/LibWeb/CSS/StyleValues/ImageStyleValue.h
 
 #pragma once
 
+#include <AK/HashMap.h>
 #include <AK/HashTable.h>
 #include <AK/Optional.h>
 #include <LibGC/Weak.h>
-#include <LibGfx/DecodedImageFrame.h>
 #include <LibGfx/Forward.h>
 #include <LibJS/Heap/Cell.h>
 #include <LibURL/URL.h>
@@ -607966,7 +607923,9 @@ public:
 
     void register_image_style_value(ImageStyleValue const&);
     void unregister_image_style_value(ImageStyleValue const&);
-    bool can_be_removed() const { return m_image_style_values.is_empty(); }
+    bool can_be_removed() const { return m_registration_counts_by_image_style_value.is_empty(); }
+
+    ::URL::URL const& url() const;
 
     [[nodiscard]] virtual GC::Ptr<HTML::DecodedImageData> decoded_image_data() const override;
 
@@ -607977,7 +607936,7 @@ private:
     void notify_image_style_values_did_update();
 
     GC::Ref<HTML::SharedResourceRequest> m_resource_request;
-    HashTable<ImageStyleValue const*> m_image_style_values;
+    HashMap<ImageStyleValue const*, size_t> m_registration_counts_by_image_style_value;
 };
 
 class ImageStyleValue final
@@ -607995,13 +607954,15 @@ public:
         virtual ~Client();
         virtual void image_style_value_did_update(ImageStyleValue&) = 0;
 
+        GC::Ptr<HTML::DecodedImageData> decoded_image_data() const;
+
     protected:
         void image_style_value_finalize();
         GC::Ptr<DOM::Document> document() const { return m_document.ptr(); }
 
         ImageStyleValue const& m_image_style_value;
         GC::Weak<DOM::Document> m_document;
-        Optional<::URL::URL> m_registered_url;
+        ImageStyleValueResource* m_resource { nullptr };
     };
 
     static ValueComparingNonnullRefPtr<ImageStyleValue const> create(URL const&);
@@ -608011,18 +607972,7 @@ public:
 
     virtual void load_any_resources(DOM::Document&) override;
 
-    Optional<CSSPixels> natural_width(DOM::Document const&) const override;
-    Optional<CSSPixels> natural_height(DOM::Document const&) const override;
-    Optional<CSSPixelFraction> natural_aspect_ratio(DOM::Document const&) const override;
-
-    virtual bool is_paintable(DOM::Document const&) const override;
-    Optional<Painting::ImagePaint> image_paint(Painting::ImagePaintRequest const&, ResolvedImage const&) const override;
-    Optional<Painting::DisplayListResource> record_display_list(Painting::DisplayListResourceStorage&, DOM::Document const&, DevicePixelRect const&, PreferredColorScheme) const;
-
-    virtual Optional<Gfx::Color> color_if_single_pixel_bitmap(DOM::Document const&) const override;
-    Optional<Gfx::DecodedImageFrame> current_frame(DOM::Document const&, DevicePixelRect const& dest_rect = {}) const;
-
-    GC::Ptr<HTML::DecodedImageData> image_data(DOM::Document const&) const;
+    virtual bool is_paintable(GC::Ptr<HTML::DecodedImageData> decoded_image_data) const override { return !!decoded_image_data; }
 
 private:
     friend class ImageStyleValueResource;
@@ -608632,7 +608582,7 @@ public:
 
     ResolvedImage resolve_for_size(Layout::NodeWithStyle const&, CSSPixelSize) const override;
 
-    bool is_paintable(DOM::Document const&) const override { return true; }
+    bool is_paintable(GC::Ptr<HTML::DecodedImageData>) const override { return true; }
 
 private:
     friend class StyleValue;
@@ -609281,7 +609231,7 @@ public:
         return color_stops_from_rust_data(list.pointer, list.length);
     }
 
-    bool is_paintable(DOM::Document const&) const override { return true; }
+    bool is_paintable(GC::Ptr<HTML::DecodedImageData>) const override { return true; }
 
     ResolvedImage resolve_for_size(Layout::NodeWithStyle const&, CSSPixelSize) const override;
 
@@ -620872,20 +620822,6 @@ CSS::PreferredColorScheme Document::canvas_color_scheme() const
     return color_scheme;
 }
 
-Vector<CSS::BackgroundLayerData> const* Document::background_layers() const
-{
-    auto* body_element = body();
-    if (!body_element)
-        return {};
-
-    // NB: Called during painting inside update_layout().
-    auto body_layout_node = body_element->unsafe_layout_node();
-    if (!body_layout_node)
-        return {};
-
-    return &body_layout_node->background_layers();
-}
-
 CSS::ImageRendering Document::background_image_rendering() const
 {
     auto* body_element = body();
@@ -626529,14 +626465,6 @@ CSS::ImageStyleValueResource* Document::css_image_resource(URL::URL const& url)
     return it->value.ptr();
 }
 
-CSS::ImageStyleValueResource const* Document::css_image_resource(URL::URL const& url) const
-{
-    auto it = m_css_image_resources.find(url);
-    if (it == m_css_image_resources.end())
-        return nullptr;
-    return it->value.ptr();
-}
-
 CSS::ImageStyleValueResource& Document::create_css_image_resource(GC::Ref<HTML::SharedResourceRequest> request)
 {
     // NB: The caller should guard against creating already existing resources.
@@ -630102,7 +630030,6 @@ public:
     Color background_color() const;
     Color canvas_background_color() const;
     CSS::PreferredColorScheme canvas_color_scheme() const;
-    Vector<CSS::BackgroundLayerData> const* background_layers() const;
     CSS::ImageRendering background_image_rendering() const;
 
     Optional<Color> normal_link_color() const;
@@ -630640,7 +630567,6 @@ public:
     HashMap<URL::URL, GC::Ptr<HTML::SharedResourceRequest>>& shared_resource_requests();
     HashMap<URL::URL, GC::Ptr<HTML::SharedResourceRequest>> const& shared_resource_requests() const;
     CSS::ImageStyleValueResource* css_image_resource(URL::URL const&);
-    CSS::ImageStyleValueResource const* css_image_resource(URL::URL const&) const;
     CSS::ImageStyleValueResource& create_css_image_resource(GC::Ref<HTML::SharedResourceRequest>);
     void remove_css_image_resource_if_unused(URL::URL const&);
     void prune_image_resource_caches();
@@ -666780,3 +666706,62 @@ WebIDL::ExceptionOr<Utf16String> Document::query_command_value(Utf16FlyString co
 }
 
 // https://w3c.github.io/editing/docs/execCommand/#value-override
+void Document::set_command_value_override(Utf16FlyString const& command, Utf16View value)
+{
+    m_command_value_override.set(command, Utf16String::from_utf16(value));
+
+    // The value override for the backColor command must be the same as the value override for the hiliteColor command,
+    // such that setting one sets the other to the same thing and unsetting one unsets the other.
+    if (command == Editing::CommandNames::backColor)
+        m_command_value_override.set(Editing::CommandNames::hiliteColor, Utf16String::from_utf16(value));
+    else if (command == Editing::CommandNames::hiliteColor)
+        m_command_value_override.set(Editing::CommandNames::backColor, Utf16String::from_utf16(value));
+}
+
+// https://w3c.github.io/editing/docs/execCommand/#value-override
+void Document::clear_command_value_override(Utf16FlyString const& command)
+{
+    m_command_value_override.remove(command);
+
+    // The value override for the backColor command must be the same as the value override for the hiliteColor command,
+    // such that setting one sets the other to the same thing and unsetting one unsets the other.
+    if (command == Editing::CommandNames::backColor)
+        m_command_value_override.remove(Editing::CommandNames::hiliteColor);
+    else if (command == Editing::CommandNames::hiliteColor)
+        m_command_value_override.remove(Editing::CommandNames::backColor);
+}
+
+}
+
+FILE: Libraries/LibWeb/Editing/InlineInsertion.cpp
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <LibWeb/DOM/Node.h>
+#include <LibWeb/Editing/InlineInsertion.h>
+#include <LibWeb/Editing/Internal/Algorithms.h>
+#include <LibWeb/Editing/ParagraphOperations.h>
+#include <LibWeb/HTML/HTMLLIElement.h>
+#include <LibWeb/HTML/HTMLOListElement.h>
+#include <LibWeb/HTML/HTMLUListElement.h>
+
+namespace Web::Editing {
+
+InlineInsertionBoundary prepare_inline_insertion_boundary(DOM::BoundaryPoint boundary, DOM::Node& containing_block)
+{
+    VERIFY(boundary.node.ptr() == &containing_block || containing_block.is_ancestor_of(boundary.node));
+
+    // INTEROP: Blink first advances through preceding inline nodes while the resulting DOM boundary represents the
+    //          same caret. Inserting after a styled run then occurs beside that run instead of creating an empty style
+    //          clone on its trailing edge.
+    while (boundary.node.ptr() != &containing_block) {
+        if (boundary.offset != boundary.node->length() || !boundary.node->parent())
+            break;
+        auto node = boundary.node;
+        boundary = { *node->parent(), static_cast<WebIDL::UnsignedLong>(node->index() + 1) };
+    }
+
+    GC::Ptr<DOM::Node> highest_styled_inline_ancestor;
