@@ -1,4 +1,273 @@
-﻿WebIDL::ExceptionOr<bool> Document::query_command_state(Utf16FlyString const& command)
+﻿        // INTEROP: An Apple-interchange-newline represents an intentional paragraph boundary, not a fragment-ending
+        //          placeholder. Blink and WebKit preserve the destination paragraph's trailing break in this case.
+        && !value.contains(u"Apple-interchange-newline"sv);
+    GC::Root<DOM::Node> paste_start_block;
+    if (paste_started_in_text_node)
+        paste_start_block = Editing::block_node_of_node(*range_before_command->start_container());
+
+    // NOTE: Step 7 below asks us whether the DOM tree was modified, so keep track of the document versions.
+    auto old_dom_tree_version = dom_tree_version();
+    auto old_character_data_version = character_data_version();
+
+    // NB: Canonicalize the caret before the command acts and records its starting selection, so that e.g. typing at an
+    //     element-level caret inserts into the adjacent content like Chromium does. Inline formatting commands with a
+    //     collapsed selection only set overrides, and Chromium does not move the caret for those.
+    bool command_edits_at_caret = command_definition.command.is_one_of(
+        Editing::CommandNames::delete_, Editing::CommandNames::formatBlock, Editing::CommandNames::forwardDelete,
+        Editing::CommandNames::indent, Editing::CommandNames::insertHorizontalRule, Editing::CommandNames::insertHTML,
+        Editing::CommandNames::insertImage, Editing::CommandNames::insertLineBreak,
+        Editing::CommandNames::insertOrderedList, Editing::CommandNames::insertParagraph,
+        Editing::CommandNames::insertText, Editing::CommandNames::insertUnorderedList,
+        Editing::CommandNames::justifyCenter, Editing::CommandNames::justifyFull, Editing::CommandNames::justifyLeft,
+        Editing::CommandNames::justifyRight, Editing::CommandNames::outdent);
+    if (affected_editing_host && m_selection && command_edits_at_caret)
+        Editing::canonicalize_collapsed_selection_for_editing(*m_selection);
+
+    // AD-HOC: Record the mutations performed by the command action on the editing history, so the user can undo them.
+    //         end_recording() is a no-op if the guard below already ended the recording.
+    if (affected_editing_host) {
+        auto category = Editing::UndoStep::Category::Other;
+        // INTEROP: Cut and paste are standalone undo units in Chromium: they never coalesce with typing or deletion
+        //          runs, so they categorize as Other even though they run the delete and insertText commands.
+        bool is_cut_or_paste = user_input_type == UIEvents::InputTypes::deleteByCut || user_input_type == UIEvents::InputTypes::insertFromPaste;
+        if (!is_cut_or_paste) {
+            if (command_definition.command.is_one_of(Editing::CommandNames::insertText, Editing::CommandNames::insertLineBreak, Editing::CommandNames::insertParagraph))
+                category = Editing::UndoStep::Category::Insertion;
+            else if (command_definition.command == Editing::CommandNames::delete_)
+                category = Editing::UndoStep::Category::BackwardDeletion;
+            else if (command_definition.command == Editing::CommandNames::forwardDelete)
+                category = Editing::UndoStep::Category::ForwardDeletion;
+        }
+        editing_history()->begin_recording(*affected_editing_host, category);
+    }
+    ScopeGuard end_recording_guard = [&] {
+        if (auto history = editing_history_if_exists())
+            history->end_recording();
+    };
+
+    // 5. Take the action for command, passing value to the instructions as an argument.
+    auto command_result = command_definition.action(*this, value);
+
+    // INTEROP: Chromium removes the trailing placeholder line break after pasting into an existing text node. The
+    //          execCommand draft only removes it when insertion creates a new text node. Perform this while the paste
+    //          history transaction is still open so undo restores the placeholder and redo removes it again.
+    if (paste_started_in_text_node) {
+        if (auto range = Editing::active_range(*this)) {
+            // INTEROP: A trailing break remains the list item's line terminator after a block fragment is merged into
+            //          that item. Blink removes paragraph placeholders here, but preserves list-item terminators.
+            if (auto block = Editing::block_node_of_node(*range->start_container()); block && block.ptr() == paste_start_block.ptr()
+                && !is<HTML::HTMLLIElement>(*block))
+                Editing::remove_extraneous_line_breaks_at_the_end_of_node(*block);
+        }
+    }
+
+    // https://w3c.github.io/editing/docs/execCommand/#preserves-overrides
+    // After taking the action, if the active range is collapsed, it must restore states and values from the recorded
+    // list.
+    if (!overrides.is_empty() && m_selection && m_selection->is_collapsed())
+        Editing::restore_states_and_values(*this, overrides);
+
+    // NB: Canonicalize the caret the command produced before the ending selection is recorded, but only if the
+    //     command actually performed an edit; Chromium leaves the caret alone otherwise.
+    bool tree_was_modified = dom_tree_version() != old_dom_tree_version
+        || character_data_version() != old_character_data_version;
+    if (affected_editing_host && m_selection && tree_was_modified)
+        Editing::canonicalize_collapsed_selection_for_editing(*m_selection);
+
+    // NB: End the recording before dispatching the input event below, so that the undo step's ending selection is the
+    //     selection produced by the command itself, not whatever an input event handler changed it to.
+    if (auto history = editing_history_if_exists())
+        history->end_recording();
+
+    // 6. If the previous step returned false, return false.
+    if (!command_result)
+        return false;
+
+    // 7. If the action modified DOM tree, then fire an event named "input" at affected editing host using InputEvent,
+    //    with its isTrusted and bubbles attributes initialized to true, inputType attribute initialized to the mapped
+    //    value of command, and its data attribute initialized to null.
+    if (dispatch_input_event == DispatchInputEvent::Yes && tree_was_modified && affected_editing_host) {
+        UIEvents::InputEventInit event_init {};
+        event_init.bubbles = true;
+        // INTEROP: When the command runs on behalf of a user cut or paste, the input event carries the user's input
+        //          type (deleteByCut or insertFromPaste) rather than the command's mapped value, like other browsers.
+        event_init.input_type = user_input_type.value_or(command_definition.mapped_value);
+
+        // AD-HOC: For insertText, we do what other browsers do and set data to value. A paste carries null data even
+        //         though it runs the insertText command.
+        if (event_init.input_type == UIEvents::InputTypes::insertText)
+            event_init.data = Utf16String::from_utf16(value);
+
+        auto event = UIEvents::InputEvent::create_from_platform_event(HTML::EventNames::input, event_init, {}, HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*this)));
+        event->set_is_trusted(true);
+
+        TemporaryChange preserve_selection_offsets { m_preserve_selection_offsets_during_identical_character_data_replacement, true };
+        affected_editing_host->dispatch_event(event);
+    }
+
+    // AD-HOC: Scroll the cursor into view after executing a command.
+    if (auto selection = get_selection())
+        selection->scroll_focus_into_view();
+
+    // 8. Return true.
+    return true;
+}
+
+// https://w3c.github.io/editing/docs/execCommand/#querycommandenabled()
+WebIDL::ExceptionOr<bool> Document::query_command_enabled(Utf16FlyString const& command)
+{
+    // AD-HOC: This is not directly mentioned in the spec, but all major browsers limit editing API calls to HTML documents
+    if (!is_html_document())
+        return WebIDL::InvalidStateError::create("queryCommandEnabled is only supported on HTML documents"_utf16);
+
+    // 2. Return true if command is both supported and enabled, false otherwise.
+    if (!MUST(query_command_supported(command)))
+        return false;
+
+    // https://w3c.github.io/editing/docs/execCommand/#enabled
+    // Among commands defined in this specification, those listed in Miscellaneous commands are always enabled, except
+    // for the cut command and the paste command.
+    // NOTE: cut and paste are actually in the Clipboard commands section
+    if (command.is_one_of_ignoring_ascii_case(
+            Editing::CommandNames::defaultParagraphSeparator,
+            Editing::CommandNames::styleWithCSS,
+            Editing::CommandNames::useCSS))
+        return true;
+
+    // INTEROP: The spec lists undo and redo among the always-enabled miscellaneous commands, but in Chromium
+    //          queryCommandEnabled("undo") is true only when there is a step to undo, and execCommand("undo") on an
+    //          empty history returns false. Redo behaves symmetrically.
+    if (command.equals_ignoring_ascii_case(Editing::CommandNames::undo)) {
+        auto history = editing_history_if_exists();
+        return history && history->can_undo();
+    }
+    if (command.equals_ignoring_ascii_case(Editing::CommandNames::redo)) {
+        auto history = editing_history_if_exists();
+        return history && history->can_redo();
+    }
+
+    // AD-HOC: selectAll requires a selection object to exist.
+    if (command.equals_ignoring_ascii_case(Editing::CommandNames::selectAll))
+        return get_selection() != nullptr;
+
+    // The other commands defined here are enabled if the active range is not null,
+    auto active_range = Editing::active_range(*this);
+    if (!active_range)
+        return false;
+
+    // its start node is either editable or an editing host,
+    auto start_node = active_range->start_container();
+    if (!start_node->is_editable_or_editing_host())
+        return false;
+
+    // FIXME: the editing host of its start node is not an EditContext editing host,
+    [[maybe_unused]] auto start_node_editing_host = start_node->editing_host();
+
+    // its end node is either editable or an editing host,
+    auto& end_node = *active_range->end_container();
+    if (!end_node.is_editable_or_editing_host())
+        return false;
+
+    // FIXME: the editing host of its end node is not an EditContext editing host,
+    [[maybe_unused]] auto end_node_editing_host = end_node.editing_host();
+
+    // and there is some editing host that is an inclusive ancestor of both its start node and its end node.
+    GC::Ptr<Node> inclusive_ancestor_editing_host;
+    start_node->for_each_inclusive_ancestor([&](GC::Ref<Node> ancestor) {
+        if (ancestor->is_editing_host() && ancestor->is_inclusive_ancestor_of(end_node)) {
+            inclusive_ancestor_editing_host = ancestor;
+            return IterationDecision::Break;
+        }
+        return IterationDecision::Continue;
+    });
+    if (!inclusive_ancestor_editing_host)
+        return false;
+
+    // NOTE: Commands can define additional conditions for being enabled, and currently the only condition mentioned in
+    //       the spec is that certain commands must not be enabled if the editing host is in the plaintext-only state.
+    if (auto const* html_element = as_if<HTML::HTMLElement>(inclusive_ancestor_editing_host.ptr()); html_element
+        && html_element->content_editable_state() == HTML::ContentEditableState::PlaintextOnly
+        && command.is_one_of_ignoring_ascii_case(
+            Editing::CommandNames::backColor,
+            Editing::CommandNames::bold,
+            Editing::CommandNames::createLink,
+            Editing::CommandNames::fontName,
+            Editing::CommandNames::fontSize,
+            Editing::CommandNames::foreColor,
+            Editing::CommandNames::formatBlock, // AD-HOC: https://github.com/w3c/editing/issues/478
+            Editing::CommandNames::hiliteColor,
+            Editing::CommandNames::indent,
+            Editing::CommandNames::insertHorizontalRule,
+            Editing::CommandNames::insertImage,
+            Editing::CommandNames::insertOrderedList,
+            Editing::CommandNames::insertUnorderedList,
+            Editing::CommandNames::italic,
+            Editing::CommandNames::justifyCenter,
+            Editing::CommandNames::justifyFull,
+            Editing::CommandNames::justifyLeft,
+            Editing::CommandNames::justifyRight,
+            Editing::CommandNames::outdent,
+            Editing::CommandNames::removeFormat,
+            Editing::CommandNames::strikethrough,
+            Editing::CommandNames::subscript,
+            Editing::CommandNames::superscript,
+            Editing::CommandNames::underline,
+            Editing::CommandNames::unlink))
+        return false;
+
+    return true;
+}
+
+// https://w3c.github.io/editing/docs/execCommand/#querycommandindeterm()
+WebIDL::ExceptionOr<bool> Document::query_command_indeterm(Utf16FlyString const& command)
+{
+    // AD-HOC: This is not directly mentioned in the spec, but all major browsers limit editing API calls to HTML documents
+    if (!is_html_document())
+        return WebIDL::InvalidStateError::create("queryCommandIndeterm is only supported on HTML documents"_utf16);
+
+    // 1. If command is not supported or has no indeterminacy, return false.
+    auto optional_command = Editing::find_command_definition(command);
+    if (!optional_command.has_value())
+        return false;
+    auto const& command_definition = optional_command.value();
+    if (!command_definition.indeterminate) {
+        // If a command has inline command activated values defined but nothing else defines when it is indeterminate,
+        // it is indeterminate if among formattable nodes effectively contained in the active range, there is at least
+        // one whose effective command value is one of the given values and at least one whose effective command value
+        // is not one of the given values.
+        if (!command_definition.inline_activated_values.is_empty()) {
+            auto range = Editing::active_range(*this);
+            bool has_at_least_one_match = false;
+            bool has_at_least_one_mismatch = false;
+            Editing::for_each_node_effectively_contained_in_range(range, [&](GC::Ref<Node> descendant) {
+                if (!Editing::is_formattable_node(descendant))
+                    return TraversalDecision::Continue;
+
+                auto node_value = Editing::effective_command_value(descendant, command_definition.command);
+                if (!node_value.has_value())
+                    return TraversalDecision::Continue;
+
+                if (command_definition.inline_activated_values.contains_slow(node_value.value()))
+                    has_at_least_one_match = true;
+                else
+                    has_at_least_one_mismatch = true;
+
+                if (has_at_least_one_match && has_at_least_one_mismatch)
+                    return TraversalDecision::Break;
+                return TraversalDecision::Continue;
+            });
+            return has_at_least_one_match && has_at_least_one_mismatch;
+        }
+
+        return false;
+    }
+
+    // 2. Return true if command is indeterminate, otherwise false.
+    return command_definition.indeterminate(*this);
+}
+
+// https://w3c.github.io/editing/docs/execCommand/#querycommandstate()
+WebIDL::ExceptionOr<bool> Document::query_command_state(Utf16FlyString const& command)
 {
     // AD-HOC: This is not directly mentioned in the spec, but all major browsers limit editing API calls to HTML documents
     if (!is_html_document())
@@ -58083,8 +58352,17 @@ private:
     HTMLDataListElement(DOM::Document&, DOM::QualifiedName);
     virtual void visit_edges(Cell::Visitor&) override;
 
+    virtual bool is_html_data_list_element() const override { return true; }
+
     GC::Ptr<DOM::HTMLCollection> m_options;
 };
+
+}
+
+namespace Web::DOM {
+
+template<>
+inline bool Node::fast_is<HTML::HTMLDataListElement>() const { return is_html_data_list_element(); }
 
 }
 
@@ -299839,6 +300117,49 @@ pub unsafe extern "C" fn style_engine_selector_query_all(
     })
 }
 
+/// # Safety
+/// `engine` and `query` must be live and belong to the same document. `matched` must be
+/// writable; it receives the first match in tree order — or zero, when nothing matches.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn style_engine_selector_query_first(
+    engine: *mut c_void,
+    query: *mut c_void,
+    root: u32,
+    include_root: bool,
+    scope_root: u32,
+    shadow_root: u32,
+    has_document_root: bool,
+    matched: *mut u32,
+) -> bool {
+    abort_on_panic(|| {
+        let Some(root) = StyleNodeID::from_raw(root) else {
+            return false;
+        };
+        if query.is_null() || matched.is_null() {
+            return false;
+        }
+        let engine = unsafe { &mut *engine.cast::<StyleEngine>() };
+        let query = unsafe { &mut *query.cast::<SelectorQuery>() };
+        let result = engine.selector_query_first(
+            &query.program,
+            SelectorQueryContext {
+                root,
+                include_root,
+                scope_root: StyleNodeID::from_raw(scope_root),
+                shadow_root: StyleNodeID::from_raw(shadow_root),
+                has_document_root,
+            },
+        );
+        let query_bytes = query.capacity_bytes();
+        query._memory.resize_required_to(&mut engine.memory, query_bytes);
+        let Ok(result) = result else {
+            return false;
+        };
+        unsafe { matched.write(result.map_or(0, |node| node.raw())) };
+        true
+    })
+}
+
 unsafe fn selector_query_matches_impl(
     engine: *mut c_void,
     query: *const c_void,
@@ -322596,6 +322917,14 @@ impl StyleEngine {
             routing_needs_detachment_sweep: false,
             sheet_rule_replacement: None,
             match_workspace: MatchEvaluationWorkspace::default(),
+            query_match_workspace: MatchEvaluationWorkspace::for_selector_query(),
+            selector_query_generation: 0,
+            query_workspace_generation: 0,
+            query_settled_transaction_version: StyleTransactionVersion(0),
+            query_sorted_candidates: Vec::new(),
+            query_sorted_candidates_stamp: None,
+            query_preorder_ranks: HashMap::default(),
+            query_preorder_ranks_stamp: None,
             exact_covered_scratch: Vec::new(),
             next_style_transaction_version: StyleTransactionVersion(1),
             document_style_computation_inputs: None,
@@ -325078,6 +325407,7 @@ pub(crate) struct SelectorQueryCache {
     attribute_values: Vec<Option<Vec<StyleAtomID>>>,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct SelectorQueryContext {
     pub(crate) root: StyleNodeID,
     pub(crate) include_root: bool,
@@ -325178,9 +325508,19 @@ impl StyleEngine {
     }
 
     pub fn prepare_selector_query(&mut self) {
+        let has_staged_structure = !(self.tree_staging.is_empty() || self.tree_staging.is_applied());
         self.apply_staged_tree_deltas();
         self.discard_prepared_batch_matching_traversal();
         self.facts.prepare_selector_query(&mut self.memory);
+        // Every candidate of the coming query shares one tree — so its sibling positions are computed once, and reused.
+        // They stay valid until something changes: Every mutation reaches this engine either as a staged-tree delta or
+        // as a non-empty style transaction — and the second is what advances the transaction version. A run of queries
+        // with neither in between — the querySelector-in-a-loop shape — keeps one workspace for the whole run.
+        let settled_version = self.next_style_transaction_version;
+        if has_staged_structure || settled_version != self.query_settled_transaction_version {
+            self.selector_query_generation = self.selector_query_generation.wrapping_add(1);
+            self.query_settled_transaction_version = settled_version;
+        }
     }
 
     pub(crate) fn selector_query_matches(
@@ -325191,7 +325531,15 @@ impl StyleEngine {
         shadow_root: Option<StyleNodeID>,
         has_document_root: bool,
     ) -> Result<bool, Incomplete> {
+        let share_sibling_geometry = program.has_positional_test();
+        if share_sibling_geometry && self.query_workspace_generation != self.selector_query_generation {
+            self.query_match_workspace = MatchEvaluationWorkspace::for_selector_query();
+            self.query_workspace_generation = self.selector_query_generation;
+        }
         let mut evaluator = MatchEvaluator::new(&self.tree, self.facts.primary());
+        if share_sibling_geometry {
+            evaluator = evaluator.with_match_workspace(&self.query_match_workspace, MatchEvaluationSide::Current);
+        }
         if !has_document_root {
             evaluator = evaluator.without_document_root();
         }
@@ -325215,6 +325563,189 @@ impl StyleEngine {
         cache: &mut SelectorQueryCache,
         context: SelectorQueryContext,
     ) -> Result<Vec<StyleNodeID>, Incomplete> {
+        let matches = self.evaluate_selector_query(program, cache, context)?;
+        if matches.len() <= 1 {
+            return Ok(matches.into_iter().collect());
+        }
+
+        let match_count = matches.len();
+        let mut ordered_matches = Vec::with_capacity(match_count);
+        for node in self.tree.preorder(context.root) {
+            if matches.contains(&node) {
+                ordered_matches.push(node);
+                if ordered_matches.len() == match_count {
+                    break;
+                }
+            }
+        }
+        debug_assert_eq!(ordered_matches.len(), match_count);
+        Ok(ordered_matches)
+    }
+
+    /// The first match in tree order, or None. One engine call serves a whole querySelector:
+    /// candidate enumeration, evaluation, and tree ordering all stay on this side of the
+    /// boundary — instead of one boundary crossing per walked element.
+    ///
+    /// When every entry's subject carries posting-backed dispatch keys, only posted candidates
+    /// are evaluated, in tree order, stopping at the first hit. Otherwise, the subtree is walked
+    /// in tree order, and each element evaluated — still one boundary crossing for the query.
+    pub(crate) fn selector_query_first(
+        &mut self,
+        program: &SelectorProgram,
+        context: SelectorQueryContext,
+    ) -> Result<Option<StyleNodeID>, Incomplete> {
+        let share_sibling_geometry = program.has_positional_test();
+        if share_sibling_geometry && self.query_workspace_generation != self.selector_query_generation {
+            self.query_match_workspace = MatchEvaluationWorkspace::for_selector_query();
+            self.query_workspace_generation = self.selector_query_generation;
+        }
+        let candidates_are_known = self.ensure_sorted_query_candidates(program, context.root);
+
+        let mut evaluator = MatchEvaluator::new(&self.tree, self.facts.primary());
+        if share_sibling_geometry {
+            evaluator = evaluator.with_match_workspace(&self.query_match_workspace, MatchEvaluationSide::Current);
+        }
+        if !context.has_document_root {
+            evaluator = evaluator.without_document_root();
+        }
+        if let Some(scope_root) = context.scope_root {
+            evaluator = evaluator.with_scope_root(scope_root);
+        }
+        if let Some(shadow_root) = context.shadow_root {
+            evaluator = evaluator.in_shadow_tree(shadow_root);
+        }
+
+        if candidates_are_known {
+            // With a single dispatch key, membership in its posting proved that feature on every
+            // candidate — but only for key kinds where the posting means exactly what the feature
+            // tests. An id or class key does: the posting holds the elements carrying that very
+            // atom. A tag-name key is folded while the feature test is case-sensitive for foreign
+            // elements, and an attribute-name key proves presence while the feature may compare a
+            // value — those must still be evaluated.
+            let proven_key = match &self.query_sorted_candidates_stamp {
+                Some(stamp)
+                    if stamp.keys.len() == 1 && matches!(stamp.keys[0], DispatchKey::Id(_) | DispatchKey::Class(_)) =>
+                {
+                    Some(stamp.keys[0])
+                }
+                _ => None,
+            };
+            for index in 0..self.query_sorted_candidates.len() {
+                let node = self.query_sorted_candidates[index];
+                if !context.include_root && node == context.root {
+                    continue;
+                }
+                for entry in program.entries() {
+                    if entry.pseudo_element.is_some() {
+                        continue;
+                    }
+                    let matched = match proven_key {
+                        Some(key) => {
+                            evaluator.matches_entry_after_dispatch(program, entry, key, node, &mut self.counters)?
+                        }
+                        None => evaluator.matches_entry(program, entry, node, &mut self.counters)?,
+                    };
+                    if matched {
+                        return Ok(Some(node));
+                    }
+                }
+            }
+            return Ok(None);
+        }
+
+        for node in self.tree.preorder(context.root) {
+            if !context.include_root && node == context.root {
+                continue;
+            }
+            for entry in program.entries() {
+                if entry.pseudo_element.is_none()
+                    && evaluator.matches_entry(program, entry, node, &mut self.counters)?
+                {
+                    return Ok(Some(node));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Refresh `query_sorted_candidates` for this program's subject keys under `root` — or report
+    /// that postings can't name every entry's candidates, and the caller has to walk.
+    fn ensure_sorted_query_candidates(&mut self, program: &SelectorProgram, root: StyleNodeID) -> bool {
+        let mut keys: Vec<DispatchKey> = Vec::new();
+        for (entry_index, entry) in program.entries().iter().enumerate() {
+            if entry.pseudo_element.is_some() {
+                continue;
+            }
+            let dispatch_keys = program.subject_dispatch_keys(entry_index);
+            if dispatch_keys.is_empty() {
+                return false;
+            }
+            for &key in dispatch_keys {
+                if !key.has_selector_posting() {
+                    return false;
+                }
+                keys.push(key);
+            }
+        }
+        if keys.is_empty() {
+            return false;
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        let generation = self.selector_query_generation;
+        if let Some(stamp) = &self.query_sorted_candidates_stamp
+            && stamp.generation == generation
+            && stamp.root == root
+            && stamp.keys == keys
+        {
+            return true;
+        }
+        // The union of every key's posting is a superset of every entry's true matches. Missing
+        // means the facts haven't materialized that posting; the walk is the correct fallback —
+        // rather than forcing a materialization from the query path.
+        let mut candidates: Vec<StyleNodeID> = Vec::new();
+        for &key in &keys {
+            match self.facts.postings().lookup(key) {
+                Lookup::Known(posting) => candidates.extend(posting.candidates()),
+                Lookup::KnownAbsent => {}
+                Lookup::Missing(_) => return false,
+            }
+        }
+        self.ensure_query_preorder_ranks(root);
+        let ranks = &self.query_preorder_ranks;
+        // A candidate without a rank lies outside the queried subtree.
+        let mut ranked: Vec<(u32, StyleNodeID)> = candidates
+            .into_iter()
+            .filter_map(|node| ranks.get(&node).map(|&rank| (rank, node)))
+            .collect();
+        ranked.sort_unstable();
+        ranked.dedup();
+        self.query_sorted_candidates.clear();
+        self.query_sorted_candidates
+            .extend(ranked.into_iter().map(|(_, node)| node));
+        self.query_sorted_candidates_stamp = Some(QuerySortedCandidatesStamp { generation, root, keys });
+        true
+    }
+
+    fn ensure_query_preorder_ranks(&mut self, root: StyleNodeID) {
+        let generation = self.selector_query_generation;
+        if self.query_preorder_ranks_stamp == Some((generation, root)) {
+            return;
+        }
+        self.query_preorder_ranks.clear();
+        for (rank, node) in self.tree.preorder(root).enumerate() {
+            self.query_preorder_ranks
+                .insert(node, u32::try_from(rank).unwrap_or(u32::MAX));
+        }
+        self.query_preorder_ranks_stamp = Some((generation, root));
+    }
+
+    fn evaluate_selector_query(
+        &mut self,
+        program: &SelectorProgram,
+        cache: &mut SelectorQueryCache,
+        context: SelectorQueryContext,
+    ) -> Result<HashSet<StyleNodeID>, Incomplete> {
         let attribute_value_catalog_version = self.facts.attribute_value_catalog_version();
         if cache.attribute_value_catalog_version != attribute_value_catalog_version
             || cache.attribute_values.len() != program.entries().len()
@@ -325242,8 +325773,19 @@ impl StyleEngine {
             );
         }
 
+        // The same tree serves every candidate of this query, so sibling geometry and positional
+        // answers are shared across the candidate loop below - exactly as the per-node entry
+        // point shares them across the calls of one query.
+        let share_sibling_geometry = program.has_positional_test();
+        if share_sibling_geometry && self.query_workspace_generation != self.selector_query_generation {
+            self.query_match_workspace = MatchEvaluationWorkspace::for_selector_query();
+            self.query_workspace_generation = self.selector_query_generation;
+        }
         let mut matches = HashSet::default();
         let mut evaluator = MatchEvaluator::new(&self.tree, self.facts.primary());
+        if share_sibling_geometry {
+            evaluator = evaluator.with_match_workspace(&self.query_match_workspace, MatchEvaluationSide::Current);
+        }
         if !context.has_document_root {
             evaluator = evaluator.without_document_root();
         }
@@ -325315,22 +325857,7 @@ impl StyleEngine {
                 }
             }
         }
-        if matches.len() <= 1 {
-            return Ok(matches.into_iter().collect());
-        }
-
-        let match_count = matches.len();
-        let mut ordered_matches = Vec::with_capacity(match_count);
-        for node in self.tree.preorder(context.root) {
-            if matches.contains(&node) {
-                ordered_matches.push(node);
-                if ordered_matches.len() == match_count {
-                    break;
-                }
-            }
-        }
-        debug_assert_eq!(ordered_matches.len(), match_count);
-        Ok(ordered_matches)
+        Ok(matches)
     }
 
     pub(super) fn materialize_cold_matching_batch(
@@ -331146,6 +331673,12 @@ impl ProgramStaging {
 }
 
 /// One document's style engine.
+struct QuerySortedCandidatesStamp {
+    generation: u64,
+    root: StyleNodeID,
+    keys: Vec<DispatchKey>,
+}
+
 pub struct StyleEngine {
     /// The capture-local document identity, absent when record-replay is disabled.
     #[cfg(feature = "style-recording")]
@@ -331185,6 +331718,28 @@ pub struct StyleEngine {
     /// The old dense rule sequence while one sheet is synchronously reparsed.
     sheet_rule_replacement: Option<SheetRuleReplacement>,
     match_workspace: MatchEvaluationWorkspace,
+    /// Sibling positions and relation answers shared by the candidates of one DOM selector query.
+    /// A query can't mutate the tree it walks — so this is reset per-query, rather than per-candidate.
+    query_match_workspace: MatchEvaluationWorkspace,
+    /// Advanced when a selector query settles over a changed document — so a run of queries over
+    /// an unchanged one shares a single workspace. A query that never asks a positional question
+    /// pays a comparison, rather than a workspace rebuild.
+    selector_query_generation: u64,
+    /// The transaction version the last selector query settled at; the change detector for the
+    /// generation above.
+    query_settled_transaction_version: StyleTransactionVersion,
+    /// Tree-ordered candidates of the last posting-driven selector query. querySelector in a loop
+    /// typically asks with the same subject keys every time — so collect-and-sort pays once per
+    /// document change, rather than once per query.
+    query_sorted_candidates: Vec<StyleNodeID>,
+    /// What `query_sorted_candidates` was computed from. Same stamp, same list.
+    query_sorted_candidates_stamp: Option<QuerySortedCandidatesStamp>,
+    /// node -> preorder rank under the stamped root; how candidates get their tree order without a
+    /// walk per query.
+    query_preorder_ranks: HashMap<StyleNodeID, u32>,
+    query_preorder_ranks_stamp: Option<(u64, StyleNodeID)>,
+    /// Which query `query_match_workspace` holds answers for.
+    query_workspace_generation: u64,
     /// Scratch for the fact rows one exact candidate evaluation covers, reused across candidates.
     exact_covered_scratch: Vec<StyleNodeID>,
     /// Monotonic identity assigned to each non-empty normalized style transaction.
@@ -349899,10 +350454,23 @@ pub struct SelectorProgram {
     language_ranges: Vec<(u32, u32)>,
     /// Immutable dispatch analysis, retained so rebuilding scope dispatches never walks the IR.
     dispatch_metadata: CachedDispatchMetadata,
+    /// Per selector node: the dispatch-bloom bits a node evaluated against that compound must
+    /// carry — or zero, when nothing certain is required. A combinator walk consults this before
+    /// trying the compound, so an ancestor that cannot possibly match costs one AND rather than
+    /// an evaluation. Only always-resident key kinds contribute (id, class, attribute name, tag
+    /// name); everything else stays out — rather than risking a bit facts never set.
+    relation_target_blooms: Box<[u64]>,
     can_leave_scope: bool,
 }
 
 impl SelectorProgram {
+    /// Whether any operator here tests a sibling position. Only those queries can reuse sibling
+    /// geometry across candidates — and attaching a workspace to the rest would cache answers no
+    /// later candidate asks for.
+    pub(super) fn has_positional_test(&self) -> bool {
+        self.nodes.iter().any(|node| matches!(node, SelectorOp::NthPosition(_)))
+    }
+
     pub(super) fn collect_atoms(&self, atoms: &mut HashSet<StyleAtomID>) -> u64 {
         let mut visited = 0_u64;
         let mut insert = |atom: StyleAtomID| {
@@ -349959,6 +350527,13 @@ impl SelectorProgram {
     #[must_use]
     pub fn node(&self, id: SelectorNodeID) -> SelectorOp {
         self.nodes[id.0 as usize]
+    }
+
+    /// The dispatch-bloom bits a node evaluated against the compound at `id` must carry. Zero —
+    /// including for a program built without dispatch metadata — means no cheap requirement.
+    #[must_use]
+    fn relation_target_bloom(&self, id: SelectorNodeID) -> u64 {
+        self.relation_target_blooms.get(id.0 as usize).copied().unwrap_or(0)
     }
 
     #[must_use]
@@ -350290,6 +350865,36 @@ impl SelectorProgramBuilder {
 
 impl SelectorProgram {
     fn cache_dispatch_metadata(&mut self) {
+        let mut relation_target_blooms = vec![0_u64; self.nodes.len()];
+        for (id, target_bloom) in relation_target_blooms.iter_mut().enumerate() {
+            let node = SelectorNodeID(u32::try_from(id).unwrap_or(u32::MAX));
+            // Only a feature op standing directly in the compound is a test of the node itself.
+            // Anything deeper (a negation, a disjunction branch, a relative query's witness) may
+            // hold elsewhere, or not at all. And only the always-resident key kinds contribute —
+            // so a bit facts never set can't reject a node that matches.
+            let single = [node];
+            let operands = match self.node(node) {
+                SelectorOp::And { first, count } => self.operands(first, count),
+                _ => &single,
+            };
+            let mut bloom = 0_u64;
+            for &operand in operands {
+                if let SelectorOp::Feature(test) = self.node(operand) {
+                    let key = dispatch_key_for_feature(test);
+                    if matches!(
+                        key,
+                        DispatchKey::Id(_)
+                            | DispatchKey::Class(_)
+                            | DispatchKey::AttributeName(_)
+                            | DispatchKey::TagName(_)
+                    ) {
+                        bloom |= dispatch_bloom_bit(key);
+                    }
+                }
+            }
+            *target_bloom = bloom;
+        }
+        self.relation_target_blooms = relation_target_blooms.into_boxed_slice();
         self.dispatch_metadata.0 = (0..self.entries.len())
             .map(|entry| {
                 let selector_entry = &self.entries[entry];
@@ -353933,6 +354538,11 @@ pub struct MatchEvaluationWorkspace {
     relations_by_evaluation_side: [MatchRelationCache; 3],
     sibling_geometry_by_tree_side: [RefCell<SiblingSequenceGeometry>; 2],
     type_positions_by_evaluation_side: [RefCell<SiblingPositionColumn>; 3],
+    /// Whether final an+b answers are memoized at all. Style recalc runs many programs over one
+    /// node — so the same test repeats, and the memo hits. A selector query is one program asking
+    /// each node once: no ask ever repeats, so the memo would only ever be written — and a map
+    /// insert per positional test is the single-most-expensive part of answering one.
+    positional_answer_memo_suppressed: bool,
     /// Canonical plain an+b answers shared across independently compiled selector programs.
     positional_answers_by_evaluation_side: [RefCell<PositionalAnswers>; 3],
 }
@@ -354148,7 +354758,19 @@ impl MatchEvaluationWorkspace {
             .1
     }
 
+    /// A workspace for the candidates of one selector query: sibling geometry is shared, final
+    /// answers are not memoized.
+    pub(super) fn for_selector_query() -> Self {
+        Self {
+            positional_answer_memo_suppressed: true,
+            ..Self::default()
+        }
+    }
+
     fn positional_answer(&self, position: NthPosition, node: StyleNodeID, side: MatchEvaluationSide) -> Option<bool> {
+        if self.positional_answer_memo_suppressed {
+            return None;
+        }
         self.positional_answers_by_evaluation_side[side as usize]
             .borrow()
             .get(position, node)
@@ -354161,6 +354783,9 @@ impl MatchEvaluationWorkspace {
         side: MatchEvaluationSide,
         answer: bool,
     ) {
+        if self.positional_answer_memo_suppressed {
+            return;
+        }
         self.positional_answers_by_evaluation_side[side as usize]
             .borrow_mut()
             .insert(position, node, answer);
@@ -354606,6 +355231,24 @@ impl<'a> MatchEvaluator<'a> {
         }
     }
 
+    /// Whether the dispatch bloom leaves `node` any chance of matching the compound at `inner`.
+    /// A row facts cannot answer for yet is never prejudged.
+    #[inline]
+    fn relation_target_may_match(&self, program: &SelectorProgram, inner: SelectorNodeID, node: StyleNodeID) -> bool {
+        let required = program.relation_target_bloom(inner);
+        if required == 0 {
+            return true;
+        }
+        // The shadow scope root matches featurelessly — so its facts prove nothing about it.
+        if Some(node) == self.scope_shadow_root {
+            return true;
+        }
+        match self.row_of(node) {
+            Ok(row) => row.facts.dispatch_bloom_of(row.row, false) & required == required,
+            Err(_) => true,
+        }
+    }
+
     #[inline]
     fn matches_relation_target(
         &self,
@@ -354902,7 +355545,9 @@ impl<'a> MatchEvaluator<'a> {
                 let mut ancestor = self.parent_of(node);
                 while let Some(current) = ancestor {
                     counters.bump(Counter::CombinatorSteps);
-                    if self.matches_relation_target(program, inner, current, counters)? {
+                    if self.relation_target_may_match(program, inner, current)
+                        && self.matches_relation_target(program, inner, current, counters)?
+                    {
                         return Ok(true);
                     }
                     ancestor = self.parent_of(current);
@@ -357361,6 +358006,7 @@ pub fn read(payload: &mut PayloadReader) -> Result<SelectorProgram, Error> {
         relative_queries,
         language_ranges,
         dispatch_metadata: CachedDispatchMetadata::default(),
+        relation_target_blooms: Box::default(),
         can_leave_scope: payload.read_bool()?,
     };
     program.cache_dispatch_metadata();
@@ -578703,16 +579349,11 @@ pkg_check_modules(WOFF2 REQUIRED IMPORTED_TARGET libwoff2dec)
 
 # TODO: Figure out if we can do this the same way on all platforms
 if (NOT ANDROID)
-    pkg_check_modules(Jxl REQUIRED IMPORTED_TARGET libjxl)
-
     pkg_check_modules(AVCODEC REQUIRED IMPORTED_TARGET libavcodec)
     pkg_check_modules(AVFORMAT REQUIRED IMPORTED_TARGET libavformat)
     pkg_check_modules(AVUTIL REQUIRED IMPORTED_TARGET libavutil)
     pkg_check_modules(LIBSWRESAMPLE REQUIRED IMPORTED_TARGET libswresample)
 else()
-    find_package(libjxl REQUIRED)
-    find_package(hwy REQUIRED)
-
     find_package(FFMPEG REQUIRED)
 endif()
 
@@ -579259,60 +579900,6 @@ endif()
 
 if (ENABLE_FUZZERS)
     add_cxx_compile_options(-fno-omit-frame-pointer)
-endif()
-
-FILE: Meta/CMake/Findlibjxl.cmake
-
-#  SDL_image:  An example image loading library for use with SDL
-#  Copyright (C) 1997-2024 Sam Lantinga <slouken@libsdl.org>
-#
-#  This software is provided 'as-is', without any express or implied
-#  warranty.  In no event will the authors be held liable for any damages
-#  arising from the use of this software.
-#
-#  Permission is granted to anyone to use this software for any purpose,
-#  including commercial applications, and to alter it and redistribute it
-#  freely, subject to the following restrictions:
-#
-#  1. The origin of this software must not be misrepresented; you must not
-#     claim that you wrote the original software. If you use this software
-#     in a product, an acknowledgment in the product documentation would be
-#     appreciated but is not required.
-#  2. Altered source versions must be plainly marked as such, and must not be
-#     misrepresented as being the original software.
-#  3. This notice may not be removed or altered from any source distribution.
-
-include(FindPackageHandleStandardArgs)
-
-find_library(libjxl_LIBRARY
-    NAMES jxl
-)
-
-find_path(libjxl_INCLUDE_PATH
-    NAMES jxl/decode.h
-)
-
-set(libjxl_COMPILE_OPTIONS "" CACHE STRING "Extra compile options of libjxl")
-
-set(libjxl_LINK_LIBRARIES "" CACHE STRING "Extra link libraries of libjxl")
-
-set(libjxl_LINK_FLAGS "" CACHE STRING "Extra link flags of libjxl")
-
-find_package_handle_standard_args(libjxl
-    REQUIRED_VARS libjxl_LIBRARY libjxl_INCLUDE_PATH
-)
-
-if (libjxl_FOUND)
-    if (NOT TARGET libjxl::libjxl)
-        add_library(libjxl::libjxl UNKNOWN IMPORTED)
-        set_target_properties(libjxl::libjxl PROPERTIES
-            IMPORTED_LOCATION "${libjxl_LIBRARY}"
-            INTERFACE_INCLUDE_DIRECTORIES "${libjxl_INCLUDE_PATH}"
-            INTERFACE_COMPILE_OPTIONS "${libjxl_COMPILE_OPTIONS}"
-            INTERFACE_LINK_LIBRARIES "${libjxl_LINK_LIBRARIES}"
-            INTERFACE_LINK_FLAGS "${libjxl_LINK_FLAGS}"
-        )
-    endif()
 endif()
 
 FILE: Meta/CMake/Findmman.cmake
@@ -579872,6 +580459,13 @@ FILE: Meta/CMake/flatpak/cargo-sources.json
     {
         "type": "archive",
         "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/array-init/array-init-2.1.0.crate",
+        "sha256": "3d62b7694a562cdf5a74227903507c56ab2cc8bdd1f781ed5cb4cf9c9f810bfc",
+        "dest": "cargo/vendor/array-init-2.1.0"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/arrayvec/arrayvec-0.7.6.crate",
         "sha256": "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50",
         "dest": "cargo/vendor/arrayvec-0.7.6"
@@ -579903,6 +580497,13 @@ FILE: Meta/CMake/flatpak/cargo-sources.json
         "url": "https://static.crates.io/crates/bumpalo/bumpalo-3.20.2.crate",
         "sha256": "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb",
         "dest": "cargo/vendor/bumpalo-3.20.2"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/byteorder/byteorder-1.5.0.crate",
+        "sha256": "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b",
+        "dest": "cargo/vendor/byteorder-1.5.0"
     },
     {
         "type": "archive",
@@ -580313,6 +580914,34 @@ FILE: Meta/CMake/flatpak/cargo-sources.json
     {
         "type": "archive",
         "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/jxl/jxl-0.6.0.crate",
+        "sha256": "7b36e70efc347a34540f61ae91b7dc304ab0bb69bd6ac62fae182389c2788016",
+        "dest": "cargo/vendor/jxl-0.6.0"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/jxl_macros/jxl_macros-0.6.0.crate",
+        "sha256": "96f637cf167445cc64f12f59869e2d2dd4225f1db7e37ec33d1738c2c334d448",
+        "dest": "cargo/vendor/jxl_macros-0.6.0"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/jxl_simd/jxl_simd-0.6.0.crate",
+        "sha256": "7fb521e862fff1898373196c7c884f563210d2dba066d5dc08f36fc6cab35f17",
+        "dest": "cargo/vendor/jxl_simd-0.6.0"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/jxl_transforms/jxl_transforms-0.6.0.crate",
+        "sha256": "77097b14a98fa6f8bde99bd16dcd19e15a8ecceaba42a8d539138090e92dcf27",
+        "dest": "cargo/vendor/jxl_transforms-0.6.0"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/lazy_static/lazy_static-1.5.0.crate",
         "sha256": "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe",
         "dest": "cargo/vendor/lazy_static-1.5.0"
@@ -580372,6 +581001,13 @@ FILE: Meta/CMake/flatpak/cargo-sources.json
         "url": "https://static.crates.io/crates/num-bigint/num-bigint-0.4.6.crate",
         "sha256": "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9",
         "dest": "cargo/vendor/num-bigint-0.4.6"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/num-derive/num-derive-0.4.2.crate",
+        "sha256": "ed3955f1a9c7c0c15e092f9c887db08b1fc683305fdf6eb6684f22555355e202",
+        "dest": "cargo/vendor/num-derive-0.4.2"
     },
     {
         "type": "archive",
@@ -580600,6 +581236,13 @@ FILE: Meta/CMake/flatpak/cargo-sources.json
     {
         "type": "archive",
         "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/syn/syn-3.0.4.crate",
+        "sha256": "e6275cddf4610d1775e6d1fe9469b2e77d0f39fd98fb7450901b821e0c53649f",
+        "dest": "cargo/vendor/syn-3.0.4"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/synstructure/synstructure-0.13.2.crate",
         "sha256": "728a70f3dbaf5bab7f0c4b1ac8d7ae5ea60a4b5549c8a5914361c99147a709d2",
         "dest": "cargo/vendor/synstructure-0.13.2"
@@ -580628,9 +581271,23 @@ FILE: Meta/CMake/flatpak/cargo-sources.json
     {
         "type": "archive",
         "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/thiserror/thiserror-2.0.20.crate",
+        "sha256": "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f",
+        "dest": "cargo/vendor/thiserror-2.0.20"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/thiserror-impl/thiserror-impl-1.0.69.crate",
         "sha256": "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1",
         "dest": "cargo/vendor/thiserror-impl-1.0.69"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/thiserror-impl/thiserror-impl-2.0.20.crate",
+        "sha256": "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af",
+        "dest": "cargo/vendor/thiserror-impl-2.0.20"
     },
     {
         "type": "archive",
@@ -580891,11 +581548,13 @@ FILE: Meta/CMake/flatpak/cargo-sources.json
             "echo '{\"files\": {}, \"package\": \"291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d\"}' > cargo/vendor/anstyle-wincon-3.0.11/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c\"}' > cargo/vendor/anyhow-1.0.102/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1\"}' > cargo/vendor/arbitrary-1.4.2/.cargo-checksum.json",
+            "echo '{\"files\": {}, \"package\": \"3d62b7694a562cdf5a74227903507c56ab2cc8bdd1f781ed5cb4cf9c9f810bfc\"}' > cargo/vendor/array-init-2.1.0/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50\"}' > cargo/vendor/arrayvec-0.7.6/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8\"}' > cargo/vendor/autocfg-1.5.0/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6\"}' > cargo/vendor/base64-0.22.1/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af\"}' > cargo/vendor/bitflags-2.11.0/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb\"}' > cargo/vendor/bumpalo-3.20.2/.cargo-checksum.json",
+            "echo '{\"files\": {}, \"package\": \"1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b\"}' > cargo/vendor/byteorder-1.5.0/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"5abbd6eeda6885048d357edc66748eea6e0268e3dd11f326fff5bd248d779c26\"}' > cargo/vendor/calendrical_calculations-0.2.4/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"befbfd072a8e81c02f8c507aefce431fe5e7d051f83d48a23ffc9b9fe5a11799\"}' > cargo/vendor/cbindgen-0.29.2/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801\"}' > cargo/vendor/cfg-if-1.0.4/.cargo-checksum.json",
@@ -580954,6 +581613,10 @@ FILE: Meta/CMake/flatpak/cargo-sources.json
             "echo '{\"files\": {}, \"package\": \"413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186\"}' > cargo/vendor/itertools-0.13.0/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682\"}' > cargo/vendor/itoa-1.0.18/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"2ceaf4c6c48465bead8cb6a0b7c4ee0c86ecbb31239032b9c66ab9a08d2f3ee1\"}' > cargo/vendor/ixdtf-0.6.5/.cargo-checksum.json",
+            "echo '{\"files\": {}, \"package\": \"7b36e70efc347a34540f61ae91b7dc304ab0bb69bd6ac62fae182389c2788016\"}' > cargo/vendor/jxl-0.6.0/.cargo-checksum.json",
+            "echo '{\"files\": {}, \"package\": \"96f637cf167445cc64f12f59869e2d2dd4225f1db7e37ec33d1738c2c334d448\"}' > cargo/vendor/jxl_macros-0.6.0/.cargo-checksum.json",
+            "echo '{\"files\": {}, \"package\": \"7fb521e862fff1898373196c7c884f563210d2dba066d5dc08f36fc6cab35f17\"}' > cargo/vendor/jxl_simd-0.6.0/.cargo-checksum.json",
+            "echo '{\"files\": {}, \"package\": \"77097b14a98fa6f8bde99bd16dcd19e15a8ecceaba42a8d539138090e92dcf27\"}' > cargo/vendor/jxl_transforms-0.6.0/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe\"}' > cargo/vendor/lazy_static-1.5.0/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2\"}' > cargo/vendor/leb128fmt-0.1.0/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"48f5d2a454e16a5ea0f4ced81bd44e4cfc7bd3a507b61887c99fd3538b28e4af\"}' > cargo/vendor/libc-0.2.184/.cargo-checksum.json",
@@ -580963,6 +581626,7 @@ FILE: Meta/CMake/flatpak/cargo-sources.json
             "echo '{\"files\": {}, \"package\": \"5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897\"}' > cargo/vendor/log-0.4.29/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79\"}' > cargo/vendor/memchr-2.8.0/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9\"}' > cargo/vendor/num-bigint-0.4.6/.cargo-checksum.json",
+            "echo '{\"files\": {}, \"package\": \"ed3955f1a9c7c0c15e092f9c887db08b1fc683305fdf6eb6684f22555355e202\"}' > cargo/vendor/num-derive-0.4.2/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"7969661fd2958a5cb096e56c8e1ad0444ac2bbcd0061bd28660485a44879858f\"}' > cargo/vendor/num-integer-0.1.46/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841\"}' > cargo/vendor/num-traits-0.2.19/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50\"}' > cargo/vendor/once_cell-1.21.4/.cargo-checksum.json",
@@ -580995,11 +581659,14 @@ FILE: Meta/CMake/flatpak/cargo-sources.json
             "echo '{\"files\": {}, \"package\": \"6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596\"}' > cargo/vendor/stable_deref_trait-1.2.1/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f\"}' > cargo/vendor/strsim-0.11.1/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"e665b8803e7b1d2a727f4023456bbbbe74da67099c585258af0ad9c5013b9b99\"}' > cargo/vendor/syn-2.0.117/.cargo-checksum.json",
+            "echo '{\"files\": {}, \"package\": \"e6275cddf4610d1775e6d1fe9469b2e77d0f39fd98fb7450901b821e0c53649f\"}' > cargo/vendor/syn-3.0.4/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"728a70f3dbaf5bab7f0c4b1ac8d7ae5ea60a4b5549c8a5914361c99147a709d2\"}' > cargo/vendor/synstructure-0.13.2/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca\"}' > cargo/vendor/target-lexicon-0.13.5/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd\"}' > cargo/vendor/tempfile-3.27.0/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52\"}' > cargo/vendor/thiserror-1.0.69/.cargo-checksum.json",
+            "echo '{\"files\": {}, \"package\": \"ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f\"}' > cargo/vendor/thiserror-2.0.20/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1\"}' > cargo/vendor/thiserror-impl-1.0.69/.cargo-checksum.json",
+            "echo '{\"files\": {}, \"package\": \"bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af\"}' > cargo/vendor/thiserror-impl-2.0.20/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"c8323304221c2a851516f22236c5722a72eaa19749016521d6dff0824447d96d\"}' > cargo/vendor/tinystr-0.8.3/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"cf92845e79fc2e2def6a5d828f0801e29a2f8acc037becc5ab08595c7d5e9863\"}' > cargo/vendor/toml-0.9.12+spec-1.1.0/.cargo-checksum.json",
             "echo '{\"files\": {}, \"package\": \"92e1cfed4a3038bc5a127e35a2d360f145e1f4b971b551a2ba5fd7aedf7e1347\"}' > cargo/vendor/toml_datetime-0.7.5+spec-1.1.0/.cargo-checksum.json",
@@ -581593,64 +582260,6 @@ FILE: Meta/CMake/flatpak/org.ladybird.Ladybird.json
       "cleanup": [
         "/share/WebP"
       ]
-    },
-    {
-      "name": "highway",
-        "buildsystem": "cmake-ninja",
-        "sources": [
-          {
-            "type": "git",
-            "url": "https://github.com/google/highway.git",
-            "tag": "1.4.0",
-            "disable-submodules": true
-          }
-        ],
-        "config-opts": [
-          "-DCMAKE_BUILD_TYPE=Release",
-          "-DCMAKE_PREFIX_PATH=/app",
-          "-DCMAKE_INSTALL_LIBDIR=lib",
-          "-DHWY_ENABLE_INSTALL=ON",
-          "-DHWY_ENABLE_EXAMPLES=OFF",
-          "-DHWY_ENABLE_TESTS=OFF",
-          "-DHWY_ENABLE_CONTRIB=OFF"
-        ]
-    },
-    {
-      "name": "libjxl",
-        "buildsystem": "cmake-ninja",
-        "sources": [
-          {
-            "type": "git",
-            "url": "https://github.com/libjxl/libjxl.git",
-            "tag": "v0.11.2",
-            "disable-submodules": true
-          }
-        ],
-        "config-opts": [
-          "-DCMAKE_BUILD_TYPE=Release",
-          "-DCMAKE_PREFIX_PATH=/app",
-          "-DCMAKE_INSTALL_LIBDIR=lib",
-          "-DJPEGXL_VERSION=0.11.1",
-          "-DJPEGXL_FORCE_SYSTEM_HWY=ON",
-          "-DJPEGXL_FORCE_SYSTEM_BROTLI=ON",
-          "-DJPEGXL_FORCE_SYSTEM_HWY=ON",
-          "-DJPEGXL_FORCE_SYSTEM_LCMS2=ON",
-          "-DJPEGXL_ENABLE_TOOLS=OFF",
-          "-DJPEGXL_ENABLE_BENCHMARK=OFF",
-          "-DJPEGXL_ENABLE_DOXYGEN=OFF",
-          "-DJPEGXL_ENABLE_EXAMPLES=OFF",
-          "-DJPEGXL_ENABLE_FUZZERS=OFF",
-          "-DJPEGXL_ENABLE_JNI=OFF",
-          "-DJPEGXL_ENABLE_MANPAGES=OFF",
-          "-DJPEGXL_ENABLE_OPENEXR=OFF",
-          "-DJPEGXL_ENABLE_PLUGINS=OFF",
-          "-DJPEGXL_ENABLE_SJPEG=OFF",
-          "-DJPEGXL_ENABLE_SKCMS=OFF",
-          "-DJPEGXL_ENABLE_TCMALLOC=OFF",
-          "-DBUILD_TESTING=OFF",
-          "-DCMAKE_FIND_PACKAGE_TARGETS_GLOBAL=ON",
-          "-DJPEGXL_BUNDLE_LIBPNG=OFF"
-        ]
     },
     {
       "name": "skia",
@@ -583067,7 +583676,7 @@ if(NOT rc EQUAL 0)
 endif()
 
 FILE: Meta/CMake/rust_crate.cmake
-# import_rust_crate(MANIFEST_PATH path/to/Cargo.toml CRATE_NAME name)
+# import_rust_crate(MANIFEST_PATH path/to/Cargo.toml CRATE_NAME name [PANIC_UNWIND])
 #
 # Builds a Rust static library crate using cargo and creates an IMPORTED target.
 # MANIFEST_PATH is relative to CMAKE_CURRENT_SOURCE_DIR.
@@ -583078,7 +583687,7 @@ FILE: Meta/CMake/rust_crate.cmake
 set_property(GLOBAL PROPERTY JOB_POOLS "${JOB_POOLS};cargo=1")
 
 function(import_rust_crate)
-    cmake_parse_arguments(PARSE_ARGV 0 ARG "" "MANIFEST_PATH;CRATE_NAME;FFI_OUTPUT_DIR;FFI_HEADER" "FEATURES;FFI_HEADERS")
+    cmake_parse_arguments(PARSE_ARGV 0 ARG "PANIC_UNWIND" "MANIFEST_PATH;CRATE_NAME;FFI_OUTPUT_DIR;FFI_HEADER" "FEATURES;FFI_HEADERS")
 
     if (NOT ARG_FFI_OUTPUT_DIR)
         set(ARG_FFI_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}")
@@ -583097,6 +583706,12 @@ function(import_rust_crate)
         CRATE_NAME ${ARG_CRATE_NAME}
         FFI_OUTPUT_DIR "${ARG_FFI_OUTPUT_DIR}"
     )
+
+    # Rust's release profile normally aborts on panic. Crates that parse untrusted input may opt
+    # into unwinding so they can contain dependency panics at their FFI boundary.
+    if (ARG_PANIC_UNWIND)
+        list(APPEND cargo_env "CARGO_PROFILE_RELEASE_PANIC=unwind")
+    endif()
 
     set(cargo_feature_flags "")
     if (ARG_FEATURES)
@@ -585569,73 +586184,6 @@ FILE: Meta/CMake/vcpkg/overlay-ports/cpptrace/vcpkg.json
       "host": true
     }
   ]
-}
-
-FILE: Meta/CMake/vcpkg/overlay-ports/highway/portfile.cmake
-vcpkg_from_github(
-    OUT_SOURCE_PATH SOURCE_PATH
-    REPO google/highway
-    REF "${VERSION}"
-    SHA512 819422857d6a74e3a936c402698e078db5b7b88fb43767e62429ec7bd954fe93b017e75029a4df4a1a97ef3a2486107eef5247da751eb487640dea409f3f2fa2
-    HEAD_REF master
-)
-
-vcpkg_check_features(OUT_FEATURE_OPTIONS FEATURE_OPTIONS
-    FEATURES
-        contrib  HWY_ENABLE_CONTRIB
-)
-
-vcpkg_cmake_configure(
-    SOURCE_PATH "${SOURCE_PATH}"
-    OPTIONS
-        ${FEATURE_OPTIONS}
-        -DHWY_ENABLE_INSTALL=ON
-        -DHWY_ENABLE_EXAMPLES=OFF
-        -DHWY_ENABLE_TESTS=OFF
-)
-
-vcpkg_cmake_install()
-vcpkg_cmake_config_fixup(PACKAGE_NAME hwy CONFIG_PATH lib/cmake/hwy)
-
-if(VCPKG_LIBRARY_LINKAGE STREQUAL "dynamic")
-    vcpkg_replace_string("${CURRENT_PACKAGES_DIR}/include/hwy/highway_export.h" "defined(HWY_SHARED_DEFINE)" "1")
-endif()
-
-file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/include")
-vcpkg_fixup_pkgconfig()
-
-vcpkg_install_copyright(FILE_LIST "${SOURCE_PATH}/LICENSE")
-file(INSTALL "${CMAKE_CURRENT_LIST_DIR}/usage" DESTINATION "${CURRENT_PACKAGES_DIR}/share/${PORT}")
-
-FILE: Meta/CMake/vcpkg/overlay-ports/highway/usage
-highway provides CMake targets:
-
-    find_package(hwy CONFIG REQUIRED)
-    target_link_libraries(main PRIVATE hwy::hwy)
-
-FILE: Meta/CMake/vcpkg/overlay-ports/highway/vcpkg.json
-{
-  "name": "highway",
-  "version": "1.4.0",
-  "description": "Performance-portable, length-agnostic SIMD with runtime dispatch",
-  "homepage": "https://github.com/google/highway",
-  "license": "Apache-2.0",
-  "dependencies": [
-    {
-      "name": "vcpkg-cmake",
-      "host": true
-    },
-    {
-      "name": "vcpkg-cmake-config",
-      "host": true
-    }
-  ],
-  "features": {
-    "contrib": {
-      "description": "SIMD related utility functions",
-      "supports": "!uwp"
-    }
-  }
 }
 
 FILE: Meta/CMake/vcpkg/overlay-ports/libtommath/bcrypt.patch
@@ -622989,709 +623537,3 @@ void ContextState::paint_current_display_list(Web::Painting::DisplayListPlayerSk
     auto& canvas = surface.canvas();
     auto save_count = canvas.save();
     if (damage_rect.has_value()) {
-        canvas.clipIRect(SkIRect::MakeXYWH(damage_rect->x(), damage_rect->y(), damage_rect->width(), damage_rect->height()));
-        canvas.clear(surface_clear_color);
-    }
-    paint_display_list(surface);
-    canvas.restoreToCount(save_count);
-}
-
-}
-
-FILE: Services/Compositor/ContextState.h
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/Function.h>
-#include <AK/Noncopyable.h>
-#include <AK/NonnullRefPtr.h>
-#include <AK/Optional.h>
-#include <AK/RefPtr.h>
-#include <AK/Vector.h>
-#include <Compositor/BackingStoreManager.h>
-#include <Compositor/ViewportScrollbarController.h>
-#include <LibCore/Forward.h>
-#include <LibGfx/PaintingSurface.h>
-#include <LibGfx/Point.h>
-#include <LibGfx/Rect.h>
-#include <LibGfx/ShareableBitmap.h>
-#include <LibGfx/Size.h>
-#include <LibWeb/Compositor/AsyncScrollTree.h>
-#include <LibWeb/Compositor/AsyncScrollingState.h>
-#include <LibWeb/Compositor/SmoothScrollAnimation.h>
-#include <LibWeb/Compositor/Types.h>
-#include <LibWeb/Forward.h>
-#include <LibWeb/Painting/AccumulatedVisualContext.h>
-#include <LibWeb/Painting/DisplayList.h>
-#include <LibWeb/Painting/DisplayListResourceStorage.h>
-#include <LibWeb/Painting/ScrollState.h>
-
-namespace Gfx {
-
-class SkiaBackendContext;
-
-}
-
-namespace Web {
-
-struct MouseEvent;
-struct PinchEvent;
-
-}
-
-namespace Web::Painting {
-
-class DisplayListPlayerSkia;
-
-}
-
-namespace Compositor {
-
-class CompositorStateWebContentClient;
-using CompositedContextResolver = Function<RefPtr<Gfx::PaintingSurface>(Web::Compositor::CompositorContextId)>;
-
-class ContextState {
-    AK_MAKE_NONCOPYABLE(ContextState);
-    AK_MAKE_NONMOVABLE(ContextState);
-
-public:
-    struct AsyncScrollResult {
-        Web::Compositor::AsyncScrollEnqueueResult enqueue_result;
-        Optional<Gfx::IntRect> frame_to_present;
-    };
-
-    struct ContextUpdateResult {
-        bool accepted { false };
-        Optional<Gfx::IntRect> frame_to_present;
-        bool should_request_rendering_update { false };
-    };
-
-    struct PreparedFrame {
-        Gfx::PaintingSurface* rendered_surface { nullptr };
-        i32 bitmap_id { 0 };
-    };
-
-    struct PendingFrame {
-        Gfx::IntRect viewport_rect;
-        Gfx::IntRect damage_rect;
-    };
-
-    ContextState(Optional<u64> page_id, CompositorStateWebContentClient&, Web::Painting::CanvasSurfaceRegistry const&, bool async_scrolling_enabled);
-    ~ContextState();
-
-    bool is_owned_by(CompositorStateWebContentClient const&) const;
-    CompositorStateWebContentClient& web_content_client() const { return m_web_content_client; }
-    void request_rendering_update();
-    void dispatch_mouse_event_to_web_content(Web::MouseEvent const&);
-
-    bool presents_to_client() const { return m_presents_to_client; }
-    void stop_presenting_to_client();
-    void did_stop_presenting_to_client_if_needed(bool was_presenting_to_client, bool will_present_to_client);
-
-    void set_parent_context(Optional<Web::Compositor::CompositorContextId>);
-    Optional<Web::Compositor::CompositorContextId> parent_context_id() const { return m_parent_context_id; }
-    RefPtr<Gfx::PaintingSurface> latest_rendered_surface() const { return m_latest_rendered_surface; }
-
-    void apply_display_list_resource_transaction(Web::Painting::DisplayListResourceTransaction&&);
-    void update_image_frame_resources(Vector<Web::Painting::DisplayListImageFrameResource>);
-    void install_display_list_update(
-        NonnullRefPtr<Web::Painting::DisplayList>,
-        Web::Painting::AccumulatedVisualContextTree,
-        Web::Painting::ScrollStateSnapshot&&);
-    void update_visual_context_tree(Web::Painting::AccumulatedVisualContextTree);
-    void update_scroll_state(Web::Painting::ScrollStateSnapshot&&);
-    void set_video_sink(Web::Painting::VideoSinkResourceId, RefPtr<Media::VideoSink>);
-    HashMap<u64, Media::VideoSinkHandle> const& video_sink_handles() const { return m_display_list_resource_storage.video_sink_handles(); }
-
-    void invalidate_wheel_event_listener_state(u64 generation);
-    ContextUpdateResult handle_mouse_event(Web::MouseEvent const&);
-    ContextUpdateResult handle_pinch_event(Web::PinchEvent const&);
-    AsyncScrollResult async_scroll_by(
-        Web::UniqueNodeID document_id,
-        Gfx::FloatPoint position,
-        Gfx::FloatPoint delta,
-        Gfx::IntRect viewport_rect,
-        Web::Compositor::SnapContainerHandling,
-        Web::Compositor::AsyncScrollOperationTracking);
-    AsyncScrollResult smooth_scroll_to(Web::Compositor::AsyncScrollNodeStableID, Gfx::FloatPoint offset, Gfx::FloatPoint main_thread_offset, Gfx::IntRect viewport_rect, double device_pixels_per_css_pixel, Web::Compositor::ScrollAnimationKind);
-    void cancel_smooth_scroll(Web::Compositor::AsyncScrollNodeStableID);
-    Optional<Gfx::IntRect> advance_smooth_scroll_animations(MonotonicTime now);
-    bool has_active_smooth_scroll_animations() const { return !m_smooth_scroll_animations.is_empty(); }
-    ContextUpdateResult async_scroll_by(Gfx::FloatPoint position, Gfx::FloatPoint delta, Web::Compositor::SnapContainerHandling);
-    bool should_defer_main_thread_present_for_async_scroll() const;
-    Web::Compositor::PendingAsyncScrollUpdates take_pending_async_scroll_updates();
-
-    void viewport_size_updated(Gfx::IntSize, Web::Compositor::WindowResizingInProgress);
-    bool should_shrink_backing_stores_after_resize() const;
-    void schedule_backing_store_shrink(Function<void()>);
-    void finish_window_resize();
-    Optional<BackingStoreManager::Publication> resize_backing_stores_if_needed(RefPtr<Gfx::SkiaBackendContext> const&, BackingStoreManager::GpuSharing);
-    void invalidate_backing_stores();
-
-    bool set_display_metadata(Optional<u64> display_id, double refresh_rate);
-    Optional<u64> display_id() const { return m_display_id; }
-    double display_refresh_rate() const { return m_display_refresh_rate; }
-    bool set_visibility(Web::Compositor::ContextVisibility);
-    Web::Compositor::ContextVisibility visibility() const { return m_visibility; }
-
-    void queue_present_frame(PendingFrame);
-    Optional<Gfx::IntRect> pending_present_frame_viewport_rect() const;
-    void mark_pending_present_frame_scheduled();
-    void unschedule_pending_present_frame() { m_pending_present_frame_scheduled = false; }
-    bool has_pending_present_frame_scheduled_on(Optional<u64> display_id) const;
-    bool can_schedule_pending_present_frame_if_unblocked() const;
-    Optional<PendingFrame> take_pending_present_frame_if_unblocked();
-    bool needs_rasterization() const;
-    Optional<Gfx::IntRect> current_frame_rect_to_present() const;
-    Optional<Gfx::IntRect> video_present_rect() const;
-    Optional<PreparedFrame> prepare_frame(Web::Painting::DisplayListPlayerSkia&, PendingFrame, CompositedContextResolver const*);
-    void did_submit_prepared_frame(Gfx::IntRect);
-    bool present_synchronously(Web::Painting::DisplayListPlayerSkia&, CompositedContextResolver const*);
-    bool can_paint_screenshot(Gfx::ShareableBitmap&) const;
-    void paint_screenshot(Web::Painting::DisplayListPlayerSkia&, Gfx::ShareableBitmap&, CompositedContextResolver const*);
-    bool acknowledge_presented_bitmap(i32 bitmap_id);
-    void did_finish_gpu_present(i32 bitmap_id);
-
-private:
-    struct ActiveSmoothScrollAnimation {
-        Web::Compositor::AsyncScrollNodeStableID stable_node_id;
-        Web::Compositor::AsyncScrollOperationID operation_id;
-        Web::Compositor::SmoothScrollAnimation animation;
-        MonotonicTime started_at;
-    };
-
-    struct VisualViewportScrollDelta {
-        Web::Compositor::AsyncScrollOffset scroll_offset;
-        Gfx::FloatPoint consumed_delta;
-    };
-
-    void stop_backing_store_shrink_timer();
-    Web::Painting::AccumulatedVisualContextTree const& current_visual_context_tree() const;
-    Optional<Gfx::FloatPoint> viewport_scroll_offset_from(Vector<Web::Compositor::AsyncScrollOffset> const&) const;
-    Optional<float> visual_viewport_scale_for_compositing() const;
-    Optional<VisualViewportScrollDelta> apply_visual_viewport_scroll_delta(Gfx::FloatPoint);
-    Optional<Gfx::FloatPoint> reapply_pending_async_scroll_offsets(Vector<Web::Compositor::AsyncScrollOffset> const&);
-    void store_pending_async_scroll_offsets(Vector<Web::Compositor::AsyncScrollOffset> const&, Optional<Web::Compositor::AsyncScrollOperationID> = {});
-    void cancel_smooth_scroll_taken_over_by_user_input(Web::Compositor::AsyncScrollNodeID);
-    void note_user_scroll_gesture_end_if_drag_ended(bool was_dragging_viewport_scrollbar);
-    Optional<Gfx::IntRect> apply_viewport_scrollbar_drag(ViewportScrollbarController::Drag const&);
-    void rebuild_wheel_hit_test_targets();
-    bool is_present_blocked() const;
-    bool can_render_frame() const;
-    Web::Painting::AccumulatedVisualContextTree const& visual_context_tree_for_compositing() const;
-    void paint_current_display_list(Web::Painting::DisplayListPlayerSkia&, Gfx::PaintingSurface&, CompositedContextResolver const*, Optional<Gfx::IntRect> damage_rect = {});
-
-    CompositorStateWebContentClient& m_web_content_client;
-    Web::Painting::CanvasSurfaceRegistry const& m_canvas_surface_registry;
-    Optional<u64> m_page_id;
-    bool const m_async_scrolling_enabled { true };
-
-    bool m_presents_to_client { false };
-    Optional<Web::Compositor::CompositorContextId> m_parent_context_id;
-
-    RefPtr<Web::Painting::DisplayList const> m_display_list;
-    Optional<Web::Painting::AccumulatedVisualContextTree> m_visual_context_tree;
-    mutable Optional<Web::Painting::AccumulatedVisualContextTree> m_visual_context_tree_for_compositing;
-    Web::Painting::DisplayListResourceStorage m_display_list_resource_storage;
-    Web::Painting::ScrollStateSnapshot m_scroll_state_snapshot;
-    BackingStoreManager m_backing_store_manager;
-    RefPtr<Gfx::PaintingSurface> m_latest_rendered_surface;
-    RefPtr<Gfx::PaintingSurface> m_damage_surface;
-
-    Web::Compositor::AsyncScrollTree m_async_scroll_tree;
-    ViewportScrollbarController m_viewport_scrollbar_controller;
-
-    Vector<Web::Compositor::AsyncScrollOffset> m_pending_async_scroll_offsets;
-    Vector<Web::Compositor::AsyncScrollOperationID> m_completed_async_scroll_operation_ids;
-    Vector<Web::Compositor::AsyncScrollOperationID> m_async_scroll_operation_ids_taken_over_by_user_input;
-    bool m_user_scroll_gesture_ended { false };
-    Vector<ActiveSmoothScrollAnimation> m_smooth_scroll_animations;
-    Web::Compositor::AsyncScrollOperationID m_next_async_scroll_operation_id { 0 };
-    Gfx::IntRect m_async_scrolling_viewport_rect;
-    bool m_has_async_scrolling_state { false };
-    bool m_can_accept_async_wheel_events { false };
-    bool m_has_blocking_wheel_event_listeners { false };
-    u64 m_wheel_event_listener_state_generation { 0 };
-    Web::Compositor::WheelRoutingAdmission m_wheel_routing_admission { Web::Compositor::WheelRoutingAdmission::NoAsyncScrollingState };
-    Optional<Web::Painting::TransformData> m_async_visual_viewport_transform;
-
-    Gfx::IntSize m_viewport_size;
-    Web::Compositor::WindowResizingInProgress m_window_resize_in_progress { Web::Compositor::WindowResizingInProgress::No };
-    RefPtr<Core::Timer> m_backing_store_shrink_timer;
-    Optional<u64> m_display_id;
-    double m_display_refresh_rate { 60.0 };
-    Web::Compositor::ContextVisibility m_visibility { Web::Compositor::ContextVisibility::Visible };
-
-    Optional<PendingFrame> m_pending_present_frame;
-    bool m_pending_present_frame_scheduled { false };
-    Optional<Gfx::IntRect> m_presented_frame;
-    Optional<i32> m_gpu_present_bitmap_id_awaiting_completion;
-};
-
-}
-
-FILE: Services/Compositor/Forward.h
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-namespace Compositor {
-
-class ConnectionFromClient;
-class ConnectionFromWebContent;
-class CompositorState;
-
-}
-
-FILE: Services/Compositor/HostWebGLContext.cpp
-/*
- * Copyright (c) 2026, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <AK/Vector.h>
-#include <Compositor/HostWebGLContext.h>
-#include <Compositor/WebGLCommandReplayer.h>
-#include <LibGfx/Bitmap.h>
-#include <LibGfx/BitmapExport.h>
-#include <LibGfx/DecodedImageFrame.h>
-#include <LibGfx/PaintingSurface.h>
-#include <LibGfx/ShareableBitmap.h>
-#include <LibGfx/SkiaBackendContext.h>
-#include <LibWeb/WebGL/TextureUpload.h>
-#include <LibWeb/WebGL/WebGLCommandList.h>
-
-namespace Compositor {
-
-using namespace Web::WebGL;
-
-static constexpr GLsizei max_webgl_string_list_entries = 16384;
-
-HostWebGLContext::HostWebGLContext(NonnullOwnPtr<OpenGLContext> gl_context)
-    : m_gl_context(move(gl_context))
-{
-}
-
-OwnPtr<HostWebGLContext> HostWebGLContext::create(RefPtr<Gfx::SkiaBackendContext> skia_backend_context, OpenGLContext::WebGLVersion version, OpenGLContext::DrawingBufferOptions options, Gfx::IntSize initial_size)
-{
-    if (initial_size.width() < 1 || initial_size.width() > max_webgl_drawing_buffer_dimension
-        || initial_size.height() < 1 || initial_size.height() > max_webgl_drawing_buffer_dimension)
-        return {};
-    auto gl_context = OpenGLContext::create(skia_backend_context, version, options);
-    if (!gl_context)
-        return {};
-    gl_context->set_size(initial_size);
-    return adopt_own(*new HostWebGLContext(gl_context.release_nonnull()));
-}
-
-Optional<ReadonlyBytes> HostWebGLContext::shared_command_buffer_range(u64 offset, u64 size_in_bytes) const
-{
-    if (!m_shared_command_buffer.is_valid())
-        return {};
-    auto data_region = m_shared_command_buffer.data_region();
-    if (offset % WebGLCommandList::command_alignment != 0)
-        return {};
-    if (offset > data_region.size() || size_in_bytes > data_region.size() - offset)
-        return {};
-    return data_region.slice(offset, size_in_bytes);
-}
-
-ErrorOr<void> HostWebGLContext::execute_commands(ReadonlyBytes bytes, Vector<Gfx::DecodedImageFrame> const& bitmaps)
-{
-    m_gl_context->make_current();
-
-    // A non-preserving context's drawing buffer is cleared after being prepared for
-    // compositing, but the clear is deferred to here (the start of the next frame's
-    // commands) so a readback taken before then still sees the rendered frame.
-    if (m_needs_clear_before_next_frame) {
-        m_gl_context->clear_buffer_to_default_values();
-        m_needs_clear_before_next_frame = false;
-    }
-
-    return WebGLCommandList::for_each_command(bytes, [&]<typename Command>(Command const& command, [[maybe_unused]] ReadonlyBytes payload) -> ErrorOr<void> {
-        if constexpr (IsSame<Command, Commands::SetDrawingBufferSize>) {
-            return set_drawing_buffer_size(command.width, command.height);
-        } else if constexpr (IsSame<Command, Commands::ReadPixelsIntoPixelPackBuffer>) {
-            m_gl_context->read_pixels_robust_angle(command.x, command.y, command.width, command.height, command.format, command.type, 0, nullptr, nullptr, nullptr, reinterpret_cast<void*>(static_cast<uintptr_t>(command.offset)));
-            return {};
-        } else if constexpr (IsSame<Command, Commands::TexImage2DFromBitmap>) {
-            return tex_image2d_from_bitmap(command, bitmaps);
-        } else if constexpr (IsSame<Command, Commands::TexSubImage2DFromBitmap>) {
-            return tex_sub_image2d_from_bitmap(command, bitmaps);
-        } else if constexpr (IsSame<Command, Commands::TexImage3DFromBitmap>) {
-            return tex_image3d_from_bitmap(command, bitmaps);
-        } else if constexpr (IsSame<Command, Commands::TexSubImage3DFromBitmap>) {
-            return tex_sub_image3d_from_bitmap(command, bitmaps);
-        } else {
-            return replay_webgl_command(*m_gl_context, m_objects, command, payload);
-        }
-    });
-}
-
-static ErrorOr<Gfx::BitmapExportResult> convert_bitmap_for_upload(Vector<Gfx::DecodedImageFrame> const& bitmaps, u32 bitmap_index, GLenum format, GLenum type, bool has_explicit_destination_size, GLsizei destination_width, GLsizei destination_height, bool flip_y, bool premultiply_alpha)
-{
-    if (bitmap_index >= bitmaps.size())
-        return Error::from_string_literal("WebGL image upload references an out-of-range bitmap");
-
-    auto export_format = texture_export_format(format, type);
-    if (!export_format.has_value())
-        return Error::from_string_literal("WebGL image upload has an unsupported format+type combination");
-
-    int export_flags = 0;
-    if (flip_y)
-        export_flags |= Gfx::ExportFlags::FlipY;
-    if (premultiply_alpha)
-        export_flags |= Gfx::ExportFlags::PremultiplyAlpha;
-
-    Optional<int> target_width;
-    Optional<int> target_height;
-    if (has_explicit_destination_size) {
-        if (destination_width < 0 || destination_height < 0) {
-            return Gfx::BitmapExportResult {
-                .buffer = {},
-                .width = destination_width,
-                .height = destination_height,
-            };
-        }
-        target_width = destination_width;
-        target_height = destination_height;
-    }
-
-    auto const& frame = bitmaps[bitmap_index];
-    return Gfx::export_bitmap_to_byte_buffer(frame.bitmap(), frame.color_space(), export_format.value(), export_flags, target_width, target_height);
-}
-
-ErrorOr<void> HostWebGLContext::tex_image2d_from_bitmap(Commands::TexImage2DFromBitmap const& command, Vector<Gfx::DecodedImageFrame> const& bitmaps)
-{
-    auto converted = TRY(convert_bitmap_for_upload(bitmaps, command.bitmap_index, command.format, command.type, command.has_explicit_destination_size, command.destination_width, command.destination_height, command.flip_y, command.premultiply_alpha));
-    m_gl_context->tex_image2d_robust_angle(command.target, command.level, command.internalformat, converted.width, converted.height, 0, command.format, command.type, converted.buffer.size(), converted.buffer.data());
-    return {};
-}
-
-ErrorOr<void> HostWebGLContext::tex_sub_image2d_from_bitmap(Commands::TexSubImage2DFromBitmap const& command, Vector<Gfx::DecodedImageFrame> const& bitmaps)
-{
-    auto converted = TRY(convert_bitmap_for_upload(bitmaps, command.bitmap_index, command.format, command.type, command.has_explicit_destination_size, command.destination_width, command.destination_height, command.flip_y, command.premultiply_alpha));
-    m_gl_context->tex_sub_image2d_robust_angle(command.target, command.level, command.xoffset, command.yoffset, converted.width, converted.height, command.format, command.type, converted.buffer.size(), converted.buffer.data());
-    return {};
-}
-
-ErrorOr<void> HostWebGLContext::tex_image3d_from_bitmap(Commands::TexImage3DFromBitmap const& command, Vector<Gfx::DecodedImageFrame> const& bitmaps)
-{
-    auto converted = TRY(convert_bitmap_for_upload(bitmaps, command.bitmap_index, command.format, command.type, command.has_explicit_destination_size, command.destination_width, command.destination_height, command.flip_y, command.premultiply_alpha));
-    m_gl_context->tex_image3d_robust_angle(command.target, command.level, command.internalformat, converted.width, converted.height, command.depth, 0, command.format, command.type, converted.buffer.size(), converted.buffer.data());
-    return {};
-}
-
-ErrorOr<void> HostWebGLContext::tex_sub_image3d_from_bitmap(Commands::TexSubImage3DFromBitmap const& command, Vector<Gfx::DecodedImageFrame> const& bitmaps)
-{
-    auto converted = TRY(convert_bitmap_for_upload(bitmaps, command.bitmap_index, command.format, command.type, command.has_explicit_destination_size, command.destination_width, command.destination_height, command.flip_y, command.premultiply_alpha));
-    m_gl_context->tex_sub_image3d_robust_angle(command.target, command.level, command.xoffset, command.yoffset, command.zoffset, converted.width, converted.height, command.depth, command.format, command.type, converted.buffer.size(), converted.buffer.data());
-    return {};
-}
-
-ErrorOr<ByteBuffer> HostWebGLContext::execute_sync_call(ReadonlyBytes request)
-{
-    m_gl_context->make_current();
-    return handle_webgl_sync_call(*m_gl_context, m_objects, request);
-}
-
-ErrorOr<NonnullRefPtr<Gfx::PaintingSurface>> HostWebGLContext::prepare_for_compositing(bool preserve_drawing_buffer)
-{
-    // Flush all pending GL work so Skia samples the finished drawing buffer. The
-    // default framebuffer was written behind Skia's back, so discard cached snapshots
-    // before the display-list player asks Skia for an image.
-    m_gl_context->present(/* preserve_drawing_buffer= */ true);
-
-    auto drawing_surface = m_gl_context->surface();
-    if (!drawing_surface)
-        return Error::from_string_literal("WebGL context has no drawing buffer");
-    m_gl_context->notify_content_will_change();
-
-    // Defer the clear (see execute_commands) so a readback before the next frame still sees
-    // this frame.
-    if (!preserve_drawing_buffer)
-        m_needs_clear_before_next_frame = true;
-
-    return drawing_surface.release_nonnull();
-}
-
-RefPtr<Gfx::PaintingSurface> HostWebGLContext::surface()
-{
-    return m_gl_context->surface();
-}
-
-Gfx::ShareableBitmap HostWebGLContext::read_back_drawing_buffer(Gfx::IntRect rect)
-{
-    m_gl_context->make_current();
-    m_gl_context->present(/* preserve_drawing_buffer= */ true);
-    auto surface = m_gl_context->surface();
-    if (!surface)
-        return {};
-
-    auto clipped_rect = rect.intersected(surface->rect());
-    if (clipped_rect.is_empty())
-        return {};
-
-    auto bitmap_or_error = Gfx::Bitmap::create_shareable(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, clipped_rect.size());
-    if (bitmap_or_error.is_error())
-        return {};
-    auto bitmap = bitmap_or_error.release_value();
-    surface->flush();
-    surface->read_into_bitmap(*bitmap, clipped_rect.location());
-    return Gfx::ShareableBitmap { move(bitmap), Gfx::ShareableBitmap::ConstructWithKnownGoodBitmap };
-}
-
-ReadPixelsResult HostWebGLContext::read_pixels_robust_angle(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLsizei buf_size, Core::AnonymousBuffer pixels)
-{
-    VERIFY(buf_size >= 0);
-    VERIFY(static_cast<size_t>(buf_size) <= pixels.size());
-
-    m_gl_context->make_current();
-
-    GLsizei length = 0;
-    GLsizei columns = 0;
-    GLsizei rows = 0;
-    m_gl_context->read_pixels_robust_angle(x, y, width, height, format, type, buf_size, &length, &columns, &rows, pixels.data<void>());
-    return {
-        .length = length,
-        .columns = columns,
-        .rows = rows,
-    };
-}
-
-bool HostWebGLContext::read_buffer_sub_data(GLenum target, Web::WebGL::GLintptr offset, Web::WebGL::GLintptr size, Core::AnonymousBuffer data)
-{
-    VERIFY(size >= 0);
-    VERIFY(static_cast<size_t>(size) <= data.size());
-
-    m_gl_context->make_current();
-
-    if (auto* mapped = m_gl_context->map_buffer_range(target, offset, size, GL_MAP_READ_BIT)) {
-        __builtin_memcpy(data.data<void>(), mapped, static_cast<size_t>(size));
-        m_gl_context->unmap_buffer(target);
-        return true;
-    }
-    return false;
-}
-
-ErrorOr<void> HostWebGLContext::set_drawing_buffer_size(int width, int height)
-{
-    VERIFY(width >= 1);
-    VERIFY(width <= max_webgl_drawing_buffer_dimension);
-    VERIFY(height >= 1);
-    VERIFY(height <= max_webgl_drawing_buffer_dimension);
-    m_gl_context->set_size({ width, height });
-    m_gl_context->make_current();
-    return {};
-}
-
-ErrorOr<void> replay_webgl_command(OpenGLContext& gl, WebGLObjectMap& objects, Commands::ShaderSource const& command, ReadonlyBytes payload)
-{
-    auto source_bytes = WebGLCommandList::resolve_string_span(payload, command.source);
-    auto shader = objects.lookup(command.shader);
-    GLchar const* source = reinterpret_cast<GLchar const*>(source_bytes.data());
-    GLint length = static_cast<GLint>(source_bytes.size() - 1);
-    gl.shader_source(shader, 1, &source, &length);
-    return {};
-}
-
-// Splits a payload of `count` packed NUL-terminated strings into pointers.
-static ErrorOr<Vector<GLchar const*>> split_packed_strings(ReadonlyBytes bytes, GLsizei count)
-{
-    if (count < 0 || count > max_webgl_string_list_entries)
-        return Error::from_string_literal("WebGL string list is too long");
-    Vector<GLchar const*> strings;
-    strings.ensure_capacity(count);
-    size_t cursor = 0;
-    for (GLsizei i = 0; i < count; ++i) {
-        auto start = cursor;
-        while (cursor < bytes.size() && bytes[cursor] != 0)
-            ++cursor;
-        if (cursor >= bytes.size())
-            return Error::from_string_literal("WebGL string is not NUL-terminated");
-        strings.unchecked_append(reinterpret_cast<GLchar const*>(bytes.data() + start));
-        ++cursor;
-    }
-    return strings;
-}
-
-ErrorOr<void> replay_webgl_command(OpenGLContext& gl, WebGLObjectMap& objects, Commands::TransformFeedbackVaryings const& command, ReadonlyBytes payload)
-{
-    auto varyings_bytes = WebGLCommandList::resolve_data_span(payload, command.varyings);
-    auto varyings = TRY(split_packed_strings(varyings_bytes, command.count));
-    auto program = objects.lookup(command.program);
-    gl.transform_feedback_varyings(program, command.count, varyings.data(), command.buffer_mode);
-    return {};
-}
-
-ErrorOr<ByteBuffer> handle_one(OpenGLContext& gl, WebGLObjectMap&, SyncCalls::GetString::Request const& request, ReadonlyBytes)
-{
-    auto const* value = gl.get_string(request.name);
-    static constexpr u8 empty_string[] { 0 };
-    auto value_bytes = value
-        ? ReadonlyBytes { value, __builtin_strlen(reinterpret_cast<char const*>(value)) + 1 }
-        : ReadonlyBytes { empty_string, sizeof(empty_string) };
-    SyncCalls::GetString::Reply reply {
-        .value = { WebGLCommandList::first_inline_data_offset(sizeof(SyncCalls::GetString::Reply)), static_cast<u32>(value_bytes.size()) },
-    };
-    return WebGLSyncCall::encode_reply(reply, value_bytes);
-}
-
-ErrorOr<ByteBuffer> handle_one(OpenGLContext& gl, WebGLObjectMap&, SyncCalls::GetVertexAttribPointervRobustANGLE::Request const& request, ReadonlyBytes)
-{
-    void* pointer = nullptr;
-    GLsizei length = 0;
-    gl.get_vertex_attrib_pointerv_robust_angle(request.index, request.pname, 1, &length, &pointer);
-    SyncCalls::GetVertexAttribPointervRobustANGLE::Reply reply {
-        .pointer = static_cast<Web::WebGL::GLintptr>(reinterpret_cast<uintptr_t>(pointer)),
-    };
-    return WebGLSyncCall::encode_reply(reply);
-}
-
-ErrorOr<ByteBuffer> handle_one(OpenGLContext& gl, WebGLObjectMap& objects, SyncCalls::GetUniformIndices::Request const& request, ReadonlyBytes payload)
-{
-    auto names_bytes = WebGLCommandList::resolve_data_span(payload, request.uniform_names);
-    auto names = TRY(split_packed_strings(names_bytes, request.uniform_count));
-    auto program = objects.lookup(request.program);
-    Vector<GLuint> indices;
-    indices.resize(request.uniform_count);
-    gl.get_uniform_indices(program, request.uniform_count, names.data(), indices.data());
-    ReadonlyBytes indices_bytes { indices.data(), indices.size() * sizeof(GLuint) };
-    SyncCalls::GetUniformIndices::Reply reply {
-        .uniform_indices = { WebGLCommandList::first_inline_data_offset(sizeof(SyncCalls::GetUniformIndices::Reply)), static_cast<u32>(indices_bytes.size()) },
-    };
-    return WebGLSyncCall::encode_reply(reply, indices_bytes);
-}
-
-}
-
-FILE: Services/Compositor/HostWebGLContext.h
-/*
- * Copyright (c) 2026, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/Error.h>
-#include <AK/HashMap.h>
-#include <AK/NonnullOwnPtr.h>
-#include <AK/OwnPtr.h>
-#include <AK/RefPtr.h>
-#include <Compositor/OpenGLContext.h>
-#include <Compositor/WebGLObjectMap.h>
-#include <LibCore/AnonymousBuffer.h>
-#include <LibGfx/Forward.h>
-#include <LibGfx/Size.h>
-#include <LibWeb/Painting/DisplayListResourceIds.h>
-#include <LibWeb/WebGL/Types.h>
-#include <LibWeb/WebGL/WebGLSharedCommandBuffer.h>
-
-namespace Web::WebGL::Commands {
-
-struct TexImage2DFromBitmap;
-struct TexSubImage2DFromBitmap;
-struct TexImage3DFromBitmap;
-struct TexSubImage3DFromBitmap;
-
-}
-
-namespace Compositor {
-
-class HostWebGLContext {
-public:
-    static OwnPtr<HostWebGLContext> create(RefPtr<Gfx::SkiaBackendContext>, OpenGLContext::WebGLVersion, OpenGLContext::DrawingBufferOptions, Gfx::IntSize initial_size);
-
-    ErrorOr<void> execute_commands(ReadonlyBytes, Vector<Gfx::DecodedImageFrame> const& bitmaps);
-
-    void set_shared_command_buffer(Web::WebGL::WebGLSharedCommandBuffer shared_command_buffer) { m_shared_command_buffer = move(shared_command_buffer); }
-    Optional<ReadonlyBytes> shared_command_buffer_range(u64 offset, u64 size_in_bytes) const;
-    void store_executed_flush_sequence_number(u64 flush_sequence_number) { m_shared_command_buffer.store_executed_flush_sequence_number(flush_sequence_number); }
-    ErrorOr<ByteBuffer> execute_sync_call(ReadonlyBytes request);
-    Gfx::ShareableBitmap read_back_drawing_buffer(Gfx::IntRect);
-    Web::WebGL::ReadPixelsResult read_pixels_robust_angle(Web::WebGL::GLint x, Web::WebGL::GLint y, Web::WebGL::GLsizei width, Web::WebGL::GLsizei height, Web::WebGL::GLenum format, Web::WebGL::GLenum type, Web::WebGL::GLsizei buf_size, Core::AnonymousBuffer pixels);
-    bool read_buffer_sub_data(Web::WebGL::GLenum target, Web::WebGL::GLintptr offset, Web::WebGL::GLintptr size, Core::AnonymousBuffer data);
-    ErrorOr<NonnullRefPtr<Gfx::PaintingSurface>> prepare_for_compositing(bool preserve_drawing_buffer);
-    RefPtr<Gfx::PaintingSurface> surface();
-
-    OpenGLContext& gl_context() { return *m_gl_context; }
-
-private:
-    explicit HostWebGLContext(NonnullOwnPtr<OpenGLContext>);
-
-    ErrorOr<void> set_drawing_buffer_size(int width, int height);
-    ErrorOr<void> tex_image2d_from_bitmap(Web::WebGL::Commands::TexImage2DFromBitmap const&, Vector<Gfx::DecodedImageFrame> const& bitmaps);
-    ErrorOr<void> tex_sub_image2d_from_bitmap(Web::WebGL::Commands::TexSubImage2DFromBitmap const&, Vector<Gfx::DecodedImageFrame> const& bitmaps);
-    ErrorOr<void> tex_image3d_from_bitmap(Web::WebGL::Commands::TexImage3DFromBitmap const&, Vector<Gfx::DecodedImageFrame> const& bitmaps);
-    ErrorOr<void> tex_sub_image3d_from_bitmap(Web::WebGL::Commands::TexSubImage3DFromBitmap const&, Vector<Gfx::DecodedImageFrame> const& bitmaps);
-
-    NonnullOwnPtr<OpenGLContext> m_gl_context;
-    WebGLObjectMap m_objects;
-    Web::WebGL::WebGLSharedCommandBuffer m_shared_command_buffer;
-    bool m_needs_clear_before_next_frame { false };
-};
-
-}
-
-FILE: Services/Compositor/main.cpp
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <Compositor/ConnectionFromClient.h>
-#include <Compositor/Sandbox.h>
-#include <LibCore/ArgsParser.h>
-#include <LibCore/EventLoop.h>
-#include <LibCore/Process.h>
-#include <LibGfx/Font/Font.h>
-#include <LibGfx/Font/FontDatabase.h>
-#include <LibGfx/Font/PathFontProvider.h>
-#include <LibGfx/SkiaBackendContext.h>
-#include <LibIPC/SingleServer.h>
-#include <LibMain/Main.h>
-#include <LibWebView/Utilities.h>
-
-ErrorOr<int> ladybird_main(Main::Arguments arguments)
-{
-    AK::set_rich_debug_enabled(true);
-
-    StringView mach_server_name;
-    StringView cache_path;
-    bool wait_for_debugger = false;
-    bool enable_test_mode = false;
-    bool force_cpu_painting = false;
-    bool force_fontconfig = false;
-    bool disable_async_scrolling = false;
-    bool disable_sandbox = false;
-
-    Core::ArgsParser args_parser;
-    args_parser.add_option(mach_server_name, "Mach server name", "mach-server-name", 0, "mach_server_name");
-    args_parser.add_option(cache_path, "Path to the profile cache", "cache-path", 0, "path");
-    args_parser.add_option(wait_for_debugger, "Wait for debugger", "wait-for-debugger");
-    args_parser.add_option(enable_test_mode, "Enable test mode", "test-mode");
-    args_parser.add_option(force_cpu_painting, "Force CPU painting", "force-cpu-painting");
-    args_parser.add_option(force_fontconfig, "Force using fontconfig for font loading", "force-fontconfig");
-    args_parser.add_option(disable_async_scrolling, "Disable async scrolling", "disable-async-scrolling");
-    args_parser.add_option(disable_sandbox, "Disable process sandboxing", "disable-sandbox");
-    args_parser.parse(arguments);
-
-    if (wait_for_debugger)
-        Core::Process::wait_for_debugger_and_break();
-
-    if (enable_test_mode)
-        Gfx::force_hinting_for_testing(Gfx::FontHintingStyle::Normal);
-
-    WebView::platform_init();
