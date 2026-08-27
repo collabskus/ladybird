@@ -8,6 +8,7 @@
 #include <AK/StdLibExtras.h>
 #include <Compositor/CompositorState.h>
 #include <Compositor/ContextState.h>
+#include <Compositor/PausedDebuggerOverlay.h>
 #include <LibCore/Timer.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/PaintingSurface.h>
@@ -35,7 +36,7 @@ static void set_or_append_pending_scroll_offset(
 
 static Web::Painting::TransformData const& visual_viewport_transform(Web::Painting::AccumulatedVisualContextTree const& visual_context_tree)
 {
-    auto const& visual_viewport_node = visual_context_tree.node_at(Web::Painting::VISUAL_VIEWPORT_NODE_INDEX);
+    auto const& visual_viewport_node = visual_context_tree.spatial_node_at(Web::Painting::VISUAL_VIEWPORT_NODE_INDEX);
     auto const* transform = visual_viewport_node.data.get_pointer<Web::Painting::TransformData>();
     VERIFY(transform);
     return *transform;
@@ -197,6 +198,9 @@ void ContextState::update_visual_context_tree(Web::Painting::AccumulatedVisualCo
     }
     m_visual_context_tree = move(visual_context_tree);
     m_visual_context_tree_for_compositing.clear();
+    // A constraints refresh changes sticky payloads without a new snapshot, and the snapshot that
+    // pairs with this tree arrives in a separate message.
+    Web::Painting::resolve_sticky_offsets(*m_visual_context_tree, m_scroll_state_snapshot);
     if (m_async_visual_viewport_transform.has_value() && visual_viewport_transforms_match(visual_viewport_transform(*m_visual_context_tree), *m_async_visual_viewport_transform))
         m_async_visual_viewport_transform.clear();
 
@@ -398,7 +402,7 @@ ContextState::AsyncScrollResult ContextState::async_scroll_by(
         operation_id = ++m_next_async_scroll_operation_id;
 
     auto async_scroll_viewport_rect = viewport_rect;
-    auto scroll_offsets = m_async_scroll_tree.apply_scroll_delta(*scroll_target.node_id, delta, m_scroll_state_snapshot);
+    auto scroll_offsets = m_async_scroll_tree.apply_scroll_delta(*scroll_target.node_id, delta, current_visual_context_tree(), m_scroll_state_snapshot);
     if (scroll_offsets.is_empty()) {
         if (operation_id.has_value())
             m_completed_async_scroll_operation_ids.append(*operation_id);
@@ -498,7 +502,7 @@ Optional<Gfx::IntRect> ContextState::advance_smooth_scroll_animations(MonotonicT
         }
 
         auto sample = active_animation.animation.sample(now - active_animation.started_at);
-        auto new_offset = m_async_scroll_tree.set_scroll_offset(*node_id, sample.offset, m_scroll_state_snapshot);
+        auto new_offset = m_async_scroll_tree.set_scroll_offset(*node_id, sample.offset, current_visual_context_tree(), m_scroll_state_snapshot);
         VERIFY(new_offset.has_value());
         auto scroll_delta = *new_offset - *old_offset;
         if (!scroll_delta.is_zero()) {
@@ -578,7 +582,7 @@ ContextState::ContextUpdateResult ContextState::async_scroll_by(Gfx::FloatPoint 
     cancel_smooth_scroll_taken_over_by_user_input(*scroll_target.node_id);
 
     auto async_scroll_viewport_rect = m_async_scrolling_viewport_rect;
-    auto scroll_offsets = m_async_scroll_tree.apply_scroll_delta(*scroll_target.node_id, async_scroll_delta, m_scroll_state_snapshot);
+    auto scroll_offsets = m_async_scroll_tree.apply_scroll_delta(*scroll_target.node_id, async_scroll_delta, current_visual_context_tree(), m_scroll_state_snapshot);
     if (scroll_offsets.is_empty())
         return {
             .accepted = true,
@@ -621,6 +625,34 @@ void ContextState::viewport_size_updated(Gfx::IntSize viewport_size, Web::Compos
     m_window_resize_in_progress = is_page_presentation_context
         ? window_resize_in_progress
         : Web::Compositor::WindowResizingInProgress::No;
+}
+
+bool ContextState::set_paused_debugger_overlay(bool visible, double device_pixel_ratio, Optional<String> font_family, Optional<WebView::PausedDebuggerOverlayAction> hovered_action)
+{
+    VERIFY(device_pixel_ratio > 0);
+    if (m_paused_debugger_overlay_visible == visible
+        && m_paused_debugger_overlay_device_pixel_ratio == device_pixel_ratio
+        && m_paused_debugger_overlay_font_family == font_family
+        && m_paused_debugger_overlay_hovered_action == hovered_action)
+        return false;
+
+    m_paused_debugger_overlay_visible = visible;
+    m_paused_debugger_overlay_device_pixel_ratio = device_pixel_ratio;
+    m_paused_debugger_overlay_font_family = move(font_family);
+    m_paused_debugger_overlay_hovered_action = hovered_action;
+    return true;
+}
+
+Optional<Gfx::IntRect> ContextState::viewport_rect_for_ui_overlay() const
+{
+    if (m_viewport_size.is_empty())
+        return {};
+
+    auto viewport_rect = m_pending_present_frame.has_value()
+        ? m_pending_present_frame->viewport_rect
+        : m_presented_frame.value_or(Gfx::IntRect {});
+    viewport_rect.set_size(m_viewport_size);
+    return viewport_rect;
 }
 
 bool ContextState::should_shrink_backing_stores_after_resize() const
@@ -828,7 +860,7 @@ void ContextState::paint_screenshot(Web::Painting::DisplayListPlayerSkia& displa
     VERIFY(can_paint_screenshot(target_bitmap));
 
     auto target_surface = Gfx::PaintingSurface::wrap_bitmap(*target_bitmap.bitmap());
-    paint_current_display_list(display_list_player, *target_surface, composited_context_resolver);
+    paint_current_display_list(display_list_player, *target_surface, composited_context_resolver, {}, PaintUIOverlay::No);
     display_list_player.flush(*target_surface);
 }
 
@@ -939,6 +971,7 @@ Optional<Gfx::FloatPoint> ContextState::reapply_pending_async_scroll_offsets(Vec
         auto reconciled_scroll_offset = m_async_scroll_tree.set_scroll_offset(
             *node_id,
             pending_scroll_offset.compositor_scroll_offset,
+            current_visual_context_tree(),
             m_scroll_state_snapshot);
         if (reconciled_scroll_offset.has_value() && m_async_scroll_tree.scroll_node_is_viewport(*node_id))
             viewport_scroll_offset = *reconciled_scroll_offset;
@@ -981,7 +1014,7 @@ Optional<Gfx::IntRect> ContextState::apply_viewport_scrollbar_drag(ViewportScrol
         return {};
 
     cancel_smooth_scroll_taken_over_by_user_input(scroll_delta->scroll_node_id);
-    auto scroll_offsets = m_async_scroll_tree.apply_scroll_delta(scroll_delta->scroll_node_id, scroll_delta->delta, m_scroll_state_snapshot);
+    auto scroll_offsets = m_async_scroll_tree.apply_scroll_delta(scroll_delta->scroll_node_id, scroll_delta->delta, current_visual_context_tree(), m_scroll_state_snapshot);
     if (scroll_offsets.is_empty())
         return {};
     rebuild_wheel_hit_test_targets();
@@ -1027,7 +1060,7 @@ Web::Painting::AccumulatedVisualContextTree const& ContextState::visual_context_
     return *m_visual_context_tree_for_compositing;
 }
 
-void ContextState::paint_current_display_list(Web::Painting::DisplayListPlayerSkia& display_list_player, Gfx::PaintingSurface& surface, CompositedContextResolver const* composited_context_resolver, Optional<Gfx::IntRect> damage_rect)
+void ContextState::paint_current_display_list(Web::Painting::DisplayListPlayerSkia& display_list_player, Gfx::PaintingSurface& surface, CompositedContextResolver const* composited_context_resolver, Optional<Gfx::IntRect> damage_rect, PaintUIOverlay paint_ui_overlay)
 {
     VERIFY(m_display_list);
     auto surface_clear_color = Gfx::to_skia_color(m_display_list->surface_clear_color().value_or(Gfx::Color::Transparent));
@@ -1041,6 +1074,8 @@ void ContextState::paint_current_display_list(Web::Painting::DisplayListPlayerSk
             &m_canvas_surface_registry,
             composited_context_resolver);
         m_viewport_scrollbar_controller.paint(target_surface, display_list_player, m_scroll_state_snapshot);
+        if (paint_ui_overlay == PaintUIOverlay::Yes && m_paused_debugger_overlay_visible)
+            paint_paused_debugger_overlay(target_surface, m_viewport_size, m_paused_debugger_overlay_device_pixel_ratio, m_paused_debugger_overlay_font_family, m_paused_debugger_overlay_hovered_action);
     };
 
     if (damage_rect.has_value() && !damage_rect->is_empty() && presents_to_client() && damage_rect->size() != surface.size() && surface.skia_backend_context()) {
