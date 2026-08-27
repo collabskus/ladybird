@@ -1,4 +1,1002 @@
-﻿    return {};
+﻿    auto& font_provider = static_cast<Gfx::PathFontProvider&>(Gfx::FontDatabase::the().install_system_font_provider(make<Gfx::PathFontProvider>()));
+    if (force_fontconfig) {
+        font_provider.set_name_but_fixme_should_create_custom_system_font_provider("FontConfig"_string);
+        Gfx::FontDatabase::the().set_force_freetype_rasterization(true);
+    }
+    for (auto const& path : TRY(Gfx::FontDatabase::font_directories()))
+        font_provider.load_all_fonts_from_uri(TRY(String::formatted("file://{}", path)));
+    font_provider.load_all_fonts_from_uri("resource://fonts"sv);
+
+    if (!force_cpu_painting)
+        Gfx::SkiaBackendContext::initialize_gpu_backend();
+    auto skia_backend_context = Gfx::SkiaBackendContext::the_main_thread_context();
+
+    auto& event_loop = Core::EventLoop::initialize_for_current_thread();
+
+    if (!disable_sandbox)
+        TRY(Compositor::apply_sandbox(cache_path));
+
+    auto client = TRY(IPC::take_over_accepted_client_from_system_server<Compositor::ConnectionFromClient>(
+        mach_server_name, move(skia_backend_context), !disable_async_scrolling));
+
+    return event_loop.exec();
+}
+
+FILE: Services/Compositor/OpenGLContext.cpp
+/*
+ * Copyright (c) 2024, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+// Define GL_GLEXT_PROTOTYPES before OpenGLContext.h pulls in the GL headers without it.
+#define GL_GLEXT_PROTOTYPES 1
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
+extern "C" {
+#include <GLES2/gl2ext_angle.h>
+}
+#include <GLES3/gl3.h>
+
+// Define EGL_EGLEXT_PROTOTYPES before eglext.h pulls in the ANGLE extension headers without it.
+#define EGL_EGLEXT_PROTOTYPES 1
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+extern "C" {
+#include <EGL/eglext_angle.h>
+}
+
+#include <AK/HashMap.h>
+#include <AK/OwnPtr.h>
+#include <AK/String.h>
+#include <LibGfx/Bitmap.h>
+#include <LibGfx/PaintingSurface.h>
+#include <LibGfx/SharedImageBuffer.h>
+#ifdef USE_VULKAN_DMABUF_IMAGES
+#    include <LibGfx/VulkanImage.h>
+#endif
+#include <Compositor/OpenGLContext.h>
+
+// Enable WebGL if we're on macOS and can use Metal, if Linux can use ANGLE's OpenGL backend for CPU-painting tests,
+// if Windows can use ANGLE's Direct3D 11 backend, or if we can use shareable Vulkan images.
+#if defined(ENABLE_WEBGL_CPU_PAINTING_SURFACE) || defined(USE_VULKAN_DMABUF_IMAGES)
+#    define ENABLE_WEBGL 1
+#endif
+
+namespace Compositor {
+
+using namespace Web::WebGL;
+
+struct OpenGLContext::Impl {
+    EGLDisplay display { EGL_NO_DISPLAY };
+    EGLConfig config { EGL_NO_CONFIG_KHR };
+    EGLContext context { EGL_NO_CONTEXT };
+    EGLSurface surface { EGL_NO_SURFACE };
+
+    GLuint framebuffer { 0 };
+    GLuint color_buffer { 0 };
+    GLuint depth_buffer { 0 };
+    EGLint texture_target { 0 };
+    bool uses_cpu_painting_surface { false };
+
+#ifdef USE_VULKAN_DMABUF_IMAGES
+    EGLImage egl_image { EGL_NO_IMAGE };
+    struct {
+        PFNEGLQUERYDMABUFFORMATSEXTPROC query_dma_buf_formats { nullptr };
+        PFNEGLQUERYDMABUFMODIFIERSEXTPROC query_dma_buf_modifiers { nullptr };
+    } ext_procs;
+#endif
+};
+
+OpenGLContext::OpenGLContext(RefPtr<Gfx::SkiaBackendContext> skia_backend_context, Impl impl, WebGLVersion webgl_version, DrawingBufferOptions drawing_buffer_options)
+    : m_skia_backend_context(move(skia_backend_context))
+    , m_impl(make<Impl>(impl))
+    , m_webgl_version(webgl_version)
+    , m_drawing_buffer_options(drawing_buffer_options)
+{
+}
+
+OpenGLContext::~OpenGLContext()
+{
+#ifdef ENABLE_WEBGL
+    free_surface_resources();
+    eglMakeCurrent(m_impl->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglDestroyContext(m_impl->display, m_impl->context);
+#endif
+}
+
+void OpenGLContext::free_surface_resources()
+{
+#ifdef ENABLE_WEBGL
+    eglMakeCurrent(m_impl->display, EGL_NO_SURFACE, EGL_NO_SURFACE, m_impl->context);
+
+    if (m_impl->framebuffer) {
+        glDeleteFramebuffers(1, &m_impl->framebuffer);
+        m_impl->framebuffer = 0;
+    }
+
+    if (m_impl->color_buffer) {
+        glDeleteTextures(1, &m_impl->color_buffer);
+        m_impl->color_buffer = 0;
+    }
+
+    if (m_impl->depth_buffer) {
+        glDeleteRenderbuffers(1, &m_impl->depth_buffer);
+        m_impl->depth_buffer = 0;
+    }
+
+#    ifdef USE_VULKAN_DMABUF_IMAGES
+    if (m_impl->egl_image != EGL_NO_IMAGE) {
+        eglDestroyImage(m_impl->display, m_impl->egl_image);
+        m_impl->egl_image = EGL_NO_IMAGE;
+    }
+#    endif
+
+    if (m_impl->surface != EGL_NO_SURFACE) {
+#    ifdef AK_OS_MACOS
+        eglReleaseTexImage(m_impl->display, m_impl->surface, EGL_BACK_BUFFER);
+#    endif
+        eglDestroySurface(m_impl->display, m_impl->surface);
+        m_impl->surface = EGL_NO_SURFACE;
+    }
+#endif
+}
+
+#ifdef ENABLE_WEBGL
+static EGLConfig get_egl_config(EGLDisplay display)
+{
+    EGLint const config_attribs[] = {
+        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+        EGL_ALPHA_SIZE, 8,
+        EGL_DEPTH_SIZE, 24,
+        EGL_STENCIL_SIZE, 8,
+        EGL_NONE
+    };
+
+    EGLint number_of_configs;
+    eglChooseConfig(display, config_attribs, NULL, 0, &number_of_configs);
+
+    Vector<EGLConfig> configs;
+    configs.resize(number_of_configs);
+    eglChooseConfig(display, config_attribs, configs.data(), number_of_configs, &number_of_configs);
+    return number_of_configs > 0 ? configs[0] : EGL_NO_CONFIG_KHR;
+}
+#endif
+
+OwnPtr<OpenGLContext> OpenGLContext::create(RefPtr<Gfx::SkiaBackendContext> skia_backend_context, WebGLVersion webgl_version, [[maybe_unused]] DrawingBufferOptions drawing_buffer_options)
+{
+#ifdef ENABLE_WEBGL
+#    if defined(AK_OS_MACOS) || (defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID))
+    bool use_cpu_painting_surface = !skia_backend_context;
+#    elif defined(AK_OS_WINDOWS)
+    // FIXME: Share the drawing buffer with Skia's Direct3D 12 device (via an NT shared handle opened on ANGLE's
+    //        Direct3D 11 device) instead of reading it back to the CPU every frame.
+    bool use_cpu_painting_surface = true;
+#    else
+    bool use_cpu_painting_surface = false;
+#    endif
+
+#    if defined(AK_OS_MACOS) || defined(USE_VULKAN_DMABUF_IMAGES)
+    if (!use_cpu_painting_surface && !skia_backend_context)
+        return {};
+#    endif
+
+#    if !defined(AK_OS_MACOS) && !defined(USE_VULKAN_DMABUF_IMAGES)
+    if (!use_cpu_painting_surface)
+        return {};
+#    endif
+
+    EGLAttrib display_attributes[] = {
+        EGL_PLATFORM_ANGLE_TYPE_ANGLE,
+#    if defined(AK_OS_MACOS)
+        EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE,
+#    elif defined(USE_VULKAN_DMABUF_IMAGES) || (defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID))
+        EGL_PLATFORM_ANGLE_TYPE_OPENGL_ANGLE,
+        EGL_PLATFORM_ANGLE_NATIVE_PLATFORM_TYPE_ANGLE,
+        EGL_PLATFORM_SURFACELESS_MESA,
+#    elif defined(AK_OS_WINDOWS)
+        EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE,
+#    endif
+        EGL_NONE,
+    };
+
+    auto display = eglGetPlatformDisplay(EGL_PLATFORM_ANGLE_ANGLE, reinterpret_cast<void*>(EGL_DEFAULT_DISPLAY), display_attributes);
+    if (display == EGL_NO_DISPLAY) {
+        dbgln("Failed to get EGL display");
+        return {};
+    }
+
+    EGLint major, minor;
+    if (!eglInitialize(display, &major, &minor)) {
+        dbgln("Failed to initialize EGL");
+        return {};
+    }
+
+    auto* config = get_egl_config(display);
+    if (config == EGL_NO_CONFIG_KHR) {
+        dbgln("Failed to find EGLConfig");
+        return {};
+    }
+
+    EGLint texture_target;
+#    if defined(AK_OS_MACOS)
+    if (use_cpu_painting_surface) {
+        texture_target = EGL_TEXTURE_2D;
+    } else {
+        eglGetConfigAttrib(display, config, EGL_BIND_TO_TEXTURE_TARGET_ANGLE, &texture_target);
+        VERIFY(texture_target == EGL_TEXTURE_RECTANGLE_ANGLE || texture_target == EGL_TEXTURE_2D);
+    }
+#    else
+    texture_target = EGL_TEXTURE_2D;
+#    endif
+
+    EGLint context_attributes[] = {
+        EGL_CONTEXT_CLIENT_VERSION,
+        webgl_version == WebGLVersion::WebGL1 ? 2 : 3,
+        EGL_CONTEXT_WEBGL_COMPATIBILITY_ANGLE,
+        EGL_TRUE,
+        EGL_ROBUST_RESOURCE_INITIALIZATION_ANGLE,
+        EGL_TRUE,
+        EGL_CONTEXT_OPENGL_BACKWARDS_COMPATIBLE_ANGLE,
+        EGL_FALSE,
+#    ifdef USE_VULKAN_DMABUF_IMAGES
+        // we need GL_OES_EGL_image
+        EGL_EXTENSIONS_ENABLED_ANGLE,
+        EGL_TRUE,
+#    endif
+        EGL_NONE,
+        EGL_NONE,
+    };
+    auto context = eglCreateContext(display, config, EGL_NO_CONTEXT, context_attributes);
+    if (context == EGL_NO_CONTEXT) {
+        dbgln("Failed to create EGL context");
+        return {};
+    }
+
+#    ifdef USE_VULKAN_DMABUF_IMAGES
+    PFNEGLQUERYDMABUFFORMATSEXTPROC pfn_egl_query_dma_buf_formats_ext = nullptr;
+    PFNEGLQUERYDMABUFMODIFIERSEXTPROC pfn_egl_query_dma_buf_modifiers_ext = nullptr;
+
+    if (!use_cpu_painting_surface) {
+        pfn_egl_query_dma_buf_formats_ext = reinterpret_cast<PFNEGLQUERYDMABUFFORMATSEXTPROC>(eglGetProcAddress("eglQueryDmaBufFormatsEXT"));
+        if (!pfn_egl_query_dma_buf_formats_ext) {
+            dbgln("eglQueryDmaBufFormatsEXT unavailable");
+            return {};
+        }
+
+        pfn_egl_query_dma_buf_modifiers_ext = reinterpret_cast<PFNEGLQUERYDMABUFMODIFIERSEXTPROC>(eglGetProcAddress("eglQueryDmaBufModifiersEXT"));
+        if (!pfn_egl_query_dma_buf_modifiers_ext) {
+            dbgln("eglQueryDmaBufModifiersEXT unavailable");
+            return {};
+        }
+    }
+#    endif
+
+    return make<OpenGLContext>(skia_backend_context, Impl {
+                                                         .display = display,
+                                                         .config = config,
+                                                         .context = context,
+                                                         .texture_target = texture_target,
+                                                         .uses_cpu_painting_surface = use_cpu_painting_surface,
+#    ifdef USE_VULKAN_DMABUF_IMAGES
+                                                         .ext_procs = {
+                                                             .query_dma_buf_formats = pfn_egl_query_dma_buf_formats_ext,
+                                                             .query_dma_buf_modifiers = pfn_egl_query_dma_buf_modifiers_ext,
+                                                         },
+#    endif
+                                                     },
+        webgl_version, drawing_buffer_options);
+#else
+    (void)skia_backend_context;
+    (void)webgl_version;
+    return {};
+#endif
+}
+
+void OpenGLContext::notify_content_will_change()
+{
+#ifdef ENABLE_WEBGL
+    if (m_impl->uses_cpu_painting_surface)
+        return;
+    m_painting_surface->notify_content_will_change();
+#endif
+}
+
+void OpenGLContext::clear_buffer_to_default_values()
+{
+#ifdef ENABLE_WEBGL
+    GLint original_framebuffer;
+    GLint original_renderbuffer;
+    GLenum framebuffer_target = GL_FRAMEBUFFER;
+    GLenum framebuffer_binding = GL_FRAMEBUFFER_BINDING;
+    if (m_webgl_version == WebGLVersion::WebGL2) {
+        framebuffer_target = GL_DRAW_FRAMEBUFFER;
+        framebuffer_binding = GL_DRAW_FRAMEBUFFER_BINDING;
+    }
+    glGetIntegerv(framebuffer_binding, &original_framebuffer);
+    glGetIntegerv(GL_RENDERBUFFER_BINDING, &original_renderbuffer);
+
+    glBindFramebuffer(framebuffer_target, default_framebuffer());
+    glBindRenderbuffer(GL_RENDERBUFFER, default_renderbuffer());
+
+    Array<GLfloat, 4> current_clear_color;
+    glGetFloatv(GL_COLOR_CLEAR_VALUE, current_clear_color.data());
+
+    GLfloat current_clear_depth;
+    glGetFloatv(GL_DEPTH_CLEAR_VALUE, &current_clear_depth);
+
+    GLint current_clear_stencil;
+    glGetIntegerv(GL_STENCIL_CLEAR_VALUE, &current_clear_stencil);
+
+    // The implicit clear value for the color buffer is (0, 0, 0, 0)
+    glClearColor(0, 0, 0, 0);
+
+    // The implicit clear value for the depth buffer is 1.0.
+    glClearDepthf(1.0f);
+
+    // The implicit clear value for the stencil buffer is 0.
+    glClearStencil(0);
+
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+
+    // Restore the clear values.
+    glClearColor(current_clear_color[0], current_clear_color[1], current_clear_color[2], current_clear_color[3]);
+    glClearDepthf(current_clear_depth);
+    glClearStencil(current_clear_stencil);
+
+    glBindFramebuffer(framebuffer_target, original_framebuffer);
+    glBindRenderbuffer(GL_RENDERBUFFER, original_renderbuffer);
+#endif
+}
+
+#ifdef AK_OS_MACOS
+void OpenGLContext::allocate_iosurface_painting_surface()
+{
+    m_shared_image_buffer = make<Gfx::SharedImageBuffer>(Gfx::SharedImageBuffer::create(m_size));
+    m_painting_surface = Gfx::PaintingSurface::create_from_shared_image_buffer(*m_shared_image_buffer, *m_skia_backend_context, Gfx::PaintingSurface::Origin::BottomLeft);
+
+    EGLint const surface_attributes[] = {
+        EGL_WIDTH,
+        m_size.width(),
+        EGL_HEIGHT,
+        m_size.height(),
+        EGL_IOSURFACE_PLANE_ANGLE,
+        0,
+        EGL_TEXTURE_TARGET,
+        m_impl->texture_target,
+        EGL_TEXTURE_INTERNAL_FORMAT_ANGLE,
+        GL_BGRA_EXT,
+        EGL_TEXTURE_FORMAT,
+        EGL_TEXTURE_RGBA,
+        EGL_TEXTURE_TYPE_ANGLE,
+        GL_UNSIGNED_BYTE,
+        EGL_NONE,
+        EGL_NONE,
+    };
+    m_impl->surface = eglCreatePbufferFromClientBuffer(m_impl->display, EGL_IOSURFACE_ANGLE, m_shared_image_buffer->iosurface_handle().core_foundation_pointer(), m_impl->config, surface_attributes);
+
+    eglMakeCurrent(m_impl->display, EGL_NO_SURFACE, EGL_NO_SURFACE, m_impl->context);
+
+    glGenTextures(1, &m_impl->color_buffer);
+    glBindTexture(m_impl->texture_target == EGL_TEXTURE_RECTANGLE_ANGLE ? GL_TEXTURE_RECTANGLE_ANGLE : GL_TEXTURE_2D, m_impl->color_buffer);
+    auto result = eglBindTexImage(m_impl->display, m_impl->surface, EGL_BACK_BUFFER);
+    VERIFY(result == EGL_TRUE);
+
+    glViewport(0, 0, m_size.width(), m_size.height());
+}
+#endif
+
+#ifdef USE_VULKAN_DMABUF_IMAGES
+bool OpenGLContext::allocate_vkimage_painting_surface()
+{
+    VERIFY(m_skia_backend_context);
+
+    VkFormat vulkan_format = VK_FORMAT_B8G8R8A8_UNORM;
+    uint32_t drm_format = Gfx::vk_format_to_drm_format(vulkan_format);
+
+    // Ensure that our format is supported by the implementation.
+    // FIXME: try other formats if not?
+    EGLint num_formats = 0;
+    m_impl->ext_procs.query_dma_buf_formats(m_impl->display, 0, nullptr, &num_formats);
+    Vector<EGLint> egl_formats;
+    egl_formats.resize(num_formats);
+    m_impl->ext_procs.query_dma_buf_formats(m_impl->display, num_formats, egl_formats.data(), &num_formats);
+    if (egl_formats.find(drm_format) == egl_formats.end()) {
+        dbgln("Compositor: DMABUF format {:#x} is not supported by this driver; falling back to a CPU painting surface", drm_format);
+        return false;
+    }
+
+    EGLint num_modifiers = 0;
+    m_impl->ext_procs.query_dma_buf_modifiers(m_impl->display, drm_format, 0, nullptr, nullptr, &num_modifiers);
+    Vector<uint64_t> egl_modifiers;
+    egl_modifiers.resize(num_modifiers);
+    Vector<EGLBoolean> external_only;
+    external_only.resize(num_modifiers);
+    m_impl->ext_procs.query_dma_buf_modifiers(m_impl->display, drm_format, num_modifiers, egl_modifiers.data(), external_only.data(), &num_modifiers);
+    Vector<uint64_t> renderable_modifiers;
+    for (int i = 0; i < num_modifiers; ++i) {
+        if (!external_only[i]) {
+            renderable_modifiers.append(egl_modifiers[i]);
+        }
+    }
+
+    auto vulkan_image_or_error = Gfx::create_shared_vulkan_image(m_skia_backend_context->vulkan_context(), m_size.width(), m_size.height(), vulkan_format, renderable_modifiers);
+    if (vulkan_image_or_error.is_error()) {
+        dbgln("Compositor: create_shared_vulkan_image failed ({}); falling back to a CPU painting surface", vulkan_image_or_error.error());
+        return false;
+    }
+    auto vulkan_image = vulkan_image_or_error.release_value();
+    m_painting_surface = Gfx::PaintingSurface::create_from_vkimage(*m_skia_backend_context, vulkan_image, Gfx::PaintingSurface::Origin::BottomLeft);
+
+    EGLAttrib attribs[] = {
+        EGL_WIDTH,
+        m_size.width(),
+        EGL_HEIGHT,
+        m_size.height(),
+        EGL_LINUX_DRM_FOURCC_EXT,
+        drm_format,
+        EGL_DMA_BUF_PLANE0_FD_EXT,
+        vulkan_image->get_dma_buf_fd(), // EGL takes ownership of the fd
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+        0,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT,
+        static_cast<uint32_t>(vulkan_image->info.row_pitch),
+        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
+        static_cast<uint32_t>(vulkan_image->info.modifier & 0xffffffff),
+        EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
+        static_cast<uint32_t>(vulkan_image->info.modifier >> 32),
+        EGL_NONE,
+    };
+    m_impl->egl_image = eglCreateImage(m_impl->display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attribs);
+    if (m_impl->egl_image == EGL_NO_IMAGE) {
+        dbgln("Compositor: eglCreateImage for the DMABUF failed; falling back to a CPU painting surface");
+        return false;
+    }
+
+    m_impl->surface = EGL_NO_SURFACE;
+    eglMakeCurrent(m_impl->display, m_impl->surface, m_impl->surface, m_impl->context);
+
+    glGenTextures(1, &m_impl->color_buffer);
+    glBindTexture(GL_TEXTURE_2D, m_impl->color_buffer);
+    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, m_impl->egl_image);
+
+    glViewport(0, 0, m_size.width(), m_size.height());
+
+    return true;
+}
+#endif
+
+#if defined(ENABLE_WEBGL_CPU_PAINTING_SURFACE)
+void OpenGLContext::allocate_cpu_painting_surface()
+{
+    m_painting_surface = Gfx::PaintingSurface::create_with_size(
+        m_size,
+        Gfx::BitmapFormat::BGRA8888,
+        Gfx::AlphaType::Premultiplied);
+
+    m_impl->surface = EGL_NO_SURFACE;
+    eglMakeCurrent(m_impl->display, m_impl->surface, m_impl->surface, m_impl->context);
+
+    glGenTextures(1, &m_impl->color_buffer);
+    glBindTexture(GL_TEXTURE_2D, m_impl->color_buffer);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    GLint original_pixel_unpack_buffer = 0;
+    if (m_webgl_version == WebGLVersion::WebGL2) {
+        glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &original_pixel_unpack_buffer);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    }
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, m_size.width(), m_size.height(), 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    if (m_webgl_version == WebGLVersion::WebGL2)
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, original_pixel_unpack_buffer);
+
+    glViewport(0, 0, m_size.width(), m_size.height());
+}
+
+void OpenGLContext::copy_default_framebuffer_to_cpu_painting_surface()
+{
+    VERIFY(m_impl->uses_cpu_painting_surface);
+    VERIFY(m_painting_surface);
+
+    auto bitmap = MUST(Gfx::Bitmap::create(Gfx::BitmapFormat::RGBA8888, Gfx::AlphaType::Premultiplied, m_size));
+
+    GLenum framebuffer_target = GL_FRAMEBUFFER;
+    GLenum framebuffer_binding = GL_FRAMEBUFFER_BINDING;
+    if (m_webgl_version == WebGLVersion::WebGL2) {
+        framebuffer_target = GL_READ_FRAMEBUFFER;
+        framebuffer_binding = GL_READ_FRAMEBUFFER_BINDING;
+    }
+
+    GLint original_framebuffer;
+    glGetIntegerv(framebuffer_binding, &original_framebuffer);
+
+    GLint original_read_buffer = GL_COLOR_ATTACHMENT0;
+    if (m_webgl_version == WebGLVersion::WebGL2)
+        glGetIntegerv(GL_READ_BUFFER, &original_read_buffer);
+
+    glBindFramebuffer(framebuffer_target, default_framebuffer());
+    if (m_webgl_version == WebGLVersion::WebGL2)
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+
+    GLint original_pack_alignment;
+    glGetIntegerv(GL_PACK_ALIGNMENT, &original_pack_alignment);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+
+    GLint original_pixel_pack_buffer = 0;
+    GLint original_pack_row_length = 0;
+    GLint original_pack_skip_pixels = 0;
+    GLint original_pack_skip_rows = 0;
+    if (m_webgl_version == WebGLVersion::WebGL2) {
+        glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &original_pixel_pack_buffer);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+
+        glGetIntegerv(GL_PACK_ROW_LENGTH, &original_pack_row_length);
+        glGetIntegerv(GL_PACK_SKIP_PIXELS, &original_pack_skip_pixels);
+        glGetIntegerv(GL_PACK_SKIP_ROWS, &original_pack_skip_rows);
+        glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+        glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+        glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+    }
+
+    for (int source_y = 0; source_y < m_size.height(); ++source_y)
+        glReadPixels(0, source_y, m_size.width(), 1, GL_RGBA, GL_UNSIGNED_BYTE, bitmap->scanline_u8(m_size.height() - source_y - 1));
+
+    if (m_webgl_version == WebGLVersion::WebGL2) {
+        glPixelStorei(GL_PACK_ROW_LENGTH, original_pack_row_length);
+        glPixelStorei(GL_PACK_SKIP_PIXELS, original_pack_skip_pixels);
+        glPixelStorei(GL_PACK_SKIP_ROWS, original_pack_skip_rows);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, original_pixel_pack_buffer);
+    }
+    glPixelStorei(GL_PACK_ALIGNMENT, original_pack_alignment);
+
+    glBindFramebuffer(framebuffer_target, original_framebuffer);
+    if (m_webgl_version == WebGLVersion::WebGL2)
+        glReadBuffer(original_read_buffer);
+
+    m_painting_surface->write_from_bitmap(*bitmap);
+}
+#endif
+
+void OpenGLContext::allocate_painting_surface_if_needed()
+{
+#ifdef ENABLE_WEBGL
+    if (m_painting_surface)
+        return;
+
+    free_surface_resources();
+
+    VERIFY(!m_size.is_empty());
+
+#    if defined(AK_OS_MACOS)
+    if (m_impl->uses_cpu_painting_surface) {
+        allocate_cpu_painting_surface();
+    } else {
+        allocate_iosurface_painting_surface();
+    }
+#    elif defined(USE_VULKAN_DMABUF_IMAGES)
+#        if defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID)
+    if (m_impl->uses_cpu_painting_surface) {
+        allocate_cpu_painting_surface();
+    } else if (!allocate_vkimage_painting_surface()) {
+        // This driver advertises the DMABUF EGL extensions but can't actually allocate a Vulkan/DMABUF painting surface
+        // (unsupported format, modifier, or image import). Fall back to a CPU painting surface.
+        m_impl->uses_cpu_painting_surface = true;
+        free_surface_resources();
+        allocate_cpu_painting_surface();
+    }
+#        else
+    (void)allocate_vkimage_painting_surface();
+#        endif
+#    elif (defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID)) || defined(AK_OS_WINDOWS)
+    allocate_cpu_painting_surface();
+#    endif
+    VERIFY(m_painting_surface);
+    VERIFY(eglGetCurrentContext() == m_impl->context);
+
+    glGenFramebuffers(1, &m_impl->framebuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, m_impl->framebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, m_impl->texture_target == EGL_TEXTURE_RECTANGLE_ANGLE ? GL_TEXTURE_RECTANGLE_ANGLE : GL_TEXTURE_2D, m_impl->color_buffer, 0);
+
+    if (m_drawing_buffer_options.depth || m_drawing_buffer_options.stencil) {
+        glGenRenderbuffers(1, &m_impl->depth_buffer);
+        glBindRenderbuffer(GL_RENDERBUFFER, m_impl->depth_buffer);
+
+        if (m_drawing_buffer_options.depth && m_drawing_buffer_options.stencil) {
+            glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, m_size.width(), m_size.height());
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, m_impl->depth_buffer);
+        } else if (m_drawing_buffer_options.depth) {
+            glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, m_size.width(), m_size.height());
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, m_impl->depth_buffer);
+        } else {
+            VERIFY(m_drawing_buffer_options.stencil);
+            glRenderbufferStorage(GL_RENDERBUFFER, GL_STENCIL_INDEX8, m_size.width(), m_size.height());
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, m_impl->depth_buffer);
+        }
+    }
+
+    VERIFY(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+#endif
+}
+
+void OpenGLContext::set_size(Gfx::IntSize const& size)
+{
+    if (m_size != size) {
+        m_painting_surface = nullptr;
+    }
+    m_size = size;
+}
+
+void OpenGLContext::make_current()
+{
+#ifdef ENABLE_WEBGL
+    allocate_painting_surface_if_needed();
+    eglMakeCurrent(m_impl->display, EGL_NO_SURFACE, EGL_NO_SURFACE, m_impl->context);
+#endif
+}
+
+void OpenGLContext::present(bool preserve_drawing_buffer)
+{
+#ifdef ENABLE_WEBGL
+    make_current();
+
+    // "Before the drawing buffer is presented for compositing the implementation shall ensure that all rendering operations have been flushed to the drawing buffer."
+    // With Metal, glFlush flushes the command buffer, but without waiting for it to be scheduled or completed.
+    // eglWaitUntilWorkScheduledANGLE flushes the command buffer, and waits until it has been scheduled, hence the name.
+    // eglWaitUntilWorkScheduledANGLE only has an effect on CGL and Metal backends, so we only use it on macOS.
+#    if defined(AK_OS_MACOS)
+    if (m_impl->uses_cpu_painting_surface)
+        glFinish();
+    else
+        eglWaitUntilWorkScheduledANGLE(m_impl->display);
+#    elif defined(USE_VULKAN_DMABUF_IMAGES)
+    // FIXME: CPU sync for now, but it would be better to export a fence and have Skia wait for it before reading from the surface
+    glFinish();
+#    elif (defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID)) || defined(AK_OS_WINDOWS)
+    glFinish();
+#    endif
+
+#    if defined(ENABLE_WEBGL_CPU_PAINTING_SURFACE)
+    if (m_impl->uses_cpu_painting_surface)
+        copy_default_framebuffer_to_cpu_painting_surface();
+#    endif
+
+    // "By default, after compositing the contents of the drawing buffer shall be cleared to their default values, as shown in the table above.
+    // This default behavior can be changed by setting the preserveDrawingBuffer attribute of the WebGLContextAttributes object.
+    // If this flag is true, the contents of the drawing buffer shall be preserved until the author either clears or overwrites them."
+    if (!preserve_drawing_buffer) {
+        // FIXME: we're assuming the clear operation won't actually be submitted to the GPU
+        clear_buffer_to_default_values();
+    }
+#else
+    (void)preserve_drawing_buffer;
+#endif
+}
+
+RefPtr<Gfx::PaintingSurface> OpenGLContext::surface()
+{
+    return m_painting_surface;
+}
+
+u32 OpenGLContext::default_renderbuffer() const
+{
+    return m_impl->depth_buffer;
+}
+
+u32 OpenGLContext::default_framebuffer() const
+{
+    return m_impl->framebuffer;
+}
+
+Vector<String> OpenGLContext::get_supported_opengl_extensions()
+{
+#ifdef ENABLE_WEBGL
+    if (m_requestable_extensions.has_value())
+        return m_requestable_extensions.value();
+
+    make_current();
+
+    Vector<String> extensions;
+
+    if (auto const* extensions_string = reinterpret_cast<char const*>(glGetString(GL_EXTENSIONS))) {
+        StringView extensions_view(extensions_string, strlen(extensions_string));
+        for (auto extension : extensions_view.split_view(' '))
+            extensions.append(MUST(String::from_utf8(extension)));
+    }
+
+    if (auto const* requestable_extensions_string = reinterpret_cast<char const*>(glGetString(GL_REQUESTABLE_EXTENSIONS_ANGLE))) {
+        StringView requestable_extensions_view(requestable_extensions_string, strlen(requestable_extensions_string));
+        for (auto extension : requestable_extensions_view.split_view(' '))
+            extensions.append(MUST(String::from_utf8(extension)));
+    }
+
+    // We must cache this, because once extensions have been requested, they're no longer requestable extensions and would
+    // not appear in this list. However, we must always report every supported extension, regardless of what has already
+    // been requested.
+    m_requestable_extensions = extensions;
+    return extensions;
+#else
+    (void)m_webgl_version;
+    return {};
+#endif
+}
+
+}
+
+FILE: Services/Compositor/OpenGLContext.h
+/*
+ * Copyright (c) 2024, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/NonnullOwnPtr.h>
+#include <AK/NonnullRefPtr.h>
+#include <AK/OwnPtr.h>
+#include <AK/RefPtr.h>
+#include <AK/Vector.h>
+#include <LibGfx/Forward.h>
+#include <LibGfx/Size.h>
+#include <LibWeb/WebGL/GLFunctions.h>
+
+#ifdef AK_OS_MACOS
+#    include <LibGfx/SharedImageBuffer.h>
+#endif
+
+#if defined(AK_OS_MACOS) || (defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID)) || defined(AK_OS_WINDOWS)
+#    define ENABLE_WEBGL_CPU_PAINTING_SURFACE
+#endif
+
+namespace Compositor {
+
+class OpenGLContext : public Web::WebGL::GLFunctions {
+public:
+    using WebGLVersion = Web::WebGL::WebGLVersion;
+
+    struct DrawingBufferOptions {
+        bool depth;
+        bool stencil;
+        bool antialias;
+    };
+
+    static OwnPtr<OpenGLContext> create(RefPtr<Gfx::SkiaBackendContext>, WebGLVersion, DrawingBufferOptions);
+
+    void notify_content_will_change();
+    void clear_buffer_to_default_values();
+    void allocate_painting_surface_if_needed();
+
+    struct Impl;
+    OpenGLContext(RefPtr<Gfx::SkiaBackendContext>, Impl, WebGLVersion, DrawingBufferOptions);
+
+    ~OpenGLContext();
+
+    void make_current();
+
+    void present(bool preserve_drawing_buffer);
+
+    void set_size(Gfx::IntSize const&);
+
+    RefPtr<Gfx::PaintingSurface> surface();
+
+    u32 default_framebuffer() const;
+    u32 default_renderbuffer() const;
+
+    Vector<String> get_supported_opengl_extensions();
+
+private:
+    RefPtr<Gfx::SkiaBackendContext> m_skia_backend_context;
+    Gfx::IntSize m_size;
+    RefPtr<Gfx::PaintingSurface> m_painting_surface;
+#ifdef AK_OS_MACOS
+    OwnPtr<Gfx::SharedImageBuffer> m_shared_image_buffer;
+#endif
+    NonnullOwnPtr<Impl> m_impl;
+    Optional<Vector<String>> m_requestable_extensions;
+    WebGLVersion m_webgl_version;
+    [[maybe_unused]] DrawingBufferOptions m_drawing_buffer_options;
+
+    void free_surface_resources();
+#if defined(AK_OS_MACOS)
+    void allocate_iosurface_painting_surface();
+#endif
+#if defined(USE_VULKAN_DMABUF_IMAGES)
+    bool allocate_vkimage_painting_surface();
+#endif
+#if defined(ENABLE_WEBGL_CPU_PAINTING_SURFACE)
+    void allocate_cpu_painting_surface();
+    void copy_default_framebuffer_to_cpu_painting_surface();
+#endif
+};
+
+}
+
+FILE: Services/Compositor/Sandbox.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Error.h>
+
+namespace Compositor {
+
+[[nodiscard]] ErrorOr<void> apply_sandbox(StringView cache_path);
+
+}
+
+FILE: Services/Compositor/SandboxLinux.cpp
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <Compositor/Sandbox.h>
+#include <LibCore/Directory.h>
+#include <LibCore/Environment.h>
+#include <LibCore/StandardPaths.h>
+#include <LibGfx/Font/FontDatabase.h>
+#include <LibSandbox/Sandbox.h>
+#include <LibSandbox/Seccomp.h>
+#include <LibWebView/Utilities.h>
+
+namespace Compositor {
+
+ErrorOr<void> apply_sandbox(StringView)
+{
+    TRY(Sandbox::install_no_new_privileges());
+    TRY(Sandbox::configure_runtime());
+
+    Vector<Sandbox::LandlockPath> paths;
+    for (auto const& path : TRY(Gfx::FontDatabase::font_directories()))
+        TRY(Sandbox::add_landlock_path_if_exists(paths, path, Sandbox::LandlockPath::Access::ReadOnly));
+    TRY(Sandbox::add_landlock_path_if_exists(paths, TRY(String::formatted("{}/fonts", WebView::s_ladybird_resource_root)), Sandbox::LandlockPath::Access::ReadOnly));
+    TRY(Sandbox::add_landlock_path_if_exists(paths, "/lib"sv, Sandbox::LandlockPath::Access::ReadOnly));
+    TRY(Sandbox::add_landlock_path_if_exists(paths, "/lib64"sv, Sandbox::LandlockPath::Access::ReadOnly));
+    TRY(Sandbox::add_landlock_path_if_exists(paths, "/usr/lib"sv, Sandbox::LandlockPath::Access::ReadOnly));
+    TRY(Sandbox::add_landlock_path_if_exists(paths, "/usr/local/lib"sv, Sandbox::LandlockPath::Access::ReadOnly));
+    TRY(Sandbox::add_landlock_path_if_exists(paths, "/etc/glvnd"sv, Sandbox::LandlockPath::Access::ReadOnly));
+    TRY(Sandbox::add_landlock_path_if_exists(paths, "/usr/share/glvnd"sv, Sandbox::LandlockPath::Access::ReadOnly));
+    TRY(Sandbox::add_landlock_path_if_exists(paths, "/usr/share/drirc.d"sv, Sandbox::LandlockPath::Access::ReadOnly));
+    TRY(Sandbox::add_landlock_path_if_exists(paths, "/usr/share/libdrm"sv, Sandbox::LandlockPath::Access::ReadOnly));
+    TRY(Sandbox::add_landlock_path_if_exists(paths, "/usr/share/vulkan"sv, Sandbox::LandlockPath::Access::ReadOnly));
+    TRY(Sandbox::add_landlock_path_if_exists(paths, "/dev/dri"sv, Sandbox::LandlockPath::Access::ReadWrite));
+    TRY(Sandbox::add_landlock_path_if_exists(paths, "/dev/udmabuf"sv, Sandbox::LandlockPath::Access::ReadWrite));
+    TRY(Sandbox::add_landlock_path_if_exists(paths, "/sys"sv, Sandbox::LandlockPath::Access::ReadOnly));
+    if (auto library_path = Core::Environment::get("LD_LIBRARY_PATH"sv); library_path.has_value()) {
+        for (auto path : library_path->split_view(':'))
+            TRY(Sandbox::add_landlock_path_if_exists(paths, path, Sandbox::LandlockPath::Access::ReadOnly));
+    }
+
+    TRY(Sandbox::add_landlock_path_if_exists(paths, "/dev/nvidiactl"sv, Sandbox::LandlockPath::Access::ReadWrite));
+
+    // NB: Add all of the primary nvidia device files (e.g. /dev/nvidia0, /dev/nvidia1, etc).
+    auto flags = static_cast<Core::DirIterator::Flags>(Core::DirIterator::SkipDots | Core::DirIterator::NoStat);
+    TRY(Core::Directory::for_each_entry("/dev"sv, flags, [&](Core::DirectoryEntry const& entry, Core::Directory const&) -> ErrorOr<IterationDecision> {
+        if (entry.name.starts_with("nvidia"sv)) {
+            auto suffix = entry.name.substring_view(6);
+            if (!suffix.is_empty() && all_of(suffix, is_ascii_digit))
+                TRY(Sandbox::add_landlock_path_if_exists(paths, TRY(String::formatted("/dev/{}", entry.name)), Sandbox::LandlockPath::Access::ReadWrite));
+        }
+
+        return IterationDecision::Continue;
+    }));
+
+    auto mesa_shader_cache_path = Core::Environment::get("MESA_SHADER_CACHE_DIR"sv)
+                                      .map([](auto path) { return path.to_byte_string(); })
+                                      .value_or_lazy_evaluated([] { return ByteString::formatted("{}/mesa_shader_cache", Core::StandardPaths::cache_directory()); });
+    TRY(Core::Directory::create(mesa_shader_cache_path, Core::Directory::CreateDirectories::Yes));
+    TRY(Sandbox::add_landlock_path_if_exists(paths, mesa_shader_cache_path, Sandbox::LandlockPath::Access::ReadWrite));
+
+    TRY(Sandbox::restrict_filesystem_with_landlock(paths.span()));
+
+    Sandbox::SeccompPolicy policy;
+    policy.allow_readonly_file_opens();
+    policy.allow_filesystem_metadata_queries();
+    policy.allow_filesystem_writes();
+    policy.allow_file_descriptor_operations();
+    policy.allow_ipc();
+    policy.allow_gpu_device_operations();
+    policy.allow_common_runtime();
+    policy.allow_executable_memory_mappings();
+    // Some GPU drivers allocate writable executable code heaps lazily after
+    // context creation, including while handling WebGL commands.
+    policy.allow_writable_executable_memory_mappings();
+    TRY(policy.install());
+
+    return {};
+}
+
+}
+
+FILE: Services/Compositor/SandboxMacOS.cpp
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/Array.h>
+#include <AK/LexicalPath.h>
+#include <Compositor/Sandbox.h>
+#include <LibCore/Directory.h>
+#include <LibCore/System.h>
+#include <LibGfx/Font/FontDatabase.h>
+#include <LibSandbox/Sandbox.h>
+#include <LibWebView/Utilities.h>
+#include <limits.h>
+#include <string.h>
+#include <unistd.h>
+
+namespace Compositor {
+
+ErrorOr<void> apply_sandbox(StringView cache_path)
+{
+    TRY(Sandbox::configure_runtime());
+
+    auto executable_path = TRY(Core::System::current_executable_path());
+    auto build_root = LexicalPath::dirname(LexicalPath::dirname(LexicalPath::dirname(LexicalPath::dirname(LexicalPath::dirname(executable_path)))));
+
+    Vector<Sandbox::SeatbeltPath> paths;
+    TRY(Sandbox::add_seatbelt_path_if_exists(paths, executable_path, Sandbox::SeatbeltPath::Access::ReadOnly));
+    TRY(Sandbox::add_seatbelt_path_if_exists(paths, LexicalPath::join(build_root, "bin"sv).string(), Sandbox::SeatbeltPath::Access::ReadOnly));
+    TRY(Sandbox::add_seatbelt_path_if_exists(paths, LexicalPath::join(build_root, "lib"sv).string(), Sandbox::SeatbeltPath::Access::ReadAndExecute));
+    TRY(Sandbox::add_seatbelt_path_if_exists(paths, LexicalPath::join(build_root, "vcpkg_installed"sv).string(), Sandbox::SeatbeltPath::Access::ReadAndExecute));
+
+    for (auto const& path : TRY(Gfx::FontDatabase::font_directories()))
+        TRY(Sandbox::add_seatbelt_path_if_exists(paths, path, Sandbox::SeatbeltPath::Access::ReadOnly));
+    TRY(Sandbox::add_seatbelt_path_if_exists(paths, TRY(String::formatted("{}/fonts", WebView::s_ladybird_resource_root)), Sandbox::SeatbeltPath::Access::ReadOnly));
+
+    TRY(Core::Directory::create(cache_path, Core::Directory::CreateDirectories::Yes));
+    TRY(Sandbox::add_seatbelt_path_if_exists(paths, cache_path, Sandbox::SeatbeltPath::Access::ReadWrite));
+
+    char darwin_user_cache_directory[PATH_MAX];
+    if (confstr(_CS_DARWIN_USER_CACHE_DIR, darwin_user_cache_directory, sizeof(darwin_user_cache_directory)) > 0) {
+        StringView darwin_user_cache_directory_view { darwin_user_cache_directory, strlen(darwin_user_cache_directory) };
+        TRY(Sandbox::add_seatbelt_path_if_exists(paths, darwin_user_cache_directory_view, Sandbox::SeatbeltPath::Access::ReadWrite));
+        if (darwin_user_cache_directory_view.starts_with("/var/"sv)) {
+            auto private_darwin_user_cache_directory = TRY(String::formatted("/private{}", darwin_user_cache_directory));
+            TRY(Sandbox::add_seatbelt_path_if_exists(paths, private_darwin_user_cache_directory, Sandbox::SeatbeltPath::Access::ReadWrite));
+        }
+    }
+
+    // ANGLE's Metal backend opens one of these while creating WebGL contexts, depending on whether the GPU is real
+    // hardware or the paravirtualized device of a virtual machine.
+    static constexpr Array metal_iokit_user_client_classes {
+        "AGXDeviceUserClient"sv,
+        "AppleParavirtDeviceUserClient"sv,
+    };
+
+    return Sandbox::apply_macos_sandbox(paths.span(), Sandbox::NetworkAccess::Denied, {}, metal_iokit_user_client_classes);
+}
+
+}
+
+FILE: Services/Compositor/SandboxUnimplemented.cpp
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <Compositor/Sandbox.h>
+
+namespace Compositor {
+
+ErrorOr<void> apply_sandbox(StringView)
+{
+    return {};
 }
 
 }
@@ -14601,7 +15599,7 @@ Web::WebDriver::Response WebDriverConnection::element_clear_impl(StringView elem
         Web::HTML::run_focusing_steps(&element);
 
         // 3. Set element's innerHTML IDL attribute to an empty string.
-        (void)element.set_inner_html(""sv);
+        (void)element.set_inner_html(""_utf16);
 
         // 4. Run the unfocusing steps for the element.
         Web::HTML::run_unfocusing_steps(&element);
@@ -100882,6 +101880,62 @@ test("basic functionality", () => {
     expect([...[], ...[...[1, 2, 3]], 4]).toEqual([1, 2, 3, 4]);
 });
 
+test("observes custom array iterator accessors", () => {
+    const array = [1, 2];
+    const originalIterator = Array.prototype[Symbol.iterator];
+    let getterCalls = 0;
+    Object.defineProperty(array, Symbol.iterator, {
+        configurable: true,
+        get() {
+            ++getterCalls;
+            this.push(3);
+            return originalIterator;
+        },
+    });
+
+    expect([...array]).toEqual([1, 2, 3]);
+    expect(getterCalls).toBe(1);
+});
+
+test("exhausts iterators when ArrayIteratorPrototype.next is an accessor", () => {
+    const iteratorPrototype = Object.getPrototypeOf([][Symbol.iterator]());
+    const originalDescriptor = Object.getOwnPropertyDescriptor(iteratorPrototype, "next");
+    let iterator;
+
+    Object.defineProperty(iteratorPrototype, "next", {
+        configurable: true,
+        get() {
+            iterator = this;
+            return originalDescriptor.value;
+        },
+    });
+
+    try {
+        expect([...[1, 2, 3]]).toEqual([1, 2, 3]);
+        expect(iterator.next()).toEqual({ value: undefined, done: true });
+    } finally {
+        Object.defineProperty(iteratorPrototype, "next", originalDescriptor);
+    }
+});
+
+test("observes replacement ArrayIteratorPrototype.next methods", () => {
+    const iteratorPrototype = Object.getPrototypeOf([][Symbol.iterator]());
+    const originalNext = iteratorPrototype.next;
+    let calls = 0;
+
+    iteratorPrototype.next = function () {
+        ++calls;
+        return originalNext.call(this);
+    };
+
+    try {
+        expect([...[1, 2, 3]]).toEqual([1, 2, 3]);
+        expect(calls).toBe(4);
+    } finally {
+        iteratorPrototype.next = originalNext;
+    }
+});
+
 test("elisions after spread remain holes", () => {
     let array = [...[], ,];
     expect(array).toHaveLength(1);
@@ -131595,6 +132649,24 @@ describe("basic functionality", () => {
             ["1", "b"],
             ["2", "c"],
         ]);
+    });
+
+    test("result arrays ignore inherited indexed setters", () => {
+        Object.defineProperty(Array.prototype, "0", {
+            configurable: true,
+            set() {
+                throw new Error("Inherited setter must not be called");
+            },
+        });
+
+        let entries;
+        try {
+            entries = Object.entries({ foo: 1 });
+        } finally {
+            delete Array.prototype[0];
+        }
+
+        expect(entries).toEqual([["foo", 1]]);
     });
 
     test("ignores non-enumerable properties", () => {
@@ -174424,6 +175496,34 @@ test("spread object with symbol keys", () => {
     const obj = { ...a };
     expect(obj.foo).toBe("bar");
     expect(obj[s]).toBe("qux");
+});
+
+test("spread creates independent property storage", () => {
+    const source = { a: 1, b: 2, c: 3, d: 4 };
+    const result = { ...source };
+
+    source.a = 10;
+    result.b = 20;
+    result.e = 5;
+
+    expect(source).toEqual({ a: 10, b: 2, c: 3, d: 4 });
+    expect(result).toEqual({ a: 1, b: 20, c: 3, d: 4, e: 5 });
+    expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+});
+
+test("spread normalizes property attributes", () => {
+    const source = Object.freeze({ a: 1, b: 2, c: 3 });
+    const result = { ...source };
+
+    expect(Object.getOwnPropertyDescriptor(result, "a")).toEqual({
+        value: 1,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+    });
+
+    result.a = 10;
+    expect(result.a).toBe(10);
 });
 
 test("spreading non-spreadable values", () => {
@@ -365439,6 +366539,35 @@ TEST_CASE(insertion_point_inside_fast_quoted_attribute_value)
     EXPECT_EQ(attribute->value, "abcxdef"sv);
 }
 
+TEST_CASE(supplementary_character)
+{
+    char16_t input[] { 0xD83D, 0xDE42 };
+    Tokenizer tokenizer { Utf16View { input, 2 } };
+
+    auto token = tokenizer.next_token();
+    VERIFY(token.has_value());
+    EXPECT_EQ(token->type(), Token::Type::Character);
+    EXPECT_EQ(token->code_point(), 0x1F642u);
+}
+
+TEST_CASE(supplementary_character_split_across_input_chunks)
+{
+    char16_t high_surrogate[] { 0xD83D };
+    char16_t low_surrogate[] { 0xDE42 };
+    Tokenizer tokenizer;
+
+    tokenizer.append_to_input_stream(Utf16View { high_surrogate, 1 });
+    EXPECT(!tokenizer.next_token().has_value());
+
+    tokenizer.append_to_input_stream(Utf16View { low_surrogate, 1 });
+    tokenizer.close_input_stream();
+
+    auto token = tokenizer.next_token();
+    VERIFY(token.has_value());
+    EXPECT_EQ(token->type(), Token::Type::Character);
+    EXPECT_EQ(token->code_point(), 0x1F642u);
+}
+
 FILE: Tests/LibWeb/TestImageData.cpp
 /*
  * Copyright (c) 2026-present, the Ladybird developers.
@@ -482446,438 +483575,3 @@ PRESERVED: content open-quote "replacement" close-quote -> "replacement" on bloc
 PRESERVED: content open-quote "replacement" close-quote -> "replacement" on block flow-root in block grid | following sibling descendant
 STATS: content open-quote "replacement" close-quote -> "replacement" on block flow-root in block grid | rebuilt subtree roots=1, escaped=false
 PASS: content open-quote "replacement" close-quote -> "replacement" on block flow-root in block grid | incremental tree matches full rebuild
-RECREATED: overflow-x visible -> auto on inline flow-root in inline-block | fixture ancestor
-RECREATED: overflow-x visible -> auto on inline flow-root in inline-block | distant sibling
-RECREATED: overflow-x visible -> auto on inline flow-root in inline-block | distant sibling descendant
-RECREATED: overflow-x visible -> auto on inline flow-root in inline-block | DOM parent
-RECREATED: overflow-x visible -> auto on inline flow-root in inline-block | preceding sibling
-RECREATED: overflow-x visible -> auto on inline flow-root in inline-block | preceding sibling descendant
-RECREATED: overflow-x visible -> auto on inline flow-root in inline-block | target
-RECREATED: overflow-x visible -> auto on inline flow-root in inline-block | target descendant
-RECREATED: overflow-x visible -> auto on inline flow-root in inline-block | following sibling
-RECREATED: overflow-x visible -> auto on inline flow-root in inline-block | following sibling descendant
-STATS: overflow-x visible -> auto on inline flow-root in inline-block | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x visible -> auto on inline flow-root in inline-block | incremental tree matches full rebuild
-PRESERVED: overflow-x scroll -> hidden on inline flow-root in math | fixture ancestor
-PRESERVED: overflow-x scroll -> hidden on inline flow-root in math | distant sibling
-PRESERVED: overflow-x scroll -> hidden on inline flow-root in math | distant sibling descendant
-PRESERVED: overflow-x scroll -> hidden on inline flow-root in math | DOM parent
-PRESERVED: overflow-x scroll -> hidden on inline flow-root in math | preceding sibling
-PRESERVED: overflow-x scroll -> hidden on inline flow-root in math | preceding sibling descendant
-RECREATED: overflow-x scroll -> hidden on inline flow-root in math | target
-RECREATED: overflow-x scroll -> hidden on inline flow-root in math | target descendant
-PRESERVED: overflow-x scroll -> hidden on inline flow-root in math | following sibling
-PRESERVED: overflow-x scroll -> hidden on inline flow-root in math | following sibling descendant
-STATS: overflow-x scroll -> hidden on inline flow-root in math | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x scroll -> hidden on inline flow-root in math | incremental tree matches full rebuild
-RECREATED: overflow-y visible -> auto on inline flow-root in table-caption | fixture ancestor
-RECREATED: overflow-y visible -> auto on inline flow-root in table-caption | distant sibling
-RECREATED: overflow-y visible -> auto on inline flow-root in table-caption | distant sibling descendant
-RECREATED: overflow-y visible -> auto on inline flow-root in table-caption | DOM parent
-RECREATED: overflow-y visible -> auto on inline flow-root in table-caption | preceding sibling
-RECREATED: overflow-y visible -> auto on inline flow-root in table-caption | preceding sibling descendant
-RECREATED: overflow-y visible -> auto on inline flow-root in table-caption | target
-RECREATED: overflow-y visible -> auto on inline flow-root in table-caption | target descendant
-RECREATED: overflow-y visible -> auto on inline flow-root in table-caption | following sibling
-RECREATED: overflow-y visible -> auto on inline flow-root in table-caption | following sibling descendant
-STATS: overflow-y visible -> auto on inline flow-root in table-caption | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y visible -> auto on inline flow-root in table-caption | incremental tree matches full rebuild
-RECREATED: overflow-y scroll -> hidden on inline flow-root in inline table | fixture ancestor
-RECREATED: overflow-y scroll -> hidden on inline flow-root in inline table | distant sibling
-RECREATED: overflow-y scroll -> hidden on inline flow-root in inline table | distant sibling descendant
-RECREATED: overflow-y scroll -> hidden on inline flow-root in inline table | DOM parent
-RECREATED: overflow-y scroll -> hidden on inline flow-root in inline table | preceding sibling
-RECREATED: overflow-y scroll -> hidden on inline flow-root in inline table | preceding sibling descendant
-RECREATED: overflow-y scroll -> hidden on inline flow-root in inline table | target
-RECREATED: overflow-y scroll -> hidden on inline flow-root in inline table | target descendant
-RECREATED: overflow-y scroll -> hidden on inline flow-root in inline table | following sibling
-RECREATED: overflow-y scroll -> hidden on inline flow-root in inline table | following sibling descendant
-STATS: overflow-y scroll -> hidden on inline flow-root in inline table | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y scroll -> hidden on inline flow-root in inline table | incremental tree matches full rebuild
-PRESERVED: text-transform uppercase -> none on inline flow-root in inline list-item | fixture ancestor
-PRESERVED: text-transform uppercase -> none on inline flow-root in inline list-item | distant sibling
-PRESERVED: text-transform uppercase -> none on inline flow-root in inline list-item | distant sibling descendant
-PRESERVED: text-transform uppercase -> none on inline flow-root in inline list-item | DOM parent
-PRESERVED: text-transform uppercase -> none on inline flow-root in inline list-item | preceding sibling
-PRESERVED: text-transform uppercase -> none on inline flow-root in inline list-item | preceding sibling descendant
-RECREATED: text-transform uppercase -> none on inline flow-root in inline list-item | target
-RECREATED: text-transform uppercase -> none on inline flow-root in inline list-item | target descendant
-PRESERVED: text-transform uppercase -> none on inline flow-root in inline list-item | following sibling
-PRESERVED: text-transform uppercase -> none on inline flow-root in inline list-item | following sibling descendant
-STATS: text-transform uppercase -> none on inline flow-root in inline list-item | rebuilt subtree roots=1, escaped=false
-PASS: text-transform uppercase -> none on inline flow-root in inline list-item | incremental tree matches full rebuild
-RECREATED: content normal -> "replacement" on inline flow-root in table-row-group | fixture ancestor
-RECREATED: content normal -> "replacement" on inline flow-root in table-row-group | distant sibling
-RECREATED: content normal -> "replacement" on inline flow-root in table-row-group | distant sibling descendant
-RECREATED: content normal -> "replacement" on inline flow-root in table-row-group | DOM parent
-RECREATED: content normal -> "replacement" on inline flow-root in table-row-group | preceding sibling
-RECREATED: content normal -> "replacement" on inline flow-root in table-row-group | preceding sibling descendant
-RECREATED: content normal -> "replacement" on inline flow-root in table-row-group | target
-RECREATED: content normal -> "replacement" on inline flow-root in table-row-group | target descendant
-RECREATED: content normal -> "replacement" on inline flow-root in table-row-group | following sibling
-RECREATED: content normal -> "replacement" on inline flow-root in table-row-group | following sibling descendant
-STATS: content normal -> "replacement" on inline flow-root in table-row-group | rebuilt subtree roots=1, escaped=false
-PASS: content normal -> "replacement" on inline flow-root in table-row-group | incremental tree matches full rebuild
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on inline flow-root in block flow-root | fixture ancestor
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on inline flow-root in block flow-root | distant sibling
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on inline flow-root in block flow-root | distant sibling descendant
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline flow-root in block flow-root | DOM parent
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline flow-root in block flow-root | preceding sibling
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline flow-root in block flow-root | preceding sibling descendant
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline flow-root in block flow-root | target
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline flow-root in block flow-root | target descendant
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline flow-root in block flow-root | following sibling
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline flow-root in block flow-root | following sibling descendant
-STATS: content open-quote "replacement" close-quote -> "replacement" on inline flow-root in block flow-root | rebuilt subtree roots=1, escaped=false
-PASS: content open-quote "replacement" close-quote -> "replacement" on inline flow-root in block flow-root | incremental tree matches full rebuild
-PRESERVED: overflow-x visible -> auto on block flex in contents | fixture ancestor
-PRESERVED: overflow-x visible -> auto on block flex in contents | distant sibling
-PRESERVED: overflow-x visible -> auto on block flex in contents | distant sibling descendant
-ABSENT: overflow-x visible -> auto on block flex in contents | DOM parent
-PRESERVED: overflow-x visible -> auto on block flex in contents | preceding sibling
-PRESERVED: overflow-x visible -> auto on block flex in contents | preceding sibling descendant
-RECREATED: overflow-x visible -> auto on block flex in contents | target
-RECREATED: overflow-x visible -> auto on block flex in contents | target descendant
-PRESERVED: overflow-x visible -> auto on block flex in contents | following sibling
-PRESERVED: overflow-x visible -> auto on block flex in contents | following sibling descendant
-STATS: overflow-x visible -> auto on block flex in contents | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x visible -> auto on block flex in contents | incremental tree matches full rebuild
-PRESERVED: overflow-x scroll -> hidden on block flex in grid | fixture ancestor
-PRESERVED: overflow-x scroll -> hidden on block flex in grid | distant sibling
-PRESERVED: overflow-x scroll -> hidden on block flex in grid | distant sibling descendant
-PRESERVED: overflow-x scroll -> hidden on block flex in grid | DOM parent
-PRESERVED: overflow-x scroll -> hidden on block flex in grid | preceding sibling
-PRESERVED: overflow-x scroll -> hidden on block flex in grid | preceding sibling descendant
-RECREATED: overflow-x scroll -> hidden on block flex in grid | target
-RECREATED: overflow-x scroll -> hidden on block flex in grid | target descendant
-PRESERVED: overflow-x scroll -> hidden on block flex in grid | following sibling
-PRESERVED: overflow-x scroll -> hidden on block flex in grid | following sibling descendant
-STATS: overflow-x scroll -> hidden on block flex in grid | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x scroll -> hidden on block flex in grid | incremental tree matches full rebuild
-RECREATED: overflow-y visible -> auto on block flex in table-row | fixture ancestor
-RECREATED: overflow-y visible -> auto on block flex in table-row | distant sibling
-RECREATED: overflow-y visible -> auto on block flex in table-row | distant sibling descendant
-RECREATED: overflow-y visible -> auto on block flex in table-row | DOM parent
-RECREATED: overflow-y visible -> auto on block flex in table-row | preceding sibling
-RECREATED: overflow-y visible -> auto on block flex in table-row | preceding sibling descendant
-RECREATED: overflow-y visible -> auto on block flex in table-row | target
-RECREATED: overflow-y visible -> auto on block flex in table-row | target descendant
-RECREATED: overflow-y visible -> auto on block flex in table-row | following sibling
-RECREATED: overflow-y visible -> auto on block flex in table-row | following sibling descendant
-STATS: overflow-y visible -> auto on block flex in table-row | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y visible -> auto on block flex in table-row | incremental tree matches full rebuild
-PRESERVED: overflow-y scroll -> hidden on block flex in inline flex | fixture ancestor
-PRESERVED: overflow-y scroll -> hidden on block flex in inline flex | distant sibling
-PRESERVED: overflow-y scroll -> hidden on block flex in inline flex | distant sibling descendant
-PRESERVED: overflow-y scroll -> hidden on block flex in inline flex | DOM parent
-PRESERVED: overflow-y scroll -> hidden on block flex in inline flex | preceding sibling
-PRESERVED: overflow-y scroll -> hidden on block flex in inline flex | preceding sibling descendant
-RECREATED: overflow-y scroll -> hidden on block flex in inline flex | target
-RECREATED: overflow-y scroll -> hidden on block flex in inline flex | target descendant
-PRESERVED: overflow-y scroll -> hidden on block flex in inline flex | following sibling
-PRESERVED: overflow-y scroll -> hidden on block flex in inline flex | following sibling descendant
-STATS: overflow-y scroll -> hidden on block flex in inline flex | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y scroll -> hidden on block flex in inline flex | incremental tree matches full rebuild
-PRESERVED: text-transform uppercase -> none on block flex in flow-root | fixture ancestor
-PRESERVED: text-transform uppercase -> none on block flex in flow-root | distant sibling
-PRESERVED: text-transform uppercase -> none on block flex in flow-root | distant sibling descendant
-PRESERVED: text-transform uppercase -> none on block flex in flow-root | DOM parent
-PRESERVED: text-transform uppercase -> none on block flex in flow-root | preceding sibling
-PRESERVED: text-transform uppercase -> none on block flex in flow-root | preceding sibling descendant
-RECREATED: text-transform uppercase -> none on block flex in flow-root | target
-RECREATED: text-transform uppercase -> none on block flex in flow-root | target descendant
-PRESERVED: text-transform uppercase -> none on block flex in flow-root | following sibling
-PRESERVED: text-transform uppercase -> none on block flex in flow-root | following sibling descendant
-STATS: text-transform uppercase -> none on block flex in flow-root | rebuilt subtree roots=1, escaped=false
-PASS: text-transform uppercase -> none on block flex in flow-root | incremental tree matches full rebuild
-RECREATED: content normal -> "replacement" on block flex in inline-table | fixture ancestor
-RECREATED: content normal -> "replacement" on block flex in inline-table | distant sibling
-RECREATED: content normal -> "replacement" on block flex in inline-table | distant sibling descendant
-RECREATED: content normal -> "replacement" on block flex in inline-table | DOM parent
-RECREATED: content normal -> "replacement" on block flex in inline-table | preceding sibling
-RECREATED: content normal -> "replacement" on block flex in inline-table | preceding sibling descendant
-RECREATED: content normal -> "replacement" on block flex in inline-table | target
-RECREATED: content normal -> "replacement" on block flex in inline-table | target descendant
-RECREATED: content normal -> "replacement" on block flex in inline-table | following sibling
-RECREATED: content normal -> "replacement" on block flex in inline-table | following sibling descendant
-STATS: content normal -> "replacement" on block flex in inline-table | rebuilt subtree roots=1, escaped=false
-PASS: content normal -> "replacement" on block flex in inline-table | incremental tree matches full rebuild
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on block flex in table-column | fixture ancestor
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on block flex in table-column | distant sibling
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on block flex in table-column | distant sibling descendant
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on block flex in table-column | DOM parent
-ABSENT: content open-quote "replacement" close-quote -> "replacement" on block flex in table-column | preceding sibling
-ABSENT: content open-quote "replacement" close-quote -> "replacement" on block flex in table-column | preceding sibling descendant
-ABSENT: content open-quote "replacement" close-quote -> "replacement" on block flex in table-column | target
-ABSENT: content open-quote "replacement" close-quote -> "replacement" on block flex in table-column | target descendant
-ABSENT: content open-quote "replacement" close-quote -> "replacement" on block flex in table-column | following sibling
-ABSENT: content open-quote "replacement" close-quote -> "replacement" on block flex in table-column | following sibling descendant
-STATS: content open-quote "replacement" close-quote -> "replacement" on block flex in table-column | rebuilt subtree roots=0, escaped=true
-PASS: content open-quote "replacement" close-quote -> "replacement" on block flex in table-column | incremental tree matches full rebuild
-RECREATED: overflow-x visible -> auto on inline flex in block table | fixture ancestor
-RECREATED: overflow-x visible -> auto on inline flex in block table | distant sibling
-RECREATED: overflow-x visible -> auto on inline flex in block table | distant sibling descendant
-RECREATED: overflow-x visible -> auto on inline flex in block table | DOM parent
-RECREATED: overflow-x visible -> auto on inline flex in block table | preceding sibling
-RECREATED: overflow-x visible -> auto on inline flex in block table | preceding sibling descendant
-RECREATED: overflow-x visible -> auto on inline flex in block table | target
-RECREATED: overflow-x visible -> auto on inline flex in block table | target descendant
-RECREATED: overflow-x visible -> auto on inline flex in block table | following sibling
-RECREATED: overflow-x visible -> auto on inline flex in block table | following sibling descendant
-STATS: overflow-x visible -> auto on inline flex in block table | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x visible -> auto on inline flex in block table | incremental tree matches full rebuild
-PRESERVED: overflow-x scroll -> hidden on inline flex in list-item | fixture ancestor
-PRESERVED: overflow-x scroll -> hidden on inline flex in list-item | distant sibling
-PRESERVED: overflow-x scroll -> hidden on inline flex in list-item | distant sibling descendant
-RECREATED: overflow-x scroll -> hidden on inline flex in list-item | DOM parent
-RECREATED: overflow-x scroll -> hidden on inline flex in list-item | preceding sibling
-RECREATED: overflow-x scroll -> hidden on inline flex in list-item | preceding sibling descendant
-RECREATED: overflow-x scroll -> hidden on inline flex in list-item | target
-RECREATED: overflow-x scroll -> hidden on inline flex in list-item | target descendant
-RECREATED: overflow-x scroll -> hidden on inline flex in list-item | following sibling
-RECREATED: overflow-x scroll -> hidden on inline flex in list-item | following sibling descendant
-STATS: overflow-x scroll -> hidden on inline flex in list-item | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x scroll -> hidden on inline flex in list-item | incremental tree matches full rebuild
-PRESERVED: overflow-y visible -> auto on inline flex in -webkit-inline-box | fixture ancestor
-PRESERVED: overflow-y visible -> auto on inline flex in -webkit-inline-box | distant sibling
-PRESERVED: overflow-y visible -> auto on inline flex in -webkit-inline-box | distant sibling descendant
-PRESERVED: overflow-y visible -> auto on inline flex in -webkit-inline-box | DOM parent
-PRESERVED: overflow-y visible -> auto on inline flex in -webkit-inline-box | preceding sibling
-PRESERVED: overflow-y visible -> auto on inline flex in -webkit-inline-box | preceding sibling descendant
-RECREATED: overflow-y visible -> auto on inline flex in -webkit-inline-box | target
-RECREATED: overflow-y visible -> auto on inline flex in -webkit-inline-box | target descendant
-PRESERVED: overflow-y visible -> auto on inline flex in -webkit-inline-box | following sibling
-PRESERVED: overflow-y visible -> auto on inline flex in -webkit-inline-box | following sibling descendant
-STATS: overflow-y visible -> auto on inline flex in -webkit-inline-box | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y visible -> auto on inline flex in -webkit-inline-box | incremental tree matches full rebuild
-PRESERVED: overflow-y scroll -> hidden on inline flex in inline flow | fixture ancestor
-PRESERVED: overflow-y scroll -> hidden on inline flex in inline flow | distant sibling
-PRESERVED: overflow-y scroll -> hidden on inline flex in inline flow | distant sibling descendant
-PRESERVED: overflow-y scroll -> hidden on inline flex in inline flow | DOM parent
-PRESERVED: overflow-y scroll -> hidden on inline flex in inline flow | preceding sibling
-PRESERVED: overflow-y scroll -> hidden on inline flex in inline flow | preceding sibling descendant
-RECREATED: overflow-y scroll -> hidden on inline flex in inline flow | target
-RECREATED: overflow-y scroll -> hidden on inline flex in inline flow | target descendant
-PRESERVED: overflow-y scroll -> hidden on inline flex in inline flow | following sibling
-PRESERVED: overflow-y scroll -> hidden on inline flex in inline flow | following sibling descendant
-STATS: overflow-y scroll -> hidden on inline flex in inline flow | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y scroll -> hidden on inline flex in inline flow | incremental tree matches full rebuild
-PRESERVED: text-transform uppercase -> none on inline flex in inline flow list-item | fixture ancestor
-PRESERVED: text-transform uppercase -> none on inline flex in inline flow list-item | distant sibling
-PRESERVED: text-transform uppercase -> none on inline flex in inline flow list-item | distant sibling descendant
-PRESERVED: text-transform uppercase -> none on inline flex in inline flow list-item | DOM parent
-PRESERVED: text-transform uppercase -> none on inline flex in inline flow list-item | preceding sibling
-PRESERVED: text-transform uppercase -> none on inline flex in inline flow list-item | preceding sibling descendant
-RECREATED: text-transform uppercase -> none on inline flex in inline flow list-item | target
-RECREATED: text-transform uppercase -> none on inline flex in inline flow list-item | target descendant
-PRESERVED: text-transform uppercase -> none on inline flex in inline flow list-item | following sibling
-PRESERVED: text-transform uppercase -> none on inline flex in inline flow list-item | following sibling descendant
-STATS: text-transform uppercase -> none on inline flex in inline flow list-item | rebuilt subtree roots=1, escaped=false
-PASS: text-transform uppercase -> none on inline flex in inline flow list-item | incremental tree matches full rebuild
-PRESERVED: content normal -> "replacement" on inline flex in inline-flex | fixture ancestor
-PRESERVED: content normal -> "replacement" on inline flex in inline-flex | distant sibling
-PRESERVED: content normal -> "replacement" on inline flex in inline-flex | distant sibling descendant
-PRESERVED: content normal -> "replacement" on inline flex in inline-flex | DOM parent
-PRESERVED: content normal -> "replacement" on inline flex in inline-flex | preceding sibling
-PRESERVED: content normal -> "replacement" on inline flex in inline-flex | preceding sibling descendant
-RECREATED: content normal -> "replacement" on inline flex in inline-flex | target
-RECREATED: content normal -> "replacement" on inline flex in inline-flex | target descendant
-PRESERVED: content normal -> "replacement" on inline flex in inline-flex | following sibling
-PRESERVED: content normal -> "replacement" on inline flex in inline-flex | following sibling descendant
-STATS: content normal -> "replacement" on inline flex in inline-flex | rebuilt subtree roots=1, escaped=false
-PASS: content normal -> "replacement" on inline flex in inline-flex | incremental tree matches full rebuild
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline flex in table-footer-group | fixture ancestor
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline flex in table-footer-group | distant sibling
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline flex in table-footer-group | distant sibling descendant
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline flex in table-footer-group | DOM parent
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline flex in table-footer-group | preceding sibling
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline flex in table-footer-group | preceding sibling descendant
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline flex in table-footer-group | target
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline flex in table-footer-group | target descendant
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline flex in table-footer-group | following sibling
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline flex in table-footer-group | following sibling descendant
-STATS: content open-quote "replacement" close-quote -> "replacement" on inline flex in table-footer-group | rebuilt subtree roots=1, escaped=false
-PASS: content open-quote "replacement" close-quote -> "replacement" on inline flex in table-footer-group | incremental tree matches full rebuild
-PRESERVED: overflow-x visible -> auto on block grid in block flex | fixture ancestor
-PRESERVED: overflow-x visible -> auto on block grid in block flex | distant sibling
-PRESERVED: overflow-x visible -> auto on block grid in block flex | distant sibling descendant
-PRESERVED: overflow-x visible -> auto on block grid in block flex | DOM parent
-PRESERVED: overflow-x visible -> auto on block grid in block flex | preceding sibling
-PRESERVED: overflow-x visible -> auto on block grid in block flex | preceding sibling descendant
-RECREATED: overflow-x visible -> auto on block grid in block flex | target
-RECREATED: overflow-x visible -> auto on block grid in block flex | target descendant
-PRESERVED: overflow-x visible -> auto on block grid in block flex | following sibling
-PRESERVED: overflow-x visible -> auto on block grid in block flex | following sibling descendant
-STATS: overflow-x visible -> auto on block grid in block flex | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x visible -> auto on block grid in block flex | incremental tree matches full rebuild
-PRESERVED: overflow-x scroll -> hidden on block grid in inline | fixture ancestor
-PRESERVED: overflow-x scroll -> hidden on block grid in inline | distant sibling
-PRESERVED: overflow-x scroll -> hidden on block grid in inline | distant sibling descendant
-PRESERVED: overflow-x scroll -> hidden on block grid in inline | DOM parent
-PRESERVED: overflow-x scroll -> hidden on block grid in inline | preceding sibling
-PRESERVED: overflow-x scroll -> hidden on block grid in inline | preceding sibling descendant
-RECREATED: overflow-x scroll -> hidden on block grid in inline | target
-RECREATED: overflow-x scroll -> hidden on block grid in inline | target descendant
-PRESERVED: overflow-x scroll -> hidden on block grid in inline | following sibling
-PRESERVED: overflow-x scroll -> hidden on block grid in inline | following sibling descendant
-STATS: overflow-x scroll -> hidden on block grid in inline | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x scroll -> hidden on block grid in inline | incremental tree matches full rebuild
-RECREATED: overflow-y visible -> auto on block grid in table | fixture ancestor
-RECREATED: overflow-y visible -> auto on block grid in table | distant sibling
-RECREATED: overflow-y visible -> auto on block grid in table | distant sibling descendant
-RECREATED: overflow-y visible -> auto on block grid in table | DOM parent
-RECREATED: overflow-y visible -> auto on block grid in table | preceding sibling
-RECREATED: overflow-y visible -> auto on block grid in table | preceding sibling descendant
-RECREATED: overflow-y visible -> auto on block grid in table | target
-RECREATED: overflow-y visible -> auto on block grid in table | target descendant
-RECREATED: overflow-y visible -> auto on block grid in table | following sibling
-RECREATED: overflow-y visible -> auto on block grid in table | following sibling descendant
-STATS: overflow-y visible -> auto on block grid in table | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y visible -> auto on block grid in table | incremental tree matches full rebuild
-PRESERVED: overflow-y scroll -> hidden on block grid in table-column-group | fixture ancestor
-PRESERVED: overflow-y scroll -> hidden on block grid in table-column-group | distant sibling
-PRESERVED: overflow-y scroll -> hidden on block grid in table-column-group | distant sibling descendant
-PRESERVED: overflow-y scroll -> hidden on block grid in table-column-group | DOM parent
-ABSENT: overflow-y scroll -> hidden on block grid in table-column-group | preceding sibling
-ABSENT: overflow-y scroll -> hidden on block grid in table-column-group | preceding sibling descendant
-ABSENT: overflow-y scroll -> hidden on block grid in table-column-group | target
-ABSENT: overflow-y scroll -> hidden on block grid in table-column-group | target descendant
-ABSENT: overflow-y scroll -> hidden on block grid in table-column-group | following sibling
-ABSENT: overflow-y scroll -> hidden on block grid in table-column-group | following sibling descendant
-STATS: overflow-y scroll -> hidden on block grid in table-column-group | rebuilt subtree roots=0, escaped=true
-PASS: overflow-y scroll -> hidden on block grid in table-column-group | incremental tree matches full rebuild
-PRESERVED: text-transform uppercase -> none on block grid in inline grid | fixture ancestor
-PRESERVED: text-transform uppercase -> none on block grid in inline grid | distant sibling
-PRESERVED: text-transform uppercase -> none on block grid in inline grid | distant sibling descendant
-PRESERVED: text-transform uppercase -> none on block grid in inline grid | DOM parent
-PRESERVED: text-transform uppercase -> none on block grid in inline grid | preceding sibling
-PRESERVED: text-transform uppercase -> none on block grid in inline grid | preceding sibling descendant
-RECREATED: text-transform uppercase -> none on block grid in inline grid | target
-RECREATED: text-transform uppercase -> none on block grid in inline grid | target descendant
-PRESERVED: text-transform uppercase -> none on block grid in inline grid | following sibling
-PRESERVED: text-transform uppercase -> none on block grid in inline grid | following sibling descendant
-STATS: text-transform uppercase -> none on block grid in inline grid | rebuilt subtree roots=1, escaped=false
-PASS: text-transform uppercase -> none on block grid in inline grid | incremental tree matches full rebuild
-PRESERVED: content normal -> "replacement" on block grid in run-in | fixture ancestor
-PRESERVED: content normal -> "replacement" on block grid in run-in | distant sibling
-PRESERVED: content normal -> "replacement" on block grid in run-in | distant sibling descendant
-PRESERVED: content normal -> "replacement" on block grid in run-in | DOM parent
-PRESERVED: content normal -> "replacement" on block grid in run-in | preceding sibling
-PRESERVED: content normal -> "replacement" on block grid in run-in | preceding sibling descendant
-RECREATED: content normal -> "replacement" on block grid in run-in | target
-RECREATED: content normal -> "replacement" on block grid in run-in | target descendant
-PRESERVED: content normal -> "replacement" on block grid in run-in | following sibling
-PRESERVED: content normal -> "replacement" on block grid in run-in | following sibling descendant
-STATS: content normal -> "replacement" on block grid in run-in | rebuilt subtree roots=1, escaped=false
-PASS: content normal -> "replacement" on block grid in run-in | incremental tree matches full rebuild
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on block grid in -webkit-box | fixture ancestor
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on block grid in -webkit-box | distant sibling
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on block grid in -webkit-box | distant sibling descendant
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on block grid in -webkit-box | DOM parent
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on block grid in -webkit-box | preceding sibling
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on block grid in -webkit-box | preceding sibling descendant
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on block grid in -webkit-box | target
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on block grid in -webkit-box | target descendant
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on block grid in -webkit-box | following sibling
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on block grid in -webkit-box | following sibling descendant
-STATS: content open-quote "replacement" close-quote -> "replacement" on block grid in -webkit-box | rebuilt subtree roots=1, escaped=false
-PASS: content open-quote "replacement" close-quote -> "replacement" on block grid in -webkit-box | incremental tree matches full rebuild
-PRESERVED: overflow-x visible -> auto on inline grid in block flow | fixture ancestor
-PRESERVED: overflow-x visible -> auto on inline grid in block flow | distant sibling
-PRESERVED: overflow-x visible -> auto on inline grid in block flow | distant sibling descendant
-RECREATED: overflow-x visible -> auto on inline grid in block flow | DOM parent
-RECREATED: overflow-x visible -> auto on inline grid in block flow | preceding sibling
-RECREATED: overflow-x visible -> auto on inline grid in block flow | preceding sibling descendant
-RECREATED: overflow-x visible -> auto on inline grid in block flow | target
-RECREATED: overflow-x visible -> auto on inline grid in block flow | target descendant
-RECREATED: overflow-x visible -> auto on inline grid in block flow | following sibling
-RECREATED: overflow-x visible -> auto on inline grid in block flow | following sibling descendant
-STATS: overflow-x visible -> auto on inline grid in block flow | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x visible -> auto on inline grid in block flow | incremental tree matches full rebuild
-PRESERVED: overflow-x scroll -> hidden on inline grid in block flow list-item | fixture ancestor
-PRESERVED: overflow-x scroll -> hidden on inline grid in block flow list-item | distant sibling
-PRESERVED: overflow-x scroll -> hidden on inline grid in block flow list-item | distant sibling descendant
-RECREATED: overflow-x scroll -> hidden on inline grid in block flow list-item | DOM parent
-RECREATED: overflow-x scroll -> hidden on inline grid in block flow list-item | preceding sibling
-RECREATED: overflow-x scroll -> hidden on inline grid in block flow list-item | preceding sibling descendant
-RECREATED: overflow-x scroll -> hidden on inline grid in block flow list-item | target
-RECREATED: overflow-x scroll -> hidden on inline grid in block flow list-item | target descendant
-RECREATED: overflow-x scroll -> hidden on inline grid in block flow list-item | following sibling
-RECREATED: overflow-x scroll -> hidden on inline grid in block flow list-item | following sibling descendant
-STATS: overflow-x scroll -> hidden on inline grid in block flow list-item | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x scroll -> hidden on inline grid in block flow list-item | incremental tree matches full rebuild
-PRESERVED: overflow-y visible -> auto on inline grid in flex | fixture ancestor
-PRESERVED: overflow-y visible -> auto on inline grid in flex | distant sibling
-PRESERVED: overflow-y visible -> auto on inline grid in flex | distant sibling descendant
-PRESERVED: overflow-y visible -> auto on inline grid in flex | DOM parent
-PRESERVED: overflow-y visible -> auto on inline grid in flex | preceding sibling
-PRESERVED: overflow-y visible -> auto on inline grid in flex | preceding sibling descendant
-RECREATED: overflow-y visible -> auto on inline grid in flex | target
-RECREATED: overflow-y visible -> auto on inline grid in flex | target descendant
-PRESERVED: overflow-y visible -> auto on inline grid in flex | following sibling
-PRESERVED: overflow-y visible -> auto on inline grid in flex | following sibling descendant
-STATS: overflow-y visible -> auto on inline grid in flex | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y visible -> auto on inline grid in flex | incremental tree matches full rebuild
-RECREATED: overflow-y scroll -> hidden on inline grid in table-header-group | fixture ancestor
-RECREATED: overflow-y scroll -> hidden on inline grid in table-header-group | distant sibling
-RECREATED: overflow-y scroll -> hidden on inline grid in table-header-group | distant sibling descendant
-RECREATED: overflow-y scroll -> hidden on inline grid in table-header-group | DOM parent
-RECREATED: overflow-y scroll -> hidden on inline grid in table-header-group | preceding sibling
-RECREATED: overflow-y scroll -> hidden on inline grid in table-header-group | preceding sibling descendant
-RECREATED: overflow-y scroll -> hidden on inline grid in table-header-group | target
-RECREATED: overflow-y scroll -> hidden on inline grid in table-header-group | target descendant
-RECREATED: overflow-y scroll -> hidden on inline grid in table-header-group | following sibling
-RECREATED: overflow-y scroll -> hidden on inline grid in table-header-group | following sibling descendant
-STATS: overflow-y scroll -> hidden on inline grid in table-header-group | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y scroll -> hidden on inline grid in table-header-group | incremental tree matches full rebuild
-RECREATED: text-transform uppercase -> none on inline grid in inline flow-root | fixture ancestor
-RECREATED: text-transform uppercase -> none on inline grid in inline flow-root | distant sibling
-RECREATED: text-transform uppercase -> none on inline grid in inline flow-root | distant sibling descendant
-RECREATED: text-transform uppercase -> none on inline grid in inline flow-root | DOM parent
-RECREATED: text-transform uppercase -> none on inline grid in inline flow-root | preceding sibling
-RECREATED: text-transform uppercase -> none on inline grid in inline flow-root | preceding sibling descendant
-RECREATED: text-transform uppercase -> none on inline grid in inline flow-root | target
-RECREATED: text-transform uppercase -> none on inline grid in inline flow-root | target descendant
-RECREATED: text-transform uppercase -> none on inline grid in inline flow-root | following sibling
-RECREATED: text-transform uppercase -> none on inline grid in inline flow-root | following sibling descendant
-STATS: text-transform uppercase -> none on inline grid in inline flow-root | rebuilt subtree roots=1, escaped=false
-PASS: text-transform uppercase -> none on inline grid in inline flow-root | incremental tree matches full rebuild
-PRESERVED: content normal -> "replacement" on inline grid in block | fixture ancestor
-PRESERVED: content normal -> "replacement" on inline grid in block | distant sibling
-PRESERVED: content normal -> "replacement" on inline grid in block | distant sibling descendant
-RECREATED: content normal -> "replacement" on inline grid in block | DOM parent
-RECREATED: content normal -> "replacement" on inline grid in block | preceding sibling
-RECREATED: content normal -> "replacement" on inline grid in block | preceding sibling descendant
-RECREATED: content normal -> "replacement" on inline grid in block | target
-RECREATED: content normal -> "replacement" on inline grid in block | target descendant
-RECREATED: content normal -> "replacement" on inline grid in block | following sibling
-RECREATED: content normal -> "replacement" on inline grid in block | following sibling descendant
-STATS: content normal -> "replacement" on inline grid in block | rebuilt subtree roots=1, escaped=false
-PASS: content normal -> "replacement" on inline grid in block | incremental tree matches full rebuild
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on inline grid in inline-grid | fixture ancestor
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on inline grid in inline-grid | distant sibling
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on inline grid in inline-grid | distant sibling descendant
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on inline grid in inline-grid | DOM parent
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on inline grid in inline-grid | preceding sibling
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on inline grid in inline-grid | preceding sibling descendant
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline grid in inline-grid | target
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline grid in inline-grid | target descendant
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on inline grid in inline-grid | following sibling
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on inline grid in inline-grid | following sibling descendant
-STATS: content open-quote "replacement" close-quote -> "replacement" on inline grid in inline-grid | rebuilt subtree roots=1, escaped=false
-PASS: content open-quote "replacement" close-quote -> "replacement" on inline grid in inline-grid | incremental tree matches full rebuild
-RECREATED: overflow-x visible -> auto on block table in table-cell | fixture ancestor
-RECREATED: overflow-x visible -> auto on block table in table-cell | distant sibling
-RECREATED: overflow-x visible -> auto on block table in table-cell | distant sibling descendant
-RECREATED: overflow-x visible -> auto on block table in table-cell | DOM parent
-RECREATED: overflow-x visible -> auto on block table in table-cell | preceding sibling
-RECREATED: overflow-x visible -> auto on block table in table-cell | preceding sibling descendant
-RECREATED: overflow-x visible -> auto on block table in table-cell | target
-RECREATED: overflow-x visible -> auto on block table in table-cell | target descendant
-RECREATED: overflow-x visible -> auto on block table in table-cell | following sibling
-RECREATED: overflow-x visible -> auto on block table in table-cell | following sibling descendant
-STATS: overflow-x visible -> auto on block table in table-cell | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x visible -> auto on block table in table-cell | incremental tree matches full rebuild
-PRESERVED: overflow-x scroll -> hidden on block table in block grid | fixture ancestor
-PRESERVED: overflow-x scroll -> hidden on block table in block grid | distant sibling
-PRESERVED: overflow-x scroll -> hidden on block table in block grid | distant sibling descendant

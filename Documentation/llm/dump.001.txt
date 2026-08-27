@@ -30293,6 +30293,11 @@ impl Utf16String {
 impl Utf16FlyString {
     /// Creates a string through AK's authoritative UTF-8 fly-string table.
     pub fn from_utf8(string: &str) -> Self {
+        if let Some(raw) = utf16_short_string_raw(string) {
+            // SAFETY: Short strings own no allocation or reference count.
+            return Self(unsafe { OwnedUtf16String::from_raw(raw) });
+        }
+
         // SAFETY: The string's storage remains alive for the duration of the call.
         let raw = unsafe { ladybird_utf16_fly_string_from_utf8(string.as_ptr(), string.len()) };
         // SAFETY: The constructor transfers one ownership reference.
@@ -30306,6 +30311,32 @@ impl Utf16FlyString {
         // SAFETY: The constructor transfers one ownership reference.
         unsafe { Self::from_raw_owned(raw) }
     }
+}
+
+/// Returns AK's one-word representation for a short ASCII string.
+pub const fn utf16_short_string_raw(string: &str) -> Option<usize> {
+    let bytes = string.as_bytes();
+    if bytes.len() >= size_of::<usize>() {
+        return None;
+    }
+
+    let mut raw = (bytes.len() << SHORT_STRING_BYTE_COUNT_SHIFT) | SHORT_STRING_FLAG;
+    let mut index = 0;
+    while index < bytes.len() {
+        if !bytes[index].is_ascii() {
+            return None;
+        }
+        #[cfg(target_endian = "little")]
+        {
+            raw |= (bytes[index] as usize) << ((index + 1) * 8);
+        }
+        #[cfg(target_endian = "big")]
+        {
+            raw |= (bytes[index] as usize) << ((size_of::<usize>() - index - 1) * 8);
+        }
+        index += 1;
+    }
+    Some(raw)
 }
 
 impl PartialEq for Utf16String {
@@ -54728,6 +54759,7 @@ dependencies = [
 name = "libweb_html_tokenizer"
 version = "0.1.0"
 dependencies = [
+ "ak",
  "cbindgen",
 ]
 
@@ -154744,6 +154776,38 @@ ALWAYS_INLINE ThrowCompletionOr<Value> get_cached_property_value(VM& vm, Value v
     return TRY(call(vm, *getter, this_value));
 }
 
+// Non-standard
+ALWAYS_INLINE Value get_own_property_without_side_effects(Object& object, PropertyKey const& property_key, StaticPropertyLookupCache& cache)
+{
+    auto& shape = object.shape();
+
+    if (auto const* cache_entry = cache.first_entry(); cache_entry
+        && (cache_entry->type == PropertyLookupCache::Entry::Type::GetOwnProperty
+            || cache_entry->type == PropertyLookupCache::Entry::Type::GetMissingProperty)
+        && &shape == cache_entry->shape.ptr()
+        && (!shape.is_dictionary() || shape.dictionary_generation() == cache_entry->shape_dictionary_generation)) {
+        if (cache_entry->type == PropertyLookupCache::Entry::Type::GetMissingProperty)
+            return {};
+        return object.get_direct(cache_entry->property_offset);
+    }
+
+    auto metadata = shape.lookup(property_key);
+    auto cache_type = metadata.has_value()
+        ? PropertyLookupCache::Entry::Type::GetOwnProperty
+        : PropertyLookupCache::Entry::Type::GetMissingProperty;
+    cache.update(cache_type, [&](auto& entry) {
+        entry.shape = shape;
+        if (metadata.has_value())
+            entry.property_offset = metadata->offset;
+        if (shape.is_dictionary())
+            entry.shape_dictionary_generation = shape.dictionary_generation();
+    });
+
+    if (!metadata.has_value())
+        return {};
+    return object.get_direct(metadata->offset);
+}
+
 ALWAYS_INLINE GC::Ptr<Object> base_object_for_get_impl(VM& vm, Value base_value)
 {
     if (base_value.is_object()) [[likely]]
@@ -238951,7 +239015,53 @@ i64 asm_slow_path_array_append(VM* vm, u32 pc, Op::ArrayAppend const* instructio
     auto lhs_size = lhs_array.indexed_array_like_size();
 
     if (instruction->is_spread()) {
+        auto* rhs_array = rhs.is_object() ? as_if<JS::Array>(rhs.as_object()) : nullptr;
+        Optional<IteratorRecordImpl> iterator_record;
+
+        if (rhs_array && lhs_array.indexed_storage_kind() <= IndexedStorageKind::Packed) {
+            static auto& iterator_method_cache = *new StaticPropertyLookupCache;
+            auto iterator_method = ASM_TRY(*vm, pc, rhs.get_method(*vm, vm->well_known_symbol_iterator(), iterator_method_cache));
+            if (!iterator_method) {
+                auto completion = vm->throw_completion<TypeError>(ErrorType::NotIterable, rhs);
+                return handle_asm_exception(*vm, pc, completion.value());
+            }
+
+            // OPTIMIZATION: The original array iterator has no observable side effects, so a packed
+            //               array can be appended in bulk if its next method is also unchanged.
+            auto original_iterator_method = vm->current_realm()->intrinsics().array_prototype_values_function();
+            if (iterator_method == original_iterator_method && rhs_array->is_simple_packed_array()) {
+                auto iterator_prototype = vm->current_realm()->intrinsics().array_iterator_prototype();
+
+                // NB: Inspect the intrinsic prototype's own property without invoking it. Using get()
+                //     here would call an accessor with the prototype as its receiver, whereas the
+                //     iterator protocol calls it with the newly created iterator as its receiver.
+                //     Accessors and replacement methods therefore take the generic path below.
+                static auto& next_method_cache = *new StaticPropertyLookupCache;
+                auto next_method = get_own_property_without_side_effects(*iterator_prototype, vm->names.next, next_method_cache);
+                if (next_method.is_function() && next_method.as_function().is_native_function()
+                    && static_cast<NativeFunction const&>(next_method.as_function()).is_array_prototype_next_builtin()) {
+                    auto elements = rhs_array->indexed_packed_elements_span();
+                    if (elements.size() <= NumericLimits<u32>::max() - lhs_size) {
+                        lhs_array.indexed_append(elements);
+                        return static_cast<i64>(pc + sizeof(Op::ArrayAppend));
+                    }
+                }
+            }
+
+            iterator_record = ASM_TRY(*vm, pc, get_iterator_from_method_impl(*vm, rhs, *iterator_method));
+        }
+
         size_t i = lhs_size;
+        if (iterator_record.has_value()) {
+            while (true) {
+                auto iterator_value = ASM_TRY(*vm, pc, iterator_step_value(*vm, *iterator_record));
+                if (!iterator_value.has_value())
+                    break;
+                lhs_array.indexed_put(i++, iterator_value.release_value());
+            }
+            return static_cast<i64>(pc + sizeof(Op::ArrayAppend));
+        }
+
         auto result = get_iterator_values(*vm, rhs, [&i, &lhs_array](Value iterator_value) -> Optional<Completion> {
             lhs_array.indexed_put(i, iterator_value);
             ++i;
@@ -244447,12 +244557,11 @@ GC::Ref<Array> Array::create_from(Realm& realm, ReadonlySpan<Value> elements)
 
     // 2. Let n be 0.
     // 3. For each element e of elements, do
-    for (u32 n = 0; n < elements.size(); ++n) {
-        // a. Perform ! CreateDataPropertyOrThrow(array, ! ToString(𝔽(n)), e).
-        MUST(array->create_data_property_or_throw(n, elements[n]));
-
-        // b. Set n to n + 1.
-    }
+    // a. Perform ! CreateDataPropertyOrThrow(array, ! ToString(𝔽(n)), e).
+    // b. Set n to n + 1.
+    // OPTIMIZATION: These are consecutive default data properties, so initialize the packed
+    //               indexed storage in one allocation instead of defining them individually.
+    array->set_indexed_property_elements(elements);
 
     // 4. Return array.
     return array;
@@ -288617,6 +288726,46 @@ ThrowCompletionOr<void> Object::copy_data_properties(VM& vm, Value source, HashT
     // 2. Let from be ! ToObject(source).
     auto from = MUST(source.to_object(vm));
 
+    // OPTIMIZATION: An empty ordinary object can reuse the shape of a compatible ordinary source
+    //               and copy its property storage directly. This is equivalent to defining each
+    //               property because all source properties already have the default attributes.
+    if (from.ptr() != this
+        && excluded_keys.is_empty()
+        && excluded_values.is_empty()
+        && &shape() == vm.current_realm()->intrinsics().new_object_shape().ptr()
+        && indexed_storage_kind() == IndexedStorageKind::None
+        && extensible()
+        && eligible_for_own_property_enumeration_fast_path()
+        && !has_intrinsic_accessors()
+        && !may_interfere_with_indexed_property_access()
+        && !requires_slow_add_own_property()
+        && from->indexed_storage_kind() == IndexedStorageKind::None
+        && from->eligible_for_own_property_enumeration_fast_path()
+        && !from->has_intrinsic_accessors()
+        && !from->may_interfere_with_indexed_property_access()
+        && !from->requires_slow_add_own_property()
+        && !from->shape().is_dictionary()
+        && !from->shape().is_prototype_shape()
+        && &from->shape().realm() == vm.current_realm()
+        && from->shape().prototype() == shape().prototype()) {
+        bool has_only_default_data_properties = true;
+        from->shape().for_each_property_in_insertion_order([&](auto const&, auto const& metadata) {
+            if (metadata.attributes != default_attributes || from->get_direct(metadata.offset).is_accessor()) {
+                has_only_default_data_properties = false;
+                return IterationDecision::Break;
+            }
+            return IterationDecision::Continue;
+        });
+
+        if (has_only_default_data_properties) {
+            unsafe_set_shape(from->shape());
+            from->shape().for_each_property_in_insertion_order([&](auto const&, auto const& metadata) {
+                put_direct(metadata.offset, from->get_direct(metadata.offset));
+            });
+            return {};
+        }
+    }
+
     // OPTIMIZATION: For ordinary objects we can iterate the shape directly and read values by storage
     //               offset, avoiding repeated property lookups through DescriptorArray::find.
     if (from->eligible_for_own_property_enumeration_fast_path()
@@ -290196,6 +290345,26 @@ void Object::indexed_append(Value value, PropertyAttributes attributes)
     indexed_put(m_indexed_array_like_size, value, attributes);
 }
 
+void Object::indexed_append(ReadonlySpan<Value> values)
+{
+    VERIFY(m_indexed_storage_kind <= IndexedStorageKind::Packed);
+    VERIFY(values.size() <= NumericLimits<u32>::max() - m_indexed_array_like_size);
+
+    if (values.is_empty())
+        return;
+
+    auto old_size = m_indexed_array_like_size;
+    auto values_size = static_cast<u32>(values.size());
+    auto new_size = old_size + values_size;
+    ensure_indexed_elements(new_size);
+
+    for (u32 i = 0; i < values_size; ++i)
+        m_indexed_elements[old_size + i] = values[i];
+
+    m_indexed_storage_kind = IndexedStorageKind::Packed;
+    m_indexed_array_like_size = new_size;
+}
+
 ValueAndAttributes Object::indexed_take_first()
 {
     if (m_indexed_storage_kind == IndexedStorageKind::Dictionary) {
@@ -290298,7 +290467,7 @@ Vector<u32> Object::indexed_indices() const
     VERIFY_NOT_REACHED();
 }
 
-void Object::set_indexed_property_elements(Vector<Value>&& values)
+void Object::set_indexed_property_elements(ReadonlySpan<Value> values)
 {
     free_indexed_elements();
 
@@ -290665,11 +290834,12 @@ public:
     u32 indexed_array_like_size() const { return m_indexed_array_like_size; }
     bool set_indexed_array_like_size(size_t new_size);
     void indexed_append(Value value, PropertyAttributes attributes = default_attributes);
+    void indexed_append(ReadonlySpan<Value> values);
     ValueAndAttributes indexed_take_first();
     ValueAndAttributes indexed_take_last();
     size_t indexed_real_size() const;
     Vector<u32> indexed_indices() const;
-    void set_indexed_property_elements(Vector<Value>&& values);
+    void set_indexed_property_elements(ReadonlySpan<Value> values);
     IndexedStorageKind indexed_storage_kind() const { return m_indexed_storage_kind; }
 
     template<typename Callback>
@@ -636715,14 +636885,13 @@ WebIDL::ExceptionOr<DOM::Element const*> Element::closest(Utf16View selectors) c
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-element-innerhtml
-WebIDL::ExceptionOr<void> Element::set_inner_html(StringView html)
+WebIDL::ExceptionOr<void> Element::set_inner_html(Utf16View html)
 {
-    auto markup = Utf16String::from_utf8(html);
     Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> target = GC::Ref { *this };
     auto* template_element = as_if<HTML::HTMLTemplateElement>(*this);
     if (template_element)
         target = template_element->content();
-    auto fragment = TRY(parse_fragment(target, markup.utf16_view()));
+    auto fragment = TRY(parse_fragment(target, html));
 
     // 5. Replace all with fragment within target.
     target.visit([&](auto node) {
@@ -640817,7 +640986,7 @@ WebIDL::ExceptionOr<void> set_inner_html(DOM::Element& element, TrustedTypes::Tr
         TrustedTypes::InjectionSink::Element_innerHTML,
         "script"sv));
 
-    return element.set_inner_html(compliant_string.to_utf8_but_should_be_ported_to_utf16());
+    return element.set_inner_html(compliant_string);
 }
 
 WebIDL::ExceptionOr<TrustedTypes::TrustedHTMLOrString> outer_html(DOM::Element& element)
@@ -641345,7 +641514,7 @@ public:
     [[nodiscard]] GC::Ptr<Element const> element_to_inherit_style_from(Optional<CSS::PseudoElement>) const;
 
     WebIDL::ExceptionOr<Utf16String> inner_html() const;
-    WebIDL::ExceptionOr<void> set_inner_html(StringView html);
+    WebIDL::ExceptionOr<void> set_inner_html(Utf16View html);
 
     WebIDL::ExceptionOr<void> set_html_unsafe(StringView html);
 
@@ -656682,18 +656851,17 @@ WebIDL::ExceptionOr<Utf16String> ShadowRoot::inner_html() const
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-shadowroot-innerhtml
-WebIDL::ExceptionOr<void> ShadowRoot::set_inner_html(StringView html)
+WebIDL::ExceptionOr<void> ShadowRoot::set_inner_html(Utf16View html)
 {
     // 2. Let context be this's host.
     auto context = this->host();
     VERIFY(context);
 
     // 3. Let fragment be the result of invoking the fragment parsing algorithm steps with context and compliantString.
-    auto markup = Utf16String::from_utf8(html);
     // Keep the shadow root as the fragment parsing target so custom element
     // creation uses this shadow tree's registry. The host is still used as
     // the parser context by the fragment parsing algorithm.
-    auto fragment = TRY(Element::parse_fragment(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> { *this }, markup.utf16_view()));
+    auto fragment = TRY(Element::parse_fragment(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> { *this }, html));
 
     // 4. Replace all with fragment within this.
     this->replace_all(fragment);
@@ -656924,7 +657092,7 @@ WebIDL::ExceptionOr<void> set_inner_html(DOM::ShadowRoot& shadow_root, TrustedTy
         TrustedTypes::InjectionSink::ShadowRoot_innerHTML,
         "script"_utf16));
 
-    return shadow_root.set_inner_html(compliant_string.to_utf8_but_should_be_ported_to_utf16());
+    return shadow_root.set_inner_html(compliant_string);
 }
 
 WebIDL::ExceptionOr<void> set_html_unsafe(DOM::ShadowRoot& shadow_root, Variant<GC::Ref<TrustedTypes::TrustedHTML>, Utf16String> const& html)
@@ -657037,7 +657205,7 @@ public:
     virtual EventTarget* get_parent(Event const&) override;
 
     WebIDL::ExceptionOr<Utf16String> inner_html() const;
-    WebIDL::ExceptionOr<void> set_inner_html(StringView);
+    WebIDL::ExceptionOr<void> set_inner_html(Utf16View);
 
     WebIDL::ExceptionOr<void> set_html_unsafe(StringView);
 
@@ -666612,156 +666780,3 @@ WebIDL::ExceptionOr<bool> Document::query_command_indeterm(Utf16FlyString const&
 }
 
 // https://w3c.github.io/editing/docs/execCommand/#querycommandstate()
-WebIDL::ExceptionOr<bool> Document::query_command_state(Utf16FlyString const& command)
-{
-    // AD-HOC: This is not directly mentioned in the spec, but all major browsers limit editing API calls to HTML documents
-    if (!is_html_document())
-        return WebIDL::InvalidStateError::create("queryCommandState is only supported on HTML documents"_utf16);
-
-    // 1. If command is not supported or has no state, return false.
-    auto optional_command = Editing::find_command_definition(command);
-    if (!optional_command.has_value())
-        return false;
-    auto const& command_definition = optional_command.release_value();
-    auto state_override = command_state_override(command_definition.command);
-    if (!command_definition.state && !state_override.has_value()) {
-        // https://w3c.github.io/editing/docs/execCommand/#inline-command-activated-values
-        // If a command has inline command activated values defined, its state is true if either no formattable node is
-        // effectively contained in the active range, and the active range's start node's effective command value is one
-        // of the given values;
-        auto const& inline_values = command_definition.inline_activated_values;
-        if (inline_values.is_empty())
-            return false;
-        auto range = Editing::active_range(*this);
-        if (!range)
-            return false;
-
-        Vector<GC::Ref<Node>> formattable_nodes;
-        Editing::for_each_node_effectively_contained_in_range(range, [&](GC::Ref<Node> descendant) {
-            if (Editing::is_formattable_node(descendant))
-                formattable_nodes.append(descendant);
-            return TraversalDecision::Continue;
-        });
-        if (formattable_nodes.is_empty())
-            return inline_values.contains_slow(Editing::effective_command_value(range->start_container(), command_definition.command).value_or({}));
-
-        // or if there is at least one formattable node effectively contained in the active range, and all of them have
-        // an effective command value equal to one of the given values.
-        return all_of(formattable_nodes, [&](GC::Ref<Node> node) {
-            return inline_values.contains_slow(Editing::effective_command_value(node, command_definition.command).value_or({}));
-        });
-    }
-
-    // 2. If the state override for command is set, return it.
-    if (state_override.has_value())
-        return state_override.release_value();
-
-    // 3. Return true if command's state is true, otherwise false.
-    return command_definition.state(*this);
-}
-
-// https://w3c.github.io/editing/docs/execCommand/#querycommandsupported()
-WebIDL::ExceptionOr<bool> Document::query_command_supported(Utf16FlyString const& command)
-{
-    // AD-HOC: This is not directly mentioned in the spec, but all major browsers limit editing API calls to HTML documents
-    if (!is_html_document())
-        return WebIDL::InvalidStateError::create("queryCommandSupported is only supported on HTML documents"_utf16);
-
-    // When the queryCommandSupported(command) method on the Document interface is invoked, the user agent must return
-    // true if command is supported and available within the current script on the current site, and false otherwise.
-    // AD-HOC: Supported commands should have an action defined. Currently, ::preserveWhitespace does not have one.
-    auto command_definition = Editing::find_command_definition(command);
-    return command_definition.has_value() && command_definition->action;
-}
-
-// https://w3c.github.io/editing/docs/execCommand/#querycommandvalue()
-WebIDL::ExceptionOr<Utf16String> Document::query_command_value(Utf16FlyString const& command)
-{
-    // AD-HOC: This is not directly mentioned in the spec, but all major browsers limit editing API calls to HTML documents
-    if (!is_html_document())
-        return WebIDL::InvalidStateError::create("queryCommandValue is only supported on HTML documents"_utf16);
-
-    // 1. If command is not supported or has no value, return the empty string.
-    auto optional_command = Editing::find_command_definition(command);
-    if (!optional_command.has_value())
-        return Utf16String {};
-    auto const& command_definition = optional_command.release_value();
-    auto value_override = command_value_override(command_definition.command);
-    if (!command_definition.value && !value_override.has_value())
-        return Utf16String {};
-
-    // 2. If command is "fontSize" and its value override is set, convert the value override to an
-    //    integer number of pixels and return the legacy font size for the result.
-    if (command_definition.command == Editing::CommandNames::fontSize && value_override.has_value()) {
-        auto pixel_size = Editing::font_size_to_pixel_size(value_override.release_value());
-        return Editing::legacy_font_size(pixel_size.to_int());
-    }
-
-    // 3. If the value override for command is set, return it.
-    if (value_override.has_value())
-        return Utf16String::from_utf16(value_override.release_value());
-
-    // 4. Return command's value.
-    return command_definition.value(*this);
-}
-
-// https://w3c.github.io/editing/docs/execCommand/#value-override
-void Document::set_command_value_override(Utf16FlyString const& command, Utf16View value)
-{
-    m_command_value_override.set(command, Utf16String::from_utf16(value));
-
-    // The value override for the backColor command must be the same as the value override for the hiliteColor command,
-    // such that setting one sets the other to the same thing and unsetting one unsets the other.
-    if (command == Editing::CommandNames::backColor)
-        m_command_value_override.set(Editing::CommandNames::hiliteColor, Utf16String::from_utf16(value));
-    else if (command == Editing::CommandNames::hiliteColor)
-        m_command_value_override.set(Editing::CommandNames::backColor, Utf16String::from_utf16(value));
-}
-
-// https://w3c.github.io/editing/docs/execCommand/#value-override
-void Document::clear_command_value_override(Utf16FlyString const& command)
-{
-    m_command_value_override.remove(command);
-
-    // The value override for the backColor command must be the same as the value override for the hiliteColor command,
-    // such that setting one sets the other to the same thing and unsetting one unsets the other.
-    if (command == Editing::CommandNames::backColor)
-        m_command_value_override.remove(Editing::CommandNames::hiliteColor);
-    else if (command == Editing::CommandNames::hiliteColor)
-        m_command_value_override.remove(Editing::CommandNames::backColor);
-}
-
-}
-
-FILE: Libraries/LibWeb/Editing/InlineInsertion.cpp
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibWeb/DOM/Node.h>
-#include <LibWeb/Editing/InlineInsertion.h>
-#include <LibWeb/Editing/Internal/Algorithms.h>
-#include <LibWeb/Editing/ParagraphOperations.h>
-#include <LibWeb/HTML/HTMLLIElement.h>
-#include <LibWeb/HTML/HTMLOListElement.h>
-#include <LibWeb/HTML/HTMLUListElement.h>
-
-namespace Web::Editing {
-
-InlineInsertionBoundary prepare_inline_insertion_boundary(DOM::BoundaryPoint boundary, DOM::Node& containing_block)
-{
-    VERIFY(boundary.node.ptr() == &containing_block || containing_block.is_ancestor_of(boundary.node));
-
-    // INTEROP: Blink first advances through preceding inline nodes while the resulting DOM boundary represents the
-    //          same caret. Inserting after a styled run then occurs beside that run instead of creating an empty style
-    //          clone on its trailing edge.
-    while (boundary.node.ptr() != &containing_block) {
-        if (boundary.offset != boundary.node->length() || !boundary.node->parent())
-            break;
-        auto node = boundary.node;
-        boundary = { *node->parent(), static_cast<WebIDL::UnsignedLong>(node->index() + 1) };
-    }
-
-    GC::Ptr<DOM::Node> highest_styled_inline_ancestor;
