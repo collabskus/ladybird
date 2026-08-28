@@ -103,6 +103,7 @@ pub(crate) fn record_display_list(
         visual_context_host,
         nested: None,
         nested_tree: None,
+        last_looked_up_box_local_frames_by_role: std::cell::RefCell::new(None),
         prerecorded: crate::painting::record::masks::PrerecordedNestedDisplayLists::default(),
         command_cache_source,
         item_cache_source,
@@ -149,9 +150,7 @@ pub(crate) fn record_display_list(
     recorder.recorder.fill_rect(inputs.bitmap_rect, inputs.background_color);
     recorder.prerecord_nested_display_lists();
     if !stacking_contexts.nodes.is_empty() {
-        recorder.recorder.save_layer();
         recorder.paint_stacking_context(0);
-        recorder.recorder.restore();
     }
     crate::painting::record::paint::inspector_overlay::record_inspector_overlays(&mut recorder);
     let mask_display_lists = recorder.recorder.take_mask_display_lists();
@@ -220,8 +219,7 @@ impl PaintRecorder<'_> {
         self.register_mask_display_lists(paintable, MaskLayerSet::CssAndSvg);
 
         let context_before_children = self.recorder.accumulated_visual_context();
-        self.paint_internal(index);
-        self.recorder.set_accumulated_visual_context(context_before_children);
+        self.with_context(context_before_children, |this| this.paint_internal(index));
     }
 
     fn paint_child(&mut self, child: u32) {
@@ -679,7 +677,6 @@ impl PaintRecorder<'_> {
     }
 
     fn paint_node(&mut self, paintable: NodeSlotId, phase: PaintPhase) {
-        let saved_nesting_level = std::mem::replace(&mut self.recorder.save_nesting_level, 0);
         let context = self.context_for_phase(paintable, phase);
         self.recorder.set_accumulated_visual_context(context);
 
@@ -757,6 +754,8 @@ impl PaintRecorder<'_> {
                 &source.display_list.bytes,
                 cached.range,
                 cached.recorded_context,
+                cached.recorded_local_frame_range,
+                self.local_frame_range(paintable),
             );
             if cache_writes_enabled {
                 self.set_cached_commands(
@@ -791,11 +790,6 @@ impl PaintRecorder<'_> {
         }
 
         self.recorder.set_accumulated_visual_context(ContextRef::default());
-        assert_eq!(
-            self.recorder.save_nesting_level, 0,
-            "unbalanced save/restore in a paint capture"
-        );
-        self.recorder.save_nesting_level = saved_nesting_level;
     }
 
     fn valid_cached_commands(
@@ -858,6 +852,7 @@ impl PaintRecorder<'_> {
         recorded_context: ContextRef,
         captured_under_empty_effective_clip: bool,
     ) {
+        let recorded_local_frame_range = self.local_frame_range(paintable);
         let cache = self.layout_arena.paintable_paint_cache(paintable);
         cache.register_capture_position(self.current_absolute_position(paintable));
         cache.set_commands(
@@ -866,9 +861,14 @@ impl PaintRecorder<'_> {
                 source_display_list_id: self.display_list_id,
                 range,
                 recorded_context,
+                recorded_local_frame_range,
                 captured_under_empty_effective_clip,
             },
         );
+    }
+
+    fn local_frame_range(&self, paintable: NodeSlotId) -> (u32, u32) {
+        self.data(paintable).local_frame_range()
     }
 
     fn set_cached_hit_test_items(

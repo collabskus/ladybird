@@ -282,8 +282,9 @@ pub(crate) fn compute_css_clip_data(
     };
     let converter = DevicePixelConverter::new(pixel_ratio);
     Some(ClipData {
-        rect: converter.rounded_device_rect(effective),
+        rect: converter.rounded_device_rect(effective).to_float(),
         corner_radii: CornerRadii::default(),
+        mode: super::ClipMode::Intersect,
     })
 }
 
@@ -365,6 +366,19 @@ pub(crate) fn border_radii_data(
             border_radius_pair(&border.border_bottom_right_radius),
             border_radius_pair(&border.border_bottom_left_radius),
         ],
+    )
+}
+
+pub(crate) fn padding_edge_border_radii(
+    style: ComputedValuesView<'_>,
+    layout_arena: &impl PaintableRowsRead,
+    slot: NodeSlotId,
+) -> BorderRadii {
+    border_radii_data(style, layout_arena, slot).shrunken(
+        style.border_top_width(),
+        style.border_right_width(),
+        style.border_bottom_width(),
+        style.border_left_width(),
     )
 }
 
@@ -779,18 +793,14 @@ pub(crate) fn compute_clip_data(
     // FIXME: Adjust the border radii for the overflow-clip-margin case.
     //        (see https://drafts.csswg.org/css-overflow-4/#valdef-overflow-clip-margin-length-0 )
     let radii = if overflow_x != overflow::VISIBLE && overflow_y != overflow::VISIBLE {
-        border_radii_data(style, layout_arena, slot).shrunken(
-            style.border_top_width(),
-            style.border_right_width(),
-            style.border_bottom_width(),
-            style.border_left_width(),
-        )
+        padding_edge_border_radii(style, layout_arena, slot)
     } else {
         BorderRadii::default()
     };
     let converter = DevicePixelConverter::new(pixel_ratio);
     Some(ClipData {
-        rect: converter.rounded_device_rect(clip_rect),
+        rect: converter.rounded_device_rect(clip_rect).to_float(),
         corner_radii: radii.as_corners(&converter),
+        mode: super::ClipMode::Intersect,
     })
 }

@@ -290,6 +290,9 @@ static_assert(sizeof(MaskLayerOrigin) == sizeof(u8));
 static_assert(to_underlying(MaskLayerOrigin::CssMaskLayers) == 0);
 static_assert(to_underlying(MaskLayerOrigin::SvgMask) == 1);
 static_assert(to_underlying(MaskLayerOrigin::SvgClip) == 2);
+static_assert(sizeof(ClipMode) == sizeof(u8));
+static_assert(to_underlying(ClipMode::Intersect) == 0);
+static_assert(to_underlying(ClipMode::Difference) == 1);
 
 #define VERIFY_SHARED_FFI_TYPE(type) static_assert(IsTriviallyCopyable<type>)
 VERIFY_SHARED_FFI_TYPE(CSSPixels);
@@ -315,6 +318,7 @@ VERIFY_SHARED_FFI_TYPE(Gfx::ScalingMode);
 VERIFY_SHARED_FFI_TYPE(Gfx::InterpolationColorSpace);
 VERIFY_SHARED_FFI_TYPE(TransformDataRole);
 VERIFY_SHARED_FFI_TYPE(MaskLayerOrigin);
+VERIFY_SHARED_FFI_TYPE(ClipMode);
 VERIFY_SHARED_FFI_TYPE(ChromeMetrics);
 static_assert(sizeof(ChromeMetrics) == 7 * sizeof(CSSPixels));
 static_assert(offsetof(ChromeMetrics, scroll_thumb_min_length) == 0);
@@ -402,7 +406,7 @@ static FrameData frame_data_from_export(Layout::RustFFI::FfiVisualContextNodeExp
     auto rect = [&] { return node.rect.to_type<DevicePixels>(); };
     switch (node.kind) {
     case Layout::RustFFI::FfiVisualContextNodeKind::Clip:
-        return ClipData { rect(), node.corner_radii };
+        return ClipData { .rect = node.clip_rect, .corner_radii = node.corner_radii, .mode = node.clip_mode };
     case Layout::RustFFI::FfiVisualContextNodeKind::ClipPath:
         return ClipPathData { .path = *static_cast<Gfx::Path const*>(node.path), .bounding_rect = rect(), .fill_rule = node.winding_rule };
     case Layout::RustFFI::FfiVisualContextNodeKind::Effects: {
@@ -451,6 +455,8 @@ static AccumulatedVisualContextTree materialize_rust_visual_context_tree(void co
         visual_context_tree.append_spatial(spatial_data_from_export(spatial_nodes[index]), SpatialNodeIndex { spatial_nodes[index].parent });
     for (auto const& node : frame_nodes)
         visual_context_tree.append_frame(frame_data_from_export(node), FrameNodeIndex { node.parent }, SpatialNodeIndex { node.spatial });
+    if (auto root_isolation_frame = Layout::RustFFI::layout_arena_visual_context_tree_root_isolation_frame(tree); root_isolation_frame != NO_FRAME_NODE.value())
+        visual_context_tree.set_root_isolation_frame(FrameNodeIndex { root_isolation_frame });
     return visual_context_tree;
 }
 

@@ -93,44 +93,6 @@ pub(crate) fn paint(recorder: &mut PaintRecorder<'_>, paintable: NodeSlotId, pha
     }
 }
 
-pub(crate) fn border_radii_shrunk_for_borders(
-    recorder: &mut PaintRecorder<'_>,
-    paintable: NodeSlotId,
-) -> crate::painting::border_radii::BorderRadii {
-    let mut radii = recorder.border_radii(paintable);
-    let layout_node = paintable;
-    if let Some(style) = recorder.layout_arena.node_style_if_live(layout_node) {
-        radii.shrink(
-            style.border_top_width(),
-            style.border_right_width(),
-            style.border_bottom_width(),
-            style.border_left_width(),
-        );
-    }
-    radii
-}
-
-pub(crate) fn begin_corner_clip(
-    recorder: &mut PaintRecorder<'_>,
-    rect: libgfx_rust::IntRect,
-    radii: &crate::painting::border_radii::BorderRadii,
-    corner_clip: libgfx_rust::CornerClip,
-) -> bool {
-    let corner_radii = radii.corners_unconditionally(&recorder.converter);
-    if !corner_radii.has_any_radius() {
-        return false;
-    }
-    recorder.recorder.save();
-    recorder.recorder.add_rounded_rect_clip(corner_radii, rect, corner_clip);
-    true
-}
-
-pub(crate) fn end_corner_clip(recorder: &mut PaintRecorder<'_>, applied: bool) {
-    if applied {
-        recorder.recorder.restore();
-    }
-}
-
 pub(crate) fn paint_base(recorder: &mut PaintRecorder<'_>, paintable: NodeSlotId, phase: PaintPhase) {
     paint_base_with(recorder, paintable, phase, background::paint_background);
 }
@@ -156,7 +118,14 @@ pub(crate) fn paint_base_with(
         let padding_box_rect =
             crate::painting::paintable_geometry::absolute_padding_box_rect(recorder.layout_arena, paintable);
         let border_radii = recorder.border_radii(paintable);
-        shadow::paint_box_shadow(recorder, paintable, border_box_rect, padding_box_rect, border_radii);
+        shadow::paint_box_shadow(
+            recorder,
+            paintable,
+            crate::painting::visual_context::PieceKey::Box,
+            border_box_rect,
+            padding_box_rect,
+            border_radii,
+        );
     }
     if phase == PaintPhase::Border
         && !crate::painting::paintable_geometry::committed_uses_collapsing_borders_model(
@@ -194,12 +163,6 @@ pub(crate) fn paint_backdrop_filter(
                 paintable,
             ));
     let border_radii = recorder.border_radii(paintable);
-    let corner_clip = begin_corner_clip(
-        recorder,
-        backdrop_region,
-        &border_radii,
-        libgfx_rust::CornerClip::Outside,
-    );
     let filter_bytes = recorder.layout_arena.node_style_if_live(paintable).and_then(|style| {
         let backdrop_filter = &style.effects().backdrop_filter;
         if crate::painting::filter_bytes::contains_url(backdrop_filter) {
@@ -219,5 +182,4 @@ pub(crate) fn paint_backdrop_filter(
             .recorder
             .apply_backdrop_filter(backdrop_region, corner_radii, &filter_bytes);
     }
-    end_corner_clip(recorder, corner_clip);
 }

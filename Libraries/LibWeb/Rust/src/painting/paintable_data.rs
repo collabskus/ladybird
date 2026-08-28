@@ -75,6 +75,13 @@ impl PaintableKind {
         matches!(self, Self::NavigableContainerViewportPaintable)
     }
 
+    pub const fn paints_box_decorations(self) -> bool {
+        !matches!(
+            self,
+            Self::None | Self::InlinePaintable | Self::SVGPathPaintable | Self::SVGImagePaintable
+        )
+    }
+
     pub const fn forms_unconnected_subtree(self) -> bool {
         matches!(
             self,
@@ -192,6 +199,10 @@ impl Default for PaintableData {
 }
 
 impl PaintableData {
+    pub fn local_frame_range(&self) -> (u32, u32) {
+        (self.frame_nodes_begin, self.frame_nodes_end)
+    }
+
     pub fn has_flag(&self, flag: PaintableFlag) -> bool {
         self.flags & flag as u32 != 0
     }
@@ -269,6 +280,22 @@ pub struct InlineBoxPieceRecord {
     pub accumulated_vertical_shift: CssPixels,
     pub present_edges: u8,
     pub is_geometry_only_placeholder: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BorderEdge {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+impl BorderEdge {
+    pub const ALL: [BorderEdge; 4] = [BorderEdge::Top, BorderEdge::Right, BorderEdge::Bottom, BorderEdge::Left];
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
 }
 
 pub const PIECE_EDGE_TOP: u8 = 1 << 0;
