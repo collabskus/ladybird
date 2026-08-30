@@ -465,7 +465,7 @@ static AccumulatedVisualContextTree materialize_rust_visual_context_tree(DOM::Do
     for (size_t index = 1; index < spatial_nodes.size(); ++index)
         visual_context_tree.append_spatial(spatial_data_from_export(spatial_nodes[index]), SpatialNodeIndex { spatial_nodes[index].parent });
     for (auto const& node : frame_nodes)
-        visual_context_tree.append_frame(frame_data_from_export(node, filter_image_storage), FrameNodeIndex { node.parent }, SpatialNodeIndex { node.spatial }, node.has_empty_effective_clip);
+        visual_context_tree.append_frame(frame_data_from_export(node, filter_image_storage), FrameNodeIndex { node.parent }, SpatialNodeIndex { node.spatial });
     if (auto root_isolation_frame = Layout::RustFFI::layout_arena_visual_context_tree_root_isolation_frame(tree); root_isolation_frame != NO_FRAME_NODE.value())
         visual_context_tree.set_root_isolation_frame(FrameNodeIndex { root_isolation_frame });
     return visual_context_tree;
@@ -638,7 +638,7 @@ void patch_rust_visual_context_nodes(DOM::Document& document, AccumulatedVisualC
     auto frame_nodes = exported_visual_context_nodes(tree, frame_begin, frame_end, Layout::RustFFI::layout_arena_visual_context_tree_export_frame_nodes);
     auto const* filter_image_storage = visual_context_filter_image_storage(document);
     for (size_t i = 0; i < frame_nodes.size(); ++i)
-        visual_context_tree.frame_node_at(FrameNodeIndex { static_cast<u32>(frame_begin + i) }).data = frame_data_from_export(frame_nodes[i], filter_image_storage);
+        visual_context_tree.set_frame_data(FrameNodeIndex { static_cast<u32>(frame_begin + i) }, frame_data_from_export(frame_nodes[i], filter_image_storage));
 }
 
 bool patch_rust_sticky_visual_context_nodes(DOM::Document& document, AccumulatedVisualContextTree& visual_context_tree)

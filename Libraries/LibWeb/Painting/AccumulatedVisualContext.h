@@ -144,7 +144,7 @@ struct FrameNode {
     FrameData data;
     FrameNodeIndex parent { NO_FRAME_NODE };
     SpatialNodeIndex spatial {};
-    bool has_empty_effective_clip { false };
+    bool clips_everything { false };
 };
 
 class AccumulatedVisualContextTree {
@@ -179,14 +179,13 @@ public:
 
     WEB_API SpatialNodeIndex append_spatial(SpatialData, SpatialNodeIndex parent);
     WEB_API FrameNodeIndex append_frame(FrameData, FrameNodeIndex parent, SpatialNodeIndex spatial);
-    WEB_API FrameNodeIndex append_frame(FrameData, FrameNodeIndex parent, SpatialNodeIndex spatial, bool has_empty_effective_clip);
     WEB_API void set_visual_viewport_transform(TransformData);
     WEB_API void reuse_version_from(AccumulatedVisualContextTree const&);
 
     SpatialNode const& spatial_node_at(SpatialNodeIndex index) const { return m_spatial_nodes[index.value()]; }
     SpatialNode& spatial_node_at(SpatialNodeIndex index) { return m_spatial_nodes[index.value()]; }
     FrameNode const& frame_node_at(FrameNodeIndex index) const { return m_frame_nodes[index.value()]; }
-    FrameNode& frame_node_at(FrameNodeIndex index) { return m_frame_nodes[index.value()]; }
+    WEB_API void set_frame_data(FrameNodeIndex, FrameData);
     ReadonlySpan<SpatialNode> spatial_nodes() const { return m_spatial_nodes.span(); }
     ReadonlySpan<FrameNode> frame_nodes() const { return m_frame_nodes.span(); }
     bool root_is_visual_viewport() const { return m_root_is_visual_viewport; }
@@ -207,7 +206,7 @@ public:
     void dump_spatial_node(SpatialNodeIndex, StringBuilder&) const;
     void dump_frame_node(FrameNodeIndex, StringBuilder&) const;
 
-    bool has_empty_effective_clip(FrameNodeIndex index) const { return index != NO_FRAME_NODE && m_frame_nodes[index.value()].has_empty_effective_clip; }
+    WEB_API Vector<bool> frames_with_empty_effective_clip() const;
 
 private:
     AccumulatedVisualContextTree(u64 version, TransformData root_transform, bool root_is_visual_viewport);
