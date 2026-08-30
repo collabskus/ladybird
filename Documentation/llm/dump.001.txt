@@ -116965,341 +116965,6 @@ using IntBoundingBox = BoundingBox<int>;
 
 }
 
-FILE: Libraries/LibGfx/BSPTree.cpp
-/*
- * Copyright (c) 2026, Tim Ledbetter <tim.ledbetter@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <AK/NumericLimits.h>
-#include <AK/Optional.h>
-#include <AK/QuickSort.h>
-#include <LibGfx/BSPTree.h>
-#include <LibGfx/Vector4.h>
-
-namespace Gfx {
-
-// Vertices closer to a splitting plane than this distance count as lying on it, giving the plane a thickness that
-// absorbs floating-point noise from the projection.
-static constexpr float on_plane_threshold = 0.05f;
-
-Vector<FloatVector3, 8> map_rect_through_projection(FloatMatrix4x4 const& matrix, FloatRect const& rect)
-{
-    // Projecting a point divides it by w, which only works in front of the eye plane where w is positive.
-    // Edges crossing behind the eye are clipped at this small positive w so the divide stays finite.
-    static constexpr float minimum_projection_w = 0.00001f;
-
-    Array corners = {
-        matrix * FloatVector4 { rect.left(), rect.top(), 0, 1 },
-        matrix * FloatVector4 { rect.right(), rect.top(), 0, 1 },
-        matrix * FloatVector4 { rect.right(), rect.bottom(), 0, 1 },
-        matrix * FloatVector4 { rect.left(), rect.bottom(), 0, 1 },
-    };
-
-    Vector<FloatVector3, 8> result;
-    auto append_projected = [&](FloatVector4 const& vertex) {
-        result.append({ vertex.x() / vertex.w(), vertex.y() / vertex.w(), vertex.z() / vertex.w() });
-    };
-    for (size_t i = 0; i < corners.size(); ++i) {
-        auto const& current = corners[i];
-        auto const& next = corners[(i + 1) % corners.size()];
-        bool current_in_front_of_eye = current.w() > minimum_projection_w;
-        bool next_in_front_of_eye = next.w() > minimum_projection_w;
-        if (current_in_front_of_eye)
-            append_projected(current);
-        if (current_in_front_of_eye != next_in_front_of_eye) {
-            auto t = (minimum_projection_w - current.w()) / (next.w() - current.w());
-            append_projected(current + (next - current) * t);
-        }
-    }
-    return result;
-}
-
-static Optional<FloatVector3> polygon_normal(ReadonlySpan<FloatVector3> vertices)
-{
-    if (vertices.size() < 3)
-        return {};
-    FloatVector3 normal { 0, 0, 0 };
-    for (size_t i = 1; i < vertices.size() - 1; ++i)
-        normal += (vertices[i] - vertices[0]).cross(vertices[i + 1] - vertices[0]);
-    auto length = normal.length();
-    // Returns no value for polygons that enclose no area, as they do not define a plane.
-    if (length == 0)
-        return {};
-    return normal / length;
-}
-
-namespace {
-
-struct PartitionedPolygon {
-    BSPPolygon polygon;
-    FloatVector3 plane_normal;
-    float plane_distance { 0 };
-};
-
-constexpr size_t no_bsp_node = NumericLimits<size_t>::max();
-
-struct BSPTreeNode {
-    FloatVector3 plane_normal;
-    float plane_distance { 0 };
-    Vector<BSPPolygon> coplanar_polygons;
-    size_t front { no_bsp_node };
-    size_t back { no_bsp_node };
-};
-
-// The polygons of a subtree that has not been built yet, and the parent slot that will reference its node.
-struct PendingSubtree {
-    Vector<PartitionedPolygon> polygons;
-    size_t parent { no_bsp_node };
-    bool is_front_child { false };
-};
-
-struct PolygonSplit {
-    Optional<PartitionedPolygon> front_piece;
-    Optional<PartitionedPolygon> back_piece;
-};
-
-}
-
-static PolygonSplit split_polygon(PartitionedPolygon polygon, ReadonlySpan<float> vertex_distances)
-{
-    Vector<FloatVector3, 8> front_vertices;
-    Vector<FloatVector3, 8> back_vertices;
-    auto const& vertices = polygon.polygon.vertices;
-    for (size_t i = 0; i < vertices.size(); ++i) {
-        size_t next_index = (i + 1) % vertices.size();
-        auto current_distance = vertex_distances[i];
-        auto next_distance = vertex_distances[next_index];
-        if (current_distance >= -on_plane_threshold)
-            front_vertices.append(vertices[i]);
-        if (current_distance <= on_plane_threshold)
-            back_vertices.append(vertices[i]);
-        bool edge_crosses_plane = (current_distance > on_plane_threshold && next_distance < -on_plane_threshold)
-            || (current_distance < -on_plane_threshold && next_distance > on_plane_threshold);
-        if (edge_crosses_plane) {
-            auto t = current_distance / (current_distance - next_distance);
-            auto intersection = vertices[i] + (vertices[next_index] - vertices[i]) * t;
-            front_vertices.append(intersection);
-            back_vertices.append(intersection);
-        }
-    }
-
-    auto make_piece = [&](Vector<FloatVector3, 8> piece_vertices) -> Optional<PartitionedPolygon> {
-        if (piece_vertices.size() < 3)
-            return {};
-        return PartitionedPolygon {
-            BSPPolygon { move(piece_vertices), polygon.polygon.plane_index, true },
-            polygon.plane_normal,
-            polygon.plane_distance,
-        };
-    };
-    return { make_piece(move(front_vertices)), make_piece(move(back_vertices)) };
-}
-
-static Vector<BSPTreeNode> build_bsp_tree(Vector<PartitionedPolygon> polygons)
-{
-    Vector<BSPTreeNode> nodes;
-    Vector<PendingSubtree> pending_subtrees;
-    if (!polygons.is_empty())
-        pending_subtrees.append({ move(polygons), no_bsp_node, false });
-
-    Vector<float, 8> vertex_distances;
-    while (!pending_subtrees.is_empty()) {
-        auto subtree = pending_subtrees.take_last();
-        auto node_index = nodes.size();
-        if (subtree.parent != no_bsp_node) {
-            if (subtree.is_front_child) {
-                nodes[subtree.parent].front = node_index;
-            } else {
-                nodes[subtree.parent].back = node_index;
-            }
-        }
-
-        auto splitter_index = subtree.polygons.size() / 2;
-        auto plane_normal = subtree.polygons[splitter_index].plane_normal;
-        auto plane_distance = subtree.polygons[splitter_index].plane_distance;
-
-        Vector<BSPPolygon> coplanar_polygons;
-        Vector<PartitionedPolygon> front_list;
-        Vector<PartitionedPolygon> back_list;
-        for (size_t polygon_index = 0; polygon_index < subtree.polygons.size(); ++polygon_index) {
-            auto& polygon = subtree.polygons[polygon_index];
-            if (polygon_index == splitter_index) {
-                coplanar_polygons.append(move(polygon.polygon));
-                continue;
-            }
-            vertex_distances.clear_with_capacity();
-            size_t front_count = 0;
-            size_t back_count = 0;
-            for (auto const& vertex : polygon.polygon.vertices) {
-                auto distance = plane_normal.dot(vertex) - plane_distance;
-                vertex_distances.append(distance);
-                if (distance > on_plane_threshold) {
-                    ++front_count;
-                } else if (distance < -on_plane_threshold) {
-                    ++back_count;
-                }
-            }
-
-            if (front_count == 0 && back_count == 0) {
-                coplanar_polygons.append(move(polygon.polygon));
-            } else if (back_count == 0) {
-                front_list.append(move(polygon));
-            } else if (front_count == 0) {
-                back_list.append(move(polygon));
-            } else {
-                auto [front_piece, back_piece] = split_polygon(move(polygon), vertex_distances);
-                if (front_piece.has_value())
-                    front_list.append(front_piece.release_value());
-                if (back_piece.has_value())
-                    back_list.append(back_piece.release_value());
-            }
-        }
-        nodes.append({ plane_normal, plane_distance, move(coplanar_polygons), no_bsp_node, no_bsp_node });
-
-        if (!front_list.is_empty())
-            pending_subtrees.append({ move(front_list), node_index, true });
-        if (!back_list.is_empty())
-            pending_subtrees.append({ move(back_list), node_index, false });
-    }
-    return nodes;
-}
-
-static Vector<BSPPolygon> collect_back_to_front(Vector<BSPTreeNode> nodes)
-{
-    Vector<BSPPolygon> ordered;
-    if (nodes.is_empty())
-        return ordered;
-
-    size_t polygon_count = 0;
-    for (auto const& node : nodes)
-        polygon_count += node.coplanar_polygons.size();
-    ordered.ensure_capacity(polygon_count);
-
-    struct TraversalStep {
-        size_t node_index { 0 };
-        bool ready_to_emit { false };
-    };
-    Vector<TraversalStep> traversal_stack;
-    traversal_stack.append({ 0, false });
-    while (!traversal_stack.is_empty()) {
-        auto step = traversal_stack.take_last();
-        auto& node = nodes[step.node_index];
-        // The subtree on the side of the plane the viewer is on paints last. Coplanar polygons paint in their stored
-        // paint order regardless of which way the plane faces.
-        auto far_subtree = node.plane_normal.z() > 0 ? node.back : node.front;
-        auto near_subtree = node.plane_normal.z() > 0 ? node.front : node.back;
-        if (!step.ready_to_emit) {
-            traversal_stack.append({ step.node_index, true });
-            if (far_subtree != no_bsp_node)
-                traversal_stack.append({ far_subtree, false });
-            continue;
-        }
-        for (auto& polygon : node.coplanar_polygons)
-            ordered.unchecked_append(move(polygon));
-        if (near_subtree != no_bsp_node)
-            traversal_stack.append({ near_subtree, false });
-    }
-    return ordered;
-}
-
-static bool all_planes_are_parallel(ReadonlySpan<PartitionedPolygon> polygons)
-{
-    // The cross product of two unit normals has the sine of the angle between the planes as its length.
-    // Below a microradian of tilt the planes are treated as parallel.
-    static constexpr float maximum_parallel_cross_length_squared = 1e-12f;
-    auto const& first_normal = polygons.first().plane_normal;
-    for (auto const& polygon : polygons.slice(1)) {
-        auto cross = polygon.plane_normal.cross(first_normal);
-        if (cross.dot(cross) > maximum_parallel_cross_length_squared)
-            return false;
-    }
-    return true;
-}
-
-static Vector<BSPPolygon> sort_parallel_polygons_back_to_front(Vector<PartitionedPolygon> polygons)
-{
-    // Fast path for parallel planes, where no splitting is needed.
-
-    auto axis = polygons.first().plane_normal;
-    if (axis.z() < 0)
-        axis = -axis;
-
-    struct DepthOrderedPolygon {
-        float depth { 0 };
-        size_t input_index { 0 };
-    };
-    Vector<DepthOrderedPolygon> order;
-    order.ensure_capacity(polygons.size());
-    for (size_t i = 0; i < polygons.size(); ++i) {
-        auto depth = polygons[i].plane_normal.dot(axis) > 0 ? polygons[i].plane_distance : -polygons[i].plane_distance;
-        order.unchecked_append({ depth, i });
-    }
-    quick_sort(order, [](DepthOrderedPolygon const& a, DepthOrderedPolygon const& b) {
-        if (a.depth != b.depth)
-            return a.depth < b.depth;
-        return a.input_index < b.input_index;
-    });
-
-    Vector<BSPPolygon> ordered;
-    ordered.ensure_capacity(order.size());
-    for (auto const& entry : order)
-        ordered.unchecked_append(move(polygons[entry.input_index].polygon));
-    return ordered;
-}
-
-Vector<BSPPolygon> split_and_sort_polygons_back_to_front(Vector<BSPPolygon> polygons)
-{
-    Vector<PartitionedPolygon> partitioned;
-    partitioned.ensure_capacity(polygons.size());
-    for (auto& polygon : polygons) {
-        auto normal = polygon_normal(polygon.vertices);
-        if (!normal.has_value())
-            continue;
-        auto distance = normal->dot(polygon.vertices.first());
-        partitioned.unchecked_append({ move(polygon), *normal, distance });
-    }
-
-    if (!partitioned.is_empty() && all_planes_are_parallel(partitioned))
-        return sort_parallel_polygons_back_to_front(move(partitioned));
-
-    return collect_back_to_front(build_bsp_tree(move(partitioned)));
-}
-
-}
-
-FILE: Libraries/LibGfx/BSPTree.h
-/*
- * Copyright (c) 2026, Tim Ledbetter <tim.ledbetter@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/Vector.h>
-#include <LibGfx/Matrix4x4.h>
-#include <LibGfx/Rect.h>
-#include <LibGfx/Vector3.h>
-
-namespace Gfx {
-
-// A convex polygon in the shared post-projection space of a three-dimensional scene, where x and y
-// are surface coordinates and the positive z-axis points toward the viewer. The plane index
-// identifies the plane the polygon was built from and is preserved on pieces produced by splitting.
-struct BSPPolygon {
-    Vector<FloatVector3, 8> vertices;
-    size_t plane_index { 0 };
-    bool clipped { false };
-};
-
-Vector<FloatVector3, 8> map_rect_through_projection(FloatMatrix4x4 const&, FloatRect const&);
-
-Vector<BSPPolygon> split_and_sort_polygons_back_to_front(Vector<BSPPolygon>);
-
-}
-
 FILE: Libraries/LibGfx/CanvasCommandList.cpp
 /*
  * Copyright (c) 2026, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
@@ -118166,7 +117831,6 @@ private:
 FILE: Libraries/LibGfx/CMakeLists.txt
 set(SOURCES
     AffineTransform.cpp
-    BSPTree.cpp
     Bitmap.cpp
     BitmapExport.cpp
     BitmapSequence.cpp
@@ -121778,8 +121442,6 @@ FILE: Libraries/LibGfx/Filter.cpp
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
 
-extern "C" void ladybird_gfx_filter_destroy(void*);
-
 namespace Gfx {
 
 static ErrorOr<Optional<ByteBuffer>> copy_optional_color_table(Optional<ReadonlyBytes> bytes)
@@ -122438,11 +122100,6 @@ ErrorOr<Gfx::Filter> decode(Decoder& decoder)
     });
 }
 
-}
-
-extern "C" void ladybird_gfx_filter_destroy(void* filter)
-{
-    delete static_cast<Gfx::Filter*>(filter);
 }
 
 FILE: Libraries/LibGfx/Filter.h
@@ -136152,6 +135809,599 @@ all_features = false
 [export.mangle]
 rename_types = "PascalCase"
 
+FILE: Libraries/LibGfx/Rust/src/bsp_tree.rs
+/*
+ * Copyright (c) 2026, Tim Ledbetter <tim.ledbetter@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+use std::cmp::Ordering;
+
+use crate::{FloatMatrix4x4, FloatRect, FloatVector3};
+
+const ON_PLANE_THRESHOLD: f32 = 0.05;
+
+// A convex polygon in the shared post-projection space of a three-dimensional scene, where x and y
+// are surface coordinates and the positive z-axis points toward the viewer. The plane index
+// identifies the plane the polygon was built from and is preserved on pieces produced by splitting.
+pub struct BspPolygon {
+    pub vertices: Vec<FloatVector3>,
+    pub plane_index: usize,
+    pub clipped: bool,
+}
+
+pub fn map_rect_through_projection(matrix: FloatMatrix4x4, rect: FloatRect) -> Vec<FloatVector3> {
+    // Projecting a point divides it by w, which only works in front of the eye plane where w is positive.
+    // Edges crossing behind the eye are clipped at this small positive w so the divide stays finite.
+    const MINIMUM_PROJECTION_W: f32 = 0.00001;
+
+    let corners = [
+        matrix.map_vector4([rect.x, rect.y, 0.0, 1.0]),
+        matrix.map_vector4([rect.right(), rect.y, 0.0, 1.0]),
+        matrix.map_vector4([rect.right(), rect.bottom(), 0.0, 1.0]),
+        matrix.map_vector4([rect.x, rect.bottom(), 0.0, 1.0]),
+    ];
+
+    let mut result = Vec::with_capacity(8);
+    let append_projected = |result: &mut Vec<FloatVector3>, vertex: [f32; 4]| {
+        result.push(FloatVector3 {
+            x: vertex[0] / vertex[3],
+            y: vertex[1] / vertex[3],
+            z: vertex[2] / vertex[3],
+        });
+    };
+    for (index, current) in corners.iter().enumerate() {
+        let next = corners[(index + 1) % corners.len()];
+        let current_in_front_of_eye = current[3] > MINIMUM_PROJECTION_W;
+        let next_in_front_of_eye = next[3] > MINIMUM_PROJECTION_W;
+        if current_in_front_of_eye {
+            append_projected(&mut result, *current);
+        }
+        if current_in_front_of_eye != next_in_front_of_eye {
+            let t = (MINIMUM_PROJECTION_W - current[3]) / (next[3] - current[3]);
+            let intersection = [
+                current[0] + (next[0] - current[0]) * t,
+                current[1] + (next[1] - current[1]) * t,
+                current[2] + (next[2] - current[2]) * t,
+                current[3] + (next[3] - current[3]) * t,
+            ];
+            append_projected(&mut result, intersection);
+        }
+    }
+    result
+}
+
+fn polygon_normal(vertices: &[FloatVector3]) -> Option<FloatVector3> {
+    if vertices.len() < 3 {
+        return None;
+    }
+    let mut normal = FloatVector3::default();
+    for index in 1..vertices.len() - 1 {
+        normal = normal + (vertices[index] - vertices[0]).cross(vertices[index + 1] - vertices[0]);
+    }
+    let length = normal.length();
+    // Returns no value for polygons that enclose no area, as they do not define a plane.
+    if length == 0.0 {
+        return None;
+    }
+    Some(normal * (1.0 / length))
+}
+
+struct PartitionedPolygon {
+    polygon: BspPolygon,
+    plane_normal: FloatVector3,
+    plane_distance: f32,
+}
+
+const NO_BSP_NODE: usize = usize::MAX;
+
+struct BspTreeNode {
+    plane_normal: FloatVector3,
+    coplanar_polygons: Vec<BspPolygon>,
+    front: usize,
+    back: usize,
+}
+
+// The polygons of a subtree that has not been built yet, and the parent slot that will reference its node.
+struct PendingSubtree {
+    polygons: Vec<PartitionedPolygon>,
+    parent: usize,
+    is_front_child: bool,
+}
+
+struct PolygonSplit {
+    front_piece: Option<PartitionedPolygon>,
+    back_piece: Option<PartitionedPolygon>,
+}
+
+fn split_polygon(polygon: PartitionedPolygon, vertex_distances: &[f32]) -> PolygonSplit {
+    let mut front_vertices = Vec::with_capacity(8);
+    let mut back_vertices = Vec::with_capacity(8);
+    let vertices = &polygon.polygon.vertices;
+    for index in 0..vertices.len() {
+        let next_index = (index + 1) % vertices.len();
+        let current_distance = vertex_distances[index];
+        let next_distance = vertex_distances[next_index];
+        if current_distance >= -ON_PLANE_THRESHOLD {
+            front_vertices.push(vertices[index]);
+        }
+        if current_distance <= ON_PLANE_THRESHOLD {
+            back_vertices.push(vertices[index]);
+        }
+        let edge_crosses_plane = (current_distance > ON_PLANE_THRESHOLD && next_distance < -ON_PLANE_THRESHOLD)
+            || (current_distance < -ON_PLANE_THRESHOLD && next_distance > ON_PLANE_THRESHOLD);
+        if edge_crosses_plane {
+            let t = current_distance / (current_distance - next_distance);
+            let intersection = vertices[index] + (vertices[next_index] - vertices[index]) * t;
+            front_vertices.push(intersection);
+            back_vertices.push(intersection);
+        }
+    }
+
+    let make_piece = |vertices: Vec<FloatVector3>| {
+        if vertices.len() < 3 {
+            return None;
+        }
+        Some(PartitionedPolygon {
+            polygon: BspPolygon {
+                vertices,
+                plane_index: polygon.polygon.plane_index,
+                clipped: true,
+            },
+            plane_normal: polygon.plane_normal,
+            plane_distance: polygon.plane_distance,
+        })
+    };
+    PolygonSplit {
+        front_piece: make_piece(front_vertices),
+        back_piece: make_piece(back_vertices),
+    }
+}
+
+fn build_bsp_tree(polygons: Vec<PartitionedPolygon>) -> Vec<BspTreeNode> {
+    let mut nodes: Vec<BspTreeNode> = Vec::new();
+    let mut pending_subtrees = Vec::new();
+    if !polygons.is_empty() {
+        pending_subtrees.push(PendingSubtree {
+            polygons,
+            parent: NO_BSP_NODE,
+            is_front_child: false,
+        });
+    }
+
+    let mut vertex_distances = Vec::with_capacity(8);
+    while let Some(subtree) = pending_subtrees.pop() {
+        let node_index = nodes.len();
+        if subtree.parent != NO_BSP_NODE {
+            if subtree.is_front_child {
+                nodes[subtree.parent].front = node_index;
+            } else {
+                nodes[subtree.parent].back = node_index;
+            }
+        }
+
+        let splitter_index = subtree.polygons.len() / 2;
+        let plane_normal = subtree.polygons[splitter_index].plane_normal;
+        let plane_distance = subtree.polygons[splitter_index].plane_distance;
+
+        let mut coplanar_polygons = Vec::new();
+        let mut front_list = Vec::new();
+        let mut back_list = Vec::new();
+        for (polygon_index, polygon) in subtree.polygons.into_iter().enumerate() {
+            if polygon_index == splitter_index {
+                coplanar_polygons.push(polygon.polygon);
+                continue;
+            }
+            vertex_distances.clear();
+            let mut front_count = 0;
+            let mut back_count = 0;
+            for vertex in &polygon.polygon.vertices {
+                let distance = plane_normal.dot(*vertex) - plane_distance;
+                vertex_distances.push(distance);
+                if distance > ON_PLANE_THRESHOLD {
+                    front_count += 1;
+                } else if distance < -ON_PLANE_THRESHOLD {
+                    back_count += 1;
+                }
+            }
+
+            if front_count == 0 && back_count == 0 {
+                coplanar_polygons.push(polygon.polygon);
+            } else if back_count == 0 {
+                front_list.push(polygon);
+            } else if front_count == 0 {
+                back_list.push(polygon);
+            } else {
+                let split = split_polygon(polygon, &vertex_distances);
+                if let Some(front_piece) = split.front_piece {
+                    front_list.push(front_piece);
+                }
+                if let Some(back_piece) = split.back_piece {
+                    back_list.push(back_piece);
+                }
+            }
+        }
+        nodes.push(BspTreeNode {
+            plane_normal,
+            coplanar_polygons,
+            front: NO_BSP_NODE,
+            back: NO_BSP_NODE,
+        });
+
+        if !front_list.is_empty() {
+            pending_subtrees.push(PendingSubtree {
+                polygons: front_list,
+                parent: node_index,
+                is_front_child: true,
+            });
+        }
+        if !back_list.is_empty() {
+            pending_subtrees.push(PendingSubtree {
+                polygons: back_list,
+                parent: node_index,
+                is_front_child: false,
+            });
+        }
+    }
+    nodes
+}
+
+fn collect_back_to_front(mut nodes: Vec<BspTreeNode>) -> Vec<BspPolygon> {
+    if nodes.is_empty() {
+        return Vec::new();
+    }
+
+    let polygon_count = nodes.iter().map(|node| node.coplanar_polygons.len()).sum();
+    let mut ordered = Vec::with_capacity(polygon_count);
+
+    struct TraversalStep {
+        node_index: usize,
+        ready_to_emit: bool,
+    }
+    let mut traversal_stack = vec![TraversalStep {
+        node_index: 0,
+        ready_to_emit: false,
+    }];
+    while let Some(step) = traversal_stack.pop() {
+        let node = &nodes[step.node_index];
+        // The subtree on the side of the plane the viewer is on paints last. Coplanar polygons paint in their stored
+        // paint order regardless of which way the plane faces.
+        let far_subtree = if node.plane_normal.z > 0.0 {
+            node.back
+        } else {
+            node.front
+        };
+        let near_subtree = if node.plane_normal.z > 0.0 {
+            node.front
+        } else {
+            node.back
+        };
+        if !step.ready_to_emit {
+            traversal_stack.push(TraversalStep {
+                node_index: step.node_index,
+                ready_to_emit: true,
+            });
+            if far_subtree != NO_BSP_NODE {
+                traversal_stack.push(TraversalStep {
+                    node_index: far_subtree,
+                    ready_to_emit: false,
+                });
+            }
+            continue;
+        }
+        ordered.append(&mut nodes[step.node_index].coplanar_polygons);
+        if near_subtree != NO_BSP_NODE {
+            traversal_stack.push(TraversalStep {
+                node_index: near_subtree,
+                ready_to_emit: false,
+            });
+        }
+    }
+    ordered
+}
+
+fn all_planes_are_parallel(polygons: &[PartitionedPolygon]) -> bool {
+    // The cross product of two unit normals has the sine of the angle between the planes as its length.
+    // Below a microradian of tilt the planes are treated as parallel.
+    const MAXIMUM_PARALLEL_CROSS_LENGTH_SQUARED: f32 = 1e-12;
+    let first_normal = polygons[0].plane_normal;
+    for polygon in &polygons[1..] {
+        let cross = polygon.plane_normal.cross(first_normal);
+        if cross.dot(cross) > MAXIMUM_PARALLEL_CROSS_LENGTH_SQUARED {
+            return false;
+        }
+    }
+    true
+}
+
+fn sort_parallel_polygons_back_to_front(mut polygons: Vec<PartitionedPolygon>) -> Vec<BspPolygon> {
+    // Fast path for parallel planes, where no splitting is needed.
+
+    let mut axis = polygons[0].plane_normal;
+    if axis.z < 0.0 {
+        axis = -axis;
+    }
+
+    struct DepthOrderedPolygon {
+        depth: f32,
+        input_index: usize,
+    }
+    let mut order = Vec::with_capacity(polygons.len());
+    for (input_index, polygon) in polygons.iter().enumerate() {
+        let depth = if polygon.plane_normal.dot(axis) > 0.0 {
+            polygon.plane_distance
+        } else {
+            -polygon.plane_distance
+        };
+        order.push(DepthOrderedPolygon { depth, input_index });
+    }
+    order.sort_by(|a, b| {
+        a.depth
+            .partial_cmp(&b.depth)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.input_index.cmp(&b.input_index))
+    });
+
+    let mut ordered = Vec::with_capacity(order.len());
+    let mut polygons_by_index: Vec<Option<PartitionedPolygon>> = polygons.drain(..).map(Some).collect();
+    for entry in order {
+        ordered.push(polygons_by_index[entry.input_index].take().unwrap().polygon);
+    }
+    ordered
+}
+
+pub fn split_and_sort_polygons_back_to_front(polygons: Vec<BspPolygon>) -> Vec<BspPolygon> {
+    let mut partitioned = Vec::with_capacity(polygons.len());
+    for polygon in polygons {
+        let Some(normal) = polygon_normal(&polygon.vertices) else {
+            continue;
+        };
+        let distance = normal.dot(polygon.vertices[0]);
+        partitioned.push(PartitionedPolygon {
+            polygon,
+            plane_normal: normal,
+            plane_distance: distance,
+        });
+    }
+
+    if !partitioned.is_empty() && all_planes_are_parallel(&partitioned) {
+        return sort_parallel_polygons_back_to_front(partitioned);
+    }
+
+    collect_back_to_front(build_bsp_tree(partitioned))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vector(x: f32, y: f32, z: f32) -> FloatVector3 {
+        FloatVector3 { x, y, z }
+    }
+
+    fn make_z_plane_polygon(z: f32, plane_index: usize) -> BspPolygon {
+        BspPolygon {
+            vertices: vec![
+                vector(-10.0, -10.0, z),
+                vector(10.0, -10.0, z),
+                vector(10.0, 10.0, z),
+                vector(-10.0, 10.0, z),
+            ],
+            plane_index,
+            clipped: false,
+        }
+    }
+
+    fn centroid_of(polygon: &BspPolygon) -> FloatVector3 {
+        let mut sum = FloatVector3::default();
+        for vertex in &polygon.vertices {
+            sum = sum + *vertex;
+        }
+        sum * (1.0 / polygon.vertices.len() as f32)
+    }
+
+    #[test]
+    fn map_rect_through_projection_maps_corners_in_order() {
+        let vertices = map_rect_through_projection(FloatMatrix4x4::identity(), FloatRect::new(10.0, 20.0, 30.0, 40.0));
+        assert_eq!(vertices.len(), 4);
+        assert_eq!(vertices[0], vector(10.0, 20.0, 0.0));
+        assert_eq!(vertices[1], vector(40.0, 20.0, 0.0));
+        assert_eq!(vertices[2], vector(40.0, 60.0, 0.0));
+        assert_eq!(vertices[3], vector(10.0, 60.0, 0.0));
+    }
+
+    #[test]
+    fn map_rect_through_projection_performs_the_perspective_divide() {
+        let mut matrix = FloatMatrix4x4::identity();
+        matrix.elements[3][0] = 0.015625;
+        let vertices = map_rect_through_projection(matrix, FloatRect::new(0.0, 0.0, 64.0, 32.0));
+        assert_eq!(vertices.len(), 4);
+        assert_eq!(vertices[0], vector(0.0, 0.0, 0.0));
+        assert_eq!(vertices[1], vector(32.0, 0.0, 0.0));
+        assert_eq!(vertices[2], vector(32.0, 16.0, 0.0));
+        assert_eq!(vertices[3], vector(0.0, 32.0, 0.0));
+    }
+
+    #[test]
+    fn map_rect_through_projection_clips_the_region_behind_the_eye() {
+        let mut matrix = FloatMatrix4x4::identity();
+        matrix.elements[3][0] = -0.03125;
+        let vertices = map_rect_through_projection(matrix, FloatRect::new(0.0, 0.0, 64.0, 32.0));
+        assert_eq!(vertices.len(), 4);
+        assert_eq!(vertices[0], vector(0.0, 0.0, 0.0));
+        assert!(vertices[1].x > 100_000.0);
+        assert!(vertices[2].x > 100_000.0);
+        assert!(vertices[2].y > 100_000.0);
+        assert_eq!(vertices[3], vector(0.0, 32.0, 0.0));
+    }
+
+    #[test]
+    fn map_rect_through_projection_drops_a_rect_entirely_behind_the_eye() {
+        let mut matrix = FloatMatrix4x4::identity();
+        matrix.elements[3][3] = -1.0;
+        assert!(map_rect_through_projection(matrix, FloatRect::new(0.0, 0.0, 64.0, 32.0)).is_empty());
+    }
+
+    #[test]
+    fn parallel_planes_sort_back_to_front_for_any_paint_order() {
+        let mut polygons = Vec::new();
+        for index in 0..20 {
+            polygons.push(make_z_plane_polygon(((index * 7) % 20) as f32, index));
+        }
+
+        // Painting proceeds in ascending z, where the largest z is nearest the viewer and paints last.
+        let sorted = split_and_sort_polygons_back_to_front(polygons);
+        assert_eq!(sorted.len(), 20);
+        for (index, polygon) in sorted.iter().enumerate() {
+            assert!(!polygon.clipped);
+            assert_eq!(polygon.vertices[0].z, index as f32);
+        }
+    }
+
+    #[test]
+    fn reversed_winding_does_not_affect_depth_order() {
+        let polygons = vec![
+            BspPolygon {
+                vertices: vec![
+                    vector(-10.0, 10.0, 5.0),
+                    vector(10.0, 10.0, 5.0),
+                    vector(10.0, -10.0, 5.0),
+                    vector(-10.0, -10.0, 5.0),
+                ],
+                plane_index: 0,
+                clipped: false,
+            },
+            make_z_plane_polygon(-5.0, 1),
+        ];
+
+        let sorted = split_and_sort_polygons_back_to_front(polygons);
+        assert_eq!(sorted.len(), 2);
+        assert_eq!(sorted[0].plane_index, 1);
+        assert_eq!(sorted[1].plane_index, 0);
+    }
+
+    #[test]
+    fn coplanar_polygons_keep_paint_order() {
+        let polygons = (0..3).map(|index| make_z_plane_polygon(0.0, index)).collect();
+
+        let sorted = split_and_sort_polygons_back_to_front(polygons);
+        assert_eq!(sorted.len(), 3);
+        for (index, polygon) in sorted.iter().enumerate() {
+            assert_eq!(polygon.plane_index, index);
+        }
+    }
+
+    #[test]
+    fn coplanar_polygons_keep_paint_order_when_sorted_against_other_planes() {
+        // The third plane is tilted so the planes do not count as parallel and ordering runs through the tree.
+        let polygons = vec![
+            make_z_plane_polygon(0.0, 0),
+            make_z_plane_polygon(0.0, 1),
+            BspPolygon {
+                vertices: vec![
+                    vector(-10.0, -10.0, -50.1),
+                    vector(10.0, -10.0, -49.9),
+                    vector(10.0, 10.0, -49.9),
+                    vector(-10.0, 10.0, -50.1),
+                ],
+                plane_index: 2,
+                clipped: false,
+            },
+        ];
+
+        let sorted = split_and_sort_polygons_back_to_front(polygons);
+        assert_eq!(sorted.len(), 3);
+        assert_eq!(sorted[0].plane_index, 2);
+        assert_eq!(sorted[1].plane_index, 0);
+        assert_eq!(sorted[2].plane_index, 1);
+    }
+
+    #[test]
+    fn intersecting_planes_are_split_into_ordered_pieces() {
+        let polygons = vec![
+            make_z_plane_polygon(0.0, 0),
+            // A polygon on the plane z = x, crossing the first polygon along the line x = 0.
+            BspPolygon {
+                vertices: vec![
+                    vector(-10.0, -10.0, -10.0),
+                    vector(10.0, -10.0, 10.0),
+                    vector(10.0, 10.0, 10.0),
+                    vector(-10.0, 10.0, -10.0),
+                ],
+                plane_index: 1,
+                clipped: false,
+            },
+        ];
+
+        let sorted = split_and_sort_polygons_back_to_front(polygons);
+        assert_eq!(sorted.len(), 3);
+
+        // The crossing polygon stays whole and the flat one is cut into a piece on either side of it. The
+        // piece with positive x lies behind the crossing plane and paints first.
+        assert_eq!(sorted[0].plane_index, 0);
+        assert!(sorted[0].clipped);
+        assert!(centroid_of(&sorted[0]).x > 0.0);
+
+        assert_eq!(sorted[1].plane_index, 1);
+        assert!(!sorted[1].clipped);
+
+        assert_eq!(sorted[2].plane_index, 0);
+        assert!(sorted[2].clipped);
+        assert!(centroid_of(&sorted[2]).x < 0.0);
+    }
+
+    #[test]
+    fn polygons_without_a_plane_are_omitted() {
+        let polygons = vec![
+            BspPolygon {
+                vertices: vec![vector(0.0, 0.0, 0.0), vector(1.0, 0.0, 0.0), vector(2.0, 0.0, 0.0)],
+                plane_index: 0,
+                clipped: false,
+            },
+            make_z_plane_polygon(0.0, 1),
+        ];
+
+        let sorted = split_and_sort_polygons_back_to_front(polygons);
+        assert_eq!(sorted.len(), 1);
+        assert_eq!(sorted[0].plane_index, 1);
+    }
+
+    #[test]
+    fn small_distant_parallel_planes_sort_without_splitting() {
+        // Two 8x8 parallel quads far from the origin, two units apart along their shared normal.
+        let polygons = vec![
+            BspPolygon {
+                vertices: vec![
+                    vector(101230.914, 99866.41, 3141.205),
+                    vector(101236.88, 99868.2, 3146.2156),
+                    vector(101235.51, 99876.0, 3145.0588),
+                    vector(101229.54, 99874.195, 3140.0483),
+                ],
+                plane_index: 0,
+                clipped: false,
+            },
+            BspPolygon {
+                vertices: vec![
+                    vector(101232.2, 99866.41, 3139.673),
+                    vector(101238.17, 99868.2, 3144.6836),
+                    vector(101236.8, 99876.0, 3143.5269),
+                    vector(101230.83, 99874.195, 3138.5164),
+                ],
+                plane_index: 1,
+                clipped: false,
+            },
+        ];
+
+        let sorted = split_and_sort_polygons_back_to_front(polygons);
+        assert_eq!(sorted.len(), 2);
+        assert_eq!(sorted[0].plane_index, 1);
+        assert!(!sorted[0].clipped);
+        assert_eq!(sorted[1].plane_index, 0);
+        assert!(!sorted[1].clipped);
+    }
+}
+
 FILE: Libraries/LibGfx/Rust/src/color.rs
 /*
  * Copyright (c) 2026-present, the Ladybird developers.
@@ -136633,6 +136883,8 @@ FILE: Libraries/LibGfx/Rust/src/geometry.rs
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use std::ops::{Add, Mul, Neg, Sub};
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(C)]
 pub struct IntPoint {
@@ -136645,6 +136897,14 @@ pub struct IntPoint {
 pub struct FloatPoint {
     pub x: f32,
     pub y: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct FloatVector3 {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -136685,6 +136945,72 @@ pub enum Orientation {
     #[default]
     Horizontal,
     Vertical,
+}
+
+impl FloatVector3 {
+    pub fn dot(self, other: Self) -> f32 {
+        self.x * other.x + self.y * other.y + self.z * other.z
+    }
+
+    pub fn cross(self, other: Self) -> Self {
+        Self {
+            x: self.y * other.z - self.z * other.y,
+            y: self.z * other.x - self.x * other.z,
+            z: self.x * other.y - self.y * other.x,
+        }
+    }
+
+    pub fn length(self) -> f32 {
+        self.dot(self).sqrt()
+    }
+}
+
+impl Add for FloatVector3 {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            x: self.x + other.x,
+            y: self.y + other.y,
+            z: self.z + other.z,
+        }
+    }
+}
+
+impl Sub for FloatVector3 {
+    type Output = Self;
+
+    fn sub(self, other: Self) -> Self {
+        Self {
+            x: self.x - other.x,
+            y: self.y - other.y,
+            z: self.z - other.z,
+        }
+    }
+}
+
+impl Mul<f32> for FloatVector3 {
+    type Output = Self;
+
+    fn mul(self, scalar: f32) -> Self {
+        Self {
+            x: self.x * scalar,
+            y: self.y * scalar,
+            z: self.z * scalar,
+        }
+    }
+}
+
+impl Neg for FloatVector3 {
+    type Output = Self;
+
+    fn neg(self) -> Self {
+        Self {
+            x: -self.x,
+            y: -self.y,
+            z: -self.z,
+        }
+    }
 }
 
 impl IntRect {
@@ -136773,6 +137099,27 @@ impl FloatRect {
     pub fn is_empty(self) -> bool {
         self.width <= 0.0 || self.height <= 0.0
     }
+    pub fn united(self, other: Self) -> Self {
+        if self.is_empty() {
+            return other;
+        }
+        if other.is_empty() {
+            return self;
+        }
+        let left = if other.x < self.x { other.x } else { self.x };
+        let top = if other.y < self.y { other.y } else { self.y };
+        let right = if self.right() < other.right() {
+            other.right()
+        } else {
+            self.right()
+        };
+        let bottom = if self.bottom() < other.bottom() {
+            other.bottom()
+        } else {
+            self.bottom()
+        };
+        Self::new(left, top, right - left, bottom - top)
+    }
     pub fn contains_rect(self, other: Self) -> bool {
         self.x <= other.x && self.right() >= other.right() && self.y <= other.y && self.bottom() >= other.bottom()
     }
@@ -136781,6 +137128,34 @@ impl FloatRect {
     }
     pub fn bottom(self) -> f32 {
         self.y + self.height
+    }
+    pub fn top_left(self) -> FloatPoint {
+        FloatPoint { x: self.x, y: self.y }
+    }
+    pub fn top_right(self) -> FloatPoint {
+        FloatPoint {
+            x: self.right(),
+            y: self.y,
+        }
+    }
+    pub fn bottom_left(self) -> FloatPoint {
+        FloatPoint {
+            x: self.x,
+            y: self.bottom(),
+        }
+    }
+    pub fn bottom_right(self) -> FloatPoint {
+        FloatPoint {
+            x: self.right(),
+            y: self.bottom(),
+        }
+    }
+    pub fn translated(self, dx: f32, dy: f32) -> Self {
+        Self {
+            x: self.x + dx,
+            y: self.y + dy,
+            ..self
+        }
     }
 }
 
@@ -136803,6 +137178,7 @@ FILE: Libraries/LibGfx/Rust/src/lib.rs
 #[path = "../../../RustAllocator.rs"]
 mod rust_allocator;
 
+pub mod bsp_tree;
 pub mod color;
 pub mod corner_radii;
 pub mod font;
@@ -136826,7 +137202,7 @@ FILE: Libraries/LibGfx/Rust/src/matrix.rs
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use crate::geometry::FloatPoint;
+use crate::geometry::{FloatPoint, FloatRect};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
@@ -136845,6 +137221,91 @@ impl AffineTransform {
         Self {
             values: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
         }
+    }
+
+    pub const fn new(a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) -> Self {
+        Self {
+            values: [a, b, c, d, e, f],
+        }
+    }
+
+    pub fn a(self) -> f32 {
+        self.values[0]
+    }
+    pub fn b(self) -> f32 {
+        self.values[1]
+    }
+    pub fn c(self) -> f32 {
+        self.values[2]
+    }
+    pub fn d(self) -> f32 {
+        self.values[3]
+    }
+    pub fn e(self) -> f32 {
+        self.values[4]
+    }
+    pub fn f(self) -> f32 {
+        self.values[5]
+    }
+
+    pub fn is_identity(self) -> bool {
+        self.values == Self::identity().values
+    }
+
+    pub fn is_identity_or_translation(self) -> bool {
+        self.a() == 1.0 && self.b() == 0.0 && self.c() == 0.0 && self.d() == 1.0
+    }
+
+    pub fn determinant(self) -> f32 {
+        self.a() * self.d() - self.b() * self.c()
+    }
+
+    pub fn inverse(self) -> Option<Self> {
+        let det = self.determinant();
+        if det == 0.0 {
+            return None;
+        }
+        Some(Self::new(
+            self.d() / det,
+            -self.b() / det,
+            -self.c() / det,
+            self.a() / det,
+            (self.c() * self.f() - self.d() * self.e()) / det,
+            (self.b() * self.e() - self.a() * self.f()) / det,
+        ))
+    }
+
+    pub fn x_scale(self) -> f32 {
+        self.a().hypot(self.b())
+    }
+
+    pub fn y_scale(self) -> f32 {
+        self.c().hypot(self.d())
+    }
+
+    pub fn map_point(self, point: FloatPoint) -> FloatPoint {
+        FloatPoint {
+            x: self.a() * point.x + self.c() * point.y + self.e(),
+            y: self.b() * point.x + self.d() * point.y + self.f(),
+        }
+    }
+
+    pub fn map_rect(self, rect: FloatRect) -> FloatRect {
+        if self.is_identity() {
+            return rect;
+        }
+        if self.is_identity_or_translation() {
+            return rect.translated(self.e(), self.f());
+        }
+        let p1 = self.map_point(rect.top_left());
+        let p2 = self.map_point(rect.top_right());
+        let p3 = self.map_point(rect.bottom_right());
+        let p4 = self.map_point(rect.bottom_left());
+        let left = p1.x.min(p2.x).min(p3.x.min(p4.x));
+        let top = p1.y.min(p2.y).min(p3.y.min(p4.y));
+        let right = p1.x.max(p2.x).max(p3.x.max(p4.x));
+        let bottom = p1.y.max(p2.y).max(p3.y.max(p4.y));
+        FloatRect::new(left, top, right - left, bottom - top)
     }
 }
 
@@ -136906,6 +137367,123 @@ impl FloatMatrix4x4 {
     pub fn is_invertible(self) -> bool {
         self.determinant() != 0.0
     }
+
+    pub fn adjugate(self) -> Self {
+        let mut adjugate = Self::identity();
+        for i in 0..4 {
+            for j in 0..4 {
+                let sign = if (i + j) % 2 == 0 { 1.0 } else { -1.0 };
+                adjugate.elements[j][i] = sign * self.first_minor(i, j);
+            }
+        }
+        adjugate
+    }
+
+    pub fn inverse(self) -> Option<Self> {
+        let determinant = self.determinant();
+        if determinant == 0.0 {
+            return None;
+        }
+        let mut inverse = self.adjugate();
+        for row in &mut inverse.elements {
+            for value in row {
+                *value /= determinant;
+            }
+        }
+        Some(inverse)
+    }
+
+    pub fn map_vector4(self, vector: [f32; 4]) -> [f32; 4] {
+        let mut result = [0.0f32; 4];
+        for (i, out) in result.iter_mut().enumerate() {
+            *out = self.elements[i][0] * vector[0]
+                + self.elements[i][1] * vector[1]
+                + self.elements[i][2] * vector[2]
+                + self.elements[i][3] * vector[3];
+        }
+        result
+    }
+
+    pub fn is_2d_affine(self) -> bool {
+        let m = &self.elements;
+        m[0][2] == 0.0
+            && m[1][2] == 0.0
+            && m[2][0] == 0.0
+            && m[2][1] == 0.0
+            && m[2][2] == 1.0
+            && m[2][3] == 0.0
+            && m[3][0] == 0.0
+            && m[3][1] == 0.0
+            && m[3][2] == 0.0
+            && m[3][3] == 1.0
+    }
+
+    pub fn extract_2d_affine(self) -> AffineTransform {
+        let m = &self.elements;
+        AffineTransform::new(m[0][0], m[1][0], m[0][1], m[1][1], m[0][3], m[1][3])
+    }
+
+    pub fn flattened(self) -> Self {
+        let mut result = self;
+        let m = &mut result.elements;
+        m[0][2] = 0.0;
+        m[1][2] = 0.0;
+        m[3][2] = 0.0;
+        m[2][0] = 0.0;
+        m[2][1] = 0.0;
+        m[2][2] = 1.0;
+        m[2][3] = 0.0;
+        if m[3][0] == 0.0 && m[3][1] == 0.0 && m[3][3] != 1.0 && m[3][3] > 0.0 {
+            let scale = 1.0 / m[3][3];
+            m[0][0] *= scale;
+            m[0][1] *= scale;
+            m[1][0] *= scale;
+            m[1][1] *= scale;
+            m[0][3] *= scale;
+            m[1][3] *= scale;
+            m[3][3] = 1.0;
+        }
+        result
+    }
+
+    pub fn is_back_face_visible(self) -> bool {
+        let determinant = self.determinant();
+        if determinant == 0.0 {
+            return false;
+        }
+        self.first_minor(2, 2) / determinant < 0.0
+    }
+}
+
+pub fn map_rect_through_matrix(matrix: FloatMatrix4x4, rect: FloatRect, minimum_projection_w: f32) -> FloatRect {
+    let map_corner = |point: FloatPoint| matrix.map_vector4([point.x, point.y, 0.0, 1.0]);
+    let mapped_corners = [
+        map_corner(rect.top_left()),
+        map_corner(rect.top_right()),
+        map_corner(rect.bottom_left()),
+        map_corner(rect.bottom_right()),
+    ];
+    let all_corners_behind_eye_plane = mapped_corners.iter().all(|corner| corner[3] <= 0.0);
+    let project_corner = |corner: [f32; 4]| -> FloatPoint {
+        let w = if all_corners_behind_eye_plane {
+            corner[3].min(-minimum_projection_w)
+        } else {
+            corner[3].max(minimum_projection_w)
+        };
+        FloatPoint {
+            x: corner[0] / w,
+            y: corner[1] / w,
+        }
+    };
+    let top_left = project_corner(mapped_corners[0]);
+    let top_right = project_corner(mapped_corners[1]);
+    let bottom_left = project_corner(mapped_corners[2]);
+    let bottom_right = project_corner(mapped_corners[3]);
+    let left = top_left.x.min(top_right.x).min(bottom_left.x.min(bottom_right.x));
+    let right = top_left.x.max(top_right.x).max(bottom_left.x.max(bottom_right.x));
+    let top = top_left.y.min(top_right.y).min(bottom_left.y.min(bottom_right.y));
+    let bottom = top_left.y.max(top_right.y).max(bottom_left.y.max(bottom_right.y));
+    FloatRect::new(left, top, right - left, bottom - top)
 }
 
 fn skip_row_and_column_of_four_by_four(elements: [[f32; 4]; 4], skip_row: usize, skip_column: usize) -> [[f32; 3]; 3] {
@@ -137041,6 +137619,194 @@ pub fn multiply_affine(lhs: AffineTransform, rhs: AffineTransform) -> AffineTran
             a * oe + c * of + e,
             b * oe + d * of + f,
         ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_matrix_approx_eq(actual: FloatMatrix4x4, expected: FloatMatrix4x4) {
+        for i in 0..4 {
+            for j in 0..4 {
+                let difference = (actual.elements[i][j] - expected.elements[i][j]).abs();
+                assert!(difference < 1e-5, "element [{i}][{j}]: {actual:?} != {expected:?}");
+            }
+        }
+    }
+
+    fn z_rotation_by_quarter_turn() -> FloatMatrix4x4 {
+        FloatMatrix4x4 {
+            elements: [
+                [0.0, -1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        }
+    }
+
+    #[test]
+    fn inverse_of_translation_negates_the_offset() {
+        assert_eq!(
+            translation_matrix(2.0, 3.0, 4.0).inverse(),
+            Some(translation_matrix(-2.0, -3.0, -4.0))
+        );
+    }
+
+    #[test]
+    fn inverse_of_scale_takes_reciprocals() {
+        assert_eq!(
+            scale_matrix(2.0, 4.0, 8.0).inverse(),
+            Some(scale_matrix(0.5, 0.25, 0.125))
+        );
+    }
+
+    #[test]
+    fn singular_matrix_has_no_inverse() {
+        let singular = scale_matrix(0.0, 1.0, 1.0);
+        assert!(!singular.is_invertible());
+        assert_eq!(singular.inverse(), None);
+    }
+
+    #[test]
+    fn inverse_composes_to_identity() {
+        let matrix = translation_matrix(10.0, 20.0, 0.0).multiplied(z_rotation_by_quarter_turn());
+        let inverse = matrix.inverse().expect("rotation with translation is invertible");
+        assert_matrix_approx_eq(matrix.multiplied(inverse), FloatMatrix4x4::identity());
+        assert_matrix_approx_eq(inverse.multiplied(matrix), FloatMatrix4x4::identity());
+    }
+
+    #[test]
+    fn map_vector4_multiplies_a_column_vector() {
+        assert_eq!(
+            translation_matrix(2.0, 3.0, 4.0).map_vector4([1.0, 1.0, 1.0, 1.0]),
+            [3.0, 4.0, 5.0, 1.0]
+        );
+        assert_eq!(
+            z_rotation_by_quarter_turn().map_vector4([1.0, 0.0, 0.0, 1.0]),
+            [0.0, 1.0, 0.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn two_dimensional_affine_detection() {
+        assert!(FloatMatrix4x4::identity().is_2d_affine());
+        assert!(affine_to_matrix(AffineTransform::new(2.0, 0.0, 0.0, 2.0, 5.0, 6.0)).is_2d_affine());
+        assert!(!perspective_matrix(100.0).is_2d_affine());
+        assert!(!translation_matrix(0.0, 0.0, 1.0).is_2d_affine());
+    }
+
+    #[test]
+    fn extracting_the_affine_part_round_trips() {
+        let transform = AffineTransform::new(1.0, 2.0, 3.0, 4.0, 5.0, 6.0);
+        assert_eq!(affine_to_matrix(transform).extract_2d_affine(), transform);
+    }
+
+    #[test]
+    fn flattening_drops_the_z_axis() {
+        assert_eq!(perspective_matrix(100.0).flattened(), FloatMatrix4x4::identity());
+        assert_eq!(
+            translation_matrix(1.0, 2.0, 3.0).flattened(),
+            translation_matrix(1.0, 2.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn flattening_normalizes_a_uniform_positive_w_scale() {
+        let mut matrix = FloatMatrix4x4::identity();
+        matrix.elements[3][3] = 2.0;
+        matrix.elements[0][3] = 10.0;
+        let expected = FloatMatrix4x4 {
+            elements: [
+                [0.5, 0.0, 0.0, 5.0],
+                [0.0, 0.5, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        };
+        assert_eq!(matrix.flattened(), expected);
+    }
+
+    #[test]
+    fn flattening_preserves_a_non_positive_w_scale() {
+        let mut matrix = FloatMatrix4x4::identity();
+        matrix.elements[3][3] = -2.0;
+        matrix.elements[0][3] = 10.0;
+        assert_eq!(matrix.flattened(), matrix);
+    }
+
+    #[test]
+    fn back_face_visibility() {
+        assert!(!FloatMatrix4x4::identity().is_back_face_visible());
+        assert!(!scale_matrix(-1.0, 1.0, 1.0).is_back_face_visible());
+        assert!(scale_matrix(-1.0, 1.0, -1.0).is_back_face_visible());
+        assert!(!scale_matrix(0.0, 1.0, -1.0).is_back_face_visible());
+    }
+
+    #[test]
+    fn affine_inverse_undoes_the_mapping() {
+        let transform = AffineTransform::new(2.0, 0.0, 0.0, 4.0, 10.0, 20.0);
+        let inverse = transform.inverse().expect("scale with translation is invertible");
+        assert_eq!(inverse, AffineTransform::new(0.5, 0.0, 0.0, 0.25, -5.0, -5.0));
+        let point = FloatPoint { x: 3.0, y: 7.0 };
+        assert_eq!(transform.map_point(point), FloatPoint { x: 16.0, y: 48.0 });
+        assert_eq!(inverse.map_point(transform.map_point(point)), point);
+        assert_eq!(AffineTransform::new(1.0, 2.0, 2.0, 4.0, 0.0, 0.0).inverse(), None);
+    }
+
+    #[test]
+    fn affine_scales_are_the_column_lengths() {
+        let rotation = AffineTransform::new(0.0, 1.0, -1.0, 0.0, 0.0, 0.0);
+        assert_eq!(rotation.x_scale(), 1.0);
+        assert_eq!(rotation.y_scale(), 1.0);
+        let skewed = AffineTransform::new(3.0, 4.0, 0.0, 5.0, 0.0, 0.0);
+        assert_eq!(skewed.x_scale(), 5.0);
+        assert_eq!(skewed.y_scale(), 5.0);
+    }
+
+    #[test]
+    fn affine_map_rect_bounds_the_mapped_corners() {
+        let rect = FloatRect::new(0.0, 0.0, 2.0, 1.0);
+        assert_eq!(AffineTransform::identity().map_rect(rect), rect);
+        assert_eq!(
+            AffineTransform::new(1.0, 0.0, 0.0, 1.0, 5.0, 6.0).map_rect(rect),
+            FloatRect::new(5.0, 6.0, 2.0, 1.0)
+        );
+        let rotation = AffineTransform::new(0.0, 1.0, -1.0, 0.0, 0.0, 0.0);
+        assert_eq!(rotation.map_rect(rect), FloatRect::new(-1.0, 0.0, 1.0, 2.0));
+    }
+
+    #[test]
+    fn projecting_a_rect_through_an_affine_matrix_maps_it_directly() {
+        let rect = FloatRect::new(0.0, 0.0, 2.0, 1.0);
+        assert_eq!(map_rect_through_matrix(FloatMatrix4x4::identity(), rect, 0.0001), rect);
+        assert_eq!(
+            map_rect_through_matrix(translation_matrix(5.0, 6.0, 0.0), rect, 0.0001),
+            FloatRect::new(5.0, 6.0, 2.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn projecting_a_rect_entirely_behind_the_eye_plane_divides_through_negative_w() {
+        let mut behind = FloatMatrix4x4::identity();
+        behind.elements[3][3] = -1.0;
+        let rect = FloatRect::new(0.0, 0.0, 2.0, 1.0);
+        assert_eq!(
+            map_rect_through_matrix(behind, rect, 0.0001),
+            FloatRect::new(-2.0, -1.0, 2.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn projecting_a_rect_crossing_the_eye_plane_clamps_the_corners_behind_it() {
+        let mut crossing = FloatMatrix4x4::identity();
+        crossing.elements[3][0] = -1.0;
+        let rect = FloatRect::new(0.0, 0.0, 2.0, 1.0);
+        assert_eq!(
+            map_rect_through_matrix(crossing, rect, 0.5),
+            FloatRect::new(0.0, 0.0, 4.0, 2.0)
+        );
     }
 }
 
@@ -506198,7 +506964,6 @@ set(SOURCES
     Painting/BoxViews.cpp
     Painting/Canvas2DCommandStream.cpp
     Painting/ChromeWidget.cpp
-    Painting/DepthSortedReplayPlan.cpp
     Painting/DisplayList.cpp
     Painting/DisplayListCommand.cpp
     Painting/DisplayListDamage.cpp
@@ -667088,596 +667853,3 @@ WebIDL::ExceptionOr<bool> Document::query_command_state(Utf16FlyString const& co
 
         Vector<GC::Ref<Node>> formattable_nodes;
         Editing::for_each_node_effectively_contained_in_range(range, [&](GC::Ref<Node> descendant) {
-            if (Editing::is_formattable_node(descendant))
-                formattable_nodes.append(descendant);
-            return TraversalDecision::Continue;
-        });
-        if (formattable_nodes.is_empty())
-            return inline_values.contains_slow(Editing::effective_command_value(range->start_container(), command_definition.command).value_or({}));
-
-        // or if there is at least one formattable node effectively contained in the active range, and all of them have
-        // an effective command value equal to one of the given values.
-        return all_of(formattable_nodes, [&](GC::Ref<Node> node) {
-            return inline_values.contains_slow(Editing::effective_command_value(node, command_definition.command).value_or({}));
-        });
-    }
-
-    // 2. If the state override for command is set, return it.
-    if (state_override.has_value())
-        return state_override.release_value();
-
-    // 3. Return true if command's state is true, otherwise false.
-    return command_definition.state(*this);
-}
-
-// https://w3c.github.io/editing/docs/execCommand/#querycommandsupported()
-WebIDL::ExceptionOr<bool> Document::query_command_supported(Utf16FlyString const& command)
-{
-    // AD-HOC: This is not directly mentioned in the spec, but all major browsers limit editing API calls to HTML documents
-    if (!is_html_document())
-        return WebIDL::InvalidStateError::create("queryCommandSupported is only supported on HTML documents"_utf16);
-
-    // When the queryCommandSupported(command) method on the Document interface is invoked, the user agent must return
-    // true if command is supported and available within the current script on the current site, and false otherwise.
-    // AD-HOC: Supported commands should have an action defined. Currently, ::preserveWhitespace does not have one.
-    auto command_definition = Editing::find_command_definition(command);
-    return command_definition.has_value() && command_definition->action;
-}
-
-// https://w3c.github.io/editing/docs/execCommand/#querycommandvalue()
-WebIDL::ExceptionOr<Utf16String> Document::query_command_value(Utf16FlyString const& command)
-{
-    // AD-HOC: This is not directly mentioned in the spec, but all major browsers limit editing API calls to HTML documents
-    if (!is_html_document())
-        return WebIDL::InvalidStateError::create("queryCommandValue is only supported on HTML documents"_utf16);
-
-    // 1. If command is not supported or has no value, return the empty string.
-    auto optional_command = Editing::find_command_definition(command);
-    if (!optional_command.has_value())
-        return Utf16String {};
-    auto const& command_definition = optional_command.release_value();
-    auto value_override = command_value_override(command_definition.command);
-    if (!command_definition.value && !value_override.has_value())
-        return Utf16String {};
-
-    // 2. If command is "fontSize" and its value override is set, convert the value override to an
-    //    integer number of pixels and return the legacy font size for the result.
-    if (command_definition.command == Editing::CommandNames::fontSize && value_override.has_value()) {
-        auto pixel_size = Editing::font_size_to_pixel_size(value_override.release_value());
-        return Editing::legacy_font_size(pixel_size.to_int());
-    }
-
-    // 3. If the value override for command is set, return it.
-    if (value_override.has_value())
-        return Utf16String::from_utf16(value_override.release_value());
-
-    // 4. Return command's value.
-    return command_definition.value(*this);
-}
-
-// https://w3c.github.io/editing/docs/execCommand/#value-override
-void Document::set_command_value_override(Utf16FlyString const& command, Utf16View value)
-{
-    m_command_value_override.set(command, Utf16String::from_utf16(value));
-
-    // The value override for the backColor command must be the same as the value override for the hiliteColor command,
-    // such that setting one sets the other to the same thing and unsetting one unsets the other.
-    if (command == Editing::CommandNames::backColor)
-        m_command_value_override.set(Editing::CommandNames::hiliteColor, Utf16String::from_utf16(value));
-    else if (command == Editing::CommandNames::hiliteColor)
-        m_command_value_override.set(Editing::CommandNames::backColor, Utf16String::from_utf16(value));
-}
-
-// https://w3c.github.io/editing/docs/execCommand/#value-override
-void Document::clear_command_value_override(Utf16FlyString const& command)
-{
-    m_command_value_override.remove(command);
-
-    // The value override for the backColor command must be the same as the value override for the hiliteColor command,
-    // such that setting one sets the other to the same thing and unsetting one unsets the other.
-    if (command == Editing::CommandNames::backColor)
-        m_command_value_override.remove(Editing::CommandNames::hiliteColor);
-    else if (command == Editing::CommandNames::hiliteColor)
-        m_command_value_override.remove(Editing::CommandNames::backColor);
-}
-
-}
-
-FILE: Libraries/LibWeb/Editing/InlineInsertion.cpp
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibWeb/DOM/Node.h>
-#include <LibWeb/Editing/InlineInsertion.h>
-#include <LibWeb/Editing/Internal/Algorithms.h>
-#include <LibWeb/Editing/ParagraphOperations.h>
-#include <LibWeb/HTML/HTMLLIElement.h>
-#include <LibWeb/HTML/HTMLOListElement.h>
-#include <LibWeb/HTML/HTMLUListElement.h>
-
-namespace Web::Editing {
-
-InlineInsertionBoundary prepare_inline_insertion_boundary(DOM::BoundaryPoint boundary, DOM::Node& containing_block)
-{
-    VERIFY(boundary.node.ptr() == &containing_block || containing_block.is_ancestor_of(boundary.node));
-
-    // INTEROP: Blink first advances through preceding inline nodes while the resulting DOM boundary represents the
-    //          same caret. Inserting after a styled run then occurs beside that run instead of creating an empty style
-    //          clone on its trailing edge.
-    while (boundary.node.ptr() != &containing_block) {
-        if (boundary.offset != boundary.node->length() || !boundary.node->parent())
-            break;
-        auto node = boundary.node;
-        boundary = { *node->parent(), static_cast<WebIDL::UnsignedLong>(node->index() + 1) };
-    }
-
-    GC::Ptr<DOM::Node> highest_styled_inline_ancestor;
-    for (auto* ancestor = boundary.node.ptr(); ancestor && ancestor != &containing_block; ancestor = ancestor->parent()) {
-        // INTEROP: Blink leaves list insertion to its dedicated list-item path instead of splitting the list's inline
-        //          destination style here.
-        if (is<HTML::HTMLLIElement>(*ancestor) || is<HTML::HTMLUListElement>(*ancestor) || is<HTML::HTMLOListElement>(*ancestor))
-            return { boundary, false };
-        if (is_inline_node(*ancestor) && is_modifiable_element(*ancestor))
-            highest_styled_inline_ancestor = *ancestor;
-    }
-    if (!highest_styled_inline_ancestor || !highest_styled_inline_ancestor->parent())
-        return { boundary, false };
-
-    // INTEROP: Blink splits the tree to the parent of the highest styled inline ancestor before rich insertion. This
-    //          keeps pasted source styling independent from formatting supplied only by the destination caret.
-    boundary = split_inline_ancestors_at_boundary(boundary, *highest_styled_inline_ancestor->parent());
-    return { boundary, true };
-}
-
-}
-
-FILE: Libraries/LibWeb/Editing/InlineInsertion.h
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <LibWeb/DOM/Range.h>
-
-namespace Web::Editing {
-
-struct InlineInsertionBoundary {
-    DOM::BoundaryPoint boundary;
-    bool split_destination_style { false };
-};
-
-InlineInsertionBoundary prepare_inline_insertion_boundary(DOM::BoundaryPoint, DOM::Node& containing_block);
-
-}
-
-FILE: Libraries/LibWeb/Editing/InsertedContent.cpp
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <AK/CharacterTypes.h>
-#include <LibWeb/DOM/DocumentFragment.h>
-#include <LibWeb/DOM/Element.h>
-#include <LibWeb/DOM/Node.h>
-#include <LibWeb/DOM/Range.h>
-#include <LibWeb/DOM/Text.h>
-#include <LibWeb/Editing/EditCommand.h>
-#include <LibWeb/Editing/InsertedContent.h>
-#include <LibWeb/Editing/Internal/Algorithms.h>
-#include <LibWeb/Editing/MutationTrackedRange.h>
-#include <LibWeb/Editing/VisiblePosition.h>
-#include <LibWeb/HTML/HTMLBRElement.h>
-#include <LibWeb/Selection/CaretNavigation.h>
-
-namespace Web::Editing {
-
-InsertedContent::InsertedContent(GC::RootVector<GC::Ref<DOM::Node>>&& nodes)
-    : m_nodes(move(nodes))
-{
-}
-
-GC::Ref<DOM::Node> InsertedContent::first_node() const
-{
-    return m_nodes.first_node();
-}
-
-GC::RootVector<GC::Ref<DOM::Node>> InsertedContent::nodes() const
-{
-    return m_nodes.connected_nodes();
-}
-
-GC::Ref<DOM::Node> InsertedContent::last_node() const
-{
-    return m_nodes.last_node();
-}
-
-GC::RootVector<GC::Ref<DOM::Text>> InsertedContent::text_nodes() const
-{
-    return m_nodes.connected_text_nodes();
-}
-
-bool InsertedContent::contains(DOM::Text const& candidate) const
-{
-    return m_nodes.contains(candidate);
-}
-
-DOM::BoundaryPoint InsertedContent::start_boundary() const
-{
-    VERIFY(m_endpoints);
-    return m_endpoints->start();
-}
-
-DOM::BoundaryPoint InsertedContent::completion_start_boundary() const
-{
-    VERIFY(m_replacement_range);
-    VERIFY(m_replacement_topology.has_value());
-
-    // INTEROP: Blink completes a replacement at the mutation-adjusted replacement position when an inline fragment
-    //          starts with a text node, or when a block fragment's unwrapped leading text was integrated into the
-    //          destination paragraph. Wrapped inline content and non-integrated blocks retain their own text seams.
-    auto completion_begins_with_text = m_nodes.leading_content_kind() == InsertedNodes::LeadingContentKind::TextNode;
-    if (*m_replacement_topology == ReplacementTopology::Block)
-        completion_begins_with_text = m_start_paragraph_was_integrated
-            && m_nodes.leading_content_kind() != InsertedNodes::LeadingContentKind::Other;
-    return completion_begins_with_text && m_replacement_was_inside_inline_content
-        ? m_replacement_range->range().start()
-        : start_boundary();
-}
-
-DOM::BoundaryPoint InsertedContent::insertion_boundary() const
-{
-    VERIFY(m_insertion_range);
-    return m_insertion_range->range().start();
-}
-
-DOM::BoundaryPoint InsertedContent::end_boundary() const
-{
-    VERIFY(m_endpoints);
-    if (auto atomic_boundary = end_boundary_after_atomic_content(); atomic_boundary.has_value())
-        return *atomic_boundary;
-    auto boundary = m_endpoints->end();
-    if (!is<DOM::Text>(*boundary.node) && boundary.offset > 0) {
-        if (auto* preceding_child = boundary.node->child_at_index(boundary.offset - 1))
-            return end_boundary_of_node(*preceding_child);
-    }
-    return boundary;
-}
-
-Optional<DOM::BoundaryPoint> InsertedContent::end_boundary_after_atomic_content() const
-{
-    auto last_atomic_node = m_nodes.last_atomic_node();
-    if (!last_atomic_node || !last_atomic_node->parent())
-        return {};
-    return end_boundary_of_node(*last_atomic_node);
-}
-
-static DOM::BoundaryPoint start_boundary_of(DOM::Node& node)
-{
-    if (auto* text = as_if<DOM::Text>(node))
-        return { *text, 0 };
-    if (auto* first_child = node.first_child())
-        return start_boundary_of(*first_child);
-    return { node, 0 };
-}
-
-void InsertedContent::insert_before(DOM::Node& parent, GC::Ptr<DOM::Node> reference_node)
-{
-    auto insertion_offset = reference_node
-        ? static_cast<WebIDL::UnsignedLong>(reference_node->index())
-        : static_cast<WebIDL::UnsignedLong>(parent.child_count());
-    track_insertion_boundary({ parent, insertion_offset });
-
-    for (auto& node : m_nodes.connected_nodes())
-        insert_node_before(node, parent, reference_node);
-}
-
-void InsertedContent::insert_into_range(DOM::Range& range, DOM::DocumentFragment& fragment)
-{
-    track_insertion_boundary(range.start());
-    MUST(insert_node_into_range(range, fragment));
-}
-
-void InsertedContent::track_insertion_boundary(DOM::BoundaryPoint boundary)
-{
-    VERIFY(!m_insertion_range);
-    // INTEROP: Completion treats a protected whitespace run before terminal atomic content differently inside a
-    //          paragraph than at its boundary. Record that topology before insertion changes the visible positions.
-    auto visible_position = VisiblePosition::create(boundary.node->document(), boundary);
-    m_insertion_was_inside_paragraph = !visible_position.is_start_of_paragraph() && !visible_position.is_end_of_paragraph();
-    if (auto previous_position = visible_position.previous(); previous_position.has_value()) {
-        auto previous_boundary = previous_position->deep_equivalent();
-        if (auto* text = as_if<DOM::Text>(*previous_boundary.node); text && text->length_in_utf16_code_units() > 0) {
-            // An upstream-equivalent position can be represented by the end of the preceding text node. In that case
-            // the code unit before the boundary, rather than the out-of-range code unit at the boundary, is relevant.
-            auto code_unit_offset = min(previous_boundary.offset, text->length_in_utf16_code_units() - 1);
-            auto code_unit = text->data().code_unit_at(code_unit_offset);
-            m_insertion_was_after_whitespace = is_ascii_space(code_unit) || code_unit == 0xa0;
-        }
-    }
-    // INTEROP: Blink retains the insertion position separately from the first inserted node. In particular, a block
-    //          insertion can move or unwrap that node while the destination-side whitespace seam remains observable.
-    m_insertion_range = make<MutationTrackedRange>(DOM::Range::create(boundary.node, boundary.offset, boundary.node, boundary.offset));
-}
-
-void InsertedContent::track_replacement_boundary(DOM::BoundaryPoint boundary, ReplacementTopology topology)
-{
-    VERIFY(!m_replacement_range);
-    VERIFY(!m_replacement_topology.has_value());
-    m_replacement_topology = topology;
-
-    // INTEROP: Blink and WebKit retain the replacement position across the topology changes made while inserting a
-    //          fragment. This is distinct from both the structural insertion position and the inserted content range.
-    m_replacement_range = make<MutationTrackedRange>(DOM::Range::create(boundary.node, boundary.offset, boundary.node, boundary.offset));
-    for (auto* ancestor = boundary.node.ptr(); ancestor && !is_block_node(*ancestor); ancestor = ancestor->parent()) {
-        if (is<DOM::Element>(*ancestor)) {
-            m_replacement_was_inside_inline_content = true;
-            break;
-        }
-    }
-}
-
-void InsertedContent::begin_tracking_content_boundaries()
-{
-    // INTEROP: Blink and WebKit track inserted nodes while preparing the fragment, then establish the logical content
-    //          range after redundant style removal has finalized its structural edges. Subsequent paragraph movement
-    //          tracks these positions through DOM mutations instead of reconstructing the final caret from nodes.
-    VERIFY(!m_endpoints);
-    auto start = start_boundary_of(*m_nodes.first_node());
-    auto end = end_boundary_of_node(*m_nodes.last_node());
-    m_endpoints = make<ReplacementEndpoints>(start, end);
-}
-
-void InsertedContent::did_replace_node(DOM::Node& node, DOM::Node& replacement)
-{
-    did_replace_node(node, replacement, replacement);
-}
-
-void InsertedContent::begin_completion(DOM::BoundaryPoint end)
-{
-    VERIFY(m_endpoints);
-
-    // INTEROP: Blink and WebKit stop consulting their structural inserted-node tracker once replacement completion
-    //          begins. Resolve the semantic start once, then carry both endpoints explicitly through every mutation.
-    m_endpoints->set_start(completion_start_boundary());
-    m_endpoints->set_end(end);
-}
-
-void InsertedContent::did_replace_node(DOM::Node& node, DOM::Node& first_replacement, DOM::Node& last_replacement)
-{
-    m_nodes.did_replace_node(node, first_replacement, last_replacement);
-}
-
-void InsertedContent::did_move_start_paragraph(DOM::BoundaryPoint start)
-{
-    VERIFY(m_endpoints);
-    m_start_paragraph_was_integrated = true;
-    Web::Selection::CaretNavigator navigator(start.node->document());
-    auto location = navigator.canonical_location_for_editing({ start.node, start.offset });
-
-    // INTEROP: Blink re-establishes the start of inserted content at the most-forward equivalent caret after moving
-    //          its first paragraph. The move can unwrap the original boundary container without orphaning its text.
-    location = navigator.canonical_location_for_extension(location, Web::Selection::SelectionDirection::Forward).value_or(location);
-    m_endpoints->set_start({ location.node, static_cast<WebIDL::UnsignedLong>(location.offset) });
-}
-
-void InsertedContent::will_integrate_end_paragraph(DOM::Node& paragraph)
-{
-    VERIFY(m_endpoints);
-    m_end_paragraph_was_integrated = true;
-
-    // INTEROP: Blink and WebKit move paragraphs with a nested replacement. If start integration folded the tracked
-    //          replacement start into the paragraph which is subsequently moved for end integration, that nested
-    //          replacement invalidates the old start and its boundary becomes an additional completion seam.
-    if (m_start_paragraph_was_integrated && paragraph.is_inclusive_ancestor_of(*m_endpoints->start().node))
-        m_normalize_end_text_seam = true;
-}
-
-}
-
-FILE: Libraries/LibWeb/Editing/InsertedContent.h
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/OwnPtr.h>
-#include <LibGC/Root.h>
-#include <LibGC/RootVector.h>
-#include <LibWeb/Editing/InsertedNodes.h>
-#include <LibWeb/Editing/MutationTrackedRange.h>
-#include <LibWeb/Editing/ReplacementEndpoints.h>
-#include <LibWeb/Forward.h>
-
-namespace Web::Editing {
-
-// Tracks both the structural edges of inserted content and the exact destination seam where it was inserted. These are
-// intentionally distinct: paragraph integration moves the content edges, while whitespace repair still needs the
-// mutation-adjusted destination seam instead of reconstructing it from the resulting tree.
-class InsertedContent {
-    AK_MAKE_NONCOPYABLE(InsertedContent);
-
-public:
-    enum class ReplacementTopology {
-        Inline,
-        Block,
-    };
-
-    explicit InsertedContent(GC::RootVector<GC::Ref<DOM::Node>>&&);
-    InsertedContent(InsertedContent&&) = default;
-
-    bool is_empty() const { return m_nodes.is_empty(); }
-    GC::RootVector<GC::Ref<DOM::Node>> nodes() const;
-    GC::Ref<DOM::Node> first_node() const;
-    GC::Ref<DOM::Node> last_node() const;
-    GC::RootVector<GC::Ref<DOM::Text>> text_nodes() const;
-    bool contains(DOM::Text const&) const;
-    DOM::BoundaryPoint insertion_boundary() const;
-    DOM::BoundaryPoint start_boundary() const;
-    DOM::BoundaryPoint completion_start_boundary() const;
-    DOM::BoundaryPoint end_boundary() const;
-    Optional<DOM::BoundaryPoint> end_boundary_after_atomic_content() const;
-    ReplacementTopology replacement_topology() const
-    {
-        VERIFY(m_replacement_topology.has_value());
-        return *m_replacement_topology;
-    }
-    bool insertion_was_inside_paragraph() const { return m_insertion_was_inside_paragraph; }
-    bool insertion_was_after_whitespace() const { return m_insertion_was_after_whitespace; }
-    bool end_paragraph_was_integrated() const { return m_end_paragraph_was_integrated; }
-
-    ReplacementEndpoints& endpoints()
-    {
-        VERIFY(m_endpoints);
-        return *m_endpoints;
-    }
-    void begin_completion(DOM::BoundaryPoint end);
-
-    void insert_before(DOM::Node& parent, GC::Ptr<DOM::Node> reference_node);
-    void insert_into_range(DOM::Range&, DOM::DocumentFragment&);
-    void track_replacement_boundary(DOM::BoundaryPoint, ReplacementTopology);
-    void begin_tracking_content_boundaries();
-    void did_replace_node(DOM::Node&, DOM::Node& replacement);
-    void did_replace_node(DOM::Node&, DOM::Node& first_replacement, DOM::Node& last_replacement);
-    void did_move_start_paragraph(DOM::BoundaryPoint);
-    void will_integrate_end_paragraph(DOM::Node&);
-    void require_end_text_seam_normalization() { m_normalize_end_text_seam = true; }
-    bool should_normalize_end_text_seam() const { return m_normalize_end_text_seam; }
-
-private:
-    void track_insertion_boundary(DOM::BoundaryPoint);
-
-    InsertedNodes m_nodes;
-    OwnPtr<MutationTrackedRange> m_replacement_range;
-    OwnPtr<MutationTrackedRange> m_insertion_range;
-    OwnPtr<ReplacementEndpoints> m_endpoints;
-    Optional<ReplacementTopology> m_replacement_topology;
-    bool m_start_paragraph_was_integrated { false };
-    bool m_insertion_was_inside_paragraph { false };
-    bool m_insertion_was_after_whitespace { false };
-    bool m_replacement_was_inside_inline_content { false };
-    bool m_end_paragraph_was_integrated { false };
-    bool m_normalize_end_text_seam { false };
-};
-
-}
-
-FILE: Libraries/LibWeb/Editing/InsertedNodes.cpp
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibWeb/DOM/Node.h>
-#include <LibWeb/DOM/Text.h>
-#include <LibWeb/Editing/InsertedNodes.h>
-#include <LibWeb/Editing/Internal/Algorithms.h>
-#include <LibWeb/HTML/HTMLBRElement.h>
-
-namespace Web::Editing {
-
-InsertedNodes::InsertedNodes(GC::RootVector<GC::Ref<DOM::Node>>&& nodes)
-    : m_nodes(move(nodes))
-{
-    if (!m_nodes.is_empty()) {
-        m_first_node = m_nodes.first();
-        m_last_node = m_nodes.last();
-        if (is<DOM::Text>(*m_first_node))
-            m_leading_content_kind = LeadingContentKind::TextNode;
-        else if (m_first_node->first_child() && is<DOM::Text>(*m_first_node->first_child()))
-            m_leading_content_kind = LeadingContentKind::UnwrappedParagraphText;
-
-        auto* last_leaf = m_last_node.ptr();
-        while (last_leaf->last_child())
-            last_leaf = last_leaf->last_child();
-        if (editing_ignores_content(*last_leaf) && !is<HTML::HTMLBRElement>(*last_leaf))
-            m_last_atomic_node = *last_leaf;
-    }
-
-    for (auto& node : m_nodes) {
-        node->for_each_in_inclusive_subtree([&](GC::Ref<DOM::Node> descendant) {
-            if (is<DOM::Text>(*descendant))
-                m_text_nodes.append(static_cast<DOM::Text&>(*descendant));
-            return TraversalDecision::Continue;
-        });
-    }
-}
-
-GC::RootVector<GC::Ref<DOM::Node>> InsertedNodes::connected_nodes() const
-{
-    GC::RootVector<GC::Ref<DOM::Node>> nodes;
-    for (auto& node : m_nodes) {
-        if (node->parent())
-            nodes.append(node);
-    }
-    return nodes;
-}
-
-GC::Ref<DOM::Node> InsertedNodes::first_node() const
-{
-    VERIFY(m_first_node);
-    return *m_first_node;
-}
-
-GC::Ref<DOM::Node> InsertedNodes::last_node() const
-{
-    VERIFY(m_last_node);
-    return *m_last_node;
-}
-
-GC::RootVector<GC::Ref<DOM::Text>> InsertedNodes::connected_text_nodes() const
-{
-    GC::RootVector<GC::Ref<DOM::Text>> text_nodes;
-    for (auto& text : m_text_nodes) {
-        if (text->parent())
-            text_nodes.append(text);
-    }
-    return text_nodes;
-}
-
-bool InsertedNodes::contains(DOM::Text const& candidate) const
-{
-    return any_of(m_text_nodes, [&](auto const& text) { return text.ptr() == &candidate && text->parent(); });
-}
-
-void InsertedNodes::did_replace_node(DOM::Node& node, DOM::Node& replacement)
-{
-    did_replace_node(node, replacement, replacement);
-}
-
-void InsertedNodes::did_replace_node(DOM::Node& node, DOM::Node& first_replacement, DOM::Node& last_replacement)
-{
-    if (m_first_node.ptr() == &node)
-        m_first_node = first_replacement;
-    if (m_last_node.ptr() == &node)
-        m_last_node = last_replacement;
-}
-
-}
-
-FILE: Libraries/LibWeb/Editing/InsertedNodes.h
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <LibGC/Root.h>
-#include <LibGC/RootVector.h>
-#include <LibWeb/Forward.h>
-
-namespace Web::Editing {
-
