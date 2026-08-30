@@ -1,4 +1,28 @@
-﻿#!/usr/bin/env python3
+﻿    results=$(printf '%s\0' "${files[@]}" \
+        | xargs -0 -n1 -P0 sh -c '
+            output=$(optipng -strip all -out "$0/optipng-$$.png" -clobber "$2" 2>&1) || true
+            decrease=$(printf "%s\n" "$output" | sed -nE "s/Output IDAT size = [0-9]+ byte(s?) \(([0-9]+) byte(s?) decrease\)/\2/p")
+            decrease="${decrease:-0}"
+            if [ "$decrease" -ge "$1" ]; then
+                printf "%d %s\n" "$decrease" "$2"
+            fi
+        ' "$tmpdir" "$MINIMUM_OPTIMIZATION_BYTES")
+    rm -rf "$tmpdir"
+
+    if [ -n "$results" ]; then
+        optimizations=$(printf '%s\n' "$results" | awk '{ S+=$1 } END { print S }')
+        echo "There are non-optimized PNG images. It is possible to reduce file sizes by at least $optimizations byte(s)."
+        printf '%s\n' "$results" | awk '{ print "  " $2 }'
+        # shellcheck disable=SC2016 # we're not trying to expand expressions here
+        echo 'Please run optipng with `-strip all` on modified PNG images and try again.'
+        exit 1
+    fi
+else
+    echo 'No PNG images to check.'
+fi
+
+FILE: Meta/Linters/check_style.py
+#!/usr/bin/env python3
 
 import os
 import pathlib
@@ -13780,6 +13804,285 @@ ErrorOr<void> apply_sandbox(Optional<StringView>, Optional<StringView>)
 
 }
 
+FILE: Services/RequestServer/AIA.cpp
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <LibCrypto/OpenSSL.h>
+#include <RequestServer/AIA.h>
+
+#include <AK/ByteString.h>
+#include <AK/HashMap.h>
+#include <AK/Time.h>
+#include <AK/Vector.h>
+
+#if defined(AK_OS_WINDOWS)
+// Included before the OpenSSL headers so the winsock2 struct timeval is renamed and can't collide with AK's.
+// Same reason CURL.h includes it before curl.h.
+#    include <AK/Windows.h>
+#endif
+
+#include <openssl/err.h>
+#include <openssl/pem.h>
+#include <openssl/pkcs7.h>
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
+#include <openssl/x509_vfy.h>
+#include <openssl/x509v3.h>
+
+namespace RequestServer {
+
+// This max was chosen to align with the (telemetry-tuned) value Chromium uses.
+static constexpr size_t max_ca_issuers_urls_per_certificate = 5;
+
+// Upper bound on the process-wide fetched-intermediate cache — so a long-lived process that visits many misconfigured
+// sites can't grow it without limit.
+static constexpr size_t max_cached_intermediates = 256;
+
+// How long a caIssuers URL whose fetch failed is remembered, before we're willing to try it again.
+static constexpr auto failed_url_retry_interval = AK::Duration::from_seconds(300);
+
+// Upper bound on the failed-URL negative cache, so a page hitting many distinct dead caIssuers URLs can't grow it
+// without limit.
+static constexpr size_t max_failed_urls = 1024;
+
+// Collect the caIssuers URLs from a cert's AIA extension. Only http URLs are returned; fetching an intermediate over
+// https would itself require cert verification — risking infinite recursion.
+Vector<ByteString> ca_issuers_urls(X509* certificate)
+{
+    Vector<ByteString> urls;
+
+    auto* authority_info_access = static_cast<AUTHORITY_INFO_ACCESS*>(X509_get_ext_d2i(certificate, NID_info_access, nullptr, nullptr));
+    if (!authority_info_access)
+        return urls;
+
+    for (int i = 0; i < sk_ACCESS_DESCRIPTION_num(authority_info_access); ++i) {
+        auto* access_description = sk_ACCESS_DESCRIPTION_value(authority_info_access, i);
+        if (OBJ_obj2nid(access_description->method) != NID_ad_ca_issuers)
+            continue;
+        if (access_description->location->type != GEN_URI)
+            continue;
+
+        auto const* uri = access_description->location->d.uniformResourceIdentifier;
+        auto url = ByteString { reinterpret_cast<char const*>(ASN1_STRING_get0_data(uri)), static_cast<size_t>(ASN1_STRING_length(uri)) };
+        if (url.starts_with("http://"sv, CaseSensitivity::CaseInsensitive) && urls.size() < max_ca_issuers_urls_per_certificate)
+            urls.append(move(url));
+    }
+
+    AUTHORITY_INFO_ACCESS_free(authority_info_access);
+    return urls;
+}
+
+// Process-wide cache of intermediate certs fetched via AIA. Each entry owns one reference to the X509. Bounded by
+// max_cached_intermediates with FIFO eviction.
+static Vector<Crypto::OpenSSL_X509>& intermediate_cache()
+{
+    static Vector<Crypto::OpenSSL_X509> cache;
+    return cache;
+}
+
+// Process-wide record of caIssuers URLs whose fetch failed, mapped to when they failed — so we don't repeatedly retry a
+// dead URL. Entries older than failed_url_retry_interval are ignored (and dropped when next encountered).
+static HashMap<ByteString, MonotonicTime>& failed_urls()
+{
+    static HashMap<ByteString, MonotonicTime> urls;
+    return urls;
+}
+
+void mark_aia_url_failed(ByteString url)
+{
+    if (failed_urls().size() >= max_failed_urls)
+        failed_urls().clear();
+    failed_urls().set(move(url), MonotonicTime::now_coarse());
+}
+
+// Parse a fetched AIA response body into one or more certs. Real-world CAs serve a bare DER-encoded cert, a PKCS#7/
+// CMS "certs-only" bundle (RFC 5280 section 4.2.2.1), or PEM.
+Vector<X509*> parse_certificates(ReadonlyBytes body)
+{
+    Vector<X509*> certificates;
+
+    auto const* der = body.data();
+    if (auto* certificate = d2i_X509(nullptr, &der, static_cast<long>(body.size()))) {
+        certificates.append(certificate);
+        return certificates;
+    }
+    // Each decoder below is tried in turn — so a failure here is expected rather than exceptional. Drop what it
+    // queued — so it can't later be mistaken for the error of an unrelated OpenSSL call on this thread.
+    ERR_clear_error();
+
+    auto const* pkcs7_data = body.data();
+    if (auto* pkcs7 = d2i_PKCS7(nullptr, &pkcs7_data, static_cast<long>(body.size()))) {
+        STACK_OF(X509)* certs = nullptr;
+        if (PKCS7_type_is_signed(pkcs7)) {
+            if (pkcs7->d.sign)
+                certs = pkcs7->d.sign->cert;
+        } else if (PKCS7_type_is_signedAndEnveloped(pkcs7)) {
+            if (pkcs7->d.signed_and_enveloped)
+                certs = pkcs7->d.signed_and_enveloped->cert;
+        }
+        for (int i = 0; certs && i < sk_X509_num(certs); ++i) {
+            auto* certificate = sk_X509_value(certs, i);
+            X509_up_ref(certificate);
+            certificates.append(certificate);
+        }
+        PKCS7_free(pkcs7);
+        if (!certificates.is_empty())
+            return certificates;
+    }
+    ERR_clear_error();
+
+    if (auto* bio = BIO_new_mem_buf(body.data(), static_cast<int>(body.size()))) {
+        while (auto* certificate = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr))
+            certificates.append(certificate);
+        BIO_free(bio);
+    }
+    // The read loop above always ends on a failed read, queueing an error even when certificates were parsed.
+    ERR_clear_error();
+
+    return certificates;
+}
+
+bool add_fetched_aia_intermediate(ReadonlyBytes body)
+{
+    auto certificates = parse_certificates(body);
+    for (auto* certificate : certificates) {
+        auto owned = Crypto::OpenSSL_X509::wrap(certificate);
+        if (owned.is_error()) {
+            X509_free(certificate);
+            continue;
+        }
+        // take_first() drops the oldest wrapper, whose destructor frees the certificate.
+        if (intermediate_cache().size() >= max_cached_intermediates)
+            (void)intermediate_cache().take_first();
+        intermediate_cache().append(owned.release_value());
+    }
+    return !certificates.is_empty();
+}
+
+// Installed via SSL_CTX_set_cert_verify_callback. On failure, we record the failing cert's caIssuers URLs for the
+// request layer to fetch and retry.
+static int verify_callback(X509_STORE_CTX* context, void* collector_data)
+{
+    auto* collector = static_cast<AIACollector*>(collector_data);
+
+    // Add the fetched intermediates alongside the certs the server sent, as untrusted path-building material.
+    auto* server_untrusted = X509_STORE_CTX_get0_untrusted(context);
+    auto* untrusted = server_untrusted ? sk_X509_dup(server_untrusted) : sk_X509_new_null();
+    if (untrusted) {
+        for (auto& candidate : intermediate_cache())
+            sk_X509_push(untrusted, candidate.ptr());
+        X509_STORE_CTX_set0_untrusted(context, untrusted);
+    }
+
+    auto result = X509_verify_cert(context);
+
+    if (untrusted) {
+        X509_STORE_CTX_set0_untrusted(context, server_untrusted);
+        sk_X509_free(untrusted);
+    }
+
+    // AIA can only repair a chain missing an intermediate issuer. For any other verification failure, fetching
+    // caIssuers is useless — so we leave the collector's pending URLs untouched.
+    auto const verify_error = X509_STORE_CTX_get_error(context);
+    auto const issuer_is_missing = verify_error == X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT || verify_error == X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY;
+
+    if (result <= 0 && collector && issuer_is_missing) {
+        if (auto* current = X509_STORE_CTX_get_current_cert(context)) {
+            for (auto& url : ca_issuers_urls(current)) {
+                if (collector->attempted_urls.contains(url))
+                    continue;
+                if (auto failed_at = failed_urls().get(url); failed_at.has_value()) {
+                    if (MonotonicTime::now_coarse() - *failed_at < failed_url_retry_interval)
+                        continue;
+                    failed_urls().remove(url);
+                }
+                if (!collector->pending_urls.contains_slow(url))
+                    collector->pending_urls.append(move(url));
+            }
+        }
+    }
+
+    // X509_verify_cert() returns -1 in exceptional cases, and a negative return from a cert_verify_callback tells
+    // OpenSSL to suspend the handshake and retry it later. Collapse it to a plain pass/fail.
+    return result > 0 ? 1 : 0;
+}
+
+// The SSL_CTX (per-connection, possibly pooled beyond the originating request) holds a strong reference to the
+// collector; this releases it when the SSL_CTX is destroyed.
+static void collector_ex_data_free(void*, void* ptr, CRYPTO_EX_DATA*, int, long, void*)
+{
+    if (ptr)
+        static_cast<AIACollector*>(ptr)->unref();
+}
+
+static int collector_ex_data_index()
+{
+    static int index = SSL_CTX_get_ex_new_index(0, nullptr, nullptr, nullptr, collector_ex_data_free);
+    return index;
+}
+
+void apply_aia_verification(SSL_CTX* ssl_context, AIACollector& collector)
+{
+    // The ex-data slot owns the reference taken here, and collector_ex_data_free() releases it when the SSL_CTX
+    // goes away. On a failed set, the pointer isn't stored — so nothing would ever release it. Hand it back here.
+    collector.ref();
+    if (SSL_CTX_set_ex_data(ssl_context, collector_ex_data_index(), &collector) != 1) {
+        collector.unref();
+        return;
+    }
+    SSL_CTX_set_cert_verify_callback(ssl_context, verify_callback, &collector);
+}
+
+}
+
+FILE: Services/RequestServer/AIA.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/ByteString.h>
+#include <AK/HashTable.h>
+#include <AK/RefCounted.h>
+#include <AK/RefPtr.h>
+#include <AK/Span.h>
+#include <AK/Vector.h>
+#include <LibTLS/OpenSSLForward.h>
+
+namespace RequestServer {
+
+// Per-request state shared with (per-connection, possibly pooled and longer-lived) SSL_CTX during verification. Ref-
+// counted, so a connection outliving its originating request can't leave the verify callback with a dangling pointer.
+class AIACollector : public RefCounted<AIACollector> {
+public:
+    Vector<ByteString> pending_urls;      // caIssuers URLs collected during verification, awaiting fetch.
+    HashTable<ByteString> attempted_urls; // URLs already fetched for this request, so they're not re-collected.
+};
+
+// During verification, any cert whose issuer we can't find locally or in the fetched-intermediate cache has its
+// caIssuers URLs appended to collector.pending_urls (skipping ones already attempted or recently known dead).
+void apply_aia_verification(SSL_CTX* ssl_context, AIACollector& collector);
+
+// Parse a fetched AIA response body and, if it yields a certificate, add it to the process-wide intermediate cache
+// that's consulted during verification. Returns true if a certificate was added.
+bool add_fetched_aia_intermediate(ReadonlyBytes body);
+
+// Record that fetching the given caIssuers URL failed — so it's not retried.
+void mark_aia_url_failed(ByteString url);
+
+// The following two parsing primitives are exposed for unit testing.
+Vector<ByteString> ca_issuers_urls(X509* certificate);
+Vector<X509*> parse_certificates(ReadonlyBytes body);
+
+}
+
 FILE: Services/RequestServer/CacheLevel.h
 /*
  * Copyright (c) 2024, Andreas Kling <andreas@ladybird.org>
@@ -13800,6 +14103,7 @@ enum class CacheLevel {
 
 FILE: Services/RequestServer/CMakeLists.txt
 set(SOURCES
+    AIA.cpp
     ConnectionFromClient.cpp
     CURL.cpp
     Request.cpp
@@ -13879,8 +14183,10 @@ FILE: Services/RequestServer/ConnectionFromClient.cpp
 #include <LibIPC/TransportHandle.h>
 #include <LibRequests/NetworkError.h>
 #include <LibRequests/WebSocket.h>
+#include <LibURL/Parser.h>
 #include <LibWebSocket/ConnectionInfo.h>
 #include <LibWebSocket/Message.h>
+#include <RequestServer/AIA.h>
 #include <RequestServer/CURL.h>
 #include <RequestServer/ConnectionFromClient.h>
 #include <RequestServer/Request.h>
@@ -14004,6 +14310,12 @@ ConnectionFromClient::~ConnectionFromClient()
     m_active_revalidation_requests.clear();
     m_pending_websockets.clear();
     m_websockets.clear();
+
+    for (auto& fetch : m_aia_fetches) {
+        curl_multi_remove_handle(m_curl_multi, fetch.key);
+        curl_easy_cleanup(fetch.key);
+    }
+    m_aia_fetches.clear();
 
     curl_multi_cleanup(m_curl_multi);
     m_curl_multi = nullptr;
@@ -14376,6 +14688,11 @@ void ConnectionFromClient::check_active_requests()
             continue;
         }
 
+        if (reinterpret_cast<uintptr_t>(application_private) & aia_fetch_private_tag) {
+            complete_aia_fetch(msg->easy_handle, msg->data.result);
+            continue;
+        }
+
         ++completions_drained;
         auto* request = static_cast<Request*>(application_private);
         request->notify_fetch_complete({}, msg->data.result);
@@ -14383,6 +14700,153 @@ void ConnectionFromClient::check_active_requests()
 
     if (completions_drained > 1)
         dbgln_if(REQUESTSERVER_WIRE_DEBUG, "RequestServer wire-batch: drained {} completions in one curl multi tick", completions_drained);
+}
+
+static size_t aia_write_body(char* data, size_t size, size_t count, void* user_data)
+{
+    auto& fetch = *static_cast<AIAFetch*>(user_data);
+    auto const length = size * count;
+    if (fetch.body.size() + length > max_aia_response_size)
+        return 0;
+    if (fetch.body.try_append(data, length).is_error())
+        return 0;
+    return length;
+}
+
+void ConnectionFromClient::fetch_aia_intermediate(Badge<Request>, ByteString const& url, u64 for_request_id)
+{
+    for (auto& in_flight : m_aia_fetches) {
+        if (in_flight.value->url == url) {
+            in_flight.value->request_ids.append(for_request_id);
+            return;
+        }
+    }
+
+    // The lookup below is async, so m_aia_fetches has no entry yet; this is what stops a second request for the
+    // same URL from starting a duplicate lookup in the meantime.
+    if (auto pending = m_pending_aia_lookups.get(url); pending.has_value()) {
+        m_pending_aia_lookups.ensure(url).append(for_request_id);
+        return;
+    }
+    m_pending_aia_lookups.set(url, { for_request_id });
+
+    auto parsed = URL::Parser::basic_parse(url);
+    if (!parsed.has_value() || parsed->serialized_host().is_empty()) {
+        abandon_aia_lookup(url);
+        return;
+    }
+    auto host = parsed->serialized_host().to_byte_string();
+    auto port = parsed->port_or_default();
+    auto weak_self = make_weak_ptr<ConnectionFromClient>();
+
+    // Resolve through RequestServer's own resolver rather than letting curl do it, so the AIA fetch honors the
+    // same DNS configuration (DoH included) as every other request this process makes.
+    m_resolver->dns.lookup(host, DNS::Messages::Class::IN, { DNS::Messages::ResourceType::A, DNS::Messages::ResourceType::AAAA })
+        ->when_rejected([weak_self, url](auto const& error) {
+            if (auto self = weak_self.strong_ref()) {
+                dbgln_if(REQUESTSERVER_DEBUG, "AIA: DNS lookup failed for {}: {}", url, error);
+                self->abandon_aia_lookup(url);
+            }
+        })
+        .when_resolved([weak_self, url, host, port](auto const& dns_result) {
+            auto self = weak_self.strong_ref();
+            if (!self)
+                return;
+            if (dns_result->is_empty() || !dns_result->has_cached_addresses()) {
+                dbgln_if(REQUESTSERVER_DEBUG, "AIA: DNS lookup returned no addresses for {}", url);
+                self->abandon_aia_lookup(url);
+                return;
+            }
+            self->start_aia_fetch(url, build_curl_resolve_list(*dns_result, host, port));
+        });
+}
+
+// Nothing will arrive to wake the waiting requests, so release them to retry without the intermediate.
+void ConnectionFromClient::abandon_aia_lookup(ByteString const& url)
+{
+    auto waiting = m_pending_aia_lookups.take(url);
+    if (!waiting.has_value())
+        return;
+    for (auto request_id : *waiting) {
+        if (auto request = m_active_requests.get(request_id); request.has_value())
+            (*request)->retry_after_aia({});
+    }
+}
+
+void ConnectionFromClient::start_aia_fetch(ByteString const& url, ByteString resolve_entry)
+{
+    auto waiting = m_pending_aia_lookups.take(url);
+    if (!waiting.has_value() || waiting->is_empty())
+        return;
+
+    auto* easy_handle = curl_easy_init();
+    if (!easy_handle) {
+        for (auto request_id : *waiting) {
+            if (auto request = m_active_requests.get(request_id); request.has_value())
+                (*request)->retry_after_aia({});
+        }
+        return;
+    }
+
+    auto fetch = make<AIAFetch>();
+    fetch->url = url;
+    fetch->request_ids = move(*waiting);
+
+    auto set_option = [&](auto option, auto value) {
+        if (auto result = curl_easy_setopt(easy_handle, option, value); result != CURLE_OK)
+            dbgln("RequestServer: AIA fetch failed to set curl option: {}", curl_easy_strerror(result));
+    };
+    set_option(CURLOPT_PRIVATE, reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(fetch.ptr()) | aia_fetch_private_tag));
+    set_option(CURLOPT_URL, url.characters());
+    set_option(CURLOPT_PROTOCOLS_STR, "http");
+    set_option(CURLOPT_REDIR_PROTOCOLS_STR, "http");
+    set_option(CURLOPT_FOLLOWLOCATION, 1L);
+    set_option(CURLOPT_MAXREDIRS, 5L);
+    set_option(CURLOPT_TIMEOUT, 10L);
+    set_option(CURLOPT_MAXFILESIZE_LARGE, static_cast<curl_off_t>(max_aia_response_size));
+    set_option(CURLOPT_NOSIGNAL, 1L);
+    set_option(CURLOPT_WRITEFUNCTION, aia_write_body);
+    set_option(CURLOPT_WRITEDATA, fetch.ptr());
+
+    if (curl_slist* resolve_list = curl_slist_append(nullptr, resolve_entry.characters())) {
+        set_option(CURLOPT_RESOLVE, resolve_list);
+        fetch->resolve_list = resolve_list;
+    }
+
+    auto result = curl_multi_add_handle(m_curl_multi, easy_handle);
+    VERIFY(result == CURLM_OK);
+
+    m_aia_fetches.set(easy_handle, move(fetch));
+}
+
+void ConnectionFromClient::complete_aia_fetch(void* easy_handle, int result_code)
+{
+    long response_code = 0;
+    curl_easy_getinfo(easy_handle, CURLINFO_RESPONSE_CODE, &response_code);
+
+    auto fetch = m_aia_fetches.take(easy_handle);
+    curl_multi_remove_handle(m_curl_multi, easy_handle);
+    curl_easy_cleanup(easy_handle);
+    if (!fetch.has_value())
+        return;
+
+    // curl only reads the resolve list while the handle is attached, so it outlives the handle and is freed here.
+    if ((*fetch)->resolve_list)
+        curl_slist_free_all((*fetch)->resolve_list);
+
+    bool added = false;
+    if (result_code == CURLE_OK && response_code == 200)
+        added = add_fetched_aia_intermediate((*fetch)->body.bytes());
+
+    if (!added) {
+        dbgln_if(REQUESTSERVER_DEBUG, "AIA: intermediate fetch from {} failed (curl={}, status={})", (*fetch)->url, result_code, response_code);
+        mark_aia_url_failed((*fetch)->url);
+    }
+
+    for (auto request_id : (*fetch)->request_ids) {
+        if (auto request = m_active_requests.get(request_id); request.has_value())
+            (*request)->retry_after_aia({});
+    }
 }
 
 void ConnectionFromClient::fail_websocket(u64 websocket_id, Requests::WebSocket::Error error)
@@ -14638,9 +15102,11 @@ FILE: Services/RequestServer/ConnectionFromClient.h
 #pragma once
 
 #include <AK/Badge.h>
+#include <AK/ByteBuffer.h>
 #include <AK/HashMap.h>
 #include <AK/Optional.h>
 #include <AK/Time.h>
+#include <AK/Vector.h>
 #include <LibCore/AnonymousBuffer.h>
 #include <LibHTTP/Cache/CacheMode.h>
 #include <LibHTTP/Cache/DiskCacheSettings.h>
@@ -14656,6 +15122,16 @@ FILE: Services/RequestServer/ConnectionFromClient.h
 #include <RequestServer/RequestServerEndpoint.h>
 
 namespace RequestServer {
+
+// Cap on an AIA response: these carry one DER or PKCS#7 certificate bundle, never anything large.
+constexpr inline size_t max_aia_response_size = 64 * KiB;
+
+struct AIAFetch {
+    ByteString url;
+    ByteBuffer body;
+    Vector<u64> request_ids;
+    curl_slist* resolve_list { nullptr };
+};
 
 class ConnectionFromClient final
     : public IPC::ConnectionFromClient<RequestClientEndpoint, RequestServerEndpoint> {
@@ -14686,6 +15162,7 @@ public:
 
     void start_revalidation_request(Badge<Request>, ByteString method, URL::URL, NonnullRefPtr<HTTP::HeaderList> request_headers, ByteBuffer request_body, HTTP::Cookie::IncludeCredentials, Core::ProxyData proxy_data);
     void request_complete(Badge<Request>, Request const&);
+    void fetch_aia_intermediate(Badge<Request>, ByteString const& url, u64 for_request_id);
 
 private:
     ConnectionFromClient(NonnullOwnPtr<IPC::Transport>, IsPrimaryConnection, IsPrivate, ConnectionMap&, RequestTransferLeaseMap&, Optional<HTTP::DiskCache&>, ByteString alt_svc_cache_path);
@@ -14726,6 +15203,7 @@ private:
     static int on_socket_callback(void*, int sockfd, int what, void* user_data, void*);
     static int on_timeout_callback(void*, long timeout_ms, void* user_data);
     void check_active_requests();
+    void complete_aia_fetch(void* easy_handle, int result_code);
     void fail_websocket(u64 websocket_id, Requests::WebSocket::Error);
 
     ErrorOr<IPC::TransportHandle> create_client_socket(IsPrivate);
@@ -14740,6 +15218,13 @@ private:
 
     HashMap<u64, NonnullOwnPtr<Request>> m_active_requests;
     HashMap<u64, NonnullOwnPtr<Request>> m_active_revalidation_requests;
+    void start_aia_fetch(ByteString const& url, ByteString resolve_entry);
+    void abandon_aia_lookup(ByteString const& url);
+
+    HashMap<void*, NonnullOwnPtr<AIAFetch>> m_aia_fetches;
+    // AIA URLs whose DNS lookup is still outstanding, mapped to the requests waiting on them. Keeps a second
+    // request asking for the same URL from starting a duplicate lookup before m_aia_fetches has an entry.
+    HashMap<ByteString, Vector<u64>> m_pending_aia_lookups;
     HashTable<u64> m_pending_websockets;
     HashMap<u64, RefPtr<WebSocket::WebSocket>> m_websockets;
 
@@ -14758,6 +15243,7 @@ private:
 };
 
 constexpr inline uintptr_t websocket_private_tag = 0x1;
+constexpr inline uintptr_t aia_fetch_private_tag = 0x2;
 
 }
 
@@ -15073,6 +15559,7 @@ FILE: Services/RequestServer/Request.cpp
 #include <LibHTTP/Cache/Utilities.h>
 #include <LibHTTP/Status.h>
 #include <LibTextCodec/Decoder.h>
+#include <RequestServer/AIA.h>
 #include <RequestServer/CURL.h>
 #include <RequestServer/ConnectionFromClient.h>
 #include <RequestServer/Request.h>
@@ -15087,21 +15574,30 @@ extern OwnPtr<ResourceSubstitutionMap> g_resource_substitution_map;
 
 static long s_connect_timeout_seconds = 90L;
 
-static CURLcode configure_ssl_context(CURL*, [[maybe_unused]] void* ssl_context, void*)
+static CURLcode configure_ssl_context(CURL*, [[maybe_unused]] void* ssl_context, [[maybe_unused]] void* aia_collector)
 {
-#if defined(SSL_OP_IGNORE_UNEXPECTED_EOF)
-    // Some HTTPS servers, including the Python server used by WPT, close the connection without sending the
-    // mandatory TLS close-notify alert. Other browsers treat such a post-handshake transport EOF as a clean TLS EOF
-    // for compatibility. Do the same while leaving curl responsible for detecting incomplete HTTP framing.
-    static auto const curl_uses_openssl = [] {
+    // Everything below casts ssl_context to an SSL_CTX, which only holds when curl is built against OpenSSL.
+    [[maybe_unused]] static auto const curl_uses_openssl = [] {
         auto const* version_info = curl_version_info(CURLVERSION_NOW);
         VERIFY(version_info);
         return version_info->ssl_version && StringView { version_info->ssl_version, strlen(version_info->ssl_version) }.starts_with("OpenSSL/"sv);
     }();
 
+#if defined(SSL_OP_IGNORE_UNEXPECTED_EOF)
+    // Some HTTPS servers, including the Python server used by WPT, close the connection without sending the
+    // mandatory TLS close-notify alert. Other browsers treat such a post-handshake transport EOF as a clean TLS EOF
+    // for compatibility. Do the same while leaving curl responsible for detecting incomplete HTTP framing.
     if (curl_uses_openssl)
         SSL_CTX_set_options(static_cast<SSL_CTX*>(ssl_context), SSL_OP_IGNORE_UNEXPECTED_EOF);
 #endif
+
+#ifndef AK_OS_MACOS
+    // curl keeps one SSL context callback per handle, and AIA has to run against the same SSL_CTX configured above. So
+    // both are applied here. The collector arrives as CURLOPT_SSL_CTX_DATA and is null on handles lacking AIA state.
+    if (curl_uses_openssl && aia_collector)
+        apply_aia_verification(static_cast<SSL_CTX*>(ssl_context), *static_cast<AIACollector*>(aia_collector));
+#endif
+
     return CURLE_OK;
 }
 
@@ -15632,6 +16128,8 @@ void Request::notify_retrieved_http_cookie(Badge<ConnectionFromClient>, StringVi
     transition_to_state(State::Fetch);
 }
 
+static constexpr size_t max_aia_fetches_per_request = 5;
+
 void Request::notify_fetch_complete(Badge<ConnectionFromClient>, int result_code)
 {
     mark_lifecycle_event(this, &WireStats::complete_observed_at);
@@ -15672,6 +16170,12 @@ void Request::notify_fetch_complete(Badge<ConnectionFromClient>, int result_code
         return;
     }
 
+    if (should_retry_after_fetching_aia_intermediate(result_code)) {
+        m_curl_result_code = result_code;
+        transition_to_state(State::Complete);
+        return;
+    }
+
     if (is_revalidation_request()) {
         if (result_code == CURLE_OK && acquire_status_code() == 304) {
             if (m_type == RequestType::BackgroundRevalidation && m_disk_cache->mode() == HTTP::DiskCache::Mode::Testing)
@@ -15699,6 +16203,42 @@ void Request::notify_fetch_complete(Badge<ConnectionFromClient>, int result_code
         transition_to_state(State::Complete);
 }
 
+bool Request::should_retry_after_fetching_aia_intermediate(int curl_result_code) const
+{
+    return m_type == RequestType::Fetch
+        && curl_result_code == CURLE_PEER_FAILED_VERIFICATION
+        && m_aia_collector
+        && !m_aia_collector->pending_urls.is_empty()
+        && m_aia_fetch_count < max_aia_fetches_per_request;
+}
+
+void Request::start_aia_fetch_and_retry()
+{
+    ++m_aia_fetch_count;
+    auto url = m_aia_collector->pending_urls.take_first();
+    m_aia_collector->attempted_urls.set(url);
+    dbgln_if(REQUESTSERVER_DEBUG, "AIA: fetching missing intermediate from {} (attempt {})", url, m_aia_fetch_count);
+    // The fetch can finish sync; a curl_easy_init fail immediately retries this request, and retry_after_aia ignores a
+    // not-already-waiting request. So enter the state first, or that retry is dropped with nothing to wake the request.
+    transition_to_state(State::WaitForAIA);
+    m_client->fetch_aia_intermediate({}, url, m_request_id);
+}
+
+void Request::retry_after_aia(Badge<ConnectionFromClient>)
+{
+    if (m_state != State::WaitForAIA)
+        return;
+
+    // Frees curl_slist allocations from the previous attempt too: handle_fetch_state() builds a fresh header, resolve
+    // and connect-to list every time, so keeping only the easy handle would strand them until the request is destroyed.
+    MUST(free_curl_structs());
+
+    m_curl_result_code = {};
+    if (m_aia_collector)
+        m_aia_collector->pending_urls.clear();
+    transition_to_state(State::Fetch);
+}
+
 void Request::transition_to_state(State state)
 {
     dbgln_if(REQUESTSERVER_DEBUG, "Request::Transition[{}]: {} -> {} ({} {})", m_request_id, state_name(m_state), state_name(state), m_method, m_url);
@@ -15717,6 +16257,9 @@ void Request::process()
         break;
     case State::WaitForCache:
         // Do nothing; we are waiting for the disk cache to notify us to proceed.
+        break;
+    case State::WaitForAIA:
+        // Do nothing; we are waiting for the AIA intermediate-certificate fetch to notify us to proceed.
         break;
     case State::FailedCacheOnly:
         handle_failed_cache_only_state();
@@ -16058,7 +16601,7 @@ void Request::handle_fetch_state()
 
     auto is_revalidation_request = this->is_revalidation_request();
 
-    if (!is_revalidation_request) {
+    if (!is_revalidation_request && !m_informed_client_request_started) {
         if (inform_client_request_started().is_error())
             return;
     }
@@ -16076,6 +16619,11 @@ void Request::handle_fetch_state()
         set_option(CURLOPT_CAINFO, path.characters());
 
     set_option(CURLOPT_SSL_CTX_FUNCTION, configure_ssl_context);
+#ifndef AK_OS_MACOS
+    if (!m_aia_collector)
+        m_aia_collector = make_ref_counted<AIACollector>();
+    set_option(CURLOPT_SSL_CTX_DATA, m_aia_collector.ptr());
+#endif
 
     if (m_content_decoding_disabled) {
         set_option(CURLOPT_ACCEPT_ENCODING, "identity");
@@ -16199,6 +16747,11 @@ void Request::handle_complete_state()
 {
     if (m_type == RequestType::Fetch) {
         VERIFY(m_curl_result_code.has_value());
+
+        if (should_retry_after_fetching_aia_intermediate(*m_curl_result_code)) {
+            start_aia_fetch_and_retry();
+            return;
+        }
 
         if (m_curl_result_code != CURLE_OK) {
             m_network_error = curl_code_to_network_error(*m_curl_result_code);
@@ -16401,6 +16954,17 @@ ErrorOr<void> Request::transfer_to_client(ConnectionFromClient& client, u64 requ
     }
     previous_client.async_request_transferred(previous_request_id);
 
+    // An in-flight AIA fetch is registered with the client that started it, keyed by that client's request id.
+    // The transfer above moved this request out of that client's table, so the fetch can no longer find it when it
+    // completes and nothing would ever leave WaitForAIA. AIA is best-effort, so drop the retry and let the
+    // verification failure that triggered it surface to the new client. Clearing the pending URLs is what keeps
+    // handle_complete_state() from simply starting the same fetch again.
+    if (m_state == State::WaitForAIA) {
+        if (m_aia_collector)
+            m_aia_collector->pending_urls.clear();
+        transition_to_state(State::Complete);
+    }
+
     return {};
 }
 
@@ -16431,6 +16995,7 @@ ErrorOr<void> Request::inform_client_request_started()
         transition_to_state(State::Error);
         return result.release_error();
     }
+    m_informed_client_request_started = true;
 
     return {};
 }
@@ -16755,6 +17320,8 @@ struct curl_slist;
 
 namespace RequestServer {
 
+class AIACollector;
+
 class Request final : public HTTP::CacheRequest {
 public:
     static NonnullOwnPtr<Request> fetch(
@@ -16811,6 +17378,7 @@ public:
     virtual void notify_request_unblocked(Badge<HTTP::DiskCache>) override;
     void notify_retrieved_http_cookie(Badge<ConnectionFromClient>, StringView cookie);
     void notify_fetch_complete(Badge<ConnectionFromClient>, int result_code);
+    void retry_after_aia(Badge<ConnectionFromClient>);
 
 private:
     struct TransferredBodyFile {
@@ -16835,6 +17403,7 @@ private:
         RetrieveCookie,    // Retrieve cookies from the UI process.
         Connect,           // Issue a network request to connect to the URL.
         Fetch,             // Issue a network request to fetch the URL.
+        WaitForAIA,        // Wait for an AIA intermediate-certificate fetch to complete, then retry the fetch.
         Complete,          // Finalize the request with the client.
         Error,             // Any error occured during the request's lifetime.
     };
@@ -16848,6 +17417,8 @@ private:
             return "ReadCache"sv;
         case State::WaitForCache:
             return "WaitForCache"sv;
+        case State::WaitForAIA:
+            return "WaitForAIA"sv;
         case State::FailedCacheOnly:
             return "FailedCacheOnly"sv;
         case State::ServeSubstitution:
@@ -16912,6 +17483,8 @@ private:
     ErrorOr<void> detach_curl_handle_from_multi();
     ErrorOr<void> free_curl_structs();
     ErrorOr<void> inform_client_request_started();
+    bool should_retry_after_fetching_aia_intermediate(int curl_result_code) const;
+    void start_aia_fetch_and_retry();
     ErrorOr<void> send_request_pipe_to_client();
     ErrorOr<void> send_transferred_body_file_to_client();
     void transfer_headers_to_client_if_needed();
@@ -16938,6 +17511,10 @@ private:
     void* m_curl_easy_handle { nullptr };
     bool m_curl_easy_handle_is_in_multi { false };
     Vector<curl_slist*> m_curl_string_lists;
+
+    RefPtr<AIACollector> m_aia_collector;
+    size_t m_aia_fetch_count { 0 };
+    bool m_informed_client_request_started { false };
     Optional<int> m_curl_result_code;
 
     NonnullRefPtr<Resolver> m_resolver;
@@ -57011,6 +57588,7 @@ add_subdirectory(LibUnicode)
 add_subdirectory(LibURL)
 add_subdirectory(LibWasm)
 add_subdirectory(LibXML)
+add_subdirectory(RequestServer)
 add_subdirectory(Meta)
 
 if (NOT WIN32)
@@ -225897,6 +226475,7 @@ import logging
 import os
 import socket
 import socketserver
+import ssl
 import sys
 import threading
 import time
@@ -226044,6 +226623,8 @@ class TestHTTPServer(socketserver.ThreadingTCPServer):
 class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     static_directory: str
     wpt_directory: str
+    aia_artifacts: dict
+    aia_config: Optional[dict]
 
     def __init__(self, *arguments, **kwargs):
         super().__init__(*arguments, directory=self.static_directory, **kwargs)
@@ -226141,6 +226722,32 @@ class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     def _serve_static_request(self):
         self._serve_wpt_file_request()
 
+    def _serve_aia_artifact(self, request_path):
+        # Serves the intermediate certificate that the broken-chain HTTPS hosts point at via their AIA caIssuers URL.
+        # Fetched by RequestServer, not by the page.
+        entry = getattr(TestHTTPRequestHandler, "aia_artifacts", {}).get(request_path)
+        if entry is None:
+            # for example, /aia/dead: a deliberately missing artifact, to exercise the failure path.
+            self.send_error(404, "Not Found")
+            return
+        content_type, body = entry
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_aia_config(self):
+        # Lets the test page discover the per-scenario HTTPS ports (each an OS-assigned port).
+        config = getattr(TestHTTPRequestHandler, "aia_config", None)
+        body = json.dumps(config or {}).encode("utf-8")
+        self.send_response(200 if config else 503)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         if self.headers.get("Upgrade", "").lower() == "websocket":
             self._serve_websocket_echo()
@@ -226156,6 +226763,10 @@ class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             self._serve_recorded_request_headers()
         elif request_path.endswith(".py"):
             self._serve_wpt_python_script()
+        elif request_path.startswith("/aia/"):
+            self._serve_aia_artifact(request_path)
+        elif request_path == "/aia-test/config":
+            self._serve_aia_config()
         else:
             self._serve_static_request()
 
@@ -226525,7 +227136,211 @@ class TestHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             pass
 
 
-def start_server(port, static_directory):
+class AIALeafHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, format: str, *args: Any) -> None:
+        pass
+
+
+class AIATLSServer(socketserver.ThreadingTCPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, server_address, handler, ssl_context):
+        super().__init__(server_address, handler)
+        self._ssl_context = ssl_context
+
+    def get_request(self):
+        sock, addr = super().get_request()
+        try:
+            return self._ssl_context.wrap_socket(sock, server_side=True), addr
+        except OSError:
+            sock.close()
+            raise
+
+
+def _setup_aia_test_servers(http_port, ca_cert_output):
+    try:
+        from cryptography import x509  # type: ignore[import-not-found]
+        from cryptography.hazmat.primitives import hashes  # type: ignore[import-not-found]
+        from cryptography.hazmat.primitives.asymmetric import ec  # type: ignore[import-not-found]
+        from cryptography.hazmat.primitives.serialization import Encoding  # type: ignore[import-not-found]
+        from cryptography.hazmat.primitives.serialization import NoEncryption  # type: ignore[import-not-found]
+        from cryptography.hazmat.primitives.serialization import PrivateFormat  # type: ignore[import-not-found]
+        from cryptography.hazmat.primitives.serialization import pkcs7  # type: ignore[import-not-found]
+        from cryptography.x509.oid import AuthorityInformationAccessOID  # type: ignore[import-not-found]
+        from cryptography.x509.oid import ExtendedKeyUsageOID  # type: ignore[import-not-found]
+        from cryptography.x509.oid import NameOID  # type: ignore[import-not-found]
+    except ImportError as error:
+        logging.warning("AIA test setup skipped: python 'cryptography' unavailable (%s)", error)
+        return
+
+    import datetime
+    import tempfile
+
+    def new_key():
+        return ec.generate_private_key(ec.SECP256R1())
+
+    def dn(common_name):
+        return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+
+    not_before, not_after = datetime.datetime(2020, 1, 1), datetime.datetime(2050, 1, 1)
+
+    root_key = new_key()
+    root = (
+        x509.CertificateBuilder()
+        .subject_name(dn("Ladybird AIA Test Root"))
+        .issuer_name(dn("Ladybird AIA Test Root"))
+        .public_key(root_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(not_before)
+        .not_valid_after(not_after)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(root_key, hashes.SHA256())
+    )
+
+    aia_base = f"http://127.0.0.1:{http_port}/aia"
+    artifacts = {}
+    scenarios = {}
+
+    def add_scenario(name, host, artifact_name, encoding, shared=None):
+        # By default, each scenario gets its own intermediate — so fetching one never populates the cache for another
+        # (which would mask whether that scenario's own fetch and parse ran). The de-dupe scenarios instead share one
+        # intermediate — to check it's fetched only once.
+        if shared is not None:
+            intermediate, intermediate_key = shared
+        else:
+            intermediate_key = new_key()
+            intermediate = (
+                x509.CertificateBuilder()
+                .subject_name(dn(f"Ladybird AIA Test Intermediate ({name})"))
+                .issuer_name(root.subject)
+                .public_key(intermediate_key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(not_before)
+                .not_valid_after(not_after)
+                .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+                .sign(root_key, hashes.SHA256())
+            )
+        if encoding == "der":
+            artifacts[f"/aia/{artifact_name}"] = ("application/pkix-cert", intermediate.public_bytes(Encoding.DER))
+            aia_url = f"{aia_base}/{artifact_name}"
+        elif encoding == "pkcs7":
+            artifacts[f"/aia/{artifact_name}"] = (
+                "application/pkcs7-mime",
+                pkcs7.serialize_certificates([intermediate], Encoding.DER),
+            )
+            aia_url = f"{aia_base}/{artifact_name}"
+        else:
+            aia_url = f"{aia_base}/dead"  # 404: the intermediate is never published
+
+        leaf_key = new_key()
+        leaf = (
+            x509.CertificateBuilder()
+            .subject_name(dn(host))
+            .issuer_name(intermediate.subject)
+            .public_key(leaf_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(not_before)
+            .not_valid_after(not_after)
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False)
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+            .add_extension(
+                x509.AuthorityInformationAccess(
+                    [
+                        x509.AccessDescription(
+                            AuthorityInformationAccessOID.CA_ISSUERS, x509.UniformResourceIdentifier(aia_url)
+                        )
+                    ]
+                ),
+                critical=False,
+            )
+            .sign(intermediate_key, hashes.SHA256())
+        )
+        scenarios[name] = (leaf, leaf_key)
+        return intermediate, intermediate_key
+
+    add_scenario("good_der", "good-der.localhost", "intermediate-der.der", "der")
+    add_scenario("good_pkcs7", "good-pkcs7.localhost", "intermediate-pkcs7.p7c", "pkcs7")
+    add_scenario("dead", "dead.localhost", None, "dead")
+    shared_intermediate = add_scenario("dedup_a", "dedup-a.localhost", "intermediate-dedup.der", "der")
+    add_scenario("dedup_b", "dedup-b.localhost", "intermediate-dedup.der", "der", shared_intermediate)
+
+    # Negative trust control: The caIssuers URL serves a self-signed cert that's *not* anchored in the trusted test
+    # root. A fetched intermediate must never complete a chain to an untrusted anchor — so this host must fail to load.
+    untrusted_key = new_key()
+    untrusted = (
+        x509.CertificateBuilder()
+        .subject_name(dn("Ladybird AIA Test UNTRUSTED root"))
+        .issuer_name(dn("Ladybird AIA Test UNTRUSTED root"))
+        .public_key(untrusted_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(not_before)
+        .not_valid_after(not_after)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(untrusted_key, hashes.SHA256())
+    )
+    artifacts["/aia/untrusted.der"] = ("application/pkix-cert", untrusted.public_bytes(Encoding.DER))
+    untrusted_leaf_key = new_key()
+    untrusted_leaf = (
+        x509.CertificateBuilder()
+        .subject_name(dn("untrusted-leaf.localhost"))
+        .issuer_name(untrusted.subject)
+        .public_key(untrusted_leaf_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(not_before)
+        .not_valid_after(not_after)
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False)
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+        .add_extension(
+            x509.AuthorityInformationAccess(
+                [
+                    x509.AccessDescription(
+                        AuthorityInformationAccessOID.CA_ISSUERS,
+                        x509.UniformResourceIdentifier(f"{aia_base}/untrusted.der"),
+                    )
+                ]
+            ),
+            critical=False,
+        )
+        .sign(untrusted_key, hashes.SHA256())
+    )
+    scenarios["untrusted"] = (untrusted_leaf, untrusted_leaf_key)
+
+    TestHTTPRequestHandler.aia_artifacts = artifacts
+
+    # Write the root CA so RequestServer (via --certificate/CAINFO) trusts the completed chains.
+    with open(ca_cert_output, "wb") as ca_file:
+        ca_file.write(root.public_bytes(Encoding.PEM))
+
+    scratch = tempfile.mkdtemp(prefix="ladybird-aia-")
+    config = {}
+    for name, (leaf, leaf_key) in scenarios.items():
+        # The cert file holds *only* the leaf — so, each HTTPS host presents a broken chain (the intermediate is omitted
+        # and must be fetched via AIA).
+        cert_path = os.path.join(scratch, f"{name}.crt")
+        key_path = os.path.join(scratch, f"{name}.key")
+        with open(cert_path, "wb") as f:
+            f.write(leaf.public_bytes(Encoding.PEM))
+        with open(key_path, "wb") as f:
+            f.write(leaf_key.private_bytes(Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption()))
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certfile=cert_path, keyfile=key_path)
+        server = AIATLSServer(("127.0.0.1", 0), AIALeafHandler, context)
+        config[name] = server.socket.getsockname()[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    TestHTTPRequestHandler.aia_config = config
+    logging.info("AIA test servers ready: %s (root CA at %s)", config, ca_cert_output)
+
+
+def start_server(port, static_directory, ca_cert_output=None):
     TestHTTPRequestHandler.static_directory = os.path.abspath(static_directory)
     TestHTTPRequestHandler.wpt_directory = os.path.join(
         TestHTTPRequestHandler.static_directory, "Text", "input", "wpt-import"
@@ -226541,6 +227356,20 @@ def start_server(port, static_directory):
         base_path=TestHTTPRequestHandler.static_directory,
         url_base="/static/",
     )
+
+    if ca_cert_output:
+        # Setup below can fail or be skipped (no 'cryptography'), and it is the only writer of this fixed path. A PEM
+        # left by an earlier run would then still be trusted, with a root key matching none of the servers now
+        # running - surfacing as a confusing TLS failure rather than the setup error it is.
+        try:
+            os.remove(ca_cert_output)
+        except FileNotFoundError:
+            pass
+
+        try:
+            _setup_aia_test_servers(httpd.socket.getsockname()[1], ca_cert_output)
+        except Exception as error:
+            logging.exception("AIA test setup failed: %s", error)
 
     print(httpd.socket.getsockname()[1])
     sys.stdout.flush()
@@ -226570,9 +227399,15 @@ if __name__ == "__main__":
         default=0,
         help="Port to run the server on",
     )
+    parser.add_argument(
+        "--ca-cert-output",
+        type=str,
+        default=None,
+        help="Path to write the AIA test root CA (PEM) to; enables the AIA broken-chain HTTPS servers",
+    )
     args = parser.parse_args()
 
-    start_server(port=args.port, static_directory=args.directory)
+    start_server(port=args.port, static_directory=args.directory, ca_cert_output=args.ca_cert_output)
 
 FILE: Tests/LibWeb/Fixtures/sceditor-caret.html
 <!DOCTYPE html>
@@ -362984,8 +363819,10 @@ FILE: Tests/LibWeb/test-web/Application.cpp
 #include "Application.h"
 #include "Fixture.h"
 
+#include <AK/LexicalPath.h>
 #include <LibCore/ArgsParser.h>
 #include <LibCore/Environment.h>
+#include <LibCore/StandardPaths.h>
 #include <LibCore/System.h>
 
 namespace TestWeb {
@@ -363063,6 +363900,10 @@ void Application::create_platform_options(WebView::BrowserOptions& browser_optio
     browser_options.disable_sql_database = WebView::DisableSQLDatabase::Yes;
 
     request_server_options.http_disk_cache_mode = WebView::HTTPDiskCacheMode::Testing;
+
+    // Trust the AIA integration test's root CA (written by the http-test-server fixture) — so its broken-chain HTTPS
+    // hosts validate once their intermediate is fetched. Must match the path passed in HttpEchoServerFixture::setup.
+    request_server_options.certificates.append(LexicalPath::join(Core::StandardPaths::tempfile_directory(), "ladybird-aia-test-ca.pem"sv).string());
 
     web_content_options.is_test_mode = WebView::IsTestMode::Yes;
 
@@ -364337,7 +365178,10 @@ void HttpEchoServerFixture::teardown_impl()
 ErrorOr<void> HttpEchoServerFixture::setup(WebView::WebContentOptions& web_content_options)
 {
     auto const script_path = LexicalPath::join(s_fixtures_path, m_script_path);
-    auto const arguments = Vector { script_path.string(), "--directory", Application::the().test_root_path };
+    // Path where http-test-server.py writes the AIA test root CA. Must match the certificate trusted by
+    // TestWeb::Application::create_platform_options.
+    auto const ca_cert_path = LexicalPath::join(Core::StandardPaths::tempfile_directory(), "ladybird-aia-test-ca.pem"sv).string();
+    auto const arguments = Vector { script_path.string(), "--directory", Application::the().test_root_path, "--ca-cert-output", ca_cert_path };
 
     // FIXME: Pick a more reasonable log path that is more observable
     auto const log_path = LexicalPath::join(Core::StandardPaths::tempfile_directory(), "http-test-server.log"sv).string();
@@ -364804,6 +365648,18 @@ static ErrorOr<void> skip_ui_process_session_history_tests_unless_enabled(Applic
         s_skipped_tests.append(TRY(real_path_for_test_input(path)));
     }
 
+    return {};
+}
+
+static ErrorOr<void> skip_aia_tests_on_apple(Application const& app)
+{
+#ifdef AK_OS_MACOS
+    auto path = LexicalPath::join(app.test_root_path, "Text/input/aia-cert-fetching.html"sv).string();
+    if (FileSystem::exists(path))
+        s_skipped_tests.append(TRY(real_path_for_test_input(path)));
+#else
+    (void)app;
+#endif
     return {};
 }
 
@@ -365655,6 +366511,7 @@ static ErrorOr<int> run_tests(Core::AnonymousBuffer const& theme, Web::DevicePix
     TRY(load_test_config(app.test_root_path));
     TRY(skip_async_scrolling_tests_unless_enabled(app));
     TRY(skip_ui_process_session_history_tests_unless_enabled(app));
+    TRY(skip_aia_tests_on_apple(app));
 
     Vector<Test> tests;
 
@@ -368255,6 +369112,7 @@ Text/input/HTML/media-source-mp4-reordered-frames.html
 Text/input/HTML/media-source-remove.html
 Text/input/HTML/media-source-setup.html
 Text/input/HTML/media-source-split-ignored-element.html
+Text/input/HTML/HTMLMediaElement-load-overrides-preload-none.html
 Text/input/HTML/HTMLMediaElement-preload-none-does-not-fetch.html
 Text/input/css/FontFace-arraybuffer-matching.html
 Text/input/wpt-import/mediacapture-streams/idlharness.https.window.html
@@ -381215,6 +382073,13 @@ right: 170px
 bottom: 109.796875px
 left: 70px
 offset within containing block: 70,50.203125
+
+FILE: Tests/LibWeb/Text/expected/aia-cert-fetching.txt
+DER intermediate via AIA: loaded
+PKCS#7 intermediate via AIA: loaded
+dead AIA URL: failed
+untrusted intermediate (must not validate): failed
+both hosts sharing an intermediate: loaded, loaded
 
 FILE: Tests/LibWeb/Text/expected/alert.txt
 PASS (didn't crash)
@@ -417323,6 +418188,11 @@ loadeddata: readyState >= HAVE_CURRENT_DATA
 canplay: readyState >= HAVE_FUTURE_DATA
 canplaythrough: readyState >= HAVE_ENOUGH_DATA
 document loaded
+
+FILE: Tests/LibWeb/Text/expected/HTML/HTMLMediaElement-load-overrides-preload-none.txt
+source error event fired after load() call
+server saw media request after load() call: true
+server saw media request after automatic load: false
 
 FILE: Tests/LibWeb/Text/expected/HTML/HTMLMediaElement-muted-content-attribute.txt
 Initial muted state when muted content attribute is present: true
@@ -488643,376 +489513,3 @@ RECREATED: overflow-x visible -> auto on inline grid in block flow | DOM parent
 RECREATED: overflow-x visible -> auto on inline grid in block flow | preceding sibling
 RECREATED: overflow-x visible -> auto on inline grid in block flow | preceding sibling descendant
 RECREATED: overflow-x visible -> auto on inline grid in block flow | target
-RECREATED: overflow-x visible -> auto on inline grid in block flow | target descendant
-RECREATED: overflow-x visible -> auto on inline grid in block flow | following sibling
-RECREATED: overflow-x visible -> auto on inline grid in block flow | following sibling descendant
-STATS: overflow-x visible -> auto on inline grid in block flow | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x visible -> auto on inline grid in block flow | incremental tree matches full rebuild
-PRESERVED: overflow-x scroll -> hidden on inline grid in block flow list-item | fixture ancestor
-PRESERVED: overflow-x scroll -> hidden on inline grid in block flow list-item | distant sibling
-PRESERVED: overflow-x scroll -> hidden on inline grid in block flow list-item | distant sibling descendant
-RECREATED: overflow-x scroll -> hidden on inline grid in block flow list-item | DOM parent
-RECREATED: overflow-x scroll -> hidden on inline grid in block flow list-item | preceding sibling
-RECREATED: overflow-x scroll -> hidden on inline grid in block flow list-item | preceding sibling descendant
-RECREATED: overflow-x scroll -> hidden on inline grid in block flow list-item | target
-RECREATED: overflow-x scroll -> hidden on inline grid in block flow list-item | target descendant
-RECREATED: overflow-x scroll -> hidden on inline grid in block flow list-item | following sibling
-RECREATED: overflow-x scroll -> hidden on inline grid in block flow list-item | following sibling descendant
-STATS: overflow-x scroll -> hidden on inline grid in block flow list-item | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x scroll -> hidden on inline grid in block flow list-item | incremental tree matches full rebuild
-PRESERVED: overflow-y visible -> auto on inline grid in flex | fixture ancestor
-PRESERVED: overflow-y visible -> auto on inline grid in flex | distant sibling
-PRESERVED: overflow-y visible -> auto on inline grid in flex | distant sibling descendant
-PRESERVED: overflow-y visible -> auto on inline grid in flex | DOM parent
-PRESERVED: overflow-y visible -> auto on inline grid in flex | preceding sibling
-PRESERVED: overflow-y visible -> auto on inline grid in flex | preceding sibling descendant
-RECREATED: overflow-y visible -> auto on inline grid in flex | target
-RECREATED: overflow-y visible -> auto on inline grid in flex | target descendant
-PRESERVED: overflow-y visible -> auto on inline grid in flex | following sibling
-PRESERVED: overflow-y visible -> auto on inline grid in flex | following sibling descendant
-STATS: overflow-y visible -> auto on inline grid in flex | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y visible -> auto on inline grid in flex | incremental tree matches full rebuild
-RECREATED: overflow-y scroll -> hidden on inline grid in table-header-group | fixture ancestor
-RECREATED: overflow-y scroll -> hidden on inline grid in table-header-group | distant sibling
-RECREATED: overflow-y scroll -> hidden on inline grid in table-header-group | distant sibling descendant
-RECREATED: overflow-y scroll -> hidden on inline grid in table-header-group | DOM parent
-RECREATED: overflow-y scroll -> hidden on inline grid in table-header-group | preceding sibling
-RECREATED: overflow-y scroll -> hidden on inline grid in table-header-group | preceding sibling descendant
-RECREATED: overflow-y scroll -> hidden on inline grid in table-header-group | target
-RECREATED: overflow-y scroll -> hidden on inline grid in table-header-group | target descendant
-RECREATED: overflow-y scroll -> hidden on inline grid in table-header-group | following sibling
-RECREATED: overflow-y scroll -> hidden on inline grid in table-header-group | following sibling descendant
-STATS: overflow-y scroll -> hidden on inline grid in table-header-group | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y scroll -> hidden on inline grid in table-header-group | incremental tree matches full rebuild
-RECREATED: text-transform uppercase -> none on inline grid in inline flow-root | fixture ancestor
-RECREATED: text-transform uppercase -> none on inline grid in inline flow-root | distant sibling
-RECREATED: text-transform uppercase -> none on inline grid in inline flow-root | distant sibling descendant
-RECREATED: text-transform uppercase -> none on inline grid in inline flow-root | DOM parent
-RECREATED: text-transform uppercase -> none on inline grid in inline flow-root | preceding sibling
-RECREATED: text-transform uppercase -> none on inline grid in inline flow-root | preceding sibling descendant
-RECREATED: text-transform uppercase -> none on inline grid in inline flow-root | target
-RECREATED: text-transform uppercase -> none on inline grid in inline flow-root | target descendant
-RECREATED: text-transform uppercase -> none on inline grid in inline flow-root | following sibling
-RECREATED: text-transform uppercase -> none on inline grid in inline flow-root | following sibling descendant
-STATS: text-transform uppercase -> none on inline grid in inline flow-root | rebuilt subtree roots=1, escaped=false
-PASS: text-transform uppercase -> none on inline grid in inline flow-root | incremental tree matches full rebuild
-PRESERVED: content normal -> "replacement" on inline grid in block | fixture ancestor
-PRESERVED: content normal -> "replacement" on inline grid in block | distant sibling
-PRESERVED: content normal -> "replacement" on inline grid in block | distant sibling descendant
-RECREATED: content normal -> "replacement" on inline grid in block | DOM parent
-RECREATED: content normal -> "replacement" on inline grid in block | preceding sibling
-RECREATED: content normal -> "replacement" on inline grid in block | preceding sibling descendant
-RECREATED: content normal -> "replacement" on inline grid in block | target
-RECREATED: content normal -> "replacement" on inline grid in block | target descendant
-RECREATED: content normal -> "replacement" on inline grid in block | following sibling
-RECREATED: content normal -> "replacement" on inline grid in block | following sibling descendant
-STATS: content normal -> "replacement" on inline grid in block | rebuilt subtree roots=1, escaped=false
-PASS: content normal -> "replacement" on inline grid in block | incremental tree matches full rebuild
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on inline grid in inline-grid | fixture ancestor
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on inline grid in inline-grid | distant sibling
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on inline grid in inline-grid | distant sibling descendant
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on inline grid in inline-grid | DOM parent
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on inline grid in inline-grid | preceding sibling
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on inline grid in inline-grid | preceding sibling descendant
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline grid in inline-grid | target
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline grid in inline-grid | target descendant
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on inline grid in inline-grid | following sibling
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on inline grid in inline-grid | following sibling descendant
-STATS: content open-quote "replacement" close-quote -> "replacement" on inline grid in inline-grid | rebuilt subtree roots=1, escaped=false
-PASS: content open-quote "replacement" close-quote -> "replacement" on inline grid in inline-grid | incremental tree matches full rebuild
-RECREATED: overflow-x visible -> auto on block table in table-cell | fixture ancestor
-RECREATED: overflow-x visible -> auto on block table in table-cell | distant sibling
-RECREATED: overflow-x visible -> auto on block table in table-cell | distant sibling descendant
-RECREATED: overflow-x visible -> auto on block table in table-cell | DOM parent
-RECREATED: overflow-x visible -> auto on block table in table-cell | preceding sibling
-RECREATED: overflow-x visible -> auto on block table in table-cell | preceding sibling descendant
-RECREATED: overflow-x visible -> auto on block table in table-cell | target
-RECREATED: overflow-x visible -> auto on block table in table-cell | target descendant
-RECREATED: overflow-x visible -> auto on block table in table-cell | following sibling
-RECREATED: overflow-x visible -> auto on block table in table-cell | following sibling descendant
-STATS: overflow-x visible -> auto on block table in table-cell | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x visible -> auto on block table in table-cell | incremental tree matches full rebuild
-PRESERVED: overflow-x scroll -> hidden on block table in block grid | fixture ancestor
-PRESERVED: overflow-x scroll -> hidden on block table in block grid | distant sibling
-PRESERVED: overflow-x scroll -> hidden on block table in block grid | distant sibling descendant
-RECREATED: overflow-x scroll -> hidden on block table in block grid | DOM parent
-RECREATED: overflow-x scroll -> hidden on block table in block grid | preceding sibling
-RECREATED: overflow-x scroll -> hidden on block table in block grid | preceding sibling descendant
-RECREATED: overflow-x scroll -> hidden on block table in block grid | target
-RECREATED: overflow-x scroll -> hidden on block table in block grid | target descendant
-RECREATED: overflow-x scroll -> hidden on block table in block grid | following sibling
-RECREATED: overflow-x scroll -> hidden on block table in block grid | following sibling descendant
-STATS: overflow-x scroll -> hidden on block table in block grid | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x scroll -> hidden on block table in block grid | incremental tree matches full rebuild
-RECREATED: overflow-y visible -> auto on block table in inline-block | fixture ancestor
-RECREATED: overflow-y visible -> auto on block table in inline-block | distant sibling
-RECREATED: overflow-y visible -> auto on block table in inline-block | distant sibling descendant
-RECREATED: overflow-y visible -> auto on block table in inline-block | DOM parent
-RECREATED: overflow-y visible -> auto on block table in inline-block | preceding sibling
-RECREATED: overflow-y visible -> auto on block table in inline-block | preceding sibling descendant
-RECREATED: overflow-y visible -> auto on block table in inline-block | target
-RECREATED: overflow-y visible -> auto on block table in inline-block | target descendant
-RECREATED: overflow-y visible -> auto on block table in inline-block | following sibling
-RECREATED: overflow-y visible -> auto on block table in inline-block | following sibling descendant
-STATS: overflow-y visible -> auto on block table in inline-block | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y visible -> auto on block table in inline-block | incremental tree matches full rebuild
-RECREATED: overflow-y scroll -> hidden on block table in math | fixture ancestor
-RECREATED: overflow-y scroll -> hidden on block table in math | distant sibling
-RECREATED: overflow-y scroll -> hidden on block table in math | distant sibling descendant
-RECREATED: overflow-y scroll -> hidden on block table in math | DOM parent
-RECREATED: overflow-y scroll -> hidden on block table in math | preceding sibling
-RECREATED: overflow-y scroll -> hidden on block table in math | preceding sibling descendant
-RECREATED: overflow-y scroll -> hidden on block table in math | target
-RECREATED: overflow-y scroll -> hidden on block table in math | target descendant
-RECREATED: overflow-y scroll -> hidden on block table in math | following sibling
-RECREATED: overflow-y scroll -> hidden on block table in math | following sibling descendant
-STATS: overflow-y scroll -> hidden on block table in math | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y scroll -> hidden on block table in math | incremental tree matches full rebuild
-RECREATED: text-transform uppercase -> none on block table in table-caption | fixture ancestor
-RECREATED: text-transform uppercase -> none on block table in table-caption | distant sibling
-RECREATED: text-transform uppercase -> none on block table in table-caption | distant sibling descendant
-RECREATED: text-transform uppercase -> none on block table in table-caption | DOM parent
-RECREATED: text-transform uppercase -> none on block table in table-caption | preceding sibling
-RECREATED: text-transform uppercase -> none on block table in table-caption | preceding sibling descendant
-RECREATED: text-transform uppercase -> none on block table in table-caption | target
-RECREATED: text-transform uppercase -> none on block table in table-caption | target descendant
-RECREATED: text-transform uppercase -> none on block table in table-caption | following sibling
-RECREATED: text-transform uppercase -> none on block table in table-caption | following sibling descendant
-STATS: text-transform uppercase -> none on block table in table-caption | rebuilt subtree roots=1, escaped=false
-PASS: text-transform uppercase -> none on block table in table-caption | incremental tree matches full rebuild
-RECREATED: content normal -> "replacement" on block table in inline table | fixture ancestor
-RECREATED: content normal -> "replacement" on block table in inline table | distant sibling
-RECREATED: content normal -> "replacement" on block table in inline table | distant sibling descendant
-RECREATED: content normal -> "replacement" on block table in inline table | DOM parent
-RECREATED: content normal -> "replacement" on block table in inline table | preceding sibling
-RECREATED: content normal -> "replacement" on block table in inline table | preceding sibling descendant
-RECREATED: content normal -> "replacement" on block table in inline table | target
-RECREATED: content normal -> "replacement" on block table in inline table | target descendant
-RECREATED: content normal -> "replacement" on block table in inline table | following sibling
-RECREATED: content normal -> "replacement" on block table in inline table | following sibling descendant
-STATS: content normal -> "replacement" on block table in inline table | rebuilt subtree roots=1, escaped=false
-PASS: content normal -> "replacement" on block table in inline table | incremental tree matches full rebuild
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on block table in inline list-item | fixture ancestor
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on block table in inline list-item | distant sibling
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on block table in inline list-item | distant sibling descendant
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on block table in inline list-item | DOM parent
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on block table in inline list-item | preceding sibling
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on block table in inline list-item | preceding sibling descendant
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on block table in inline list-item | target
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on block table in inline list-item | target descendant
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on block table in inline list-item | following sibling
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on block table in inline list-item | following sibling descendant
-STATS: content open-quote "replacement" close-quote -> "replacement" on block table in inline list-item | rebuilt subtree roots=1, escaped=false
-PASS: content open-quote "replacement" close-quote -> "replacement" on block table in inline list-item | incremental tree matches full rebuild
-RECREATED: overflow-x visible -> auto on inline table in table-row-group | fixture ancestor
-RECREATED: overflow-x visible -> auto on inline table in table-row-group | distant sibling
-RECREATED: overflow-x visible -> auto on inline table in table-row-group | distant sibling descendant
-RECREATED: overflow-x visible -> auto on inline table in table-row-group | DOM parent
-RECREATED: overflow-x visible -> auto on inline table in table-row-group | preceding sibling
-RECREATED: overflow-x visible -> auto on inline table in table-row-group | preceding sibling descendant
-RECREATED: overflow-x visible -> auto on inline table in table-row-group | target
-RECREATED: overflow-x visible -> auto on inline table in table-row-group | target descendant
-RECREATED: overflow-x visible -> auto on inline table in table-row-group | following sibling
-RECREATED: overflow-x visible -> auto on inline table in table-row-group | following sibling descendant
-STATS: overflow-x visible -> auto on inline table in table-row-group | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x visible -> auto on inline table in table-row-group | incremental tree matches full rebuild
-PRESERVED: overflow-x scroll -> hidden on inline table in block flow-root | fixture ancestor
-PRESERVED: overflow-x scroll -> hidden on inline table in block flow-root | distant sibling
-PRESERVED: overflow-x scroll -> hidden on inline table in block flow-root | distant sibling descendant
-RECREATED: overflow-x scroll -> hidden on inline table in block flow-root | DOM parent
-RECREATED: overflow-x scroll -> hidden on inline table in block flow-root | preceding sibling
-RECREATED: overflow-x scroll -> hidden on inline table in block flow-root | preceding sibling descendant
-RECREATED: overflow-x scroll -> hidden on inline table in block flow-root | target
-RECREATED: overflow-x scroll -> hidden on inline table in block flow-root | target descendant
-RECREATED: overflow-x scroll -> hidden on inline table in block flow-root | following sibling
-RECREATED: overflow-x scroll -> hidden on inline table in block flow-root | following sibling descendant
-STATS: overflow-x scroll -> hidden on inline table in block flow-root | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x scroll -> hidden on inline table in block flow-root | incremental tree matches full rebuild
-RECREATED: overflow-y visible -> auto on inline table in contents | fixture ancestor
-RECREATED: overflow-y visible -> auto on inline table in contents | distant sibling
-RECREATED: overflow-y visible -> auto on inline table in contents | distant sibling descendant
-ABSENT: overflow-y visible -> auto on inline table in contents | DOM parent
-RECREATED: overflow-y visible -> auto on inline table in contents | preceding sibling
-RECREATED: overflow-y visible -> auto on inline table in contents | preceding sibling descendant
-RECREATED: overflow-y visible -> auto on inline table in contents | target
-RECREATED: overflow-y visible -> auto on inline table in contents | target descendant
-RECREATED: overflow-y visible -> auto on inline table in contents | following sibling
-RECREATED: overflow-y visible -> auto on inline table in contents | following sibling descendant
-STATS: overflow-y visible -> auto on inline table in contents | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y visible -> auto on inline table in contents | incremental tree matches full rebuild
-PRESERVED: overflow-y scroll -> hidden on inline table in grid | fixture ancestor
-PRESERVED: overflow-y scroll -> hidden on inline table in grid | distant sibling
-PRESERVED: overflow-y scroll -> hidden on inline table in grid | distant sibling descendant
-RECREATED: overflow-y scroll -> hidden on inline table in grid | DOM parent
-RECREATED: overflow-y scroll -> hidden on inline table in grid | preceding sibling
-RECREATED: overflow-y scroll -> hidden on inline table in grid | preceding sibling descendant
-RECREATED: overflow-y scroll -> hidden on inline table in grid | target
-RECREATED: overflow-y scroll -> hidden on inline table in grid | target descendant
-RECREATED: overflow-y scroll -> hidden on inline table in grid | following sibling
-RECREATED: overflow-y scroll -> hidden on inline table in grid | following sibling descendant
-STATS: overflow-y scroll -> hidden on inline table in grid | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y scroll -> hidden on inline table in grid | incremental tree matches full rebuild
-RECREATED: text-transform uppercase -> none on inline table in table-row | fixture ancestor
-RECREATED: text-transform uppercase -> none on inline table in table-row | distant sibling
-RECREATED: text-transform uppercase -> none on inline table in table-row | distant sibling descendant
-RECREATED: text-transform uppercase -> none on inline table in table-row | DOM parent
-RECREATED: text-transform uppercase -> none on inline table in table-row | preceding sibling
-RECREATED: text-transform uppercase -> none on inline table in table-row | preceding sibling descendant
-RECREATED: text-transform uppercase -> none on inline table in table-row | target
-RECREATED: text-transform uppercase -> none on inline table in table-row | target descendant
-RECREATED: text-transform uppercase -> none on inline table in table-row | following sibling
-RECREATED: text-transform uppercase -> none on inline table in table-row | following sibling descendant
-STATS: text-transform uppercase -> none on inline table in table-row | rebuilt subtree roots=1, escaped=false
-PASS: text-transform uppercase -> none on inline table in table-row | incremental tree matches full rebuild
-RECREATED: content normal -> "replacement" on inline table in inline flex | fixture ancestor
-RECREATED: content normal -> "replacement" on inline table in inline flex | distant sibling
-RECREATED: content normal -> "replacement" on inline table in inline flex | distant sibling descendant
-RECREATED: content normal -> "replacement" on inline table in inline flex | DOM parent
-RECREATED: content normal -> "replacement" on inline table in inline flex | preceding sibling
-RECREATED: content normal -> "replacement" on inline table in inline flex | preceding sibling descendant
-RECREATED: content normal -> "replacement" on inline table in inline flex | target
-RECREATED: content normal -> "replacement" on inline table in inline flex | target descendant
-RECREATED: content normal -> "replacement" on inline table in inline flex | following sibling
-RECREATED: content normal -> "replacement" on inline table in inline flex | following sibling descendant
-STATS: content normal -> "replacement" on inline table in inline flex | rebuilt subtree roots=1, escaped=false
-PASS: content normal -> "replacement" on inline table in inline flex | incremental tree matches full rebuild
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on inline table in flow-root | fixture ancestor
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on inline table in flow-root | distant sibling
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on inline table in flow-root | distant sibling descendant
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline table in flow-root | DOM parent
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline table in flow-root | preceding sibling
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline table in flow-root | preceding sibling descendant
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline table in flow-root | target
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline table in flow-root | target descendant
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline table in flow-root | following sibling
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on inline table in flow-root | following sibling descendant
-STATS: content open-quote "replacement" close-quote -> "replacement" on inline table in flow-root | rebuilt subtree roots=1, escaped=false
-PASS: content open-quote "replacement" close-quote -> "replacement" on inline table in flow-root | incremental tree matches full rebuild
-RECREATED: overflow-x visible -> auto on block flow list-item in inline-table | fixture ancestor
-RECREATED: overflow-x visible -> auto on block flow list-item in inline-table | distant sibling
-RECREATED: overflow-x visible -> auto on block flow list-item in inline-table | distant sibling descendant
-RECREATED: overflow-x visible -> auto on block flow list-item in inline-table | DOM parent
-RECREATED: overflow-x visible -> auto on block flow list-item in inline-table | preceding sibling
-RECREATED: overflow-x visible -> auto on block flow list-item in inline-table | preceding sibling descendant
-RECREATED: overflow-x visible -> auto on block flow list-item in inline-table | target
-RECREATED: overflow-x visible -> auto on block flow list-item in inline-table | target descendant
-RECREATED: overflow-x visible -> auto on block flow list-item in inline-table | following sibling
-RECREATED: overflow-x visible -> auto on block flow list-item in inline-table | following sibling descendant
-STATS: overflow-x visible -> auto on block flow list-item in inline-table | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x visible -> auto on block flow list-item in inline-table | incremental tree matches full rebuild
-PRESERVED: overflow-x scroll -> hidden on block flow list-item in table-column | fixture ancestor
-PRESERVED: overflow-x scroll -> hidden on block flow list-item in table-column | distant sibling
-PRESERVED: overflow-x scroll -> hidden on block flow list-item in table-column | distant sibling descendant
-PRESERVED: overflow-x scroll -> hidden on block flow list-item in table-column | DOM parent
-ABSENT: overflow-x scroll -> hidden on block flow list-item in table-column | preceding sibling
-ABSENT: overflow-x scroll -> hidden on block flow list-item in table-column | preceding sibling descendant
-ABSENT: overflow-x scroll -> hidden on block flow list-item in table-column | target
-ABSENT: overflow-x scroll -> hidden on block flow list-item in table-column | target descendant
-ABSENT: overflow-x scroll -> hidden on block flow list-item in table-column | following sibling
-ABSENT: overflow-x scroll -> hidden on block flow list-item in table-column | following sibling descendant
-STATS: overflow-x scroll -> hidden on block flow list-item in table-column | rebuilt subtree roots=0, escaped=true
-PASS: overflow-x scroll -> hidden on block flow list-item in table-column | incremental tree matches full rebuild
-RECREATED: overflow-y visible -> auto on block flow list-item in block table | fixture ancestor
-RECREATED: overflow-y visible -> auto on block flow list-item in block table | distant sibling
-RECREATED: overflow-y visible -> auto on block flow list-item in block table | distant sibling descendant
-RECREATED: overflow-y visible -> auto on block flow list-item in block table | DOM parent
-RECREATED: overflow-y visible -> auto on block flow list-item in block table | preceding sibling
-RECREATED: overflow-y visible -> auto on block flow list-item in block table | preceding sibling descendant
-RECREATED: overflow-y visible -> auto on block flow list-item in block table | target
-RECREATED: overflow-y visible -> auto on block flow list-item in block table | target descendant
-RECREATED: overflow-y visible -> auto on block flow list-item in block table | following sibling
-RECREATED: overflow-y visible -> auto on block flow list-item in block table | following sibling descendant
-STATS: overflow-y visible -> auto on block flow list-item in block table | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y visible -> auto on block flow list-item in block table | incremental tree matches full rebuild
-PRESERVED: overflow-y scroll -> hidden on block flow list-item in list-item | fixture ancestor
-PRESERVED: overflow-y scroll -> hidden on block flow list-item in list-item | distant sibling
-PRESERVED: overflow-y scroll -> hidden on block flow list-item in list-item | distant sibling descendant
-PRESERVED: overflow-y scroll -> hidden on block flow list-item in list-item | DOM parent
-PRESERVED: overflow-y scroll -> hidden on block flow list-item in list-item | preceding sibling
-PRESERVED: overflow-y scroll -> hidden on block flow list-item in list-item | preceding sibling descendant
-RECREATED: overflow-y scroll -> hidden on block flow list-item in list-item | target
-RECREATED: overflow-y scroll -> hidden on block flow list-item in list-item | target descendant
-PRESERVED: overflow-y scroll -> hidden on block flow list-item in list-item | following sibling
-PRESERVED: overflow-y scroll -> hidden on block flow list-item in list-item | following sibling descendant
-STATS: overflow-y scroll -> hidden on block flow list-item in list-item | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y scroll -> hidden on block flow list-item in list-item | incremental tree matches full rebuild
-PRESERVED: text-transform uppercase -> none on block flow list-item in -webkit-inline-box | fixture ancestor
-PRESERVED: text-transform uppercase -> none on block flow list-item in -webkit-inline-box | distant sibling
-PRESERVED: text-transform uppercase -> none on block flow list-item in -webkit-inline-box | distant sibling descendant
-PRESERVED: text-transform uppercase -> none on block flow list-item in -webkit-inline-box | DOM parent
-PRESERVED: text-transform uppercase -> none on block flow list-item in -webkit-inline-box | preceding sibling
-PRESERVED: text-transform uppercase -> none on block flow list-item in -webkit-inline-box | preceding sibling descendant
-RECREATED: text-transform uppercase -> none on block flow list-item in -webkit-inline-box | target
-RECREATED: text-transform uppercase -> none on block flow list-item in -webkit-inline-box | target descendant
-PRESERVED: text-transform uppercase -> none on block flow list-item in -webkit-inline-box | following sibling
-PRESERVED: text-transform uppercase -> none on block flow list-item in -webkit-inline-box | following sibling descendant
-STATS: text-transform uppercase -> none on block flow list-item in -webkit-inline-box | rebuilt subtree roots=1, escaped=false
-PASS: text-transform uppercase -> none on block flow list-item in -webkit-inline-box | incremental tree matches full rebuild
-PRESERVED: content normal -> "replacement" on block flow list-item in inline flow | fixture ancestor
-PRESERVED: content normal -> "replacement" on block flow list-item in inline flow | distant sibling
-PRESERVED: content normal -> "replacement" on block flow list-item in inline flow | distant sibling descendant
-PRESERVED: content normal -> "replacement" on block flow list-item in inline flow | DOM parent
-PRESERVED: content normal -> "replacement" on block flow list-item in inline flow | preceding sibling
-PRESERVED: content normal -> "replacement" on block flow list-item in inline flow | preceding sibling descendant
-RECREATED: content normal -> "replacement" on block flow list-item in inline flow | target
-RECREATED: content normal -> "replacement" on block flow list-item in inline flow | target descendant
-PRESERVED: content normal -> "replacement" on block flow list-item in inline flow | following sibling
-PRESERVED: content normal -> "replacement" on block flow list-item in inline flow | following sibling descendant
-STATS: content normal -> "replacement" on block flow list-item in inline flow | rebuilt subtree roots=1, escaped=false
-PASS: content normal -> "replacement" on block flow list-item in inline flow | incremental tree matches full rebuild
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on block flow list-item in inline flow list-item | fixture ancestor
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on block flow list-item in inline flow list-item | distant sibling
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on block flow list-item in inline flow list-item | distant sibling descendant
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on block flow list-item in inline flow list-item | DOM parent
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on block flow list-item in inline flow list-item | preceding sibling
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on block flow list-item in inline flow list-item | preceding sibling descendant
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on block flow list-item in inline flow list-item | target
-RECREATED: content open-quote "replacement" close-quote -> "replacement" on block flow list-item in inline flow list-item | target descendant
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on block flow list-item in inline flow list-item | following sibling
-PRESERVED: content open-quote "replacement" close-quote -> "replacement" on block flow list-item in inline flow list-item | following sibling descendant
-STATS: content open-quote "replacement" close-quote -> "replacement" on block flow list-item in inline flow list-item | rebuilt subtree roots=1, escaped=false
-PASS: content open-quote "replacement" close-quote -> "replacement" on block flow list-item in inline flow list-item | incremental tree matches full rebuild
-PRESERVED: overflow-x visible -> auto on inline flow list-item in inline-flex | fixture ancestor
-PRESERVED: overflow-x visible -> auto on inline flow list-item in inline-flex | distant sibling
-PRESERVED: overflow-x visible -> auto on inline flow list-item in inline-flex | distant sibling descendant
-PRESERVED: overflow-x visible -> auto on inline flow list-item in inline-flex | DOM parent
-PRESERVED: overflow-x visible -> auto on inline flow list-item in inline-flex | preceding sibling
-PRESERVED: overflow-x visible -> auto on inline flow list-item in inline-flex | preceding sibling descendant
-RECREATED: overflow-x visible -> auto on inline flow list-item in inline-flex | target
-RECREATED: overflow-x visible -> auto on inline flow list-item in inline-flex | target descendant
-PRESERVED: overflow-x visible -> auto on inline flow list-item in inline-flex | following sibling
-PRESERVED: overflow-x visible -> auto on inline flow list-item in inline-flex | following sibling descendant
-STATS: overflow-x visible -> auto on inline flow list-item in inline-flex | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x visible -> auto on inline flow list-item in inline-flex | incremental tree matches full rebuild
-RECREATED: overflow-x scroll -> hidden on inline flow list-item in table-footer-group | fixture ancestor
-RECREATED: overflow-x scroll -> hidden on inline flow list-item in table-footer-group | distant sibling
-RECREATED: overflow-x scroll -> hidden on inline flow list-item in table-footer-group | distant sibling descendant
-RECREATED: overflow-x scroll -> hidden on inline flow list-item in table-footer-group | DOM parent
-RECREATED: overflow-x scroll -> hidden on inline flow list-item in table-footer-group | preceding sibling
-RECREATED: overflow-x scroll -> hidden on inline flow list-item in table-footer-group | preceding sibling descendant
-RECREATED: overflow-x scroll -> hidden on inline flow list-item in table-footer-group | target
-RECREATED: overflow-x scroll -> hidden on inline flow list-item in table-footer-group | target descendant
-RECREATED: overflow-x scroll -> hidden on inline flow list-item in table-footer-group | following sibling
-RECREATED: overflow-x scroll -> hidden on inline flow list-item in table-footer-group | following sibling descendant
-STATS: overflow-x scroll -> hidden on inline flow list-item in table-footer-group | rebuilt subtree roots=1, escaped=false
-PASS: overflow-x scroll -> hidden on inline flow list-item in table-footer-group | incremental tree matches full rebuild
-PRESERVED: overflow-y visible -> auto on inline flow list-item in block flex | fixture ancestor
-PRESERVED: overflow-y visible -> auto on inline flow list-item in block flex | distant sibling
-PRESERVED: overflow-y visible -> auto on inline flow list-item in block flex | distant sibling descendant
-PRESERVED: overflow-y visible -> auto on inline flow list-item in block flex | DOM parent
-PRESERVED: overflow-y visible -> auto on inline flow list-item in block flex | preceding sibling
-PRESERVED: overflow-y visible -> auto on inline flow list-item in block flex | preceding sibling descendant
-RECREATED: overflow-y visible -> auto on inline flow list-item in block flex | target
-RECREATED: overflow-y visible -> auto on inline flow list-item in block flex | target descendant
-PRESERVED: overflow-y visible -> auto on inline flow list-item in block flex | following sibling
-PRESERVED: overflow-y visible -> auto on inline flow list-item in block flex | following sibling descendant
-STATS: overflow-y visible -> auto on inline flow list-item in block flex | rebuilt subtree roots=1, escaped=false
-PASS: overflow-y visible -> auto on inline flow list-item in block flex | incremental tree matches full rebuild
-PRESERVED: overflow-y scroll -> hidden on inline flow list-item in inline | fixture ancestor
-PRESERVED: overflow-y scroll -> hidden on inline flow list-item in inline | distant sibling
-PRESERVED: overflow-y scroll -> hidden on inline flow list-item in inline | distant sibling descendant
-PRESERVED: overflow-y scroll -> hidden on inline flow list-item in inline | DOM parent
-PRESERVED: overflow-y scroll -> hidden on inline flow list-item in inline | preceding sibling
-PRESERVED: overflow-y scroll -> hidden on inline flow list-item in inline | preceding sibling descendant
-RECREATED: overflow-y scroll -> hidden on inline flow list-item in inline | target
-RECREATED: overflow-y scroll -> hidden on inline flow list-item in inline | target descendant
