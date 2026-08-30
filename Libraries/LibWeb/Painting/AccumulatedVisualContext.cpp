@@ -21,7 +21,6 @@
 #include <LibWeb/Page/Page.h>
 #include <LibWeb/Painting/AccumulatedVisualContext.h>
 #include <LibWeb/Painting/Blending.h>
-#include <LibWeb/Painting/PaintingRustBridge.h>
 #include <LibWeb/Painting/ResolvedCSSFilter.h>
 #include <LibWeb/Painting/ScrollState.h>
 
@@ -87,20 +86,6 @@ AccumulatedVisualContextTree AccumulatedVisualContextTree::create_with_content_o
     });
 }
 
-CSSPixelRect apply_css_transform_to_rect(Layout::Node const& box, CSSPixelRect const& rect)
-{
-    auto transform_data = rust_compute_css_transform(box, 1.0);
-    if (!transform_data.has_value())
-        return rect;
-
-    auto affine_transform = Gfx::extract_2d_affine_transform(transform_data->matrix);
-    auto transformed_rect = rect.to_type<float>();
-    transformed_rect.translate_by(-transform_data->origin);
-    transformed_rect = affine_transform.map(transformed_rect);
-    transformed_rect.translate_by(transform_data->origin);
-    return transformed_rect.to_type<CSSPixels>();
-}
-
 SpatialNodeIndex AccumulatedVisualContextTree::append_spatial(SpatialData data, SpatialNodeIndex parent)
 {
     VERIFY(parent.value() < m_spatial_nodes.size());
@@ -111,7 +96,6 @@ SpatialNodeIndex AccumulatedVisualContextTree::append_spatial(SpatialData data, 
 
 FrameNodeIndex AccumulatedVisualContextTree::append_frame(FrameData data, FrameNodeIndex parent, SpatialNodeIndex spatial)
 {
-    VERIFY(spatial.value() < m_spatial_nodes.size());
     bool empty_clip = false;
     if (parent != NO_FRAME_NODE) {
         VERIFY(parent.value() < m_frame_nodes.size());
@@ -125,9 +109,15 @@ FrameNodeIndex AccumulatedVisualContextTree::append_frame(FrameData data, FrameN
         else if (data.has<MaskData>())
             empty_clip = data.get<MaskData>().rect.is_empty();
     }
+    return append_frame(move(data), parent, spatial, empty_clip);
+}
 
+FrameNodeIndex AccumulatedVisualContextTree::append_frame(FrameData data, FrameNodeIndex parent, SpatialNodeIndex spatial, bool has_empty_effective_clip)
+{
+    VERIFY(spatial.value() < m_spatial_nodes.size());
+    VERIFY(parent == NO_FRAME_NODE || parent.value() < m_frame_nodes.size());
     auto index = FrameNodeIndex(m_frame_nodes.size());
-    m_frame_nodes.append({ move(data), parent, spatial, empty_clip });
+    m_frame_nodes.append({ move(data), parent, spatial, has_empty_effective_clip });
     return index;
 }
 
@@ -138,35 +128,10 @@ void AccumulatedVisualContextTree::set_visual_viewport_transform(TransformData t
     m_spatial_nodes[VISUAL_VIEWPORT_NODE_INDEX.value()].data = move(transform);
 }
 
-bool AccumulatedVisualContextTree::is_compatible_with(AccumulatedVisualContextTree const& other) const
-{
-    if (m_spatial_nodes.size() != other.m_spatial_nodes.size() || m_frame_nodes.size() != other.m_frame_nodes.size())
-        return false;
-    if (m_root_isolation_frame != other.m_root_isolation_frame)
-        return false;
-
-    for (size_t i = 0; i < m_spatial_nodes.size(); ++i) {
-        auto const& node = m_spatial_nodes[i];
-        auto const& other_node = other.m_spatial_nodes[i];
-        if (node.parent != other_node.parent || node.data.index() != other_node.data.index())
-            return false;
-    }
-    for (size_t i = 0; i < m_frame_nodes.size(); ++i) {
-        auto const& node = m_frame_nodes[i];
-        auto const& other_node = other.m_frame_nodes[i];
-        if (node.parent != other_node.parent || node.spatial != other_node.spatial)
-            return false;
-        if (node.has_empty_effective_clip != other_node.has_empty_effective_clip)
-            return false;
-        if (node.data.index() != other_node.data.index())
-            return false;
-    }
-    return true;
-}
-
 void AccumulatedVisualContextTree::reuse_version_from(AccumulatedVisualContextTree const& other)
 {
-    VERIFY(is_compatible_with(other));
+    VERIFY(m_spatial_nodes.size() == other.m_spatial_nodes.size());
+    VERIFY(m_frame_nodes.size() == other.m_frame_nodes.size());
     m_version = other.m_version;
 }
 
@@ -415,78 +380,6 @@ Optional<Gfx::FloatPoint> AccumulatedVisualContextTree::transform_point_for_hit_
         return {};
 
     return context_walk.point;
-}
-
-SpatialNodeIndex SortingContexts::outermost_context_of(SpatialNodeIndex context) const
-{
-    for (;;) {
-        auto link = links.get(context.value());
-        if (!link.has_value() || link->parent_context == NO_SORTING_CONTEXT)
-            return context;
-        context = link->parent_context;
-    }
-}
-
-SortingContexts AccumulatedVisualContextTree::resolve_sorting_contexts() const
-{
-    auto node_count = m_spatial_nodes.size();
-
-    Vector<bool> is_sorting_context_root;
-    is_sorting_context_root.resize(node_count);
-    bool has_sorting_context_roots = false;
-    for (auto const& node : m_spatial_nodes) {
-        if (auto const* transform = node.data.get_pointer<TransformData>(); transform && transform->sorting_context_root_index.has_value()) {
-            is_sorting_context_root[transform->sorting_context_root_index->value()] = true;
-            has_sorting_context_roots = true;
-        }
-    }
-    if (!has_sorting_context_roots)
-        return {};
-
-    // Roots always precede their contexts' nodes, so a single forward walk resolves every node.
-    SortingContexts contexts;
-    contexts.leaf_by_node.ensure_capacity(node_count);
-    contexts.context_by_node.ensure_capacity(node_count);
-    for (size_t i = 0; i < node_count; ++i) {
-        auto index = SpatialNodeIndex { static_cast<u32>(i) };
-        auto parent = m_spatial_nodes[i].parent.value();
-        auto inherited_leaf = i == 0 ? NO_SORTING_CONTEXT : contexts.leaf_by_node[parent];
-        auto inherited_context = i == 0 ? NO_SORTING_CONTEXT : contexts.context_by_node[parent];
-        auto const* transform = m_spatial_nodes[i].data.get_pointer<TransformData>();
-        if (transform && transform->sorting_context_root_index.has_value()) {
-            contexts.leaf_by_node.unchecked_append(index);
-            contexts.context_by_node.unchecked_append(*transform->sorting_context_root_index);
-        } else if (is_sorting_context_root[i]) {
-            contexts.links.set(index.value(), { inherited_context, inherited_leaf });
-            contexts.leaf_by_node.unchecked_append(index);
-            contexts.context_by_node.unchecked_append(index);
-        } else {
-            contexts.leaf_by_node.unchecked_append(inherited_leaf);
-            contexts.context_by_node.unchecked_append(inherited_context);
-        }
-    }
-    return contexts;
-}
-
-Optional<float> AccumulatedVisualContextTree::plane_depth_at_point_for_hit_test(SpatialNodeIndex plane_node_index, Gfx::FloatPoint screen_point, ScrollStateSnapshot const& scroll_state) const
-{
-    auto chain = build_ancestor_chain(plane_node_index);
-    auto accumulated_matrix = Gfx::FloatMatrix4x4::identity();
-    for (size_t i = chain.size(); i > 0; --i) {
-        auto node_index = chain[i - 1];
-        auto local = local_spatial_matrix(m_spatial_nodes[node_index.value()], node_index, scroll_state);
-        accumulated_matrix = (local.flattens_inherited_transform ? Gfx::flattened(accumulated_matrix) : accumulated_matrix) * local.matrix;
-    }
-
-    auto inverse = accumulated_matrix.inverse();
-    if (!inverse.has_value())
-        return {};
-
-    auto const& matrix = *inverse;
-    auto depth = -(screen_point.x() * matrix[2, 0] + screen_point.y() * matrix[2, 1] + matrix[2, 3]) / matrix[2, 2];
-    if (!isfinite(depth))
-        return {};
-    return depth;
 }
 
 Gfx::FloatPoint AccumulatedVisualContextTree::inverse_transform_point(SpatialNodeIndex index, Gfx::FloatPoint screen_point) const
