@@ -147418,8 +147418,15 @@ AK::Duration calculate_freshness_lifetime(u32 status_code, HeaderList const& hea
         heuristics_allowed = true;
     }
 
-    if (heuristics_allowed)
+    if (heuristics_allowed) {
+        // INTEROP: Chromium treats 301 and 308 responses without explicit freshness as indefinitely fresh, while
+        //          WebKit assigns 301 responses a one-year lifetime. Use the more conservative one-year lifetime for
+        //          both permanent redirect status codes.
+        if (status_code == 301 || status_code == 308)
+            return AK::Duration::from_seconds(365 * 24 * 60 * 60);
+
         return calculate_heuristic_freshness_lifetime(headers, current_time_offset_for_testing);
+    }
 
     // No explicit expiration time, and heuristics not allowed or not applicable.
     return {};
@@ -487689,6 +487696,35 @@ WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> Animatable::get_animations_inter
     return relevant_animations;
 }
 
+ReadonlySpan<GC::Ref<Animation>> Animatable::associated_animations_in_composite_order()
+{
+    if (!m_impl)
+        return {};
+
+    if (!m_impl->is_sorted_by_composite_order) {
+        quick_sort(m_impl->associated_animations, [](auto const& a, auto const& b) {
+            auto a_effect = a->effect();
+            auto b_effect = b->effect();
+            bool a_is_keyframe_effect = a_effect && is<KeyframeEffect>(*a_effect);
+            bool b_is_keyframe_effect = b_effect && is<KeyframeEffect>(*b_effect);
+            if (a_is_keyframe_effect && b_is_keyframe_effect)
+                return KeyframeEffect::composite_order(static_cast<KeyframeEffect&>(*a_effect), static_cast<KeyframeEffect&>(*b_effect)) < 0;
+            if (a_is_keyframe_effect != b_is_keyframe_effect)
+                return !a_is_keyframe_effect;
+            return a->global_animation_list_order() < b->global_animation_list_order();
+        });
+        m_impl->is_sorted_by_composite_order = true;
+    }
+
+    return m_impl->associated_animations.span();
+}
+
+void Animatable::invalidate_associated_animation_composite_order()
+{
+    if (m_impl)
+        m_impl->is_sorted_by_composite_order = false;
+}
+
 bool Animatable::has_relevant_animations() const
 {
     if (!m_impl)
@@ -487705,6 +487741,8 @@ bool Animatable::has_relevant_animations() const
 void Animatable::associate_with_animation(GC::Ref<Animation> animation)
 {
     auto& impl = ensure_impl();
+    if (impl.associated_animations.contains_slow(animation))
+        return;
     impl.associated_animations.append(animation);
     impl.is_sorted_by_composite_order = false;
 
@@ -487715,6 +487753,7 @@ void Animatable::disassociate_with_animation(GC::Ref<Animation> animation)
 {
     auto& impl = *m_impl;
     impl.associated_animations.remove_first_matching([&](auto element) { return animation == element; });
+    impl.is_sorted_by_composite_order = false;
 
     as<DOM::Element>(*this).document().disassociate_with_animation(animation);
 }
@@ -487727,6 +487766,36 @@ void Animatable::on_document_changed(DOM::Document& old_document, DOM::Document&
     for (auto const& animation : m_impl->associated_animations) {
         old_document.disassociate_with_animation(animation);
         new_document.associate_with_animation(animation);
+    }
+}
+
+void Animatable::cancel_css_animations_and_transitions()
+{
+    if (!m_impl)
+        return;
+
+    GC::RootVector<GC::Ref<Animation>> animations_to_cancel;
+    for (auto& animations : m_impl->css_defined_animations) {
+        if (!animations)
+            continue;
+        for (auto& animation : *animations)
+            animations_to_cancel.append(animation);
+        animations->clear();
+    }
+    for (auto& transition : m_impl->transitions) {
+        if (!transition)
+            continue;
+        for (auto& animation : transition->associated_transitions)
+            animations_to_cancel.append(animation.value);
+        transition->associated_transitions.clear();
+        transition->transition_attribute_indices.clear();
+        transition->transition_attributes.clear();
+    }
+    m_impl->has_css_defined_animations = false;
+
+    for (auto& animation : animations_to_cancel) {
+        animation->cancel(Animation::ShouldInvalidate::No);
+        animation->schedule_disassociation_from_target_after_css_cancellation();
     }
 }
 
@@ -487845,6 +487914,19 @@ bool Animatable::has_css_defined_animations() const
         return false;
 
     return m_impl->has_css_defined_animations;
+}
+
+bool Animatable::has_css_animations_or_transitions() const
+{
+    if (!m_impl)
+        return false;
+    if (m_impl->has_css_defined_animations)
+        return true;
+    for (auto const& transition : m_impl->transitions) {
+        if (transition && !transition->associated_transitions.is_empty())
+            return true;
+    }
+    return false;
 }
 
 Vector<GC::Ref<CSS::CSSAnimation>> const* Animatable::css_defined_animations(Optional<CSS::PseudoElement> pseudo_element)
@@ -487968,13 +488050,17 @@ public:
     WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> get_animations(GetAnimationsOptions const& options);
     WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> get_animations(Bindings::GetAnimationsOptions const& options);
     WebIDL::ExceptionOr<Vector<GC::Ref<Animation>>> get_animations_internal(GetAnimationsSorted sorted, GetAnimationsOptions const& options);
+    ReadonlySpan<GC::Ref<Animation>> associated_animations_in_composite_order();
+    void invalidate_associated_animation_composite_order();
     bool has_relevant_animations() const;
 
     void associate_with_animation(GC::Ref<Animation>);
     void disassociate_with_animation(GC::Ref<Animation>);
     void on_document_changed(DOM::Document& old_document, DOM::Document& new_document);
+    void cancel_css_animations_and_transitions();
 
     bool has_css_defined_animations() const;
+    bool has_css_animations_or_transitions() const;
     Vector<GC::Ref<CSS::CSSAnimation>> const* css_defined_animations(Optional<CSS::PseudoElement>);
     void set_css_defined_animations(Optional<CSS::PseudoElement>, Vector<GC::Ref<CSS::CSSAnimation>>&&);
 
@@ -488834,6 +488920,13 @@ WebIDL::ExceptionOr<void> Animation::play(ShouldInvalidate should_invalidate)
 // https://drafts.csswg.org/web-animations-2/#play-an-animation
 WebIDL::ExceptionOr<void> Animation::play_an_animation(AutoRewind auto_rewind, ShouldInvalidate should_invalidate)
 {
+    m_css_cancellation_disassociation_pending = false;
+    if (m_needs_target_reassociation && m_effect) {
+        if (auto target = m_effect->target())
+            target->associate_with_animation(*this);
+        m_needs_target_reassociation = false;
+    }
+
     // 1. Let aborted pause be a boolean flag that is true if animation has a pending pause task, and false otherwise.
     auto aborted_pause = m_pending_pause_task == TaskState::Scheduled;
 
@@ -488938,6 +489031,15 @@ WebIDL::ExceptionOr<void> Animation::play_an_animation(AutoRewind auto_rewind, S
     update_finished_state(DidSeek::No, SynchronouslyNotify::No, should_invalidate);
 
     return {};
+}
+
+void Animation::disassociate_from_target_after_css_cancellation()
+{
+    m_css_cancellation_disassociation_pending = false;
+    if (!m_effect || !m_effect->target())
+        return;
+    m_effect->target()->disassociate_with_animation(*this);
+    m_needs_target_reassociation = true;
 }
 
 // https://www.w3.org/TR/web-animations-1/#dom-animation-pause
@@ -489872,6 +489974,9 @@ public:
 
     Optional<DOM::AbstractElement> owning_element() const { return m_owning_element; }
     void set_owning_element(Optional<DOM::AbstractElement>&& value) { m_owning_element = move(value); }
+    void schedule_disassociation_from_target_after_css_cancellation() { m_css_cancellation_disassociation_pending = true; }
+    bool css_cancellation_disassociation_pending() const { return m_css_cancellation_disassociation_pending; }
+    void disassociate_from_target_after_css_cancellation();
     void update_style_if_needed() const;
 
     virtual AnimationClass animation_class() const { return AnimationClass::None; }
@@ -489985,6 +490090,8 @@ private:
 
     // https://www.w3.org/TR/css-animations-2/#owning-element-section
     Optional<DOM::AbstractElement> m_owning_element;
+    bool m_css_cancellation_disassociation_pending { false };
+    bool m_needs_target_reassociation { false };
 
     Optional<HTML::TaskID> m_pending_finish_microtask_id;
 
@@ -490948,7 +491055,14 @@ AnimationUpdateContext::~AnimationUpdateContext()
         target->document().style_computer().for_each_provisional_transition_effect(element, [&](KeyframeEffect& effect) {
             effects_to_collect.append(effect);
         });
-        effects_to_collect.extend(it.value.effects);
+        for (auto& animation : target->associated_animations_in_composite_order()) {
+            if (animation->is_idle() || !animation->effect() || !is<KeyframeEffect>(*animation->effect()))
+                continue;
+            auto& effect = static_cast<KeyframeEffect&>(*animation->effect());
+            if (effect.target() != target || effect.pseudo_element_type() != element.pseudo_element())
+                continue;
+            effects_to_collect.append(effect);
+        }
         if (!effects_to_collect.is_empty())
             target->document().style_computer().collect_animations_into(element, effects_to_collect.span(), *style, CSS::StyleComputer::AnimationRefresh::Yes);
         auto animated_properties_after_update = style->animated_properties_snapshot();
@@ -507659,6 +507773,9 @@ bool blocks_wheel_event_at_position(AsyncScrollingState const& async_scrolling_s
 
     VERIFY(display_list->compatible_visual_context_tree_version() == visual_context_tree->version());
     for (auto const& region : async_scrolling_state.blocking_wheel_event_regions) {
+        if (region.context.spatial.value() >= visual_context_tree->spatial_nodes().size()
+            || (region.context.frame != Painting::NO_FRAME_NODE && region.context.frame.value() >= visual_context_tree->frame_nodes().size()))
+            return true;
         auto position_in_context = visual_context_tree->transform_point_for_hit_test(region.context, position, scroll_state_snapshot);
         if (position_in_context.has_value() && region.rect.contains(*position_in_context))
             return true;
@@ -507675,7 +507792,7 @@ static WheelHitTestResult hit_test_scroll_node_at_position(AsyncScrollingState c
     auto async_scrolling_state_copy = async_scrolling_state;
     scroll_tree.set_state(move(async_scrolling_state_copy));
     scroll_tree.rebuild_wheel_hit_test_targets(display_list, visual_context_tree, scroll_state_snapshot);
-    return scroll_tree.hit_test_scroll_node_for_wheel(position, delta, snap_container_handling);
+    return scroll_tree.hit_test_scroll_node_for_wheel(*visual_context_tree, position, delta, snap_container_handling);
 }
 
 WheelScrollAdmission admit_wheel_scroll(AsyncScrollingState const& async_scrolling_state, RefPtr<Painting::DisplayList const> const& display_list, Painting::AccumulatedVisualContextTree const* visual_context_tree, Painting::ScrollStateSnapshot const& scroll_state_snapshot, Gfx::FloatPoint position, Gfx::FloatPoint delta, SnapContainerHandling snap_container_handling, bool blocking_wheel_event_regions_are_current)
@@ -507897,7 +508014,7 @@ void AsyncScrollTree::set_state(AsyncScrollingState&& state)
     m_cached_wheel_hit_test_targets.clear();
     m_cached_main_thread_wheel_event_targets.clear();
     m_cached_blocking_wheel_event_targets.clear();
-    m_visual_context_tree = nullptr;
+    m_visual_context_tree_version.clear();
 }
 
 AsyncScrollNode const* AsyncScrollTree::scroll_node_for_id(AsyncScrollNodeID node_id) const
@@ -508070,16 +508187,23 @@ void AsyncScrollTree::rebuild_wheel_hit_test_targets(RefPtr<Painting::DisplayLis
     m_cached_wheel_hit_test_targets.clear();
     m_cached_main_thread_wheel_event_targets.clear();
     m_cached_blocking_wheel_event_targets.clear();
-    m_visual_context_tree = nullptr;
+    m_visual_context_tree_version.clear();
     m_scroll_state_snapshot = scroll_state_snapshot;
     if (!display_list || !visual_context_tree)
         return;
 
     VERIFY(display_list->compatible_visual_context_tree_version() == visual_context_tree->version());
-    m_visual_context_tree = visual_context_tree;
+    m_visual_context_tree_version = visual_context_tree->version();
+
+    auto context_is_valid = [&](Painting::ContextRef context) {
+        return context.spatial.value() < visual_context_tree->spatial_nodes().size()
+            && (context.frame == Painting::NO_FRAME_NODE || context.frame.value() < visual_context_tree->frame_nodes().size());
+    };
 
     m_cached_wheel_hit_test_targets.ensure_capacity(m_wheel_hit_test_regions.size());
     for (auto const& target : m_wheel_hit_test_regions) {
+        if (!context_is_valid(target.context))
+            continue;
         m_cached_wheel_hit_test_targets.append({
             .target_node_id = target.target_node_id,
             .context = target.context,
@@ -508091,6 +508215,8 @@ void AsyncScrollTree::rebuild_wheel_hit_test_targets(RefPtr<Painting::DisplayLis
 
     m_cached_main_thread_wheel_event_targets.ensure_capacity(m_main_thread_wheel_event_regions.size());
     for (auto const& region : m_main_thread_wheel_event_regions) {
+        if (!context_is_valid(region.context))
+            continue;
         m_cached_main_thread_wheel_event_targets.append({
             .context = region.context,
             .rect = region.rect,
@@ -508099,6 +508225,8 @@ void AsyncScrollTree::rebuild_wheel_hit_test_targets(RefPtr<Painting::DisplayLis
     }
 
     for (auto const& region : m_blocking_wheel_event_regions) {
+        if (!context_is_valid(region.context))
+            continue;
         m_cached_blocking_wheel_event_targets.append({
             .context = region.context,
             .rect = region.rect,
@@ -508112,7 +508240,7 @@ void AsyncScrollTree::clear_wheel_hit_test_targets()
     m_cached_wheel_hit_test_targets.clear();
     m_cached_main_thread_wheel_event_targets.clear();
     m_cached_blocking_wheel_event_targets.clear();
-    m_visual_context_tree = nullptr;
+    m_visual_context_tree_version.clear();
 }
 
 static bool wheel_hit_test_target_contains_point(CachedWheelHitTestTarget const& target, Gfx::FloatPoint position_in_context)
@@ -508147,7 +508275,7 @@ Optional<AsyncScrollNodeID> AsyncScrollTree::scroll_node_id_for_stable_id(AsyncS
     return {};
 }
 
-WheelHitTestResult AsyncScrollTree::hit_test_scroll_node_for_wheel(Gfx::FloatPoint position, Gfx::FloatPoint delta, SnapContainerHandling snap_container_handling) const
+WheelHitTestResult AsyncScrollTree::hit_test_scroll_node_for_wheel(Painting::AccumulatedVisualContextTree const& visual_context_tree, Gfx::FloatPoint position, Gfx::FloatPoint delta, SnapContainerHandling snap_container_handling) const
 {
     auto scrolled_on_the_main_thread_instead = [&](WheelHitTestResult const& result) {
         if (snap_container_handling == SnapContainerHandling::ScrollOnCompositor || !result.node_id.has_value())
@@ -508165,8 +508293,13 @@ WheelHitTestResult AsyncScrollTree::hit_test_scroll_node_for_wheel(Gfx::FloatPoi
         return result;
     };
 
-    if (!m_visual_context_tree)
+    if (m_visual_context_tree_version != visual_context_tree.version())
         return {};
+
+    auto context_is_valid = [&](Painting::ContextRef context) {
+        return context.spatial.value() < visual_context_tree.spatial_nodes().size()
+            && (context.frame == Painting::NO_FRAME_NODE || context.frame.value() < visual_context_tree.frame_nodes().size());
+    };
 
     if (m_has_blocking_wheel_event_region_covering_viewport)
         return { {}, false, true };
@@ -508175,7 +508308,9 @@ WheelHitTestResult AsyncScrollTree::hit_test_scroll_node_for_wheel(Gfx::FloatPoi
         if (!target.viewport_rect.contains(position))
             continue;
 
-        auto position_in_context = m_visual_context_tree->transform_point_for_hit_test(target.context, position, m_scroll_state_snapshot);
+        if (!context_is_valid(target.context))
+            continue;
+        auto position_in_context = visual_context_tree.transform_point_for_hit_test(target.context, position, m_scroll_state_snapshot);
         if (position_in_context.has_value() && target.rect.contains(*position_in_context))
             return { {}, true };
     }
@@ -508184,7 +508319,9 @@ WheelHitTestResult AsyncScrollTree::hit_test_scroll_node_for_wheel(Gfx::FloatPoi
         if (!target.viewport_rect.contains(position))
             continue;
 
-        auto position_in_context = m_visual_context_tree->transform_point_for_hit_test(target.context, position, m_scroll_state_snapshot);
+        if (!context_is_valid(target.context))
+            continue;
+        auto position_in_context = visual_context_tree.transform_point_for_hit_test(target.context, position, m_scroll_state_snapshot);
         if (position_in_context.has_value() && target.rect.contains(*position_in_context))
             return { {}, false, true };
     }
@@ -508193,7 +508330,9 @@ WheelHitTestResult AsyncScrollTree::hit_test_scroll_node_for_wheel(Gfx::FloatPoi
         if (!target.viewport_rect.contains(position))
             continue;
 
-        auto position_in_context = m_visual_context_tree->transform_point_for_hit_test(target.context, position, m_scroll_state_snapshot);
+        if (!context_is_valid(target.context))
+            continue;
+        auto position_in_context = visual_context_tree.transform_point_for_hit_test(target.context, position, m_scroll_state_snapshot);
         if (!position_in_context.has_value() || !wheel_hit_test_target_contains_point(target, *position_in_context))
             continue;
         if (!target.target_node_id.has_value())
@@ -508292,7 +508431,7 @@ public:
     Optional<Gfx::FloatPoint> scroll_offset_for_node(AsyncScrollNodeID, Painting::ScrollStateSnapshot const&) const;
     Optional<AsyncScrollNodeID> viewport_scroll_node_id() const;
     Optional<AsyncScrollNodeID> scroll_node_id_for_stable_id(AsyncScrollNodeStableID) const;
-    WheelHitTestResult hit_test_scroll_node_for_wheel(Gfx::FloatPoint position, Gfx::FloatPoint delta, SnapContainerHandling) const;
+    WheelHitTestResult hit_test_scroll_node_for_wheel(Painting::AccumulatedVisualContextTree const&, Gfx::FloatPoint position, Gfx::FloatPoint delta, SnapContainerHandling) const;
     bool scroll_node_is_viewport(AsyncScrollNodeID) const;
     Vector<AsyncScrollOffset> apply_scroll_delta(AsyncScrollNodeID, Gfx::FloatPoint delta, Painting::AccumulatedVisualContextTree const&, Painting::ScrollStateSnapshot&);
     Optional<Gfx::FloatPoint> set_scroll_offset(AsyncScrollNodeID, Gfx::FloatPoint, Painting::AccumulatedVisualContextTree const&, Painting::ScrollStateSnapshot&);
@@ -508316,7 +508455,7 @@ private:
     Vector<BlockingWheelEventRegion> m_blocking_wheel_event_regions;
     Vector<CachedMainThreadWheelEventTarget> m_cached_main_thread_wheel_event_targets;
     Vector<CachedBlockingWheelEventTarget> m_cached_blocking_wheel_event_targets;
-    Painting::AccumulatedVisualContextTree const* m_visual_context_tree { nullptr };
+    Optional<u64> m_visual_context_tree_version;
     Painting::ScrollStateSnapshot m_scroll_state_snapshot;
     bool m_has_blocking_wheel_event_region_covering_viewport { false };
 };
@@ -508422,10 +508561,10 @@ void CompositorContextHandle::viewport_size_updated(Gfx::IntSize viewport_size, 
     m_host.viewport_size_updated(m_context_id, viewport_size, window_resize_in_progress);
 }
 
-void CompositorContextHandle::present_frame(Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect)
+void CompositorContextHandle::present_frame(Gfx::IntRect viewport_rect)
 {
     m_host.flush_canvas_2d_stream();
-    m_host.present_frame(m_context_id, viewport_rect, damage_rect);
+    m_host.present_frame(m_context_id, viewport_rect);
 }
 
 void CompositorContextHandle::request_screenshot(NonnullRefPtr<Gfx::PaintingSurface> target_surface, Function<void()>&& callback)
@@ -508512,7 +508651,7 @@ public:
     void cancel_smooth_scroll(AsyncScrollNodeStableID);
     PendingAsyncScrollUpdates take_pending_async_scroll_updates();
     void viewport_size_updated(Gfx::IntSize, WindowResizingInProgress);
-    void present_frame(Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect);
+    void present_frame(Gfx::IntRect viewport_rect);
     void request_screenshot(NonnullRefPtr<Gfx::PaintingSurface>, Function<void()>&& callback);
 
 private:
@@ -508558,7 +508697,7 @@ public:
     virtual void cancel_smooth_scroll(CompositorContextId, AsyncScrollNodeStableID) = 0;
     virtual PendingAsyncScrollUpdates take_pending_async_scroll_updates(CompositorContextId) = 0;
     virtual void viewport_size_updated(CompositorContextId, Gfx::IntSize, WindowResizingInProgress) = 0;
-    virtual void present_frame(CompositorContextId, Gfx::IntRect viewport_rect, Gfx::IntRect damage_rect) = 0;
+    virtual void present_frame(CompositorContextId, Gfx::IntRect viewport_rect) = 0;
     virtual void request_screenshot(CompositorContextId, NonnullRefPtr<Gfx::PaintingSurface>, Function<void()>&& callback) = 0;
 
 protected:
@@ -543121,6 +543260,17 @@ int CSSAnimation::class_specific_composite_order(GC::Ref<Animations::Animation> 
     return global_animation_list_order() - other->global_animation_list_order();
 }
 
+void CSSAnimation::set_animation_name_index(size_t index)
+{
+    if (m_animation_name_index == index)
+        return;
+    m_animation_name_index = index;
+    if (auto effect = this->effect(); effect && is<Animations::KeyframeEffect>(*effect)) {
+        if (auto target = static_cast<Animations::KeyframeEffect&>(*effect).target())
+            target->invalidate_associated_animation_composite_order();
+    }
+}
+
 Animations::AnimationClass CSSAnimation::animation_class() const
 {
     if (owning_element().has_value())
@@ -543351,7 +543501,7 @@ public:
 
     void apply_css_properties(AnimationProperties const&);
 
-    void set_animation_name_index(size_t index) { m_animation_name_index = index; }
+    void set_animation_name_index(size_t index);
 
     EasingFunction const& default_easing() const { return m_default_easing; }
 
@@ -563310,10 +563460,8 @@ double LinearEasingFunction::evaluate_at(double input_progress, bool before_flag
 {
     Vector<StyleValueFFI::FfiLinearEasingPoint> points;
     points.ensure_capacity(control_points.size());
-    for (auto const& point : control_points) {
-        VERIFY(point.input.has_value());
-        points.unchecked_append({ .input = *point.input, .output = point.output });
-    }
+    for (auto const& point : control_points)
+        points.unchecked_append({ .input = point.input, .output = point.output });
     StyleValueFFI::FfiEasingDescriptor descriptor {
         .kind = StyleValueFFI::FfiEasingKind::Linear,
         .linear_points = points.data(),
@@ -563363,10 +563511,15 @@ double StepsEasingFunction::evaluate_at(double input_progress, bool before_flag)
 }
 
 // https://drafts.csswg.org/css-easing/#linear-canonicalization
-static Vector<LinearEasingFunction::ControlPoint> canonicalize_linear_easing_function_control_points(Vector<LinearEasingFunction::ControlPoint> control_points)
+struct UnresolvedLinearEasingControlPoint {
+    Optional<double> input;
+    double output;
+};
+
+static Vector<LinearEasingFunction::ControlPoint> canonicalize_linear_easing_function_control_points(Vector<UnresolvedLinearEasingControlPoint> control_points)
 {
     // To canonicalize a linear() function’s control points, perform the following:
-    Vector<LinearEasingFunction::ControlPoint> canonicalized_control_points = control_points;
+    auto canonicalized_control_points = move(control_points);
 
     // 1. If the first control point lacks an input progress value, set its input progress value to 0.
     if (!canonicalized_control_points.first().input.has_value())
@@ -563414,7 +563567,11 @@ static Vector<LinearEasingFunction::ControlPoint> canonicalize_linear_easing_fun
         }
     }
 
-    return canonicalized_control_points;
+    Vector<LinearEasingFunction::ControlPoint> resolved_control_points;
+    resolved_control_points.ensure_capacity(canonicalized_control_points.size());
+    for (auto const& control_point : canonicalized_control_points)
+        resolved_control_points.unchecked_append({ control_point.input.value(), control_point.output });
+    return resolved_control_points;
 }
 
 // https://drafts.csswg.org/css-easing-2/#linear-easing-function
@@ -563457,7 +563614,7 @@ EasingFunction EasingFunction::from_style_value(StyleValue const& style_value)
     if (style_value.is_easing()) {
         return style_value.as_easing().function().visit(
             [&](EasingStyleValue::Linear const& linear) -> EasingFunction {
-                Vector<LinearEasingFunction::ControlPoint> resolved_control_points;
+                Vector<UnresolvedLinearEasingControlPoint> unresolved_control_points;
 
                 for (auto const& control_point : linear.stops) {
                     double output = number_from_style_value(control_point.output, {});
@@ -563466,13 +563623,13 @@ EasingFunction EasingFunction::from_style_value(StyleValue const& style_value)
                     if (control_point.input)
                         input = Percentage::from_style_value(*control_point.input).as_fraction();
 
-                    resolved_control_points.append({ input, output });
+                    unresolved_control_points.append({ input, output });
                 }
 
                 // https://drafts.csswg.org/css-easing-2/#funcdef-linear
                 // If an argument lacks a <percentage>, its input progress value is initially empty. This is corrected
                 // at used value time by linear() canonicalization.
-                resolved_control_points = canonicalize_linear_easing_function_control_points(resolved_control_points);
+                auto resolved_control_points = canonicalize_linear_easing_function_control_points(move(unresolved_control_points));
 
                 return LinearEasingFunction { resolved_control_points, linear.to_utf16_string(SerializationMode::ResolvedValue) };
             },
@@ -563526,9 +563683,7 @@ NonnullRefPtr<StyleValue const> EasingFunction::to_style_value() const
         [](LinearEasingFunction const& linear) -> NonnullRefPtr<StyleValue const> {
             Vector<EasingStyleValue::Linear::Stop> stops;
             for (auto const& point : linear.control_points) {
-                ValueComparingRefPtr<StyleValue const> input;
-                if (point.input.has_value())
-                    input = PercentageStyleValue::create(Percentage { *point.input * 100 });
+                auto input = PercentageStyleValue::create(Percentage { point.input * 100 });
                 stops.append({ NumberStyleValue::create(point.output), move(input) });
             }
             return EasingStyleValue::create(EasingStyleValue::Linear { move(stops) });
@@ -563590,7 +563745,7 @@ namespace Web::CSS {
 
 struct LinearEasingFunction {
     struct ControlPoint {
-        Optional<double> input;
+        double input;
         double output;
 
         bool operator==(ControlPoint const&) const = default;
@@ -589106,10 +589261,8 @@ void StyleComputer::collect_animation_effects_into(DOM::AbstractElement abstract
         return easing.visit(
             [&](LinearEasingFunction const& linear) {
                 points.ensure_capacity(linear.control_points.size());
-                for (auto const& point : linear.control_points) {
-                    VERIFY(point.input.has_value());
-                    points.unchecked_append({ .input = *point.input, .output = point.output });
-                }
+                for (auto const& point : linear.control_points)
+                    points.unchecked_append({ .input = point.input, .output = point.output });
                 return StyleValueFFI::FfiEasingDescriptor {
                     .kind = StyleValueFFI::FfiEasingKind::Linear,
                     .linear_points = points.data(),
@@ -627185,6 +627338,8 @@ void Document::run_the_update_intersection_observations_steps(HighResolutionTime
             // isIntersecting be false.
             bool is_intersecting = false;
 
+            bool intersection_geometry_intersects = false;
+
             // targetRect be a DOMRectReadOnly with x, y, width, and height set to 0.
             CSSPixelRect target_rect { 0, 0, 0, 0 };
 
@@ -627217,20 +627372,20 @@ void Document::run_the_update_intersection_observations_steps(HighResolutionTime
 
                 // 8. Let isIntersecting be true if targetRect and rootBounds intersect or are edge-adjacent, even if the
                 //    intersection has zero area (because rootBounds or targetRect have zero area).
-                is_intersecting = target_rect.edge_adjacent_intersects(root_bounds);
+                intersection_geometry_intersects = target_rect.edge_adjacent_intersects(root_bounds);
 
                 // 9. If targetArea is non-zero, let intersectionRatio be intersectionArea divided by targetArea.
                 //    Otherwise, let intersectionRatio be 1 if isIntersecting is true, or 0 if isIntersecting is false.
                 if (target_area != 0.0)
                     intersection_ratio = (intersection_area / target_area).to_double();
                 else
-                    intersection_ratio = is_intersecting ? 1.0 : 0.0;
+                    intersection_ratio = intersection_geometry_intersects ? 1.0 : 0.0;
 
                 // 10. Set thresholdIndex to the index of the first entry in observer.thresholds whose value is greater
                 //     than intersectionRatio, or the length of observer.thresholds if intersectionRatio is greater than
                 //     or equal to the last entry in observer.thresholds.
                 // NB: Thresholds are sorted in ascending order, so we use binary search.
-                {
+                if (intersection_geometry_intersects) {
                     auto const& thresholds = observer->thresholds();
                     size_t lo = 0;
                     size_t hi = thresholds.size();
@@ -627243,6 +627398,10 @@ void Document::run_the_update_intersection_observations_steps(HighResolutionTime
                     }
                     threshold_index = lo;
                 }
+
+                // INTEROP: All other engines report isIntersecting as false when the intersection ratio is below the
+                //          first threshold. See https://github.com/w3c/IntersectionObserver/issues/432.
+                is_intersecting = threshold_index > 0;
             }
 
             // 11. Let intersectionObserverRegistration be the IntersectionObserverRegistration record in target’s
@@ -627844,6 +628003,14 @@ void Document::disassociate_with_animation(GC::Ref<Animations::Animation> animat
     m_associated_animations.remove(animation);
 }
 
+size_t Document::associated_animation_count() const
+{
+    size_t count = 0;
+    for ([[maybe_unused]] auto& animation : m_associated_animations)
+        ++count;
+    return count;
+}
+
 void Document::append_pending_animation_event(Web::DOM::Document::PendingAnimationEvent const& event)
 {
     if (m_style_stabilization_epoch_depth > 0) {
@@ -627872,8 +628039,11 @@ void Document::update_animations_and_send_events(double timestamp)
         for (auto& animation : m_associated_animations)
             animations.append(animation);
 
-        for (auto& animation : animations)
+        for (auto& animation : animations) {
             dispatch_events_for_animation_if_necessary(animation);
+            if (animation->css_cancellation_disassociation_pending())
+                animation->disassociate_from_target_after_css_cancellation();
+        }
 
         // 2. Remove replaced animations for doc.
         remove_replaced_animations();
@@ -631866,6 +632036,7 @@ public:
     void disassociate_with_timeline(GC::Ref<Animations::AnimationTimeline>);
     void associate_with_animation(GC::Ref<Animations::Animation>);
     void disassociate_with_animation(GC::Ref<Animations::Animation>);
+    size_t associated_animation_count() const;
 
     struct PendingAnimationEvent {
         GC::Ref<DOM::Event> event;
@@ -641718,8 +641889,8 @@ Utf16FlyString const& Element::html_uppercased_qualified_name() const
 
 void Element::play_or_cancel_animations_after_display_property_change()
 {
-    // OPTIMIZATION: We don't care about elements with no CSS defined animations
-    if (!has_css_defined_animations())
+    // OPTIMIZATION: We don't care about elements with no CSS animations or transitions.
+    if (!has_css_animations_or_transitions())
         return;
 
     // OPTIMIZATION: We don't care about animations in disconnected subtrees.
@@ -641741,21 +641912,22 @@ void Element::play_or_cancel_animations_after_display_property_change()
 
     auto has_inclusive_ancestor_with_display_none_ignoring_animations = this->has_inclusive_ancestor_with_display_none_ignoring_animations();
 
+    if (has_inclusive_ancestor_with_display_none_ignoring_animations) {
+        cancel_css_animations_and_transitions();
+        return;
+    }
+
     auto play_or_cancel_depending_on_display = [&](Vector<GC::Ref<CSS::CSSAnimation>> const& animations) {
         for (auto& animation : animations) {
-            if (has_inclusive_ancestor_with_display_none_ignoring_animations) {
-                animation->cancel();
-            } else {
-                // NOTE: It is safe to assume this has a value as it is set when creating a CSS defined animation
-                auto play_state = animation->last_css_animation_play_state().value();
+            // NOTE: It is safe to assume this has a value as it is set when creating a CSS defined animation
+            auto play_state = animation->last_css_animation_play_state().value();
 
-                if (play_state == CSS::AnimationPlayState::Running) {
-                    HTML::TemporaryExecutionContext context(document().relevant_settings_object());
-                    animation->play_from_css();
-                } else if (play_state == CSS::AnimationPlayState::Paused) {
-                    HTML::TemporaryExecutionContext context(document().relevant_settings_object());
-                    animation->pause_from_css();
-                }
+            if (play_state == CSS::AnimationPlayState::Running) {
+                HTML::TemporaryExecutionContext context(document().relevant_settings_object());
+                animation->play_from_css();
+            } else if (play_state == CSS::AnimationPlayState::Paused) {
+                HTML::TemporaryExecutionContext context(document().relevant_settings_object());
+                animation->pause_from_css();
             }
         }
     };
@@ -650071,6 +650243,10 @@ void Node::remove(bool suppress_observers)
         removal_style_record_pins.pin_layout_style_records(*this);
 
     // 11. Run the removing steps with node, true, and parent.
+    if (was_connected) {
+        if (auto* element = as_if<Element>(*this))
+            element->cancel_css_animations_and_transitions();
+    }
     removed_from(IsSubtreeRoot::Yes, parent, parent_root);
 
     // A subtree holding the focused or hovered node takes `:focus-within` and `:hover` out of the
@@ -650091,6 +650267,11 @@ void Node::remove(bool suppress_observers)
 
     // 14. For each shadow-including descendant descendant of node, in shadow-including tree order:
     for_each_shadow_including_descendant([&](Node& descendant) {
+        if (was_connected) {
+            if (auto* element = as_if<Element>(descendant))
+                element->cancel_css_animations_and_transitions();
+        }
+
         // 1. Run the removing steps with descendant, false, and parent.
         descendant.removed_from(IsSubtreeRoot::No, parent, parent_root);
 
@@ -667707,156 +667888,3 @@ WebIDL::ExceptionOr<bool> Document::query_command_enabled(Utf16FlyString const& 
     // Among commands defined in this specification, those listed in Miscellaneous commands are always enabled, except
     // for the cut command and the paste command.
     // NOTE: cut and paste are actually in the Clipboard commands section
-    if (command.is_one_of_ignoring_ascii_case(
-            Editing::CommandNames::defaultParagraphSeparator,
-            Editing::CommandNames::styleWithCSS,
-            Editing::CommandNames::useCSS))
-        return true;
-
-    // INTEROP: The spec lists undo and redo among the always-enabled miscellaneous commands, but in Chromium
-    //          queryCommandEnabled("undo") is true only when there is a step to undo, and execCommand("undo") on an
-    //          empty history returns false. Redo behaves symmetrically.
-    if (command.equals_ignoring_ascii_case(Editing::CommandNames::undo)) {
-        auto history = editing_history_if_exists();
-        return history && history->can_undo();
-    }
-    if (command.equals_ignoring_ascii_case(Editing::CommandNames::redo)) {
-        auto history = editing_history_if_exists();
-        return history && history->can_redo();
-    }
-
-    // AD-HOC: selectAll requires a selection object to exist.
-    if (command.equals_ignoring_ascii_case(Editing::CommandNames::selectAll))
-        return get_selection() != nullptr;
-
-    // The other commands defined here are enabled if the active range is not null,
-    auto active_range = Editing::active_range(*this);
-    if (!active_range)
-        return false;
-
-    // its start node is either editable or an editing host,
-    auto start_node = active_range->start_container();
-    if (!start_node->is_editable_or_editing_host())
-        return false;
-
-    // FIXME: the editing host of its start node is not an EditContext editing host,
-    [[maybe_unused]] auto start_node_editing_host = start_node->editing_host();
-
-    // its end node is either editable or an editing host,
-    auto& end_node = *active_range->end_container();
-    if (!end_node.is_editable_or_editing_host())
-        return false;
-
-    // FIXME: the editing host of its end node is not an EditContext editing host,
-    [[maybe_unused]] auto end_node_editing_host = end_node.editing_host();
-
-    // and there is some editing host that is an inclusive ancestor of both its start node and its end node.
-    GC::Ptr<Node> inclusive_ancestor_editing_host;
-    start_node->for_each_inclusive_ancestor([&](GC::Ref<Node> ancestor) {
-        if (ancestor->is_editing_host() && ancestor->is_inclusive_ancestor_of(end_node)) {
-            inclusive_ancestor_editing_host = ancestor;
-            return IterationDecision::Break;
-        }
-        return IterationDecision::Continue;
-    });
-    if (!inclusive_ancestor_editing_host)
-        return false;
-
-    // NOTE: Commands can define additional conditions for being enabled, and currently the only condition mentioned in
-    //       the spec is that certain commands must not be enabled if the editing host is in the plaintext-only state.
-    if (auto const* html_element = as_if<HTML::HTMLElement>(inclusive_ancestor_editing_host.ptr()); html_element
-        && html_element->content_editable_state() == HTML::ContentEditableState::PlaintextOnly
-        && command.is_one_of_ignoring_ascii_case(
-            Editing::CommandNames::backColor,
-            Editing::CommandNames::bold,
-            Editing::CommandNames::createLink,
-            Editing::CommandNames::fontName,
-            Editing::CommandNames::fontSize,
-            Editing::CommandNames::foreColor,
-            Editing::CommandNames::formatBlock, // AD-HOC: https://github.com/w3c/editing/issues/478
-            Editing::CommandNames::hiliteColor,
-            Editing::CommandNames::indent,
-            Editing::CommandNames::insertHorizontalRule,
-            Editing::CommandNames::insertImage,
-            Editing::CommandNames::insertOrderedList,
-            Editing::CommandNames::insertUnorderedList,
-            Editing::CommandNames::italic,
-            Editing::CommandNames::justifyCenter,
-            Editing::CommandNames::justifyFull,
-            Editing::CommandNames::justifyLeft,
-            Editing::CommandNames::justifyRight,
-            Editing::CommandNames::outdent,
-            Editing::CommandNames::removeFormat,
-            Editing::CommandNames::strikethrough,
-            Editing::CommandNames::subscript,
-            Editing::CommandNames::superscript,
-            Editing::CommandNames::underline,
-            Editing::CommandNames::unlink))
-        return false;
-
-    return true;
-}
-
-// https://w3c.github.io/editing/docs/execCommand/#querycommandindeterm()
-WebIDL::ExceptionOr<bool> Document::query_command_indeterm(Utf16FlyString const& command)
-{
-    // AD-HOC: This is not directly mentioned in the spec, but all major browsers limit editing API calls to HTML documents
-    if (!is_html_document())
-        return WebIDL::InvalidStateError::create("queryCommandIndeterm is only supported on HTML documents"_utf16);
-
-    // 1. If command is not supported or has no indeterminacy, return false.
-    auto optional_command = Editing::find_command_definition(command);
-    if (!optional_command.has_value())
-        return false;
-    auto const& command_definition = optional_command.value();
-    if (!command_definition.indeterminate) {
-        // If a command has inline command activated values defined but nothing else defines when it is indeterminate,
-        // it is indeterminate if among formattable nodes effectively contained in the active range, there is at least
-        // one whose effective command value is one of the given values and at least one whose effective command value
-        // is not one of the given values.
-        if (!command_definition.inline_activated_values.is_empty()) {
-            auto range = Editing::active_range(*this);
-            bool has_at_least_one_match = false;
-            bool has_at_least_one_mismatch = false;
-            Editing::for_each_node_effectively_contained_in_range(range, [&](GC::Ref<Node> descendant) {
-                if (!Editing::is_formattable_node(descendant))
-                    return TraversalDecision::Continue;
-
-                auto node_value = Editing::effective_command_value(descendant, command_definition.command);
-                if (!node_value.has_value())
-                    return TraversalDecision::Continue;
-
-                if (command_definition.inline_activated_values.contains_slow(node_value.value()))
-                    has_at_least_one_match = true;
-                else
-                    has_at_least_one_mismatch = true;
-
-                if (has_at_least_one_match && has_at_least_one_mismatch)
-                    return TraversalDecision::Break;
-                return TraversalDecision::Continue;
-            });
-            return has_at_least_one_match && has_at_least_one_mismatch;
-        }
-
-        return false;
-    }
-
-    // 2. Return true if command is indeterminate, otherwise false.
-    return command_definition.indeterminate(*this);
-}
-
-// https://w3c.github.io/editing/docs/execCommand/#querycommandstate()
-WebIDL::ExceptionOr<bool> Document::query_command_state(Utf16FlyString const& command)
-{
-    // AD-HOC: This is not directly mentioned in the spec, but all major browsers limit editing API calls to HTML documents
-    if (!is_html_document())
-        return WebIDL::InvalidStateError::create("queryCommandState is only supported on HTML documents"_utf16);
-
-    // 1. If command is not supported or has no state, return false.
-    auto optional_command = Editing::find_command_definition(command);
-    if (!optional_command.has_value())
-        return false;
-    auto const& command_definition = optional_command.release_value();
-    auto state_override = command_state_override(command_definition.command);
-    if (!command_definition.state && !state_override.has_value()) {
-        // https://w3c.github.io/editing/docs/execCommand/#inline-command-activated-values
