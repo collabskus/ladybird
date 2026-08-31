@@ -1,4 +1,86 @@
-﻿    if (closes_coalescing)
+﻿        // A collapsed selection can have multiple DOM representations for one rendered caret. Store the canonical
+        // visible position in history without moving the live selection: replacement still acts at the exact DOM
+        // boundary chosen by script, while undo restores the position Chromium exposes after the edit.
+        auto visible_position = VisiblePosition::create(editing_host.document(), { *focus_node, static_cast<WebIDL::UnsignedLong>(focus_offset) }, selection->focus_affinity());
+        auto deep_equivalent = visible_position.deep_equivalent();
+        anchor_node = deep_equivalent.node;
+        focus_node = deep_equivalent.node;
+        anchor_offset = deep_equivalent.offset;
+        focus_offset = deep_equivalent.offset;
+    }
+    snapshot.anchor_node = anchor_node;
+    snapshot.anchor_offset = anchor_offset;
+    snapshot.focus_node = focus_node;
+    snapshot.focus_offset = focus_offset;
+    snapshot.focus_affinity = selection->focus_affinity();
+    return snapshot;
+}
+
+// INTEROP: Chromium fires a non-cancelable input event with inputType "historyUndo" or
+//          "historyRedo" at the undo step's editing host after applying it, for both
+//          execCommand() and the keyboard shortcuts.
+static void dispatch_history_input_event(DOM::Document& document, GC::Ref<DOM::Node> editing_host, Utf16FlyString const& input_type)
+{
+    (void)document;
+    Bindings::InputEventInit event_init {};
+    event_init.bubbles = true;
+    event_init.input_type = input_type;
+
+    auto event = UIEvents::InputEvent::create_from_platform_event(HTML::EventNames::input, event_init);
+    event->set_is_trusted(true);
+    editing_host->dispatch_event(event);
+}
+
+void EditingHistory::begin_recording(DOM::Node& editing_host, UndoStep::Category category)
+{
+    // NB: Editing commands cannot nest: execCommand() refuses to run recursively, and history
+    //     application never records. A nested recording would mean an editing command invoked
+    //     another one through some new path without thinking about history bookkeeping.
+    VERIFY(!m_undo_step_being_recorded);
+    VERIFY(!m_applying_history_step);
+
+    m_undo_step_being_recorded = editing_host.heap().allocate<UndoStep>(editing_host, category);
+    m_undo_step_being_recorded->set_starting_selection(capture_selection(editing_host));
+}
+
+void EditingHistory::end_recording()
+{
+    auto step = m_undo_step_being_recorded;
+    if (!step)
+        return;
+    m_undo_step_being_recorded = nullptr;
+
+    // A command that did not modify the DOM leaves no trace in the history.
+    if (!step->has_commands())
+        return;
+
+    step->set_ending_selection(capture_selection(step->editing_host()));
+
+    // NB: Decide this before merging, since merging moves the commands into the open step.
+    bool closes_coalescing = step->performed_lasting_node_removal();
+
+    if (m_open_step && !m_undo_stack.is_empty() && m_open_step == m_undo_stack.last()
+        && m_open_step->editing_host() == step->editing_host()
+        && m_open_step->accepts_merge_of(step->category())) {
+        // NB: The redo stack is necessarily empty here: it only fills up through undo, which
+        //     ends coalescing, so a merge can never bypass the redo invalidation below.
+        bool deferred_close = m_open_step->closes_after_next_merge();
+        m_open_step->merge(*step);
+        if (deferred_close)
+            m_open_step = nullptr;
+    } else {
+        step->finalize_starting_selection();
+
+        // A new editing action discards everything that was undone.
+        m_redo_stack.clear();
+
+        if (m_undo_stack.size() >= maximum_undo_stack_depth)
+            m_undo_stack.take_first();
+        m_undo_stack.append(*step);
+        m_open_step = step->category() != UndoStep::Category::Other ? step.ptr() : nullptr;
+    }
+
+    if (closes_coalescing)
         m_open_step = nullptr;
 
     notify_state_if_changed(step->editing_host()->document());
@@ -333457,11 +333539,15 @@ impl StyleEngine {
             .filter(|&exposed| exposed != scope && Some(exposed) != inner_scope && !slotted_scopes.contains(&exposed))
             .collect();
 
-        if self
+        // A reaction derived while applying the published transaction can extend the C++ pass
+        // beyond the region whose facts this transaction prepared. Keep using the shared batch
+        // for covered nodes, but let an unprepared node take the exact adaptive path below.
+        let prepared_batch_contains_node = self
             .batch_matching_traversal
             .as_ref()
-            .is_some_and(|traversal| traversal.batch.is_some())
-        {
+            .and_then(|traversal| traversal.batch.as_ref())
+            .is_some_and(|batch| batch.row_of(node).is_some());
+        if prepared_batch_contains_node {
             // The box moves out of its slot so its fields can be borrowed while `self` stays
             // mutably borrowable; what moves is one pointer, not the batch.
             let mut held_traversal = self.batch_matching_traversal.take().unwrap();
@@ -370996,6 +371082,30 @@ fn scoped_planning_does_not_prepare_a_complete_matching_batch() {
         engine.counters().get(Counter::PreparedMatchingBatchRowsCloned),
         cloned_before
     );
+}
+
+#[test]
+fn a_prepared_fact_batch_falls_back_for_an_unprepared_node() {
+    let (mut engine, nodes) = nested_document();
+    let target = StyleAtomID(201);
+    add_target_rule(&mut engine, StyleSheetObjectID(1), target);
+    add_feature(&mut engine, nodes[2], LocalFeatureKey::Class(target));
+    discard_transaction(&mut engine);
+
+    let mut facts = StyleNodeFacts::new();
+    engine.facts.materialize([nodes[1]].into_iter(), &mut facts);
+    let batch: MatchingFactBatch = facts.into();
+    engine
+        .memory
+        .reserve_required(MemoryCategory::BatchScratch, batch.capacity_bytes());
+    let mut prepared = PreparedBatchMatchingTraversal::new(nodes[0]);
+    prepared.batch = Some(batch);
+    engine.prepared_batch_matching_traversal = Some(prepared);
+
+    engine.begin_adaptive_cold_matching_batch(nodes[0]);
+    assert_eq!(engine.match_element(nodes[2]).unwrap().len(), 1);
+    engine.end_cold_matching_batch();
+    assert_eq!(engine.memory().bytes_in_category(MemoryCategory::BatchScratch), 0);
 }
 
 #[test]
@@ -622622,115 +622732,3 @@ def main():
         "build", help="Compiles the target binaries", parents=[preset_parser, compiler_parser, target_parser]
     )
     build_parser.add_argument(
-        "args", nargs=argparse.REMAINDER, help="Additional arguments passed through to the build system"
-    )
-
-    test_parser = subparsers.add_parser(
-        "test", help="Runs the unit tests on the build host", parents=[preset_parser, compiler_parser]
-    )
-    test_parser.add_argument(
-        "pattern", nargs=argparse.OPTIONAL, help="Limits the tests that are run to those that match the regex pattern"
-    )
-
-    run_parser = subparsers.add_parser(
-        "run", help="Runs the application on the build host", parents=[preset_parser, compiler_parser, target_parser]
-    )
-    run_parser.add_argument(
-        "args", nargs=argparse.REMAINDER, help="Additional arguments passed through to the application"
-    )
-
-    debug_parser = subparsers.add_parser(
-        "debug",
-        help="Launches the application on the build host in a gdb or lldb session",
-        parents=[preset_parser, compiler_parser, target_parser],
-    )
-    debug_parser.add_argument("--debugger", required=False, default=platform.default_debugger())
-    debug_parser.add_argument(
-        "-cmd", action="append", required=False, default=[], help="Additional commands passed through to the debugger"
-    )
-    debug_parser.add_argument(
-        "args", nargs=argparse.REMAINDER, help="Additional arguments passed through to the build system"
-    )
-
-    profile_parser = subparsers.add_parser(
-        "profile",
-        help="Launches the application under callgrind for performance profiling",
-        parents=[preset_parser, compiler_parser, target_parser],
-    )
-    profile_parser.add_argument(
-        "args", nargs=argparse.REMAINDER, help="Additional arguments passed through to the application"
-    )
-
-    install_parser = subparsers.add_parser(
-        "install", help="Installs the target binary", parents=[preset_parser, compiler_parser, target_parser]
-    )
-
-    install_parser.add_argument(
-        "args", nargs=argparse.REMAINDER, help="Additional arguments passed through to the build system"
-    )
-
-    vcpkg_parser = subparsers.add_parser(
-        "vcpkg", help="Ensure that dependencies are available", parents=[preset_parser]
-    )
-    vcpkg_parser.add_argument("--jobs", "-j", required=False)
-
-    subparsers.add_parser("clean", help="Cleans the build environment", parents=[preset_parser])
-
-    rebuild_parser = subparsers.add_parser(
-        "rebuild",
-        help="Cleans the build environment and compiles the target binaries",
-        parents=[preset_parser, compiler_parser, target_parser],
-    )
-    rebuild_parser.add_argument(
-        "args", nargs=argparse.REMAINDER, help="Additional arguments passed through to the build system"
-    )
-
-    addr2line_parser = subparsers.add_parser(
-        "addr2line",
-        help="Resolves the addresses in the target binary to a file:line",
-        parents=[preset_parser, compiler_parser, target_parser],
-    )
-    addr2line_parser.add_argument("--program", required=False, default=platform.default_symbolizer())
-    addr2line_parser.add_argument("addresses", nargs=argparse.REMAINDER)
-
-    args = parser.parse_args()
-
-    if not args.command:
-        parser.print_help()
-        sys.exit(1)
-
-    if platform.host_system != HostSystem.Windows and os.geteuid() == 0:
-        print("Do not run ladybird.py as root, your Build directory will become root-owned", file=sys.stderr)
-        sys.exit(1)
-    elif platform.host_system == HostSystem.Windows and "VCINSTALLDIR" not in os.environ:
-        print("ladybird.py must be run from a Visual Studio enabled environment", file=sys.stderr)
-        sys.exit(1)
-
-    if "target" in args:
-        if platform.host_system != HostSystem.Windows and args.target == "ladybird":
-            args.target = "Ladybird"
-        if not args.target and args.command not in ("build", "rebuild"):
-            args.target = "ladybird" if platform.host_system == HostSystem.Windows else "Ladybird"
-
-    if args.command == "build":
-        build_dir = configure_main(platform, args.preset, args.cc, args.cxx, args.jobs, args.gui)
-        build_main(build_dir, args.jobs, args.target, args.args)
-    elif args.command == "test":
-        build_dir = configure_main(platform, args.preset, args.cc, args.cxx, args.jobs, args.gui)
-        build_main(build_dir, args.jobs)
-        test_main(build_dir, args.preset, args.pattern)
-    elif args.command == "run":
-        if args.preset == "Sanitizer":
-            # FIXME: Find some way to centralize these b/w CMakePresets.json, CI files, Documentation and here.
-            os.environ["ASAN_OPTIONS"] = os.environ.get(
-                "ASAN_OPTIONS",
-                "strict_string_checks=1:check_initialization_order=1:strict_init_order=1:"
-                "detect_stack_use_after_return=1:allocator_may_return_null=1",
-            )
-            os.environ["UBSAN_OPTIONS"] = os.environ.get(
-                "UBSAN_OPTIONS", "print_stacktrace=1:print_summary=1:halt_on_error=1"
-            )
-        build_dir = configure_main(platform, args.preset, args.cc, args.cxx, args.jobs, args.gui)
-        build_main(build_dir, args.jobs, args.target)
-        run_main(platform.host_system, build_dir, args.target, args.args)
-    elif args.command == "debug":
