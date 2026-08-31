@@ -488134,6 +488134,7 @@ FILE: Libraries/LibWeb/Animations/Animation.cpp
 #include <LibWeb/Animations/AnimationPlaybackEvent.h>
 #include <LibWeb/Animations/BindingsGlue.h>
 #include <LibWeb/Animations/DocumentTimeline.h>
+#include <LibWeb/Animations/KeyframeEffect.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/CSS/CSSAnimation.h>
@@ -488504,6 +488505,16 @@ void Animation::calculate_auto_aligned_start_time()
 // https://www.w3.org/TR/web-animations-1/#animation-current-time
 Optional<TimeValue> Animation::current_time() const
 {
+    return current_time_at(m_timeline ? m_timeline->current_time() : Optional<TimeValue> {});
+}
+
+Optional<TimeValue> Animation::current_time_for_observation() const
+{
+    return current_time_at(m_timeline ? m_timeline->current_time_for_observation() : Optional<TimeValue> {});
+}
+
+Optional<TimeValue> Animation::current_time_at(Optional<TimeValue> timeline_time) const
+{
     // The current time is calculated from the first matching condition from below:
 
     // -> If the animation’s hold time is resolved,
@@ -488516,7 +488527,7 @@ Optional<TimeValue> Animation::current_time() const
     //    - the animation has no associated timeline, or
     //    - the associated timeline is inactive, or
     //    - the animation’s start time is unresolved.
-    if (!m_timeline || m_timeline->is_inactive() || !m_start_time.has_value()) {
+    if (!m_timeline || !timeline_time.has_value() || !m_start_time.has_value()) {
         // The current time is an unresolved time value.
         return {};
     }
@@ -488525,7 +488536,13 @@ Optional<TimeValue> Animation::current_time() const
     //    current time = (timeline time - start time) × playback rate
     //    Where timeline time is the current time value of the associated timeline. The playback rate value is defined
     //    in §4.4.15 Speed control.
-    return (m_timeline->current_time().value() - m_start_time.value()) * playback_rate();
+    return (timeline_time.value() - m_start_time.value()) * playback_rate();
+}
+
+NullableCSSNumberish Animation::current_time_for_bindings() const
+{
+    update_style_if_needed();
+    return NullableCSSNumberish::from_optional_css_numberish_time(current_time_for_observation());
 }
 
 // https://www.w3.org/TR/web-animations-1/#animation-set-the-current-time
@@ -488609,6 +488626,11 @@ void Animation::update_style_if_needed() const
 
 AnimationPlayState Animation::play_state() const
 {
+    return play_state_at(current_time());
+}
+
+AnimationPlayState Animation::play_state_at(Optional<TimeValue> current_time) const
+{
     // The play state of animation, animation, at a given moment is the state corresponding to the first matching
     // condition from the following:
 
@@ -488616,7 +488638,6 @@ AnimationPlayState Animation::play_state() const
     //    - The current time of animation is unresolved, and
     //    - the start time of animation is unresolved, and
     //    - animation does not have either a pending play task or a pending pause task,
-    auto current_time = this->current_time();
     if (!current_time.has_value() && !m_start_time.has_value() && !pending()) {
         // → idle
         return AnimationPlayState::Idle;
@@ -488649,7 +488670,7 @@ AnimationPlayState Animation::play_state_for_bindings()
     if (auto owning_element = this->owning_element(); owning_element.has_value())
         owning_element->document().update_style();
 
-    return play_state();
+    return play_state_at(current_time_for_observation());
 }
 
 bool Animation::pending_for_bindings() const
@@ -488664,9 +488685,18 @@ GC::Ref<WebIDL::Promise> Animation::ready_for_bindings() const
     return ready();
 }
 
-GC::Ref<WebIDL::Promise> Animation::finished_for_bindings() const
+GC::Ref<WebIDL::Promise> Animation::finished_for_bindings()
 {
     update_style_if_needed();
+    auto observed_timeline_time = m_timeline ? m_timeline->current_time_for_observation() : Optional<TimeValue> {};
+    auto observed_current_time = current_time_at(observed_timeline_time);
+    if (m_timeline
+        && !m_is_finished
+        && play_state_at(current_time()) != AnimationPlayState::Finished
+        && play_state_at(observed_current_time) == AnimationPlayState::Finished) {
+        AnimationTimeline::CurrentTimeOverrideScope current_time_override_scope { *m_timeline, observed_timeline_time };
+        update_finished_state(DidSeek::No, SynchronouslyNotify::Yes, ShouldInvalidate::No, observed_current_time);
+    }
     return finished();
 }
 
@@ -489294,8 +489324,26 @@ void Animation::update()
 
     // Prevent unnecessary work if the animation is already finished and can't exit the finished state due to timeline
     // changes
-    if (!m_is_finished || !m_timeline->is_monotonically_increasing())
-        update_finished_state(DidSeek::No, SynchronouslyNotify::Yes);
+    if (!m_is_finished || !m_timeline->is_monotonically_increasing()) {
+        bool was_finished = m_is_finished;
+        update_finished_state(DidSeek::No, SynchronouslyNotify::Yes, ShouldInvalidate::No);
+        if (play_state() == AnimationPlayState::Running && m_effect && is<KeyframeEffect>(*m_effect)) {
+            auto& effect = static_cast<KeyframeEffect&>(*m_effect);
+            bool output_is_constant_before_active_start = !pending()
+                && effect.is_in_the_before_phase()
+                && m_timeline
+                && m_timeline->is_monotonically_increasing()
+                && playback_rate() > 0;
+            if (effect.can_skip_per_frame_style_update()) {
+                if (auto target = effect.target())
+                    target->document().note_throttled_animation_style_update();
+            } else if (!pending() && !output_is_constant_before_active_start) {
+                invalidate_effect();
+            }
+        } else if (m_is_finished != was_finished) {
+            invalidate_effect();
+        }
+    }
 
     // Act on the pending play or pause task
     if (m_pending_play_task == TaskState::Scheduled && is_ready()) {
@@ -489306,6 +489354,23 @@ void Animation::update()
     if (m_pending_pause_task == TaskState::Scheduled && is_ready_to_run_pending_pause_task()) {
         m_pending_pause_task = TaskState::None;
         run_pending_pause_task();
+    }
+
+    if (play_state() == AnimationPlayState::Running && !pending() && m_effect && is<KeyframeEffect>(*m_effect)) {
+        auto& effect = static_cast<KeyframeEffect&>(*m_effect);
+        if (effect.is_in_the_before_phase()
+            && m_timeline && m_timeline->is_monotonically_increasing()
+            && playback_rate() > 0
+            && effect.start_delay().type == TimeValue::Type::Milliseconds) {
+            auto animation_current_time = current_time();
+            if (animation_current_time.has_value() && animation_current_time->type == TimeValue::Type::Milliseconds) {
+                auto delay = (effect.start_delay().value - animation_current_time->value) / playback_rate();
+                if (delay > 0) {
+                    if (auto target = effect.target())
+                        target->document().schedule_animation_wakeup(delay);
+                }
+            }
+        }
     }
 }
 
@@ -489398,7 +489463,7 @@ WebIDL::ExceptionOr<void> Animation::silently_set_current_time(Optional<TimeValu
 }
 
 // https://www.w3.org/TR/web-animations-1/#update-an-animations-finished-state
-void Animation::update_finished_state(DidSeek did_seek, SynchronouslyNotify synchronously_notify, ShouldInvalidate should_invalidate)
+void Animation::update_finished_state(DidSeek did_seek, SynchronouslyNotify synchronously_notify, ShouldInvalidate should_invalidate, Optional<TimeValue> observed_current_time)
 {
     auto& realm = HTML::relevant_realm(relevant_global_object());
 
@@ -489408,11 +489473,11 @@ void Animation::update_finished_state(DidSeek did_seek, SynchronouslyNotify sync
     //
     // Note: This is required to accommodate timelines that may change direction. Without this definition, a once-
     //       finished animation would remain finished even when its timeline progresses in the opposite direction.
-    Optional<TimeValue> unconstrained_current_time;
-    if (did_seek == DidSeek::No) {
+    Optional<TimeValue> unconstrained_current_time = observed_current_time;
+    if (!unconstrained_current_time.has_value() && did_seek == DidSeek::No) {
         TemporaryChange change(m_hold_time, {});
         unconstrained_current_time = current_time();
-    } else {
+    } else if (!unconstrained_current_time.has_value()) {
         unconstrained_current_time = current_time();
     }
 
@@ -489749,8 +489814,12 @@ void Animation::invalidate_effect()
     if (!m_effect)
         return;
 
-    if (auto target = m_effect->target())
-        target->document().set_needs_animated_style_update();
+    if (!is<KeyframeEffect>(*m_effect))
+        return;
+
+    auto& effect = static_cast<KeyframeEffect&>(*m_effect);
+    if (auto target = effect.target())
+        target->document().set_needs_animated_style_update(effect);
 }
 
 Animation::Animation(HTML::EnvironmentSettingsObject& environment)
@@ -489902,12 +489971,10 @@ public:
     void calculate_auto_aligned_start_time();
 
     // https://drafts.csswg.org/web-animations-2/#dom-animation-currenttime
-    NullableCSSNumberish current_time_for_bindings() const
-    {
-        update_style_if_needed();
-        return NullableCSSNumberish::from_optional_css_numberish_time(current_time());
-    }
+    NullableCSSNumberish current_time_for_bindings() const;
     Optional<TimeValue> current_time() const;
+    Optional<TimeValue> current_time_for_observation() const;
+    Optional<TimeValue> current_time_at(Optional<TimeValue> timeline_time) const;
     virtual WebIDL::ExceptionOr<void> set_current_time_for_bindings(NullableCSSNumberish const&);
 
     double playback_rate() const { return m_playback_rate; }
@@ -489935,7 +490002,7 @@ public:
     }
 
     // https://www.w3.org/TR/web-animations-1/#dom-animation-finished
-    GC::Ref<WebIDL::Promise> finished_for_bindings() const;
+    GC::Ref<WebIDL::Promise> finished_for_bindings();
     GC::Ref<WebIDL::Promise> finished() const { return current_finished_promise(); }
     bool is_finished() const { return m_is_finished; }
 
@@ -490003,6 +490070,8 @@ protected:
     virtual void finalize() override;
 
 private:
+    AnimationPlayState play_state_at(Optional<TimeValue> current_time) const;
+
     virtual GC::Ptr<Bindings::Wrappable> relevant_global_impl() const override;
 
     enum class TaskState {
@@ -490026,7 +490095,7 @@ private:
 
     void apply_any_pending_playback_rate();
     WebIDL::ExceptionOr<void> silently_set_current_time(Optional<TimeValue>);
-    void update_finished_state(DidSeek, SynchronouslyNotify, ShouldInvalidate = ShouldInvalidate::Yes);
+    void update_finished_state(DidSeek, SynchronouslyNotify, ShouldInvalidate = ShouldInvalidate::Yes, Optional<TimeValue> observed_current_time = {});
     void reset_an_animations_pending_tasks();
 
     bool is_ready() const;
@@ -490147,10 +490216,12 @@ FILE: Libraries/LibWeb/Animations/AnimationEffect.cpp
  */
 
 #include <AK/Bitmap.h>
+#include <AK/ScopeGuard.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibWeb/Animations/Animation.h>
 #include <LibWeb/Animations/AnimationEffect.h>
 #include <LibWeb/Animations/AnimationTimeline.h>
+#include <LibWeb/Animations/KeyframeEffect.h>
 #include <LibWeb/Bindings/AnimationEffect.h>
 #include <LibWeb/CSS/CSSNumericValue.h>
 #include <LibWeb/CSS/ComputedStyleWorkingSet.h>
@@ -490260,6 +490331,14 @@ Bindings::EffectTiming AnimationEffect::get_timing() const
 Bindings::ComputedEffectTiming AnimationEffect::get_computed_timing() const
 {
     update_style_if_needed();
+
+    if (m_associated_animation) {
+        m_has_local_time_override_for_observation = true;
+        m_local_time_override_for_observation = m_associated_animation->current_time_for_observation();
+    }
+    ScopeGuard clear_local_time_override = [&] {
+        m_has_local_time_override_for_observation = false;
+    };
 
     // 1. Returns the calculated timing properties for this animation effect.
 
@@ -490504,6 +490583,9 @@ WebIDL::ExceptionOr<void> AnimationEffect::update_timing(Bindings::OptionalEffec
     // 6. Follow the procedure to normalize specified timing.
     normalize_specified_timing();
 
+    if (auto* keyframe_effect = as_if<KeyframeEffect>(*this))
+        keyframe_effect->clear_per_frame_style_update_cache();
+
     // AD-HOC: Notify the associated animation that the effect timing has changed.
     if (auto animation = m_associated_animation)
         animation->effect_timing_changed({});
@@ -490553,6 +490635,9 @@ TimeValue AnimationEffect::end_time() const
 // https://www.w3.org/TR/web-animations-1/#local-time
 Optional<TimeValue> AnimationEffect::local_time() const
 {
+    if (m_has_local_time_override_for_observation)
+        return m_local_time_override_for_observation;
+
     // The local time of an animation effect at a given moment is based on the first matching condition from the
     // following:
 
@@ -491063,6 +491148,12 @@ AnimationUpdateContext::~AnimationUpdateContext()
                 continue;
             effects_to_collect.append(effect);
         }
+        // A dirty effect may have just become irrelevant. Include it once so rebuilding the
+        // animated overlay removes its terminal contribution.
+        for (auto& dirty_effect : it.value.effects) {
+            if (!effects_to_collect.contains_slow(dirty_effect))
+                effects_to_collect.append(dirty_effect);
+        }
         if (!effects_to_collect.is_empty())
             target->document().style_computer().collect_animations_into(element, effects_to_collect.span(), *style, CSS::StyleComputer::AnimationRefresh::Yes);
         auto animated_properties_after_update = style->animated_properties_snapshot();
@@ -491381,6 +491472,9 @@ protected:
     // https://www.w3.org/TR/web-animations-1/#time-transformations
     CSS::EasingFunction m_timing_function { CSS::EasingFunction::linear() };
 
+    mutable bool m_has_local_time_override_for_observation { false };
+    mutable Optional<TimeValue> m_local_time_override_for_observation;
+
     // Used for calculating transitions in StyleComputer
     Phase m_previous_phase { Phase::Idle };
     double m_previous_current_iteration { 0.0 };
@@ -491576,11 +491670,29 @@ FILE: Libraries/LibWeb/Animations/AnimationTimeline.cpp
 
 #include <LibWeb/Animations/Animation.h>
 #include <LibWeb/Animations/AnimationTimeline.h>
+#include <LibWeb/Animations/KeyframeEffect.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/HTML/EventLoop/EventLoop.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HighResolutionTime/TimeOrigin.h>
 
 namespace Web::Animations {
 
 GC_DEFINE_ALLOCATOR(AnimationTimeline);
+
+AnimationTimeline::CurrentTimeOverrideScope::CurrentTimeOverrideScope(AnimationTimeline& timeline, Optional<TimeValue> current_time)
+    : m_timeline(timeline)
+    , m_previous_current_time_override(timeline.m_current_time_override_for_style_sampling)
+    , m_had_previous_current_time_override(timeline.m_has_current_time_override_for_style_sampling)
+{
+    m_timeline->set_current_time_override_for_style_sampling(move(current_time));
+}
+
+AnimationTimeline::CurrentTimeOverrideScope::~CurrentTimeOverrideScope()
+{
+    m_timeline->m_current_time_override_for_style_sampling = move(m_previous_current_time_override);
+    m_timeline->m_has_current_time_override_for_style_sampling = m_had_previous_current_time_override;
+}
 
 // https://drafts.csswg.org/web-animations-1/#dom-animationtimeline-currenttime
 Optional<TimeValue> AnimationTimeline::current_time() const
@@ -491588,7 +491700,47 @@ Optional<TimeValue> AnimationTimeline::current_time() const
     // Returns the current time for this timeline or null if this timeline is inactive.
     if (is_inactive())
         return {};
-    return m_current_time;
+    return effective_current_time();
+}
+
+NullableCSSNumberish AnimationTimeline::current_time_for_bindings()
+{
+    return NullableCSSNumberish::from_optional_css_numberish_time(current_time_for_observation());
+}
+
+Optional<TimeValue> AnimationTimeline::current_time_for_observation()
+{
+    if (!m_is_monotonically_increasing || !can_sample_current_time_at_timestamp())
+        return current_time();
+
+    bool has_animation_without_per_frame_tick = false;
+    for (auto const& animation : m_associated_animations) {
+        auto effect = animation.effect();
+        if (!effect || !is<KeyframeEffect>(*effect))
+            continue;
+        auto& keyframe_effect = static_cast<KeyframeEffect&>(*effect);
+        if (keyframe_effect.per_frame_animation_tick_was_skipped() || keyframe_effect.can_skip_per_frame_animation_tick()) {
+            has_animation_without_per_frame_tick = true;
+            break;
+        }
+    }
+    if (!has_animation_without_per_frame_tick)
+        return current_time();
+
+    auto& settings = associated_document()->relevant_settings_object();
+    auto task_generation = settings.responsible_event_loop().task_generation();
+    if (m_last_current_time_update_task_generation == task_generation)
+        return m_observed_current_time;
+
+    // OPTIMIZATION: An animation skipped by the per-frame sampler does not keep the rendering update loop alive.
+    //               Sample document timelines only when script observes them, and at most once per event-loop task
+    //               so all reads within a stable state agree.
+    auto timestamp = HighResolutionTime::relative_high_resolution_time(
+        HighResolutionTime::unsafe_shared_current_time(), settings.global_object());
+    m_observed_current_time = current_time_at_timestamp(timestamp);
+    m_last_current_time_update_task_generation = task_generation;
+    ++associated_document()->style_invalidation_counters().animation_timeline_synchronizations;
+    return m_observed_current_time;
 }
 
 void AnimationTimeline::set_current_time(Optional<TimeValue> value)
@@ -491599,6 +491751,8 @@ void AnimationTimeline::set_current_time(Optional<TimeValue> value)
     }
 
     m_current_time = value;
+    m_observed_current_time = value;
+    m_last_current_time_update_task_generation = associated_document()->relevant_settings_object().responsible_event_loop().task_generation();
 
     update_associated_animations();
 }
@@ -491612,8 +491766,16 @@ void AnimationTimeline::update_associated_animations()
     //   updated.
     // - Queueing animation events for any such animations.
     // NB: Since we dispatch events for all animations regardless of whether they have a timeline we handle them all together in Document::update_animations_and_send_events()
+    ++associated_document()->style_invalidation_counters().animation_timeline_associated_animation_updates;
     for (auto& animation : m_associated_animations)
         animation.update();
+}
+
+Optional<TimeValue> AnimationTimeline::effective_current_time() const
+{
+    if (m_has_current_time_override_for_style_sampling)
+        return m_current_time_override_for_style_sampling;
+    return m_current_time;
 }
 
 // https://drafts.csswg.org/web-animations-2/#timeline-duration
@@ -491632,7 +491794,7 @@ NullableCSSNumberish AnimationTimeline::duration_for_bindings() const
 bool AnimationTimeline::is_inactive() const
 {
     // A timeline is considered to be inactive when its time value is unresolved, and active otherwise.
-    return !m_current_time.has_value();
+    return !effective_current_time().has_value();
 }
 
 AnimationTimeline::AnimationTimeline(GC::Ref<DOM::Document> document)
@@ -491682,11 +491844,23 @@ class AnimationTimeline : public Bindings::GCAllocatedWrappable {
 public:
     static constexpr bool OVERRIDES_FINALIZE = true;
 
-    NullableCSSNumberish current_time_for_bindings() const
-    {
-        return NullableCSSNumberish::from_optional_css_numberish_time(current_time());
-    }
+    class CurrentTimeOverrideScope {
+    public:
+        CurrentTimeOverrideScope(AnimationTimeline&, Optional<TimeValue>);
+        ~CurrentTimeOverrideScope();
+
+        CurrentTimeOverrideScope(CurrentTimeOverrideScope const&) = delete;
+        CurrentTimeOverrideScope& operator=(CurrentTimeOverrideScope const&) = delete;
+
+    private:
+        GC::Ref<AnimationTimeline> m_timeline;
+        Optional<TimeValue> m_previous_current_time_override;
+        bool m_had_previous_current_time_override { false };
+    };
+
+    NullableCSSNumberish current_time_for_bindings();
     Optional<TimeValue> current_time() const;
+    Optional<TimeValue> current_time_for_observation();
 
     virtual void update_current_time(double timestamp) = 0;
 
@@ -491715,6 +491889,8 @@ protected:
 
     void set_current_time(Optional<TimeValue> value);
     void update_associated_animations();
+    virtual bool can_sample_current_time_at_timestamp() const { return false; }
+    virtual Optional<TimeValue> current_time_at_timestamp(double) const { return current_time(); }
 
     // https://www.w3.org/TR/web-animations-1/#dom-animationtimeline-currenttime
     Optional<TimeValue> m_current_time {};
@@ -491726,6 +491902,23 @@ protected:
     GC::Ref<DOM::Document> m_associated_document;
 
     GC::WeakHashSet<Animation> m_associated_animations;
+    Optional<u64> m_last_current_time_update_task_generation;
+    Optional<TimeValue> m_observed_current_time;
+
+private:
+    friend class DOM::Document;
+
+    void set_current_time_override_for_style_sampling(Optional<TimeValue> value)
+    {
+        m_current_time_override_for_style_sampling = move(value);
+        m_has_current_time_override_for_style_sampling = true;
+    }
+    void clear_current_time_override_for_style_sampling() { m_has_current_time_override_for_style_sampling = false; }
+
+    Optional<TimeValue> effective_current_time() const;
+
+    Optional<TimeValue> m_current_time_override_for_style_sampling;
+    bool m_has_current_time_override_for_style_sampling { false };
 };
 
 }
@@ -491840,6 +492033,13 @@ void DocumentTimeline::update_current_time(double timestamp)
         m_is_monotonically_increasing = true;
 }
 
+Optional<TimeValue> DocumentTimeline::current_time_at_timestamp(double timestamp) const
+{
+    if (is_inactive())
+        return {};
+    return TimeValue { TimeValue::Type::Milliseconds, timestamp - m_origin_time };
+}
+
 // https://www.w3.org/TR/web-animations-1/#document-timelines
 bool DocumentTimeline::is_inactive() const
 {
@@ -491901,6 +492101,10 @@ public:
     virtual Optional<double> convert_a_timeline_time_to_an_origin_relative_time(Optional<TimeValue>) override;
     virtual bool can_convert_a_timeline_time_to_an_origin_relative_time() const override { return true; }
 
+protected:
+    virtual bool can_sample_current_time_at_timestamp() const override { return true; }
+    virtual Optional<TimeValue> current_time_at_timestamp(double) const override;
+
 private:
     DocumentTimeline(DOM::Document&, HighResolutionTime::DOMHighResTimeStamp origin_time);
     virtual ~DocumentTimeline() override = default;
@@ -491934,6 +492138,7 @@ FILE: Libraries/LibWeb/Animations/KeyframeEffect.cpp
 #include <LibGC/Heap.h>
 #include <LibJS/Runtime/Iterator.h>
 #include <LibWeb/Animations/Animation.h>
+#include <LibWeb/Animations/AnimationTimeline.h>
 #include <LibWeb/Animations/KeyframeEffect.h>
 #include <LibWeb/Animations/PseudoElementParsing.h>
 #include <LibWeb/Bindings/KeyframeEffect.h>
@@ -491945,7 +492150,11 @@ FILE: Libraries/LibWeb/Animations/KeyframeEffect.cpp
 #include <LibWeb/ComputedValuesRustFFI.h>
 #include <LibWeb/DOM/AbstractElement.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/DOM/Slot.h>
+#include <LibWeb/HTML/EventNames.h>
+#include <LibWeb/HTML/HTMLSlotElement.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HTML/Window.h>
 #include <LibWeb/Layout/Node.h>
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
@@ -492938,8 +493147,9 @@ KeyframeEffect::KeyframeEffect() = default;
 
 void KeyframeEffect::invalidate_effect()
 {
+    m_can_skip_per_frame_style_update_cache.clear();
     if (m_target_element)
-        m_target_element->document().set_needs_animated_style_update();
+        m_target_element->document().set_needs_animated_style_update(*this);
 }
 
 void KeyframeEffect::visit_edges(GC::Cell::Visitor& visitor)
@@ -492947,6 +493157,130 @@ void KeyframeEffect::visit_edges(GC::Cell::Visitor& visitor)
     Base::visit_edges(visitor);
     visitor.visit(m_target_element);
     visitor.visit(m_keyframe_objects_cache);
+}
+
+bool KeyframeEffect::can_skip_per_frame_style_update() const
+{
+    auto target = this->target();
+    auto cache_result = [&](bool result) {
+        if (target && target->document().layout_is_up_to_date()) {
+            m_can_skip_per_frame_style_update_cache = CanSkipPerFrameStyleUpdateCache {
+                .target_style_generation = target->animation_style_generation(),
+                .target_subtree_style_generation = target->animation_subtree_style_generation(),
+                .target_is_connected = target->is_connected(),
+                .layout_node = target->unsafe_layout_node(),
+                .result = result,
+            };
+        }
+        return result;
+    };
+    if (target && target->document().layout_is_up_to_date()) {
+        auto const* layout_node = target->unsafe_layout_node();
+        if (m_can_skip_per_frame_style_update_cache.has_value()
+            && m_can_skip_per_frame_style_update_cache->target_style_generation == target->animation_style_generation()
+            && m_can_skip_per_frame_style_update_cache->target_subtree_style_generation == target->animation_subtree_style_generation()
+            && m_can_skip_per_frame_style_update_cache->target_is_connected == target->is_connected()
+            && m_can_skip_per_frame_style_update_cache->layout_node == layout_node) {
+            ++target->document().style_invalidation_counters().animation_style_skip_cache_hits;
+            return m_can_skip_per_frame_style_update_cache->result;
+        }
+        if (m_can_skip_per_frame_style_update_cache.has_value())
+            ++target->document().style_invalidation_counters().animation_style_skip_cache_misses;
+    }
+
+    // INTEROP: Other engines suppress main-thread style sampling for invisible transform animations. Restrict this
+    // optimization to the infinite transform-only case until animation overflow updates can also be throttled safely.
+    if (!isinf(iteration_count()) || pseudo_element_type().has_value())
+        return cache_result(false);
+
+    if (!target)
+        return false;
+    if (!target->is_connected())
+        return cache_result(true);
+    if (target->namespace_uri() == Namespace::SVG)
+        return cache_result(false);
+
+    bool has_animated_property = false;
+    auto const* key_frame_set = m_key_frame_set.ptr();
+    if (!key_frame_set)
+        return false;
+    for (auto const& keyframe : key_frame_set->keyframes_by_key) {
+        for (auto const& property : keyframe.properties) {
+            has_animated_property = true;
+            if (!first_is_one_of(property.key,
+                    CSS::PropertyID::Transform,
+                    CSS::PropertyID::Translate,
+                    CSS::PropertyID::Rotate,
+                    CSS::PropertyID::Scale))
+                return cache_result(false);
+        }
+    }
+    if (!has_animated_property)
+        return cache_result(false);
+
+    if (!target->document().layout_is_up_to_date())
+        return false;
+    auto const* layout_node = target->unsafe_layout_node();
+    if (!layout_node || layout_node->visibility() != CSS::Visibility::Hidden)
+        return cache_result(false);
+
+    bool has_visible_descendant = false;
+    layout_node->for_each_in_inclusive_subtree_of_type<Layout::NodeWithStyle>([&](auto const& descendant) {
+        if (descendant.visibility() != CSS::Visibility::Visible)
+            return TraversalDecision::Continue;
+        has_visible_descendant = true;
+        return TraversalDecision::Break;
+    });
+    if (has_visible_descendant)
+        return cache_result(false);
+
+    return cache_result(true);
+}
+
+bool KeyframeEffect::can_skip_per_frame_animation_tick() const
+{
+    if (auto animation = associated_animation(); animation && !animation->pending()
+        && animation->play_state() == Bindings::AnimationPlayState::Running
+        && animation->playback_rate() > 0
+        && animation->timeline() && animation->timeline()->is_monotonically_increasing()
+        && is_in_the_before_phase())
+        return true;
+
+    if (!can_skip_per_frame_style_update())
+        return false;
+
+    // An infinite effect cannot reach its natural end, so animationend listeners do not require a continuous tick.
+    auto has_css_animation_event_listener_requiring_animation_tick = [](DOM::EventTarget const& event_target) {
+        return event_target.has_event_listener(HTML::EventNames::animationcancel)
+            || event_target.has_event_listener(HTML::EventNames::animationiteration)
+            || event_target.has_event_listener(HTML::EventNames::animationstart)
+            || event_target.has_event_listener(HTML::EventNames::webkitAnimationIteration)
+            || event_target.has_event_listener(HTML::EventNames::webkitAnimationStart);
+    };
+
+    auto target = this->target();
+    VERIFY(target);
+    for (auto* node = static_cast<DOM::Node*>(target.ptr()); node;) {
+        if (has_css_animation_event_listener_requiring_animation_tick(*node))
+            return false;
+        if (auto assigned_slot = DOM::assigned_slot_for_node(*node))
+            node = assigned_slot.ptr();
+        else
+            node = node->parent_or_shadow_host();
+    }
+    if (auto window = target->document().window(); window && has_css_animation_event_listener_requiring_animation_tick(*window))
+        return false;
+
+    return true;
+}
+
+void KeyframeEffect::request_observation_sample()
+{
+    if (m_needs_observation_sample)
+        return;
+    m_needs_observation_sample = true;
+    if (m_target_element)
+        m_target_element->document().set_needs_animated_style_update(*this);
 }
 
 void KeyframeEffect::update_computed_properties(AnimationUpdateContext& context)
@@ -493191,6 +493525,23 @@ public:
 
     virtual bool is_keyframe_effect() const override { return true; }
 
+    bool can_skip_per_frame_style_update() const;
+    void clear_per_frame_style_update_cache() { m_can_skip_per_frame_style_update_cache.clear(); }
+    bool can_skip_per_frame_animation_tick() const;
+    void request_observation_sample();
+    bool request_element_scoped_observation_sample(u64 task_generation)
+    {
+        if (m_last_element_scoped_observation_sample_task_generation == task_generation)
+            return false;
+        m_last_element_scoped_observation_sample_task_generation = task_generation;
+        request_observation_sample();
+        return true;
+    }
+    bool observation_sample_requested() const { return m_needs_observation_sample; }
+    bool consume_observation_sample_request() { return exchange(m_needs_observation_sample, false); }
+    bool per_frame_animation_tick_was_skipped() const { return m_per_frame_animation_tick_was_skipped; }
+    void note_per_frame_animation_tick_was_skipped() { m_per_frame_animation_tick_was_skipped = true; }
+    void clear_per_frame_animation_tick_was_skipped() { m_per_frame_animation_tick_was_skipped = false; }
     virtual void update_computed_properties(AnimationUpdateContext&) override;
     void update_computed_properties_for_style(AnimationUpdateContext&, DOM::AbstractElement);
 
@@ -493218,6 +493569,17 @@ private:
     Vector<GC::Ref<JS::Object>> m_keyframe_objects_cache {};
 
     RefPtr<KeyFrameSet const> m_key_frame_set {};
+    bool m_needs_observation_sample { false };
+    struct CanSkipPerFrameStyleUpdateCache {
+        u64 target_style_generation { 0 };
+        u64 target_subtree_style_generation { 0 };
+        bool target_is_connected { false };
+        Layout::Node const* layout_node { nullptr };
+        bool result { false };
+    };
+    mutable Optional<CanSkipPerFrameStyleUpdateCache> m_can_skip_per_frame_style_update_cache;
+    Optional<u64> m_last_element_scoped_observation_sample_task_generation;
+    bool m_per_frame_animation_tick_was_skipped { false };
 };
 
 WebIDL::ExceptionOr<Vector<BaseKeyframe>> process_keyframes(JS::Realm&, GC::Ptr<JS::Object>);
@@ -555167,7 +555529,7 @@ static Optional<Layout::NodeWithStyle*> prepare_computed_style_and_layout_for_pr
     if (needs_layout || needs_layout_node) {
         // Properties that need layout computation or layout node for special resolution
         // always need update_layout() to ensure both style and layout tree are up to date.
-        abstract_element.document().update_layout(DOM::UpdateLayoutReason::ResolvedCSSStyleDeclarationProperty);
+        abstract_element.document().update_layout_if_needed_for_node(abstract_element.element(), DOM::UpdateLayoutReason::ResolvedCSSStyleDeclarationProperty);
         layout_node = abstract_element.layout_node();
     }
     // Ensure styles are up to date. update_layout()/update_style() skip display:none subtrees,
@@ -555195,7 +555557,7 @@ static Optional<Layout::NodeWithStyle*> prepare_computed_style_and_layout_for_pr
     bool const needs_layout_for_container_queries = style_or_inheritance_ancestor_depends_on_size_container_query
         && !abstract_element.document().layout_is_up_to_date();
     if (needs_layout_for_container_queries) {
-        abstract_element.document().update_layout(DOM::UpdateLayoutReason::ResolvedCSSStyleDeclarationProperty);
+        abstract_element.document().update_layout_if_needed_for_node(abstract_element.element(), DOM::UpdateLayoutReason::ResolvedCSSStyleDeclarationProperty);
         layout_node = abstract_element.layout_node();
         // A synthetic pseudo which is not rendered is not part of the layout-driven pseudo
         // recomputation above. Refresh its CSSOM-only style against the settled container size.
@@ -579333,7 +579695,10 @@ public:
 
     CSSPixels to_px(CSSPixels reference_value) const
     {
-        return resolved(reference_value).absolute_length_to_px();
+        if (!is_calculated())
+            return resolved(reference_value).absolute_length_to_px();
+        auto resolved_length = calculated()->resolve_length({ .percentage_basis = Length::make_px(reference_value) }).value();
+        return CSSPixels::truncated_value_for(resolved_length.absolute_length_to_px_without_rounding());
     }
 
     Length resolved(CSSPixels reference_value) const
@@ -588187,7 +588552,7 @@ public:
     {
         if (!value.pointer)
             return 0;
-        return length_percentage().resolved(reference_value).absolute_length_to_px();
+        return length_percentage().to_px(reference_value);
     }
 
     bool contains_percentage() const
@@ -616626,6 +616991,10 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
         bool const was_unstyled = !previous_style_record;
         auto const* previous_box_values = element->style_group<ComputedValues::BoxValues>();
         bool const was_display_none = previous_box_values && display_from_ffi_display(previous_box_values->display).is_none();
+        auto const* previous_inherited_box_values = element->style_group<ComputedValues::InheritedBoxValues>();
+        auto const previous_visibility = previous_inherited_box_values
+            ? Optional<Visibility> { static_cast<Visibility>(previous_inherited_box_values->visibility) }
+            : Optional<Visibility> {};
         bool const needs_regular_style_recompute = reaction.reaction & (StyleEngine::PublishedStyle | StyleEngine::RecomputeStyle | StyleEngine::RecomputeDescendantStyles | StyleEngine::AncestorBecameVisible);
         bool const needs_custom_property_recompute = reaction.reaction & StyleEngine::InheritedCustomProperties;
         bool const needs_inherited_style_recompute = reaction.reaction & StyleEngine::InheritedStyle;
@@ -616698,6 +617067,12 @@ static RequiredInvalidationAfterStyleChange apply_style_engine_reactions(DOM::Do
         } else if (needs_custom_property_recompute && element->refresh_inherited_custom_property_data()) {
             did_change_custom_properties = true;
             element->invalidate_descendant_styles_depending_on_style_container_query();
+        }
+
+        auto const* current_inherited_box_values = element->style_group<ComputedValues::InheritedBoxValues>();
+        if (previous_visibility.has_value() && current_inherited_box_values
+            && *previous_visibility != static_cast<Visibility>(current_inherited_box_values->visibility)) {
+            document.throttled_animation_visibility_changed();
         }
 
         if (!invalidation.is_none() || did_change_custom_properties || ancestor_became_visible)
@@ -616829,7 +617204,7 @@ static void update_style(DOM::Document& document)
     record_non_author_stylesheets(document);
     if (document.has_completed_style_update()
         && !document.style_computer().style_engine().has_pending_transaction()) {
-        document.update_animated_style_if_needed();
+        document.sample_animation_effects_needing_style_update();
         if (!document.style_computer().style_engine().has_pending_transaction())
             return;
     }
@@ -616846,7 +617221,7 @@ static void update_style(DOM::Document& document)
 
     if (!style_engine_transaction.reactions.is_empty())
         document.note_style_stabilization_has_style_reactions();
-    document.update_animated_style_if_needed();
+    document.sample_animation_effects_needing_style_update();
 
     auto style_engine_reactions = move(style_engine_transaction.reactions);
     auto prefers_broad_matching_batch = style_engine_transaction.prefers_broad_matching_batch;
@@ -617007,7 +617382,7 @@ static void update_style(DOM::Document& document)
 
     document.set_has_completed_style_update();
     apply_document_style_invalidation_after_style_change(document, invalidation);
-    document.update_animated_style_if_needed();
+    document.sample_animation_effects_needing_style_update();
 }
 
 static void apply_targeted_style_invalidation(DOM::Element& element, RequiredInvalidationAfterStyleChange const& invalidation, bool did_change_custom_properties, bool descendant_style_recompute_needed, Optional<StyleNodeID> child_materialized_by_targeted_update)
@@ -617162,7 +617537,7 @@ static bool update_style_for_element(DOM::Document& document, DOM::AbstractEleme
             update_style(document);
             ran_regular_style_update = true;
         } else {
-            document.update_animated_style_if_needed();
+            document.sample_animation_effects_needing_style_update();
             if (!document.is_running_update_layout()
                 && document.style_computer().style_engine().has_pending_transaction()) {
                 update_style(document);
@@ -617272,11 +617647,13 @@ void Document::update_style()
 
 bool Document::update_style_for_element(AbstractElement const& abstract_element)
 {
+    flush_throttled_animation_style_update_for_node(abstract_element.element());
     return CSS::update_style_for_element(*this, abstract_element, StyleUpdateMode::Normal);
 }
 
 bool Document::update_style_for_element(AbstractElement const& abstract_element, StyleUpdateMode mode)
 {
+    flush_throttled_animation_style_update_for_node(abstract_element.element());
     return CSS::update_style_for_element(*this, abstract_element, mode);
 }
 
@@ -621323,6 +621700,7 @@ void Document::record_layout_tree_build(u64 rebuilt_subtree_root_count, bool esc
 
 void Document::finalize()
 {
+    stop_animation_wakeup_timer();
     if (m_layout_node_arena)
         Layout::RustFFI::layout_arena_clear_chrome_state_callback(m_layout_node_arena->handle());
     CSS::ComputedValuesFFI::rust_custom_property_registry_destroy(m_rust_custom_property_registry);
@@ -622682,6 +623060,9 @@ void Document::update_layout_if_needed_for_node(Node const& node, UpdateLayoutRe
     if (!node.is_connected())
         return;
 
+    if (reason != UpdateLayoutReason::HTMLEventLoopRenderingUpdate)
+        flush_throttled_animation_style_update_for_node(node);
+
     auto* document_element = this->document_element();
     auto const may_have_style_query_dependencies = document_element && document_element->is_style_query_container();
     auto const reads_layout_geometry = reason == UpdateLayoutReason::ElementGetClientRects
@@ -622735,7 +623116,7 @@ void Document::update_layout_if_needed_for_node(Node const& node, UpdateLayoutRe
         }
     }
 
-    update_layout(reason);
+    update_layout(reason, ThrottledAnimationSamplingScope::Element);
 }
 
 void Document::flush_deferred_style_change_event()
@@ -622967,9 +623348,17 @@ Document::PartialRelayoutResult Document::try_partial_relayout(HashTable<WeakPtr
 
 void Document::update_layout(UpdateLayoutReason reason)
 {
+    update_layout(reason, ThrottledAnimationSamplingScope::Document);
+}
+
+void Document::update_layout(UpdateLayoutReason reason, ThrottledAnimationSamplingScope animation_sampling_scope)
+{
     auto navigable = this->navigable();
     if (!navigable || navigable->active_document().ptr() != this)
         return;
+
+    if (reason != UpdateLayoutReason::HTMLEventLoopRenderingUpdate && animation_sampling_scope == ThrottledAnimationSamplingScope::Document)
+        flush_throttled_animation_style_update();
 
     VERIFY(!m_is_running_update_layout);
     m_is_running_update_layout = true;
@@ -623252,24 +623641,58 @@ void Document::invalidate_style_for_viewport_change()
     });
 }
 
-void Document::update_animated_style_if_needed()
+void Document::sample_animation_effects_needing_style_update()
 {
     if (!m_needs_animated_style_update)
         return;
 
-    Animations::AnimationUpdateContext context;
+    VERIFY(!m_is_updating_animated_style);
+    m_is_updating_animated_style = true;
+    ScopeGuard clear_is_updating_animated_style = [&] {
+        finish_animated_style_update();
+    };
 
     GC::RootVector<GC::Ref<Animations::Animation>> animations;
-
-    for (auto& animation : m_associated_animations) {
-        if (animation.is_idle())
-            continue;
-
-        if (!animation.effect())
-            continue;
-
-        animations.append(animation);
+    if (m_force_throttled_animation_style_update) {
+        for (auto& animation : m_associated_animations) {
+            if (animation.is_idle() || !animation.effect() || !is<Animations::KeyframeEffect>(*animation.effect()))
+                continue;
+            animations.append(animation);
+        }
+    } else {
+        for (auto& effect : m_effects_needing_animated_style_update) {
+            auto animation = effect.associated_animation();
+            if (!animation || animation->is_idle())
+                continue;
+            animations.append(*animation);
+        }
     }
+    m_effects_needing_animated_style_update.clear();
+    m_needs_animated_style_update = false;
+
+    if (animations.is_empty()) {
+        m_force_throttled_animation_style_update = false;
+        m_has_throttled_animation_style_update = false;
+        return;
+    }
+
+    bool has_requested_observation_sample = any_of(animations, [](auto const& animation) {
+        return as_if<Animations::KeyframeEffect>(*animation->effect())->observation_sample_requested();
+    });
+
+    GC::RootVector<GC::Ref<Animations::AnimationTimeline>> timelines_with_current_time_override;
+    if (m_force_throttled_animation_style_update || has_requested_observation_sample) {
+        for (auto& timeline : m_associated_animation_timelines)
+            timelines_with_current_time_override.append(timeline);
+        for (auto& timeline : timelines_with_current_time_override)
+            timeline->set_current_time_override_for_style_sampling(timeline->current_time_for_observation());
+    }
+    ScopeGuard clear_current_time_overrides = [&] {
+        for (auto& timeline : timelines_with_current_time_override)
+            timeline->clear_current_time_override_for_style_sampling();
+    };
+
+    Animations::AnimationUpdateContext context;
 
     quick_sort(animations, [](GC::Ref<Animations::Animation>& a, GC::Ref<Animations::Animation>& b) {
         auto& a_effect = as<Animations::KeyframeEffect>(*a->effect());
@@ -623277,14 +623700,135 @@ void Document::update_animated_style_if_needed()
         return Animations::KeyframeEffect::composite_order(a_effect, b_effect) < 0;
     });
 
-    for (auto& animation : animations)
+    bool has_throttled_animation_style_update = m_force_throttled_animation_style_update ? false : m_has_throttled_animation_style_update;
+    for (auto& animation : animations) {
+        auto& effect = *as_if<Animations::KeyframeEffect>(*animation->effect());
+        bool observation_sample_requested = effect.consume_observation_sample_request();
+        if (effect.can_skip_per_frame_style_update()) {
+            has_throttled_animation_style_update = true;
+            if (!m_force_throttled_animation_style_update && !observation_sample_requested)
+                continue;
+        }
         animation->effect()->update_computed_properties(context);
+    }
 
-    m_needs_animated_style_update = false;
+    m_has_throttled_animation_style_update = has_throttled_animation_style_update;
+    if (m_force_throttled_animation_style_update)
+        m_last_forced_throttled_animation_style_update_task_generation = relevant_settings_object().responsible_event_loop().task_generation();
+    m_force_throttled_animation_style_update = false;
 }
 
-void Document::set_needs_animated_style_update()
+void Document::flush_throttled_animation_style_update()
 {
+    if (!m_has_throttled_animation_style_update)
+        return;
+    auto task_generation = relevant_settings_object().responsible_event_loop().task_generation();
+    if (!m_needs_animated_style_update
+        && m_last_forced_throttled_animation_style_update_task_generation == task_generation)
+        return;
+    m_has_throttled_animation_style_update = false;
+    m_force_throttled_animation_style_update = true;
+    m_needs_animated_style_update = true;
+}
+
+void Document::flush_throttled_animation_style_update_for_node(Node const& node)
+{
+    auto task_generation = relevant_settings_object().responsible_event_loop().task_generation();
+    for (auto& animation : m_associated_animations) {
+        if (!animation.effect())
+            continue;
+        auto* effect = as_if<Animations::KeyframeEffect>(*animation.effect());
+        if (!effect)
+            continue;
+        auto target = effect->target();
+        if (!target
+            || !effect->can_skip_per_frame_style_update()
+            || (!target->is_shadow_including_inclusive_ancestor_of(node) && !node.is_shadow_including_inclusive_ancestor_of(*target)))
+            continue;
+        if (m_is_updating_animated_style)
+            m_effects_needing_animated_style_update_after_current_update.set(*effect);
+        else
+            effect->request_element_scoped_observation_sample(task_generation);
+    }
+}
+
+void Document::stop_animation_wakeup_timer()
+{
+    if (!m_animation_wakeup_timer)
+        return;
+    m_animation_wakeup_timer->stop();
+    m_animation_wakeup_deadline.clear();
+}
+
+void Document::schedule_animation_wakeup(double delay_ms)
+{
+    auto timer_delay_ms = clamp(static_cast<i64>(ceil(delay_ms)), 1, static_cast<i64>(NumericLimits<int>::max()));
+    auto deadline = MonotonicTime::now() + AK::Duration::from_milliseconds(timer_delay_ms);
+    if (m_animation_wakeup_timer && m_animation_wakeup_timer->is_active()
+        && m_animation_wakeup_deadline.has_value() && *m_animation_wakeup_deadline <= deadline)
+        return;
+
+    m_animation_wakeup_deadline = deadline;
+    if (!m_animation_wakeup_timer) {
+        m_animation_wakeup_timer = Core::Timer::create_single_shot(static_cast<int>(timer_delay_ms), GC::weak_callback(*this, [](auto& document) {
+            document.m_animation_wakeup_deadline.clear();
+            auto timestamp = HighResolutionTime::relative_high_resolution_time(
+                HighResolutionTime::unsafe_shared_current_time(), document.relevant_settings_object().global_object());
+            Optional<double> next_wakeup_delay_ms;
+            bool reached_wakeup = false;
+            for (auto& animation : document.m_associated_animations) {
+                if (!animation.effect())
+                    continue;
+                auto* effect = as_if<Animations::KeyframeEffect>(*animation.effect());
+                if (!effect)
+                    continue;
+                if (animation.play_state() != Bindings::AnimationPlayState::Running
+                    || animation.pending()
+                    || animation.playback_rate() <= 0
+                    || !animation.timeline()
+                    || !animation.timeline()->is_monotonically_increasing()
+                    || effect->start_delay().type != Animations::TimeValue::Type::Milliseconds)
+                    continue;
+                auto timeline_time = animation.timeline()->current_time_at_timestamp(timestamp);
+                auto current_time = animation.current_time_at(timeline_time);
+                if (!current_time.has_value() || current_time->type != Animations::TimeValue::Type::Milliseconds)
+                    continue;
+                if (current_time->value < effect->start_delay().value) {
+                    auto delay = (effect->start_delay().value - current_time->value) / animation.playback_rate();
+                    if (!next_wakeup_delay_ms.has_value() || delay < *next_wakeup_delay_ms)
+                        next_wakeup_delay_ms = delay;
+                    continue;
+                }
+                effect->request_observation_sample();
+                reached_wakeup = true;
+            }
+            if (next_wakeup_delay_ms.has_value())
+                document.schedule_animation_wakeup(*next_wakeup_delay_ms);
+            if (reached_wakeup) {
+                ++document.m_style_invalidation_counters.animation_frame_pump_requests;
+                document.page().client().request_frame();
+            }
+        }));
+    }
+    m_animation_wakeup_timer->restart(static_cast<int>(timer_delay_ms));
+}
+
+void Document::throttled_animation_visibility_changed()
+{
+    if (!m_has_throttled_animation_style_update)
+        return;
+    flush_throttled_animation_style_update();
+    page().client().request_frame();
+}
+
+void Document::set_needs_animated_style_update(Animations::KeyframeEffect& effect)
+{
+    if (m_is_updating_animated_style) {
+        m_effects_needing_animated_style_update_after_current_update.set(effect);
+        return;
+    }
+
+    m_effects_needing_animated_style_update.set(effect);
     if (m_needs_animated_style_update)
         return;
 
@@ -623295,6 +623839,30 @@ void Document::set_needs_animated_style_update()
         return;
 
     page().client().request_frame();
+}
+
+void Document::finish_animated_style_update()
+{
+    VERIFY(m_is_updating_animated_style);
+    m_is_updating_animated_style = false;
+
+    GC::RootVector<GC::Ref<Animations::KeyframeEffect>> effects;
+    for (auto& effect : m_effects_needing_animated_style_update_after_current_update)
+        effects.append(effect);
+    m_effects_needing_animated_style_update_after_current_update.clear();
+
+    for (auto& effect : effects)
+        effect->request_observation_sample();
+}
+
+void Document::request_reentrant_animation_style_flush_for_testing(Badge<Internals::Internals>, Node const& node)
+{
+    VERIFY(!m_is_updating_animated_style);
+    m_is_updating_animated_style = true;
+    ScopeGuard clear_is_updating_animated_style = [&] {
+        finish_animated_style_update();
+    };
+    flush_throttled_animation_style_update_for_node(node);
 }
 
 void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates derived_structure_updates, ReadonlySpan<Layout::Box const*> boxes_needing_eager_measurement)
@@ -625634,8 +626202,10 @@ void Document::update_the_visibility_state(HTML::VisibilityState visibility_stat
     event->set_bubbles(true);
     dispatch_event(event);
 
-    if (m_visibility_state == HTML::VisibilityState::Visible)
+    if (m_visibility_state == HTML::VisibilityState::Visible) {
+        flush_throttled_animation_style_update();
         page().client().request_frame();
+    }
 }
 
 // https://drafts.csswg.org/cssom-view/#document-run-the-resize-steps
@@ -626480,6 +627050,7 @@ void Document::destroy()
 
     // 2. Abort document.
     abort();
+    stop_animation_wakeup_timer();
 
     // AD-HOC: Notify document observers that this document became inactive.
     //         This handles iframe-removal destruction, which doesn't otherwise go through
@@ -626961,6 +627532,7 @@ bool Document::is_allowed_to_use_feature(PolicyControlledFeature feature) const
 
 void Document::did_stop_being_active_document_in_navigable()
 {
+    stop_animation_wakeup_timer();
     clear_layout_nodes_for_inactive_document();
     tear_down_layout_tree();
 
@@ -628000,6 +628572,11 @@ void Document::associate_with_animation(GC::Ref<Animations::Animation> animation
 
 void Document::disassociate_with_animation(GC::Ref<Animations::Animation> animation)
 {
+    if (animation->effect() && is<Animations::KeyframeEffect>(*animation->effect())) {
+        auto& effect = static_cast<Animations::KeyframeEffect&>(*animation->effect());
+        m_effects_needing_animated_style_update.remove(effect);
+        m_effects_needing_animated_style_update_after_current_update.remove(effect);
+    }
     m_associated_animations.remove(animation);
 }
 
@@ -628020,6 +628597,34 @@ void Document::append_pending_animation_event(Web::DOM::Document::PendingAnimati
     }
     m_pending_animation_event_queue.append(event);
     ++m_style_invalidation_counters.committed_animation_events;
+}
+
+void Document::prepare_to_observe_css_animation_events()
+{
+    GC::RootVector<GC::Ref<Animations::KeyframeEffect>> effects_to_synchronize;
+    for (auto& animation : m_associated_animations) {
+        if (!animation.is_css_animation() || !animation.effect() || !is<Animations::KeyframeEffect>(*animation.effect()))
+            continue;
+        auto& effect = static_cast<Animations::KeyframeEffect&>(*animation.effect());
+        if (effect.per_frame_animation_tick_was_skipped())
+            effects_to_synchronize.append(effect);
+    }
+    if (effects_to_synchronize.is_empty())
+        return;
+
+    auto timestamp = HighResolutionTime::relative_high_resolution_time(
+        HighResolutionTime::unsafe_shared_current_time(), relevant_settings_object().global_object());
+    auto timelines_to_update = GC::RootVector { m_associated_animation_timelines.values() };
+    for (auto const& timeline : timelines_to_update)
+        timeline->update_current_time(timestamp);
+
+    // OPTIMIZATION: Events which occurred while there were no listeners were intentionally not sampled. Establish
+    //               the current phase as the baseline so a newly added listener only observes future events.
+    for (auto& effect : effects_to_synchronize) {
+        effect->set_previous_phase(effect->phase());
+        effect->set_previous_current_iteration(effect->current_iteration().value_or(0.0));
+        effect->clear_per_frame_animation_tick_was_skipped();
+    }
 }
 
 // https://www.w3.org/TR/web-animations-1/#update-animations-and-send-events
@@ -628104,13 +628709,22 @@ void Document::update_animations_and_send_events(double timestamp)
     //         false to true, and the flag is both set and cleared within the same rendering update.
     //         Without this, animations only advance when unrelated tasks happen to schedule rendering
     //         updates. Keep the frame pump going as long as some animation attached to a monotonically
-    //         increasing timeline is running.
+    //         increasing timeline needs main-thread painting or observable animation events.
     for (auto const& animation : m_associated_animations) {
         if (animation.play_state() != Bindings::AnimationPlayState::Running)
             continue;
         auto timeline = animation.timeline();
         if (!timeline || !timeline->is_monotonically_increasing())
             continue;
+        if (animation.effect() && is<Animations::KeyframeEffect>(*animation.effect())) {
+            auto& effect = static_cast<Animations::KeyframeEffect&>(*animation.effect());
+            if (effect.can_skip_per_frame_animation_tick()) {
+                effect.note_per_frame_animation_tick_was_skipped();
+                continue;
+            }
+            effect.clear_per_frame_animation_tick_was_skipped();
+        }
+        ++m_style_invalidation_counters.animation_frame_pump_requests;
         page().client().request_frame();
         break;
     }
@@ -631500,6 +632114,12 @@ public:
     void obtain_theme_color();
 
     void update_style();
+    void note_throttled_animation_style_update() { m_has_throttled_animation_style_update = true; }
+    void flush_throttled_animation_style_update();
+    void flush_throttled_animation_style_update_for_node(Node const&);
+    void schedule_animation_wakeup(double delay_ms);
+    void stop_animation_wakeup_timer();
+    void throttled_animation_visibility_changed();
     void invalidate_style_for_viewport_change();
     bool suppresses_attribute_style_invalidation() const { return m_suppresses_attribute_style_invalidation; }
     void set_suppresses_attribute_style_invalidation(bool suppresses) { m_suppresses_attribute_style_invalidation = suppresses; }
@@ -631510,7 +632130,12 @@ public:
     };
     bool update_style_for_element(AbstractElement const&);
     bool update_style_for_element(AbstractElement const&, StyleUpdateMode);
+    enum class ThrottledAnimationSamplingScope : u8 {
+        Document,
+        Element,
+    };
     void update_layout(UpdateLayoutReason);
+    void update_layout(UpdateLayoutReason, ThrottledAnimationSamplingScope);
     void note_content_visibility_auto_style() { m_may_have_content_visibility_auto_style = true; }
     void note_default_scroll_shift_anchor() { m_may_have_default_scroll_shift_anchor = true; }
     [[nodiscard]] bool may_have_default_scroll_shift_anchor() const { return m_may_have_default_scroll_shift_anchor; }
@@ -631531,10 +632156,15 @@ public:
     };
     void update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates, ReadonlySpan<Layout::Box const*> boxes_needing_eager_measurement = {});
     void update_paint_and_hit_testing_properties_if_needed();
-    void update_animated_style_if_needed();
+    void sample_animation_effects_needing_style_update();
     void update_style_computer_viewport_rect();
     bool needs_animated_style_update() const { return m_needs_animated_style_update; }
-    void clear_needs_animated_style_update() { m_needs_animated_style_update = false; }
+    void clear_needs_animated_style_update()
+    {
+        m_needs_animated_style_update = false;
+        m_effects_needing_animated_style_update.clear();
+        m_effects_needing_animated_style_update_after_current_update.clear();
+    }
     bool is_running_update_layout() const { return m_is_running_update_layout; }
 
     void invalidate_layout_tree(InvalidateLayoutTreeReason);
@@ -632046,6 +632676,7 @@ public:
     };
     void append_pending_animation_event(PendingAnimationEvent const&);
     void update_animations_and_send_events(double timestamp);
+    void prepare_to_observe_css_animation_events();
     void dispatch_events_for_animation_if_necessary(GC::Ref<Animations::Animation>);
     void remove_replaced_animations();
 
@@ -632085,7 +632716,8 @@ public:
     GC::RootVector<GC::Ref<Element>> elements_from_point(double x, double y);
     GC::Ptr<Element const> scrolling_element() const;
 
-    void set_needs_animated_style_update();
+    void set_needs_animated_style_update(Animations::KeyframeEffect&);
+    void request_reentrant_animation_style_flush_for_testing(Badge<Internals::Internals>, Node const&);
 
     CSS::SheetSetStyleCacheRegistry& sheet_set_style_cache_registry() { return m_sheet_set_style_cache_registry; }
 
@@ -632122,6 +632754,11 @@ public:
         u64 animated_style_reconstruction_fallbacks { 0 };
         u64 animated_style_overlay_builds { 0 };
         u64 animated_style_full_builds { 0 };
+        u64 animation_frame_pump_requests { 0 };
+        u64 animation_timeline_associated_animation_updates { 0 };
+        u64 animation_style_skip_cache_hits { 0 };
+        u64 animation_style_skip_cache_misses { 0 };
+        u64 animation_timeline_synchronizations { 0 };
         u64 base_style_partial_builds { 0 };
         u64 base_style_full_builds { 0 };
         u64 computed_longhand_evaluations { 0 };
@@ -632477,6 +633114,8 @@ protected:
 private:
     friend struct AdoptedStyleSheetsAccess;
 
+    void finish_animated_style_update();
+
     GC::Ref<WebIDL::ObservableArray> adopted_style_sheets() const;
 
     void set_needs_repaint(InvalidateDisplayList = InvalidateDisplayList::Yes);
@@ -632733,6 +633372,12 @@ private:
     u64 m_full_layout_count { 0 };
 
     bool m_needs_animated_style_update { false };
+    GC::WeakHashSet<Animations::KeyframeEffect> m_effects_needing_animated_style_update;
+    GC::WeakHashSet<Animations::KeyframeEffect> m_effects_needing_animated_style_update_after_current_update;
+    bool m_is_updating_animated_style { false };
+    bool m_has_throttled_animation_style_update { false };
+    bool m_force_throttled_animation_style_update { false };
+    Optional<u64> m_last_forced_throttled_animation_style_update_task_generation;
 
     HashTable<GC::Ptr<NodeIterator>> m_node_iterators;
 
@@ -632839,6 +633484,8 @@ private:
     bool m_will_declaratively_refresh { false };
 
     RefPtr<Core::Timer> m_active_refresh_timer;
+    RefPtr<Core::Timer> m_animation_wakeup_timer;
+    Optional<MonotonicTime> m_animation_wakeup_deadline;
 
     bool m_temporary_document_for_fragment_parsing { false };
 
@@ -640530,6 +641177,8 @@ void Element::replace_style_record(CSS::StyleRecordID style_record_identity)
 
 void Element::set_computed_style(Optional<CSS::PseudoElement> pseudo_element_type, CSS::StyleRecordID style_record_identity)
 {
+    for (auto* element = this; element; element = element->parent_or_shadow_host_element())
+        ++element->m_animation_subtree_style_generation;
     if (pseudo_element_type.has_value()) {
         VERIFY(is_synthetic_pseudo_element(*pseudo_element_type));
         if (!!style_record_identity)
@@ -640538,6 +641187,7 @@ void Element::set_computed_style(Optional<CSS::PseudoElement> pseudo_element_typ
             existing_pseudo_element->set_computed_style(0);
         return;
     }
+    ++m_animation_style_generation;
     replace_style_record(style_record_identity);
     computed_properties_changed();
 }
@@ -642679,6 +643329,8 @@ public:
 
     [[nodiscard]] CSS::ComputedStyleRecordView computed_style(Optional<CSS::PseudoElement> = {}) const;
     [[nodiscard]] CSS::StyleRecordID style_record_identity(Optional<CSS::PseudoElement> = {}) const;
+    u64 animation_style_generation() const { return m_animation_style_generation; }
+    u64 animation_subtree_style_generation() const { return m_animation_subtree_style_generation; }
     [[nodiscard]] bool has_style(Optional<CSS::PseudoElement> pseudo_element = {}) const { return !!style_record_identity(pseudo_element); }
     [[nodiscard]] void const* style_record_payloads(Optional<CSS::PseudoElement> = {}) const;
     template<typename StyleGroup>
@@ -643224,6 +643876,8 @@ private:
     // borrow the record-owned computed-values view rather than retaining one complete style per
     // element.
     CSS::StyleRecordID m_style_record_identity;
+    u64 m_animation_style_generation { 0 };
+    u64 m_animation_subtree_style_generation { 0 };
     RefPtr<CSS::CustomPropertyData const> m_custom_property_data;
     OwnPtr<CSS::StyleInputRecord> m_style_input_record;
     PublishedCustomPropertyNames m_published_custom_property_names;
@@ -646054,6 +646708,46 @@ static void invalidate_compositor_wheel_event_listener_state(EventTarget& event_
     }
 }
 
+static bool is_css_animation_event_listener(DOMEventListener const& listener)
+{
+    return AK::first_is_one_of(listener.type,
+        HTML::EventNames::animationcancel,
+        HTML::EventNames::animationend,
+        HTML::EventNames::animationiteration,
+        HTML::EventNames::animationstart,
+        HTML::EventNames::webkitAnimationEnd,
+        HTML::EventNames::webkitAnimationIteration,
+        HTML::EventNames::webkitAnimationStart);
+}
+
+static void wake_animation_frame_pump_for_animation_event_listener(EventTarget& event_target, DOMEventListener const& listener)
+{
+    if (!is_css_animation_event_listener(listener))
+        return;
+
+    if (auto* window = as_if<HTML::Window>(event_target)) {
+        window->associated_document().page().client().request_frame();
+        return;
+    }
+
+    if (auto* node = as_if<Node>(event_target))
+        node->document().page().client().request_frame();
+}
+
+static void prepare_to_observe_css_animation_events(EventTarget& event_target, DOMEventListener const& listener)
+{
+    if (!is_css_animation_event_listener(listener))
+        return;
+
+    if (auto* window = as_if<HTML::Window>(event_target)) {
+        window->associated_document().prepare_to_observe_css_animation_events();
+        return;
+    }
+
+    if (auto* node = as_if<Node>(event_target))
+        node->document().prepare_to_observe_css_animation_events();
+}
+
 static void update_needs_beforeunload_check(EventTarget& event_target, DOMEventListener const& listener)
 {
     if (listener.type != HTML::EventNames::beforeunload)
@@ -646137,8 +646831,10 @@ void EventTarget::add_an_event_listener(DOMEventListener& listener)
             && entry->capture == listener.capture;
     });
     if (it == event_listener_list.end()) {
+        prepare_to_observe_css_animation_events(*this, listener);
         event_listener_list.append(listener);
         invalidate_compositor_wheel_event_listener_state(*this, listener);
+        wake_animation_frame_pump_for_animation_event_listener(*this, listener);
         update_needs_beforeunload_check(*this, listener);
         event_listener_list_changed();
     }
@@ -667211,680 +667907,3 @@ void EditingHistory::end_recording()
         m_open_step = step->category() != UndoStep::Category::Other ? step.ptr() : nullptr;
     }
 
-    if (closes_coalescing)
-        m_open_step = nullptr;
-
-    notify_state_if_changed(step->editing_host()->document());
-}
-
-EditingHistory::ProxyMutationScope::ProxyMutationScope(DOM::Node& node)
-    : m_history(node.document().editing_history_if_exists())
-{
-    if (m_history)
-        m_history->m_proxy_mutation_depth++;
-}
-
-EditingHistory::ProxyMutationScope::~ProxyMutationScope()
-{
-    if (m_history)
-        m_history->m_proxy_mutation_depth--;
-}
-
-void EditingHistory::notify_dom_mutation()
-{
-    if (!m_undo_step_being_recorded || m_proxy_mutation_depth > 0 || m_applying_history_step)
-        return;
-    dbgln("Editing: DOM mutated during a recorded editing command without going through the Editing proxy; this mutation will not be undoable!");
-}
-
-void EditingHistory::selection_changed()
-{
-    // Selection changes performed by the recorded command itself or by history application do
-    // not end coalescence; everything else (caret movement, clicks, script) does.
-    if (m_undo_step_being_recorded || m_applying_history_step)
-        return;
-    m_open_step = nullptr;
-}
-
-bool EditingHistory::can_undo()
-{
-    prune_steps_for_disconnected_hosts();
-    return !m_undo_stack.is_empty();
-}
-
-bool EditingHistory::can_redo()
-{
-    prune_steps_for_disconnected_hosts();
-    return !m_redo_stack.is_empty();
-}
-
-GC::Ptr<UndoStep> EditingHistory::next_undo_step()
-{
-    prune_steps_for_disconnected_hosts();
-    return m_undo_stack.is_empty() ? nullptr : m_undo_stack.last().ptr();
-}
-
-GC::Ptr<UndoStep> EditingHistory::next_redo_step()
-{
-    prune_steps_for_disconnected_hosts();
-    return m_redo_stack.is_empty() ? nullptr : m_redo_stack.last().ptr();
-}
-
-bool EditingHistory::undo(DOM::Document& document)
-{
-    if (m_applying_history_step || m_undo_step_being_recorded)
-        return false;
-    if (!can_undo())
-        return false;
-
-    m_open_step = nullptr;
-    auto step = m_undo_stack.take_last();
-    bool performed_any_mutation;
-    {
-        TemporaryChange applying { m_applying_history_step, true };
-        performed_any_mutation = step->unapply();
-    }
-    restore_selection(document, step->starting_selection());
-
-    // NB: A step that could not perform anything was invalidated by script mutation after it was
-    //     recorded; replaying it in the other direction would garble content, so drop it.
-    if (performed_any_mutation)
-        m_redo_stack.append(step);
-
-    notify_state_if_changed(document);
-    dispatch_history_input_event(document, step->editing_host(), UIEvents::InputTypes::historyUndo);
-    return true;
-}
-
-bool EditingHistory::redo(DOM::Document& document)
-{
-    if (m_applying_history_step || m_undo_step_being_recorded)
-        return false;
-    if (!can_redo())
-        return false;
-
-    m_open_step = nullptr;
-    auto step = m_redo_stack.take_last();
-    bool performed_any_mutation;
-    {
-        TemporaryChange applying { m_applying_history_step, true };
-        performed_any_mutation = step->reapply();
-    }
-    restore_selection(document, step->ending_selection());
-
-    // NB: A step that could not perform anything was invalidated by script mutation after it was
-    //     recorded; replaying it in the other direction would garble content, so drop it.
-    if (performed_any_mutation)
-        m_undo_stack.append(step);
-
-    notify_state_if_changed(document);
-    dispatch_history_input_event(document, step->editing_host(), UIEvents::InputTypes::historyRedo);
-    return true;
-}
-
-// Tells the UI whether undo and redo are available, e.g. for enabling menu items.
-void EditingHistory::notify_state_if_changed(DOM::Document& document)
-{
-    bool new_can_undo = can_undo();
-    bool new_can_redo = can_redo();
-    if (new_can_undo == m_last_notified_can_undo && new_can_redo == m_last_notified_can_redo)
-        return;
-    m_last_notified_can_undo = new_can_undo;
-    m_last_notified_can_redo = new_can_redo;
-    document.page().client().page_did_update_editing_history_state(new_can_undo, new_can_redo);
-}
-
-void EditingHistory::prune_steps_for_disconnected_hosts()
-{
-    // INTEROP: Blink erases the undo steps owned by a root editable element when it is removed
-    //          from the document (except in designMode documents, where the host may well be
-    //          reinserted). We prune lazily whenever the stacks are consulted instead, which is
-    //          observably equivalent for command state queries and for undo/redo themselves, and
-    //          preserves the history when a host is briefly detached and reinserted.
-    m_undo_stack.remove_all_matching([](GC::Ref<UndoStep> const& step) { return !step->editing_host()->is_connected(); });
-    m_redo_stack.remove_all_matching([](GC::Ref<UndoStep> const& step) { return !step->editing_host()->is_connected(); });
-}
-
-void EditingHistory::restore_selection(DOM::Document& document, SelectionSnapshot const& snapshot)
-{
-    // Text controls have their own selection instead of a document selection.
-    if (snapshot.text_control) {
-        if (!snapshot.text_control->is_connected() || &snapshot.text_control->document() != &document)
-            return;
-        if (auto* control = dynamic_cast<HTML::FormAssociatedTextControlElement*>(snapshot.text_control.ptr()))
-            control->set_the_selection_range(snapshot.text_control_start, snapshot.text_control_end, snapshot.text_control_direction);
-        return;
-    }
-
-    auto selection = document.get_selection();
-    if (!selection)
-        return;
-
-    // NB: Scripts may have removed or moved the captured endpoints since the step was recorded;
-    //     leave the selection alone if they are no longer valid, like Blink does.
-    auto anchor = snapshot.anchor_node;
-    auto focus = snapshot.focus_node;
-    if (!anchor || !focus)
-        return;
-    if (!anchor->is_connected() || !focus->is_connected())
-        return;
-    if (&anchor->document() != &document || &focus->document() != &document)
-        return;
-    if (snapshot.anchor_offset > anchor->length() || snapshot.focus_offset > focus->length())
-        return;
-
-    MUST(selection->set_base_and_extent(*anchor, snapshot.anchor_offset, *focus, snapshot.focus_offset));
-    selection->set_focus_affinity(snapshot.focus_affinity);
-}
-
-// INTEROP: Chromium's keyboard undo/redo dispatches a cancelable beforeinput event with
-//          inputType "historyUndo" or "historyRedo" at the step's editing host before touching
-//          anything; a canceled event means no mutation happens and no history entry is
-//          consumed. With nothing to undo or redo, no events fire at all. execCommand("undo")
-//          takes the command path instead, which never fires beforeinput.
-EventResult perform_history_action(DOM::Document& document, HistoryAction action)
-{
-    auto history = document.editing_history_if_exists();
-    if (!history)
-        return EventResult::Handled;
-
-    auto step = action == HistoryAction::Undo ? history->next_undo_step() : history->next_redo_step();
-    if (!step)
-        return EventResult::Handled;
-
-    auto const& input_type = action == HistoryAction::Undo ? UIEvents::InputTypes::historyUndo : UIEvents::InputTypes::historyRedo;
-
-    Bindings::InputEventInit event_init {};
-    event_init.bubbles = true;
-    event_init.cancelable = true;
-    event_init.input_type = input_type;
-    auto event = UIEvents::InputEvent::create_from_platform_event(UIEvents::EventNames::beforeinput, event_init);
-    event->set_is_trusted(true);
-    if (!step->editing_host()->dispatch_event(event))
-        return EventResult::Handled;
-
-    if (action == HistoryAction::Undo)
-        history->undo(document);
-    else
-        history->redo(document);
-    return EventResult::Handled;
-}
-
-void EditingHistory::visit_edges(Cell::Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-    visitor.visit(m_undo_step_being_recorded);
-    visitor.visit(m_open_step);
-    visitor.visit(m_undo_stack);
-    visitor.visit(m_redo_stack);
-}
-
-}
-
-FILE: Libraries/LibWeb/Editing/EditingHistory.h
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/Vector.h>
-#include <LibGC/CellAllocator.h>
-#include <LibJS/Heap/Cell.h>
-#include <LibWeb/Forward.h>
-#include <LibWeb/HTML/FormAssociatedElement.h>
-#include <LibWeb/Page/EventResult.h>
-#include <LibWeb/TextAffinity.h>
-
-namespace Web::Editing {
-
-// Undo/redo for user editing, from typing in contenteditable and text controls to execCommand()
-// formatting. The moving parts, bottom up:
-//
-//  * EditCommand (EditCommand.h) is one reversible primitive DOM mutation: insert node, remove
-//    node, replace character data, split text, change attribute. The editing algorithms perform
-//    their mutations through the Editing proxy functions, which create and apply these commands.
-//    This is the moral equivalent of the SimpleEditCommand hierarchies in WebKit and Blink and of
-//    Gecko's transactions; unlike those engines our high-level editing algorithms stay shaped
-//    like the execCommand specification, so the proxy records the primitives for them.
-//
-//  * UndoStep is one user-level action: the flat, ordered list of commands it performed plus the
-//    selection (with direction and caret affinity) before and after it. Undo unapplies the
-//    commands in reverse order and restores the starting selection; redo reapplies them forward
-//    and restores the ending selection. Commands re-validate against the current DOM and decline
-//    when scripts have invalidated them, and a step replays all of its commands or none, so
-//    replay is always memory-safe and never garbles script-produced content.
-//
-//  * EditingHistory owns the undo and redo stacks for a document, shared by every editing host
-//    and text control in it. Document::exec_command() opens a recording around each editing
-//    command's action, and the text control edit handlers do the same around their value
-//    mutations; nothing else records, which is what keeps script-driven DOM mutation out of the
-//    history. When a recording ends, the new step either merges into the still-open previous
-//    step (typing and deletion runs coalesce into one undo unit, using Chromium's rules; see
-//    end_recording() and UndoStep::accepts_merge_of()) or is pushed, which discards the redo
-//    stack.
-//
-// Undo entry points: execCommand("undo"/"redo") fires only the historyUndo/historyRedo input
-// event, while the keyboard shortcuts and the browser UI go through perform_history_action(),
-// which first dispatches a cancelable beforeinput at the step's editing host, all matching
-// Chromium. queryCommandEnabled("undo") reports whether a step is available, and the history
-// pushes that state to the UI so menu items can enable and disable themselves.
-
-// Snapshot of the document selection around an undo step. Raw endpoints are stored instead of a
-// live range so that later DOM mutation cannot drag them around; restoration re-validates the
-// endpoints and is skipped when they are no longer meaningful. Storing anchor and focus
-// separately preserves the selection's direction.
-struct SelectionSnapshot {
-    GC::Ptr<DOM::Node> anchor_node;
-    size_t anchor_offset { 0 };
-    GC::Ptr<DOM::Node> focus_node;
-    size_t focus_offset { 0 };
-    TextAffinity focus_affinity { TextAffinity::Downstream };
-
-    // Text controls have their own selection instead of a document selection.
-    GC::Ptr<HTML::HTMLElement> text_control;
-    size_t text_control_start { 0 };
-    size_t text_control_end { 0 };
-    HTML::SelectionDirection text_control_direction { HTML::SelectionDirection::None };
-};
-
-// One user-level editing action: the ordered list of reversible edit commands it performed, and
-// the selections to restore when moving through history. Undoing a step unapplies its commands
-// in reverse order and restores the starting selection; redoing reapplies them in order and
-// restores the ending selection.
-class UndoStep final : public JS::Cell {
-    GC_CELL(UndoStep, JS::Cell);
-    GC_DECLARE_ALLOCATOR(UndoStep);
-
-public:
-    // The kind of user action that created (or was merged into) a step, used to decide which
-    // subsequent actions may coalesce into it.
-    enum class Category : u8 {
-        Insertion,
-        BackwardDeletion,
-        ForwardDeletion,
-        Other,
-    };
-
-    GC::Ref<DOM::Node> editing_host() const { return m_editing_host; }
-    Category category() const { return m_category; }
-
-    void add_command(GC::Ref<EditCommand> command) { m_commands.append(command); }
-    bool has_commands() const { return !m_commands.is_empty(); }
-
-    SelectionSnapshot const& starting_selection() const { return m_starting_selection; }
-    void set_starting_selection(SelectionSnapshot const& snapshot) { m_starting_selection = snapshot; }
-    SelectionSnapshot const& ending_selection() const { return m_ending_selection; }
-    void set_ending_selection(SelectionSnapshot const& snapshot) { m_ending_selection = snapshot; }
-
-    // Both replay all of the commands or none of them, rolling the step back when a command
-    // mid-step refuses, and return whether the mutations were performed; a step that refused
-    // has been invalidated by scripts and gets dropped by the history.
-    bool unapply();
-    bool reapply();
-
-    // Coalescence, following Chromium: an insertion joins any open unit, a deletion only joins a
-    // unit whose most recent action was the same kind of deletion, and everything else never
-    // merges. Merging extends this step's command list and ending selection, with special
-    // handling so undoing a deletion run restores a selection over everything it deleted.
-    bool accepts_merge_of(Category);
-    void merge(UndoStep&);
-    void finalize_starting_selection();
-    bool performed_lasting_node_removal() const;
-
-    // INTEROP: Chromium's text controls end a typing unit one character into a new line (their
-    //          internal editor removes a placeholder br there); the recording site sets this
-    //          after a line break so the next merged action closes the unit.
-    bool closes_after_next_merge() const { return m_closes_after_next_merge; }
-    void set_closes_after_next_merge() { m_closes_after_next_merge = true; }
-
-private:
-    UndoStep(GC::Ref<DOM::Node> editing_host, Category);
-
-    virtual void visit_edges(Cell::Visitor&) override;
-
-    GC::Ref<DOM::Node> m_editing_host;
-    Category m_category { Category::Other };
-    Category m_last_merged_category { Category::Other };
-    bool m_closes_after_next_merge { false };
-    Vector<GC::Ref<EditCommand>> m_commands;
-    SelectionSnapshot m_starting_selection;
-    SelectionSnapshot m_ending_selection;
-};
-
-// Per-document history of user editing actions, shared by all editing hosts in the document.
-// Modeled on the undo stacks in Blink and Gecko: each entry is an UndoStep that knows how to
-// reverse and replay itself, together with the selections to restore around it. Only mutations
-// performed by editing commands enter the history; script-driven DOM mutation is invisible to it.
-class EditingHistory final : public JS::Cell {
-    GC_CELL(EditingHistory, JS::Cell);
-    GC_DECLARE_ALLOCATOR(EditingHistory);
-
-public:
-    [[nodiscard]] static GC::Ref<EditingHistory> create();
-
-    // The undo step for the editing command currently executing, if any. DOM mutations made
-    // through the Editing proxy functions are recorded onto this step.
-    GC::Ptr<UndoStep> undo_step_being_recorded() { return m_undo_step_being_recorded; }
-
-    // Brackets one user editing action: begin_recording() creates the step and captures the
-    // starting selection, the Editing proxy functions add commands to it while the action runs,
-    // and end_recording() captures the ending selection and merges or pushes the step. A step
-    // that recorded no commands leaves no trace. end_recording() is idempotent, so callers may
-    // invoke it from a scope guard as well as before dispatching their input event.
-    void begin_recording(DOM::Node& editing_host, UndoStep::Category);
-    void end_recording();
-
-    // Editing code must perform DOM mutations through the Editing proxy functions while a
-    // command is being recorded, or the mutation silently escapes undo. The proxy brackets its
-    // mutations with this scope, and the DOM primitives report mutations so bypasses are
-    // diagnosed during development instead of surfacing as broken undo.
-    class ProxyMutationScope {
-    public:
-        explicit ProxyMutationScope(DOM::Node&);
-        ~ProxyMutationScope();
-
-    private:
-        GC::Ptr<EditingHistory> m_history;
-    };
-    void notify_dom_mutation();
-
-    bool can_undo();
-    bool can_redo();
-    bool undo(DOM::Document&);
-    bool redo(DOM::Document&);
-
-    GC::Ptr<UndoStep> next_undo_step();
-    GC::Ptr<UndoStep> next_redo_step();
-
-    // Called whenever the document selection changes; ends typing coalescence unless the change
-    // came from an editing command or from history application itself.
-    void selection_changed();
-
-private:
-    EditingHistory() = default;
-
-    virtual void visit_edges(Cell::Visitor&) override;
-
-    void prune_steps_for_disconnected_hosts();
-    void restore_selection(DOM::Document&, SelectionSnapshot const&);
-    void notify_state_if_changed(DOM::Document&);
-
-    GC::Ptr<UndoStep> m_undo_step_being_recorded;
-    GC::Ptr<UndoStep> m_open_step;
-    Vector<GC::Ref<UndoStep>> m_undo_stack;
-    Vector<GC::Ref<UndoStep>> m_redo_stack;
-    bool m_applying_history_step { false };
-    bool m_last_notified_can_undo { false };
-    bool m_last_notified_can_redo { false };
-    u32 m_proxy_mutation_depth { 0 };
-};
-
-enum class HistoryAction : u8 {
-    Undo,
-    Redo,
-};
-
-// The user-initiated (keyboard shortcut) entry point for undo and redo. Unlike execCommand(),
-// this dispatches a cancelable beforeinput event first; canceling it leaves both the DOM and the
-// history untouched.
-EventResult perform_history_action(DOM::Document&, HistoryAction);
-
-}
-
-FILE: Libraries/LibWeb/Editing/ExecCommand.cpp
-/*
- * Copyright (c) 2024-2025, Jelle Raaijmakers <jelle@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <AK/ScopeGuard.h>
-#include <AK/TemporaryChange.h>
-#include <LibWeb/DOM/Document.h>
-#include <LibWeb/DOM/Event.h>
-#include <LibWeb/DOM/Range.h>
-#include <LibWeb/DOM/Text.h>
-#include <LibWeb/Editing/CommandNames.h>
-#include <LibWeb/Editing/Commands.h>
-#include <LibWeb/Editing/EditingHistory.h>
-#include <LibWeb/Editing/Internal/Algorithms.h>
-#include <LibWeb/HTML/HTMLLIElement.h>
-#include <LibWeb/HTML/Scripting/Environments.h>
-#include <LibWeb/HighResolutionTime/TimeOrigin.h>
-#include <LibWeb/Selection/Selection.h>
-#include <LibWeb/UIEvents/InputEvent.h>
-#include <LibWeb/UIEvents/InputTypes.h>
-
-namespace Web::DOM {
-
-GC::Ref<Editing::EditingHistory> Document::editing_history()
-{
-    if (!m_editing_history)
-        m_editing_history = Editing::EditingHistory::create();
-    return *m_editing_history;
-}
-
-// https://w3c.github.io/editing/docs/execCommand/#execcommand()
-WebIDL::ExceptionOr<bool> Document::exec_command(Utf16FlyString const& command, [[maybe_unused]] bool show_ui, Utf16View value)
-{
-    return exec_command_internal(command, show_ui, value, DispatchInputEvent::Yes);
-}
-
-WebIDL::ExceptionOr<bool> Document::exec_command_internal(Utf16FlyString const& command, [[maybe_unused]] bool show_ui, Utf16View value, DispatchInputEvent dispatch_input_event, Optional<Utf16FlyString> const& user_input_type)
-{
-    // AD-HOC: This is not directly mentioned in the spec, but all major browsers limit editing API calls to HTML documents
-    if (!is_html_document())
-        return WebIDL::InvalidStateError::create("execCommand is only supported on HTML documents"_utf16);
-
-    // AD-HOC: All major browsers refuse to recursively execute execCommand() (e.g. inside input event handlers).
-    if (m_inside_exec_command)
-        return false;
-    TemporaryChange guard_recursion { m_inside_exec_command, true };
-
-    // 1. If only one argument was provided, let show UI be false.
-    // 2. If only one or two arguments were provided, let value be the empty string.
-    // NOTE: these steps are dealt by the default values for both show_ui and value
-
-    // 3. If command is not supported or not enabled, return false.
-    // NOTE: query_command_enabled() also checks if command is supported
-    if (!MUST(query_command_enabled(command)))
-        return false;
-
-    // 4. If command is not in the Miscellaneous commands section:
-    //
-    //    We don't fire events for copy/cut/paste/undo/redo/selectAll because they should all have their own events. We
-    //    don't fire events for styleWithCSS/useCSS because it's not obvious where to fire them, or why anyone would
-    //    want them. We don't fire events for unsupported commands, because then if they became supported and were
-    //    classified with the miscellaneous events, we'd have to stop firing events for consistency's sake.
-    //
-    // AD-HOC: The defaultParagraphSeparator command is also in the Miscellaneous commands section
-    auto optional_command = Editing::find_command_definition(command);
-    VERIFY(optional_command.has_value());
-    auto const& command_definition = optional_command.release_value();
-    GC::Ptr<Node> affected_editing_host;
-    if (!command_definition.command.is_one_of(Editing::CommandNames::copy, Editing::CommandNames::cut,
-            Editing::CommandNames::defaultParagraphSeparator, Editing::CommandNames::paste, Editing::CommandNames::redo,
-            Editing::CommandNames::selectAll, Editing::CommandNames::styleWithCSS, Editing::CommandNames::undo,
-            Editing::CommandNames::useCSS)) {
-        // 1. Let affected editing host be the editing host that is an inclusive ancestor of the active range's start
-        //    node and end node, and is not the ancestor of any editing host that is an inclusive ancestor of the active
-        //    range's start node and end node.
-        //
-        // NOTE: Because either the start or end node of the range could be inside an editing host that is part of the
-        //       other node's editing host, we can probe both and see if either one is the other's ancestor.
-        // NOTE: We can reuse ->editing_host() here since query_command_enabled() above already checked that both the
-        //       start and end nodes are either editable or an editing host.
-        auto range = Editing::active_range(*this);
-        auto& start_node_editing_host = *range->start_container()->editing_host();
-        auto& end_node_editing_host = *range->end_container()->editing_host();
-        affected_editing_host = start_node_editing_host.is_ancestor_of(end_node_editing_host)
-            ? end_node_editing_host
-            : start_node_editing_host;
-
-        // 2. Fire an event named "beforeinput" at affected editing host using InputEvent, with its
-        //    bubbles and cancelable attributes initialized to true, and its data attribute
-        //    initialized to null.
-        // 3. If the value returned by the previous step is false, return false.
-        // 4. If command is not enabled, return false.
-        //
-        //    We have to check again whether the command is enabled, because the beforeinput handler might have done
-        //    something annoying like getSelection().removeAllRanges().
-        // 5. Let affected editing host be the editing host that is an inclusive ancestor of the active range's start
-        //    node and end node, and is not the ancestor of any editing host that is an inclusive ancestor of the active
-        //    range's start node and end node.
-        //
-        //    This new affected editing host is what we'll fire the input event at in a couple of lines. We want to
-        //    compute it beforehand just to be safe: bugs in the command action might remove the selection or something
-        //    bad like that, and we don't want to have to handle it later. We recompute it after the beforeinput event
-        //    is handled so that if the handler moves the selection to some other editing host, the input event will be
-        //    fired at the editing host that was actually affected.
-
-        // AD-HOC: No, we don't. Neither Chrome nor Firefox fire the "beforeinput" event for execCommand(). This is an
-        //         open discussion for the spec: https://github.com/w3c/editing/issues/200
-    }
-
-    // https://w3c.github.io/editing/docs/execCommand/#preserves-overrides
-    // If a command preserves overrides, then before taking its action, the user agent must record current overrides.
-    Vector<Editing::RecordedOverride> overrides;
-    if (command_definition.preserves_overrides)
-        overrides = Editing::record_current_overrides(*this);
-
-    // INTEROP: Chromium distinguishes pastes that begin inside text from pastes at an element boundary when deciding
-    //          whether a trailing line break is merely a placeholder. Record this before caret canonicalization can
-    //          turn an element-level boundary into an equivalent text position.
-    auto range_before_command = Editing::active_range(*this);
-    bool paste_started_in_text_node = user_input_type == UIEvents::InputTypes::insertFromPaste
-        && range_before_command && is<DOM::Text>(*range_before_command->start_container())
-        // INTEROP: An Apple-interchange-newline represents an intentional paragraph boundary, not a fragment-ending
-        //          placeholder. Blink and WebKit preserve the destination paragraph's trailing break in this case.
-        && !value.contains(u"Apple-interchange-newline"sv);
-    GC::Root<DOM::Node> paste_start_block;
-    if (paste_started_in_text_node)
-        paste_start_block = Editing::block_node_of_node(*range_before_command->start_container());
-
-    // NOTE: Step 7 below asks us whether the DOM tree was modified, so keep track of the document versions.
-    auto old_dom_tree_version = dom_tree_version();
-    auto old_character_data_version = character_data_version();
-
-    // NB: Canonicalize the caret before the command acts and records its starting selection, so that e.g. typing at an
-    //     element-level caret inserts into the adjacent content like Chromium does. Inline formatting commands with a
-    //     collapsed selection only set overrides, and Chromium does not move the caret for those.
-    bool command_edits_at_caret = command_definition.command.is_one_of(
-        Editing::CommandNames::delete_, Editing::CommandNames::formatBlock, Editing::CommandNames::forwardDelete,
-        Editing::CommandNames::indent, Editing::CommandNames::insertHorizontalRule, Editing::CommandNames::insertHTML,
-        Editing::CommandNames::insertImage, Editing::CommandNames::insertLineBreak,
-        Editing::CommandNames::insertOrderedList, Editing::CommandNames::insertParagraph,
-        Editing::CommandNames::insertText, Editing::CommandNames::insertUnorderedList,
-        Editing::CommandNames::justifyCenter, Editing::CommandNames::justifyFull, Editing::CommandNames::justifyLeft,
-        Editing::CommandNames::justifyRight, Editing::CommandNames::outdent);
-    if (affected_editing_host && m_selection && command_edits_at_caret)
-        Editing::canonicalize_collapsed_selection_for_editing(*m_selection);
-
-    // AD-HOC: Record the mutations performed by the command action on the editing history, so the user can undo them.
-    //         end_recording() is a no-op if the guard below already ended the recording.
-    if (affected_editing_host) {
-        auto category = Editing::UndoStep::Category::Other;
-        // INTEROP: Cut and paste are standalone undo units in Chromium: they never coalesce with typing or deletion
-        //          runs, so they categorize as Other even though they run the delete and insertText commands.
-        bool is_cut_or_paste = user_input_type == UIEvents::InputTypes::deleteByCut || user_input_type == UIEvents::InputTypes::insertFromPaste;
-        if (!is_cut_or_paste) {
-            if (command_definition.command.is_one_of(Editing::CommandNames::insertText, Editing::CommandNames::insertLineBreak, Editing::CommandNames::insertParagraph))
-                category = Editing::UndoStep::Category::Insertion;
-            else if (command_definition.command == Editing::CommandNames::delete_)
-                category = Editing::UndoStep::Category::BackwardDeletion;
-            else if (command_definition.command == Editing::CommandNames::forwardDelete)
-                category = Editing::UndoStep::Category::ForwardDeletion;
-        }
-        editing_history()->begin_recording(*affected_editing_host, category);
-    }
-    ScopeGuard end_recording_guard = [&] {
-        if (auto history = editing_history_if_exists())
-            history->end_recording();
-    };
-
-    // 5. Take the action for command, passing value to the instructions as an argument.
-    auto command_result = command_definition.action(*this, value);
-
-    // INTEROP: Chromium removes the trailing placeholder line break after pasting into an existing text node. The
-    //          execCommand draft only removes it when insertion creates a new text node. Perform this while the paste
-    //          history transaction is still open so undo restores the placeholder and redo removes it again.
-    if (paste_started_in_text_node) {
-        if (auto range = Editing::active_range(*this)) {
-            // INTEROP: A trailing break remains the list item's line terminator after a block fragment is merged into
-            //          that item. Blink removes paragraph placeholders here, but preserves list-item terminators.
-            if (auto block = Editing::block_node_of_node(*range->start_container()); block && block.ptr() == paste_start_block.ptr()
-                && !is<HTML::HTMLLIElement>(*block))
-                Editing::remove_extraneous_line_breaks_at_the_end_of_node(*block);
-        }
-    }
-
-    // https://w3c.github.io/editing/docs/execCommand/#preserves-overrides
-    // After taking the action, if the active range is collapsed, it must restore states and values from the recorded
-    // list.
-    if (!overrides.is_empty() && m_selection && m_selection->is_collapsed())
-        Editing::restore_states_and_values(*this, overrides);
-
-    // NB: Canonicalize the caret the command produced before the ending selection is recorded, but only if the
-    //     command actually performed an edit; Chromium leaves the caret alone otherwise.
-    bool tree_was_modified = dom_tree_version() != old_dom_tree_version
-        || character_data_version() != old_character_data_version;
-    if (affected_editing_host && m_selection && tree_was_modified)
-        Editing::canonicalize_collapsed_selection_for_editing(*m_selection);
-
-    // NB: End the recording before dispatching the input event below, so that the undo step's ending selection is the
-    //     selection produced by the command itself, not whatever an input event handler changed it to.
-    if (auto history = editing_history_if_exists())
-        history->end_recording();
-
-    // 6. If the previous step returned false, return false.
-    if (!command_result)
-        return false;
-
-    // 7. If the action modified DOM tree, then fire an event named "input" at affected editing host using InputEvent,
-    //    with its isTrusted and bubbles attributes initialized to true, inputType attribute initialized to the mapped
-    //    value of command, and its data attribute initialized to null.
-    if (dispatch_input_event == DispatchInputEvent::Yes && tree_was_modified && affected_editing_host) {
-        UIEvents::InputEventInit event_init {};
-        event_init.bubbles = true;
-        // INTEROP: When the command runs on behalf of a user cut or paste, the input event carries the user's input
-        //          type (deleteByCut or insertFromPaste) rather than the command's mapped value, like other browsers.
-        event_init.input_type = user_input_type.value_or(command_definition.mapped_value);
-
-        // AD-HOC: For insertText, we do what other browsers do and set data to value. A paste carries null data even
-        //         though it runs the insertText command.
-        if (event_init.input_type == UIEvents::InputTypes::insertText)
-            event_init.data = Utf16String::from_utf16(value);
-
-        auto event = UIEvents::InputEvent::create_from_platform_event(HTML::EventNames::input, event_init, {}, HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*this)));
-        event->set_is_trusted(true);
-
-        TemporaryChange preserve_selection_offsets { m_preserve_selection_offsets_during_identical_character_data_replacement, true };
-        affected_editing_host->dispatch_event(event);
-    }
-
-    // AD-HOC: Scroll the cursor into view after executing a command.
-    if (auto selection = get_selection())
-        selection->scroll_focus_into_view();
-
-    // 8. Return true.
-    return true;
-}
-
-// https://w3c.github.io/editing/docs/execCommand/#querycommandenabled()
-WebIDL::ExceptionOr<bool> Document::query_command_enabled(Utf16FlyString const& command)
-{
-    // AD-HOC: This is not directly mentioned in the spec, but all major browsers limit editing API calls to HTML documents
-    if (!is_html_document())
-        return WebIDL::InvalidStateError::create("queryCommandEnabled is only supported on HTML documents"_utf16);
-
-    // 2. Return true if command is both supported and enabled, false otherwise.
-    if (!MUST(query_command_supported(command)))
-        return false;
-
-    // https://w3c.github.io/editing/docs/execCommand/#enabled
-    // Among commands defined in this specification, those listed in Miscellaneous commands are always enabled, except
-    // for the cut command and the paste command.
-    // NOTE: cut and paste are actually in the Clipboard commands section
