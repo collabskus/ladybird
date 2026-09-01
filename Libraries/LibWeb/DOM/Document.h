@@ -497,8 +497,6 @@ public:
     void update_layout(UpdateLayoutReason);
     void update_layout(UpdateLayoutReason, ThrottledAnimationSamplingScope);
     void note_content_visibility_auto_style() { m_may_have_content_visibility_auto_style = true; }
-    void note_default_scroll_shift_anchor() { m_may_have_default_scroll_shift_anchor = true; }
-    [[nodiscard]] bool may_have_default_scroll_shift_anchor() const { return m_may_have_default_scroll_shift_anchor; }
     enum class PartialRelayoutResult : u8 {
         NotEligible,
         Done,
@@ -940,6 +938,8 @@ public:
     DocumentUnloadTimingInfo& previous_document_unload_timing() { return m_previous_document_unload_timing; }
     DocumentUnloadTimingInfo const& previous_document_unload_timing() const { return m_previous_document_unload_timing; }
     void set_previous_document_unload_timing(DocumentUnloadTimingInfo const& previous_document_unload_timing) { m_previous_document_unload_timing = previous_document_unload_timing; }
+
+    void set_navigation_timing_entry(GC::Ref<NavigationTiming::PerformanceNavigationTiming> entry) { m_navigation_timing_entry = entry; }
 
     // https://w3c.github.io/editing/docs/execCommand/
     enum class DispatchInputEvent {
@@ -1580,7 +1580,6 @@ private:
     NonnullRefPtr<Painting::ChromeWidgetRegistry> m_chrome_widget_registry;
     RefPtr<Layout::Viewport> m_layout_root;
     bool m_may_have_content_visibility_auto_style { false };
-    bool m_may_have_default_scroll_shift_anchor { false };
 
     GC::Ptr<Node> m_hovered_node;
     GC::Ptr<Node> m_inspected_node;
@@ -1813,6 +1812,9 @@ private:
 
     // https://html.spec.whatwg.org/multipage/dom.html#previous-document-unload-timing
     DocumentUnloadTimingInfo m_previous_document_unload_timing;
+
+    // https://w3c.github.io/navigation-timing/#dfn-navigation-timing-entry
+    GC::Ptr<NavigationTiming::PerformanceNavigationTiming> m_navigation_timing_entry;
 
     // https://w3c.github.io/selection-api/#dfn-selection
     GC::Ptr<Selection::Selection> m_selection;

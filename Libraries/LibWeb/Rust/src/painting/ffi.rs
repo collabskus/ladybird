@@ -1102,7 +1102,7 @@ pub unsafe extern "C" fn layout_arena_update_accumulated_visual_contexts(
         }) {
             reason = reason.max(VisualContextGlobalRebuildReason::TreeInputsChanged);
         }
-        if inputs.may_have_default_scroll_shift_anchor {
+        if arena_ref.may_have_default_scroll_shift_anchor() {
             reason = reason.max(VisualContextGlobalRebuildReason::AnchorsRegistered);
         }
         if state.tree.as_deref().is_some_and(|tree| tree.should_compact()) {
@@ -1607,21 +1607,6 @@ pub unsafe extern "C" fn ladybird_web_record_image_paint_display_list(
         }
         let recorded = recorder.into_builder().finish();
         unsafe { consume(context, (&recorded).into(), Rc::into_raw(Rc::new(tree)).cast()) };
-    });
-}
-
-/// # Safety
-///
-/// `sink` must be the pointer handed to the callback, used synchronously.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn layout_arena_paint_push_overlay_glyph(sink: *mut c_void, glyph_id: u32, x: f32, y: f32) {
-    abort_on_panic(|| {
-        // SAFETY: `sink` is the Vec pointer handed out by FfiPaintHostCallbacks::overlay_label.
-        let glyphs = unsafe { &mut *sink.cast::<Vec<crate::painting::display_list::commands::DisplayListGlyph>>() };
-        glyphs.push(crate::painting::display_list::commands::DisplayListGlyph {
-            position: libgfx_rust::FloatPoint { x, y },
-            glyph_id,
-        });
     });
 }
 
