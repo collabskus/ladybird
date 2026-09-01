@@ -512,7 +512,7 @@ public:
         HandledByAfterLayoutCommit,
         HandledByFullLayoutCommit,
     };
-    void update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates, ReadonlySpan<Layout::Box const*> boxes_needing_eager_measurement = {});
+    void update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates);
     void update_paint_and_hit_testing_properties_if_needed();
     void sample_animation_effects_needing_style_update();
     void update_style_computer_viewport_rect();
@@ -844,21 +844,17 @@ public:
     Painting::ChromeWidgetRegistry const& chrome_widget_registry() const { return *m_chrome_widget_registry; }
 
     // Attribution of pending updates for partial relayout. Invariant: every update recorded
-    // since the last layout pass is either attributed to a boundary in the registered root
-    // set, or the escape bit is set. The dispatch may only run partial relayout while the
-    // escape bit is clear; a full layout pass re-derives every fact boundary qualification
-    // depends on, so it clears the bit.
+    // since the last layout pass is either attributed to a boundary in the root set the
+    // layout node arena keeps, or the escape bit is set. The dispatch may only run partial
+    // relayout while the escape bit is clear; a full layout pass re-derives every fact
+    // boundary qualification depends on, so it clears the bit.
     class PartialRelayoutInvalidation {
     public:
-        void record_boundary(Layout::Box&);
         void record_escape(PartialRelayoutEscapeReason);
         void clear_escape(PartialRelayoutEscapeClearReason);
         [[nodiscard]] bool escapes() const { return m_escapes; }
-        [[nodiscard]] bool has_registered_roots() const { return !m_registered_roots.is_empty(); }
-        [[nodiscard]] HashTable<WeakPtr<Layout::Box>> take_registered_roots() { return move(m_registered_roots); }
 
     private:
-        HashTable<WeakPtr<Layout::Box>> m_registered_roots;
         bool m_escapes { false };
     };
     [[nodiscard]] PartialRelayoutInvalidation& partial_relayout_invalidation() { return m_partial_relayout_invalidation; }
@@ -1504,7 +1500,7 @@ private:
     void collect_boxes_with_auto_content_visibility();
     bool needs_style_update_after_layout();
     bool any_anchor_names_are_registered() const;
-    PartialRelayoutResult try_partial_relayout(HashTable<WeakPtr<Layout::Box>> registered_partial_relayout_roots, bool& needs_layout_tree_rebuild, bool should_collect_devtools_layout_data);
+    PartialRelayoutResult try_partial_relayout(Vector<Layout::RustFFI::NodeSlotId> registered_partial_relayout_root_slots, bool& needs_layout_tree_rebuild, bool should_collect_devtools_layout_data);
 
     void process_pending_list_item_renumbers();
     bool reconcile_stale_list_item_counters_after_tree_build(Vector<Layout::Node*> const& rebuilt_subtree_roots);
@@ -1516,7 +1512,7 @@ private:
         Subtree,
         Full,
     };
-    void after_layout_commit(LayoutTreeChanged, LayoutCommitScope, ReadonlySpan<Layout::Box const*> boxes_needing_eager_overflow_measurement = {});
+    void after_layout_commit(LayoutTreeChanged, LayoutCommitScope);
 
     void run_unloading_cleanup_steps();
 
@@ -1906,9 +1902,6 @@ private:
     bool m_design_mode_enabled { false };
 
     bool m_needs_accumulated_visual_contexts_update { false };
-
-    bool m_needs_full_scrollable_overflow_recalculation { false };
-    Vector<Layout::RustFFI::NodeSlotId> m_boxes_needing_scrollable_overflow_recalculation;
 
     HashMap<Compositor::AsyncScrollNodeStableID, Painting::SnappedAreas> m_scroll_container_snapped_areas;
     Vector<WeakPtr<Layout::Node const>> m_scroll_snap_containers;
