@@ -1867,7 +1867,6 @@ void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed, Layout
     // NB: Called during layout update.
     m_layout_root->invalidate_text_blocks_cache();
 
-    invalidate_stacking_context_tree();
     set_needs_to_record_display_list();
     set_needs_to_refresh_scroll_state(true);
 
@@ -2225,7 +2224,7 @@ Document::PartialRelayoutResult Document::try_partial_relayout(HashTable<WeakPtr
         set_layout_root(as<Layout::Viewport>(*tree_build_result.root));
         record_layout_tree_build(tree_build_result.rebuilt_subtree_roots.size(), tree_build_result.layout_tree_update_escaped_rebuild_roots);
         needs_layout_tree_rebuild = false;
-        if (reconcile_stale_list_item_counters_after_tree_build(tree_build_result.rebuilt_subtree_roots))
+        if (reconcile_stale_list_item_counters_after_tree_build(tree_build_result.rebuilt_subtree_roots) || tree_build_result.needs_another_build_pass)
             return PartialRelayoutResult::NeedsAnotherLayoutPass;
         layout_tree_was_built_in_partial_branch = true;
         pending_updates_escaped_during_partial_build = m_partial_relayout_invalidation.escapes()
@@ -2411,6 +2410,9 @@ void Document::update_layout(UpdateLayoutReason reason, ThrottledAnimationSampli
             // NB: Called during layout update.
             if (document_element && document_element->unsafe_layout_node())
                 propagate_scrollbar_width_to_viewport(*document_element, *m_layout_root);
+
+            if (tree_build_result.needs_another_build_pass)
+                continue;
 
             set_needs_full_layout_tree_update(false);
 
@@ -5590,14 +5592,6 @@ void Document::set_page_showing(bool page_showing)
         return document_observer.document_page_showing_observer();
     },
         m_page_showing);
-}
-
-void Document::invalidate_stacking_context_tree()
-{
-    // NB: Called during stacking context invalidation.
-    auto const* layout_node = this->unsafe_layout_node();
-    if (layout_node && Painting::has_committed_box(*layout_node))
-        Painting::invalidate_stacking_context(*layout_node);
 }
 
 void Document::check_favicon_after_loading_link_resource()
@@ -10444,7 +10438,6 @@ RefPtr<Painting::DisplayList> Document::record_display_list(HTML::PaintConfig co
         page().client().page_did_change_background_color(canvas_background_color);
     }
 
-    document_paint_state.build_stacking_context_tree_if_needed(*this);
     document_paint_state.refresh_scroll_state(*this);
 
     Painting::InspectorOverlayInputs overlay_inputs;
@@ -11053,7 +11046,7 @@ Utf16String Document::dump_stacking_context_tree()
     if (!has_committed_viewport_box())
         return "No paintable"_utf16;
 
-    paint_state().build_stacking_context_tree_if_needed(*this);
+    update_paint_and_hit_testing_properties_if_needed();
 
     StringBuilder builder;
     Painting::dump_stacking_context_tree(builder, *this);
