@@ -1,4 +1,922 @@
-﻿        headers["Content-Type"] = "application/json"
+﻿                raise AssertionError(f"Queued Delete Session failed with HTTP {status}: {response_body}")
+    finally:
+        webdriver.terminate()
+        try:
+            webdriver.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            webdriver.kill()
+            webdriver.wait()
+
+    if webdriver.returncode not in (0, -15):
+        raise RuntimeError(f"WebDriver exited with status {webdriver.returncode}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("webdriver_binary")
+    args = parser.parse_args()
+
+    run_test(args.webdriver_binary)
+
+
+if __name__ == "__main__":
+    main()
+
+FILE: Tests/LibWebView/test-webdriver-error-keep-alive.py
+#!/usr/bin/env python3
+#
+# Copyright (c) 2026-present, the Ladybird developers.
+#
+# SPDX-License-Identifier: BSD-2-Clause
+
+import argparse
+import http.client
+import json
+import socket
+import subprocess
+import time
+
+EVENT_TIMEOUT_SECONDS = 30
+WEBDRIVER_REQUEST_TIMEOUT_SECONDS = 30
+
+
+def unused_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def wait_for_port(port):
+    deadline = time.monotonic() + EVENT_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                return
+        except OSError:
+            time.sleep(0.05)
+    raise RuntimeError(f"Timed out waiting for port {port}")
+
+
+def request(connection, method, path, body=None):
+    encoded_body = json.dumps(body).encode() if body is not None else None
+    headers = {"Connection": "keep-alive"}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    connection.request(method, path, encoded_body, headers)
+    response = connection.getresponse()
+    response_body = response.read().decode()
+
+    payload = json.loads(response_body) if response_body else {}
+    return response.status, payload, response_body
+
+
+def run_test(webdriver_binary):
+    webdriver_port = unused_port()
+    webdriver = subprocess.Popen([webdriver_binary, "--headless", "-l", "127.0.0.1", "-p", str(webdriver_port)])
+    connection = None
+    try:
+        wait_for_port(webdriver_port)
+
+        # Every request in this test is sent over the same keep-alive connection, matching how the
+        # WPT wdspec harness drives WebDriver. An error response must leave the connection usable.
+        connection = http.client.HTTPConnection("127.0.0.1", webdriver_port, timeout=WEBDRIVER_REQUEST_TIMEOUT_SECONDS)
+
+        status, payload, response_body = request(
+            connection,
+            "POST",
+            "/session",
+            {"capabilities": {"alwaysMatch": {"ladybird:headless": True}}},
+        )
+        value = payload.get("value")
+        session_id = value.get("sessionId") if isinstance(value, dict) else None
+        if status != 200 or not session_id:
+            raise AssertionError(f"New Session failed with HTTP {status}: {response_body}")
+
+        status, payload, response_body = request(
+            connection, "POST", f"/session/{session_id}/window", {"handle": "does-not-exist"}
+        )
+        if status != 404 or payload.get("value", {}).get("error") != "no such window":
+            raise AssertionError(f"Switch To Window returned an unexpected response: HTTP {status}: {response_body}")
+
+        status, payload, response_body = request(connection, "GET", f"/session/{session_id}/title")
+        if status != 200:
+            raise AssertionError(f"Get Title after error failed with HTTP {status}: {response_body}")
+
+        status, payload, response_body = request(connection, "GET", f"/session/{session_id}/unknown-command")
+        if status != 404 or payload.get("value", {}).get("error") != "unknown command":
+            raise AssertionError(f"Unknown command returned an unexpected response: HTTP {status}: {response_body}")
+
+        status, payload, response_body = request(connection, "GET", f"/session/{session_id}/title")
+        if status != 200:
+            raise AssertionError(f"Get Title after unknown command failed with HTTP {status}: {response_body}")
+
+        status, payload, response_body = request(connection, "DELETE", f"/session/{session_id}")
+        if status != 200:
+            raise AssertionError(f"Delete Session failed with HTTP {status}: {response_body}")
+    finally:
+        if connection is not None:
+            connection.close()
+        webdriver.terminate()
+        try:
+            webdriver.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            webdriver.kill()
+            webdriver.wait()
+
+    if webdriver.returncode not in (0, -15):
+        raise RuntimeError(f"WebDriver exited with status {webdriver.returncode}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("webdriver_binary")
+    args = parser.parse_args()
+
+    run_test(args.webdriver_binary)
+
+
+if __name__ == "__main__":
+    main()
+
+FILE: Tests/LibWebView/test-webdriver-session-history.py
+#!/usr/bin/env python3
+#
+# Copyright (c) 2026-present, the Ladybird developers.
+#
+# SPDX-License-Identifier: BSD-2-Clause
+
+import argparse
+import http.client
+import http.server
+import json
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+from typing import cast
+
+BLOCKED_RESPONSE_TIMEOUT_SECONDS = 30
+EVENT_TIMEOUT_SECONDS = 30
+WEBDRIVER_REQUEST_TIMEOUT_SECONDS = 60
+WEB_ELEMENT_IDENTIFIER = "element-6066-11e4-a52e-4f735466cecf"
+
+
+class TestPageServer(http.server.ThreadingHTTPServer):
+    def __init__(self, server_address, request_handler_class):
+        super().__init__(server_address, request_handler_class)
+        self.blocked_frame_b_requested = threading.Event()
+        self.frame_b_blocked_document_ran = threading.Event()
+        self.release_blocked_frame_b = threading.Event()
+        self.blocked_reload_requested = threading.Event()
+        self.reload_recovery_requested = threading.Event()
+        self.release_blocked_reload = threading.Event()
+        self.reload_blocked_request_lock = threading.Lock()
+        self.reload_blocked_request_count = 0
+        self.blocked_process_swap_back_requested = threading.Event()
+        self.process_swap_back_recovery_requested = threading.Event()
+        self.process_swap_back_document_ran = threading.Event()
+        self.release_blocked_process_swap_back = threading.Event()
+        self.process_swap_back_blocked_request_lock = threading.Lock()
+        self.process_swap_back_blocked_request_count = 0
+        self.block_forward_load = False
+        self.blocked_forward_requested = threading.Event()
+        self.release_blocked_forward = threading.Event()
+        self.blocked_cross_site_post_requested = threading.Event()
+        self.release_blocked_cross_site_post = threading.Event()
+        self.blocked_same_site_post_requested = threading.Event()
+        self.release_blocked_same_site_post = threading.Event()
+        self.blocked_same_url_post_requested = threading.Event()
+        self.release_blocked_same_url_post = threading.Event()
+        self.block_post_result_load = False
+        self.blocked_post_result_load_requested = threading.Event()
+        self.post_result_load_became_interactive = threading.Event()
+        self.release_blocked_post_result_load = threading.Event()
+        self.blocked_navigation_requested = threading.Event()
+        self.release_blocked_navigation = threading.Event()
+        self.blocked_navigation_response_finished = threading.Event()
+        self.navigation_blocked_document_ran = threading.Event()
+        self.blocked_no_content_navigation_requested = threading.Event()
+        self.release_blocked_no_content_navigation = threading.Event()
+        self.a_request_lock = threading.Lock()
+        self.a_request_count = 0
+        self.state_replace_load_document_ran = threading.Event()
+        self.a_document_ran = threading.Event()
+        self.fragment_source_document_ran = threading.Event()
+        self.fragment_target_document_ran = threading.Event()
+        self.b_document_ran = threading.Event()
+        self.c_document_ran = threading.Event()
+        self.d_document_ran = threading.Event()
+        self.post_result_document_ran = threading.Event()
+        self.cross_site_post_result_document_ran = threading.Event()
+        self.same_site_post_result_document_ran = threading.Event()
+        self.same_url_post_result_document_ran = threading.Event()
+        self.reload_blocked_document_ran = threading.Event()
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], BrokenPipeError):
+            return
+        super().handle_error(request, client_address)
+
+
+class TestPageHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        server = cast(TestPageServer, self.server)
+        server_port = server.server_port
+
+        if self.path == "/a":
+            with server.a_request_lock:
+                server.a_request_count += 1
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                f"""<!doctype html>
+<title>A</title>
+<script>fetch('/document-ran?a');</script>
+<a id="go" href="http://127.0.0.1:{server_port}/b">B</a>
+<a id="redirect" href="http://localhost:{server_port}/redirect-to-b">Redirect to B</a>
+<a id="pending" href="http://localhost:{server_port}/navigation-blocked">Pending</a>
+<a id="pending-redirect" href="http://localhost:{server_port}/redirect-to-navigation-blocked">Pending redirect</a>
+<a id="pending-cross-site" href="http://127.0.0.1:{server_port}/navigation-blocked">Pending cross-site</a>
+<a id="pending-cross-site-no-content" href="http://127.0.0.1:{server_port}/navigation-no-content-blocked">Pending cross-site no content</a>
+<p>A</p>""".encode()
+            )
+            return
+
+        if self.path == "/document-ran?a":
+            server.a_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/fragment-source":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Fragment Source</title>
+<script>fetch('/document-ran?fragment-source');</script>
+<p>Fragment Source</p>""".encode()
+            )
+            return
+
+        if self.path == "/fragment-target":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Fragment Target</title>
+<script>fetch('/document-ran?fragment-target');</script>
+<h2 id="section">Section</h2>
+<p>Fragment Target</p>""".encode()
+            )
+            return
+
+        if self.path == "/webdriver-intercepted-navigation-click":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                b"""<!doctype html>
+<button id="button">Navigate</button>
+<script>
+window.navigationType = "none";
+navigation.addEventListener("navigate", event => {
+    event.intercept();
+    window.navigationType = event.navigationType;
+});
+button.addEventListener("click", () => {
+    const script = document.createElement("script");
+    script.textContent = 'location.href="?foo"';
+    document.body.append(script);
+});
+</script>"""
+            )
+            return
+
+        if self.path == "/document-ran?fragment-source":
+            server.fragment_source_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/document-ran?fragment-target":
+            server.fragment_target_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/redirect-to-b":
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{server_port}/b")
+            self.end_headers()
+            return
+
+        if self.path == "/redirect-to-tls-failure":
+            self.send_response(302)
+            self.send_header("Location", f"https://127.0.0.1:{server_port}/tls-failure")
+            self.end_headers()
+            return
+
+        if self.path == "/redirect-to-navigation-blocked":
+            self.send_response(302)
+            self.send_header("Location", f"http://localhost:{server_port}/navigation-blocked")
+            self.end_headers()
+            return
+
+        if self.path == "/navigation-blocked":
+            server.blocked_navigation_requested.set()
+            if not server.release_blocked_navigation.wait(timeout=BLOCKED_RESPONSE_TIMEOUT_SECONDS):
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"timed out waiting to unblock navigation")
+                return
+
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(
+                    b"<!doctype html><title>Pending navigation committed</title>"
+                    b"<script>fetch('/document-ran?navigation-blocked');</script>"
+                )
+            finally:
+                server.blocked_navigation_response_finished.set()
+            return
+
+        if self.path == "/document-ran?navigation-blocked":
+            server.navigation_blocked_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/navigation-no-content-blocked":
+            server.blocked_no_content_navigation_requested.set()
+            if not server.release_blocked_no_content_navigation.wait(timeout=BLOCKED_RESPONSE_TIMEOUT_SECONDS):
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"timed out waiting to unblock no-content navigation")
+                return
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path.startswith("/nested"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                f"""<!doctype html>
+<title>Nested</title>
+<iframe id="frame" src="http://localhost:{server_port}/frame-a"></iframe>
+<p>Nested</p>""".encode()
+            )
+            return
+
+        if self.path.startswith("/state"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            document_ready_script = ""
+            if self.path == "/state?replace-load":
+                document_ready_script = "<script>fetch('/document-ran?state-replace-load');</script>"
+            self.wfile.write(
+                f"""<!doctype html>
+<title>State</title>
+{document_ready_script}
+<p>State</p>""".encode()
+            )
+            return
+
+        if self.path.startswith("/scroll"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Scroll</title>
+<style>
+body {
+    margin: 0;
+    min-height: 4000px;
+}
+</style>
+<p>Scroll</p>""".encode()
+            )
+            return
+
+        if self.path == "/reload-blocked":
+            should_block = False
+            with server.reload_blocked_request_lock:
+                server.reload_blocked_request_count += 1
+                if server.reload_blocked_request_count > 2:
+                    server.reload_recovery_requested.set()
+                should_block = server.reload_blocked_request_count > 1
+
+            if should_block:
+                server.blocked_reload_requested.set()
+                if not server.release_blocked_reload.wait(timeout=BLOCKED_RESPONSE_TIMEOUT_SECONDS):
+                    self.send_response(500)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(b"timed out waiting to unblock reload")
+                    return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Reload Blocked</title>
+<script>fetch('/document-ran?reload-blocked');</script>
+<p>Reload Blocked</p>""".encode()
+            )
+            return
+
+        if self.path == "/process-swap-back-blocked":
+            should_block = False
+            with server.process_swap_back_blocked_request_lock:
+                server.process_swap_back_blocked_request_count += 1
+                if server.process_swap_back_blocked_request_count > 2:
+                    server.process_swap_back_recovery_requested.set()
+                should_block = server.process_swap_back_blocked_request_count > 1
+
+            if should_block:
+                server.blocked_process_swap_back_requested.set()
+                if not server.release_blocked_process_swap_back.wait(timeout=BLOCKED_RESPONSE_TIMEOUT_SECONDS):
+                    self.send_response(500)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(b"timed out waiting to unblock process-swap back")
+                    return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                f"""<!doctype html>
+<title>Process Swap Back Blocked</title>
+<script>fetch('/document-ran?process-swap-back-blocked');</script>
+<a id="go" href="http://127.0.0.1:{server_port}/b">B</a>
+<p>Process Swap Back Blocked</p>""".encode()
+            )
+            return
+
+        if self.path == "/forward-blocked":
+            if server.block_forward_load:
+                server.blocked_forward_requested.set()
+                if not server.release_blocked_forward.wait(timeout=BLOCKED_RESPONSE_TIMEOUT_SECONDS):
+                    self.send_response(500)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(b"timed out waiting to unblock forward")
+                    return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Forward Blocked</title>
+<p>Forward Blocked</p>""".encode()
+            )
+            return
+
+        if self.path == "/frame-a":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Frame A</title>
+<p>Frame A</p>""".encode()
+            )
+            return
+
+        if self.path == "/frame-b":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Frame B</title>
+<p>Frame B</p>""".encode()
+            )
+            return
+
+        if self.path == "/frame-b-blocked":
+            server.blocked_frame_b_requested.set()
+            if not server.release_blocked_frame_b.wait(timeout=BLOCKED_RESPONSE_TIMEOUT_SECONDS):
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"timed out waiting to unblock frame")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Frame B Blocked</title>
+<script>addEventListener('load', () => fetch('/document-ran?frame-b-blocked'));</script>
+<p>Frame B Blocked</p>""".encode()
+            )
+            return
+
+        if self.path == "/iframe-deferred-fragment-first":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Deferred Fragment First</title>
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+    setTimeout(() => {
+        location.hash = "/all";
+    }, 0);
+});
+</script>""".encode()
+            )
+            return
+
+        if self.path == "/iframe-deferred-fragment-second":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Deferred Fragment Second</title>
+<div id="replacement-ready"></div>""".encode()
+            )
+            return
+
+        if self.path == "/b":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                f"""<!doctype html>
+<title>B</title>
+<script>fetch('/document-ran?b');</script>
+<a id="go" href="http://127.0.0.1:{server_port}/c">C</a>
+<a id="branch" href="http://localhost:{server_port}/d">D</a>
+<p>B</p>""".encode()
+            )
+            return
+
+        if self.path == "/document-ran?b":
+            server.b_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/c":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                f"""<!doctype html>
+<title>C</title>
+<script>fetch('/document-ran?c');</script>
+<a id="go" href="http://localhost:{server_port}/a">A</a>
+<p>C</p>""".encode()
+            )
+            return
+
+        if self.path == "/document-ran?state-replace-load":
+            server.state_replace_load_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/document-ran?c":
+            server.c_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/document-ran?process-swap-back-blocked":
+            server.process_swap_back_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/document-ran?frame-b-blocked":
+            server.frame_b_blocked_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/document-ran?post-result":
+            server.post_result_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/document-ran?post-result-load-blocked":
+            server.post_result_load_became_interactive.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/post-result-load-blocked":
+            server.blocked_post_result_load_requested.set()
+            if not server.release_blocked_post_result_load.wait(timeout=BLOCKED_RESPONSE_TIMEOUT_SECONDS):
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"timed out waiting to finish POST result load")
+                return
+
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/document-ran?cross-site-post-result":
+            server.cross_site_post_result_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/document-ran?same-site-post-result":
+            server.same_site_post_result_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/document-ran?same-url-post-result":
+            server.same_url_post_result_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/document-ran?reload-blocked":
+            server.reload_blocked_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/d":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>D</title>
+<script>fetch('/document-ran?d');</script>
+<script>
+window.initialHistoryLength = history.length;
+window.initialNavigationEntryCount = navigation.entries().length;
+window.initialNavigationCurrentIndex = navigation.currentEntry.index;
+</script>
+<p>D</p>""".encode()
+            )
+            return
+
+        if self.path == "/document-ran?d":
+            server.d_document_ran.set()
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/post-form":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Post Form</title>
+<form id="post-form" method="post" action="/post-result">
+<input name="name" value="ladybird">
+<button id="submit">Submit</button>
+</form>
+<p>Post Form</p>""".encode()
+            )
+            return
+
+        if self.path == "/post-blocked-form":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Post Blocked Form</title>
+<form id="post-form" method="post" action="/post-result-blocked-same-site">
+<input name="name" value="ladybird">
+<button id="submit">Submit</button>
+</form>
+<p>Post Blocked Form</p>""".encode()
+            )
+            return
+
+        if self.path == "/post-same-url-blocked":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Post Same URL Blocked Form</title>
+<form id="post-form" method="post" action="/post-same-url-blocked">
+<input name="name" value="ladybird">
+<button id="submit">Submit</button>
+</form>
+<p>Post Same URL Blocked Form</p>""".encode()
+            )
+            return
+
+        if self.path == "/cross-site-post-form":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                f"""<!doctype html>
+<title>Cross-site Post Form</title>
+<form id="post-form" method="post" action="http://127.0.0.1:{server_port}/post-result">
+<input name="name" value="ladybird">
+<button id="submit">Submit</button>
+</form>
+<p>Cross-site Post Form</p>""".encode()
+            )
+            return
+
+        if self.path == "/cross-site-post-blocked-form":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                f"""<!doctype html>
+<title>Cross-site Post Blocked Form</title>
+<form id="post-form" method="post" action="http://127.0.0.1:{server_port}/post-result-blocked">
+<input name="name" value="ladybird">
+<button id="submit">Submit</button>
+</form>
+<p>Cross-site Post Blocked Form</p>""".encode()
+            )
+            return
+
+        if self.path == "/post-result":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                """<!doctype html>
+<title>Post Result GET</title>
+<p id="result">GET</p>""".encode()
+            )
+            return
+
+        self.send_response(404)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"not found")
+
+    def do_POST(self):
+        server = cast(TestPageServer, self.server)
+
+        if self.path == "/post-result-blocked":
+            content_length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(content_length).decode()
+            server.blocked_cross_site_post_requested.set()
+            if not server.release_blocked_cross_site_post.wait(timeout=BLOCKED_RESPONSE_TIMEOUT_SECONDS):
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"timed out waiting to unblock cross-site POST")
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                f"""<!doctype html>
+<title>Post Result Blocked POST</title>
+<script>fetch('/document-ran?cross-site-post-result');</script>
+<p id="result">POST:{body}</p>""".encode()
+            )
+            return
+
+        if self.path == "/post-result-blocked-same-site":
+            content_length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(content_length).decode()
+            server.blocked_same_site_post_requested.set()
+            if not server.release_blocked_same_site_post.wait(timeout=BLOCKED_RESPONSE_TIMEOUT_SECONDS):
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"timed out waiting to unblock same-site POST")
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                f"""<!doctype html>
+<title>Post Result Blocked Same-Site POST</title>
+<script>fetch('/document-ran?same-site-post-result');</script>
+<p id="result">POST:{body}</p>""".encode()
+            )
+            return
+
+        if self.path == "/post-same-url-blocked":
+            content_length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(content_length).decode()
+            server.blocked_same_url_post_requested.set()
+            if not server.release_blocked_same_url_post.wait(timeout=BLOCKED_RESPONSE_TIMEOUT_SECONDS):
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"timed out waiting to unblock same-URL POST")
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                f"""<!doctype html>
+<title>Post Same URL Blocked POST</title>
+<script>fetch('/document-ran?same-url-post-result');</script>
+<p id="result">POST:{body}</p>""".encode()
+            )
+            return
+
+        if self.path == "/post-result":
+            content_length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(content_length).decode()
+            load_blocker = ""
+            if server.block_post_result_load:
+                load_blocker = """
+<script>addEventListener('DOMContentLoaded', () => fetch('/document-ran?post-result-load-blocked'));</script>
+<img src="/post-result-load-blocked">"""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                f"""<!doctype html>
+<title>Post Result POST</title>
+<script>fetch('/document-ran?post-result');</script>
+{load_blocker}
+<p id="result">POST:{body}</p>""".encode()
+            )
+            return
+
+        self.send_response(404)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"not found")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def unused_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def wait_for_port(port, timeout=EVENT_TIMEOUT_SECONDS):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                return
+        except OSError:
+            time.sleep(0.05)
+    raise RuntimeError(f"Timed out waiting for port {port}")
+
+
+def wait_for_event(event, label, timeout=EVENT_TIMEOUT_SECONDS):
+    if event.wait(timeout=timeout):
+        return
+    raise RuntimeError(f"Timed out waiting for {label}")
+
+
+def count_open_fds(pid):
+    proc_fd = f"/proc/{pid}/fd"
+    if os.path.isdir(proc_fd):
+        return len(os.listdir(proc_fd))
+    try:
+        result = subprocess.run(["lsof", "-p", str(pid)], capture_output=True, text=True)
+    except FileNotFoundError:
+        return None
+    return max(0, len(result.stdout.splitlines()) - 1)
+
+
+def request_raw(webdriver_port, method, path, body=None):
+    encoded_body = None
+    headers = {}
+    if body is not None:
+        encoded_body = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
 
     connection = http.client.HTTPConnection("127.0.0.1", webdriver_port, timeout=WEBDRIVER_REQUEST_TIMEOUT_SECONDS)
     try:
@@ -16118,10 +17036,61 @@ TEST_CASE(transferring_request_reissues_cookie_lookup_for_new_owner)
     EXPECT(primary_connection.is_open());
 }
 
+FILE: Tests/UI/AppKit/AppKitEventLoopTestMain.mm
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/Format.h>
+#include <AK/Vector.h>
+#include <Application/EventLoopImplementationMacOS.h>
+#include <LibCore/EventLoopImplementation.h>
+#include <LibTest/TestSuite.h>
+
+#import <Cocoa/Cocoa.h>
+
+int main(int argc, char** argv)
+{
+    if (argc < 1 || !argv[0] || '\0' == *argv[0]) {
+        warnln("Test main does not have a valid test name!");
+        return 1;
+    }
+
+    [NSApplication sharedApplication];
+    Core::EventLoopManager::install(*new Ladybird::EventLoopManagerMacOS);
+
+    Vector<StringView> arguments;
+    arguments.ensure_capacity(argc);
+    for (auto i = 0; i < argc; ++i)
+        arguments.append({ argv[i], strlen(argv[i]) });
+
+    auto result = Test::TestSuite::the().main(argv[0], arguments);
+    Test::TestSuite::release();
+    return result != 0;
+}
+
 FILE: Tests/UI/AppKit/CMakeLists.txt
 if (NOT APPLE)
     return()
 endif()
+
+add_library(AppKitEventLoopTestMain OBJECT
+    AppKitEventLoopTestMain.mm
+    "${LADYBIRD_SOURCE_DIR}/Libraries/LibTest/AssertionHandler.cpp"
+)
+target_include_directories(AppKitEventLoopTestMain PRIVATE "${LADYBIRD_SOURCE_DIR}/UI/AppKit")
+target_link_libraries(AppKitEventLoopTestMain PRIVATE AK LibCore LibTest "-framework Cocoa")
+
+ladybird_test("TestEventLoopImplementation.cpp" UI/AppKit
+    CUSTOM_MAIN "$<TARGET_OBJECTS:AppKitEventLoopTestMain>"
+    NAME TestAppKitEventLoopImplementation
+    LIBS LibSync LibThreading
+)
+target_sources(TestAppKitEventLoopImplementation PRIVATE "${LADYBIRD_SOURCE_DIR}/UI/AppKit/Application/EventLoopImplementationMacOS.mm")
+target_include_directories(TestAppKitEventLoopImplementation PRIVATE "${LADYBIRD_SOURCE_DIR}/UI/AppKit")
+target_link_libraries(TestAppKitEventLoopImplementation PRIVATE "-framework Cocoa")
 
 ladybird_test("TestClipboardTypes.mm" UI/AppKit NAME TestAppKitClipboardTypes LIBS LibWebView)
 target_sources(TestAppKitClipboardTypes PRIVATE "${LADYBIRD_SOURCE_DIR}/UI/AppKit/Application/ClipboardTypes.mm")
@@ -16201,6 +17170,83 @@ TEST_CASE(round_trips_every_supported_mime_type)
         EXPECT_NE(pasteboard_type, nil);
         EXPECT_EQ(Ladybird::mime_type_for_pasteboard_type(pasteboard_type), MUST(String::from_utf8(mime_type)));
     }
+}
+
+FILE: Tests/UI/AppKit/TestEventLoopImplementation.cpp
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <LibCore/EventLoop.h>
+#include <LibCore/ThreadEventQueue.h>
+#include <LibSync/ConditionVariable.h>
+#include <LibTest/TestCase.h>
+#include <LibThreading/Thread.h>
+
+TEST_CASE(quit_event_loop_before_worker_run_loop_waits)
+{
+    IGNORE_USE_IN_ESCAPING_LAMBDA Sync::Mutex mutex;
+    IGNORE_USE_IN_ESCAPING_LAMBDA Sync::ConditionVariable condition { mutex };
+    IGNORE_USE_IN_ESCAPING_LAMBDA RefPtr<Core::WeakEventLoopReference> weak_ref;
+    IGNORE_USE_IN_ESCAPING_LAMBDA Core::ThreadEventQueue* thread_event_queue { nullptr };
+    IGNORE_USE_IN_ESCAPING_LAMBDA bool may_exec { false };
+    IGNORE_USE_IN_ESCAPING_LAMBDA bool callback_is_running { false };
+    IGNORE_USE_IN_ESCAPING_LAMBDA bool callback_may_return { false };
+
+    auto thread = Threading::Thread::construct("AppKit event loop"sv, [&] {
+        Core::EventLoop event_loop;
+        {
+            Sync::MutexLocker locker { mutex };
+            weak_ref = Core::EventLoop::current_weak();
+            thread_event_queue = &Core::ThreadEventQueue::current();
+            condition.broadcast();
+            condition.wait_while([&] { return !may_exec; });
+        }
+        return event_loop.exec();
+    });
+    thread->start();
+
+    RefPtr<Core::WeakEventLoopReference> event_loop;
+    Core::ThreadEventQueue* event_queue;
+    {
+        Sync::MutexLocker locker { mutex };
+        condition.wait_while([&] { return !thread_event_queue; });
+        event_loop = weak_ref;
+        event_queue = thread_event_queue;
+    }
+
+    event_queue->deferred_invoke([&] {
+        Sync::MutexLocker locker { mutex };
+        callback_is_running = true;
+        condition.broadcast();
+        condition.wait_while([&] { return !callback_may_return; });
+    });
+
+    {
+        Sync::MutexLocker locker { mutex };
+        may_exec = true;
+        condition.broadcast();
+        condition.wait_while([&] { return !callback_is_running; });
+    }
+
+    {
+        auto strong_event_loop = event_loop->take();
+        VERIFY(strong_event_loop);
+        EXPECT(!strong_event_loop->was_exit_requested());
+        strong_event_loop->quit(42);
+        EXPECT(strong_event_loop->was_exit_requested());
+    }
+
+    {
+        Sync::MutexLocker locker { mutex };
+        callback_may_return = true;
+        condition.broadcast();
+    }
+
+    auto exit_code = MUST(thread->join<void*>());
+    EXPECT_EQ(reinterpret_cast<intptr_t>(exit_code), 42);
 }
 
 FILE: Tests/UI/CMakeLists.txt
@@ -20085,7 +21131,12 @@ Core::EventLoop& Application::create_platform_event_loop()
         [::Application sharedApplication];
     }
 
-    return WebView::Application::create_platform_event_loop();
+    auto& event_loop = WebView::Application::create_platform_event_loop();
+
+    if (!browser_options().headless_mode.has_value())
+        static_cast<EventLoopImplementationMacOS&>(event_loop.impl()).set_main_loop();
+
+    return event_loop;
 }
 
 Optional<String> Application::ui_font_family() const
@@ -21688,9 +22739,6 @@ public:
 
 class EventLoopImplementationMacOS final : public Core::EventLoopImplementation {
 public:
-    // FIXME: This currently only manages the main NSApp event loop, as that is all we currently
-    //        interact with. When we need multiple event loops, or an event loop that isn't the
-    //        NSApp loop, we will need to create our own CFRunLoop.
     static NonnullOwnPtr<EventLoopImplementationMacOS> create();
 
     virtual int exec() override;
@@ -21700,6 +22748,8 @@ public:
     virtual void deferred_invoke(Function<void()>&&) override;
     virtual bool was_exit_requested() const override;
 
+    void set_main_loop();
+
     virtual ~EventLoopImplementationMacOS() override;
 
 private:
@@ -21708,7 +22758,7 @@ private:
     struct Impl;
     NonnullOwnPtr<Impl> m_impl;
 
-    int m_exit_code { 0 };
+    bool m_main_loop { false };
 };
 
 }
@@ -21723,6 +22773,7 @@ FILE: UI/AppKit/Application/EventLoopImplementationMacOS.mm
 #include <AK/Assertions.h>
 #include <AK/HashMap.h>
 #include <AK/IDAllocator.h>
+#include <AK/NumericLimits.h>
 #include <AK/Singleton.h>
 #include <AK/TemporaryChange.h>
 #include <Application/EventLoopImplementationMacOS.h>
@@ -22160,12 +23211,32 @@ NonnullOwnPtr<EventLoopImplementationMacOS> EventLoopImplementationMacOS::create
 
 int EventLoopImplementationMacOS::exec()
 {
-    [NSApp run];
-    return m_exit_code;
+    if (auto exit_code = exit_code_if_requested(); exit_code.has_value())
+        return exit_code.release_value();
+
+    if (m_main_loop) {
+        [NSApp run];
+        if (auto exit_code = exit_code_if_requested(); exit_code.has_value())
+            return exit_code.release_value();
+        return 0;
+    }
+
+    for (;;) {
+        pump(PumpMode::WaitForEvents);
+        if (auto exit_code = exit_code_if_requested(); exit_code.has_value())
+            return exit_code.release_value();
+    }
 }
 
 size_t EventLoopImplementationMacOS::pump(PumpMode mode)
 {
+    if (!m_main_loop) {
+        auto result = m_thread_event_queue.process();
+        auto duration = mode == PumpMode::WaitForEvents && result == 0 ? NumericLimits<double>::max() : 0;
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, duration, true);
+        return result + m_thread_event_queue.process();
+    }
+
     auto* wait_until = mode == PumpMode::WaitForEvents ? [NSDate distantFuture] : [NSDate distantPast];
 
     auto* event = [NSApp nextEventMatchingMask:NSEventMaskAny
@@ -22187,8 +23258,14 @@ size_t EventLoopImplementationMacOS::pump(PumpMode mode)
 
 void EventLoopImplementationMacOS::quit(int exit_code)
 {
-    m_exit_code = exit_code;
-    [NSApp stop:nil];
+    request_exit(exit_code);
+    if (m_main_loop) {
+        [NSApp stop:nil];
+    } else {
+        CFRunLoopSourceSignal(m_impl->deferred_source);
+        CFRunLoopWakeUp(m_impl->run_loop);
+        CFRunLoopStop(m_impl->run_loop);
+    }
 }
 
 void EventLoopImplementationMacOS::wake()
@@ -22206,7 +23283,15 @@ void EventLoopImplementationMacOS::deferred_invoke(Function<void()>&& invokee)
 
 bool EventLoopImplementationMacOS::was_exit_requested() const
 {
-    return ![NSApp isRunning];
+    if (Core::EventLoopImplementation::was_exit_requested())
+        return true;
+    return m_main_loop && ![NSApp isRunning];
+}
+
+void EventLoopImplementationMacOS::set_main_loop()
+{
+    VERIFY(CFRunLoopGetCurrent() == CFRunLoopGetMain());
+    m_main_loop = true;
 }
 
 }
