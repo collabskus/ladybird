@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use crate::css::css_pixels::CssPixels;
+use crate::css::css_pixels::{CssPixelRect, CssPixels};
 use crate::layout::node_data::NodeKind;
 use crate::layout::node_data::NodeSlotId;
 use crate::layout::node_facts;
@@ -12,6 +12,8 @@ use crate::painting::fragment_ownership;
 use crate::painting::paintable_data::FragmentRecord;
 use crate::painting::paintable_rows::PaintableRowsRead;
 use crate::painting::text_fragment;
+use libgfx_rust::{FloatPoint, FloatRect, FloatSize, IntPoint, IntRect, IntSize};
+use std::fmt::Write;
 
 fn push_class_name(out: &mut Vec<u8>, kind: NodeKind) {
     debug_assert!(kind != NodeKind::Unset, "Unset layout node kind has no class name");
@@ -22,22 +24,42 @@ fn push_usize(out: &mut Vec<u8>, value: usize) {
     out.extend_from_slice(value.to_string().as_bytes());
 }
 
-fn push_css_pixels(out: &mut Vec<u8>, value: CssPixels) {
+pub(crate) struct Utf8Sink<'a>(pub(crate) &'a mut Vec<u8>);
+
+impl Write for Utf8Sink<'_> {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        self.0.extend_from_slice(text.as_bytes());
+        Ok(())
+    }
+}
+
+pub(crate) fn push_css_pixels(output: &mut impl Write, value: CssPixels) {
     let raw = value.raw_value();
     if raw < 0 {
-        out.push(b'-');
+        let _ = output.write_char('-');
     }
     let magnitude = raw.unsigned_abs();
-    out.extend_from_slice((magnitude / 64).to_string().as_bytes());
+    let _ = write!(output, "{}", magnitude / 64);
     let frac = magnitude % 64;
     if frac != 0 {
-        let mut digits = format!("{:06}", u64::from(frac) * 15625).into_bytes();
-        while digits.last() == Some(&b'0') {
+        let mut digits = format!("{:06}", u64::from(frac) * 15625);
+        while digits.ends_with('0') {
             digits.pop();
         }
-        out.push(b'.');
-        out.extend_from_slice(&digits);
+        let _ = write!(output, ".{digits}");
     }
+}
+
+pub(crate) fn push_css_pixel_rect(output: &mut impl Write, rect: CssPixelRect) {
+    let _ = output.write_char('[');
+    push_css_pixels(output, rect.x);
+    let _ = output.write_char(',');
+    push_css_pixels(output, rect.y);
+    let _ = output.write_char(' ');
+    push_css_pixels(output, rect.width);
+    let _ = output.write_char('x');
+    push_css_pixels(output, rect.height);
+    let _ = output.write_char(']');
 }
 
 fn push_code_point(out: &mut Vec<u8>, code_point: u32) {
@@ -97,17 +119,10 @@ fn dump_fragment(
     push_usize(out, fragment.start_offset);
     out.extend_from_slice(b", length: ");
     push_usize(out, fragment.length_in_code_units);
-    out.extend_from_slice(b", rect: [");
-    let rect = text_fragment::absolute_rect(layout_arena, fragment);
-    push_css_pixels(out, rect.x);
-    out.push(b',');
-    push_css_pixels(out, rect.y);
-    out.push(b' ');
-    push_css_pixels(out, rect.width);
-    out.push(b'x');
-    push_css_pixels(out, rect.height);
-    out.extend_from_slice(b"] baseline: ");
-    push_css_pixels(out, fragment.baseline);
+    out.extend_from_slice(b", rect: ");
+    push_css_pixel_rect(&mut Utf8Sink(out), text_fragment::absolute_rect(layout_arena, fragment));
+    out.extend_from_slice(b" baseline: ");
+    push_css_pixels(&mut Utf8Sink(out), fragment.baseline);
     out.push(b'\n');
     if fragment.length_in_code_units > 0 {
         push_indent(out, indent);
@@ -194,7 +209,19 @@ pub(crate) fn format_float_like_ak(value: f32) -> String {
     if value == 0.0 {
         return "0".to_string();
     }
-    let shortest_scientific = format!("{:e}", value.abs());
+    // Dragonbox, which AK formats through, picks the same-length decimal closest to the value and
+    // breaks an exact tie toward the even significand; Rust's shortest form breaks it the other
+    // way. Re-rounding the shortest digit count through `{:.*e}` is correctly rounded ties-to-even,
+    // so it reproduces Dragonbox's choice.
+    let shortest = format!("{:e}", value.abs());
+    let significant_digits = shortest
+        .split_once('e')
+        .expect("Rust scientific formatting always contains an exponent")
+        .0
+        .bytes()
+        .filter(u8::is_ascii_digit)
+        .count();
+    let shortest_scientific = format!("{:.*e}", significant_digits - 1, value.abs());
     let (mantissa_text, exponent_text) = shortest_scientific
         .split_once('e')
         .expect("Rust scientific formatting always contains an exponent");
@@ -238,6 +265,56 @@ pub(crate) fn format_float_like_ak(value: f32) -> String {
     text
 }
 
+pub(crate) fn push_float_like_ak(output: &mut String, value: f32) {
+    output.push_str(&format_float_like_ak(value));
+}
+
+pub(crate) fn push_int_point(output: &mut String, point: IntPoint) {
+    let _ = write!(output, "[{},{}]", point.x, point.y);
+}
+
+pub(crate) fn push_float_point(output: &mut String, point: FloatPoint) {
+    output.push('[');
+    push_float_like_ak(output, point.x);
+    output.push(',');
+    push_float_like_ak(output, point.y);
+    output.push(']');
+}
+
+pub(crate) fn push_int_size(output: &mut String, size: IntSize) {
+    let _ = write!(output, "[{}x{}]", size.width, size.height);
+}
+
+pub(crate) fn push_float_size(output: &mut String, size: FloatSize) {
+    output.push('[');
+    push_float_like_ak(output, size.width);
+    output.push('x');
+    push_float_like_ak(output, size.height);
+    output.push(']');
+}
+
+pub(crate) fn push_int_rect_components(output: &mut String, rect: IntRect) {
+    let _ = write!(output, "{},{} {}x{}", rect.x, rect.y, rect.width, rect.height);
+}
+
+pub(crate) fn push_int_rect(output: &mut String, rect: IntRect) {
+    output.push('[');
+    push_int_rect_components(output, rect);
+    output.push(']');
+}
+
+pub(crate) fn push_float_rect(output: &mut String, rect: FloatRect) {
+    output.push('[');
+    push_float_like_ak(output, rect.x);
+    output.push(',');
+    push_float_like_ak(output, rect.y);
+    output.push(' ');
+    push_float_like_ak(output, rect.width);
+    output.push('x');
+    push_float_like_ak(output, rect.height);
+    output.push(']');
+}
+
 #[cfg(test)]
 mod tests {
     use super::format_float_like_ak;
@@ -257,5 +334,11 @@ mod tests {
         assert_eq!(format_float_like_ak(1.5e22), "1.5e+22");
         assert_eq!(format_float_like_ak(f32::INFINITY), "inf");
         assert_eq!(format_float_like_ak(f32::NEG_INFINITY), "-inf");
+    }
+
+    #[test]
+    fn floats_break_ties_toward_the_even_significand_like_dragonbox() {
+        assert_eq!(format_float_like_ak(134.390625), "134.39062");
+        assert_eq!(format_float_like_ak(33555510.0), "33555510");
     }
 }
