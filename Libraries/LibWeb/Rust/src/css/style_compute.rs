@@ -3010,7 +3010,7 @@ impl ParentSnapshot<'_> {
             .and_then(|overlay| overlay.get(property_id))
             && overlay_wins(entry, self.is_important(property_id))
         {
-            return Some(entry.value.data());
+            return Some(entry.value());
         }
         for (property, value) in self.table.retained_inheritance_dependent_values() {
             if property == property_id
@@ -3026,7 +3026,7 @@ impl ParentSnapshot<'_> {
         if let Some(entry) = self.animated_property(property_id)
             && overlay_wins(entry, self.is_important(property_id))
         {
-            return Some(entry.value.data());
+            return Some(entry.value());
         }
         self.value(property_id)
     }
@@ -3043,7 +3043,7 @@ impl ParentSnapshot<'_> {
             .is_some_and(|overlay| !overlay.is_empty())
     }
 
-    fn animated_property(&self, property_id: u16) -> Option<&crate::css::animated_overlay::AnimatedOverlayEntry> {
+    fn animated_property(&self, property_id: u16) -> Option<&crate::css::animated_overlay::FfiAnimatedOverlayEntry> {
         self.inherited_value_overlay
             .or(self.stored_animated_overlay)
             .and_then(|overlay| overlay.get(property_id))
@@ -4304,7 +4304,7 @@ unsafe fn drive_property_computation(
             {
                 animated_overlay.set_owned(
                     property_id,
-                    animated_property.value.clone(),
+                    animated_property.clone_value(),
                     true,
                     animated_property.result_of_transition,
                 );
@@ -4438,9 +4438,6 @@ unsafe fn drive_property_computation(
         );
         if pending_effective_color_scheme >= 0 {
             longhand_table.set_effective_color_scheme(pending_effective_color_scheme);
-        }
-        if let Some(animated_overlay) = unsafe { animated_overlay.as_mut() } {
-            animated_overlay.refresh_ffi_entries();
         }
         if phase != LONGHAND_DRIVE_PHASE_REMAINING {
             return;
@@ -5295,7 +5292,15 @@ pub unsafe extern "C" fn rust_compute_animation_keyframe_longhands(
         let mut depends_on_viewport_metrics = false;
         let mut font_metrics_depend_on_viewport_metrics = false;
         for indices in longhands_by_keyframe.values() {
-            let mut table = ComputedLonghandTable::copied_for_drive(underlying_longhand_table);
+            // The keyframe drive reads only the selected longhands and the coordination inputs
+            // seeded below. Starting from the underlying table would retain and release every
+            // unrelated longhand for every keyframe on every animation sample.
+            let mut table = ComputedLonghandTable::new();
+            // Background lists coordinate against the underlying background-image layer count
+            // when background-image is not selected by this keyframe.
+            if let Some(value) = underlying_longhand_table.get(property_id::BACKGROUND_IMAGE) {
+                table.set(property_id::BACKGROUND_IMAGE, value.clone_retained(), -1);
+            }
             let mut store = CascadedPropertyStore::new();
             for property_id in FIRST_LONGHAND_PROPERTY_ID..=LAST_LONGHAND_PROPERTY_ID {
                 if !is_required_driver_input(property_id) {
@@ -6539,9 +6544,6 @@ fn finalize_style(
         longhand_table.set_important(prop::TEXT_ALIGN, false);
         longhand_table.set_inherited(prop::TEXT_ALIGN, finalization.text_align.inherited);
         finalization.invalidated_longhands |= FINALIZED_TEXT_ALIGN;
-    }
-    if let Some(overlay) = animated_overlay {
-        overlay.refresh_ffi_entries();
     }
     finalization
 }
