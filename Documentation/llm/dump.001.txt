@@ -139859,6 +139859,15 @@ pub struct OwnedPath {
     identity: u64,
 }
 
+impl std::fmt::Debug for OwnedPath {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OwnedPath")
+            .field("identity", &self.identity)
+            .finish()
+    }
+}
+
 impl OwnedPath {
     /// Assumes sole ownership of a heap-allocated `Gfx::Path`.
     ///
@@ -626941,6 +626950,15 @@ void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpda
     if (!m_layout_node_arena)
         return;
 
+    // The update reads each box's scroll-offset flag in place of the offset it mirrors.
+    static bool const verify_scroll_offset_flags = getenv("LIBWEB_VERIFY_SCROLL_OFFSET_FLAGS") != nullptr;
+    if (verify_scroll_offset_flags && m_layout_root) {
+        m_layout_root->for_each_in_inclusive_subtree([](Layout::Node const& node) {
+            node.verify_has_scroll_offset_flag();
+            return TraversalDecision::Continue;
+        });
+    }
+
     auto outcome = Painting::rust_update_scrollable_overflow(*this,
         derived_structure_updates == ScrollableOverflowDerivedStructureUpdates::HandledByFullLayoutCommit);
     if (!outcome.performed_recalculation)
@@ -634442,9 +634460,12 @@ RefPtr<Painting::DisplayList> Document::record_display_list(HTML::PaintConfig co
     auto display_list = Painting::record_rust_display_list(*this, *placeholder_display_list, resource_storage, cache_mode, config, overlay_inputs);
     if (!display_list)
         return nullptr;
-    m_hit_test_display_list = Painting::HitTestDisplayList::create_from_rust_recording(visual_context_tree.structural_epoch(), layout_node_arena(), *m_chrome_widget_registry);
 
-    if (cache_mode == Painting::PaintCommandCacheMode::ReadWrite) {
+    bool const recording_returned_the_paint_command_cache_source = display_list == document_paint_state.display_list_used_as_paint_command_cache_source();
+    if (!recording_returned_the_paint_command_cache_source || !m_hit_test_display_list || !m_hit_test_display_list->is_current())
+        m_hit_test_display_list = Painting::HitTestDisplayList::create_from_rust_recording(visual_context_tree.structural_epoch(), layout_node_arena(), *m_chrome_widget_registry);
+
+    if (cache_mode == Painting::PaintCommandCacheMode::ReadWrite && !recording_returned_the_paint_command_cache_source) {
         document_paint_state.set_display_list_used_as_paint_command_cache_source(display_list, resource_storage.collect_referenced_resources(*display_list));
     }
 
@@ -645670,17 +645691,29 @@ CSSPixelPoint Element::scroll_offset(Optional<CSS::PseudoElement> pseudo_element
     return rare_data ? rare_data->scroll_offset : CSSPixelPoint {};
 }
 
+// The layout arena measures a box that holds a scroll offset eagerly after a full commit, so the
+// current box re-derives that fact whenever the stored offset changes. Layout need not be up to
+// date for that: the box is only annotated, not read, and a box that a pending layout tree rebuild
+// replaces is never consulted again, while its replacement derives the fact when it is constructed.
+// That is why the unchecked layout node accessor is the right one here.
 void Element::set_scroll_offset(Optional<CSS::PseudoElement> pseudo_element_type, CSSPixelPoint offset)
 {
     if (pseudo_element_type.has_value()) {
-        if (auto pseudo_element = get_synthetic_pseudo_element(*pseudo_element_type); pseudo_element.has_value())
-            pseudo_element->set_scroll_offset(offset);
-    } else {
-        if (!offset.is_zero())
-            ensure_element_rare_data().scroll_offset = offset;
-        else if (auto* rare_data = element_rare_data())
-            rare_data->scroll_offset = {};
+        auto pseudo_element = get_synthetic_pseudo_element(*pseudo_element_type);
+        if (!pseudo_element.has_value())
+            return;
+        pseudo_element->set_scroll_offset(offset);
+        if (auto* layout_node = pseudo_element->unsafe_layout_node())
+            layout_node->update_has_scroll_offset_flag();
+        return;
     }
+
+    if (!offset.is_zero())
+        ensure_element_rare_data().scroll_offset = offset;
+    else if (auto* rare_data = element_rare_data())
+        rare_data->scroll_offset = {};
+    if (auto* layout_node = unsafe_layout_node())
+        layout_node->update_has_scroll_offset_flag();
 }
 
 Optional<Element::Dir> Element::dir() const
@@ -655789,7 +655822,8 @@ void Node::inserted()
         m_is_connected = parent()->is_connected();
 
     recompute_editable_subtree_flag();
-    update_inside_blocking_wheel_event_handler_state();
+    if (update_inside_blocking_wheel_event_handler_state())
+        set_needs_repaint();
 
     // The DOM insertion steps visit shadow-including inclusive descendants in tree order, so an
     // element's parent and preceding siblings already have their identities by the time it records
@@ -655863,7 +655897,8 @@ void Node::removed_from(IsSubtreeRoot, Node* old_parent, Node&)
 void Node::moved_from(IsSubtreeRoot, GC::Ptr<Node>)
 {
     recompute_editable_subtree_flag();
-    update_inside_blocking_wheel_event_handler_state();
+    if (update_inside_blocking_wheel_event_handler_state())
+        set_needs_repaint();
 }
 
 static bool is_root_wheel_event_target(Node const& node)
@@ -655872,27 +655907,48 @@ static bool is_root_wheel_event_target(Node const& node)
     return &node == &document || &node == document.document_element() || &node == document.body();
 }
 
-void Node::update_inside_blocking_wheel_event_handler_state()
+bool Node::update_inside_blocking_wheel_event_handler_state()
 {
+    bool const was_inside_blocking_wheel_event_handler = m_inside_blocking_wheel_event_handler;
     m_inside_blocking_wheel_event_handler = false;
     if (auto* parent = parent_or_shadow_host_node())
         m_inside_blocking_wheel_event_handler = parent->inside_blocking_wheel_event_handler();
 
     if (!m_inside_blocking_wheel_event_handler && !is_root_wheel_event_target(*this) && has_blocking_wheel_event_listener())
         m_inside_blocking_wheel_event_handler = true;
+
+    return was_inside_blocking_wheel_event_handler != m_inside_blocking_wheel_event_handler;
+}
+
+static void set_needs_repaint_of_top_layer_boxes(Element& element, Layout::Node const* layout_node_repainted_by_caller)
+{
+    if (auto* layout_node = element.unsafe_layout_node(); layout_node && layout_node != layout_node_repainted_by_caller)
+        Painting::set_needs_repaint_in_subtree(*layout_node);
+    if (auto* backdrop_layout_node = element.pseudo_element_unsafe_layout_node(CSS::PseudoElement::Backdrop))
+        Painting::set_needs_repaint_in_subtree(*backdrop_layout_node);
 }
 
 void Node::update_inside_blocking_wheel_event_handler_state_for_subtree()
 {
     if (is_root_wheel_event_target(*this)) {
-        update_inside_blocking_wheel_event_handler_state();
+        (void)update_inside_blocking_wheel_event_handler_state();
         return;
     }
 
-    for_each_shadow_including_inclusive_descendant([](Node& node) {
-        node.update_inside_blocking_wheel_event_handler_state();
+    auto* subtree_layout_node = unsafe_layout_node();
+    bool any_descendant_flipped_blocking_wheel_state = false;
+    for_each_shadow_including_inclusive_descendant([&](Node& node) {
+        if (!node.update_inside_blocking_wheel_event_handler_state())
+            return TraversalDecision::Continue;
+        any_descendant_flipped_blocking_wheel_state = true;
+        if (auto* element = as_if<Element>(node); element && element->rendered_in_top_layer())
+            set_needs_repaint_of_top_layer_boxes(*element, subtree_layout_node);
+        else if (!subtree_layout_node)
+            node.set_needs_repaint();
         return TraversalDecision::Continue;
     });
+    if (any_descendant_flipped_blocking_wheel_state && subtree_layout_node)
+        Painting::set_needs_repaint_in_subtree(*subtree_layout_node);
 }
 
 ParentNode* Node::parent_or_shadow_host()
@@ -657936,7 +657992,7 @@ public:
     bool is_connected() const { return m_is_connected; }
     void set_is_connected(bool is_connected) { m_is_connected = is_connected; }
     bool inside_blocking_wheel_event_handler() const { return m_inside_blocking_wheel_event_handler; }
-    void update_inside_blocking_wheel_event_handler_state();
+    bool update_inside_blocking_wheel_event_handler_state();
     void update_inside_blocking_wheel_event_handler_state_for_subtree();
 
     [[nodiscard]] bool is_browsing_context_connected() const;
@@ -659766,6 +659822,9 @@ void SyntheticPseudoElement::set_layout_node(Layout::NodeWithStyle* value)
     if (m_layout_node && m_layout_node.ptr() != value)
         m_layout_node->pin_style_record_for_detachment();
     m_layout_node = value;
+    // The box becomes the pseudo-element's box here, which is when it starts holding its scroll offset.
+    if (value)
+        value->update_has_scroll_offset_flag();
 }
 
 void SyntheticPseudoElement::update_animated_properties(Badge<Web::Animations::KeyframeEffect> const&, DOM::AbstractElement abstract_element, Web::Animations::KeyframeEffect& effect, Web::Animations::AnimationUpdateContext& context)
@@ -667826,71 +667885,3 @@ namespace Web::Editing::CommandNames {
     __ENUMERATE_COMMAND_NAME(insertImage, "insertImage")                             \
     __ENUMERATE_COMMAND_NAME(insertLineBreak, "insertLineBreak")                     \
     __ENUMERATE_COMMAND_NAME(insertOrderedList, "insertOrderedList")                 \
-    __ENUMERATE_COMMAND_NAME(insertParagraph, "insertParagraph")                     \
-    __ENUMERATE_COMMAND_NAME(insertText, "insertText")                               \
-    __ENUMERATE_COMMAND_NAME(insertUnorderedList, "insertUnorderedList")             \
-    __ENUMERATE_COMMAND_NAME(italic, "italic")                                       \
-    __ENUMERATE_COMMAND_NAME(justifyCenter, "justifyCenter")                         \
-    __ENUMERATE_COMMAND_NAME(justifyFull, "justifyFull")                             \
-    __ENUMERATE_COMMAND_NAME(justifyLeft, "justifyLeft")                             \
-    __ENUMERATE_COMMAND_NAME(justifyRight, "justifyRight")                           \
-    __ENUMERATE_COMMAND_NAME(outdent, "outdent")                                     \
-    __ENUMERATE_COMMAND_NAME(paste, "paste")                                         \
-    __ENUMERATE_COMMAND_NAME(preserveWhitespace, "preserveWhitespace")               \
-    __ENUMERATE_COMMAND_NAME(redo, "redo")                                           \
-    __ENUMERATE_COMMAND_NAME(removeFormat, "removeFormat")                           \
-    __ENUMERATE_COMMAND_NAME(selectAll, "selectAll")                                 \
-    __ENUMERATE_COMMAND_NAME(strikethrough, "strikethrough")                         \
-    __ENUMERATE_COMMAND_NAME(styleWithCSS, "styleWithCSS")                           \
-    __ENUMERATE_COMMAND_NAME(subscript, "subscript")                                 \
-    __ENUMERATE_COMMAND_NAME(superscript, "superscript")                             \
-    __ENUMERATE_COMMAND_NAME(underline, "underline")                                 \
-    __ENUMERATE_COMMAND_NAME(undo, "undo")                                           \
-    __ENUMERATE_COMMAND_NAME(unlink, "unlink")                                       \
-    __ENUMERATE_COMMAND_NAME(useCSS, "useCSS")
-
-#define __ENUMERATE_COMMAND_NAME(name, command) extern Utf16FlyString const& name;
-ENUMERATE_COMMAND_NAMES
-#undef __ENUMERATE_COMMAND_NAME
-
-}
-
-FILE: Libraries/LibWeb/Editing/Commands.cpp
-/*
- * Copyright (c) 2024-2025, Jelle Raaijmakers <jelle@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibGC/RootVector.h>
-#include <LibUnicode/CharacterTypes.h>
-#include <LibUnicode/Segmenter.h>
-#include <LibWeb/CSS/PropertyID.h>
-#include <LibWeb/DOM/Comment.h>
-#include <LibWeb/DOM/Document.h>
-#include <LibWeb/DOM/DocumentFragment.h>
-#include <LibWeb/DOM/ElementFactory.h>
-#include <LibWeb/DOM/Range.h>
-#include <LibWeb/DOM/Text.h>
-#include <LibWeb/Editing/CommandNames.h>
-#include <LibWeb/Editing/Commands.h>
-#include <LibWeb/Editing/EditCommand.h>
-#include <LibWeb/Editing/EditingHistory.h>
-#include <LibWeb/Editing/Internal/Algorithms.h>
-#include <LibWeb/Editing/ReplaceSelection.h>
-#include <LibWeb/HTML/HTMLAnchorElement.h>
-#include <LibWeb/HTML/HTMLBRElement.h>
-#include <LibWeb/HTML/HTMLHRElement.h>
-#include <LibWeb/HTML/HTMLImageElement.h>
-#include <LibWeb/HTML/HTMLLIElement.h>
-#include <LibWeb/HTML/HTMLTableElement.h>
-#include <LibWeb/HTML/Numbers.h>
-#include <LibWeb/HTML/Scripting/Environments.h>
-#include <LibWeb/Layout/Node.h>
-#include <LibWeb/Namespace.h>
-#include <LibWeb/Selection/SelectionModifier.h>
-#include <LibWeb/TrustedTypes/RequireTrustedTypesForDirective.h>
-#include <LibWeb/TrustedTypes/TrustedTypePolicy.h>
-
-namespace Web::Editing {
-
