@@ -69251,6 +69251,7 @@ FILE: Libraries/LibCore/EventLoopImplementationUnix.cpp
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/GenericShorthands.h>
 #include <AK/HashMap.h>
 #include <AK/NeverDestroyed.h>
 #include <AK/Singleton.h>
@@ -69269,10 +69270,16 @@ FILE: Libraries/LibCore/EventLoopImplementationUnix.cpp
 #include <LibSync/Once.h>
 #include <LibSync/RWLock.h>
 #include <pthread.h>
+#include <signal.h>
 #include <sys/select.h>
 #include <unistd.h>
 
 namespace Core {
+
+// Signals remain bound to the first event loop that registers a handler.
+static Atomic<int> s_signal_wake_pipe_write_fd { -1 };
+static Atomic<pid_t> s_signal_wake_pipe_pid { 0 };
+static Atomic<unsigned> s_pending_signal_counts[NSIG];
 
 namespace {
 
@@ -69391,9 +69398,8 @@ struct ThreadData {
     ThreadData()
     {
         thread_id = pthread_self();
-        pid = getpid();
 
-        auto result = Core::System::pipe2(O_CLOEXEC);
+        auto result = Core::System::pipe2(O_CLOEXEC | O_NONBLOCK);
         if (result.is_error()) {
             warnln("\033[31;1mFailed to create event loop pipe:\033[0m {}", result.error());
             VERIFY_NOT_REACHED();
@@ -69408,8 +69414,11 @@ struct ThreadData {
 
     ~ThreadData()
     {
-        close(wake_pipe_fds[0]);
-        close(wake_pipe_fds[1]);
+        // Keep signal pipes open so an in-flight handler cannot write to a reused descriptor.
+        if (!wake_pipe_is_signal_target) {
+            close(wake_pipe_fds[0]);
+            close(wake_pipe_fds[1]);
+        }
 
         Sync::RWLockLocker<Sync::LockMode::Write> locker(thread_data_lock());
         thread_data().remove(thread_id);
@@ -69425,10 +69434,9 @@ struct ThreadData {
     Vector<pollfd, 32> poll_fds;
 
     // The wake pipe is used to notify another event loop that someone has called wake(), or a signal has been received.
-    // wake() writes 0i32 into the pipe, signals write the signal number (guaranteed non-zero).
     Array<int, 2> wake_pipe_fds { -1, -1 };
+    bool wake_pipe_is_signal_target { false };
 
-    pid_t pid { 0 };
     pthread_t thread_id { 0 };
 };
 
@@ -69474,10 +69482,11 @@ void EventLoopImplementationUnix::wake()
 {
     int wake_event = 0;
     auto result = Core::System::write(m_wake_pipe_write_fd, { &wake_event, sizeof(wake_event) });
-    // EBADF here just indicates that the ThreadData is destroyed, so we must be exiting the thread.
-    // Ignore it.
-    if (result.is_error() && result.error().code() == EBADF)
-        return;
+    if (result.is_error()) {
+        // EBADF means the thread data is gone. EAGAIN means a pending event already fills the pipe.
+        if (first_is_one_of(result.error().code(), EBADF, EAGAIN))
+            return;
+    }
     MUST(move(result));
 }
 
@@ -69486,7 +69495,6 @@ void EventLoopManagerUnix::wait_for_events(EventLoopImplementation::PumpMode mod
     auto& thread_data = ThreadData::the();
     Sync::MutexLocker locker(thread_data.mutex);
 
-retry:
     bool has_pending_events = ThreadEventQueue::current().has_pending_events();
 
     auto time_at_iteration_start = MonotonicTime::now_coarse();
@@ -69539,17 +69547,8 @@ try_select_again:
             VERIFY_NOT_REACHED();
         }
         VERIFY(nread > 0);
-        bool wake_requested = false;
-        int event_count = nread / sizeof(wake_events[0]);
-        for (int i = 0; i < event_count; i++) {
-            if (wake_events[i] != 0)
-                dispatch_signal(wake_events[i]);
-            else
-                wake_requested = true;
-        }
-
-        if (!wake_requested && nread == sizeof(wake_events))
-            goto retry;
+        if (thread_data.wake_pipe_fds[1] == s_signal_wake_pipe_write_fd.load(AK::MemoryOrder::memory_order_acquire))
+            dispatch_pending_signals();
     }
 
     if (error_or_marked_fd_count.value() != 0) {
@@ -69652,6 +69651,15 @@ void EventLoopManagerUnix::dispatch_signal(int signal_number)
     }
 }
 
+void EventLoopManagerUnix::dispatch_pending_signals()
+{
+    for (int signal_number = 1; signal_number < NSIG; ++signal_number) {
+        auto pending_count = s_pending_signal_counts[signal_number].exchange(0, AK::MemoryOrder::memory_order_acq_rel);
+        for (unsigned i = 0; i < pending_count; ++i)
+            dispatch_signal(signal_number);
+    }
+}
+
 SignalHandlers::SignalHandlers(int signal_number, void (*handle_signal)(int))
     : m_signal_number(signal_number)
     , m_original_handler(signal(signal_number, handle_signal))
@@ -69716,33 +69724,47 @@ bool SignalHandlers::remove(int handler_id)
 
 void EventLoopManagerUnix::handle_signal(int signal_number)
 {
-    VERIFY(signal_number != 0);
+    VERIFY(signal_number > 0 && signal_number < NSIG);
 
-    // Use the thread-local directly instead of ThreadData::the() to avoid
-    // taking a write lock on thread_data_lock(). Signal handlers must not
-    // acquire locks, as we may already be holding one on this thread.
-    if (!s_this_thread_data)
+    auto saved_errno = errno;
+
+    auto current_pid = getpid();
+    if (current_pid != s_signal_wake_pipe_pid.load(AK::MemoryOrder::memory_order_acquire)) {
+        // Do not forward a signal to the parent process's pipe between fork() and exec().
+        errno = saved_errno;
         return;
-    auto& thread_data = *s_this_thread_data;
-
-    // We MUST check if the current pid still matches, because there
-    // is a window between fork() and exec() where a signal delivered
-    // to our fork could be inadvertently routed to the parent process!
-    if (getpid() == thread_data.pid) {
-        int nwritten = write(thread_data.wake_pipe_fds[1], &signal_number, sizeof(signal_number));
-        if (nwritten < 0) {
-            perror("EventLoopImplementationUnix::register_signal: write");
-            VERIFY_NOT_REACHED();
-        }
-    } else {
-        // We're a fork who received a signal, reset thread_data.pid.
-        thread_data.pid = getpid();
     }
+
+    s_pending_signal_counts[signal_number].fetch_add(1, AK::MemoryOrder::memory_order_release);
+
+    auto wake_pipe_write_fd = s_signal_wake_pipe_write_fd.load(AK::MemoryOrder::memory_order_acquire);
+    if (wake_pipe_write_fd >= 0) {
+        int wake_event = 0;
+        while (write(wake_pipe_write_fd, &wake_event, sizeof(wake_event)) < 0 && errno == EINTR) {
+        }
+    }
+
+    errno = saved_errno;
 }
 
 int EventLoopManagerUnix::register_signal(int signal_number, Function<void(int)> handler)
 {
-    VERIFY(signal_number != 0);
+    VERIFY(signal_number > 0 && signal_number < NSIG);
+
+    auto& thread_data = ThreadData::the();
+    auto current_pid = getpid();
+    if (s_signal_wake_pipe_pid.load(AK::MemoryOrder::memory_order_acquire) != current_pid) {
+        s_signal_wake_pipe_write_fd.store(-1, AK::MemoryOrder::memory_order_release);
+        for (auto& pending_signal_count : s_pending_signal_counts)
+            pending_signal_count.store(0, AK::MemoryOrder::memory_order_relaxed);
+        thread_data.wake_pipe_is_signal_target = true;
+        s_signal_wake_pipe_write_fd.store(thread_data.wake_pipe_fds[1], AK::MemoryOrder::memory_order_release);
+        s_signal_wake_pipe_pid.store(current_pid, AK::MemoryOrder::memory_order_release);
+    } else {
+        // Signal handlers are process-wide, so they must share one event loop.
+        VERIFY(s_signal_wake_pipe_write_fd.load(AK::MemoryOrder::memory_order_acquire) == thread_data.wake_pipe_fds[1]);
+    }
+
     auto& info = *signals_info();
     auto handlers = info.signal_handlers.find(signal_number);
     if (handlers == info.signal_handlers.end()) {
@@ -69890,6 +69912,7 @@ public:
 
 private:
     void dispatch_signal(int signal_number);
+    void dispatch_pending_signals();
     static void handle_signal(int signal_number);
 };
 
@@ -155739,6 +155762,7 @@ FILE: Libraries/LibIPC/TransportBootstrapMach.cpp
 #include <LibCore/System.h>
 #include <LibIPC/MachBootstrapMessages.h>
 #include <LibIPC/TransportBootstrapMach.h>
+#include <LibIPC/TransportMachPort.h>
 #include <LibSync/Mutex.h>
 
 #include <mach/mach.h>
@@ -155819,6 +155843,10 @@ ErrorOr<TransportBootstrapMachPorts> TransportBootstrapMachServer::create_on_dem
 
     auto remote_receive_right = TRY(Core::MachPort::create_with_right(Core::MachPort::PortRight::Receive));
     auto remote_send_right = TRY(remote_receive_right.insert_right(Core::MachPort::MessageRight::MakeSend));
+
+    // Either peer may send messages before the other has constructed its transport.
+    TransportMachPort::raise_receive_queue_limit(local_receive_right);
+    TransportMachPort::raise_receive_queue_limit(remote_receive_right);
 
     send_transport_ports_to_child(move(reply_port), TransportBootstrapMachPorts {
                                                         .receive_right = move(remote_receive_right),
@@ -156166,10 +156194,18 @@ ErrorOr<TransportMachPort::Paired> TransportMachPort::create_paired()
     auto port_b_recv = TRY(Core::MachPort::create_with_right(Core::MachPort::PortRight::Receive));
     auto port_b_send = TRY(port_b_recv.insert_right(Core::MachPort::MessageRight::MakeSend));
 
+    // The peer may receive messages before it has constructed its transport.
+    raise_receive_queue_limit(port_b_recv);
+
     return Paired {
         make<TransportMachPort>(move(port_a_recv), move(port_b_send)),
         TransportHandle { move(port_b_recv), move(port_a_send) },
     };
+}
+
+void TransportMachPort::raise_receive_queue_limit(Core::MachPort const& receive_right)
+{
+    set_mach_port_queue_limit(receive_right.port());
 }
 
 TransportMachPort::TransportMachPort(Core::MachPort receive_right, Core::MachPort send_right)
@@ -156653,6 +156689,8 @@ public:
         TransportHandle remote_handle;
     };
     static ErrorOr<Paired> create_paired();
+
+    static void raise_receive_queue_limit(Core::MachPort const&);
 
     TransportMachPort(Core::MachPort receive_right, Core::MachPort send_right);
     ~TransportMachPort();
@@ -507357,6 +507395,7 @@ FILE: Libraries/LibWeb/Clipboard/Clipboard.cpp
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Enumerate.h>
 #include <LibGC/Heap.h>
 #include <LibJS/Runtime/Array.h>
 #include <LibJS/Runtime/PrimitiveString.h>
@@ -507400,16 +507439,17 @@ static GC::Ptr<FileAPI::Blob> clipboard_item_data_blob(JS::Value value)
     return Bindings::impl_from<FileAPI::Blob>(&value.as_object());
 }
 
-static void resolve_clipboard_items_promise(JS::Realm& realm, WebIDL::Promise& promise, GC::RootVector<GC::Ref<ClipboardItem>> const& items)
+static void resolve_clipboard_items_promise(JS::Realm& realm, WebIDL::Promise& promise, ReadonlySpan<GC::Ref<ClipboardItem>> items)
 {
+    auto& wrapper_world = Bindings::host_defined_wrapper_world(realm);
     auto clipboard_items = MUST(JS::Array::create(realm, 0));
-    for (size_t i = 0; i < items.size(); ++i)
-        MUST(clipboard_items->create_data_property(JS::PropertyKey { i }, Bindings::wrap(Bindings::host_defined_wrapper_world(realm), realm, items.at(i))));
+    for (auto [i, item] : enumerate(items))
+        MUST(clipboard_items->create_data_property(JS::PropertyKey { i }, Bindings::wrap(wrapper_world, realm, item)));
     WebIDL::resolve_promise(promise, clipboard_items);
 }
 
 // https://w3c.github.io/clipboard-apis/#os-specific-well-known-format
-static String os_specific_well_known_format(MimeSniff::MimeType const& mime_type)
+String os_specific_well_known_format(MimeSniff::MimeType const& mime_type)
 {
     // 1. Let wellKnownFormat be an empty string.
     String well_known_format {};
@@ -507449,17 +507489,8 @@ static String os_specific_well_known_format(MimeSniff::MimeType const& mime_type
     return well_known_format;
 }
 
-static String os_specific_well_known_format(StringView mime_type_string)
-{
-    // NOTE: Here we always takes the Linux case, and defer to the browser process to handle OS specific implementations.
-    auto mime_type = MimeSniff::MimeType::parse(mime_type_string);
-    if (!mime_type.has_value())
-        return {};
-
-    return os_specific_well_known_format(*mime_type);
-}
-
-static String os_specific_well_known_format(Utf16View mime_type_string)
+template<typename T>
+static String os_specific_well_known_format(T const& mime_type_string)
 {
     // NOTE: Here we always takes the Linux case, and defer to the browser process to handle OS specific implementations.
     auto mime_type = MimeSniff::MimeType::parse(mime_type_string);
@@ -507496,11 +507527,13 @@ static void write_blobs_and_option_to_clipboard(JS::Realm& realm, ReadonlySpan<G
         }
 
         // 3. Let payload be the result of UTF-8 decoding item’s underlying byte sequence.
-        auto decoder = TextCodec::decoder_for("UTF-8"sv);
-        auto payload = MUST(TextCodec::convert_input_to_utf8_using_given_decoder_unless_there_is_a_byte_order_mark(*decoder, item->raw_bytes()));
+        // FIXME: Spec issue: UTF-8 decoding here does not make sense. This would make a simple clipboard.write ->
+        //        clipboard.read sequence for PNG data corrupt.
+        //        https://github.com/w3c/clipboard-apis/issues/217
+        ByteString payload { item->raw_bytes() };
 
         // 4. Insert payload and presentationStyle into the system clipboard using formatString as the native clipboard format.
-        representations.empend(payload.to_byte_string(), move(format_string));
+        representations.empend(move(format_string), move(payload));
     }
 
     window.page().client().page_did_insert_clipboard_item({ move(representations) }, presentation_style);
@@ -507550,7 +507583,7 @@ static bool check_clipboard_write_permission(JS::Realm& realm)
     return false;
 }
 
-// https://w3c.github.io/clipboard-apis/#dom-clipboard-readtext
+// https://w3c.github.io/clipboard-apis/#dom-clipboard-read
 void Clipboard::read(JS::Realm& realm, ClipboardReadOptions formats, GC::Ref<WebIDL::Promise> promise)
 {
     // 3. If formats is not empty, then:
@@ -507581,14 +507614,25 @@ void Clipboard::read(JS::Realm& realm, ClipboardReadOptions formats, GC::Ref<Web
             return;
         }
 
-        // 3. Let data be a copy of the system clipboard data.
+        // 3. Let data be the system clipboard data.
         HTML::relevant_window(realm.global_object()).page().request_clipboard_entries(GC::create_function(GC::Heap::the(), [&realm, promise, formats = move(formats)](Vector<SystemClipboardItem> data) mutable {
             HTML::TemporaryExecutionContext execution_context { realm };
 
-            // 4. Let items be a sequence<clipboard item>.
-            GC::RootVector<GC::Ref<ClipboardItem>> items;
+            // 4. Let snapshotChangeCount be the current clipboard change count.
+            // FIXME: We are meant to independently track any changes to the system clipboard in the UI. We are also
+            //        meant to only fetch metadata about the system clipboard at this point, and defer reading the
+            //        actual data until ClipboardItem.getType() is invoked.
+            size_t snapshot_change_count = 0;
 
-            // 5. For each systemClipboardItem in data:
+            // 5. Let items be a sequence of ordered maps, each entry having keys "item" (a clipboard item) and
+            //    "originating" (a system clipboard item or null).
+            struct ReadItem {
+                GC::Ref<ClipboardItem> item;
+                Optional<SystemClipboardItem> originating;
+            };
+            GC::ConservativeVector<ReadItem> items;
+
+            // 6. For each systemClipboardItem in data:
             for (auto const& system_clipboard_item : data) {
                 // 1. Let item be a new clipboard item.
                 auto item = ClipboardItem::create();
@@ -507597,84 +507641,73 @@ void Clipboard::read(JS::Realm& realm, ClipboardReadOptions formats, GC::Ref<Web
                 for (auto const& system_clipboard_representation : system_clipboard_item.system_clipboard_representations) {
                     // 1. Let mimeType be the result of running the well-known mime type from os specific format
                     //    algorithm given systemClipboardRepresentation’s name.
-                    auto mime_type = os_specific_well_known_format(system_clipboard_representation.mime_type);
+                    auto mime_type = os_specific_well_known_format(system_clipboard_representation.name);
 
                     // 2. If mimeType is null, continue this loop.
                     if (mime_type.is_empty())
                         continue;
-
-                    auto decoder = TextCodec::decoder_for("UTF-8"sv);
-                    auto string = MUST(TextCodec::convert_input_to_utf8_using_given_decoder_unless_there_is_a_byte_order_mark(*decoder, system_clipboard_representation.data));
 
                     // 3. Let representation be a new representation.
                     ClipboardItem::Representation representation {
                         // 4. Set representation’s MIME type to mimeType.
                         .mime_type = Utf16String::from_utf8(mime_type),
 
-                        // 7. Resolve representation’s data with systemClipboardRepresentation’s data.
-                        .data = WebIDL::create_resolved_promise(realm, JS::PrimitiveString::create(realm.vm(), Utf16String::from_utf8(string))),
+                        // 5. Set representation’s data to a new promise in realm.
+                        .data = WebIDL::create_promise(realm),
                     };
 
-                    // 5. Let isUnsanitized be false.
-                    auto is_unsanitized = false;
-
-                    // 6. If formats is not empty, then:
-                    if (formats.unsanitized.has_value()) {
-                        // 1. For each format in formats["unsanitized"]:
-                        for (auto const& format : *formats.unsanitized) {
-                            // 1. If format is equal to MIME type, set isUnsanitized to true.
-                            if (format == representation.mime_type) {
-                                is_unsanitized = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    // 8. The user agent, MAY sanitize representation’s data, unless representation’s MIME type's essence
-                    //    is "image/png", which should remain unsanitized to preserve meta data, or if it satisfies the
-                    //    below conditions:
-                    //     1. representation’s MIME type is in optional unsanitized data types list.
-                    //     2. isUnsanitized is true.
-                    // FIXME: Sanitization is an underspecified spec feature. See:
-                    //        https://github.com/w3c/clipboard-apis/issues/73
-                    (void)is_unsanitized;
-
-                    // 9. Append representation to item’s list of representations.
+                    // 6. Append representation to item’s list of representations.
                     item->append_representation(move(representation));
-
-                    // 10. Set isUnsanitized to false.
-                    is_unsanitized = false;
                 }
 
-                // 3. If item’s list of representations size is greater than 0, append item to items.
+                // 3. If item’s list of representations size is greater than 0, append the ordered map
+                //    «[ "item" → item, "originating" → systemClipboardItem ]» to items.
                 if (!item->representations().is_empty())
-                    items.append(item);
+                    items.empend(item, system_clipboard_item);
             }
 
-            // 6. If items has a size > 0, then:
+            // 7. If items has a size > 0, then:
             if (!items.is_empty()) {
-                // FIXME: 1. Let firstItem be items[0]
+                // FIXME: 1. Let firstItem be items[0]["item"]
                 // FIXME: 2. Run the read web custom format algorithm given firstItem.
             }
-            // 7. Else:
+            // 8. Else:
             else {
                 // FIXME: 1. Let customItem be a new clipboard item.
                 // FIXME: 2. Run the read web custom format algorithm given customItem.
-                // FIXME: 3. If customItem’s list of representations size is greater than 0, append customItem to items.
+                // FIXME: 3. If customItem’s list of representations size is greater than 0, append the ordered map
+                //           «[ "item" → customItem, "originating" → null ]» to items.
             }
 
-            // 8. Queue a global task on the clipboard task source, given realm’s global object, to perform the below steps:
-            queue_global_task(HTML::Task::Source::Clipboard, realm.global_object(), GC::create_function(GC::Heap::the(), [&realm, promise, items = move(items)]() mutable {
+            // 9. Queue a global task on the clipboard task source, given realm’s global object, to perform the below steps:
+            queue_global_task(HTML::Task::Source::Clipboard, realm.global_object(), GC::create_function(GC::Heap::the(), [&realm, promise, formats = move(formats), snapshot_change_count, items = move(items)]() mutable {
                 HTML::TemporaryExecutionContext execution_context { realm };
 
                 // 1. Let clipboardItems be a sequence<ClipboardItem>.
-                // 2. For each clipboard item underlyingItem of items:
-                //     1. Let clipboardItem be the result of running the steps of create a ClipboardItem object given
-                //        underlyingItem and realm.
-                //     2. Append clipboardItem to clipboardItems.
+                auto clipboard_items = GC::Heap::the().allocate<GC::HeapVector<GC::Ref<ClipboardItem>>>();
 
-                // 2. Resolve p with clipboardItems.
-                resolve_clipboard_items_promise(realm, promise, items);
+                // 2. For each ordered map entry of items:
+                for (auto& [item, originating] : items) {
+                    // 1. Let clipboardItem be the result of running the steps of create a ClipboardItem object given
+                    //    entry["item"] and realm.
+                    auto clipboard_item = item;
+
+                    // 2. Set clipboardItem’s clipboard change count at read to snapshotChangeCount.
+                    clipboard_item->set_clipboard_change_count_at_read(snapshot_change_count);
+
+                    // 3. Set clipboardItem’s originating system clipboard item to entry["originating"].
+                    clipboard_item->set_originating_system_clipboard_item(move(originating));
+
+                    // 4. If formats is not empty, set clipboardItem’s unsanitized MIME types to formats["unsanitized"].
+                    if (formats.unsanitized.has_value())
+                        clipboard_item->set_unsanitized_mime_types(*formats.unsanitized);
+
+                    // 5. Append clipboardItem to clipboardItems.
+                    clipboard_items->elements().append(clipboard_item);
+                }
+
+                // 3. Resolve p with clipboardItems.
+                resolve_clipboard_items_promise(realm, promise, clipboard_items->elements());
             }));
         }));
     }));
@@ -507713,7 +507746,7 @@ void Clipboard::read_text(JS::Realm& realm, GC::Ref<WebIDL::Promise> promise)
                     for (auto const& system_clipboard_representation : system_clipboard_item.system_clipboard_representations) {
                         // 1. Let mimeType be the result of running the well-known mime type from os specific format
                         //    algorithm given systemClipboardRepresentation’s name.
-                        auto mime_type = os_specific_well_known_format(system_clipboard_representation.mime_type);
+                        auto mime_type = os_specific_well_known_format(system_clipboard_representation.name);
 
                         // 2. If mimeType is null, continue this loop.
                         if (mime_type.is_empty())
@@ -507987,6 +508020,8 @@ private:
     Clipboard();
 };
 
+String os_specific_well_known_format(MimeSniff::MimeType const&);
+
 }
 
 FILE: Libraries/LibWeb/Clipboard/Clipboard.idl
@@ -508126,9 +508161,12 @@ FILE: Libraries/LibWeb/Clipboard/ClipboardItem.cpp
 #include <LibGC/Heap.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
+#include <LibWeb/Clipboard/Clipboard.h>
 #include <LibWeb/Clipboard/ClipboardItem.h>
 #include <LibWeb/FileAPI/Blob.h>
+#include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/MimeSniff/MimeType.h>
+#include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/WebIDL/Promise.h>
 
 namespace Web::Clipboard {
@@ -508238,9 +508276,19 @@ WebIDL::ExceptionOr<GC::Ref<ClipboardItem>> ClipboardItem::create(GC::OrderedRoo
     return create(items, options.presentation_style);
 }
 
-PresentationStyle ClipboardItem::presentation_style() const
+ClipboardItem::ClipboardItem()
+    : m_presentation_style(PresentationStyle::Unspecified)
 {
-    return m_presentation_style;
+}
+
+ClipboardItem::~ClipboardItem() = default;
+
+void ClipboardItem::visit_edges(GC::Cell::Visitor& visitor)
+{
+    Base::visit_edges(visitor);
+    for (auto& representation : m_representations)
+        visitor.visit(representation.data);
+    visitor.visit(m_representations_with_resolvers);
 }
 
 void ClipboardItem::append_representation(Representation representation)
@@ -508250,7 +508298,7 @@ void ClipboardItem::append_representation(Representation representation)
 }
 
 // https://w3c.github.io/clipboard-apis/#dom-clipboarditem-gettype
-WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> ClipboardItem::get_type(JS::Realm& realm, Utf16String const& type) const
+WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> ClipboardItem::get_type(JS::Realm& realm, Utf16String const& type)
 {
     // 2. Let isCustom be false.
     bool is_custom = false;
@@ -508274,7 +508322,7 @@ WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> ClipboardItem::get_type(JS::Realm&
 
     auto mime_type_serialized = mime_type->serialized();
 
-    // 6. Let itemTypeList be this's clipboard item's list of representations.
+    // 6. Let itemTypeList be this’s clipboard item’s list of representations.
     auto const& item_type_list = representations();
 
     // 7.  Let p be a new promise in realm.
@@ -508283,13 +508331,106 @@ WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> ClipboardItem::get_type(JS::Realm&
     // 8. For each representation in itemTypeList:
     for (auto const& representation : item_type_list) {
         // 1. If representation’s MIME type is mimeType and representation’s isCustom is isCustom, then:
-        if (representation.mime_type == Utf16String::from_utf8(mime_type_serialized) && representation.is_custom == is_custom) {
-            // 1. Let representationDataPromise be the representation’s data.
+        if (representation.mime_type == mime_type_serialized && representation.is_custom == is_custom) {
+            // FIXME: 1. If this’s clipboard change count at read is not null, and the current clipboard change count is not
+            //           equal to this’s clipboard change count at read, then reject p with an "InvalidStateError" DOMException
+            //           in realm, and return p.
+
+            // 2. If this’s clipboard change count at read is not null, then:
+            if (m_clipboard_change_count_at_read.has_value()) {
+                // 1. Let key be mimeType’s essence. If isCustom is true, prefix key with `"web "`.
+                auto key = mime_type->essence();
+                if (is_custom)
+                    key = MUST(String::formatted("web {}", mime_type->essence()));
+
+                // 2. If this’s representations with resolvers[key] exists, then return this’s representations with resolvers[key].
+                if (auto resolver = m_representations_with_resolvers.get(key); resolver.has_value())
+                    return resolver.release_value();
+
+                // 3. Set this’s representations with resolvers[key] to p.
+                m_representations_with_resolvers.set(key, promise);
+
+                // 4. Run the following steps in parallel:
+                Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(GC::Heap::the(), [this, &realm, promise, mime_type = mime_type.release_value(), is_custom]() {
+                    // 1. Let clipboardItem be this’s originating system clipboard item.
+                    auto const& clipboard_item = m_originating_system_clipboard_item;
+
+                    // 2. If clipboardItem is null, then queue a global task on the clipboard task source, given realm’s
+                    //    global object, to reject p with an "InvalidStateError" DOMException in realm, then abort these
+                    //    steps.
+                    if (!clipboard_item.has_value()) {
+                        queue_global_task(HTML::Task::Source::Clipboard, realm.global_object(), GC::create_function(GC::Heap::the(), [&realm, promise]() {
+                            HTML::TemporaryExecutionContext execution_context { realm };
+                            WebIDL::reject_promise(promise, WebIDL::InvalidStateError::create("This clipboard item is missing an originating system clipboard entry"_utf16));
+                        }));
+                        return;
+                    }
+
+                    String os_format_name;
+
+                    // 3. If isCustom is true, then:
+                    if (is_custom) {
+                        // FIXME: 1. Let mapName be the os specific custom map name.
+                        // FIXME: 2. Let mapRepresentation be the system clipboard representation in clipboardItem’s list of system
+                        //           clipboard representations whose name is mapName. If there is no such system clipboard
+                        //           representation, then queue a global task on the clipboard task source, given realm’s global
+                        //           object, to reject p with a "NotFoundError" DOMException in realm, then abort these steps.
+                        // FIXME: 3. Let webCustomFormatMapString be the JSON string deserialized from mapRepresentation’s data.
+                        // FIXME: 4. Let osFormatName be the value in webCustomFormatMapString whose key matches mimeType
+                        //           serialized.
+                        // FIXME: 5. If osFormatName is not found, then queue a global task on the clipboard task source, given
+                        //           realm’s global object, to reject p with a "NotFoundError" DOMException in realm, then abort
+                        //           these steps.
+                    }
+                    // 4. Else, let osFormatName be the result of running os specific well-known format given mimeType.
+                    else {
+                        os_format_name = os_specific_well_known_format(mime_type);
+                    }
+
+                    // 5. Let clipboardRepresentation be the system clipboard representation in clipboardItem’s list of
+                    //    system clipboard representations whose name is osFormatName. If there is no such system clipboard
+                    //    representation, then queue a global task on the clipboard task source, given realm’s global object,
+                    //    to reject p with a "NotFoundError" DOMException in realm, then abort these steps.
+                    auto clipboard_representation = clipboard_item->system_clipboard_representations.first_matching([&](auto const& item) {
+                        return item.name == os_format_name;
+                    });
+
+                    if (!clipboard_representation.has_value()) {
+                        queue_global_task(HTML::Task::Source::Clipboard, realm.global_object(), GC::create_function(GC::Heap::the(), [&realm, promise, os_format_name]() {
+                            HTML::TemporaryExecutionContext execution_context { realm };
+                            WebIDL::reject_promise(promise, WebIDL::NotFoundError::create(realm, Utf16String::formatted("No data found for MIME type: {}", os_format_name)));
+                        }));
+                        return;
+                    }
+
+                    // 6. Let rawData be clipboardRepresentation’s data.
+                    auto const& raw_data = clipboard_representation->data;
+
+                    // 7. Let cleanData be a copy of rawData.
+                    auto clean_data = MUST(ByteBuffer::copy(raw_data.bytes()));
+
+                    // FIXME: 8. If mimeType’s essence is in this’s unsanitized MIME types and mimeType’s essence is in the
+                    //           optional unsanitized data types list, then do nothing.
+                    // FIXME: 9. Else, if mimeType’s essence is not "image/png", the user agent MAY sanitize cleanData.
+
+                    // 10. Let blob be a Blob whose type is mimeType serialized and whose underlying byte sequence is cleanData.
+                    auto blob = FileAPI::Blob::create(move(clean_data), mime_type.serialized_as_utf16());
+
+                    // 11. Queue a global task on the clipboard task source, given realm’s global object, to resolve p with blob.
+                    queue_global_task(HTML::Task::Source::Clipboard, realm.global_object(), GC::create_function(GC::Heap::the(), [&realm, promise, blob]() {
+                        HTML::TemporaryExecutionContext execution_context { realm };
+                        resolve_clipboard_item_blob_promise(realm, promise, blob);
+                    }));
+                }));
+            }
+
+            // 3. Let representationDataPromise be the representation’s data.
             auto representation_data_promise = representation.data;
 
-            // 2. React to representationDataPromise:
+            // 4. React to representationDataPromise:
             WebIDL::react_to_promise(
                 *representation_data_promise,
+                // 1. If representationDataPromise was fulfilled with value v, then:
                 GC::create_function(GC::Heap::the(), [&realm, promise, mime_type_serialized](JS::Value value) -> WebIDL::ExceptionOr<JS::Value> {
                     // 1. If v is a DOMString, then follow the below steps:
                     if (value.is_string()) {
@@ -508319,7 +508460,7 @@ WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> ClipboardItem::get_type(JS::Realm&
                     return JS::js_undefined();
                 }));
 
-            // 3. Return p.
+            // 5. Return p.
             return promise;
         }
     }
@@ -508340,21 +508481,6 @@ bool ClipboardItem::supports(Utf16String const& type)
     return type == "text/plain"_utf16 || type == "text/html"_utf16 || type == "image/png"_utf16;
 }
 
-ClipboardItem::ClipboardItem()
-    : m_presentation_style(PresentationStyle::Unspecified)
-{
-}
-
-ClipboardItem::~ClipboardItem() = default;
-
-void ClipboardItem::visit_edges(GC::Cell::Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-    for (auto& representation : m_representations) {
-        visitor.visit(representation.data);
-    }
-}
-
 }
 
 FILE: Libraries/LibWeb/Clipboard/ClipboardItem.h
@@ -508371,6 +508497,7 @@ FILE: Libraries/LibWeb/Clipboard/ClipboardItem.h
 #include <LibJS/Runtime/PromiseCapability.h>
 #include <LibWeb/Bindings/ClipboardItem.h>
 #include <LibWeb/Bindings/Wrappable.h>
+#include <LibWeb/Clipboard/SystemClipboard.h>
 #include <LibWeb/DOM/Event.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/DataTransfer.h>
@@ -508402,24 +508529,46 @@ public:
 
     virtual ~ClipboardItem() override;
 
-    PresentationStyle presentation_style() const;
+    PresentationStyle presentation_style() const { return m_presentation_style; }
 
     Vector<Utf16String> const& types() const { return m_types; }
 
-    Vector<Representation> const& representations() const { return m_representations; }
-    void append_representation(Representation);
-    WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> get_type(JS::Realm&, Utf16String const& type) const;
+    WebIDL::ExceptionOr<GC::Ref<WebIDL::Promise>> get_type(JS::Realm&, Utf16String const& type);
 
     static bool supports(Utf16String const& type);
+
+    Vector<Representation> const& representations() const { return m_representations; }
+    void append_representation(Representation);
+
+    void set_clipboard_change_count_at_read(size_t count) { m_clipboard_change_count_at_read = count; }
+    void set_originating_system_clipboard_item(Optional<SystemClipboardItem> item) { m_originating_system_clipboard_item = move(item); }
+    void set_unsanitized_mime_types(Vector<Utf16String> types) { m_unsanitized_mime_types = move(types); }
 
 private:
     ClipboardItem();
 
     virtual void visit_edges(GC::Cell::Visitor&) override;
 
-    PresentationStyle m_presentation_style;
-    Vector<Utf16String> m_types;
+    // https://w3c.github.io/clipboard-apis/#list-of-representations
     Vector<Representation> m_representations;
+
+    // https://w3c.github.io/clipboard-apis/#presentation-style
+    PresentationStyle m_presentation_style;
+
+    // https://w3c.github.io/clipboard-apis/#clipboarditem-types-array
+    Vector<Utf16String> m_types;
+
+    // https://w3c.github.io/clipboard-apis/#clipboarditem-clipboard-change-count-at-read
+    Optional<size_t> m_clipboard_change_count_at_read;
+
+    // https://w3c.github.io/clipboard-apis/#clipboarditem-originating-system-clipboard-item
+    Optional<SystemClipboardItem> m_originating_system_clipboard_item;
+
+    // https://w3c.github.io/clipboard-apis/#clipboarditem-unsanitized-mime-types
+    Vector<Utf16String> m_unsanitized_mime_types;
+
+    // https://w3c.github.io/clipboard-apis/#clipboarditem-representations-with-resolvers
+    HashMap<String, GC::Ref<WebIDL::Promise>> m_representations_with_resolvers;
 };
 
 }
@@ -508461,18 +508610,18 @@ FILE: Libraries/LibWeb/Clipboard/SystemClipboard.cpp
 template<>
 ErrorOr<void> IPC::encode(Encoder& encoder, Web::Clipboard::SystemClipboardRepresentation const& output)
 {
+    TRY(encoder.encode(output.name));
     TRY(encoder.encode(output.data));
-    TRY(encoder.encode(output.mime_type));
     return {};
 }
 
 template<>
 ErrorOr<Web::Clipboard::SystemClipboardRepresentation> IPC::decode(Decoder& decoder)
 {
+    auto name = TRY(decoder.decode<String>());
     auto data = TRY(decoder.decode<ByteString>());
-    auto mime_type = TRY(decoder.decode<String>());
 
-    return Web::Clipboard::SystemClipboardRepresentation { move(data), move(mime_type) };
+    return Web::Clipboard::SystemClipboardRepresentation { move(name), move(data) };
 }
 
 template<>
@@ -508509,8 +508658,8 @@ namespace Web::Clipboard {
 
 // https://w3c.github.io/clipboard-apis/#system-clipboard-representation
 struct SystemClipboardRepresentation {
+    String name;
     ByteString data;
-    String mime_type;
 };
 
 // https://w3c.github.io/clipboard-apis/#system-clipboard-item
@@ -509326,7 +509475,6 @@ set(SOURCES
     Internals/XRTest.cpp
     IntersectionObserver/IntersectionObserver.cpp
     IntersectionObserver/IntersectionObserverEntry.cpp
-    Layout/BlockContainer.cpp
     Layout/Box.cpp
     Layout/ImageProvider.cpp
     Layout/LayoutRustBridge.cpp
@@ -539512,57 +539660,6 @@ bool ComputedValues::differs_in_any_layout_affecting_group_payload_from(Computed
     return false;
 }
 
-// https://drafts.csswg.org/css-transforms-2/#grouping-property-values
-bool ComputedValues::has_transform_style_grouping_property() const
-{
-    // The following CSS property values require the user agent to create a flattened representation of the
-    // descendant elements before they can be applied, and therefore force the element to have a used style of
-    // flat for preserve-3d.
-    // NB: The contain bullet requires layout context and is checked by NodeWithStyle::used_transform_style().
-
-    // overflow: any value other than visible or clip.
-    if (!first_is_one_of(overflow_x(), Overflow::Visible, Overflow::Clip)
-        || !first_is_one_of(overflow_y(), Overflow::Visible, Overflow::Clip))
-        return true;
-
-    // opacity: any value less than 1.
-    if (opacity() < 1)
-        return true;
-
-    // filter: any value other than none.
-    if (filter().has_filters())
-        return true;
-
-    // clip: any value other than auto.
-    if (!clip().is_auto())
-        return true;
-
-    // clip-path: any value other than none.
-    if (clip_path().has_value())
-        return true;
-
-    // isolation: used value of isolate.
-    if (isolation() == Isolation::Isolate)
-        return true;
-
-    // mask-image: any value other than none.
-    if (mask().has_value() || any_of(mask_layers(), [](auto const& layer) { return layer.background_image != nullptr; }))
-        return true;
-
-    // FIXME: mask-border-source: any value other than none.
-
-    // mix-blend-mode: any value other than normal.
-    if (mix_blend_mode() != MixBlendMode::Normal)
-        return true;
-
-    // AD-HOC: backdrop-filter is missing from the specification's list, but it buffers descendants the same way
-    //         filter does, and other engines treat it as a grouping property.
-    if (backdrop_filter().has_filters())
-        return true;
-
-    return false;
-}
-
 void const* ComputedValues::style_group_payload(StyleGroupIndex group) const
 {
     switch (group) {
@@ -540112,11 +540209,6 @@ BorderImageData ComputedValues::BorderValues::border_image_value() const
     result.repeat_x = keyword_to_border_image_repeat(repeat_items[0]->to_keyword()).value_or(BorderImageRepeat::Stretch);
     result.repeat_y = keyword_to_border_image_repeat(repeat_items[1 % repeat_items.size()]->to_keyword()).value_or(BorderImageRepeat::Stretch);
     return result;
-}
-
-RefPtr<AbstractImageStyleValue const> ComputedValues::BorderValues::border_image_source_value() const
-{
-    return first_abstract_image_value(border_image_source);
 }
 
 Vector<BackgroundLayerData> ComputedValues::BackgroundValues::background_layers_value() const
@@ -542115,8 +542207,6 @@ public:
     bool adopt_identical_group_payloads(ComputedValues const& previous) const;
     bool differs_in_any_layout_affecting_group_payload_from(ComputedValues const& other) const;
 
-    bool has_transform_style_grouping_property() const;
-
     // Returns the Rust-owned payload for direct read-only layout access. The
     // pointer is borrowed from this immutable ComputedValues instance.
     void const* style_group_payload(StyleGroupIndex) const;
@@ -542470,14 +542560,6 @@ public:
             return style_value->as_cursor();
         }
         PointerEvents pointer_events_value() const { return static_cast<PointerEvents>(pointer_events); }
-        ScrollbarColorData scrollbar_color_value() const
-        {
-            return {
-                .thumb_color = Color::from_bgra(scrollbar_color.thumb_color),
-                .track_color = Color::from_bgra(scrollbar_color.track_color),
-                .is_auto = scrollbar_color.is_auto,
-            };
-        }
         PreferredColorScheme color_scheme_value() const { return static_cast<PreferredColorScheme>(color_scheme); }
         ReadonlySpan<Utf16FlyString> color_schemes_span() const
         {
@@ -542518,8 +542600,6 @@ public:
 
         Optional<SVGPaint> fill_value() const { return paint_value(fill); }
         Optional<SVGPaint> stroke_value() const { return paint_value(stroke); }
-        FillRule fill_rule_value() const { return static_cast<FillRule>(fill_rule); }
-        ClipRule clip_rule_value() const { return static_cast<ClipRule>(clip_rule); }
         StrokeLinecap stroke_linecap_value() const { return static_cast<StrokeLinecap>(stroke_linecap); }
         StrokeLinejoin stroke_linejoin_value() const { return static_cast<StrokeLinejoin>(stroke_linejoin); }
         ColorInterpolation color_interpolation_value() const { return static_cast<ColorInterpolation>(color_interpolation); }
@@ -542826,7 +542906,6 @@ public:
             }
         }
 
-        TransformBox transform_box_value() const { return static_cast<TransformBox>(transform_box); }
         TransformOrigin transform_origin_value() const
         {
             return {
@@ -542888,7 +542967,6 @@ public:
         BorderData const& border_right_value() const { return reinterpret_cast<BorderData const&>(border_right); }
         BorderData const& border_bottom_value() const { return reinterpret_cast<BorderData const&>(border_bottom); }
         BorderImageData border_image_value() const;
-        RefPtr<AbstractImageStyleValue const> border_image_source_value() const;
 
         bool operator==(BorderValues const& other) const
         {
@@ -625770,11 +625848,6 @@ void Document::invalidate_layout_tree(InvalidateLayoutTreeReason reason)
     tear_down_layout_tree();
 }
 
-void Document::PartialRelayoutInvalidation::record_boundary(Layout::Box& box)
-{
-    m_registered_roots.set(box.make_weak_ptr<Layout::Box>());
-}
-
 void Document::PartialRelayoutInvalidation::record_escape(PartialRelayoutEscapeReason reason)
 {
     dbgln_if(UPDATE_LAYOUT_DEBUG, "Pending updates escape partial relayout boundaries ({})", to_string(reason));
@@ -625885,10 +625958,8 @@ static void relayout_subtree(Layout::Box& subtree_root)
         bridge.compute_subtree_layout(subtree_root);
     }
 
-    subtree_root.for_each_in_inclusive_subtree([](auto& node) {
-        node.reset_needs_layout_update();
-        return TraversalDecision::Continue;
-    });
+    Layout::RustFFI::layout_arena_reset_layout_update_flags_in_subtree(
+        subtree_root.arena_handle(), Layout::Node::slot_id(&subtree_root));
 }
 
 // Recomputes containing blocks and derives the abspos escape flags for the inclusive subtree
@@ -625907,7 +625978,7 @@ static void recompute_containing_blocks_in_inclusive_subtree(Layout::NodeArena& 
 
 // Refreshes every structure derived from committed layout results, shared by the partial and
 // full layout paths so neither can forget one.
-void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed, LayoutCommitScope layout_commit_scope, ReadonlySpan<Layout::Box const*> boxes_needing_eager_overflow_measurement)
+void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed, LayoutCommitScope layout_commit_scope)
 {
     // NB: Called during layout update.
     m_layout_root->invalidate_text_blocks_cache();
@@ -625918,10 +625989,10 @@ void Document::after_layout_commit(LayoutTreeChanged layout_tree_changed, Layout
     // A commit that changed the tree can have replaced boxes referenced by the cached
     // contained-boxes index; refresh it before overflow measurement follows them. A pending full
     // recalculation rebuilds the index inside its own measurement traversal instead.
-    if (layout_tree_changed == LayoutTreeChanged::Yes && !m_needs_full_scrollable_overflow_recalculation)
+    if (layout_tree_changed == LayoutTreeChanged::Yes && !Layout::RustFFI::layout_arena_needs_full_scrollable_overflow_recalculation(layout_node_arena().handle()))
         Layout::RustFFI::layout_arena_rebuild_scrollable_overflow_contained_boxes(layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root.ptr()));
     if (layout_commit_scope == LayoutCommitScope::Full)
-        update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates::HandledByFullLayoutCommit, boxes_needing_eager_overflow_measurement);
+        update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates::HandledByFullLayoutCommit);
     else
         update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates::HandledByAfterLayoutCommit);
 
@@ -626248,12 +626319,12 @@ bool Document::needs_style_update_after_layout()
 // relayout boundary subtrees. Runs the incremental layout tree build itself when tree updates
 // are pending (consuming `needs_layout_tree_rebuild`), so an ineligible update continues to
 // the full layout path without rebuilding again.
-Document::PartialRelayoutResult Document::try_partial_relayout(HashTable<WeakPtr<Layout::Box>> registered_partial_relayout_roots, bool& needs_layout_tree_rebuild, bool should_collect_devtools_layout_data)
+Document::PartialRelayoutResult Document::try_partial_relayout(Vector<Layout::RustFFI::NodeSlotId> registered_partial_relayout_root_slots, bool& needs_layout_tree_rebuild, bool should_collect_devtools_layout_data)
 {
     if (!m_layout_root
         || needs_full_layout_tree_update()
         || m_partial_relayout_invalidation.escapes()
-        || registered_partial_relayout_roots.is_empty()
+        || registered_partial_relayout_root_slots.is_empty()
         || m_layout_root->needs_layout_update()
         || !m_query_containers_needing_container_query_evaluation_after_layout.is_empty()
         || should_collect_devtools_layout_data
@@ -626291,64 +626362,29 @@ Document::PartialRelayoutResult Document::try_partial_relayout(HashTable<WeakPtr
     for (auto* rebuilt_root : rebuilt_subtree_roots)
         recompute_containing_blocks_in_inclusive_subtree(layout_node_arena(), *rebuilt_root);
 
-    // Collect the live boundary set from the post-build tree: registered boundaries that
-    // survived the build, plus the nearest boundary containing each rebuilt subtree - which
-    // re-discovers a boundary whose own box the build replaced, since the saved layout inputs
-    // carried over to the replacement.
-    Vector<Layout::Box*> partial_relayout_roots;
-    HashTable<Layout::Box*> collected_boundaries;
-    auto collect_boundary = [&](Layout::Box& box, bool box_was_replaced) {
-        if (collected_boundaries.set(&box) != AK::HashSetResult::InsertedNewEntry)
-            return true;
+    Vector<Layout::RustFFI::NodeSlotId> rebuilt_subtree_root_slots;
+    rebuilt_subtree_root_slots.ensure_capacity(rebuilt_subtree_roots.size());
+    for (auto* rebuilt_root : rebuilt_subtree_roots)
+        rebuilt_subtree_root_slots.unchecked_append(Layout::Node::slot_id(rebuilt_root));
 
-        // A replaced box applies the saved-inputs validity check unconditionally: the change
-        // that drove the replacement cannot be classified anymore.
-        bool saved_inputs_may_be_style_stale = box.needs_own_geometry_update() || box_was_replaced;
-        if (saved_inputs_may_be_style_stale && box.is_absolutely_positioned() && !Layout::can_replay_saved_abspos_layout_inputs_after_style_change(box))
-            return false;
-
-        partial_relayout_roots.append(&box);
-        return true;
-    };
-
-    for (auto const& root : registered_partial_relayout_roots) {
-        auto* box = root.ptr();
-        // A boundary that did not survive the build was either replaced (re-discovered
-        // through the rebuilt subtree roots below) or removed together with the dirt
-        // inside it (the removal dirtied its parent, whose own marking covers the
-        // mutation).
-        if (!box || !box->parent())
-            continue;
-        if (!box->is_partial_relayout_boundary() || !collect_boundary(*box, false))
-            return PartialRelayoutResult::NotEligible;
-    }
-
-    for (auto* rebuilt_root : rebuilt_subtree_roots) {
-        // Every rebuilt subtree must lie inside a boundary for its dirt to be confined.
-        // The rebuilt box itself may qualify with its committed row still pending; boundaries
-        // above it were not replaced and must have one.
-        Layout::Box* containing_boundary = nullptr;
-        if (auto* rebuilt_box = as_if<Layout::Box>(*rebuilt_root); rebuilt_box && rebuilt_box->is_partial_relayout_boundary())
-            containing_boundary = rebuilt_box;
-        for (auto* ancestor = rebuilt_root->parent(); !containing_boundary && ancestor; ancestor = ancestor->parent()) {
-            if (auto* ancestor_box = as_if<Layout::Box>(*ancestor); ancestor_box && ancestor_box->is_partial_relayout_boundary())
-                containing_boundary = ancestor_box;
-        }
-        if (!containing_boundary || !collect_boundary(*containing_boundary, containing_boundary == rebuilt_root))
-            return PartialRelayoutResult::NotEligible;
-    }
-
-    // A root nested inside another root is relaid out as part of the ancestor's subtree.
-    partial_relayout_roots.remove_all_matching([&](auto* root) {
-        for (auto* ancestor = root->parent(); ancestor; ancestor = ancestor->parent()) {
-            if (auto* ancestor_box = as_if<Layout::Box>(*ancestor); ancestor_box && collected_boundaries.contains(ancestor_box))
-                return true;
-        }
-        return false;
-    });
-
-    if (partial_relayout_roots.is_empty())
+    Vector<Layout::RustFFI::NodeSlotId> partial_relayout_root_slots;
+    bool boundary_set_supports_partial_relayout = Layout::RustFFI::layout_arena_collect_partial_relayout_roots(
+        layout_node_arena().handle(),
+        registered_partial_relayout_root_slots.data(), registered_partial_relayout_root_slots.size(),
+        rebuilt_subtree_root_slots.data(), rebuilt_subtree_root_slots.size(),
+        &partial_relayout_root_slots,
+        [](void* context, Layout::RustFFI::NodeSlotId root) {
+            static_cast<Vector<Layout::RustFFI::NodeSlotId>*>(context)->append(root);
+        });
+    if (!boundary_set_supports_partial_relayout)
         return PartialRelayoutResult::NotEligible;
+
+    Vector<Layout::Box*> partial_relayout_roots;
+    partial_relayout_roots.ensure_capacity(partial_relayout_root_slots.size());
+    for (auto slot : partial_relayout_root_slots) {
+        auto* root = static_cast<Layout::Node*>(Layout::RustFFI::layout_arena_node_shell_if_live(layout_node_arena().handle(), slot));
+        partial_relayout_roots.unchecked_append(&as<Layout::Box>(*root));
+    }
 
     // The final boundary can be wider than the rebuilt roots that led us to it. Replaying such a
     // boundary may re-enter intrinsic sizing for descendants outside those rebuilt roots, including
@@ -626425,7 +626461,12 @@ void Document::update_layout(UpdateLayoutReason reason, ThrottledAnimationSampli
             return;
         }
 
-        auto registered_partial_relayout_roots = m_partial_relayout_invalidation.take_registered_roots();
+        Vector<Layout::RustFFI::NodeSlotId> registered_partial_relayout_root_slots;
+        Layout::RustFFI::layout_arena_take_partial_relayout_boundary_roots(
+            layout_node_arena().handle(), &registered_partial_relayout_root_slots,
+            [](void* context, Layout::RustFFI::NodeSlotId slot) {
+                static_cast<Vector<Layout::RustFFI::NodeSlotId>*>(context)->append(slot);
+            });
 
         // NOTE: If this is a document hosting <template> contents, layout is unnecessary.
         if (m_created_for_appropriate_template_contents)
@@ -626433,7 +626474,7 @@ void Document::update_layout(UpdateLayoutReason reason, ThrottledAnimationSampli
 
         auto needs_layout_tree_rebuild = !m_layout_root || needs_layout_tree_update() || child_needs_layout_tree_update() || needs_full_layout_tree_update();
 
-        switch (try_partial_relayout(move(registered_partial_relayout_roots), needs_layout_tree_rebuild, should_collect_devtools_layout_data)) {
+        switch (try_partial_relayout(move(registered_partial_relayout_root_slots), needs_layout_tree_rebuild, should_collect_devtools_layout_data)) {
         case PartialRelayoutResult::Done:
             return;
         case PartialRelayoutResult::NeedsAnotherLayoutPass:
@@ -626487,26 +626528,20 @@ void Document::update_layout(UpdateLayoutReason reason, ThrottledAnimationSampli
 
         layout_node_arena().sync_enrolled_content_for_layout();
         Layout::LayoutRustBridge bridge;
-        Vector<Layout::Box const*> boxes_needing_eager_overflow_measurement;
         bridge.run_root_layout(
             *m_layout_root,
             viewport_rect.width(),
             viewport_rect.height(),
             should_collect_devtools_layout_data);
-        m_layout_root->for_each_in_inclusive_subtree_of_type<Layout::Box>([&](auto& box) {
-            if ((&box == m_layout_root.ptr() || box.is_scroll_container() || !Painting::scroll_offset(box).is_zero()) && Painting::has_committed_box(box))
-                boxes_needing_eager_overflow_measurement.append(&box);
-            return TraversalDecision::Continue;
-        });
         Layout::RustFFI::layout_arena_rebuild_scrollable_overflow_contained_boxes(layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root.ptr()));
 
         style_invalidation_counters().relayouts_performed++;
 
-        m_needs_full_scrollable_overflow_recalculation = true;
+        Layout::RustFFI::layout_arena_set_needs_full_scrollable_overflow_recalculation(layout_node_arena().handle());
 
         ++m_full_layout_count;
 
-        after_layout_commit(LayoutTreeChanged::Yes, LayoutCommitScope::Full, boxes_needing_eager_overflow_measurement);
+        after_layout_commit(LayoutTreeChanged::Yes, LayoutCommitScope::Full);
 
         Layout::RustFFI::layout_arena_reset_layout_update_flags_in_subtree(
             layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root.ptr()));
@@ -626581,7 +626616,7 @@ bool Document::layout_is_up_to_date() const
         && !needs_layout_tree_update()
         && !child_needs_layout_tree_update()
         && !needs_full_layout_tree_update()
-        && !m_partial_relayout_invalidation.has_registered_roots();
+        && (!m_layout_node_arena || !Layout::RustFFI::layout_arena_has_partial_relayout_boundary_roots(m_layout_node_arena->handle()));
 }
 
 void Document::update_style_computer_viewport_rect()
@@ -626866,141 +626901,28 @@ void Document::finish_animated_style_update()
         effect->request_observation_sample();
 }
 
-void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates derived_structure_updates, ReadonlySpan<Layout::Box const*> boxes_needing_eager_measurement)
+void Document::update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates derived_structure_updates)
 {
-    // For every box that will be re-measured, the overflow data it had before, so the diff below
-    // can tell what actually changed; an empty value means the box's committed row was reset by a
-    // subtree layout commit and the old data is unknown.
-    HashMap<Layout::Box const*, Optional<Painting::OverflowData>> old_overflow_data_by_box;
-
-    auto pending_boxes = move(m_boxes_needing_scrollable_overflow_recalculation);
-    auto needs_full_recalculation = exchange(m_needs_full_scrollable_overflow_recalculation, false);
-    if (pending_boxes.is_empty() && !needs_full_recalculation)
+    if (!m_layout_node_arena)
         return;
-    if (!has_committed_viewport_box())
+
+    auto outcome = Painting::rust_update_scrollable_overflow(*this,
+        derived_structure_updates == ScrollableOverflowDerivedStructureUpdates::HandledByFullLayoutCommit);
+    if (!outcome.performed_recalculation)
         return;
 
     style_invalidation_counters().scrollable_overflow_recalculations++;
 
-    // The scroll offset can become invalid if the scrollable overflow rectangle has changed. For
-    // example, if the scroll container has been scrolled to the very end and then its scrollable
-    // overflow rect becomes smaller, the scroll offset would be out of bounds. Re-applying the
-    // current offset clamps it against the new rect.
-    auto clamp_scroll_offset = [](Layout::Node const& box) {
-        if (!Painting::scroll_offset(box).is_zero())
-            Painting::set_scroll_offset(const_cast<Layout::Node&>(box), Painting::scroll_offset(box));
-    };
-
-    if (derived_structure_updates == ScrollableOverflowDerivedStructureUpdates::HandledByFullLayoutCommit) {
-        VERIFY(needs_full_recalculation);
-
-        // A full-root commit reset every surviving row, including its overflow data and
-        // paint cache. There is therefore no old overflow to preserve or diff. Ordinary boxes are
-        // measured recursively when their overflow contributes to one of these roots, so they do
-        // not need separate eager measurement.
-        for (auto const* box : boxes_needing_eager_measurement) {
-            if (!Painting::has_committed_box(*box))
-                continue;
-            Painting::rust_measure_scrollable_overflow(*box);
-            clamp_scroll_offset(*box);
-        }
-        return;
-    }
-
-    auto record_and_clear_overflow_data = [&](Layout::Box const& box) {
-        if (!Painting::has_committed_box(box))
-            return true;
-        if (old_overflow_data_by_box.contains(&box))
-            return false;
-        old_overflow_data_by_box.set(&box, Painting::overflow_data(box));
-        Painting::clear_overflow_data(box);
-        return true;
-    };
-
-    if (needs_full_recalculation) {
-        m_layout_root->for_each_in_inclusive_subtree_of_type<Layout::Box>([&](auto& box) {
-            record_and_clear_overflow_data(box);
-            return TraversalDecision::Continue;
-        });
-        Layout::RustFFI::layout_arena_rebuild_scrollable_overflow_contained_boxes(layout_node_arena().handle(), Layout::Node::slot_id(m_layout_root.ptr()));
-    } else {
-        for (auto const& paintable_slot : pending_boxes) {
-            auto* layout_node = Painting::layout_node_for_committed_slot(layout_node_arena(), paintable_slot);
-            if (!layout_node)
-                continue;
-            auto const* box = as_if<Layout::Box>(*layout_node);
-            if (!box)
-                continue;
-            bool was_reset_by_subtree_layout_commit = !Painting::overflow_data(*box).has_value();
-            if (was_reset_by_subtree_layout_commit) {
-                box->for_each_in_inclusive_subtree_of_type<Layout::Box>([&](auto& subtree_box) {
-                    record_and_clear_overflow_data(subtree_box);
-                    return TraversalDecision::Continue;
-                });
-            }
-            for (auto const* containing_block = box->containing_block(); containing_block; containing_block = containing_block->containing_block()) {
-                if (Painting::has_committed_box(*containing_block))
-                    Painting::clear_cached_overflow_data(*containing_block);
-                if (!record_and_clear_overflow_data(*containing_block))
-                    break;
-            }
-        }
-    }
-
-    if (old_overflow_data_by_box.is_empty())
-        return;
-
-    for (auto const& it : old_overflow_data_by_box) {
-        if (!Painting::has_committed_box(*it.key))
-            continue;
-
-        // Boxes reset by a subtree commit have no previous overflow data. They will be measured
-        // recursively if an ancestor reaches them. Measuring each one here would repeatedly walk
-        // the same containing-block chains after a small subtree update.
-        if (!it.value.has_value() && it.key != m_layout_root.ptr() && !it.key->is_scroll_container() && Painting::scroll_offset(*it.key).is_zero())
-            continue;
-
-        Painting::rust_measure_scrollable_overflow(*it.key);
-        clamp_scroll_offset(*it.key);
-    }
-
-    bool any_overflow_changed = false;
-    bool any_has_scrollable_overflow_flipped = false;
-    for (auto const& [box, old_overflow_data] : old_overflow_data_by_box) {
-        if (!Painting::has_committed_box(*box))
-            continue;
-        auto new_overflow_data = Painting::overflow_data(*box);
-        if (!new_overflow_data.has_value())
-            continue;
-        // A box with no prior overflow data was just created or reset by the layout commit, so
-        // its paint cache is already clean.
-        if (!old_overflow_data.has_value())
-            continue;
-        // Boxes that merely moved do not register here; everything derived below is
-        // translation-invariant, and movement-driven repaint belongs to the layout commit.
-        bool rect_changed = old_overflow_data->scrollable_overflow_rect_relative_to_padding_box != new_overflow_data->scrollable_overflow_rect_relative_to_padding_box;
-        bool has_scrollable_overflow_flipped = old_overflow_data->has_scrollable_overflow != new_overflow_data->has_scrollable_overflow;
-        if (!rect_changed && !has_scrollable_overflow_flipped)
-            continue;
-        // Cached paint commands and hit-test items capture scrollbar geometry and per-direction
-        // scrollability derived from the overflow rect, so they cannot be reused once it changes.
-        // This must also run for the after-layout-commit path: a subtree relayout re-measures a
-        // surviving ancestor's overflow without resetting the ancestor's committed row.
-        Painting::invalidate_paint_cache(*box);
-        any_overflow_changed = true;
-        any_has_scrollable_overflow_flipped |= has_scrollable_overflow_flipped;
-    }
-
-    if (derived_structure_updates == ScrollableOverflowDerivedStructureUpdates::HandledByAfterLayoutCommit)
+    if (derived_structure_updates != ScrollableOverflowDerivedStructureUpdates::UpdateAfterMeasure)
         return;
 
     // Nothing derived from scrollable overflow needs updating. In particular, this keeps transform
     // changes that ride the accumulated-visual-context value-update path free of display list
     // re-recording when the overflow they produce is unchanged.
-    if (!any_overflow_changed)
+    if (!outcome.any_overflow_changed)
         return;
 
-    if (any_has_scrollable_overflow_flipped) {
+    if (outcome.any_has_scrollable_overflow_flipped) {
         set_needs_accumulated_visual_contexts_update(true);
     } else if (!m_needs_accumulated_visual_contexts_update) {
         // Sticky insets only depend on scrollport geometry and which ancestor is scrollable, neither of
@@ -634369,27 +634291,7 @@ void Document::schedule_scrollable_overflow_recalculation(Layout::Node const& la
         return;
     }
 
-    if (auto const* box = as_if<Layout::Box>(layout_node)) {
-        for (auto const* containing_box = box; containing_box; containing_box = containing_box->containing_block()) {
-            if (Painting::has_committed_box(*containing_box))
-                Painting::clear_cached_overflow_data(*containing_box);
-        }
-    }
-
-    if (m_needs_full_scrollable_overflow_recalculation)
-        return;
-
-    // NB: Cap the queue in case it's never consumed (e.g. forced style updates in a document that never
-    //     updates layout).
-    static constexpr size_t max_pending_scrollable_overflow_recalculations = 1024;
-    if (m_boxes_needing_scrollable_overflow_recalculation.size() >= max_pending_scrollable_overflow_recalculations) {
-        m_boxes_needing_scrollable_overflow_recalculation.clear();
-        m_needs_full_scrollable_overflow_recalculation = true;
-        return;
-    }
-
-    if (Painting::has_committed_box(layout_node))
-        m_boxes_needing_scrollable_overflow_recalculation.append(Painting::committed_row_slot(layout_node));
+    Layout::RustFFI::layout_arena_schedule_scrollable_overflow_recalculation(layout_node.arena_handle(), Layout::Node::slot_id(&layout_node));
 }
 
 void Document::schedule_scrollable_overflow_recalculation(Element& element)
@@ -636061,7 +635963,7 @@ public:
         HandledByAfterLayoutCommit,
         HandledByFullLayoutCommit,
     };
-    void update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates, ReadonlySpan<Layout::Box const*> boxes_needing_eager_measurement = {});
+    void update_scrollable_overflow(ScrollableOverflowDerivedStructureUpdates);
     void update_paint_and_hit_testing_properties_if_needed();
     void sample_animation_effects_needing_style_update();
     void update_style_computer_viewport_rect();
@@ -636393,21 +636295,17 @@ public:
     Painting::ChromeWidgetRegistry const& chrome_widget_registry() const { return *m_chrome_widget_registry; }
 
     // Attribution of pending updates for partial relayout. Invariant: every update recorded
-    // since the last layout pass is either attributed to a boundary in the registered root
-    // set, or the escape bit is set. The dispatch may only run partial relayout while the
-    // escape bit is clear; a full layout pass re-derives every fact boundary qualification
-    // depends on, so it clears the bit.
+    // since the last layout pass is either attributed to a boundary in the root set the
+    // layout node arena keeps, or the escape bit is set. The dispatch may only run partial
+    // relayout while the escape bit is clear; a full layout pass re-derives every fact
+    // boundary qualification depends on, so it clears the bit.
     class PartialRelayoutInvalidation {
     public:
-        void record_boundary(Layout::Box&);
         void record_escape(PartialRelayoutEscapeReason);
         void clear_escape(PartialRelayoutEscapeClearReason);
         [[nodiscard]] bool escapes() const { return m_escapes; }
-        [[nodiscard]] bool has_registered_roots() const { return !m_registered_roots.is_empty(); }
-        [[nodiscard]] HashTable<WeakPtr<Layout::Box>> take_registered_roots() { return move(m_registered_roots); }
 
     private:
-        HashTable<WeakPtr<Layout::Box>> m_registered_roots;
         bool m_escapes { false };
     };
     [[nodiscard]] PartialRelayoutInvalidation& partial_relayout_invalidation() { return m_partial_relayout_invalidation; }
@@ -637053,7 +636951,7 @@ private:
     void collect_boxes_with_auto_content_visibility();
     bool needs_style_update_after_layout();
     bool any_anchor_names_are_registered() const;
-    PartialRelayoutResult try_partial_relayout(HashTable<WeakPtr<Layout::Box>> registered_partial_relayout_roots, bool& needs_layout_tree_rebuild, bool should_collect_devtools_layout_data);
+    PartialRelayoutResult try_partial_relayout(Vector<Layout::RustFFI::NodeSlotId> registered_partial_relayout_root_slots, bool& needs_layout_tree_rebuild, bool should_collect_devtools_layout_data);
 
     void process_pending_list_item_renumbers();
     bool reconcile_stale_list_item_counters_after_tree_build(Vector<Layout::Node*> const& rebuilt_subtree_roots);
@@ -637065,7 +636963,7 @@ private:
         Subtree,
         Full,
     };
-    void after_layout_commit(LayoutTreeChanged, LayoutCommitScope, ReadonlySpan<Layout::Box const*> boxes_needing_eager_overflow_measurement = {});
+    void after_layout_commit(LayoutTreeChanged, LayoutCommitScope);
 
     void run_unloading_cleanup_steps();
 
@@ -637455,9 +637353,6 @@ private:
     bool m_design_mode_enabled { false };
 
     bool m_needs_accumulated_visual_contexts_update { false };
-
-    bool m_needs_full_scrollable_overflow_recalculation { false };
-    Vector<Layout::RustFFI::NodeSlotId> m_boxes_needing_scrollable_overflow_recalculation;
 
     HashMap<Compositor::AsyncScrollNodeStableID, Painting::SnappedAreas> m_scroll_container_snapped_areas;
     Vector<WeakPtr<Layout::Node const>> m_scroll_snap_containers;
@@ -655820,31 +655715,23 @@ void Node::set_needs_layout_tree_update(bool value, SetNeedsLayoutTreeUpdateReas
 
         // NB: Propagating layout invalidation, layout is not up to date.
         if (auto layout_node = this->unsafe_layout_node()) {
-            if (!layout_node->parent() && !layout_node->is_viewport())
+            auto classification = Layout::RustFFI::layout_arena_classify_layout_tree_update(
+                layout_node->arena_handle(), Layout::Node::slot_id(layout_node),
+                is_structural_boundary_self_rebuild_reason(reason));
+
+            if (classification.layout_node_is_detached_from_tree)
                 document().partial_relayout_invalidation().record_escape(PartialRelayoutEscapeReason::DirtyDomNodeHasDetachedLayoutNode);
 
-            bool registered_boundary_self_rebuild = false;
-            if (auto* box = as_if<Layout::Box>(layout_node); box
-                && is_structural_boundary_self_rebuild_reason(reason)
-                && box->is_partial_relayout_boundary()) {
-                box->set_needs_layout_update(SetNeedsLayoutReason::LayoutTreeUpdate, Layout::LayoutUpdatePropagation::BoundarySelfOnly);
-                registered_boundary_self_rebuild = true;
-            } else {
-                layout_node->set_needs_layout_update(SetNeedsLayoutReason::LayoutTreeUpdate);
-            }
+            layout_node->set_needs_layout_update(SetNeedsLayoutReason::LayoutTreeUpdate,
+                classification.marks_partial_relayout_boundary_self_only
+                    ? Layout::LayoutUpdatePropagation::BoundarySelfOnly
+                    : Layout::LayoutUpdatePropagation::ThroughAncestors);
 
-            // If the layout node has an anonymous parent, rebuild from the nearest non-anonymous ancestor.
-            // A boundary that registered itself for a structural change skips this escalation: a child-list
-            // mutation cannot change its own box kind, so replacing its box in place cannot require
-            // restructuring the surrounding anonymous siblings.
-            // FIXME: This is not optimal, and we should figure out how to rebuild a smaller part of the tree.
-            if (!registered_boundary_self_rebuild && layout_node->parent() && layout_node->parent()->is_anonymous()) {
-                auto* ancestor = layout_node->parent();
-                while (ancestor && ancestor->is_anonymous())
-                    ancestor = ancestor->parent();
-                if (ancestor)
-                    ancestor->dom_node()->set_needs_layout_tree_update(true, reason);
-            }
+            // FIXME: Escalating a rebuild past anonymous parents is not optimal, and we should
+            //        figure out how to rebuild a smaller part of the tree.
+            if (auto* ancestor_to_re_mark = static_cast<Layout::Node*>(Layout::RustFFI::layout_arena_node_shell_if_live(
+                    layout_node->arena_handle(), classification.nearest_non_anonymous_ancestor_when_parent_is_anonymous)))
+                ancestor_to_re_mark->dom_node()->set_needs_layout_tree_update(true, reason);
         }
         // NB: A dirty node with no layout node needs no escape tracking: rebuilding it either
         //     still produces no layout node, or the change is covered by the escalations
@@ -667954,3 +667841,83 @@ bool command_back_color_action(DOM::Document& document, Utf16View value)
     Utf16View resulting_value = value;
     Optional<Utf16String> prefixed_resulting_value;
     if (!Color::from_utf16_string(resulting_value).has_value()) {
+        prefixed_resulting_value = Utf16String::formatted("#{}", resulting_value);
+        resulting_value = prefixed_resulting_value->utf16_view();
+
+        // 2. If value is still not a valid CSS color, or if it is currentColor, return false.
+        // AD-HOC: No browser does this. They always return true.
+        if (!Color::from_utf16_string(resulting_value).has_value()) {
+            // FIXME: Also return true in case of currentColor.
+            return true;
+        }
+    }
+
+    // 3. Set the selection's value to value.
+    set_the_selections_value(document, CommandNames::backColor, resulting_value);
+
+    // 4. Return true.
+    return true;
+}
+
+// https://w3c.github.io/editing/docs/execCommand/#the-backcolor-command
+static bool command_back_color_indeterminate(DOM::Document const& document)
+{
+    return standard_inline_indeterminate(document, CommandNames::backColor);
+}
+
+// https://w3c.github.io/editing/docs/execCommand/#the-backcolor-command
+static Utf16String command_back_color_value(DOM::Document const& document)
+{
+    return standard_inline_value(document, CommandNames::backColor);
+}
+
+// https://w3c.github.io/editing/docs/execCommand/#the-bold-command
+bool command_bold_action(DOM::Document& document, Utf16View)
+{
+    // If queryCommandState("bold") returns true, set the selection's value to "normal".
+    if (MUST(document.query_command_state(CommandNames::bold))) {
+        set_the_selections_value(document, CommandNames::bold, "normal"sv);
+    }
+
+    // Otherwise set the selection's value to "bold".
+    else {
+        set_the_selections_value(document, CommandNames::bold, "bold"sv);
+    }
+
+    // Either way, return true.
+    return true;
+}
+
+// https://w3c.github.io/editing/docs/execCommand/#the-createlink-command
+bool command_create_link_action(DOM::Document& document, Utf16View value)
+{
+    // 1. If value is the empty string, return false.
+    if (value.is_empty())
+        return false;
+
+    // 2. For each editable a element that has an href attribute and is an ancestor of some node effectively contained
+    //    in the active range, set that a element's href attribute to value.
+    HashTable<DOM::Node*> visited_ancestors;
+    auto set_value_for_ancestor_anchors = [&](GC::Ref<DOM::Node> node) {
+        node->for_each_ancestor([&](GC::Ref<DOM::Node> ancestor) {
+            if (visited_ancestors.contains(ancestor.ptr()))
+                return IterationDecision::Break;
+            if (auto* anchor = as_if<HTML::HTMLAnchorElement>(*ancestor); anchor && anchor->is_editable()
+                && anchor->has_attribute(HTML::AttributeNames::href))
+                anchor->set_href(value);
+            visited_ancestors.set(ancestor.ptr());
+            return IterationDecision::Continue;
+        });
+    };
+    for_each_node_effectively_contained_in_range(active_range(document), [&](GC::Ref<DOM::Node> descendant) {
+        set_value_for_ancestor_anchors(descendant);
+        return TraversalDecision::Continue;
+    });
+
+    // 3. Set the selection's value to value.
+    set_the_selections_value(document, CommandNames::createLink, value);
+
+    // 4. Return true.
+    return true;
+}
+
