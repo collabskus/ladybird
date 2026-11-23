@@ -26,7 +26,9 @@ namespace Media::FFmpeg {
     C(Audio::Channel::TopFrontRight, AVChannel::AV_CHAN_TOP_FRONT_RIGHT)            \
     C(Audio::Channel::TopBackLeft, AVChannel::AV_CHAN_TOP_BACK_LEFT)                \
     C(Audio::Channel::TopBackCenter, AVChannel::AV_CHAN_TOP_BACK_CENTER)            \
-    C(Audio::Channel::TopBackRight, AVChannel::AV_CHAN_TOP_BACK_RIGHT)
+    C(Audio::Channel::TopBackRight, AVChannel::AV_CHAN_TOP_BACK_RIGHT)              \
+    C(Audio::Channel::TopSideLeft, AVChannel::AV_CHAN_TOP_SIDE_LEFT)                \
+    C(Audio::Channel::TopSideRight, AVChannel::AV_CHAN_TOP_SIDE_RIGHT)
 
 ErrorOr<Audio::ChannelMap> FFmpegChannelLayout::to_channel_map() const
 {
@@ -125,7 +127,8 @@ ErrorOr<FFmpegChannelLayout> FFmpegChannelLayout::from_channel_map(FFmpegFunctio
         // Native order follows the order of the declarations in AVChannel, which are sequential.
         // If we find that one of the channels in our input mapping doesn't match this requirement,
         // fall back to a custom order.
-        if (channel <= last_channel)
+        auto channel_has_bit_in_native_mask = channel >= 0 && static_cast<size_t>(channel) < NumericLimits<decltype(AVChannelLayout::u.mask)>::digits();
+        if (channel <= last_channel || !channel_has_bit_in_native_mask)
             return FFmpegChannelLayout(functions, TRY(channel_map_to_custom_av_channel_layout(functions, channel_map)));
         layout.u.mask |= 1ULL << channel;
         last_channel = channel;

@@ -22,7 +22,6 @@ static void check_core_audio_channel_layout_size(AudioChannelLayout const& layou
     VERIFY(size >= minimum_layout_size.value());
 }
 
-// This must be kept in the order defined by AudioChannelBitmap.
 #define ENUMERATE_CHANNEL_POSITIONS(C)          \
     C(Left, Channel::FrontLeft)                 \
     C(Right, Channel::FrontRight)               \
@@ -41,7 +40,25 @@ static void check_core_audio_channel_layout_size(AudioChannelLayout const& layou
     C(TopBackRight, Channel::TopBackRight)      \
     C(LeftTopFront, Channel::TopFrontLeft)      \
     C(CenterTopFront, Channel::TopFrontCenter)  \
-    C(RightTopFront, Channel::TopFrontRight)
+    C(RightTopFront, Channel::TopFrontRight)    \
+    C(LeftTopMiddle, Channel::TopSideLeft)      \
+    C(RightTopMiddle, Channel::TopSideRight)    \
+    C(LeftTopRear, Channel::TopBackLeft)        \
+    C(CenterTopRear, Channel::TopBackCenter)    \
+    C(RightTopRear, Channel::TopBackRight)
+
+static Channel channel_of_bitmap_bit(u32 bit)
+{
+#define CHANNEL_OF_BITMAP_BIT(core_audio_channel_name, audio_channel) \
+    case kAudioChannelBit_##core_audio_channel_name:                  \
+        return audio_channel;
+
+    switch (bit) {
+        ENUMERATE_CHANNEL_POSITIONS(CHANNEL_OF_BITMAP_BIT)
+    default:
+        return Channel::Unknown;
+    }
+}
 
 ErrorOr<ChannelMap> core_audio_channel_layout_to_channel_map(AudioChannelLayout const& channel_layout, u32 channel_layout_size)
 {
@@ -56,17 +73,11 @@ ErrorOr<ChannelMap> core_audio_channel_layout_to_channel_map(AudioChannelLayout 
         return ChannelMap::quadrophonic();
     if (channel_layout.mChannelLayoutTag == kAudioChannelLayoutTag_AudioUnit_5_1)
         return ChannelMap::surround_5_1();
+    // This tag puts its side surround channels before its rear surround channels.
     if (channel_layout.mChannelLayoutTag == kAudioChannelLayoutTag_AudioUnit_7_1)
-        return ChannelMap::surround_7_1();
+        return ChannelMap(Channel::FrontLeft, Channel::FrontRight, Channel::FrontCenter, Channel::LowFrequency, Channel::SideLeft, Channel::SideRight, Channel::BackLeft, Channel::BackRight);
 
     Vector<Channel, ChannelMap::capacity()> channels;
-
-#define MAYBE_ADD_CHANNEL_FROM_BITMAP_FLAG(core_audio_channel_name, audio_channel)            \
-    if ((channel_layout.mChannelBitmap & kAudioChannelBit_##core_audio_channel_name) != 0) {  \
-        if (channels.size() == ChannelMap::capacity())                                        \
-            return Error::from_string_literal("Device channel layout had too many channels"); \
-        channels.unchecked_append(audio_channel);                                             \
-    }
 
 #define MAYBE_ADD_CHANNEL_FROM_CHANNEL_DESCRIPTION(core_audio_channel_name, audio_channel) \
     case kAudioChannelLabel_##core_audio_channel_name:                                     \
@@ -74,7 +85,16 @@ ErrorOr<ChannelMap> core_audio_channel_layout_to_channel_map(AudioChannelLayout 
         break;
 
     if (channel_layout.mChannelLayoutTag == kAudioChannelLayoutTag_UseChannelBitmap) {
-        ENUMERATE_CHANNEL_POSITIONS(MAYBE_ADD_CHANNEL_FROM_BITMAP_FLAG);
+        // The channels come in the order of their bits.
+        u32 const bitmap = channel_layout.mChannelBitmap;
+        for (u32 bit_index = 0; bit_index < 32; bit_index++) {
+            u32 const bit = 1u << bit_index;
+            if ((bitmap & bit) == 0)
+                continue;
+            if (channels.size() == ChannelMap::capacity())
+                return Error::from_string_literal("Device channel layout had too many channels");
+            channels.unchecked_append(channel_of_bitmap_bit(bit));
+        }
     } else {
         auto fill_channels_from_channel_descriptions = [&](AudioChannelLayout const& channel_layout) -> ErrorOr<void> {
             VERIFY(channel_layout.mNumberChannelDescriptions > 0);
