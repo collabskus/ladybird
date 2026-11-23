@@ -151,14 +151,25 @@ impl<'pass> FlexItemDetails<'pass> {
 const _: () = assert!(size_of::<FlexItem>() <= 128);
 
 impl FlexItem {
-    fn new(box_: Node, alignment_facts: FlexItemAlignmentFacts, inputs: &FlexItemInputs<'_>) -> Self {
+    fn new(
+        box_: Node,
+        alignment_facts: FlexItemAlignmentFacts,
+        inputs: &FlexItemInputs<'_>,
+        main_axis_is_horizontal: bool,
+    ) -> Self {
+        // https://drafts.csswg.org/css-sizing-3/#valdef-width-min-content
+        // NB: In a box's block axis, min-content, max-content and fit-content are equivalent to its automatic size, so
+        //     such a minimum main size is an automatic minimum size where the main axis is the item's block axis.
+        let main_axis_is_block_axis = main_axis_is_horizontal != inputs.inline_axis_is_horizontal;
+        let main_min_size_is_auto = inputs.min_main_size.is_auto()
+            || (main_axis_is_block_axis && inputs.min_main_size.is_intrinsic_sizing_constraint());
         Self {
             box_,
             alignment_facts,
             cross_size_is_stretch: inputs.preferred_cross_size.is_stretch(),
             cross_size_is_calc_size: inputs.preferred_cross_size.calc_size().is_some(),
             cross_min_or_max_size_is_stretch: inputs.min_cross_size.is_stretch() || inputs.max_cross_size.is_stretch(),
-            main_min_size_is_auto: inputs.min_main_size.is_auto(),
+            main_min_size_is_auto,
             main_min_size_is_calc_size: inputs.min_main_size.calc_size().is_some(),
             max_main_size_is_none: false,
             max_cross_size_is_none: false,
@@ -1215,7 +1226,12 @@ impl<'pass> FlexFormattingContext<'pass> {
                     let (inputs, alignment_facts) = self.resolve_item_inputs(child);
                     let order = self.order_of_item(inputs.style);
                     items_have_different_orders |= *order_of_first_item.get_or_insert(order) != order;
-                    self.flex_items.push(FlexItem::new(child, alignment_facts, &inputs));
+                    self.flex_items.push(FlexItem::new(
+                        child,
+                        alignment_facts,
+                        &inputs,
+                        self.main_axis_is_horizontal(),
+                    ));
                     self.items_to_fork.take();
                     self.flex_item_details.push(FlexItemDetails::new(inputs, cells));
                     self.populate_specified_margins(self.flex_items.len() - 1);
@@ -4233,19 +4249,26 @@ impl<'pass> FlexFormattingContext<'pass> {
         self.resolve_own_auto_block_size_from_max_content_main_size();
 
         // 3. Determine the flex base size and hypothetical main size of each item
-        let mut all_items_have_definite_main_sizes = true;
+        // NB: An item's automatic minimum size is never more than its specified size suggestion, so it can't raise a
+        //     flex base size that's at least that suggestion. A flex-basis smaller than the item's width or height,
+        //     e.g., is raised to the smaller of that size and the item's content size.
+        let mut automatic_minimum_sizes_cannot_raise_base_sizes = true;
         let mut sum_of_flex_base_sizes = CssPixels::default();
         for index in 0..self.flex_items.len() {
             self.determine_flex_base_size(index);
-            all_items_have_definite_main_sizes &= self.has_definite_main_size(index);
-            sum_of_flex_base_sizes += self.flex_items[index].flex_base_size;
+            let flex_base_size = self.flex_items[index].flex_base_size;
+            automatic_minimum_sizes_cannot_raise_base_sizes &= self
+                .specified_size_suggestion(index)
+                .is_some_and(|suggestion| flex_base_size >= suggestion);
+            sum_of_flex_base_sizes += flex_base_size;
         }
 
         // OPTIMIZATION: We try to avoid calculating the "automatic minimum size" if possible,
         //               since it may require expensive intrinsic sizing layout.
         //               If this is a single-line flex container and the sum of flex bases sizes
         //               won't exceed the available space in the main axis, we know the layout
-        //               algorithm won't have to shrink anything, thus not needing the minimum size.
+        //               algorithm won't have to shrink anything. And where no automatic minimum size can raise an
+        //               item's flex base size either, the minimum size isn't needed at all.
         let should_skip_automatic_minimum_size_clamp = !self
             .available_space
             .unwrap()
@@ -4253,7 +4276,7 @@ impl<'pass> FlexFormattingContext<'pass> {
             .is_intrinsic_sizing_constraint()
             && self.is_single_line()
             && self.has_definite_main_size_used(&self.container_cells)
-            && all_items_have_definite_main_sizes
+            && automatic_minimum_sizes_cannot_raise_base_sizes
             && sum_of_flex_base_sizes <= self.available_space_for_items.unwrap().main.to_px_or_zero();
 
         for index in 0..self.flex_items.len() {
