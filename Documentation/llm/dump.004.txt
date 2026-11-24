@@ -1,4 +1,298 @@
-﻿    void remove_entries_added_by(BlobURLEntryOwner const&);
+﻿    void query(ClientID, AutocompleteQueryID, String, size_t max_suggestions, Vector<AutocompleteSuggestion> additional_suggestions = {});
+    void cancel(ClientID);
+    void record_engagement(OmniboxEngagement);
+
+private:
+    struct Client final : public RefCounted<Client> {
+        explicit Client(OnQueryComplete callback)
+            : on_query_complete(move(callback))
+        {
+        }
+
+        OnQueryComplete on_query_complete;
+        Optional<AutocompleteQueryID> active_query_id;
+    };
+
+    struct Query {
+        ClientID client_id { 0 };
+        AutocompleteQueryID query_id { 0 };
+        String input;
+        size_t max_suggestions { 0 };
+        Vector<AutocompleteSuggestion> additional_suggestions;
+    };
+
+    intptr_t worker_main(Optional<ByteString> history_database_directory);
+    void deliver(Query const&, Vector<AutocompleteSuggestion>);
+    bool query_is_current(Query const&);
+
+    Core::EventLoop& m_main_event_loop;
+    HashMap<ClientID, NonnullRefPtr<Client>> m_clients;
+    ClientID m_next_client_id { 0 };
+
+    Mutex m_worker_mutex;
+    ConditionVariable m_worker_condition { m_worker_mutex };
+    HashMap<ClientID, Query> m_active_queries;
+    Vector<Query> m_pending_queries;
+    Vector<OmniboxEngagement> m_pending_engagements;
+    Optional<ClientID> m_running_query_client_id;
+    Database::Database* m_interruptible_database { nullptr };
+    bool m_stopping { false };
+    NonnullRefPtr<Threading::Thread> m_worker;
+};
+
+}
+
+FILE: Libraries/LibWebView/BlobURLStore.cpp
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/Random.h>
+#include <LibWebCommon/FileAPI/BlobURLStore.h>
+#include <LibWebView/BlobURLStore.h>
+#include <LibWebView/WebContentClient.h>
+#include <LibWebView/WebWorkerClient.h>
+
+namespace WebView {
+
+static void const* owner_pointer(BlobURLEntryOwner const& owner)
+{
+    return owner.visit([](auto const& client) -> void const* { return client.ptr(); });
+}
+
+static Optional<URL::BlobURLEntry::Token> token_of(Web::FileAPI::SerializedBlobURLEntry const& entry)
+{
+    if (auto const* blob = entry.object.get_pointer<Web::FileAPI::SerializedBlobURLEntry::Blob>())
+        return blob->token;
+    return {};
+}
+
+// https://w3c.github.io/FileAPI/#add-an-entry
+URL::BlobURLEntry::Token BlobURLStore::add_entry(Utf16String url, Web::FileAPI::SerializedBlobURLEntry entry, BlobURLEntryOwner added_by, Optional<LocalFileRoot> root_of_adder)
+{
+    // NB: Blob URLs are random, so one that is already here came from a different process. Leave it alone.
+    if (m_entries.contains(url))
+        return 0;
+
+    // NB: The token is unguessable and assigned here so that a process cannot name an entry it was not given.
+    URL::BlobURLEntry::Token token = 0;
+    if (auto* blob = entry.object.get_pointer<Web::FileAPI::SerializedBlobURLEntry::Blob>()) {
+        token = get_random<URL::BlobURLEntry::Token>();
+        blob->token = token;
+        m_entry_urls_by_token.set(token, url);
+    }
+
+    m_entries.set(move(url), Entry { move(entry), move(added_by), move(root_of_adder), false, 0 });
+    return token;
+}
+
+void BlobURLStore::remove_entry(Utf16String const& url)
+{
+    auto entry = m_entries.get(url);
+    if (!entry.has_value())
+        return;
+
+    if (auto token = token_of(entry->entry); token.has_value())
+        m_entry_urls_by_token.remove(*token);
+    m_entries.remove(url);
+}
+
+// https://w3c.github.io/FileAPI/#dfn-revokeObjectURL
+void BlobURLStore::remove_entries(Vector<Utf16String> const& urls, URL::Origin const& environment_origin, BlobURLEntryOwner const& removed_by)
+{
+    for (auto const& url : urls) {
+        // 3. Let entry be urlRecord’s blob URL entry.
+        auto entry = m_entries.get(url);
+
+        // 4. If entry is null, return.
+        if (!entry.has_value() || entry->revoked)
+            continue;
+
+        // 5. Let isAuthorized be the result of checking for same-partition blob URL usage with entry and the current settings object.
+        bool is_authorized = Web::FileAPI::check_for_same_partition_blob_url_usage(entry->entry.origin, environment_origin);
+
+        // 6. If isAuthorized is false, then return.
+        if (!is_authorized)
+            continue;
+
+        // 7. Remove an entry from the Blob URL Store for url.
+        auto added_by = entry->added_by;
+        auto handles = entry->handles;
+        entry->revoked = true;
+
+        // NB: The process that added the entry keeps it for its parser. Tell it, unless it is the one revoking.
+        if (owner_pointer(added_by) != owner_pointer(removed_by)) {
+            added_by.visit([&](auto const& client) {
+                if (client)
+                    client->async_blob_url_entry_removed(url);
+            });
+        }
+
+        if (handles == 0)
+            remove_entry(url);
+    }
+}
+
+void BlobURLStore::remove_entries_added_by(BlobURLEntryOwner const& owner)
+{
+    auto const* owner_to_remove = owner_pointer(owner);
+    if (!owner_to_remove)
+        return;
+
+    m_entries.remove_all_matching([&](auto const&, auto const& entry) {
+        if (owner_pointer(entry.added_by) != owner_to_remove)
+            return false;
+        if (auto token = token_of(entry.entry); token.has_value())
+            m_entry_urls_by_token.remove(*token);
+        return true;
+    });
+}
+
+void BlobURLStore::remove_entries_added_by(Vector<Utf16String> const& urls, BlobURLEntryOwner const& owner)
+{
+    for (auto const& url : urls) {
+        auto entry = m_entries.get(url);
+        if (!entry.has_value() || entry->revoked || owner_pointer(entry->added_by) != owner_pointer(owner))
+            continue;
+
+        entry->revoked = true;
+        if (entry->handles == 0)
+            remove_entry(url);
+    }
+}
+
+void BlobURLStore::acquire(URL::BlobURLEntry::Token token)
+{
+    auto url = m_entry_urls_by_token.get(token);
+    if (!url.has_value())
+        return;
+
+    if (auto entry = m_entries.get(*url); entry.has_value())
+        ++entry->handles;
+}
+
+void BlobURLStore::release(URL::BlobURLEntry::Token token)
+{
+    auto url = m_entry_urls_by_token.get(token);
+    if (!url.has_value())
+        return;
+
+    auto url_string = *url;
+    auto entry = m_entries.get(url_string);
+    if (!entry.has_value() || entry->handles == 0)
+        return;
+
+    if (--entry->handles == 0 && entry->revoked)
+        remove_entry(url_string);
+}
+
+// https://w3c.github.io/FileAPI/#blob-url-resolve
+Optional<Web::FileAPI::SerializedBlobURLEntry> BlobURLStore::resolve(Utf16String const& url, Optional<URL::BlobURLEntry::Token> token) const
+{
+    // NB: A revoked entry still answers to its token, but no longer to its URL. See URL::BlobURLEntry::Token.
+    if (token.has_value()) {
+        auto entry_url = m_entry_urls_by_token.get(*token);
+        if (!entry_url.has_value())
+            return {};
+        if (auto entry = m_entries.get(*entry_url); entry.has_value())
+            return entry->entry;
+        return {};
+    }
+
+    auto entry = m_entries.get(url);
+    if (!entry.has_value() || entry->revoked)
+        return {};
+    return entry->entry;
+}
+
+Optional<LocalFileRoot> BlobURLStore::local_file_root_of_entry(Utf16String const& url, URL::Origin const& origin) const
+{
+    auto entry = m_entries.get(url);
+    if (!entry.has_value() || entry->revoked || !entry->entry.origin.is_file_origin() || !entry->entry.origin.is_same_origin(origin))
+        return {};
+    return entry->root_of_adder;
+}
+
+BlobURLHandle::BlobURLHandle(BlobURLStore& store, URL::BlobURLEntry::Token token)
+    : m_store(store.make_weak_ptr())
+    , m_token(token)
+{
+    store.acquire(token);
+}
+
+BlobURLHandle::BlobURLHandle(BlobURLHandle&& other)
+    : m_store(move(other.m_store))
+    , m_token(exchange(other.m_token, 0))
+{
+}
+
+BlobURLHandle& BlobURLHandle::operator=(BlobURLHandle&& other)
+{
+    if (this != &other) {
+        release();
+        m_store = move(other.m_store);
+        m_token = exchange(other.m_token, 0);
+    }
+    return *this;
+}
+
+void BlobURLHandle::release()
+{
+    if (m_token == 0)
+        return;
+    if (auto* store = m_store.ptr())
+        store->release(m_token);
+    m_token = 0;
+}
+
+BlobURLHandle BlobURLHandle::for_url(BlobURLStore* store, Optional<URL::URL> const& url)
+{
+    if (!store || !url.has_value() || !url->blob_url_entry().has_value())
+        return {};
+
+    auto const* blob = url->blob_url_entry()->object.get_pointer<URL::BlobURLEntry::Blob>();
+    if (!blob || blob->token == 0)
+        return {};
+
+    return BlobURLHandle { *store, blob->token };
+}
+
+}
+
+FILE: Libraries/LibWebView/BlobURLStore.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/HashMap.h>
+#include <AK/Optional.h>
+#include <AK/Utf16String.h>
+#include <AK/Variant.h>
+#include <AK/WeakPtr.h>
+#include <AK/Weakable.h>
+#include <LibWebCommon/FileAPI/SerializedBlobURLEntry.h>
+#include <LibWebView/Export.h>
+#include <LibWebView/Forward.h>
+#include <LibWebView/LocalFileRoot.h>
+
+namespace WebView {
+
+using BlobURLEntryOwner = Variant<WeakPtr<WebContentClient>, WeakPtr<WebWorkerClient>>;
+
+// https://w3c.github.io/FileAPI/#BlobURLStore
+class WEBVIEW_API BlobURLStore : public Weakable<BlobURLStore> {
+public:
+    AK_ALLOC_WITH_KMALLOC;
+
+    URL::BlobURLEntry::Token add_entry(Utf16String url, Web::FileAPI::SerializedBlobURLEntry, BlobURLEntryOwner added_by, Optional<LocalFileRoot> root_of_adder = {});
+    void remove_entries(Vector<Utf16String> const& urls, URL::Origin const& environment_origin, BlobURLEntryOwner const& removed_by);
+    void remove_entries_added_by(BlobURLEntryOwner const&);
     void remove_entries_added_by(Vector<Utf16String> const& urls, BlobURLEntryOwner const&);
 
     Optional<Web::FileAPI::SerializedBlobURLEntry> resolve(Utf16String const& url, Optional<URL::BlobURLEntry::Token>) const;
@@ -38985,6 +39279,7 @@ AK::Duration time_until_next_update_check(UnixDateTime last_check, UnixDateTime 
 }
 
 struct CountedPeriods {
+    bool _new { false };
     bool day { false };
     bool week { false };
     bool month { false };
@@ -39073,6 +39368,8 @@ static ByteString update_check_header(SystemDescription const& system, StringVie
         append_member(builder, "arch"sv, "aarch64"sv);
 
     append_member(builder, "pkg"sv, install_method_name(system.install_method));
+    if (counted._new)
+        append_member(builder, "new"sv, {});
     if (counted.day)
         append_member(builder, "daily"sv, {});
     if (counted.week)
@@ -39226,13 +39523,13 @@ void UpdateChecker::check(UpdateCheckTrigger trigger)
     }
 
     // The first check of each day, week and month counts this installation once for it, and the very first check counts
-    // it for all three.
+    // it for all three and marks the installation as new.
     CountedPeriods counted;
     if (BROWSER_IS_RELEASE_BUILD) {
         if (auto previous_check = last_check(); previous_check.has_value())
             counted = periods_begun_since(*previous_check, m_check_started);
         else
-            counted = { .day = true, .week = true, .month = true };
+            counted = { ._new = true, .day = true, .week = true, .month = true };
     }
 
     auto headers = HTTP::HeaderList::create();
@@ -139876,6 +140173,7 @@ FILE: Services/AudioServer/SandboxMacOS.cpp
  */
 
 #include <AudioServer/Sandbox.h>
+#include <AudioToolbox/AudioConverter.h>
 #include <LibCore/System.h>
 #include <LibSandbox/Sandbox.h>
 
@@ -139891,6 +140189,28 @@ ErrorOr<void> apply_sandbox(StringView mach_server_name)
     // The audio frameworks look up the main bundle of the process.
     if (auto bundle = Sandbox::application_bundle_for_executable(executable_path); bundle.has_value())
         TRY(Sandbox::add_seatbelt_path_if_exists(paths, *bundle, Sandbox::SeatbeltPath::Access::ReadOnly));
+
+    // AudioToolbox checks the code signature of the process the first time it creates an AudioConverter or initializes
+    // an output unit, and it asks for the path behind a descriptor it holds to do so, which the sandbox doesn't allow:
+    // The output then fails to open, or the process crashes with SIGBUS. It checks only once per process, and on any
+    // attempt to create a converter, even one that fails, so asking for one here gets the check done before the sandbox
+    // is in place, whatever the result.
+    AudioStreamBasicDescription const source_format {
+        .mSampleRate = 48000,
+        .mFormatID = kAudioFormatLinearPCM,
+        .mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+        .mBytesPerPacket = 4,
+        .mFramesPerPacket = 1,
+        .mBytesPerFrame = 4,
+        .mChannelsPerFrame = 1,
+        .mBitsPerChannel = 32,
+        .mReserved = 0,
+    };
+    auto destination_format = source_format;
+    destination_format.mSampleRate = 44100;
+    AudioConverterRef converter = nullptr;
+    if (AudioConverterNew(&source_format, &destination_format, &converter) == noErr)
+        AudioConverterDispose(converter);
 
     return Sandbox::apply_macos_sandbox({
         .paths = paths.span(),
@@ -215159,7 +215479,8 @@ Optional<Web::HTML::ScriptRegistry::Content> PageClient::devtools_source_content
     if (!document)
         return {};
 
-    return document->script_registry().script_content(source_id.script_id, document->source().utf16_view());
+    auto document_source = document->source();
+    return document->script_registry().script_content(source_id.script_id, document_source.utf16_view());
 }
 
 Vector<WebView::DebuggerSourcePosition> PageClient::devtools_source_breakpoint_positions(Web::HTML::ScriptRegistry::Identifier const& source_id) const
@@ -255705,41 +256026,6 @@ TEST_CASE(studio_range_rgb_is_stretched_to_full_range)
     EXPECT(colors_are_close(*planes_color, expected_color));
 }
 
-// Only the rows before a plane's last one have to be padded up to its stride, so a plane can end right after its last
-// sample. Such a plane must convert to the same pixels as a padded one.
-TEST_CASE(biplanar_conversion_reads_planes_whose_last_row_is_not_padded)
-{
-    constexpr Gfx::IntSize size { 5, 3 };
-
-    for (auto subsampling : { Media::Subsampling::yuv420(), Media::Subsampling::yuv422(), Media::Subsampling::yuv444() }) {
-        for (u8 bit_depth : { 8, 10 }) {
-            size_t bytes_per_sample = bit_depth > 8 ? 2 : 1;
-            size_t stride = 16 * bytes_per_sample;
-            auto chroma_size = subsampling.subsampled_size(size.to_type<size_t>());
-            auto luma_row_byte_count = size.width() * bytes_per_sample;
-            auto chroma_row_byte_count = chroma_size.width() * 2 * bytes_per_sample;
-
-            auto padded_luma = MUST(ByteBuffer::create_uninitialized(stride * size.height()));
-            auto padded_chroma = MUST(ByteBuffer::create_uninitialized(stride * chroma_size.height()));
-            for (size_t index = 0; index < padded_luma.size(); index++)
-                padded_luma[index] = static_cast<u8>(40 + (index * 7));
-            for (size_t index = 0; index < padded_chroma.size(); index++)
-                padded_chroma[index] = static_cast<u8>(90 + (index * 13));
-
-            // The unpadded planes are copies in buffers of their own, which end right after their last sample.
-            auto unpadded_luma = MUST(ByteBuffer::copy(padded_luma.bytes().trim((stride * (size.height() - 1)) + luma_row_byte_count)));
-            auto unpadded_chroma = MUST(ByteBuffer::copy(padded_chroma.bytes().trim((stride * (chroma_size.height() - 1)) + chroma_row_byte_count)));
-
-            auto padded = MUST(Gfx::biplanar_yuv_to_bitmap(size, bit_depth, subsampling, {}, { .data = padded_luma.bytes(), .stride = stride }, { .data = padded_chroma.bytes(), .stride = stride }));
-            auto unpadded = MUST(Gfx::biplanar_yuv_to_bitmap(size, bit_depth, subsampling, {}, { .data = unpadded_luma.bytes(), .stride = stride }, { .data = unpadded_chroma.bytes(), .stride = stride }));
-            for (int y = 0; y < size.height(); y++) {
-                for (int x = 0; x < size.width(); x++)
-                    EXPECT_EQ(unpadded->get_pixel(x, y), padded->get_pixel(x, y));
-            }
-        }
-    }
-}
-
 FILE: Tests/Compositor/TestVSyncScheduler.cpp
 /*
  * Copyright (c) 2026-present, the Ladybird developers.
@@ -274186,6 +274472,7 @@ set(TEST_SOURCES
     TestSharedFontProvider.cpp
     TestWOFF.cpp
     TestWOFF2.cpp
+    TestYUVData.cpp
 )
 
 list(APPEND TEST_SOURCES TestBitmapSequence.cpp TestShareableBitmap.cpp)
@@ -277892,6 +278179,134 @@ TEST_CASE(malformed_woff2)
         auto font_or_error = WOFF2::try_load_from_bytes(file->bytes());
         EXPECT(font_or_error.is_error());
     }
+}
+
+FILE: Tests/LibGfx/TestYUVData.cpp
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/ByteBuffer.h>
+#include <LibGfx/Bitmap.h>
+#include <LibGfx/YUVData.h>
+#include <LibTest/TestCase.h>
+
+namespace {
+
+enum class SampleAlignment : u8 {
+    LowBits,
+    HighBits,
+};
+
+void write_sample(ByteBuffer& plane, size_t offset, u16 value, u8 bit_depth, SampleAlignment alignment)
+{
+    if (bit_depth <= 8) {
+        plane[offset] = static_cast<u8>(value);
+        return;
+    }
+    if (alignment == SampleAlignment::HighBits)
+        value <<= 16 - bit_depth;
+    plane[offset] = static_cast<u8>(value & 0xff);
+    plane[offset + 1] = static_cast<u8>(value >> 8);
+}
+
+bool colors_are_close(Gfx::Color a, Gfx::Color b)
+{
+    auto close = [](u8 x, u8 y) { return (x > y ? x - y : y - x) <= 1; };
+    return close(a.red(), b.red()) && close(a.green(), b.green()) && close(a.blue(), b.blue()) && a.alpha() == b.alpha();
+}
+
+constexpr size_t PLANE_STRIDE_IN_SAMPLES = 16;
+constexpr u8 PADDING_BYTE = 0xee;
+
+}
+
+// Every luma row and every chroma row holds samples of its own. A row that is left out, or that takes its chroma from
+// another row, then converts to different pixels than the planar conversion of the same samples.
+TEST_CASE(biplanar_conversion_matches_planar_conversion)
+{
+    for (int height : { 1, 2, 3, 4, 5 }) {
+        Gfx::IntSize size { 5, height };
+        for (auto subsampling : { Media::Subsampling::yuv420(), Media::Subsampling::yuv422(), Media::Subsampling::yuv444() }) {
+            for (u8 bit_depth : { 8, 10 }) {
+                size_t bytes_per_sample = bit_depth > 8 ? 2 : 1;
+                u16 scale = bit_depth > 8 ? 4 : 1;
+                size_t stride = PLANE_STRIDE_IN_SAMPLES * bytes_per_sample;
+                auto chroma_size = subsampling.subsampled_size(size.to_type<size_t>());
+
+                auto luma_sample = [&](size_t x, size_t y) { return static_cast<u16>((60 + (y * 25) + (x * 4)) * scale); };
+                auto blue_chroma_sample = [&](size_t x, size_t y) { return static_cast<u16>((110 + (y * 10) + (x * 3)) * scale); };
+                auto red_chroma_sample = [&](size_t x, size_t y) { return static_cast<u16>((150 - (y * 10) + (x * 2)) * scale); };
+
+                auto biplanar_luma = MUST(ByteBuffer::create_uninitialized(stride * size.height()));
+                auto biplanar_chroma = MUST(ByteBuffer::create_uninitialized(stride * chroma_size.height()));
+                biplanar_luma.bytes().fill(PADDING_BYTE);
+                biplanar_chroma.bytes().fill(PADDING_BYTE);
+
+                auto plane_sizes = MUST(Gfx::YUVData::plane_sizes(size, bit_depth, subsampling));
+                auto planar_luma = MUST(ByteBuffer::create_zeroed(plane_sizes.y));
+                auto planar_blue_chroma = MUST(ByteBuffer::create_zeroed(plane_sizes.u));
+                auto planar_red_chroma = MUST(ByteBuffer::create_zeroed(plane_sizes.v));
+
+                for (size_t y = 0; y < static_cast<size_t>(size.height()); y++) {
+                    for (size_t x = 0; x < static_cast<size_t>(size.width()); x++) {
+                        auto sample = luma_sample(x, y);
+                        write_sample(biplanar_luma, (y * stride) + (x * bytes_per_sample), sample, bit_depth, SampleAlignment::HighBits);
+                        write_sample(planar_luma, ((y * size.width()) + x) * bytes_per_sample, sample, bit_depth, SampleAlignment::LowBits);
+                    }
+                }
+                for (size_t y = 0; y < chroma_size.height(); y++) {
+                    for (size_t x = 0; x < chroma_size.width(); x++) {
+                        auto blue = blue_chroma_sample(x, y);
+                        auto red = red_chroma_sample(x, y);
+                        auto biplanar_offset = (y * stride) + (x * 2 * bytes_per_sample);
+                        write_sample(biplanar_chroma, biplanar_offset, blue, bit_depth, SampleAlignment::HighBits);
+                        write_sample(biplanar_chroma, biplanar_offset + bytes_per_sample, red, bit_depth, SampleAlignment::HighBits);
+                        auto planar_offset = ((y * chroma_size.width()) + x) * bytes_per_sample;
+                        write_sample(planar_blue_chroma, planar_offset, blue, bit_depth, SampleAlignment::LowBits);
+                        write_sample(planar_red_chroma, planar_offset, red, bit_depth, SampleAlignment::LowBits);
+                    }
+                }
+
+                auto biplanar = MUST(Gfx::biplanar_yuv_to_bitmap(size, bit_depth, subsampling, {},
+                    { .data = biplanar_luma.bytes(), .stride = stride },
+                    { .data = biplanar_chroma.bytes(), .stride = stride }));
+                auto planar = MUST(MUST(Gfx::YUVData::create(size, bit_depth, subsampling, {},
+                                            planar_luma.bytes(), planar_blue_chroma.bytes(), planar_red_chroma.bytes()))
+                        .to_bitmap());
+
+                for (int y = 0; y < size.height(); y++) {
+                    for (int x = 0; x < size.width(); x++) {
+                        auto biplanar_color = biplanar->get_pixel(x, y);
+                        auto planar_color = planar->get_pixel(x, y);
+                        if (!colors_are_close(biplanar_color, planar_color)) {
+                            FAIL(ByteString::formatted("{}x{} at {} bits, chroma {}x{}: pixel ({}, {}) is {}, but the planar conversion gives {}",
+                                size.width(), size.height(), bit_depth, chroma_size.width(), chroma_size.height(), x, y, biplanar_color, planar_color));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE(biplanar_conversion_refuses_planes_whose_last_row_is_not_padded)
+{
+    constexpr Gfx::IntSize size { 5, 3 };
+    constexpr size_t stride = PLANE_STRIDE_IN_SAMPLES;
+
+    auto luma = MUST(ByteBuffer::create_zeroed(stride * size.height()));
+    auto chroma = MUST(ByteBuffer::create_zeroed(stride * 2));
+    Gfx::BiplanarYUVPlane padded_luma { .data = luma.bytes(), .stride = stride };
+    Gfx::BiplanarYUVPlane padded_chroma { .data = chroma.bytes(), .stride = stride };
+    Gfx::BiplanarYUVPlane unpadded_luma { .data = luma.bytes().trim((stride * (size.height() - 1)) + size.width()), .stride = stride };
+    Gfx::BiplanarYUVPlane unpadded_chroma { .data = chroma.bytes().trim(stride + 6), .stride = stride };
+
+    EXPECT(!Gfx::biplanar_yuv_to_bitmap(size, 8, Media::Subsampling::yuv420(), {}, padded_luma, padded_chroma).is_error());
+    EXPECT(Gfx::biplanar_yuv_to_bitmap(size, 8, Media::Subsampling::yuv420(), {}, unpadded_luma, padded_chroma).is_error());
+    EXPECT(Gfx::biplanar_yuv_to_bitmap(size, 8, Media::Subsampling::yuv420(), {}, padded_luma, unpadded_chroma).is_error());
 }
 
 FILE: Tests/LibHTTP/CMakeLists.txt
@@ -550947,22 +551362,24 @@ Viewport <#document> at [0,0] [0+0+0 800 0+0+0] [0+0+0 600 0+0+0] [BFC] children
       frag 0 from BlockContainer start: 0, length: 0, rect: [9,10 69.84375x128] baseline: 129
       BlockContainer <select> at [9,10] inline-block [0+1+0 69.84375 0+1+0] [0+1+1 128 1+1+0] [BFC] children: not-inline
         BlockContainer <div> at [9,10] [0+0+0 69.84375 0+0+0] [0+0+0 128 0+0+0] [BFC] children: not-inline
-          BlockContainer <div> at [13,10] [0+0+4 61.84375 4+0+0] [0+0+0 16 0+0+0] children: inline
-            frag 0 from TextNode start: 0, length: 9, rect: [13,11 61.84375x14] baseline: 11
-                "New label"
-            TextNode <#text> (not painted)
-          BlockContainer <div> at [25.65625,26] [0+0+16.65625 49.1875 4+0+0] [0+0+0 16 0+0+0] children: inline
-            frag 0 from TextNode start: 0, length: 1, rect: [25.65625,27 7.78125x14] baseline: 11
-                "B"
-            TextNode <#text> (not painted)
-          BlockContainer <div> at [13,42] [0+0+4 61.84375 4+0+0] [0+0+0 16 0+0+0] children: inline
-            frag 0 from TextNode start: 0, length: 8, rect: [13,43 53.875x14] baseline: 11
-                "Disabled"
-            TextNode <#text> (not painted)
-          BlockContainer <div> at [25.65625,58] [0+0+16.65625 49.1875 4+0+0] [0+0+0 16 0+0+0] children: inline
-            frag 0 from TextNode start: 0, length: 1, rect: [25.65625,59 8.59375x14] baseline: 11
-                "C"
-            TextNode <#text> (not painted)
+          BlockContainer <optgroup#relabeled> at [9,10] [0+0+0 69.84375 0+0+0] [0+0+0 32 0+0+0] children: not-inline
+            BlockContainer <(anonymous)> at [13,10] [0+0+4 61.84375 4+0+0] [0+0+0 16 0+0+0] children: inline
+              frag 0 from GeneratedTextNode start: 0, length: 9, rect: [13,11 61.84375x14] baseline: 11
+                  "New label"
+              GeneratedTextNode <(anonymous)> (not painted)
+            BlockContainer <option> at [25.65625,26] [0+0+16.65625 49.1875 4+0+0] [0+0+0 16 0+0+0] children: inline
+              frag 0 from TextNode start: 0, length: 1, rect: [25.65625,27 7.78125x14] baseline: 11
+                  "B"
+              TextNode <#text> (not painted)
+          BlockContainer <optgroup#disabled> at [9,42] [0+0+0 69.84375 0+0+0] [0+0+0 32 0+0+0] children: not-inline
+            BlockContainer <(anonymous)> at [13,42] [0+0+4 61.84375 4+0+0] [0+0+0 16 0+0+0] children: inline
+              frag 0 from GeneratedTextNode start: 0, length: 8, rect: [13,43 53.875x14] baseline: 11
+                  "Disabled"
+              GeneratedTextNode <(anonymous)> (not painted)
+            BlockContainer <option> at [25.65625,58] [0+0+16.65625 49.1875 4+0+0] [0+0+0 16 0+0+0] children: inline
+              frag 0 from TextNode start: 0, length: 1, rect: [25.65625,59 8.59375x14] baseline: 11
+                  "C"
+              TextNode <#text> (not painted)
       TextNode <#text> (not painted)
 
 SC for Viewport<#document> [0,0 800x600] (z-index: auto)
@@ -550975,14 +551392,16 @@ Viewport <#document> at [0,0] [0+0+0 800 0+0+0] [0+0+0 600 0+0+0] [BFC] children
       frag 0 from BlockContainer start: 0, length: 0, rect: [9,10 55.8125x64] baseline: 65
       BlockContainer <select> at [9,10] inline-block [0+1+0 55.8125 0+1+0] [0+1+1 64 1+1+0] [BFC] children: not-inline
         BlockContainer <div> at [9,10] [0+0+0 55.8125 0+0+0] [0+0+0 64 0+0+0] [BFC] children: not-inline
-          BlockContainer <div> at [13,10] [0+0+4 47.8125 4+0+0] [0+0+0 16 0+0+0] children: inline
-            frag 0 from TextNode start: 0, length: 5, rect: [13,11 35.109375x14] baseline: 11
-                "First"
-            TextNode <#text> (not painted)
-          BlockContainer <div> at [13,26] [0+0+4 47.8125 4+0+0] [0+0+0 16 0+0+0] children: inline
-            frag 0 from TextNode start: 0, length: 6, rect: [13,27 47.8125x14] baseline: 11
-                "Second"
-            TextNode <#text> (not painted)
+          BlockContainer <optgroup> at [9,10] [0+0+0 55.8125 0+0+0] [0+0+0 16 0+0+0] children: not-inline
+            BlockContainer <(anonymous)> at [13,10] [0+0+4 47.8125 4+0+0] [0+0+0 16 0+0+0] children: inline
+              frag 0 from GeneratedTextNode start: 0, length: 5, rect: [13,11 35.109375x14] baseline: 11
+                  "First"
+              GeneratedTextNode <(anonymous)> (not painted)
+          BlockContainer <optgroup> at [9,26] [0+0+0 55.8125 0+0+0] [0+0+0 16 0+0+0] children: not-inline
+            BlockContainer <(anonymous)> at [13,26] [0+0+4 47.8125 4+0+0] [0+0+0 16 0+0+0] children: inline
+              frag 0 from GeneratedTextNode start: 0, length: 6, rect: [13,27 47.8125x14] baseline: 11
+                  "Second"
+              GeneratedTextNode <(anonymous)> (not painted)
       TextNode <#text> (not painted)
 
 SC for Viewport<#document> [0,0 800x600] (z-index: auto)
@@ -599915,6 +600334,14 @@ FILE: Tests/LibWeb/Ref/expected/select-line-height-ignored-ref.html
     <option>Test</option>
 </select>
 
+FILE: Tests/LibWeb/Ref/expected/select-list-box-author-option-style.html
+<!doctype html>
+<select multiple><option>one</option><optgroup label="group"><option>two</option></optgroup></select>
+
+FILE: Tests/LibWeb/Ref/expected/select-list-box-disabled-group-label.html
+<!doctype html>
+<select multiple><optgroup label="Group"></optgroup></select>
+
 FILE: Tests/LibWeb/Ref/expected/select-option-use-label.html
 <!doctype html>
 <select>
@@ -602662,6 +603089,46 @@ FILE: Tests/LibWeb/Ref/expected/svg/symbol-transform-box-view-box-ref.html
 </style>
 <svg width="100" height="100" viewBox="0 0 10 10">
     <rect width="4" height="4" fill="green" style="transform-box: view-box; transform: rotate(45deg)"/>
+</svg>
+
+FILE: Tests/LibWeb/Ref/expected/svg/text-content-paint-server-follows-text-bounding-box-ref.html
+<!DOCTYPE html>
+<style>
+    body {
+        margin: 0;
+    }
+    svg {
+        display: block;
+    }
+</style>
+<svg width="400" height="80">
+    <rect x="10" y="14" width="80" height="20" fill="green" />
+    <rect x="90" y="14" width="80" height="20" />
+</svg>
+
+FILE: Tests/LibWeb/Ref/expected/svg/text-content-paint-server-uses-text-bounding-box-ref.html
+<!DOCTYPE html>
+<style>
+    body {
+        margin: 0;
+    }
+    svg {
+        display: block;
+    }
+</style>
+<svg width="400" height="280">
+    <rect x="10" y="14" width="120" height="20" />
+    <rect x="130" y="14" width="40" height="20" fill="orange" />
+    <rect x="10" y="54" width="120" height="20" />
+    <rect x="130" y="54" width="40" height="20" fill="orange" />
+    <rect x="10" y="94" width="120" height="20" />
+    <rect x="130" y="94" width="40" height="20" fill="orange" />
+    <rect x="10" y="134" width="120" height="20" />
+    <rect x="130" y="134" width="40" height="20" fill="orange" />
+    <rect x="10" y="174" width="120" height="20" />
+    <rect x="130" y="174" width="40" height="20" fill="orange" />
+    <rect x="10" y="214" width="120" height="20" />
+    <rect x="10" y="254" width="40" height="20" fill="green" />
 </svg>
 
 FILE: Tests/LibWeb/Ref/expected/svg/tiny-viewbox-path-and-gradient-ref.html
@@ -611534,6 +612001,53 @@ FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-display/display-contents-supp
 <title>CSS Test Reference</title>
 <link rel="author" title="Emilio Cobos Álvarez" href="mailto:emilio@crisal.io">
 <p>Test passes if you see nothing below.</p>
+
+FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-display/select-4-option-optgroup-display-none-ref.html
+<!DOCTYPE HTML>
+<!--
+     Any copyright is dedicated to the Public Domain.
+     http://creativecommons.org/publicdomain/zero/1.0/
+-->
+<html><head>
+  <meta charset="utf-8">
+  <title>Reference: display:none on OPTION and OPTGROUP</title>
+  <link rel="author" title="Mats Palmgren" href="mailto:mats@mozilla.com">
+  <style>
+
+.none { display:none; }
+.contents { display:contents; }
+.red { color: red; }
+.green { color: green; }
+
+select { -webkit-appearance: none; }
+
+:root {
+  will-change: transform;
+}
+
+  </style>
+</head>
+<body>
+
+<pre>FAIL if there is any red color</pre>
+
+<optgroup></optgroup>
+<optgroup class="contents red"></optgroup>
+<optgroup class="contents green" label="optgroup"></optgroup>
+
+<br>
+
+<select class="red" size="4"></select>
+<select size="4" class="red"></select>
+<select size="4" class="red"></select>
+<select size="4" class="red"><optgroup></select>
+<select size="4"></select>
+<select size="4" class="red"></select>
+<select size="4" class="red"></select>
+<select size="4" class="red"></select>
+
+</body>
+</html>
 
 FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-flexbox/flex-order-wrap-reverse-baseline-ref.html
 <!DOCTYPE html>
@@ -647874,481 +648388,3 @@ FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-multicol/multicol-fill-balanc
 <link rel="stylesheet" type="text/css" href="../../fonts/ahem.css" />
 <style type="text/css"><![CDATA[
 body>div {
-	font-family: Ahem;
-	font-size: 1.25em;
-	line-height: 1em;
-	color: green;
-	height: 3em;
-	width: 2em;
-	orphans: 1;
-	widows: 1;
-	position: relative;
-	margin: 1em;
-}
-div.col {
-	column-count: 2;
-	column-fill: balance;
-	column-gap: 0;
-}
-div.red {
-	background: red; position: absolute; z-index: -1;
-}
-]]></style>
-</head>
-
-<body>
-
-<div class='ref'>
-oo<br/>tt
-</div>
-
-<div class='ref'>
-oo<br/>tt
-</div>
-
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-multicol/multicol-gap-000-ref.xht
-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
-<html xmlns="http://www.w3.org/1999/xhtml">
- <head>
-  <title>CSS Reftest Reference</title>
-  <link rel="author" title="Hakon Wium Lie" href="mailto:howcome@opera.com" />
-  <link rel="reviewer" title="Gérard Talbot" href="http://www.gtalbot.org/BrowserBugsSection/css21testsuite/" /> <!-- 2013-08-25 -->
-  <meta name="flags" content="ahem" />
-  <link rel="stylesheet" type="text/css" href="../../fonts/ahem.css" />
-  <style type="text/css"><![CDATA[
-  div
-  {
-  font: 1.25em/1 Ahem;
-  margin: 1em 0;
-  width: 30em;
-  }
-
-  span {color: yellow;}
-  ]]></style>
- </head>
- <body>
-
-  <p>Test passes if the 2 horizontal bars are <strong>identical</strong>.</p>
-
-  <div>1234567890<span>1234567890</span>1234567890</div>
-
-  <div>1234567890<span>1234567890</span>1234567890</div>
-
- </body>
-</html>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-multicol/multicol-gap-001-ref.xht
-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
-<html xmlns="http://www.w3.org/1999/xhtml">
-<head>
-  <title>CSS Reftest Reference</title>
-  <link rel="author" title="Opera Software ASA" href="http://www.opera.com/" />
-  <link rel="reviewer" title="Gérard Talbot" href="http://www.gtalbot.org/BrowserBugsSection/css21testsuite/" /> <!-- 2013-08-05 -->
-  <meta name="flags" content="image" />
-  <style type="text/css"><![CDATA[
-  div {margin: 1.25em; line-height: 1;}
-
-  img {vertical-align: top;}
-  ]]></style>
- </head>
- <body>
-  <p>Test passes if the 2 stripes are <strong>identical</strong>.</p>
-
-  <div><img src="support/black20x20.png" alt="Image download support must be enabled" /><img src="support/swatch-yellow.png" width="20" height="20" alt="Image download support must be enabled" /><img src="support/black20x20.png" alt="Image download support must be enabled" /></div>
-
-  <div><img src="support/black20x20.png" alt="Image download support must be enabled" /><img src="support/swatch-yellow.png" width="20" height="20" alt="Image download support must be enabled" /><img src="support/black20x20.png" alt="Image download support must be enabled" /></div>
-
- </body>
-</html>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-multicol/multicol-gap-002-ref.xht
-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
-<html xmlns="http://www.w3.org/1999/xhtml">
- <head>
-  <title>CSS Reftest Reference</title>
-  <link rel="author" title="Opera Software ASA" href="http://www.opera.com/" />
-  <link rel="reviewer" title="Gérard Talbot" href="http://www.gtalbot.org/BrowserBugsSection/css21testsuite/" /> <!-- 2013-08-05 -->
-  <meta name="flags" content="image" />
-  <style type="text/css"><![CDATA[
-  table
-  {
-  background-color: yellow;
-  border-spacing: 0px;
-  border: gray solid 1em;
-  font: 1.25em/1 serif;
-  }
-
-  td {padding: 0 1em 0 0;}
-
-  img, td {vertical-align: top;}
-
-  td#last-cell {padding-right: 0;}
-  ]]></style>
- </head>
- <body>
- <table>
-   <tr>
-     <td><img src="support/black20x20.png" width="40" height="40" alt="Image download support must be enabled" /></td><td><img src="support/swatch-blue.png" width="40" height="40" alt="Image download support must be enabled" /></td><td><img src="support/swatch-blue.png" width="40" height="40" alt="Image download support must be enabled" /></td><td id="last-cell"><img src="support/black20x20.png" width="40" height="40" alt="Image download support must be enabled" /></td>
-    </tr>
-  </table>
- </body>
-</html>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-multicol/multicol-gap-fraction-001-ref.xht
-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
-<html xmlns="http://www.w3.org/1999/xhtml">
- <head>
-  <title>CSS Reftest Reference</title>
-  <link rel="author" title="Opera Software ASA" href="http://www.opera.com/" />
-  <link rel="reviewer" title="Gérard Talbot" href="http://www.gtalbot.org/BrowserBugsSection/css21testsuite/" /> <!-- 2013-08-05 -->
-  <meta name="flags" content="ahem" />
-  <link rel="stylesheet" type="text/css" href="../../fonts/ahem.css" />
-  <style type="text/css"><![CDATA[
-  body > div
-  {
-  background-color: gray;
-  font: 1.25em/1 Ahem;
-  height: 4em;
-  position: relative;
-  width: 14.5em;
-  }
-
-  p, div > div
-  {
-  background-color: blue;
-  height: 1em;
-  left: 0;
-  margin: 0;
-  position: absolute;
-  top: 0;
-  width: 4em;
-  }
-
-  div > div
-  {
-  background-color: black;
-  height: 4em;
-  }
-
-  p {left: 7.5em;}
-
-  p + p
-  {
-  left: 8.5em;
-  top: 1em;
-  }
-
-  p + p + p
-  {
-  left: 9.5em;
-  top: 2em;
-  }
-
-  p + p + p + p
-  {
-  left: 10.5em;
-  top: 3em;
-  }
-  ]]></style>
- </head>
- <body>
-
-  <div>
-	<div></div>
-	<p></p>
-	<p></p>
-	<p></p>
-	<p></p>
-  </div>
-
- </body>
-</html>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-multicol/multicol-gap-large-001-ref.xht
-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
-<html xmlns="http://www.w3.org/1999/xhtml">
-<head>
-  <title>CSS Reftest Reference</title>
-  <link rel="author" title="Opera Software ASA" href="http://www.opera.com/" />
-  <link rel="reviewer" title="Gérard Talbot" href="http://www.gtalbot.org/BrowserBugsSection/css21testsuite/" /> <!-- 2013-08-06 -->
-  <meta name="flags" content="image ahem" />
-  <link rel="stylesheet" href="../../fonts/ahem.css" />
-  <style type="text/css"><![CDATA[
-  body {font: 1.25em/1 Ahem;}
-  img {vertical-align: top;}
-  ]]></style>
- </head>
- <body>
-    <div><img src="support/swatch-gray.png" width="260" height="20" alt="Image download support must be enabled" /></div>
-
-  <div><img src="support/swatch-gray.png" width="20" height="40" alt="Image download support must be enabled" /><img src="support/black20x20.png" width="40" height="40" alt="Image download support must be enabled" /><img src="support/swatch-yellow.png" width="40" height="40" alt="Image download support must be enabled" /><img src="support/swatch-blue.png" width="40" height="40" alt="Image download support must be enabled" /><img src="support/swatch-yellow.png" width="40" height="40" alt="Image download support must be enabled" /><img src="support/swatch-blue.png" width="40" height="40" alt="Image download support must be enabled" /><img src="support/swatch-yellow.png" width="20" height="40" alt="Image download support must be enabled" /><img src="support/swatch-gray.png" width="20" height="40"
-alt="Image download support must be enabled" /><img src="support/black20x20.png" width="40" height="40" alt="Image download support must be enabled" /></div>
-
-  <div><img src="support/swatch-gray.png" width="260" height="20" alt="Image download support must be enabled" /></div>
-
- </body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-multicol/multicol-gap-large-002-ref.xht
-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
-<html xmlns="http://www.w3.org/1999/xhtml">
-<head>
-  <title>CSS Reftest Reference</title>
-  <link rel="author" title="Opera Software ASA" href="http://www.opera.com/" />
-  <link rel="reviewer" title="Gérard Talbot" href="http://www.gtalbot.org/BrowserBugsSection/css21testsuite/" /> <!-- 2013-08-06 -->
-  <meta name="flags" content="image" />
-  <style type="text/css"><![CDATA[
-  div {font: 1.25em/1 serif;}
-
-  img {vertical-align: top;}
-  ]]></style>
- </head>
- <body>
-    <div><img src="support/swatch-gray.png" width="260" height="20" alt="Image download support must be enabled" /></div>
-
-  <div><img src="support/swatch-gray.png" width="20" height="40" alt="Image download support must be enabled" /><img src="support/black20x20.png" width="40" height="40" alt="Image download support must be enabled" /><img src="support/swatch-yellow.png" width="110" height="40" alt="Image download support must be enabled" /><img src="support/swatch-blue.png" width="40" height="40" alt="Image download support must be enabled" /><img src="support/swatch-yellow.png" width="30" height="40" alt="Image download support must be enabled" /><img src="support/swatch-gray.png" width="20" height="40" alt="Image download support must be enabled" /></div>
-
-  <div><img src="support/swatch-gray.png" width="20" height="40" alt="Image download support must be enabled" /><img src="support/swatch-blue.png" width="40" height="40" alt="Image download support must be enabled" /><img src="support/swatch-yellow.png" width="110" height="40" alt="Image download support must be enabled" /><img src="support/black20x20.png" width="40" height="40" alt="Image download support must be enabled" /><img src="support/swatch-yellow.png" width="30" height="40" alt="Image download support must be enabled" /><img src="support/swatch-gray.png" width="20" height="40" alt="Image download support must be enabled" /></div>
-
-  <div><img src="support/swatch-gray.png" width="260" height="20" alt="Image download support must be enabled" /></div>
-
- </body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-multicol/multicol-height-001-ref.xht
-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
-<html xmlns="http://www.w3.org/1999/xhtml">
-<head>
-  <title>CSS Reftest Reference</title>
-  <link rel="author" title="Opera Software ASA" href="http://www.opera.com/" />
-  <link rel="reviewer" title="Gérard Talbot" href="http://www.gtalbot.org/BrowserBugsSection/css21testsuite/" /> <!-- 2013-08-06 -->
-  <meta name="flags" content="image" />
-  <style type="text/css"><![CDATA[
-  img
-  {
-  left: 135px;
-  /* 6em + (2em/2) - (10px/2) == 135px */
-  position: relative;
-  vertical-align: top;
-  }
-
-  img + img {left: 285px;}
-  /* 6em + 2em + 6em + (2em/2) - (10px/2) - 10px == 285px */
-  ]]></style>
- </head>
- <body>
-
-  <p>Test passes if there are 2 blue vertical stripes of equal height.</p>
-
-  <div><img src="support/swatch-blue.png" width="10" height="160" alt="Image download support must be enabled" /><img src="support/swatch-blue.png" width="10" height="160" alt="Image download support must be enabled" /></div>
-
- </body>
-</html>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-multicol/multicol-height-002-print-ref.xht
-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
-<html xmlns="http://www.w3.org/1999/xhtml">
- <head>
-  <title>CSS Reftest Reference</title>
-  <link rel="author" title="Elika J. Etemad" href="http://fantasai.inkedblade.net/contact" />
-  <style type="text/css"><![CDATA[
-    html, body { height: 100%; }
-    * { margin: 0; }
-    div {
-      border: double blue 12px;
-      height: 150%;
-      padding: 0 12px;
-    }
-    div > p {
-      border-right: solid orange 12px;
-      border-left: solid orange 12px;
-      width: 50%;
-      margin: 0 auto;
-      height: 100%;
-    }
-    blockquote {
-      border: solid thick yellow;
-    }  ]]></style>
- </head>
- <body>
-  <p>Test passes if even when printed:</p>
-  <ul>
-    <li>Two vertical orange stripes stretch exactly
-    from the inner top edge to the inner bottom edge of the blue box below.</li>
-    <li>There is a yellow stripe immediately below the blue box.</li>
-  </ul>
-  <div>
-    <p></p>
-  </div>
-  <blockquote></blockquote>
- </body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-multicol/multicol-inherit-001-ref.xht
-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
-<html xmlns="http://www.w3.org/1999/xhtml">
-<head>
-  <title>CSS Reftest Reference</title>
-  <link rel="author" title="Opera Software ASA" href="http://www.opera.com/" />
-  <link rel="reviewer" title="Gérard Talbot" href="http://www.gtalbot.org/BrowserBugsSection/css21testsuite/" /> <!-- 2013-08-08 -->
-  <meta name="flags" content="image" />
-  <style type="text/css"><![CDATA[
-  div
-  {
-  background-color: yellow;
-  font: 1.25em/1 serif;
-  margin: 0em 1em;
-  padding: 0em 1em 1em;
-  width: 30em;
-  }
-
-  img
-  {
-  padding-right: 1em;
-  vertical-align: top;
-  }
-
-  img.column-gap {margin-right: 2em;}
-
-  img#last {padding-right: 0em;}
-  ]]></style>
- </head>
- <body>
-
-  <div><img src="support/black20x20.png" width="40" height="60" alt="Image download support must be enabled" /><img src="support/black20x20.png" width="40" height="60" alt="Image download support must be enabled" /><img class="column-gap" src="support/black20x20.png" width="40" height="40" alt="Image download support must be enabled" /><img src="support/black20x20.png" width="40" height="60" alt="Image download support must be enabled" /><img src="support/black20x20.png" width="40" height="60" alt="Image download support must be enabled" /><img class="column-gap" src="support/black20x20.png" width="40" height="40" alt="Image download support must be enabled" /><img src="support/black20x20.png" width="40" height="60" alt="Image download support must be enabled" /><img src="support/black20x20.png"
-width="40" height="60" alt="Image download support must be enabled" /><img id="last" src="support/black20x20.png" width="40" height="40" alt="Image download support must be enabled" /></div>
-
- </body>
-</html>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-multicol/multicol-inherit-002-ref.xht
-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
-<html xmlns="http://www.w3.org/1999/xhtml">
-<head>
-  <title>CSS Reftest Reference</title>
-  <link rel="author" title="Opera Software ASA" href="http://www.opera.com/" />
-  <link rel="reviewer" title="Gérard Talbot" href="http://www.gtalbot.org/BrowserBugsSection/css21testsuite/" /> <!-- 2013-08-08 -->
-  <meta name="flags" content="image" />
-  <style type="text/css"><![CDATA[
-  div
-  {
-  background-color: blue;
-  font: 1.25em/1 serif;
-  margin: 1em;
-  padding: 0em 1em 1em;
-  width: 30em;
-  }
-
-  img {vertical-align: top;}
-
-  img.column-gap
-  {
-  margin-left: -2em;
-  margin-right: 3em;
-  vertical-align: bottom;
-  }
-
-  img#last
-  {
-  margin-left: -2em;
-  vertical-align: bottom;
-  }
-  ]]></style>
- </head>
- <body>
-
-  <div><img src="support/black20x20.png" width="40" height="60" alt="Image download support must be enabled" /><img src="support/swatch-yellow.png" width="20" height="60" alt="Image download support must be enabled" /><img src="support/black20x20.png" width="40" height="60" alt="Image download support must be enabled" /><img src="support/swatch-yellow.png" width="20" height="60" alt="Image download support must be enabled" /><img src="support/black20x20.png" width="40" height="40" alt="Image download support must be enabled" /><img  class="column-gap" src="support/swatch-yellow.png" width="40" height="20" alt="Image download support must be enabled" /><img src="support/black20x20.png" width="40" height="60" alt="Image download support must be enabled" /><img src="support/swatch-yellow.png" width="20" height="60" alt="Image download support must be enabled" /><img src="support/black20x20.png" width="40" height="60" alt="Image download support must be enabled" /><img src="support/swatch-yellow.png" width="20" height="60" alt="Image download support must be enabled" /><img src="support/black20x20.png" width="40" height="40" alt="Image download support must be enabled" /><img  class="column-gap" src="support/swatch-yellow.png" width="40" height="20" alt="Image download support must be enabled" /><img src="support/black20x20.png" width="40" height="60" alt="Image download support must be enabled" /><img src="support/swatch-yellow.png" width="20" height="60" alt="Image download support must be enabled" /><img src="support/black20x20.png" width="40" height="60" alt="Image download support must be enabled" /><img src="support/swatch-yellow.png" width="20" height="60" alt="Image download support must be enabled" /><img src="support/black20x20.png" width="40" height="40" alt="Image download support must be enabled" /><img id="last" src="support/swatch-yellow.png" width="40" height="20" alt="Image download support must be enabled" /></div>
-
- </body>
-</html>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-multicol/multicol-inherit-3-ref.xht
-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN"
-"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
-<html xmlns="http://www.w3.org/1999/xhtml">
-<head>
-<title>multicolumn | inheritance</title>
-<link rel="author" title="Opera Software ASA" href="http://www.opera.com/"/>
-<link rel="stylesheet" type="text/css" href="../../fonts/ahem.css" />
-<style type="text/css"><![CDATA[
-body {
-	width: 75em;
-}
-body>div {
-	color: black;
-	background: yellow;
-	height: 2em;
-	position: relative;
-}
-div div {
-	position: absolute;
-	top: 0;
-	left: 0;
-}
-#two {left: 19em;}
-#three {left: 38em;}
-div div div {
-	font-family: Ahem;
-	font-size: 1em;
-	line-height: 1em;
-	width: 2em;
-	height: 2em;
-	color: black;
-	position: absolute;
-	left: 1em;
-}
-.a2 {left: 4em;}
-.a3 {left: 10.5em;}
-.a4 {left: 13.5em;}
-#two div {color: blue;}
-#three div {color: pink;}
-]]></style>
-</head>
-
-<body>
-
-<div>
-	<div>
-		<div>xx xx</div>
-		<div class="a2">xx xx</div>
-		<div class="a3">xx xx</div>
-		<div class="a4">xx xx</div>
-	</div>
-	<div id="two">
-		<div>xx xx</div>
-		<div class="a2">xx xx</div>
-		<div class="a3">xx xx</div>
-		<div class="a4">xx xx</div>
-	</div>
-	<div id="three">
-		<div>xx xx</div>
-		<div class="a2">xx xx</div>
-		<div class="a3">xx xx</div>
-		<div class="a4">xx xx</div>
-	</div>
-</div>
-
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-multicol/multicol-list-item-001-ref.xht
-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
-<html xmlns="http://www.w3.org/1999/xhtml">
-<head>
-  <title>CSS Reftest Reference</title>
-  <link rel="author" title="Opera Software ASA" href="http://www.opera.com/" />
-  <link rel="reviewer" title="Gérard Talbot" href="http://www.gtalbot.org/BrowserBugsSection/css21testsuite/" /> <!-- 2013-08-10 -->
-  <style type="text/css"><![CDATA[
-  div
-  {
-  background-color: black;
-  height: 100px;
-  width: 200px;
-  }
-   ]]></style>
- </head>
- <body>
-
-  <div></div>
-
- </body>
-</html>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-multicol/multicol-list-item-003-ref.html
-<!DOCTYPE html>
-<link rel="author" title="Morten Stenshorne" href="mailto:mstensho@chromium.org">
