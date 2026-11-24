@@ -5,12 +5,15 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/ByteString.h>
 #include <AK/Enumerate.h>
 #include <AK/Format.h>
+#include <LibPlatformFeatures/SystemFacts.h>
 #include <RequestServer/AIA.h>
 #include <RequestServer/CURL.h>
 #include <RequestServer/CertificateExceptions.h>
 #include <RequestServer/Resolver.h>
+#include <openssl/crypto.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
@@ -89,10 +92,27 @@ static int verify_server_certificate_has_subject_alt_name(int preverify_ok, X509
 // Our SSL context callbacks require OpenSSL's SSL_CTX.
 static bool curl_uses_openssl()
 {
+    // Those callbacks change curl's SSL_CTX through the OpenSSL we link, which only holds when curl uses that same
+    // OpenSSL. A system curl can load another one, for instance once the system has moved on to a newer OpenSSL than
+    // the one Ladybird was built against. Both are then loaded, and the structures of one handed to the other corrupt
+    // memory, so leave curl's SSL_CTX alone in that case.
     static auto const uses_openssl = [] {
         auto const* version_info = curl_version_info(CURLVERSION_NOW);
         VERIFY(version_info);
-        return version_info->ssl_version && StringView { version_info->ssl_version, strlen(version_info->ssl_version) }.starts_with("OpenSSL/"sv);
+        if (!version_info->ssl_version)
+            return false;
+        auto curl_openssl_version = PlatformFeatures::OpenSSLFacts::openssl_version_from_curl_ssl_version({ version_info->ssl_version, strlen(version_info->ssl_version) });
+        if (!curl_openssl_version.has_value())
+            return false;
+
+        // The Browser tells the user about this as well, from what the system probe found.
+        auto our_openssl_version = ByteString::formatted("{}.{}.{}", OPENSSL_version_major(), OPENSSL_version_minor(), OPENSSL_version_patch());
+        if (*curl_openssl_version != our_openssl_version) {
+            warnln("RequestServer: curl uses OpenSSL {}, but Ladybird uses OpenSSL {}. Ladybird has to be rebuilt against the OpenSSL that curl uses, until then it leaves curl's TLS configuration as it is.",
+                *curl_openssl_version, our_openssl_version);
+            return false;
+        }
+        return true;
     }();
     return uses_openssl;
 }
