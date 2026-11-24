@@ -9,6 +9,8 @@
 //! source, and only code that gets compiled reads it again.
 
 use super::base::Parser;
+use super::base::RECURSION_LIMIT_MESSAGE;
+use super::base::RegexCheckError;
 use super::token::*;
 use super::unit::*;
 
@@ -58,20 +60,20 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
     #[inline(always)]
     pub fn at(&self, index: usize) -> u32 {
         // SAFETY: The lexer never goes further than one block into the padding.
-        unsafe { (*self.src.add(index)).code() }
+        unsafe { (*self.src.wrapping_add(index)).code() }
     }
 
     /// The source text from `start` up to `end`.
     pub(crate) fn source_view(&self, start: usize, end: usize) -> &[U] {
         debug_assert!(start <= end && end <= self.len as usize);
         // SAFETY: The range is within the source.
-        unsafe { ak::slice_from_raw_parts(self.src.add(start), end - start) }
+        unsafe { ak::slice_from_raw_parts(self.src.wrapping_add(start), end - start) }
     }
 
     #[inline(always)]
     fn block(&self, index: usize) -> Block {
         // SAFETY: As for at().
-        unsafe { U::load(self.src.add(index)) }
+        unsafe { U::load(self.src.wrapping_add(index)) }
     }
 
     #[inline(always)]
@@ -89,6 +91,11 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
     }
 
     pub(crate) fn lex(&mut self) {
+        // NB: A parse that has failed lexes no further into the source, whose end may have no padding.
+        if self.err.is_some() {
+            self.tok = T::Eof;
+            return;
+        }
         let mut p = self.pos as usize;
         let mut newline = false;
         let c = loop {
@@ -904,80 +911,22 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
             }
             seen[flag as usize] = true;
         }
-        let pattern: &[u16] =
-            zone.alloc_slice_from_iter((start + 1..self.regex_body_end as usize).map(|i| self.at(i) as u16));
-        if let Err(message) = (self.validate_regex)(zone, pattern, flags) {
-            self.fail(start as u32, message);
-            return;
+        // 13.2.7.1 Static Semantics: Early Errors, https://tc39.es/ecma262/#sec-primary-expression-regular-expression-literals-static-semantics-early-errors
+        // PrimaryExpression : RegularExpressionLiteral
+        // It is a Syntax Error if IsValidRegularExpressionLiteral(RegularExpressionLiteral) is false.
+        // NB: A reparse only follows a first parse that checked every pattern.
+        if !self.is_reparsing() {
+            let pattern: &[u16] =
+                zone.alloc_slice_from_iter((start + 1..self.regex_body_end as usize).map(|i| self.at(i) as u16));
+            if let Err(error) = (self.validate_regex)(zone, pattern, flags) {
+                let message = match error {
+                    RegexCheckError::Invalid(message) => message,
+                    RegexCheckError::OutOfStack => RECURSION_LIMIT_MESSAGE,
+                };
+                self.fail(start as u32, message);
+                return;
+            }
         }
         self.token(T::Regex, p);
-    }
-
-    /// Whether the directive prologue at `start` contains "use strict". This looks ahead in the source so that the
-    /// rest of the prologue is parsed knowing it.
-    pub(crate) fn has_use_strict_directive(&mut self, start: usize) -> bool {
-        let mut p = start;
-        loop {
-            p = self.skip_trivia_raw(p).0;
-            let quote = self.at(p);
-            if quote != 0x22 && quote != 0x27 {
-                return false;
-            }
-            let content = p + 1;
-            let mut q = content;
-            loop {
-                let c = self.at(q);
-                if c == quote {
-                    break;
-                }
-                if q >= self.len as usize || c == 0x0A || c == 0x0D {
-                    return false;
-                }
-                q += if c == 0x5C { 2 } else { 1 };
-            }
-            let is_use_strict = q - content == 10 && (0..10).all(|i| self.at(content + i) == b"use strict"[i] as u32);
-            let (after, newline) = self.skip_trivia_raw(q + 1);
-            let next = self.at(after);
-            if is_use_strict {
-                if next == 0x3B || next == 0x7D || after >= self.len as usize {
-                    return true;
-                }
-                let continues = matches!(
-                    next as u8 as char,
-                    '(' | '`' | '.' | '[' | '+' | '-' | '/' | '*' | '%' | '<' | '>' | '=' | ',' | '?' | '^' | '&' | '|'
-                ) && next < 0x80
-                    || (next == 0x21 && self.at(after + 1) == 0x3D);
-                return newline && !continues;
-            }
-            p = after;
-            if next == 0x3B {
-                p += 1;
-            }
-        }
-    }
-
-    fn skip_trivia_raw(&mut self, start: usize) -> (usize, bool) {
-        let mut p = start;
-        let mut newline = false;
-        loop {
-            let c = self.at(p);
-            match c {
-                0x20 | 0x09 | 0x0B | 0x0C => p += 1,
-                0x0A | 0x0D | 0x2028 | 0x2029 => {
-                    newline = true;
-                    p += 1;
-                }
-                0x2F if self.at(p + 1) == 0x2F => p = self.skip_line_comment(p + 2),
-                0x2F if self.at(p + 1) == 0x2A => match self.skip_block_comment(p + 2) {
-                    Some((end, had_newline)) => {
-                        p = end;
-                        newline |= had_newline;
-                    }
-                    None => return (p, newline),
-                },
-                _ if c >= 0x80 && is_unicode_whitespace(c) => p += 1,
-                _ => return (p, newline),
-            }
-        }
     }
 }

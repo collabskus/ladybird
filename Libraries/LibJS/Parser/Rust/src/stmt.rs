@@ -26,6 +26,16 @@ pub(crate) enum Context {
     Single,
 }
 
+/// The parameters of a function.
+pub(crate) struct ParameterList {
+    pub list: u32,
+    pub count: u32,
+    /// ExpectedArgumentCount of the list.
+    pub length: u32,
+    pub simple: bool,
+    pub has_rest: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum VarKind {
     Var,
@@ -56,10 +66,6 @@ impl VarKind {
 }
 
 impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
-    pub(crate) fn parse_statement_list_item(&mut self, top_level: bool) -> u32 {
-        self.parse_statement(Context::List, top_level)
-    }
-
     fn is_let(&mut self, context: Context) -> bool {
         if !self.is_contextual(N_LET) {
             return false;
@@ -787,13 +793,14 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
         let init_start = self.tok_start;
         let saved_cover_error = self.cover_error;
         self.cover_error = NONE;
-        self.for_await_head = await_at != NONE;
         let init = if await_at != NONE {
+            // 14.7.5 The for-in, for-of, and for-await-of Statements, https://tc39.es/ecma262/#sec-for-in-and-for-of-statements
+            // ForInOfStatement : for await ( [lookahead ≠ let] LeftHandSideExpression of AssignmentExpression ) Statement
+            // NB: `async of` at the start of a LeftHandSideExpression is the name `async`.
             self.parse_left_hand_side(false)
         } else {
             self.parse_expression(true, true)
         };
-        self.for_await_head = false;
         let is_of = self.is_contextual(N_OF);
         if self.tok == T::KIn || is_of {
             if await_at != NONE && !is_of {
@@ -1036,7 +1043,7 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
             arguments_other_uses: 0,
             reads_arguments_index: false,
             may_write_parameters: false,
-            in_class_of_sloppy_function: self.in_class_of_sloppy_function,
+            arguments_of_sloppy_function: self.arguments_of_sloppy_function,
             is_arrow: false,
             summary_ordinal: 0,
         }
@@ -1135,15 +1142,39 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
     }
 
     /// The parameter list, from the `(`.
-    pub(crate) fn parse_parameter_list(&mut self, state: &mut FunctionState) -> (u32, u32, u32, bool, bool) {
+    pub(crate) fn parse_parameter_list(&mut self, state: &mut FunctionState) -> ParameterList {
         let params_start = self.tok_start;
         self.expect(T::LParen);
+        let parameters = self.parse_parameters_until(T::RParen, params_start, state);
+        self.expect(T::RParen);
+        parameters
+    }
+
+    /// Parses the whole source as the parameter list of a function of the given kind.
+    pub fn parse_parameters_of_dynamic_function(&mut self, is_generator: bool, is_async: bool) {
+        self.open_scope_with(scope_flag::TOP, 0);
+        self.lex();
+        let new_ctx = Self::function_ctx(is_generator, is_async);
+        let flags = Self::function_flags(is_generator, is_async);
+        let mut state = self.begin_function(0, new_ctx, flags);
+        let parameters = self.parse_parameters_until(T::Eof, 0, &mut state);
+
+        // 15.1.1 Static Semantics: Early Errors, https://tc39.es/ecma262/#sec-parameter-lists-static-semantics-early-errors
+        // FormalParameters : FormalParameterList
+        // It is a Syntax Error if IsSimpleParameterList of FormalParameterList is false and the BoundNames of FormalParameterList contains any duplicate elements.
+        if !parameters.simple && self.duplicate_parameter != NONE {
+            self.fail(self.duplicate_parameter, "Duplicate parameter names not allowed");
+        }
+    }
+
+    /// Parses parameters up to `close`.
+    fn parse_parameters_until(&mut self, close: T, params_start: u32, state: &mut FunctionState) -> ParameterList {
         let mark = self.scratch.len();
         let mut simple = true;
         let mut has_rest = false;
         let mut length = 0;
         let mut counting = true;
-        while self.tok != T::RParen && self.tok != T::Eof {
+        while self.tok != close && self.tok != T::Eof {
             let item_start = self.tok_start;
             let item = if self.tok == T::Ellipsis {
                 self.next();
@@ -1151,7 +1182,7 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
                 has_rest = true;
                 simple = false;
                 counting = false;
-                if self.tok != T::RParen {
+                if self.tok != close {
                     self.fail(self.tok_start, "Rest parameter must be last");
                 }
                 self.ast.push(tag::REST, item_start, target, 0)
@@ -1166,11 +1197,10 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
                 item
             };
             self.scratch.push(item);
-            if self.tok != T::RParen {
-                self.expect_comma_or(T::RParen);
+            if self.tok != close {
+                self.expect_comma_or(close);
             }
         }
-        self.expect(T::RParen);
         let count = (self.scratch.len() - mark) as u32;
         let list = self.finish_list(mark);
         if self.yield_pos != 0 || self.await_pos != 0 {
@@ -1179,7 +1209,13 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
         if simple {
             state.flags |= function_flag::SIMPLE_PARAMETERS;
         }
-        (list, count, length, simple, has_rest)
+        ParameterList {
+            list,
+            count,
+            length,
+            simple,
+            has_rest,
+        }
     }
 
     pub(crate) fn parse_function_tail(
@@ -1205,7 +1241,13 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
             let node = self.skip_function(moved_state, row);
             return (node, 0, false);
         }
-        let (list, count, length, simple, has_rest) = self.parse_parameter_list(state);
+        let ParameterList {
+            list,
+            count,
+            length,
+            simple,
+            has_rest,
+        } = self.parse_parameter_list(state);
         if self.tok != T::LBrace {
             self.unexpected();
         }
@@ -1228,37 +1270,22 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
         is_arrow: bool,
         is_method: bool,
     ) -> u32 {
-        let old_strict = self.strict;
-        let mut use_strict = false;
-        if !old_strict || !simple {
-            use_strict = self.has_use_strict_directive(self.tok_end as usize);
-            if use_strict && !simple {
-                self.fail(
-                    self.tok_start,
-                    "Illegal 'use strict' directive in function with non-simple parameter list",
-                );
-            }
-        }
-        if use_strict {
-            self.strict = true;
-        }
+        // 15.1.1 Static Semantics: Early Errors, https://tc39.es/ecma262/#sec-parameter-lists-static-semantics-early-errors
+        // UniqueFormalParameters : FormalParameters
+        // It is a Syntax Error if the BoundNames of FormalParameters contains any duplicate elements.
+        // FormalParameters : FormalParameterList
+        // It is a Syntax Error if IsSimpleParameterList of FormalParameterList is false and the BoundNames of FormalParameterList contains any duplicate elements.
+        // NB: Strict functions, arrow functions and methods have UniqueFormalParameters.
         if self.duplicate_parameter != NONE && (self.strict || !simple || is_arrow || is_method) {
             self.fail(self.duplicate_parameter, "Duplicate parameter names not allowed");
         }
-        if self.strict {
-            if let Some((name, pos)) = name {
-                self.check_strict_binding_name(name, pos);
-            }
-            if !old_strict {
-                let count = self.ast.extra[parameters as usize];
-                for i in 0..count {
-                    let parameter = self.ast.extra[(parameters + 1 + i) as usize];
-                    if self.ast.tag[parameter as usize] == tag::IDENT {
-                        let (name, pos) = (self.ast.a[parameter as usize], self.ast.pos[parameter as usize]);
-                        self.check_strict_binding_name(name, pos);
-                    }
-                }
-            }
+
+        // 15.2.1 Static Semantics: Early Errors, https://tc39.es/ecma262/#sec-function-definitions-static-semantics-early-errors
+        // If BindingIdentifier is present and IsStrict(BindingIdentifier) is true, it is a Syntax Error if the StringValue of BindingIdentifier is either "eval" or "arguments".
+        if self.strict
+            && let Some((name, pos)) = name
+        {
+            self.check_strict_binding_name(name, pos);
         }
         if !simple {
             self.open_function_body_scope(state);
@@ -1267,12 +1294,105 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
         state.body_start = self.tok_start;
         state.first_body_row = self.ast.tag.len() as u32;
         let mark = self.scratch.len();
+        let mut prologue = Prologue::default();
         while self.tok != T::RBrace && self.tok != T::Eof {
-            let statement = self.parse_statement(Context::List, false);
+            let was_strict = self.strict;
+            let (statement, use_strict) = self.parse_statement_of_prologue(&mut prologue, false);
             self.scratch.push(statement);
+            if !use_strict {
+                continue;
+            }
+
+            // It is a Syntax Error if FunctionBodyContainsUseStrict of FunctionBody is true and IsSimpleParameterList of FormalParameters is false.
+            // NB: Arrow functions and methods have the same rule.
+            if !simple {
+                self.fail(
+                    self.ast.pos[statement as usize],
+                    "Illegal 'use strict' directive in function with non-simple parameter list",
+                );
+            }
+            if !was_strict {
+                self.arguments_of_sloppy_function |= is_arrow;
+                self.check_parameters_of_strict_function(name, parameters);
+            }
         }
         self.expect(T::RBrace);
         self.finish_list(mark)
+    }
+
+    // 15.2.1 Static Semantics: Early Errors, https://tc39.es/ecma262/#sec-function-definitions-static-semantics-early-errors
+    /// Checks the name and the parameters of a function that a directive makes strict.
+    fn check_parameters_of_strict_function(&mut self, name: Option<(u32, u32)>, parameters: u32) {
+        // If IsStrict(FormalParameters) is true, the Early Error rules for UniqueFormalParameters : FormalParameters are applied.
+        if self.duplicate_parameter != NONE {
+            self.fail(self.duplicate_parameter, "Duplicate parameter names not allowed");
+        }
+
+        // If BindingIdentifier is present and IsStrict(BindingIdentifier) is true, it is a Syntax Error if the StringValue of BindingIdentifier is either "eval" or "arguments".
+        if let Some((name, pos)) = name {
+            self.check_strict_binding_name(name, pos);
+        }
+
+        // 13.1.1 Static Semantics: Early Errors, https://tc39.es/ecma262/#sec-identifiers-static-semantics-early-errors
+        // BindingIdentifier : Identifier
+        // It is a Syntax Error if IsStrict(this production) is true and the StringValue of Identifier is either "arguments" or "eval".
+        // NB: The parameters were parsed before the directive made them strict code.
+        let count = self.ast.extra[parameters as usize];
+        for i in 0..count {
+            let parameter = self.ast.extra[(parameters + 1 + i) as usize];
+            if self.ast.tag[parameter as usize] == tag::IDENT {
+                let (name, pos) = (self.ast.a[parameter as usize], self.ast.pos[parameter as usize]);
+                self.check_strict_binding_name(name, pos);
+            }
+        }
+    }
+
+    // 11.2.1 Directive Prologues and the Use Strict Directive, https://tc39.es/ecma262/#sec-directive-prologues-and-the-use-strict-directive
+    /// Parses a statement of a list that starts with a directive prologue. Returns the statement, and whether it is a
+    /// use strict directive, which makes the code strict from there on.
+    pub(crate) fn parse_statement_of_prologue(&mut self, prologue: &mut Prologue, top_level: bool) -> (u32, bool) {
+        // A Directive Prologue is the longest sequence of ExpressionStatements occurring as the initial StatementListItems or ModuleItems of a FunctionBody, a ScriptBody, or a ModuleBody and where each ExpressionStatement in the sequence consists entirely of a StringLiteral token followed by a semicolon.
+        if prologue.has_ended || self.tok != T::Str {
+            prologue.has_ended = true;
+            return (self.parse_statement(Context::List, top_level), false);
+        }
+        let (start, has_legacy_escape) = (self.tok_start, self.tok_legacy);
+        let statement = self.parse_statement(Context::List, top_level);
+        let expression = self.ast.a[statement as usize];
+        let is_directive = statement != 0
+            && self.ast.tag[statement as usize] == tag::EXPR_STMT
+            && self.ast.tag[expression as usize] == tag::STR
+            && self.ast.pos[expression as usize] == start;
+        if !is_directive {
+            prologue.has_ended = true;
+            return (statement, false);
+        }
+        if has_legacy_escape && prologue.legacy_escape == NONE {
+            prologue.legacy_escape = start;
+        }
+
+        // A Use Strict Directive is an ExpressionStatement in a Directive Prologue whose StringLiteral is either of the exact code point sequences "use strict" or 'use strict'. A Use Strict Directive may not contain an EscapeSequence or LineContinuation.
+        let use_strict = b"use strict";
+        let content = start as usize + 1;
+        let closing_quote = self.ast.a[expression as usize] as usize - 1;
+        let is_use_strict = closing_quote - content == use_strict.len()
+            && (0..use_strict.len()).all(|i| self.at(content + i) == u32::from(use_strict[i]));
+        if is_use_strict && !self.strict {
+            self.strict = true;
+
+            // 12.9.4.1 Static Semantics: Early Errors, https://tc39.es/ecma262/#sec-string-literals-early-errors
+            // EscapeSequence :: LegacyOctalEscapeSequence
+            // EscapeSequence :: NonOctalDecimalEscapeSequence
+            // It is a Syntax Error if IsStrict(this production) is true.
+            // NOTE: It is possible for string literals to precede a Use Strict Directive that places the enclosing code in strict mode, and implementations must take care to enforce the above rules for such literals.
+            if prologue.legacy_escape != NONE {
+                self.fail(
+                    prologue.legacy_escape,
+                    "Octal escape sequence in string literal not allowed in strict mode",
+                );
+            }
+        }
+        (statement, is_use_strict)
     }
 
     /// A method's function, from the `(`. Returns its node, its parameter count and whether it has a rest parameter.
@@ -1314,8 +1434,8 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
         let saved_class_start = core::mem::replace(&mut self.class_start, start);
         self.next();
         let old_strict = self.strict;
-        let was_in_class_of_sloppy_function = self.in_class_of_sloppy_function;
-        self.in_class_of_sloppy_function |= !old_strict;
+        let was_arguments_of_sloppy_function = self.arguments_of_sloppy_function;
+        self.arguments_of_sloppy_function |= !old_strict;
         self.strict = true;
         let mut name = NONE;
         if self.tok == T::Name && !(self.is_contextual(N_IMPLEMENTS)) {
@@ -1359,7 +1479,7 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
             self.scratch.push(element);
         }
         self.strict = old_strict;
-        self.in_class_of_sloppy_function = was_in_class_of_sloppy_function;
+        self.arguments_of_sloppy_function = was_arguments_of_sloppy_function;
         self.class_start = saved_class_start;
         self.expect(T::RBrace);
         self.exit_class_body();
@@ -1665,9 +1785,16 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
         if scope_flags & scope_flag::STATIC_BLOCK != 0 {
             self.in_arrow = false;
         }
+        // 15.7.11 Runtime Semantics: ClassStaticBlockDefinitionEvaluation ( homeObj ), https://tc39.es/ecma262/#sec-runtime-semantics-classstaticblockdefinitionevaluation
+        // NB: A static block is the body of a function of its own, so its function declarations are not those of a
+        //     block around the class.
+        let saved_block_mark = (self.block_mark, self.last_function_of_block);
+        self.block_mark = NONE;
+        self.last_function_of_block = 0;
         self.open_scope_with(scope_flags, func);
         let id = self.cur_scope;
         let node = parse(self);
+        (self.block_mark, self.last_function_of_block) = saved_block_mark;
         let scope = *self.scopes.last().expect("the scope is still there");
         let has_eval = scope.has_eval;
         self.last_pseudo_function_row = self.close_scope();
@@ -1710,6 +1837,10 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
     /// of the class, so that nothing else ever reads the row but the compilation of the function.
     fn class_function_row(&mut self, key: u32, start: u32, flags: u32, name: u32, reserved_row: u32) -> u32 {
         if self.is_reparsing() {
+            // NB: A parse that has failed may not have come across what the first parse made the row for.
+            if self.err.is_some() {
+                return NONE;
+            }
             return self
                 .first_pass_row_at(key)
                 .expect("the first parse made a row for the code of a class");

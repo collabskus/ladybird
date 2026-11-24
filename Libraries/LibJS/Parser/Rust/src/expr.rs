@@ -9,6 +9,7 @@
 
 use super::base::*;
 use super::columns::*;
+use super::stmt::ParameterList;
 use super::token::*;
 use super::unit::Unit;
 
@@ -685,6 +686,15 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
         self.close_scope();
         let list = self.finish_list(mark);
         self.note_use(N_ASYNC);
+
+        // 13.3.6.1 Runtime Semantics: Evaluation, https://tc39.es/ecma262/#sec-function-calls-runtime-semantics-evaluation
+        // CallExpression : CoverCallExpressionAndAsyncArrowHead
+        // 4. Let ref be ? Evaluation of memberExpr.
+        // 9. Return ? EvaluateCall(func, ref, args, tailCall).
+        // NB: Marks async as the callee, so that EvaluateCall gets the this value from ref.
+        if self.marks {
+            self.mark_node(base as usize, tag::MARK_CALLEE, 0, params_start);
+        }
         let call_tag = if self.marks && in_array {
             tag::CALL_ARRAY
         } else {
@@ -778,7 +788,7 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
                     // NB: A read of `arguments.length` or `arguments[key]` takes this back (see `note_arguments_read()`).
                     self.arguments_other_uses += u32::from(name == N_ARGUMENTS);
                     if name == N_ARGUMENTS
-                        && (!self.strict || self.in_class_of_sloppy_function)
+                        && (!self.strict || self.arguments_of_sloppy_function)
                         && !self.is_declared_in_current_function(name)
                     {
                         self.scopes.last_mut().unwrap().arguments_access = true;
@@ -796,14 +806,21 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
                         if let Some(arrow) = self.skip_arrow_function(start, param_pos) {
                             return arrow;
                         }
-                        if !(self.for_await_head && param == N_OF && !self.tok_escaped) {
-                            self.next();
-                            if self.tok != T::Arrow || self.nl_before {
-                                self.unexpected();
-                                return 0;
-                            }
-                            return self.parse_arrow_single(start, param, param_pos, true, no_in);
+                        self.next();
+                        if self.tok != T::Arrow || self.nl_before {
+                            self.unexpected();
+                            return 0;
                         }
+                        // 15.9 Async Arrow Function Definitions, https://tc39.es/ecma262/#sec-async-arrow-function-definitions
+                        // AsyncArrowBindingIdentifier[Yield] : BindingIdentifier[?Yield, +Await]
+                        // 13.1.1 Static Semantics: Early Errors, https://tc39.es/ecma262/#sec-identifiers-static-semantics-early-errors
+                        // BindingIdentifier[Yield, Await] : yield
+                        // It is a Syntax Error if this production has a [Yield] parameter.
+                        if param == N_YIELD && self.ctx & ctx::GENERATOR != 0 {
+                            self.fail(param_pos, "'yield' is not allowed as an identifier in this context");
+                            return 0;
+                        }
+                        return self.parse_arrow_single(start, param, param_pos, true, no_in);
                     }
                 }
                 if self.tok == T::Arrow && can_be_arrow && !self.nl_before {
@@ -855,7 +872,7 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
             }
             T::KNew => self.parse_new(),
             T::KClass => self.parse_class(false),
-            T::KSuper => self.parse_super(),
+            T::KSuper => self.parse_super(for_new),
             T::KImport => self.parse_import_expression(for_new),
             _ => {
                 self.expected("primary expression");
@@ -864,14 +881,18 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
         }
     }
 
-    fn parse_super(&mut self) -> u32 {
+    // 13.3 Left-Hand-Side Expressions, https://tc39.es/ecma262/#sec-left-hand-side-expressions
+    /// `super`, which what follows makes a SuperProperty or a SuperCall. `for_new` is whether `new` constructs it.
+    fn parse_super(&mut self, for_new: bool) -> u32 {
         let start = self.tok_start;
         if self.ctx & ctx::SUPER_PROPERTY == 0 {
             self.fail(start, "'super' keyword unexpected here");
             return 0;
         }
         self.next();
-        if self.tok == T::LParen && self.ctx & ctx::SUPER_CALL == 0 {
+        // MemberExpression : new MemberExpression Arguments
+        // NB: SuperProperty is a MemberExpression, but SuperCall is not.
+        if self.tok == T::LParen && (for_new || self.ctx & ctx::SUPER_CALL == 0) {
             self.fail(start, "'super' keyword unexpected here");
             return 0;
         }
@@ -1388,7 +1409,13 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
         let own_flags = function_flag::ARROW | if is_async { function_flag::ASYNC } else { 0 };
         let mut state = self.begin_function(start, new_ctx, own_flags);
         self.scopes.last_mut().unwrap().flags |= scope_flag::ARROW;
-        let (list, count, length, simple, _) = self.parse_parameter_list(&mut state);
+        let ParameterList {
+            list,
+            count,
+            length,
+            simple,
+            ..
+        } = self.parse_parameter_list(&mut state);
         self.parse_arrow_body(&mut state, list, count, length, simple, params_start, no_in, start)
     }
 
@@ -1629,6 +1656,7 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
                 }
             }
             tag::ARRAY | tag::ARRAY_SPREAD | tag::ARRAY_PATTERN => {
+                let literal_tag = self.ast.tag[node as usize];
                 self.ast.tag[node as usize] = tag::ARRAY_PATTERN;
                 let list = self.ast.a[node as usize];
                 let count = self.ast.extra[list as usize];
@@ -1653,6 +1681,21 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
                             self.convert_to_assignable(argument, bind);
                         }
                         _ => self.convert_to_assignable(element, bind),
+                    }
+                }
+                if self.marks && literal_tag != tag::ARRAY_PATTERN {
+                    let mark = self.ast.b[node as usize];
+                    self.ast.tag[mark as usize] = tag::EMPTY;
+                    // NB: The mark where the array starts to be built comes right before the rest element.
+                    if literal_tag == tag::ARRAY_SPREAD {
+                        let before_rest = if count >= 2 {
+                            self.ast.extra[(list + count - 1) as usize]
+                        } else {
+                            mark
+                        };
+                        let array_start = before_rest as usize + 1;
+                        assert_eq!(self.ast.tag[array_start], tag::MARK_ARRAY_START);
+                        self.ast.tag[array_start] = tag::EMPTY;
                     }
                 }
             }

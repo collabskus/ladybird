@@ -767,6 +767,84 @@ TEST_CASE(h265_sequence_parameter_set_returns_its_ids_and_reorder_depth)
     EXPECT(!Media::Codecs::H265::parse_sequence_parameter_set(hevc_sequence_parameter_set.span().trim(6)).has_value());
 }
 
+// x265's sequence parameter set for a 4:4:4 RGB stream, which states an identity matrix in its VUI.
+static constexpr Array<u8, 43> hevc_rgb_sequence_parameter_set {
+    0x42, 0x01, 0x01, 0x04, 0x08, 0x00, 0x00, 0x03, 0x00, 0x9e, 0x08, 0x00, 0x00, 0x03, 0x00, 0x00,
+    0x3c, 0x90, 0x01, 0x41, 0x01, 0xe2, 0xcb, 0x2b, 0x34, 0x92, 0x65, 0x78, 0x0b, 0x70, 0x20, 0x20,
+    0x00, 0x40, 0x00, 0x00, 0x03, 0x00, 0x40, 0x00, 0x00, 0x06, 0x42
+};
+
+// A 4:4:4 sequence parameter set whose VUI follows scaling lists, PCM, three short-term reference picture sets (the
+// second predicted from the first) and two long-term reference pictures. It states BT.709 primaries, the sRGB transfer
+// and an identity matrix in full range.
+static constexpr Array<u8, 76> hevc_sequence_parameter_set_with_reference_picture_sets {
+    0x42, 0x01, 0x01, 0x04, 0x08, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
+    0x00, 0x5d, 0x90, 0x01, 0x41, 0x01, 0xe2, 0xcb, 0x2b, 0xc9, 0x27, 0xaa, 0xaa, 0xaa, 0xed, 0x34,
+    0xd3, 0x4d, 0x34, 0xd3, 0x4d, 0x34, 0xd3, 0x4d, 0x34, 0xd3, 0x4d, 0x34, 0xd3, 0x4d, 0x34, 0xd3,
+    0x4d, 0x34, 0xd3, 0x4d, 0x34, 0xd3, 0x4a, 0xaa, 0xf7, 0x7c, 0x46, 0xbf, 0xf6, 0x15, 0xec, 0x16,
+    0x12, 0xff, 0xf0, 0x00, 0x10, 0x00, 0x1b, 0x70, 0x10, 0xd0, 0x00, 0x08
+};
+
+TEST_CASE(h265_sequence_parameter_set_reads_its_chroma_format_and_colour_description)
+{
+    auto parameter_set = Media::Codecs::H265::parse_sequence_parameter_set(hevc_rgb_sequence_parameter_set);
+    EXPECT(parameter_set.has_value());
+    if (!parameter_set.has_value())
+        return;
+    EXPECT_EQ(parameter_set->chroma_format_idc, 3);
+    EXPECT_EQ(parameter_set->cicp.matrix_coefficients(), Media::MatrixCoefficients::Identity);
+    EXPECT_EQ(parameter_set->cicp.video_full_range_flag(), Media::VideoFullRangeFlag::Full);
+
+    parameter_set = Media::Codecs::H265::parse_sequence_parameter_set(hevc_sequence_parameter_set);
+    EXPECT(parameter_set.has_value());
+    if (!parameter_set.has_value())
+        return;
+    EXPECT_EQ(parameter_set->chroma_format_idc, 1);
+}
+
+TEST_CASE(h265_sequence_parameter_set_reads_the_colour_description_past_reference_picture_sets)
+{
+    auto parameter_set = Media::Codecs::H265::parse_sequence_parameter_set(hevc_sequence_parameter_set_with_reference_picture_sets);
+    EXPECT(parameter_set.has_value());
+    if (!parameter_set.has_value())
+        return;
+    EXPECT_EQ(parameter_set->chroma_format_idc, 3);
+    EXPECT_EQ(parameter_set->sps_max_num_reorder_pics, 2);
+    EXPECT_EQ(parameter_set->cicp.color_primaries(), Media::ColorPrimaries::BT709);
+    EXPECT_EQ(parameter_set->cicp.transfer_characteristics(), Media::TransferCharacteristics::SRGB);
+    EXPECT_EQ(parameter_set->cicp.matrix_coefficients(), Media::MatrixCoefficients::Identity);
+    EXPECT_EQ(parameter_set->cicp.video_full_range_flag(), Media::VideoFullRangeFlag::Full);
+}
+
+TEST_CASE(h265_sequence_parameter_set_without_a_readable_colour_description_reports_unspecified_color)
+{
+    // Cut well before the VUI, but after every field a decoder is configured from.
+    auto parameter_set = Media::Codecs::H265::parse_sequence_parameter_set(hevc_sequence_parameter_set_with_reference_picture_sets.span().trim(56));
+    EXPECT(parameter_set.has_value());
+    if (!parameter_set.has_value())
+        return;
+    EXPECT_EQ(parameter_set->chroma_format_idc, 3);
+    EXPECT_EQ(parameter_set->cicp, Media::CodingIndependentCodePoints {});
+}
+
+// x264's sequence parameter set for a High 4:4:4 Predictive RGB stream, which states an identity matrix in its VUI.
+static constexpr Array<u8, 29> avc_rgb_sequence_parameter_set {
+    0x67, 0xf4, 0x00, 0x0d, 0x91, 0x9b, 0x28, 0x28, 0x3f, 0x60, 0x2d, 0xc0, 0x80, 0x80, 0x10, 0x00,
+    0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x03, 0x20, 0xf1, 0x42, 0x99, 0x60
+};
+
+TEST_CASE(h264_sequence_parameter_set_reads_its_chroma_format_and_colour_description)
+{
+    auto parameter_set = Media::Codecs::H264::parse_sequence_parameter_set(avc_rgb_sequence_parameter_set);
+    EXPECT(parameter_set.has_value());
+    if (!parameter_set.has_value())
+        return;
+    EXPECT_EQ(parameter_set->chroma_format_idc, 3);
+    EXPECT_EQ(parameter_set->bit_depth_luma, 8);
+    EXPECT_EQ(parameter_set->cicp.matrix_coefficients(), Media::MatrixCoefficients::Identity);
+    EXPECT_EQ(parameter_set->cicp.video_full_range_flag(), Media::VideoFullRangeFlag::Full);
+}
+
 TEST_CASE(h265_video_and_picture_parameter_sets_return_their_ids)
 {
     auto video_parameter_set = Media::Codecs::H265::parse_video_parameter_set(hevc_video_parameter_set);
@@ -1142,6 +1220,45 @@ TEST_CASE(h264_sequence_parameter_set_returns_its_id_and_inferred_reorder_depth)
     EXPECT(!Media::Codecs::H264::parse_sequence_parameter_set(nal_unit).has_value());
     nal_unit[0] = 0xe7; // forbidden_zero_bit
     EXPECT(!Media::Codecs::H264::parse_sequence_parameter_set(nal_unit).has_value());
+}
+
+TEST_CASE(h264_sequence_parameter_set_reads_its_profile_chroma_format_and_bit_depth)
+{
+    auto expect_format = [](ReadonlyBytes nal_unit, u8 profile_idc, u8 chroma_format_idc, u8 bit_depth_luma) {
+        auto parameter_set = Media::Codecs::H264::parse_sequence_parameter_set(nal_unit);
+        EXPECT(parameter_set.has_value());
+        if (!parameter_set.has_value())
+            return;
+        EXPECT_EQ(parameter_set->profile_idc, profile_idc);
+        EXPECT_EQ(parameter_set->chroma_format_idc, chroma_format_idc);
+        EXPECT_EQ(parameter_set->bit_depth_luma, bit_depth_luma);
+    };
+
+    // Baseline profile states no chroma format or bit depth, so they are inferred as 4:2:0 and 8-bit.
+    Array<u8, 10> baseline { 0x67, 0x42, 0x00, 0x1e, 0x04, 0x17, 0x03, 0x60, 0xf6, 0x40 };
+    expect_format(baseline, 66, 1, 8);
+
+    // x264's sequence parameter sets for High, High 10, High 4:2:2 and High 4:4:4 Predictive streams.
+    Array<u8, 27> high {
+        0x67, 0x64, 0x00, 0x0d, 0xac, 0xd9, 0x41, 0x41, 0xfb, 0x01, 0x6a, 0x04, 0x04, 0x0a, 0x80, 0x00,
+        0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x19, 0x07, 0x8a, 0x14, 0xcb
+    };
+    expect_format(high, 100, 1, 8);
+    Array<u8, 29> high_10 {
+        0x67, 0x6e, 0x00, 0x0d, 0xa6, 0xcd, 0x94, 0x14, 0x1f, 0xb0, 0x16, 0xa0, 0x40, 0x40, 0xa8, 0x00,
+        0x00, 0x03, 0x00, 0x08, 0x00, 0x00, 0x03, 0x01, 0x90, 0x78, 0xa1, 0x4c, 0xb0
+    };
+    expect_format(high_10, 110, 1, 10);
+    Array<u8, 27> high_422 {
+        0x67, 0x7a, 0x00, 0x0d, 0xbc, 0xd9, 0x41, 0x41, 0xfb, 0x01, 0x6a, 0x04, 0x04, 0x0a, 0x80, 0x00,
+        0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x19, 0x07, 0x8a, 0x14, 0xcb
+    };
+    expect_format(high_422, 122, 2, 8);
+    Array<u8, 29> high_444 {
+        0x67, 0xf4, 0x00, 0x0d, 0x91, 0x9b, 0x28, 0x28, 0x3f, 0x60, 0x2d, 0x40, 0x80, 0x81, 0x50, 0x00,
+        0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x03, 0x20, 0xf1, 0x42, 0x99, 0x60
+    };
+    expect_format(high_444, 244, 3, 8);
 }
 
 TEST_CASE(h264_picture_parameter_set_returns_its_id_and_sequence_reference)

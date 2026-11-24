@@ -37,8 +37,21 @@ pub const USE_IN_WITH: u32 = 1 << 31;
 /// How many zero code units the lexer needs after the source.
 pub const SOURCE_PADDING: usize = 64;
 
-/// What the lexer finds past the end of a source without padding once a parse has given up on it.
-static NO_MORE_SOURCE: [u16; 64] = [0; 64];
+/// How far the directive prologue of a statement list has got.
+pub(crate) struct Prologue {
+    pub has_ended: bool,
+    /// Where the first directive with a legacy escape is, or `NONE`.
+    pub legacy_escape: u32,
+}
+
+impl Default for Prologue {
+    fn default() -> Self {
+        Self {
+            has_ended: false,
+            legacy_escape: NONE,
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -212,14 +225,22 @@ pub(crate) struct FunctionState {
     pub arguments_other_uses: u32,
     pub reads_arguments_index: bool,
     pub may_write_parameters: bool,
-    pub in_class_of_sloppy_function: bool,
+    pub arguments_of_sloppy_function: bool,
     pub is_arrow: bool,
     pub summary_ordinal: u32,
 }
 
 /// How the parser checks a regular expression literal with the regex engine of the runtime that embeds it, so that an
-/// invalid one becomes an early error. Gives the message of the error, written into the zone, if it is invalid.
-pub type ValidateRegex = for<'z> fn(zone: &'z Zone, pattern: &[u16], flags: &[u16]) -> Result<(), &'z str>;
+/// invalid one becomes an early error.
+pub type ValidateRegex = for<'z> fn(zone: &'z Zone, pattern: &[u16], flags: &[u16]) -> Result<(), RegexCheckError<'z>>;
+
+/// Why a regular expression literal did not pass [`ValidateRegex`].
+pub enum RegexCheckError<'z> {
+    /// The literal is invalid, with the message of the error written into the zone.
+    Invalid(&'z str),
+    /// The stack that is left does not hold the check.
+    OutOfStack,
+}
 
 /// The first syntax error, at a source offset, with its message in the work zone or in the program.
 pub struct PendingError<'z> {
@@ -312,6 +333,8 @@ pub struct Parser<'a, 'k, U: Unit> {
     pub(crate) validate_regex: ValidateRegex,
     /// How many bindings of the function being parsed have a place in its summary.
     pub(crate) summary_ordinal: u32,
+    /// Where the unit at offset 0 of the source is. A parse of a function again may have only a tail of the source,
+    /// which puts this outside of what it can read.
     pub(crate) src: *const U,
     pub len: u32,
     pub(crate) pos: u32,
@@ -354,8 +377,6 @@ pub struct Parser<'a, 'k, U: Unit> {
     /// Where the expression in the parentheses opened last starts. A function there is likely to be called, but not one
     /// that starts after the `(` of a list of arguments, which an arrow function usually is.
     pub(crate) parenthesized_expression_start: u32,
-    /// Whether this is the left side of `for await`, where `async of` is no arrow function.
-    pub(crate) for_await_head: bool,
 
     /// The state of each name, by its id. A parse of a function again has the states of its reparse context, which
     /// are all clean when it starts and ends.
@@ -409,9 +430,9 @@ pub struct Parser<'a, 'k, U: Unit> {
     pub(crate) reads_arguments_index: bool,
     /// Whether something in the function may write a binding of the name of one of its parameters.
     pub(crate) may_write_parameters: bool,
-    /// Whether the code being parsed is in a class in a function that is not strict. The code of a class is strict, but
-    /// `arguments` in its heritage and computed keys is the arguments object of that function.
-    pub(crate) in_class_of_sloppy_function: bool,
+    /// Whether the code being parsed is strict, but `arguments` in it may be that of a function around it that is not.
+    /// That is so in the heritage and computed keys of a class, and in an arrow function with its own "use strict".
+    pub(crate) arguments_of_sloppy_function: bool,
     /// Whether the closest function, counting static blocks, is an arrow function.
     pub(crate) in_arrow: bool,
 
@@ -614,7 +635,6 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
             duplicate_parameter: NONE,
             last_arrow: 0,
             parenthesized_expression_start: NONE,
-            for_await_head: false,
             names,
             uses: ZoneVec::with_capacity_in(estimated_uses, zone),
             decls: ZoneVec::with_capacity_in(estimated_uses / 16, zone),
@@ -649,7 +669,7 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
             arguments_other_uses: 0,
             reads_arguments_index: false,
             may_write_parameters: false,
-            in_class_of_sloppy_function: false,
+            arguments_of_sloppy_function: false,
             in_arrow: false,
 
             private_declared: ZoneVec::new_in(zone),
@@ -671,14 +691,12 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
 
     pub fn parse_program(&mut self) -> u32 {
         self.open_scope_with(scope_flag::TOP, 0);
-        if !self.strict {
-            self.strict = self.has_use_strict_directive(self.pos as usize);
-        }
         self.lex();
         self.first_token_start = self.tok_start;
         let mark = self.scratch.len();
+        let mut prologue = Prologue::default();
         while self.tok != T::Eof {
-            let statement = self.parse_statement_list_item(true);
+            let (statement, _) = self.parse_statement_of_prologue(&mut prologue, true);
             self.scratch.push(statement);
         }
         let list = self.finish_list(mark);
@@ -947,10 +965,6 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
         if self.err.is_none() {
             self.err = Some(PendingError { pos, message });
         }
-        if self.is_reparsing() {
-            // The end of the source may have no padding, and the lexer is about to read it.
-            self.src = NO_MORE_SOURCE.as_ptr().cast::<U>().wrapping_sub(self.len as usize);
-        }
         self.tok = T::Eof;
         self.tok_start = self.len;
         self.tok_end = self.len;
@@ -1130,75 +1144,81 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
             while self.ast.tag[node] == tag::PAREN {
                 node = self.ast.a[node] as usize;
             }
-            // NB: What `delete` of an optional chain is about is the end of the chain.
-            if mark == tag::MARK_DELETE && self.ast.tag[node] == tag::CHAIN {
-                node = self.ast.a[node] as usize;
-                self.ast.tag[node] = match self.ast.tag[node] {
-                    tag::MEMBER | tag::OPT_MEMBER => tag::MEMBER_DELETE,
-                    tag::INDEX | tag::OPT_INDEX => tag::INDEX_DELETE,
-                    other => other,
-                };
-                return;
-            }
-            // NB: What gets called on what comes from the end of the chain too, through the parentheses around it.
-            if mark == tag::MARK_CALLEE && self.ast.tag[node] == tag::CHAIN {
-                node = self.ast.a[node] as usize;
-                self.ast.tag[node] = match self.ast.tag[node] {
-                    tag::MEMBER | tag::OPT_MEMBER => tag::MEMBER_CALLEE,
-                    tag::INDEX | tag::OPT_INDEX => tag::INDEX_CALLEE,
-                    tag::PRIVATE_MEMBER | tag::OPT_PRIVATE_MEMBER => tag::PRIVATE_MEMBER_CALLEE,
-                    tag::SUPER_MEMBER => tag::SUPER_MEMBER_CALLEE,
-                    tag::SUPER_INDEX => tag::SUPER_INDEX_CALLEE,
-                    other => other,
-                };
-                return;
-            }
-            let offset = mark - tag::MARK_CALLEE;
-            let marked = match self.ast.tag[node] {
-                tag::IDENT => tag::IDENT_MARKED + offset,
-                tag::MEMBER if mark != tag::MARK_KEY && mark != tag::MARK_DECLARATION && mark != tag::MARK_TYPEOF => {
-                    tag::MEMBER_MARKED + offset
-                }
-                tag::INDEX if mark != tag::MARK_KEY && mark != tag::MARK_DECLARATION && mark != tag::MARK_TYPEOF => {
-                    tag::INDEX_MARKED + offset
-                }
-                tag::SUPER if mark == tag::MARK_CALLEE => tag::SUPER_CALLEE,
-                tag::SUPER_MEMBER
-                    if mark != tag::MARK_KEY && mark != tag::MARK_DECLARATION && mark != tag::MARK_TYPEOF =>
-                {
-                    tag::SUPER_MEMBER_MARKED + offset
-                }
-                tag::SUPER_INDEX
-                    if mark != tag::MARK_KEY && mark != tag::MARK_DECLARATION && mark != tag::MARK_TYPEOF =>
-                {
-                    tag::SUPER_INDEX_MARKED + offset
-                }
-                tag::PRIVATE_MEMBER
-                    if mark != tag::MARK_KEY && mark != tag::MARK_DECLARATION && mark != tag::MARK_TYPEOF =>
-                {
-                    tag::PRIVATE_MEMBER_MARKED + offset
-                }
-                tag::OPT_MEMBER if mark == tag::MARK_CALLEE => tag::OPT_MEMBER_CALLEE,
-                tag::OPT_INDEX if mark == tag::MARK_CALLEE => tag::OPT_INDEX_CALLEE,
-                tag::OPT_PRIVATE_MEMBER if mark == tag::MARK_CALLEE => tag::PRIVATE_MEMBER_CALLEE,
-                tag::STR if mark == tag::MARK_KEY => tag::STR_KEY,
-                tag::NUM if mark == tag::MARK_KEY => tag::NUM_KEY,
-                _ => 0,
-            };
-            if marked != 0 {
-                self.ast.tag[node] = marked;
-                if mark == tag::MARK_DECLARATION {
-                    self.ast.b[node] = a;
-                } else if mark == tag::MARK_TYPEOF || (mark == tag::MARK_CALLEE && marked == tag::IDENT_CALLEE) {
-                    // NB: A name is where it is until it takes more than reading it.
-                    self.ast.b[node] = position;
-                } else if mark != tag::MARK_KEY {
-                    self.ast.pos[node] = position;
-                }
+            if self.mark_node(node, mark, a, position) {
                 return;
             }
         }
         self.ast.push(mark, self.prev_start, a, 0);
+    }
+
+    /// Marks the reference at the row `node` in place with `mark`, one of those from `MARK_CALLEE` to `MARK_KEY`, if it
+    /// is a reference that the mark is for. Returns whether it was.
+    #[inline(always)]
+    pub(crate) fn mark_node(&mut self, mut node: usize, mark: u8, a: u32, position: u32) -> bool {
+        // NB: What `delete` of an optional chain is about is the end of the chain.
+        if mark == tag::MARK_DELETE && self.ast.tag[node] == tag::CHAIN {
+            node = self.ast.a[node] as usize;
+            self.ast.tag[node] = match self.ast.tag[node] {
+                tag::MEMBER | tag::OPT_MEMBER => tag::MEMBER_DELETE,
+                tag::INDEX | tag::OPT_INDEX => tag::INDEX_DELETE,
+                other => other,
+            };
+            return true;
+        }
+        // NB: What gets called on what comes from the end of the chain too, through the parentheses around it.
+        if mark == tag::MARK_CALLEE && self.ast.tag[node] == tag::CHAIN {
+            node = self.ast.a[node] as usize;
+            self.ast.tag[node] = match self.ast.tag[node] {
+                tag::MEMBER | tag::OPT_MEMBER => tag::MEMBER_CALLEE,
+                tag::INDEX | tag::OPT_INDEX => tag::INDEX_CALLEE,
+                tag::PRIVATE_MEMBER | tag::OPT_PRIVATE_MEMBER => tag::PRIVATE_MEMBER_CALLEE,
+                tag::SUPER_MEMBER => tag::SUPER_MEMBER_CALLEE,
+                tag::SUPER_INDEX => tag::SUPER_INDEX_CALLEE,
+                other => other,
+            };
+            return true;
+        }
+        let offset = mark - tag::MARK_CALLEE;
+        let marked = match self.ast.tag[node] {
+            tag::IDENT => tag::IDENT_MARKED + offset,
+            tag::MEMBER if mark != tag::MARK_KEY && mark != tag::MARK_DECLARATION && mark != tag::MARK_TYPEOF => {
+                tag::MEMBER_MARKED + offset
+            }
+            tag::INDEX if mark != tag::MARK_KEY && mark != tag::MARK_DECLARATION && mark != tag::MARK_TYPEOF => {
+                tag::INDEX_MARKED + offset
+            }
+            tag::SUPER if mark == tag::MARK_CALLEE => tag::SUPER_CALLEE,
+            tag::SUPER_MEMBER if mark != tag::MARK_KEY && mark != tag::MARK_DECLARATION && mark != tag::MARK_TYPEOF => {
+                tag::SUPER_MEMBER_MARKED + offset
+            }
+            tag::SUPER_INDEX if mark != tag::MARK_KEY && mark != tag::MARK_DECLARATION && mark != tag::MARK_TYPEOF => {
+                tag::SUPER_INDEX_MARKED + offset
+            }
+            tag::PRIVATE_MEMBER
+                if mark != tag::MARK_KEY && mark != tag::MARK_DECLARATION && mark != tag::MARK_TYPEOF =>
+            {
+                tag::PRIVATE_MEMBER_MARKED + offset
+            }
+            tag::OPT_MEMBER if mark == tag::MARK_CALLEE => tag::OPT_MEMBER_CALLEE,
+            tag::OPT_INDEX if mark == tag::MARK_CALLEE => tag::OPT_INDEX_CALLEE,
+            tag::OPT_PRIVATE_MEMBER if mark == tag::MARK_CALLEE => tag::PRIVATE_MEMBER_CALLEE,
+            tag::STR if mark == tag::MARK_KEY => tag::STR_KEY,
+            tag::NUM if mark == tag::MARK_KEY => tag::NUM_KEY,
+            _ => 0,
+        };
+        if marked != 0 {
+            self.ast.tag[node] = marked;
+            if mark == tag::MARK_DECLARATION {
+                self.ast.b[node] = a;
+            } else if mark == tag::MARK_TYPEOF || (mark == tag::MARK_CALLEE && marked == tag::IDENT_CALLEE) {
+                // NB: A name is where it is until it takes more than reading it.
+                self.ast.b[node] = position;
+            } else if mark != tag::MARK_KEY {
+                self.ast.pos[node] = position;
+            }
+            return true;
+        }
+        false
     }
 
     /// Leaves a mark at the start of a construct that does not go through the rows in order, for `end_subtree()`.
@@ -1993,7 +2013,7 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
             arguments_other_uses: self.arguments_other_uses,
             reads_arguments_index: self.reads_arguments_index,
             may_write_parameters: self.may_write_parameters,
-            in_class_of_sloppy_function: self.in_class_of_sloppy_function,
+            arguments_of_sloppy_function: self.arguments_of_sloppy_function,
             is_arrow: self.in_arrow,
             summary_ordinal: self.summary_ordinal,
         };
@@ -2005,7 +2025,7 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
         self.reads_arguments_index = false;
         self.may_write_parameters = false;
         self.in_arrow = flags & function_flag::ARROW != 0;
-        self.in_class_of_sloppy_function &= self.in_arrow;
+        self.arguments_of_sloppy_function &= self.in_arrow;
         self.ctx = new_ctx;
         self.labels_base = self.labels.len() as u32;
         self.yield_pos = 0;
@@ -2229,7 +2249,7 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
         self.arguments_other_uses = state.arguments_other_uses + u32::from(arrow_might_need_arguments);
         self.reads_arguments_index = state.reads_arguments_index;
         self.may_write_parameters = state.may_write_parameters;
-        self.in_class_of_sloppy_function = state.in_class_of_sloppy_function;
+        self.arguments_of_sloppy_function = state.arguments_of_sloppy_function;
         self.in_arrow = state.is_arrow;
 
         if retained {
@@ -2564,8 +2584,7 @@ impl<'a: 'k, 'k, U: Unit> Parser<'a, 'k, U> {
         }
     }
 
-    /// Every recursive path of the parser goes through this, and through leave() on the way back. The limit on the
-    /// depth also protects what walks the tree later, which recursion here reaches as deep as it reached here.
+    /// Every recursive path of the parser goes through this, and through leave() on the way back.
     #[inline(always)]
     pub(crate) fn enter(&mut self) -> bool {
         let marker = 0u8;

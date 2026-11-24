@@ -35,6 +35,7 @@ use crate::parser::ParseError;
 use crate::parser::ParseOptions;
 use crate::parser::ScriptData;
 use crate::parser::TopLevelRows;
+use crate::parser::check_function_parameters;
 use crate::parser::check_syntax;
 use crate::parser::with_parsed_tree;
 use crate::utf16::Utf16View;
@@ -494,104 +495,102 @@ pub(crate) fn module_environment_scope(scope: &ast::Scope) -> Arc<bytecode::code
     )
 }
 
-/// Recursively collect var declared names for module scope.
+// 8.2.8 Static Semantics: VarDeclaredNames, https://tc39.es/ecma262/#sec-static-semantics-vardeclarednames
+/// Collects the VarDeclaredNames of a ModuleItem.
 pub(crate) fn collect_module_var_names(statement: &ast::Statement, f: &mut dyn FnMut(Utf16View<'_>)) {
-    match statement.kind() {
-        StatementKind::VariableDeclaration(declaration) if declaration.kind == ast::DeclarationKind::Var => {
-            for declarator in &declaration.declarations {
-                for_each_bound_name(&declarator.target, f);
+    // ModuleItem : ExportDeclaration
+    // 1. If ExportDeclaration is export VariableStatement, return the BoundNames of ExportDeclaration.
+    // 2. Return a new empty List.
+    if let StatementKind::Export(export_data) = statement.kind() {
+        if let Some(statement) = export_data.statement {
+            collect_var_declared_names(statement, f);
+        }
+        return;
+    }
+    collect_var_declared_names(*statement, f);
+}
+
+// 8.2.8 Static Semantics: VarDeclaredNames, https://tc39.es/ecma262/#sec-static-semantics-vardeclarednames
+/// Collects the VarDeclaredNames of a statement, in the order of the source.
+pub(crate) fn collect_var_declared_names(mut statement: ast::Statement<'_>, push_name: &mut dyn FnMut(Utf16View<'_>)) {
+    // NB: The VarDeclaredNames of a statement are those of the statements in it, which are a list here in place of
+    //     recursion: statements nest as deeply as the parser allows, which is more than the stack may have room for.
+    let mut pending = Vec::new();
+    loop {
+        match statement.kind() {
+            // VariableStatement : var VariableDeclarationList ;
+            // 1. Return the BoundNames of VariableDeclarationList.
+            StatementKind::VariableDeclaration(declaration) if declaration.kind == ast::DeclarationKind::Var => {
+                for declarator in &declaration.declarations {
+                    for_each_bound_name(&declarator.target, push_name);
+                }
+            }
+            _ => {
+                let start = pending.len();
+                child_statements(statement, &mut pending);
+                pending[start..].reverse();
             }
         }
-        StatementKind::Export(export_data) => {
-            if let Some(statement) = export_data.statement {
-                collect_module_var_names(&statement, f);
-            }
-        }
-        _ => {
-            for_each_child_statement(statement, &mut |child| {
-                collect_module_var_names(child, f);
-            });
-        }
+        let Some(next) = pending.pop() else {
+            return;
+        };
+        statement = next;
     }
 }
 
-/// Recursively collect var-declared names from a statement and all nested
-/// statements, excluding function/class bodies (which create new var scopes).
-pub(crate) fn collect_var_names_recursive(statement: &ast::Statement, push_name: &mut dyn FnMut(Utf16View<'_>)) {
-    match statement.kind() {
-        StatementKind::VariableDeclaration(declaration) if declaration.kind == ast::DeclarationKind::Var => {
-            for declarator in &declaration.declarations {
-                for_each_bound_name(&declarator.target, push_name);
-            }
-        }
-        _ => {
-            for_each_child_statement(statement, &mut |child| {
-                collect_var_names_recursive(child, push_name);
-            });
-        }
-    }
-}
-
-/// Visit each child statement of a statement, excluding function/class bodies
-/// (which create new var scopes). This enables recursive var-declaration walking.
-fn for_each_child_statement(statement: &ast::Statement, f: &mut dyn FnMut(&ast::Statement)) {
+/// Appends the child statements of a statement, excluding function/class bodies
+/// (which create new var scopes), as VarDeclaredNames goes through them.
+fn child_statements<'a>(statement: ast::Statement<'a>, children: &mut Vec<ast::Statement<'a>>) {
     match statement.kind() {
         StatementKind::Block(scope) => {
-            for child in &scope.children {
-                f(&child);
-            }
+            children.extend(&scope.children);
         }
         StatementKind::If(data) => {
-            f(&data.consequent);
-            if let Some(alternate) = &data.alternate {
-                f(alternate);
-            }
+            children.push(data.consequent);
+            children.extend(data.alternate);
         }
         StatementKind::While(data) => {
-            f(&data.body);
+            children.push(data.body);
         }
         StatementKind::DoWhile(data) => {
-            f(&data.body);
+            children.push(data.body);
         }
         StatementKind::With(data) => {
-            f(&data.body);
+            children.push(data.body);
         }
         StatementKind::For(data) => {
             if let Some(ast::ForInit::Declaration(declaration)) = &data.init {
-                f(declaration);
+                children.push(*declaration);
             }
-            f(&data.body);
+            children.push(data.body);
         }
         StatementKind::ForInOf(data) => {
             if let ast::ForInOfLhs::Declaration(declaration) = &data.lhs {
-                f(declaration);
+                children.push(*declaration);
             }
-            f(&data.body);
+            children.push(data.body);
         }
         StatementKind::Switch(data) => {
             for case in &data.cases {
-                for child in &case.scope.children {
-                    f(&child);
-                }
+                children.extend(&case.scope.children);
             }
         }
         StatementKind::Try(data) => {
-            f(&data.block);
+            children.push(data.block);
             if let Some(handler) = &data.handler {
-                f(&handler.body);
+                children.push(handler.body);
             }
-            if let Some(finalizer) = &data.finalizer {
-                f(finalizer);
-            }
+            children.extend(data.finalizer);
         }
         StatementKind::Labelled(data) => {
-            f(&data.item);
+            children.push(data.item);
         }
         // Don't recurse into function/class bodies (new var scopes)
         _ => {}
     }
 }
 
+// 8.2.1 Static Semantics: BoundNames, https://tc39.es/ecma262/#sec-static-semantics-boundnames
 pub(crate) fn for_each_bound_name(target: &ast::VariableDeclaratorTarget, f: &mut dyn FnMut(Utf16View<'_>)) {
     match target {
         ast::VariableDeclaratorTarget::Identifier(identifier) => f(identifier.text()),
@@ -601,8 +600,16 @@ pub(crate) fn for_each_bound_name(target: &ast::VariableDeclaratorTarget, f: &mu
     }
 }
 
+// 8.2.1 Static Semantics: BoundNames, https://tc39.es/ecma262/#sec-static-semantics-boundnames
 fn for_each_bound_name_in_pattern(pattern: &ast::BindingPattern, f: &mut dyn FnMut(Utf16View<'_>)) {
-    for entry in &pattern.entries {
+    // NB: The BoundNames of a pattern are those of the patterns in it, which are a list here in place of recursion:
+    //     patterns nest as deeply as the parser allows, which is more than the stack may have room for.
+    let mut pending = vec![pattern.entries.iter()];
+    while let Some(entries) = pending.last_mut() {
+        let Some(entry) = entries.next() else {
+            pending.pop();
+            continue;
+        };
         match &entry.alias {
             None => {
                 if let Some(ast::BindingEntryName::Identifier(identifier)) = &entry.name {
@@ -611,7 +618,7 @@ fn for_each_bound_name_in_pattern(pattern: &ast::BindingPattern, f: &mut dyn FnM
             }
             Some(ast::BindingEntryAlias::Identifier(identifier)) => f(identifier.text()),
             Some(ast::BindingEntryAlias::BindingPattern(inner)) => {
-                for_each_bound_name_in_pattern(inner, f);
+                pending.push(inner.entries.iter());
             }
             Some(ast::BindingEntryAlias::MemberExpression(_)) => {}
         }
@@ -1018,48 +1025,21 @@ pub fn parse_dynamic_function(
     body_source: &[u16],
     kind: ast::FunctionKind,
 ) -> Result<ParsedDynamicFunction, Vec<ParseError>> {
-    // Lex the parameters on their own first, so that lexer errors such as an unterminated comment have positions in
-    // the parameter string.
-    let mut lexer = crate::lexer::Lexer::new(Utf16View::Utf16(parameters_source), 1, 0);
-    loop {
-        let token = lexer.next();
-        if token.token_type == crate::token::TokenType::Eof {
-            break;
-        }
-        if token.token_type == crate::token::TokenType::Invalid {
-            let message = token
-                .message
-                .unwrap_or_else(|| format!("Unexpected token {}", token.token_type.name()));
-            return Err(vec![ParseError {
-                message,
-                line: token.line_number,
-                column: token.line_column,
-            }]);
-        }
-    }
+    // 17. Let parameters be ParseText(P, parameterSym).
+    // 18. If parameters is a List of errors, throw a SyntaxError exception.
+    check_function_parameters(&ak::Utf16String::from_utf16(parameters_source), kind)?;
 
-    // Then check them as the parameters of a function of the same kind.
-    let mut parameters_check: Vec<u16> = Vec::new();
-    parameters_check.extend_from_slice(match kind {
-        ast::FunctionKind::Generator => utf16!("function* test("),
-        ast::FunctionKind::Async => utf16!("async function test("),
-        ast::FunctionKind::AsyncGenerator => utf16!("async function* test("),
-        ast::FunctionKind::Normal => utf16!("function test("),
-    });
-    parameters_check.extend_from_slice(parameters_source);
-    parameters_check.extend_from_slice(utf16!("\n) {}"));
-    check_syntax(
-        &ak::Utf16String::from_utf16(&parameters_check),
-        &ParseOptions::new(ProgramType::Script),
-    )?;
-
-    // Check the body on its own as a script with the flags of a function body of the kind.
+    // 19. Let body be ParseText(bodyParseString, bodySym).
+    // 20. If body is a List of errors, throw a SyntaxError exception.
     let mut options = ParseOptions::new(ProgramType::Script);
     options.function_body = Some(kind);
     check_syntax(&ak::Utf16String::from_utf16(body_source), &options)?;
 
-    // The function is parsed as a function expression, so it has no Program scope whose globals its identifiers
-    // could bind to.
+    // 21. NOTE: The parameters and body are parsed separately to ensure that each is valid alone. For example, new Function("/*", "*/ ) {") does not evaluate to a function.
+    // 22. NOTE: If this step is reached, sourceText must have the syntax of exprSym (although the reverse implication does not hold). The purpose of the next two steps is to enforce any Early Error rules which apply to exprSym directly.
+    // 23. Let expr be ParseText(sourceText, exprSym).
+    // 24. If expr is a List of errors, throw a SyntaxError exception.
+    // NB: As a function expression, the function has no Program scope whose globals its identifiers could bind to.
     let mut options = ParseOptions::new(ProgramType::Script);
     options.suppress_globals = true;
     Ok(ParsedDynamicFunction {
@@ -1562,7 +1542,7 @@ fn collect_var_scoped_declarations(tree: &SyntaxTree<'_>) -> VarScopedDeclaratio
     // Var names (var declarations at any nesting level + top-level function declarations)
     let mut var_names = Vec::new();
     for child in &scope.children {
-        collect_var_names_recursive(&child, &mut |name| var_names.push(name.into()));
+        collect_var_declared_names(child, &mut |name| var_names.push(name.into()));
         if let Some(function) = child.function_declaration_for_labelled_item()
             && let Some(name) = function.name
         {
@@ -1604,7 +1584,7 @@ fn collect_var_scoped_declarations(tree: &SyntaxTree<'_>) -> VarScopedDeclaratio
     // Var-scoped names (var VariableDeclaration names, excluding function declarations)
     let mut var_scoped_names = Vec::new();
     for child in &scope.children {
-        collect_var_names_recursive(&child, &mut |name| var_scoped_names.push(name.into()));
+        collect_var_declared_names(child, &mut |name| var_scoped_names.push(name.into()));
     }
 
     let mut lexical_bindings = Vec::new();
