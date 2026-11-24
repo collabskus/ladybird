@@ -9,9 +9,11 @@
 #pragma once
 
 #include <AK/Array.h>
+#include <AK/Function.h>
 #include <AK/HashMap.h>
 #include <AK/HashTable.h>
 #include <AK/Optional.h>
+#include <AK/ScopeGuard.h>
 #include <AK/TypeCasts.h>
 #include <AK/Vector.h>
 #include <AK/kmalloc.h>
@@ -59,6 +61,7 @@ class AllTabsPopover;
 class ChromeHeaderButton;
 class LadybirdButton;
 
+class TabBarButton;
 class TabMicrophoneIndicator;
 class TabWidget;
 class WindowControlsReveal;
@@ -104,6 +107,11 @@ public:
     void lock_tab_widths();
     void recreate_icons();
     int pinned_tab_count() const;
+
+    TabBarButton* tab_close_button(int index) const;
+    void set_tab_close_button(int index, TabBarButton*);
+    TabBarButton* tab_audio_button(int index) const;
+    void set_tab_audio_button(int index, TabBarButton*);
 
     void update_loading_ring_animation();
     void update_microphone_indicators();
@@ -222,6 +230,11 @@ private:
     void set_hovered_tab_index(int);
     qreal loading_ring_opacity(int index) const;
     void ensure_tab_visible(int index);
+    struct TabButtons {
+        TabBarButton* close { nullptr };
+        TabBarButton* audio { nullptr };
+    };
+    void set_tab_button(int index, TabBarButton* TabButtons::*, TabBarButton*);
     void update_tab_button_geometry();
     TabMicrophoneIndicator* microphone_indicator(int index) const;
     int horizontal_tab_min_width(int index) const;
@@ -274,8 +287,6 @@ private:
     int m_settled_tab_count { 0 };
 
     QVariantAnimation* m_loading_ring_animation { nullptr };
-    // NB: QTabBar has room for only two widgets on each tab, the speaker and the close button, so the tab bar keeps the
-    //     microphone indicators itself.
     HashMap<Tab const*, TabMicrophoneIndicator*> m_microphone_indicators;
     QIcon m_fallback_tab_icon;
     QHash<QString, QStaticText> m_tab_title_texts;
@@ -311,6 +322,8 @@ public:
 
     void add_tab(Tab* widget, QString const& label);
     void insert_tab(int index, Tab* widget, QString const& label);
+    ScopeGuard<Function<void()>> defer_tab_updates();
+    bool tab_updates_deferred() const { return m_tab_updates_deferred; }
     void remove_tab(int index);
     Tab* take_tab(int index);
     // Another tab stands in for the one at the index, which keeps its place in the tab bar rather than closing.
@@ -517,6 +530,7 @@ private:
     QWidget* m_toolbar_row_backdrop { nullptr };
     bool m_is_resizing_vertical_tabs { false };
     bool m_is_updating_chrome_style { false };
+    bool m_tab_updates_deferred { false };
     int m_vertical_tabs_expanded_width { 0 };
     int m_vertical_tabs_resize_start_global_x { 0 };
     int m_vertical_tabs_resize_start_width { 0 };
