@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 
 use crate::code_units::CodeUnits;
@@ -473,6 +474,51 @@ enum TextRunStops {
     Markup,
     /// U+003C (<) and U+0026 (&).
     MarkupAndCharacterReferences,
+}
+
+#[derive(Clone, Copy)]
+pub enum CharacterReferenceContext {
+    Data,
+    Attribute,
+}
+
+/// Decode references in text supplied by another tokenizer. Only an ampersand enters the HTML state machine;
+/// literal code units, including line endings and unpaired surrogates, belong to the caller's input.
+pub fn decode_character_references(input: &[u16], context: CharacterReferenceContext) -> Cow<'_, [u16]> {
+    let ampersand = u16::from(b'&');
+    let Some(mut start) = input.iter().position(|&unit| unit == ampersand) else {
+        return Cow::Borrowed(input);
+    };
+    let mut tokenizer = HtmlTokenizer::new(input.to_vec());
+    tokenizer.return_state = match context {
+        CharacterReferenceContext::Data => State::Data,
+        CharacterReferenceContext::Attribute => State::AttributeValueUnquoted,
+    };
+    let mut output = Vec::with_capacity(input.len());
+    output.extend_from_slice(&input[..start]);
+    loop {
+        tokenizer.current_offset = start + 1;
+        tokenizer.state = State::CharacterReference;
+        let mut token = Token::default();
+        let first = tokenizer
+            .next_token_into_impl::<true>(&mut token, false, false)
+            .then_some(token);
+        for token in first.into_iter().chain(tokenizer.queued_tokens.drain(..)) {
+            debug_assert_eq!(token.token_type, TokenType::Character);
+            let character = char::from_u32(token.code_point).expect("a character reference emits scalar values");
+            output.extend_from_slice(character.encode_utf16(&mut [0; 2]));
+        }
+        output.extend(tokenizer.current_builder.as_slice().code_units());
+        tokenizer.current_builder.clear();
+
+        let remaining = &input[tokenizer.current_offset..];
+        let Some(next) = remaining.iter().position(|&unit| unit == ampersand) else {
+            output.extend_from_slice(remaining);
+            return Cow::Owned(output);
+        };
+        output.extend_from_slice(&remaining[..next]);
+        start = tokenizer.current_offset + next;
+    }
 }
 
 impl HtmlTokenizer {
@@ -1188,6 +1234,15 @@ impl HtmlTokenizer {
 
     /// Puts the next token in `out`, and returns whether there was one. What `out` held before is dropped only then.
     pub fn next_token_into(&mut self, out: &mut Token, stop_at_insertion_point: bool, cdata_allowed: bool) -> bool {
+        self.next_token_into_impl::<false>(out, stop_at_insertion_point, cdata_allowed)
+    }
+
+    fn next_token_into_impl<const ONE_CHARACTER_REFERENCE: bool>(
+        &mut self,
+        out: &mut Token,
+        stop_at_insertion_point: bool,
+        cdata_allowed: bool,
+    ) -> bool {
         self.stop_at_insertion_point = stop_at_insertion_point;
         self.cdata_allowed = cdata_allowed;
 
@@ -1201,6 +1256,9 @@ impl HtmlTokenizer {
         }
 
         loop {
+            if ONE_CHARACTER_REFERENCE && (self.state == self.return_state || self.state == State::AmbiguousAmpersand) {
+                return self.take_queued_token(out);
+            }
             // Check insertion point before consuming.
             if self.should_pause_before_next_input_character() {
                 return false;
@@ -2962,18 +3020,24 @@ impl HtmlTokenizer {
                 // Hexadecimal character reference state
                 State::HexadecimalCharacterReference => match current_input_character {
                     Some(cp) if is_ascii_digit(cp) => {
-                        self.character_reference_code =
-                            self.character_reference_code.wrapping_mul(16).wrapping_add(cp - 0x30);
+                        self.character_reference_code = self
+                            .character_reference_code
+                            .saturating_mul(16)
+                            .saturating_add(cp - 0x30);
                         continue;
                     }
                     Some(cp @ 0x41..=0x46) => {
-                        self.character_reference_code =
-                            self.character_reference_code.wrapping_mul(16).wrapping_add(cp - 0x37);
+                        self.character_reference_code = self
+                            .character_reference_code
+                            .saturating_mul(16)
+                            .saturating_add(cp - 0x37);
                         continue;
                     }
                     Some(cp @ 0x61..=0x66) => {
-                        self.character_reference_code =
-                            self.character_reference_code.wrapping_mul(16).wrapping_add(cp - 0x57);
+                        self.character_reference_code = self
+                            .character_reference_code
+                            .saturating_mul(16)
+                            .saturating_add(cp - 0x57);
                         continue;
                     }
                     Some(0x3B) => {
@@ -2991,8 +3055,10 @@ impl HtmlTokenizer {
                 // Decimal character reference state
                 State::DecimalCharacterReference => match current_input_character {
                     Some(cp) if is_ascii_digit(cp) => {
-                        self.character_reference_code =
-                            self.character_reference_code.wrapping_mul(10).wrapping_add(cp - 0x30);
+                        self.character_reference_code = self
+                            .character_reference_code
+                            .saturating_mul(10)
+                            .saturating_add(cp - 0x30);
                         continue;
                     }
                     Some(0x3B) => {

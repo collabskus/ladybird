@@ -33,14 +33,14 @@ struct Stop {
     FetchId fetch_id;
 };
 
-// The answer to a manual-redirect delivery's continuation, given exactly once.
+// The answer to the continuation of a manual redirect a fetch handed over, given at most once.
 struct ResolveRedirect {
     struct Follow { };
     struct AcceptAsFinal { };
     struct Abandon { };
     using Resolution = Variant<Follow, AcceptAsFinal, Abandon>;
 
-    DeliveryId delivery_id;
+    FetchId fetch_id;
     ContinuationId continuation_id;
     Resolution resolution;
 };
@@ -60,6 +60,11 @@ struct CompletedPreloadResponse {
 struct PreloadResponseResolved {
     FetchId fetch_id;
     CompletedPreloadResponse response;
+};
+
+// Main fetch's wait for a preload's response, which the agent can no longer resolve.
+struct PreloadWaitAbandoned {
+    FetchId fetch_id;
 };
 
 struct TransportControl {
@@ -97,6 +102,7 @@ using EngineCommand = Variant<
     Command::Stop,
     Command::ResolveRedirect,
     Command::PreloadResponseResolved,
+    Command::PreloadWaitAbandoned,
     Command::TransportControl,
     Command::NavigationBodyAdopted,
     Command::AdoptNetworkTransport>;

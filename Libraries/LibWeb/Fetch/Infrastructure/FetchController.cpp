@@ -60,7 +60,6 @@ void FetchController::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_algorithms);
     visitor.visit(m_task_destination);
     visitor.visit(m_page);
-    visitor.visit(m_preflighted_fetch_controller);
     visitor.visit(m_pending_preloaded_response);
     visitor.visit(m_stop_steps);
     visitor.visit(m_pending_responses);
@@ -137,9 +136,10 @@ void FetchController::set_report_timing_steps(GC::Ref<GC::Function<void(JS::Obje
     m_report_timing_steps = report_timing_steps;
 }
 
-void FetchController::set_next_manual_redirect_steps(GC::Ref<GC::Function<void()>> next_manual_redirect_steps)
+void FetchController::set_next_manual_redirect_steps(Engine::ContinuationId continuation_id, GC::Ref<GC::Function<void()>> next_manual_redirect_steps)
 {
     m_next_manual_redirect_steps = next_manual_redirect_steps;
+    m_redirect_continuation_id = continuation_id;
 }
 
 // https://fetch.spec.whatwg.org/#finalize-and-report-timing
@@ -162,8 +162,25 @@ void FetchController::process_next_manual_redirect() const
     m_next_manual_redirect_steps->function()();
 }
 
+void FetchController::resolve_redirect(Engine::Command::ResolveRedirect::Resolution resolution)
+{
+    auto continuation_id = exchange(m_redirect_continuation_id, {});
+    if (!continuation_id.has_value())
+        return;
+
+    VERIFY(m_started_fetch.has_value());
+    Engine::Command::ResolveRedirect resolve {
+        .fetch_id = m_started_fetch->fetch_id,
+        .continuation_id = *continuation_id,
+        .resolution = move(resolution),
+    };
+    m_started_fetch->fetch_executor->post(move(resolve));
+}
+
 void FetchController::when_body_ends(Engine::DeliveryId delivery_id, Response& response, GC::Ptr<GC::Function<void(HighResolutionTime::DOMHighResTimeStamp)>> steps)
 {
+    if (m_fetch_ended)
+        return;
     m_awaited_end_of_body = AwaitedEndOfBody { delivery_id, response.make_weak_ptr<Response>(), steps };
 }
 
@@ -178,6 +195,16 @@ void FetchController::did_end_body(Engine::Event::EndOfBody const& end_of_body)
 
     if (awaited.steps)
         awaited.steps->function()(end_of_body.end_time);
+}
+
+void FetchController::did_end_fetch()
+{
+    m_fetch_ended = true;
+    m_awaited_end_of_body.clear();
+
+    VERIFY(m_started_fetch.has_value());
+    if (auto* registry = m_registry.ptr())
+        registry->release_fetch(m_started_fetch->fetch_id);
 }
 
 // https://fetch.spec.whatwg.org/#extract-full-timing-info
@@ -233,7 +260,21 @@ void FetchController::terminate()
 
 void FetchController::set_started_fetch(Engine::FetchId fetch_id, Engine::FetchExecutor& fetch_executor)
 {
+    VERIFY(!m_started_fetch.has_value());
     m_started_fetch = StartedFetch { fetch_id, fetch_executor };
+}
+
+Optional<Engine::FetchId> FetchController::started_fetch_id() const
+{
+    if (!m_started_fetch.has_value())
+        return {};
+    return m_started_fetch->fetch_id;
+}
+
+Engine::FetchExecutor& FetchController::started_fetch_executor() const
+{
+    VERIFY(m_started_fetch.has_value());
+    return *m_started_fetch->fetch_executor;
 }
 
 void FetchController::stop_fetch()

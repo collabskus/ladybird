@@ -15,6 +15,7 @@
 #include <AK/RefPtr.h>
 #include <AK/StringView.h>
 #include <AK/ThreadID.h>
+#include <AK/Variant.h>
 #include <AK/WeakPtr.h>
 #include <AK/Weakable.h>
 #include <AK/kmalloc.h>
@@ -22,6 +23,7 @@
 #include <LibWeb/Fetch/Engine/EngineCommand.h>
 #include <LibWeb/Fetch/Engine/EngineEventSink.h>
 #include <LibWeb/Fetch/Engine/FetchBodyDeliveryGate.h>
+#include <LibWeb/Fetch/Engine/FetchByteChannel.h>
 #include <LibWeb/Fetch/Engine/Ids.h>
 #include <LibWeb/Fetch/Engine/NetworkActivity.h>
 #include <LibWeb/Fetch/Engine/NetworkActivityObservers.h>
@@ -30,6 +32,7 @@
 namespace Web::Fetch::Engine {
 
 class FetchEngineRecords;
+class FetchLoad;
 
 // What the fetch engine keeps of a fetch it has started. Every method runs on the engine's loop, and so does the
 // record's destruction.
@@ -57,23 +60,117 @@ public:
     void set_cors_preflight_body_transport(FetchBodyDeliveryGate::Transport&);
     void stop_cors_preflight_body_transport();
 
+    // For a stop, abort or termination of the fetch: abandons the redirect continuation that is open, and any opened
+    // later, and stops the fetch's body transport.
+    void stop();
+
     void add_network_transport(NetworkTransportHandle&, FetchBodyDeliveryGate&);
 
     // Marks the channel as the body of a response handed over to the agent that started the fetch, and returns the id
     // of that delivery. A Closed channel, whose body has arrived whole, is not marked and gets none.
     Optional<DeliveryId> deliver_body(FetchByteChannel&);
 
+    // Opens the continuation of a manual redirect the fetch hands over, which waits for the agent's answer. The
+    // redirect's response arrived through the given network transport, if any.
+    [[nodiscard]] ContinuationId open_redirect_continuation(NetworkTransportHandle*);
+
+    enum class RedirectAnswerResult : u8 {
+        Settled,
+        // The continuation was settled before, or the id names another one.
+        NotOpen,
+        // Main fetch has not handed the redirect over yet.
+        NotHandedOver,
+    };
+    // Settles the open continuation with the agent's answer once main fetch has handed the redirect over. Abandoning
+    // releases the lease of its network transport and stops the body transport; following lets main fetch run again.
+    [[nodiscard]] RedirectAnswerResult resolve_redirect(ContinuationId, Command::ResolveRedirect::Resolution const&);
+
+    // Starts a load of the fetch's request, which main fetch runs.
+    [[nodiscard]] NonnullRefPtr<FetchLoad> start_load();
+
+    // Main fetch has handed a response over to the agent. Does nothing once main fetch has ended.
+    void main_fetch_handed_over();
+    // Main fetch can no longer hand a response over, and the channel of the body it reads to its end, if any, is
+    // cancelled. Does nothing once main fetch has ended.
+    void main_fetch_cannot_hand_over();
+    // Main fetch waits until the whole of the body in the channel has been read, which never happens once the channel is
+    // cancelled or transferred before its end.
+    void main_fetch_reads_whole_body(FetchByteChannel&);
+
+    // Main fetch waits for a preload's response, until the agent resolves the wait or abandons it.
+    void main_fetch_waits_for_preload();
+    void main_fetch_stops_waiting_for_preload();
+    // Ends main fetch's wait for a preload's response, after which main fetch can no longer hand a response over. Returns
+    // whether main fetch was waiting.
+    [[nodiscard]] bool abandon_preload_wait();
+
+    // Whether the fetch has ended: main fetch has ended, no load is live and no redirect continuation is open.
+    [[nodiscard]] bool has_ended() const { return m_ended; }
+
 private:
     friend class FetchEngineRecords;
+    friend class FetchLoad;
 
     FetchEngineRecord(FetchEngineRecords&, FetchId, NonnullOwnPtr<EngineEventSink>, NonnullRefPtr<NetworkActivityObservers const>);
 
+    [[nodiscard]] bool is_on_owner_thread() const { return m_owner_thread.is_current_thread(); }
+
+    void abandon_redirect();
+    void did_end_load();
+    void end_main_fetch_if_its_read_cannot_end();
+    void end_main_fetch();
+    // Sends the fetch's end as its last event once nothing keeps the fetch from ending.
+    void end_fetch_unless_anything_is_left();
+
+    AK::ThreadID m_owner_thread { AK::ThreadID::current() };
     WeakPtr<FetchEngineRecords> m_records;
     FetchId m_fetch_id;
     NonnullOwnPtr<EngineEventSink> m_event_sink;
     NonnullRefPtr<NetworkActivityObservers const> m_network_activity_observers;
     WeakPtr<FetchBodyDeliveryGate::Transport> m_body_transport;
     WeakPtr<FetchBodyDeliveryGate::Transport> m_cors_preflight_body_transport;
+
+    struct RedirectContinuation {
+        ContinuationId id;
+        WeakPtr<NetworkTransportHandle> network_transport;
+    };
+    Optional<RedirectContinuation> m_redirect_continuation;
+
+    // Whether a stop, abort or termination of the fetch has reached the engine.
+    bool m_stopped { false };
+
+    struct MainFetchRunning { };
+    struct MainFetchWaitsForPreload { };
+    // Main fetch reads the whole of the body in the channel before it hands the response over.
+    struct MainFetchReadsWholeBody {
+        NonnullRefPtr<FetchByteChannel> channel;
+    };
+    struct MainFetchEnded { };
+    Variant<MainFetchRunning, MainFetchWaitsForPreload, MainFetchReadsWholeBody, MainFetchEnded> m_main_fetch { MainFetchRunning {} };
+    size_t m_live_load_count { 0 };
+    bool m_ended { false };
+};
+
+// One load of a fetch's request: from its start until its transport will deliver nothing more.
+class WEB_API FetchLoad final : public RefCounted<FetchLoad> {
+public:
+    // The load has resolved its pending response, possibly with a network error.
+    void did_give_response();
+    // Ends the load, unless it has ended already.
+    void end();
+    // Ends the load at its last callback. Main fetch can no longer hand a response over if the load has not resolved its
+    // pending response.
+    void end_at_its_last_callback();
+    [[nodiscard]] bool has_ended() const { return m_ended; }
+
+private:
+    friend class FetchEngineRecord;
+
+    explicit FetchLoad(FetchEngineRecord&);
+
+    NonnullRefPtr<FetchEngineRecord> m_record;
+    bool m_gave_response { false };
+    bool m_ended { false };
 };
 
 // The records of the fetches an engine has started, by fetch id, and the network transports it controls. A record stays
@@ -100,8 +197,23 @@ public:
     // Reports to the agent a fetch id no higher than that of an earlier start, and returns null for it.
     [[nodiscard]] RefPtr<FetchEngineRecord> start(FetchId, NonnullOwnPtr<EngineEventSink>, NonnullRefPtr<NetworkActivityObservers const>);
 
-    // Does nothing once the fetch's record is gone. Reports to the agent a fetch id above that of every started fetch.
-    void stop_body_transport(FetchId);
+    // Handles a stop, abort or termination of the fetch. Does nothing once the fetch's record is gone. Reports to the
+    // agent a fetch id above that of every started fetch.
+    void stop(FetchId);
+
+    // An answer for a continuation that is not open, or for a fetch whose record is gone, is dropped.
+    struct RedirectAnswerDropped { };
+    struct RedirectAnswerMisbehaved { };
+    using RedirectAnswerOutcome = Variant<NonnullRefPtr<FetchEngineRecord>, RedirectAnswerDropped, RedirectAnswerMisbehaved>;
+
+    // Settles the open continuation the answer names, returning the fetch's record. Reports to the agent a fetch id
+    // above every start, a continuation id above every offer, or an answer before the redirect's handover.
+    [[nodiscard]] RedirectAnswerOutcome resolve_redirect(Command::ResolveRedirect const&);
+    void did_offer_redirect_continuation(Badge<FetchEngineRecord>, ContinuationId);
+
+    // Does nothing once the fetch has ended or its record is gone. Reports to the agent a fetch id above that of every
+    // started fetch, or a fetch whose main fetch does not wait for a preload.
+    void abandon_preload_wait(FetchId);
 
     // Records a network transport, which the agent's transport controls name by the id and transport epoch of its
     // request.
@@ -124,6 +236,7 @@ private:
     NonnullOwnPtr<Agent> m_agent;
     AK::ThreadID m_owner_thread { AK::ThreadID::current() };
     FetchId m_last_started_fetch_id { 0 };
+    ContinuationId m_last_offered_continuation_id { 0 };
     HashMap<FetchId, FetchEngineRecord*> m_records;
 
     struct NetworkTransport {
