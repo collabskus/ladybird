@@ -1,4 +1,1009 @@
-﻿                // FIXME: Report a parse error somehow.
+﻿    auto credentials_mode = cors_setting == CORSSettingAttribute::Anonymous ? Request::CredentialsMode::SameOrigin : Request::CredentialsMode::Include;
+    return get_or_create(document, { url, mode, credentials_mode, {}, ReferrerPolicy::ReferrerPolicy::EmptyString });
+}
+
+GC::Ref<SharedResourceRequest> SharedResourceRequest::get_or_create(DOM::Document& document, Key key)
+{
+    auto& shared_resource_requests = document.shared_resource_requests();
+    if (auto it = shared_resource_requests.find(key); it != shared_resource_requests.end()) {
+        it->value->touch_memory_cache_entry();
+        return *it->value;
+    }
+    auto request = GC::Heap::the().allocate<SharedResourceRequest>(document.page(), key, document);
+    shared_resource_requests.set(move(key), request);
+    return request;
+}
+
+GC::Ref<SharedResourceRequest> SharedResourceRequest::get_or_create(DOM::Document& document, Fetch::Infrastructure::Request const& request)
+{
+    return get_or_create(document, { request.url(), request.mode(), request.credentials_mode(), request.integrity_metadata(), request.referrer_policy() });
+}
+
+GC::Ref<SharedResourceRequest> SharedResourceRequest::create_from_image_response_body(DOM::Document& document, URL::URL const& url, Fetch::Infrastructure::Body const& body, bool is_cors_cross_origin, GC::Ptr<GC::Function<void()>> on_body_read)
+{
+    using Request = Fetch::Infrastructure::Request;
+    auto request = GC::Heap::the().allocate<SharedResourceRequest>(document.page(), Key { url, Request::Mode::NoCORS, Request::CredentialsMode::Include, {}, ReferrerPolicy::ReferrerPolicy::EmptyString }, document);
+    request->m_can_be_shared = false;
+    request->m_state = State::Fetching;
+    // NB: The element that presents the image may start to wait for it only after the body has been read.
+    request->m_load_event_delayer.emplace(document);
+
+    GC::Weak weak_request { *request };
+    auto process_body = GC::create_function(GC::Heap::the(), GC::captures(weak_request, on_body_read, is_cors_cross_origin), [](auto& weak_request, auto& on_body_read, auto is_cors_cross_origin, ByteBuffer data) {
+        // NB: A document for an SVG image is an XML document, so this is never an SVG image.
+        if (auto request = weak_request.ptr())
+            request->handle_successful_fetch(request->url(), IsSVGImage::No, move(data), is_cors_cross_origin);
+        if (on_body_read)
+            on_body_read->function()();
+    });
+    auto process_body_error = GC::create_function(GC::Heap::the(), GC::captures(weak_request, on_body_read), [](auto& weak_request, auto& on_body_read, JS::Value) {
+        if (auto request = weak_request.ptr())
+            request->handle_failed_fetch();
+        if (on_body_read)
+            on_body_read->function()();
+    });
+
+    auto& realm = HTML::relevant_realm(document);
+    body.fully_read(realm, process_body, process_body_error, GC::Ref { realm.global_object() });
+    return request;
+}
+
+SharedResourceRequest::SharedResourceRequest(GC::Ref<Page> page, Key key, GC::Ref<DOM::Document> document)
+    : m_page(page)
+    , m_key(move(key))
+    , m_document(document)
+{
+    touch_memory_cache_entry();
+}
+
+SharedResourceRequest::~SharedResourceRequest() = default;
+
+void SharedResourceRequest::finalize()
+{
+    end_rendering_pending_operation(this);
+    Base::finalize();
+
+    // Don't release m_load_event_delayer or touch m_document here. While we're in our document's shared resource
+    // requests, the document keeps us alive, so if we're being finalized, it is dying in this same collection and may
+    // already have been finalized itself. The delayer is released by our destructor, after the GC has cleared its weak
+    // pointer to a dead document.
+}
+
+void SharedResourceRequest::remove_from_document()
+{
+    auto& shared_resource_requests = m_document->shared_resource_requests();
+    if (auto it = shared_resource_requests.find(m_key); it != shared_resource_requests.end() && it->value.ptr() == this)
+        shared_resource_requests.remove(it);
+}
+
+void SharedResourceRequest::visit_edges(JS::Cell::Visitor& visitor)
+{
+    Base::visit_edges(visitor);
+    visitor.visit(m_fetch_controller);
+    visitor.visit(m_document);
+    visitor.visit(m_page);
+    for (auto& callback : m_callbacks) {
+        visitor.visit(callback.on_finish);
+        visitor.visit(callback.on_fail);
+        visitor.visit(callback.on_stop);
+    }
+    visitor.visit(m_image_data);
+}
+
+GC::Ptr<DecodedImageData> SharedResourceRequest::image_data() const
+{
+    return m_image_data;
+}
+
+bool SharedResourceRequest::can_be_pruned_from_memory_cache() const
+{
+    // NB: Pruning an image that still has clients (e.g. a live element displaying it) frees no memory, since the
+    //     clients keep the decoded data alive, but it forces a refetch if script recreates an element with the
+    //     same URL, e.g. when a framework re-renders the page.
+    return m_image_data && !m_image_data->has_clients();
+}
+
+void SharedResourceRequest::touch_memory_cache_entry()
+{
+    m_cache_touch_serial = ++s_next_memory_cache_touch_serial;
+}
+
+GC::Ptr<Fetch::Infrastructure::FetchController> SharedResourceRequest::fetch_controller()
+{
+    return m_fetch_controller.ptr();
+}
+
+void SharedResourceRequest::set_fetch_controller(GC::Ptr<Fetch::Infrastructure::FetchController> fetch_controller)
+{
+    m_fetch_controller = move(fetch_controller);
+}
+
+void SharedResourceRequest::fetch_resource(NonnullRefPtr<Fetch::Infrastructure::Request> request)
+{
+    auto& realm = HTML::relevant_realm(*m_document);
+    VERIFY(needs_fetching());
+
+    if (!ResourceLoader::is_initialized()) {
+        handle_failed_fetch();
+        return;
+    }
+
+    GC::Weak weak_this { *this };
+    Fetch::Infrastructure::FetchAlgorithms::Input fetch_algorithms_input { Fetch::Engine::BodyIntent::DeliverStreamToConsumerAgent };
+    fetch_algorithms_input.process_response = GC::create_function<void(GC::Ref<Fetch::Infrastructure::ResponseView>)>(GC::Heap::the(), GC::captures(weak_this, realm, request), [](auto& weak_this, auto& realm, auto& request, GC::Ref<Fetch::Infrastructure::ResponseView> response) {
+        auto self = weak_this.ptr();
+        if (!self)
+            return;
+
+        auto image_data_is_cors_cross_origin = response->is_cors_cross_origin();
+
+        // FIXME: If the response is CORS cross-origin, we must use its internal response to query any of its data. See:
+        //        https://github.com/whatwg/html/issues/9355
+        response = response->unsafe_response();
+
+        auto process_body = GC::create_function(GC::Heap::the(), GC::captures(weak_this, request, response, image_data_is_cors_cross_origin), [](auto& weak_this, auto& request, auto& response, auto& image_data_is_cors_cross_origin, ByteBuffer data) {
+            auto self = weak_this.ptr();
+            if (!self)
+                return;
+
+            auto extracted_mime_type = Fetch::Infrastructure::extract_mime_type(response->header_list());
+            auto const is_svg_image = extracted_mime_type.has_value()
+                ? extracted_mime_type.value().essence() == "image/svg+xml"sv
+                : request->url().basename().ends_with(".svg"sv);
+            if (extracted_mime_type.has_value())
+                self->m_image_mime_type = extracted_mime_type->essence();
+            self->handle_successful_fetch(response->url().value_or(request->url()), is_svg_image ? IsSVGImage::Yes : IsSVGImage::No, move(data), image_data_is_cors_cross_origin);
+        });
+        auto process_body_error = GC::create_function(GC::Heap::the(), GC::captures(weak_this), [](auto& weak_this, JS::Value) {
+            auto self = weak_this.ptr();
+            if (!self)
+                return;
+
+            self->handle_failed_fetch();
+        });
+
+        // Check for failed fetch response
+        if (!response->body()) {
+            self->handle_failed_fetch();
+            return;
+        }
+
+        if (!Fetch::Infrastructure::is_ok_status(response->status())) {
+            // NB: Fetch only reports the response's timing once its body has been fully read, so read it without
+            //     holding back the failure.
+            auto ignore_chunk = GC::create_function(GC::Heap::the(), [](ByteBuffer) { });
+            auto ignore_end_of_body = GC::create_function(GC::Heap::the(), [] { });
+            auto ignore_body_error = GC::create_function(GC::Heap::the(), [](JS::Value) { });
+            (void)response->body()->incrementally_read(realm, ignore_chunk, ignore_end_of_body, ignore_body_error, GC::Ref { realm.global_object() });
+            self->handle_failed_fetch();
+            return;
+        }
+
+        response->body()->fully_read(realm, process_body, process_body_error, GC::Ref { realm.global_object() });
+    });
+
+    m_state = State::Fetching;
+    // NB: A user that waits for the fetch decides if the fetch delays the load event; a lazy image's callbacks don't.
+    auto some_waiter_delays = any_of(m_callbacks, [](auto const& callbacks) {
+        return callbacks.id != 0 && callbacks.delays_load_event == DelaysLoadEvent::Yes;
+    });
+    if (m_fetch_has_user_without_callbacks || some_waiter_delays)
+        m_load_event_delayer.emplace(*m_document);
+
+    auto fetch_controller = Fetch::Fetching::fetch(
+        realm,
+        request,
+        Fetch::Infrastructure::FetchAlgorithms::create(move(fetch_algorithms_input)));
+
+    fetch_controller->set_stop_steps(GC::create_function(GC::Heap::the(), GC::captures(weak_this), [](auto& weak_this) {
+        if (auto self = weak_this.ptr())
+            self->handle_stopped_fetch();
+    }));
+    set_fetch_controller(fetch_controller);
+}
+
+void SharedResourceRequest::wait_without_callbacks()
+{
+    m_fetch_has_user_without_callbacks = true;
+    if (m_state == State::Fetching && !m_load_event_delayer.has_value())
+        m_load_event_delayer.emplace(*m_document);
+}
+
+void SharedResourceRequest::add_callbacks(GC::Ptr<GC::Function<void()>> on_finish, GC::Ptr<GC::Function<void()>> on_fail, GC::Ptr<GC::Function<void()>> on_stop)
+{
+    (void)add_removable_callbacks(on_finish, on_fail, on_stop);
+}
+
+Optional<u64> SharedResourceRequest::add_removable_callbacks(GC::Ptr<GC::Function<void()>> on_finish, GC::Ptr<GC::Function<void()>> on_fail, GC::Ptr<GC::Function<void()>> on_stop, DelaysLoadEvent delays_load_event)
+{
+    if (m_state == State::Finished) {
+        if (on_finish)
+            on_finish->function()();
+        return {};
+    }
+
+    if (m_state == State::Failed) {
+        if (on_fail)
+            on_fail->function()();
+        return {};
+    }
+
+    if (m_state == State::Stopped) {
+        if (on_stop)
+            on_stop->function()();
+        return {};
+    }
+
+    Callbacks callbacks;
+    callbacks.id = m_next_callbacks_id++;
+    callbacks.delays_load_event = delays_load_event;
+    callbacks.on_finish = on_finish;
+    callbacks.on_fail = on_fail;
+    callbacks.on_stop = on_stop;
+
+    auto id = callbacks.id;
+    m_callbacks.append(move(callbacks));
+
+    // NB: The fetch may have stopped delaying the load event because nothing waited for it, but now something does.
+    if (m_state == State::Fetching && delays_load_event == DelaysLoadEvent::Yes && !m_load_event_delayer.has_value())
+        m_load_event_delayer.emplace(*m_document);
+    return id;
+}
+
+void SharedResourceRequest::remove_callbacks(u64 id)
+{
+    // NB: The callbacks are only invoked once the request is no longer new or fetching. A callback that is being
+    //     invoked can get here, and the invocation goes on over m_callbacks, so then only mark the entry as no longer
+    //     waiting, and skip it when invoking the callbacks.
+    if (m_state == State::New || m_state == State::Fetching) {
+        m_callbacks.remove_first_matching([id](auto const& callbacks) { return callbacks.id == id; });
+    } else {
+        for (auto& callbacks : m_callbacks) {
+            if (callbacks.id == id)
+                callbacks.id = 0;
+        }
+    }
+
+    // NB: The fetch keeps going so that its result can still be cached, but once nothing waits for it anymore, it
+    //     must not keep delaying the load event of the document.
+    auto nothing_waits = all_of(m_callbacks, [](auto const& callbacks) {
+        return callbacks.id == 0 || callbacks.delays_load_event == DelaysLoadEvent::No;
+    });
+    if (m_state == State::Fetching && nothing_waits && !m_fetch_has_user_without_callbacks)
+        m_load_event_delayer.clear();
+}
+
+void SharedResourceRequest::handle_successful_fetch(URL::URL const& url_string, IsSVGImage is_svg_image, ByteBuffer data, bool image_data_is_cors_cross_origin)
+{
+    begin_rendering_pending_operation(this, *m_document, RenderingPendingReason::ImageDecodes);
+    // AD-HOC: At this point, things gets very ad-hoc.
+    // FIXME: Bring this closer to spec.
+
+    if (is_svg_image == IsSVGImage::Yes) {
+        m_image_mime_type = "image/svg+xml"_string;
+
+        // NB: The decode waits for the image's document to load completely, which it may never do, and its promise keeps
+        //     both handlers. So they hold this request weakly: its document keeps it alive for as long as it is needed.
+        SVG::SVGDecodedImageData::decode(m_page, url_string, data)
+            ->when_resolved([weak_this = GC::Weak { *this }, image_data_is_cors_cross_origin](auto& image_data) {
+                auto self = weak_this.ptr();
+                if (!self)
+                    return;
+                self->m_image_data = image_data.ptr();
+                self->m_image_data->set_is_cors_cross_origin(image_data_is_cors_cross_origin);
+                self->handle_successful_resource_load();
+            })
+            .when_rejected([weak_this = GC::Weak { *this }](Error&) {
+                if (auto self = weak_this.ptr())
+                    self->handle_failed_fetch();
+            });
+        return;
+    }
+
+    // NB: The image's own bytes are a better source than the server's claim, which is often missing or wrong. Formats
+    //     that sniffing does not know keep the claimed type.
+    if (auto sniffed_type = MimeSniff::Resource::sniff(data, { .sniffing_context = MimeSniff::SniffingContext::Image }); sniffed_type.is_image())
+        m_image_mime_type = sniffed_type.essence();
+
+    // NB: Keeping the encoded data lets the decoded image data discard its frame while it is not in use. The decode
+    //     request copies the bytes before it returns, so the handler can own the buffer they are read from.
+    auto encoded_data = make<ByteBuffer>(move(data));
+    auto encoded_bytes = encoded_data->bytes();
+    auto handle_successful_bitmap_decode = [strong_this = GC::Root(*this), image_data_is_cors_cross_origin, encoded_data = move(encoded_data)](Web::Platform::DecodedImage& result) mutable -> ErrorOr<void> {
+        if (result.session_id != 0) {
+            // Streaming animated decode: create AnimatedBitmapDecodedImageData.
+            auto first_frame = Gfx::DecodedImageFrame::create(*result.frames.first().bitmap, result.color_space);
+            if (first_frame.is_error()) {
+                Web::Platform::ImageCodecPlugin::the().stop_animation_decode(result.session_id);
+                return first_frame.release_error();
+            }
+            strong_this->m_image_data = AnimatedBitmapDecodedImageData::create(
+                *strong_this->m_document,
+                result.session_id,
+                result.loop_count,
+                move(result.color_space),
+                move(result.all_durations),
+                first_frame.release_value());
+        } else {
+            // Single-shot decode: create BitmapDecodedImageData as before.
+            Vector<BitmapDecodedImageData::Frame> frames;
+            for (auto& frame : result.frames) {
+                frames.append(BitmapDecodedImageData::Frame {
+                    .frame = TRY(Gfx::DecodedImageFrame::create(*frame.bitmap, result.color_space)),
+                    .duration = static_cast<int>(frame.duration),
+                });
+            }
+            strong_this->m_image_data = BitmapDecodedImageData::create(move(frames), result.loop_count, result.is_animated, move(*encoded_data)).release_value_but_fixme_should_propagate_errors();
+        }
+        strong_this->m_image_data->set_is_cors_cross_origin(image_data_is_cors_cross_origin);
+        strong_this->handle_successful_resource_load();
+        return {};
+    };
+
+    auto handle_failed_decode = [strong_this = GC::Root(*this)](Error&) -> void {
+        strong_this->handle_failed_fetch();
+    };
+
+    (void)Web::Platform::ImageCodecPlugin::the().decode_image(encoded_bytes, move(handle_successful_bitmap_decode), move(handle_failed_decode));
+}
+
+void SharedResourceRequest::handle_failed_fetch()
+{
+    end_rendering_pending_operation(this);
+    m_state = State::Failed;
+    m_load_event_delayer.clear();
+    m_fetch_controller = nullptr;
+    for (auto& callback : m_callbacks) {
+        if (callback.id != 0 && callback.on_fail)
+            callback.on_fail->function()();
+    }
+    m_callbacks.clear();
+}
+
+// NB: A stopped fetch never responds, so nothing waits on it anymore, and a later request for the URL
+//     fetches it again.
+void SharedResourceRequest::response_body_fetch_was_stopped()
+{
+    handle_stopped_fetch();
+}
+
+void SharedResourceRequest::handle_stopped_fetch()
+{
+    if (m_state != State::Fetching)
+        return;
+
+    end_rendering_pending_operation(this);
+    m_state = State::Stopped;
+    remove_from_document();
+    m_load_event_delayer.clear();
+    m_fetch_controller = nullptr;
+    for (auto& callback : m_callbacks) {
+        if (callback.id != 0 && callback.on_stop)
+            callback.on_stop->function()();
+    }
+    m_callbacks.clear();
+}
+
+void SharedResourceRequest::handle_successful_resource_load()
+{
+    end_rendering_pending_operation(this);
+    m_state = State::Finished;
+    m_load_event_delayer.clear();
+    m_fetch_controller = nullptr;
+    for (auto& callback : m_callbacks) {
+        if (callback.id != 0 && callback.on_finish)
+            callback.on_finish->function()();
+    }
+    m_callbacks.clear();
+    m_document->prune_image_resource_caches();
+}
+
+bool SharedResourceRequest::needs_fetching() const
+{
+    return m_state == State::New;
+}
+
+bool SharedResourceRequest::is_fetching() const
+{
+    return m_state == State::Fetching;
+}
+
+}
+
+FILE: Libraries/LibWeb/HTML/SharedResourceRequest.h
+/*
+ * Copyright (c) 2023, Andreas Kling <andreas@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Utf16String.h>
+#include <LibGC/Function.h>
+#include <LibGC/Ptr.h>
+#include <LibJS/Heap/Cell.h>
+#include <LibURL/URL.h>
+#include <LibWeb/DOM/DocumentLoadEventDelayer.h>
+#include <LibWeb/Forward.h>
+#include <LibWeb/HTML/CORSSettingAttribute.h>
+#include <LibWebCommon/ReferrerPolicy/ReferrerPolicy.h>
+
+namespace Web::HTML {
+
+class SharedResourceRequest final : public JS::Cell {
+    GC_CELL(SharedResourceRequest, JS::Cell);
+    GC_DECLARE_ALLOCATOR(SharedResourceRequest);
+
+public:
+    // NB: Only requests with the same mode, credentials mode, integrity metadata and referrer policy share a
+    //     resource. The origin is the same for every request of a document.
+    struct Key {
+        URL::URL url;
+        Fetch::Infrastructure::Request::Mode mode;
+        Fetch::Infrastructure::Request::CredentialsMode credentials_mode;
+        Utf16String integrity_metadata;
+        ReferrerPolicy::ReferrerPolicy referrer_policy { ReferrerPolicy::ReferrerPolicy::EmptyString };
+
+        [[nodiscard]] bool operator==(Key const&) const = default;
+    };
+
+    [[nodiscard]] static GC::Ref<SharedResourceRequest> get_or_create(DOM::Document&, URL::URL const&, CORSSettingAttribute);
+    [[nodiscard]] static GC::Ref<SharedResourceRequest> get_or_create(DOM::Document&, Fetch::Infrastructure::Request const&);
+
+    // Creates a private request that decodes a raster image from the body of a response,
+    // instead of fetching it. No fetch checks this resource against the policies of the document, so it is only for
+    // the element that presents it, and get_or_create() never returns it.
+    // Calls on_body_read once reading the body has ended, whether or not that succeeded.
+    [[nodiscard]] static GC::Ref<SharedResourceRequest> create_from_image_response_body(DOM::Document&, URL::URL const&, Fetch::Infrastructure::Body const&, bool is_cors_cross_origin, GC::Ptr<GC::Function<void()>> on_body_read);
+
+    // Ends a request created from a response body whose fetch was stopped or is no longer wanted, as that body will
+    // never be read to its end. Does nothing once the request has finished.
+    void response_body_fetch_was_stopped();
+
+    virtual ~SharedResourceRequest() override;
+
+    URL::URL const& url() const { return m_key.url; }
+    Key const& key() const { return m_key; }
+    Optional<String> const& image_mime_type() const { return m_image_mime_type; }
+    [[nodiscard]] bool can_be_shared() const { return m_can_be_shared; }
+
+    [[nodiscard]] GC::Ptr<DecodedImageData> image_data() const;
+    [[nodiscard]] bool can_be_pruned_from_memory_cache() const;
+    [[nodiscard]] u64 cache_touch_serial() const { return m_cache_touch_serial; }
+    void touch_memory_cache_entry();
+
+    [[nodiscard]] GC::Ptr<Fetch::Infrastructure::FetchController> fetch_controller();
+    void set_fetch_controller(GC::Ptr<Fetch::Infrastructure::FetchController>);
+
+    void fetch_resource(NonnullRefPtr<Fetch::Infrastructure::Request>);
+
+    // Records a user that waits for the fetch without callbacks, so that the fetch delays the load event for it.
+    void wait_without_callbacks();
+
+    void add_callbacks(GC::Ptr<GC::Function<void()>> on_finish, GC::Ptr<GC::Function<void()>> on_fail, GC::Ptr<GC::Function<void()>> on_stop = {});
+
+    enum class DelaysLoadEvent : u8 {
+        No,
+        Yes,
+    };
+
+    // Returns an ID for remove_callbacks(), or nothing if the callbacks already ran.
+    Optional<u64> add_removable_callbacks(GC::Ptr<GC::Function<void()>> on_finish, GC::Ptr<GC::Function<void()>> on_fail, GC::Ptr<GC::Function<void()>> on_stop = {}, DelaysLoadEvent = DelaysLoadEvent::Yes);
+    void remove_callbacks(u64 id);
+
+    bool is_fetching() const;
+    bool needs_fetching() const;
+
+private:
+    [[nodiscard]] static GC::Ref<SharedResourceRequest> get_or_create(DOM::Document&, Key);
+
+    explicit SharedResourceRequest(GC::Ref<Page>, Key, GC::Ref<DOM::Document>);
+
+    virtual void finalize() override;
+    virtual void visit_edges(JS::Cell::Visitor&) override;
+
+    enum class IsSVGImage {
+        No,
+        Yes,
+    };
+
+    void handle_successful_fetch(URL::URL const&, IsSVGImage, ByteBuffer data, bool image_data_is_cors_cross_origin);
+    void handle_failed_fetch();
+    void handle_stopped_fetch();
+    void handle_successful_resource_load();
+    void remove_from_document();
+
+    enum class State {
+        New,
+        Fetching,
+        Finished,
+        Failed,
+        Stopped,
+    };
+
+    State m_state { State::New };
+    Optional<String> m_image_mime_type;
+
+    GC::Ref<Page> m_page;
+
+    struct Callbacks {
+        // NB: Zero when nothing waits for these callbacks anymore.
+        u64 id { 0 };
+        DelaysLoadEvent delays_load_event { DelaysLoadEvent::Yes };
+        GC::Ptr<GC::Function<void()>> on_finish;
+        GC::Ptr<GC::Function<void()>> on_fail;
+        GC::Ptr<GC::Function<void()>> on_stop;
+    };
+    Vector<Callbacks> m_callbacks;
+    u64 m_next_callbacks_id { 1 };
+
+    // NB: Set once a user waits for the fetch without callbacks.
+    bool m_fetch_has_user_without_callbacks { false };
+
+    Key m_key;
+    bool m_can_be_shared { true };
+    GC::Ptr<DecodedImageData> m_image_data;
+    GC::Ptr<Fetch::Infrastructure::FetchController> m_fetch_controller;
+    u64 m_cache_touch_serial { 0 };
+
+    GC::Ptr<DOM::Document> m_document;
+
+    Optional<DOM::DocumentLoadEventDelayer> m_load_event_delayer;
+};
+
+}
+
+namespace AK {
+
+template<>
+struct Traits<Web::HTML::SharedResourceRequest::Key> : public DefaultTraits<Web::HTML::SharedResourceRequest::Key> {
+    static unsigned hash(Web::HTML::SharedResourceRequest::Key const& key)
+    {
+        auto hash = pair_int_hash(Traits<URL::URL>::hash(key.url), to_underlying(key.mode));
+        hash = pair_int_hash(hash, to_underlying(key.credentials_mode));
+        hash = pair_int_hash(hash, key.integrity_metadata.hash());
+        return pair_int_hash(hash, to_underlying(key.referrer_policy));
+    }
+};
+
+}
+
+FILE: Libraries/LibWeb/HTML/SharedWorker.cpp
+/*
+ * Copyright (c) 2025, Tim Flynn <trflynn89@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <LibGC/Heap.h>
+#include <LibWeb/DOM/Document.h>
+#include <LibWeb/DOM/Event.h>
+#include <LibWeb/HTML/EventLoop/EventLoop.h>
+#include <LibWeb/HTML/EventNames.h>
+#include <LibWeb/HTML/MessageEvent.h>
+#include <LibWeb/HTML/MessagePort.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
+#include <LibWeb/HTML/SharedWorker.h>
+#include <LibWeb/HTML/Window.h>
+#include <LibWeb/HTML/WindowOrWorkerGlobalScope.h>
+#include <LibWeb/HTML/Worker.h>
+#include <LibWeb/TrustedTypes/RequireTrustedTypesForDirective.h>
+#include <LibWeb/TrustedTypes/TrustedTypePolicy.h>
+
+namespace Web::HTML {
+
+GC_DEFINE_ALLOCATOR(SharedWorker);
+
+WebIDL::ExceptionOr<GC::Ref<SharedWorker>> SharedWorker::create_for_constructor(JS::Object& relevant_global_object, TrustedTypes::TrustedScriptURLOrString const& script_url, Variant<Utf16String, Bindings::SharedWorkerOptions> options)
+{
+    return create(HTML::relevant_window_or_worker_global_scope(relevant_global_object), script_url, move(options));
+}
+
+// https://html.spec.whatwg.org/multipage/workers.html#dom-sharedworker
+WebIDL::ExceptionOr<GC::Ref<SharedWorker>> SharedWorker::create(WindowOrWorkerGlobalScopeMixin& global_scope, TrustedTypes::TrustedScriptURLOrString const& script_url, Variant<Utf16String, Bindings::SharedWorkerOptions> options_value)
+{
+    // 1. Let compliantScriptURL be the result of invoking the get trusted type compliant string algorithm with
+    //    TrustedScriptURL, this's relevant global object, scriptURL, "SharedWorker constructor", and "script".
+    auto const compliant_script_url = TRY(get_trusted_type_compliant_string(
+        TrustedTypes::TrustedTypeName::TrustedScriptURL,
+        HTML::relevant_global_object(global_scope),
+        script_url,
+        TrustedTypes::InjectionSink::SharedWorker_constructor,
+        TrustedTypes::Script.view()));
+
+    // 2. If options is a DOMString, set options to a new Bindings::SharedWorkerOptions dictionary whose name member is
+    //    set to the value of options and whose other members are set to their default values.
+    auto options = options_value.visit(
+        [](Utf16String const& name) {
+            Bindings::SharedWorkerOptions options;
+            options.name = name;
+            return options;
+        },
+        [&](Bindings::SharedWorkerOptions& options) {
+            return move(options);
+        });
+
+    // 3. Let outside settings be this's relevant settings object.
+    auto& outside_settings = HTML::relevant_settings_object(global_scope);
+
+    // 4. Let urlRecord be the result of encoding-parsing a URL given compliantScriptURL, relative to outsideSettings.
+    auto url = outside_settings.encoding_parse_url(compliant_script_url.utf16_view());
+
+    // 5. If urlRecord is failure, then throw a "SyntaxError" DOMException.
+    if (!url.has_value())
+        return WebIDL::SyntaxError::create("SharedWorker constructed with invalid URL"_utf16);
+
+    // 6. Let outsidePort be a new MessagePort in outsideSettings's realm.
+    auto outside_port = MessagePort::create(outside_settings.realm());
+
+    // 10. Let worker be this.
+    // AD-HOC: We do this first so that we can use `this`.
+
+    // 7. Set this's port to outsidePort.
+    auto worker = GC::Heap::the().allocate<SharedWorker>(
+        global_scope.this_impl(), url.release_value(), options, outside_port);
+
+    // 10. Let worker be this.
+    // NB: This is done earlier.
+
+    // 11. Enqueue the following steps to the shared worker manager:
+    // The actual shared worker manager is owned by the UI process. It will either start a new
+    // worker agent or transfer this port to an existing same-key SharedWorkerGlobalScope.
+    run_a_worker(worker, worker->m_script_url, outside_settings, outside_port, worker->m_options);
+
+    return worker;
+}
+
+SharedWorker::SharedWorker(GC::Ref<DOM::EventTarget> relevant_global_object, URL::URL script_url,
+    Bindings::SharedWorkerOptions options, MessagePort& port)
+    : m_script_url(move(script_url))
+    , m_options(move(options))
+    , m_port(port)
+    , m_global_object(relevant_global_object)
+{
+}
+
+SharedWorker::~SharedWorker() = default;
+
+void SharedWorker::visit_edges(Cell::Visitor& visitor)
+{
+    Base::visit_edges(visitor);
+    visitor.visit(m_port);
+    visitor.visit(m_global_object);
+    visitor.visit(m_agent);
+}
+
+JS::Object& SharedWorker::relevant_global_object() const
+{
+    return HTML::relevant_global_object(HTML::relevant_window_or_worker_global_scope(*m_global_object));
+}
+
+}
+
+FILE: Libraries/LibWeb/HTML/SharedWorker.h
+/*
+ * Copyright (c) 2025, Tim Flynn <trflynn89@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Utf16String.h>
+#include <LibURL/URL.h>
+#include <LibWeb/Bindings/SharedWorker.h>
+#include <LibWeb/Forward.h>
+#include <LibWeb/HTML/AbstractWorker.h>
+#include <LibWeb/HTML/WorkerAgentParent.h>
+#include <LibWeb/TrustedTypes/TrustedScriptURL.h>
+#include <LibWeb/WebIDL/ExceptionOr.h>
+
+namespace Web::HTML {
+
+// https://html.spec.whatwg.org/multipage/workers.html#dedicated-workers-and-the-worker-interface
+class SharedWorker final
+    : public DOM::EventTarget
+    , public HTML::AbstractWorker {
+    WEB_WRAPPABLE(SharedWorker, DOM::EventTarget);
+    GC_DECLARE_ALLOCATOR(SharedWorker);
+
+public:
+    static WebIDL::ExceptionOr<GC::Ref<SharedWorker>> create_for_constructor(JS::Object&, TrustedTypes::TrustedScriptURLOrString const& script_url, Variant<Utf16String, Bindings::SharedWorkerOptions> options);
+    static WebIDL::ExceptionOr<GC::Ref<SharedWorker>> create(WindowOrWorkerGlobalScopeMixin&, TrustedTypes::TrustedScriptURLOrString const& script_url, Variant<Utf16String, Bindings::SharedWorkerOptions> options);
+
+    virtual ~SharedWorker();
+
+    // https://html.spec.whatwg.org/multipage/workers.html#dom-sharedworker-port
+    GC::Ref<MessagePort> port()
+    {
+        // The port getter steps are to return this's port.
+        return m_port;
+    }
+
+    Bindings::SharedWorkerOptions const& options() const { return m_options; }
+
+    void set_agent(WorkerAgentParent& agent) { m_agent = agent; }
+
+private:
+    SharedWorker(GC::Ref<DOM::EventTarget> relevant_global_object, URL::URL script_url, Bindings::SharedWorkerOptions, MessagePort&);
+
+    JS::Object& relevant_global_object() const;
+
+    // ^AbstractWorker
+    virtual DOM::EventTarget& this_event_target() override { return *this; }
+    virtual void visit_edges(Cell::Visitor&) override;
+
+    URL::URL m_script_url;
+    Bindings::SharedWorkerOptions m_options;
+
+    // Each SharedWorker has a port, a MessagePort set when the object is created.
+    // https://html.spec.whatwg.org/multipage/workers.html#concept-sharedworker-port
+    GC::Ref<MessagePort> m_port;
+    GC::Ref<DOM::EventTarget> m_global_object;
+
+    GC::Ptr<WorkerAgentParent> m_agent;
+};
+
+}
+
+FILE: Libraries/LibWeb/HTML/SharedWorker.idl
+// https://html.spec.whatwg.org/multipage/workers.html#sharedworker
+[Exposed=Window]
+interface SharedWorker : EventTarget {
+    constructor((TrustedScriptURL or USVString) scriptURL, optional (DOMString or SharedWorkerOptions) options = {});
+
+    readonly attribute MessagePort port;
+};
+
+dictionary SharedWorkerOptions : WorkerOptions {
+    boolean extendedLifetime = false;
+};
+
+SharedWorker includes AbstractWorker;
+
+FILE: Libraries/LibWeb/HTML/SharedWorkerGlobalScope.cpp
+/*
+ * Copyright (c) 2025, Tim Flynn <trflynn89@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/Diagnostics.h>
+#include <LibWeb/HTML/SharedWorkerGlobalScope.h>
+#include <LibWeb/Page/Page.h>
+
+namespace Web::HTML {
+
+GC_DEFINE_ALLOCATOR(SharedWorkerGlobalScope);
+
+HashTable<GC::RawRef<SharedWorkerGlobalScope>>& all_shared_worker_global_scopes()
+{
+    // NB: Free what this thread kept when it exits.
+#ifdef AK_COMPILER_CLANG
+    AK_IGNORE_DIAGNOSTIC("-Wexit-time-destructors", static thread_local HashTable<GC::RawRef<SharedWorkerGlobalScope>> set)
+#else
+    static thread_local HashTable<GC::RawRef<SharedWorkerGlobalScope>> set;
+#endif
+    return set;
+}
+
+SharedWorkerGlobalScope::SharedWorkerGlobalScope(GC::Ref<Web::Page> page)
+    : WorkerGlobalScope(page)
+{
+    all_shared_worker_global_scopes().set(*this);
+}
+
+SharedWorkerGlobalScope::~SharedWorkerGlobalScope() = default;
+
+void SharedWorkerGlobalScope::finalize()
+{
+    Base::finalize();
+    WindowOrWorkerGlobalScopeMixin::finalize();
+
+    all_shared_worker_global_scopes().remove(*this);
+}
+
+// https://html.spec.whatwg.org/multipage/workers.html#dom-sharedworkerglobalscope-close
+void SharedWorkerGlobalScope::close()
+{
+    // The close() method steps are to close a worker given this.
+    close_a_worker();
+
+    // NB: This script can run on for as long as it wants to. The UI process has to know by the time it returns, as a
+    //     constructor that runs after that may not pick a global whose closing flag is true.
+    page()->client().page_did_close_shared_worker();
+}
+
+#define __ENUMERATE(attribute_name, event_name)                                     \
+    void SharedWorkerGlobalScope::set_##attribute_name(WebIDL::CallbackType* value) \
+    {                                                                               \
+        set_event_handler_attribute(event_name, move(value));                       \
+    }                                                                               \
+                                                                                    \
+    WebIDL::CallbackType* SharedWorkerGlobalScope::attribute_name()                 \
+    {                                                                               \
+        return event_handler_attribute(event_name);                                 \
+    }
+ENUMERATE_SHARED_WORKER_GLOBAL_SCOPE_EVENT_HANDLERS(__ENUMERATE)
+#undef __ENUMERATE
+
+}
+
+FILE: Libraries/LibWeb/HTML/SharedWorkerGlobalScope.h
+/*
+ * Copyright (c) 2025, Tim Flynn <trflynn89@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/HashTable.h>
+#include <LibJS/Forward.h>
+#include <LibWeb/Export.h>
+#include <LibWeb/HTML/WorkerGlobalScope.h>
+
+namespace Web::HTML {
+
+#define ENUMERATE_SHARED_WORKER_GLOBAL_SCOPE_EVENT_HANDLERS(E) \
+    E(onconnect, HTML::EventNames::connect)
+
+class WEB_API SharedWorkerGlobalScope
+    : public WorkerGlobalScope {
+    WEB_WRAPPABLE(SharedWorkerGlobalScope, WorkerGlobalScope);
+    GC_DECLARE_ALLOCATOR(SharedWorkerGlobalScope);
+
+public:
+    virtual ~SharedWorkerGlobalScope() override;
+
+    void set_constructor_origin(URL::Origin origin) { m_constructor_origin = move(origin); }
+    URL::Origin const& constructor_origin() const { return m_constructor_origin.value(); }
+
+    void set_constructor_url(URL::URL url) { m_constructor_url = move(url); }
+    URL::URL const& constructor_url() const { return m_constructor_url; }
+
+    Fetch::Infrastructure::Request::CredentialsMode credentials() const { return m_credentials; }
+    void set_credentials(Fetch::Infrastructure::Request::CredentialsMode credentials) { m_credentials = credentials; }
+
+    void close();
+
+#define __ENUMERATE(attribute_name, event_name)       \
+    void set_##attribute_name(WebIDL::CallbackType*); \
+    WebIDL::CallbackType* attribute_name();
+    ENUMERATE_SHARED_WORKER_GLOBAL_SCOPE_EVENT_HANDLERS(__ENUMERATE)
+#undef __ENUMERATE
+
+private:
+    explicit SharedWorkerGlobalScope(GC::Ref<Web::Page>);
+
+    virtual void initialize_web_interfaces_impl() override;
+    virtual void finalize() override;
+
+    Optional<URL::Origin> m_constructor_origin;
+    URL::URL m_constructor_url;
+    Fetch::Infrastructure::Request::CredentialsMode m_credentials;
+};
+
+HashTable<GC::RawRef<SharedWorkerGlobalScope>>& all_shared_worker_global_scopes();
+
+}
+
+FILE: Libraries/LibWeb/HTML/SharedWorkerGlobalScope.idl
+// https://html.spec.whatwg.org/multipage/workers.html#sharedworkerglobalscope
+[Global=(Worker,SharedWorker),Exposed=SharedWorker]
+interface SharedWorkerGlobalScope : WorkerGlobalScope {
+    [Replaceable] readonly attribute DOMString name;
+
+    undefined close();
+
+    attribute EventHandler onconnect;
+};
+
+FILE: Libraries/LibWeb/HTML/SourceSet.cpp
+/*
+ * Copyright (c) 2023, Andreas Kling <andreas@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/AllOf.h>
+#include <AK/Function.h>
+#include <AK/HashMap.h>
+#include <AK/QuickSort.h>
+#include <LibWeb/CSS/Parser/Parser.h>
+#include <LibWeb/DOM/Document.h>
+#include <LibWeb/HTML/Numbers.h>
+#include <LibWeb/HTML/SourceSet.h>
+#include <LibWeb/Layout/Node.h>
+#include <LibWebCommon/Infra/CharacterTypes.h>
+
+namespace Web::HTML {
+
+SourceSet::SourceSet()
+    // Note: m_source_size always gets reassigned to its proper value during one of the construction algorithms.
+    //       0px is just a fake value here so that we don't have to muddy the type system by using Optional.
+    : m_source_size(CSS::LengthStyleValue::create(CSS::Length::make_px(0)))
+{
+}
+
+bool SourceSet::is_empty() const
+{
+    return m_sources.is_empty();
+}
+
+static double pixel_density(ImageSource const& image_source)
+{
+    return image_source.descriptor.get<ImageSource::PixelDensityDescriptorValue>().value;
+}
+
+// https://html.spec.whatwg.org/multipage/images.html#select-an-image-source-from-a-source-set
+ImageSourceAndPixelDensity SourceSet::select_an_image_source(double device_pixel_ratio)
+{
+    // 1. If an entry b in sourceSet has the same associated pixel density descriptor as an earlier entry a in sourceSet,
+    //    then remove entry b.
+    //    Repeat this step until none of the entries in sourceSet have the same associated pixel density descriptor
+    //    as an earlier entry.
+
+    Vector<ImageSource> unique_pixel_density_sources;
+    HashMap<double, ImageSource> unique_pixel_density_sources_map;
+    for (auto const& source : m_sources) {
+        auto source_pixel_density = pixel_density(source);
+        if (!unique_pixel_density_sources_map.contains(source_pixel_density)) {
+            unique_pixel_density_sources.append(source);
+            unique_pixel_density_sources_map.set(source_pixel_density, source);
+        }
+    }
+
+    // 2. In an implementation-defined manner, choose one image source from sourceSet. Let selectedSource be this choice.
+    //    NB: Match other engines by selecting the lowest density that is at least the display's device pixel ratio,
+    //        otherwise the greatest density available.
+    // 3. Return selectedSource and its associated pixel density.
+
+    quick_sort(unique_pixel_density_sources, [](auto& a, auto& b) {
+        return pixel_density(a) < pixel_density(b);
+    });
+    for (auto const& source : unique_pixel_density_sources) {
+        if (pixel_density(source) >= device_pixel_ratio) {
+            return { source, pixel_density(source) };
+        }
+    }
+
+    return { unique_pixel_density_sources.last(), pixel_density(unique_pixel_density_sources.last()) };
+}
+
+static Utf16View collect_a_sequence_of_code_points(Function<bool(u32 code_point)> condition, Utf16View input, size_t& position)
+{
+    // 1. Let result be the empty string.
+    // 2. While position doesn’t point past the end of input and the code point at position within input meets the condition condition:
+    //    1. Append that code point to the end of result.
+    //    2. Advance position by 1.
+    // 3. Return result.
+
+    size_t start = position;
+    while (position < input.length_in_code_units() && condition(input.code_unit_at(position)))
+        ++position;
+    return input.substring_view(start, position - start);
+}
+
+// https://html.spec.whatwg.org/multipage/images.html#parse-a-srcset-attribute
+SourceSet parse_a_srcset_attribute(Utf16View input)
+{
+    // 1. Let input be the value passed to this algorithm.
+
+    // 2. Let position be a pointer into input, initially pointing at the start of the string.
+    size_t position = 0;
+
+    // 3. Let candidates be an initially empty source set.
+    SourceSet candidates;
+
+splitting_loop:
+    // 4. Splitting loop: Collect a sequence of code points that are ASCII whitespace or U+002C COMMA characters from input given position.
+    //    If any U+002C COMMA characters were collected, that is a parse error.
+    collect_a_sequence_of_code_points(
+        [](u32 code_point) {
+            if (code_point == ',') {
+                // FIXME: Report a parse error somehow.
                 return true;
             }
             return Infra::is_ascii_whitespace(code_point);
@@ -17690,6 +18695,7 @@ FILE: Libraries/LibWeb/Internals/Internals.cpp
 #include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/Fetch/Infrastructure/NetworkPartitionKey.h>
 #include <LibWeb/Geolocation/Geolocation.h>
+#include <LibWeb/Geometry/DOMPointReadOnly.h>
 #include <LibWeb/Geometry/DOMRect.h>
 #include <LibWeb/HTML/AnimatedBitmapDecodedImageData.h>
 #include <LibWeb/HTML/AutoplaySettings.h>
@@ -20693,6 +21699,14 @@ GC::Ptr<Geometry::DOMRect> Internals::presented_border_box(DOM::Element& element
     return Geometry::DOMRect::create(rect.x().to_double(), rect.y().to_double(), rect.width().to_double(), rect.height().to_double());
 }
 
+GC::Ptr<Geometry::DOMPointReadOnly> Internals::presented_scroll_offset(DOM::Element& scroller)
+{
+    CSSPixelPoint offset;
+    if (!scroller.style_node_id() || !Layout::RustFFI::document_host_presented_scroll_offset(scroller.document().layout_node_arena().host(), scroller.style_node_id().value(), &offset))
+        return nullptr;
+    return Geometry::DOMPointReadOnly::create(offset.x().to_double(), offset.y().to_double());
+}
+
 Optional<Vector<String>> Internals::presented_compositor_animations(DOM::Element& element)
 {
     u32 properties = 0;
@@ -22082,6 +23096,7 @@ public:
     Utf16String presented_selection();
     Utf16String painted_selection();
     GC::Ptr<Geometry::DOMRect> presented_border_box(DOM::Element&);
+    GC::Ptr<Geometry::DOMPointReadOnly> presented_scroll_offset(DOM::Element&);
     Optional<Vector<String>> presented_compositor_animations(DOM::Element&);
     Optional<double> presented_opacity(DOM::Element&);
     Optional<String> presented_color(DOM::Element&, Optional<Utf16String> const& pseudo_element);
@@ -22586,6 +23601,9 @@ interface Internals {
     DOMString paintedSelection();
     // The border box of the element in the last frame a clock tick presented.
     DOMRect? presentedBorderBox(Element element);
+    // The scroll position in CSS pixels the last frame a clock tick presented was recorded with, or null if the frame
+    // had no scroll node for the element.
+    DOMPointReadOnly? presentedScrollOffset(Element scroller);
     // The properties compositor animations drove on the box of the element in the last frame a clock tick presented, or
     // null where the frame showed no border box of it.
     sequence<DOMString>? presentedCompositorAnimations(Element element);
@@ -164091,6 +165109,12 @@ fn parse_font_shorthand(context: &ParseContext, values: &[ComponentValue]) -> Pa
     let mut font_variant = None;
     let mut font_weight = None;
     let mut font_width = None;
+    // https://quirks.spec.whatwg.org/#the-unitless-length-quirk
+    // The font-size longhand accepts quirky lengths, but the font shorthand does not.
+    let size_context = ParseContext {
+        in_quirks_mode: false,
+        ..*context
+    };
     let mut normal_count = 0;
     let mut index = 0;
     while index < components.len() {
@@ -164124,7 +165148,7 @@ fn parse_font_shorthand(context: &ParseContext, values: &[ComponentValue]) -> Pa
             index += 1;
             continue;
         }
-        if let Some(font_size) = parse_component_for_property(context, property_id::FONT_SIZE, component) {
+        if let Some(font_size) = parse_component_for_property(&size_context, property_id::FONT_SIZE, component) {
             index += 1;
             let line_height = if components.get(index).is_some_and(|value| value.is_delim(b'/')) {
                 index += 1;
@@ -196327,6 +197351,53 @@ fn cascade_layer_order<'a>(sheets: impl IntoIterator<Item = &'a NativeStyleSheet
     let mut result = Vec::with_capacity(children.len());
     flatten(0, &children, &mut qualified, &mut result);
     result
+}
+
+/// Visit font-face rules in document order and report each rule's normal cascade layer precedence.
+///
+/// # Safety
+/// The array and its sheets must be live for this call. The callback must not mutate the sheets.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_style_sheets_visit_font_face_rules(
+    sheets: *const *const NativeStyleSheet,
+    count: usize,
+    context: *mut c_void,
+    visit: unsafe extern "C" fn(*mut c_void, u64, usize),
+) {
+    if count == 0 {
+        return;
+    }
+    let sheets = unsafe { ak::slice_from_raw_parts(sheets, count) };
+    let active_sheets = || {
+        sheets
+            .iter()
+            .map(|&sheet| unsafe { &*sheet })
+            .filter(|sheet| sheet.media.matches())
+    };
+    let mut ranks = None;
+    for sheet in active_sheets() {
+        sheet.visit_effective_rule_data(FfiRuleTraversalOrder::Preorder, &[], &mut |rule, prefix, _| {
+            if rule.rule_type() != NativeRuleType::FontFace {
+                return;
+            }
+            let rank = if prefix.is_empty() {
+                usize::MAX
+            } else {
+                let ranks = ranks.get_or_insert_with(|| {
+                    cascade_layer_order(active_sheets())
+                        .into_iter()
+                        .enumerate()
+                        .map(|(rank, name)| (name, rank))
+                        .collect::<HashMap<_, _>>()
+                });
+                let Some(&rank) = ranks.get(prefix) else {
+                    return;
+                };
+                rank
+            };
+            unsafe { visit(context, rule.identity(), rank) };
+        });
+    }
 }
 
 /// Publish the layer order of the host's ordered, active author sheets.
@@ -324336,7 +325407,7 @@ impl LinksHeldApartFromTheirContainingBlocks {
             .push(node);
     }
 
-    fn remove(&mut self, node: NodeSlotId) {
+    pub(super) fn remove(&mut self, node: NodeSlotId) {
         if let Some(containing_block) = self.containing_block_of.remove(&node) {
             self.remove_from(containing_block, node);
         }
@@ -324573,6 +325644,44 @@ mod tests {
     use crate::css::computed_values::{ComputedLengthPercentageOrAuto, ComputedStyleValueHandle};
     use crate::css::css_enums::overflow;
     use crate::css::style::layout_style::LayoutScratchStyle;
+
+    #[test]
+    fn discarded_fragment_links_leave_the_containing_block_index() {
+        let mut arena = LayoutNodeArena::new();
+        let container = arena.allocate_for_test().slot;
+        let cleared = arena.allocate_for_test().slot;
+        let freed = arena.allocate_for_test().slot;
+        for child in [cleared, freed] {
+            arena.set_committed_fragment_link(child, FragmentLink::for_test(child), None);
+            arena.note_whether_link_is_held_apart_from_its_containing_block(child, container, true);
+        }
+        assert_eq!(
+            arena
+                .links_held_apart_from_their_containing_blocks
+                .held_apart_from(container),
+            &[cleared, freed]
+        );
+
+        arena.clear_committed_fragment_link(cleared);
+        assert_eq!(
+            arena
+                .links_held_apart_from_their_containing_blocks
+                .held_apart_from(container),
+            &[freed]
+        );
+
+        let main_thread = crate::stage::MainThread::for_test();
+        arena
+            .free_subtree(freed)
+            .destroy_shells_and_invoke_callbacks(&main_thread);
+        assert!(arena.links_held_apart_from_their_containing_blocks.is_empty());
+
+        for row in [cleared, container] {
+            arena
+                .free_subtree(row)
+                .destroy_shells_and_invoke_callbacks(&main_thread);
+        }
+    }
 
     #[test]
     fn overflow_percentage_margins_use_the_containing_blocks_inline_size() {
@@ -350863,6 +351972,7 @@ impl LayoutNodeArena {
         if let Some(slot) = self.default_scroll_shift_anchors.get_mut(index as usize) {
             *slot = DefaultScrollShiftAnchorSlot::default();
         }
+        self.links_held_apart_from_their_containing_blocks.remove(id);
         self.paintable_rows.reset_committed_fragment_link_slot(index);
         self.text_slots.reset(index as usize);
         self.text_nodes_enrolled_for_content_sync.remove(&id);
@@ -354699,6 +355809,7 @@ impl LayoutNodeArena {
         // Cached runs may reuse the committed paintable subtree without replaying its fragments.
         // Once that subtree is cleared, a later layout must rebuild it instead.
         self.memo_invalidations.note_run_cache_entries_dropped(id.slot_index());
+        self.links_held_apart_from_their_containing_blocks.remove(id);
         drop(self.take_committed_fragment_link(id));
     }
 
@@ -432665,11 +433776,13 @@ pub(crate) struct RenderingPreparation {
 /// resource, a visual context tree built anew, or a compositor animation of a box the round built again.
 pub(crate) struct VisualContextsNeedHost(pub(crate) &'static str);
 
-/// The visual context tree a clock tick's frame takes to the compositor, with the scroll offsets of its nodes where its
-/// structure is not the one the compositor has.
+/// The visual context tree a clock tick's frame takes to the compositor, and the scroll offsets of its nodes where the
+/// tick updated it, which the frame was recorded with.
 pub(crate) struct ClockTickVisualContexts {
     pub(crate) tree: Arc<VisualContextTree>,
-    pub(crate) restructured_scroll_offsets: Option<Vec<FloatPoint>>,
+    pub(crate) scroll_offsets: Option<Vec<FloatPoint>>,
+    /// Whether the tree's structure is not the one the compositor has.
+    pub(crate) restructured: bool,
 }
 
 /// Brings the paint state of `arena` up to date with what a clock tick's round laid out, for the tick's frame, as the
@@ -432720,7 +433833,8 @@ pub(crate) fn prepare_for_clock_tick(
             state.published_compositor_animations = tree.visual_animations().to_vec();
             return Ok(Some(ClockTickVisualContexts {
                 tree: state.tree.clone().expect("the tree is there"),
-                restructured_scroll_offsets: None,
+                scroll_offsets: None,
+                restructured: false,
             }));
         }
         (inputs, tree.shared_visual_animations())
@@ -432743,11 +433857,16 @@ pub(crate) fn prepare_for_clock_tick(
         if let Some(inputs) = state.last_compositor_scroll_inputs {
             refresh_compositor_scroll_table(arena, state, inputs);
         }
+        // NB: The update rebuilds the scroll state with every offset at zero, whether or not it changed the tree's
+        //     structure, and the frame places its window around the viewport by those offsets: They're refreshed from
+        //     layout here, so a pane scrolled down keeps what it shows in the window. The host takes the same offsets.
+        let scroll_offsets = scroll_state_snapshot(&arena.paintable_rows(), state, inputs.device_pixels_per_css_pixel);
         let tree = state.tree.as_mut().expect("an incremental update keeps the tree");
         if !outcome.structural_epoch_changed {
             return Ok(Some(ClockTickVisualContexts {
                 tree: tree.clone(),
-                restructured_scroll_offsets: None,
+                scroll_offsets: Some(scroll_offsets),
+                restructured: false,
             }));
         }
         // The update dropped the animations, which name nodes of the old structure: each goes on driving the nodes of its
@@ -432763,12 +433882,10 @@ pub(crate) fn prepare_for_clock_tick(
             )?;
             Arc::make_mut(tree).set_visual_animations(animations);
         }
-        let tree = tree.clone();
-        // The host refreshes its own copy of the scroll state still.
-        let scroll_offsets = scroll_state_snapshot(&arena.paintable_rows(), state, inputs.device_pixels_per_css_pixel);
         Ok(Some(ClockTickVisualContexts {
-            tree,
-            restructured_scroll_offsets: Some(scroll_offsets),
+            tree: tree.clone(),
+            scroll_offsets: Some(scroll_offsets),
+            restructured: true,
         }))
     })
 }
@@ -436391,8 +437508,6 @@ impl LayoutNodeArena {
     }
 
     pub(crate) fn paintable_row_cleared(&mut self, reset: PaintableRowReset) {
-        // NB: The overflow index may keep listing this box. Overflow measurement passes over boxes without a row, and
-        //     populating the row again notes the box anew.
         self.reset_paintable_row(true, reset);
     }
 
@@ -437043,16 +438158,16 @@ impl Presentation {
     pub(crate) fn take_visual_context_tree(&mut self, visual_contexts: ClockTickVisualContexts) {
         let ClockTickVisualContexts {
             tree,
-            restructured_scroll_offsets,
+            scroll_offsets,
+            restructured,
         } = visual_contexts;
-        // A tree of another structure takes a new display list recorded against it, and the scroll offsets of its own
-        // nodes. A frame that records nothing seals no tree, and takes the render state's: the compositor's display list
-        // was cut from a tree of its structure.
-        let tree_is_restructured = restructured_scroll_offsets.is_some();
-        if let Some(scroll_offsets) = restructured_scroll_offsets {
+        // A tree of another structure takes a new display list recorded against it. And a tree a tick updated takes the
+        // scroll offsets of its own nodes, which the frame was recorded with. A frame that records nothing seals no tree,
+        // and takes the render state's: the compositor's display list was cut from a tree of its structure.
+        if let Some(scroll_offsets) = scroll_offsets {
             self.scroll_state = ScrollStateSnapshot::from_device_offsets(scroll_offsets);
         }
-        if !tree_is_restructured && let Some(epoch) = self.seal.visual_context_tree_structural_epoch {
+        if !restructured && let Some(epoch) = self.seal.visual_context_tree_structural_epoch {
             assert_eq!(
                 tree.structural_epoch, epoch,
                 "a tree of the same structure keeps its structural epoch"
@@ -437074,7 +438189,8 @@ impl Presentation {
         if let Some(tree) = visual_context_tree {
             self.take_visual_context_tree(ClockTickVisualContexts {
                 tree,
-                restructured_scroll_offsets: None,
+                scroll_offsets: None,
+                restructured: false,
             });
         }
         let presenter = self.presenter.clone();
@@ -477670,7 +478786,7 @@ use crate::css::style::tree::StyleNodeID;
 use crate::css::transition::HoverTransitions;
 use crate::layout::node_data::{GENERATED_FOR_AFTER, GENERATED_FOR_BEFORE, GENERATED_FOR_MARKER, NodeSlotId};
 use crate::layout::tree_update_marks::{FfiLayoutTreeUpdateMark, layout_tree_update_reuse_reason};
-use crate::layout::used_values::FfiCssPixelRect;
+use crate::layout::used_values::{FfiCssPixelPoint, FfiCssPixelRect};
 use crate::layout::{ClockRound, ClockRoundDeclined, HostStyle, LayoutNodeArena};
 use crate::paint_stage::Presenting;
 use crate::painting::paint_passes::{ClockTickVisualContexts, VisualContextsNeedHost, prepare_for_clock_tick};
@@ -477836,6 +478952,8 @@ pub(crate) struct Lane {
     shown: TickShownRecords,
     /// The border boxes of the plan's elements, and of those the hover restyled, in the last frame a tick presented.
     presented_border_boxes: Vec<(StyleNodeID, CssPixelRect)>,
+    /// The scroll positions in CSS pixels the last frame a tick presented was recorded with. For a test.
+    presented_scroll_offsets: Vec<(StyleNodeID, CssPixelPoint)>,
     /// The color each box the ticks showed samples in showed in that frame, as `0xAARRGGBB`. For a test.
     presented_colors: Vec<(StyleNodeID, u8, u32)>,
     /// How many compositor animations of the frame drive each box of `presented_border_boxes`, and the opacity its
@@ -478251,6 +479369,7 @@ pub struct ClockTicks {
 #[derive(Default)]
 struct PresentedBoxes {
     border_boxes: Vec<(StyleNodeID, CssPixelRect)>,
+    scroll_offsets: Vec<(StyleNodeID, CssPixelPoint)>,
     colors: Vec<(StyleNodeID, u8, u32)>,
     compositor_animations: Vec<(StyleNodeID, u32, f32)>,
 }
@@ -478499,6 +479618,15 @@ impl ClockTicks {
             .border_boxes
             .iter()
             .find_map(|&(presented, rect)| (presented == element).then_some(rect))
+    }
+
+    /// The scroll position of `element` the last frame a tick presented was recorded with, in CSS pixels.
+    pub(super) fn presented_scroll_offset(&self, element: StyleNodeID) -> Option<CssPixelPoint> {
+        let presented = self.presented_boxes.lock().expect("presented boxes");
+        presented
+            .scroll_offsets
+            .iter()
+            .find_map(|&(presented, offset)| (presented == element).then_some(offset))
     }
 
     /// The properties compositor animations drove on the box of `element` in the last frame a tick presented, one bit
@@ -478867,6 +479995,7 @@ impl Lane {
             restyles_built_again: Vec::new(),
             shown: TickShownRecords::default(),
             presented_border_boxes: Vec::new(),
+            presented_scroll_offsets: Vec::new(),
             presented_colors: Vec::new(),
             presented_compositor_animations: Vec::new(),
             scroll_offsets: Vec::new(),
@@ -479299,6 +480428,17 @@ impl Lane {
                         .then(|| (element, absolute_border_box_rect(&rows, row)))
                 }),
         );
+        self.presented_scroll_offsets.clear();
+        let scroll_state = &arena.paint_state().visual_context.scroll_state;
+        self.presented_scroll_offsets
+            .extend(scroll_state.states().iter().enumerate().filter_map(|(slot, scroll)| {
+                if scroll.is_sticky {
+                    return None;
+                }
+                let element = arena.dom_node_style_node(scroll.paintable)?;
+                let offset = scroll_state.own_offset(slot);
+                Some((element, CssPixelPoint::new(-offset.x, -offset.y)))
+            }));
         self.presented_compositor_animations.clear();
         if let Some(tree) = arena.paint_state().visual_context.tree.as_deref() {
             self.presented_compositor_animations
@@ -479785,6 +480925,24 @@ pub extern "C" fn document_host_presented_opacity(host: &DocumentHost, element: 
         return false;
     };
     *opacity = presented;
+    true
+}
+
+/// Writes the scroll position of `element` the last frame a tick presented was recorded with to `offset`, in CSS
+/// pixels, and answers whether that frame had a scroll node for the element. For a test.
+#[unsafe(no_mangle)]
+pub extern "C" fn document_host_presented_scroll_offset(
+    host: &DocumentHost,
+    element: u32,
+    offset: &mut FfiCssPixelPoint,
+) -> bool {
+    super::wait_for_render_side();
+    let Some(presented) =
+        StyleNodeID::from_raw(element).and_then(|element| host.clock_ticks().presented_scroll_offset(element))
+    else {
+        return false;
+    };
+    *offset = presented.into();
     true
 }
 
@@ -483170,6 +484328,7 @@ impl LaneSlot {
             self.presented = true;
             *self.ticks.presented_boxes.lock().expect("presented boxes") = super::PresentedBoxes {
                 border_boxes: lane.presented_border_boxes.clone(),
+                scroll_offsets: lane.presented_scroll_offsets.clone(),
                 colors: lane.presented_colors.clone(),
                 compositor_animations: lane.presented_compositor_animations.clone(),
             };
@@ -530784,7 +531943,7 @@ InputEvent::~InputEvent() = default;
 void InputEvent::visit_edges(Visitor& visitor)
 {
     Base::visit_edges(visitor);
-    visitor.visit(static_cast<GC::Cell*>(m_data_transfer.ptr()));
+    visitor.visit(m_data_transfer);
     visitor.visit(m_target_ranges);
 }
 
@@ -530887,7 +532046,7 @@ interface InputEvent : UIEvent {
     readonly attribute DOMString inputType;
 
     // https://w3c.github.io/input-events/#interface-InputEvent
-    [DirectGetter] readonly attribute DataTransfer? dataTransfer;
+    readonly attribute DataTransfer? dataTransfer;
     sequence<StaticRange> getTargetRanges();
 };
 
@@ -552392,7 +553551,10 @@ struct ObservableArrayHostClassTraits {
 
             // 5. Remove the last item from handler.[[BackingList]].
             // 6. Return true.
-            return array.array_set(vm.names.length, JS::Value(index), &array);
+            if (!TRY(array.array_set(vm.names.length, JS::Value(index), &array)))
+                return false;
+            observable_array.did_change_backing_list();
+            return true;
         }
 
         // 4. Return ? O.[[Delete]](P).
@@ -552440,6 +553602,8 @@ struct ObservableArrayHostClassTraits {
             // 2. Remove the last item from handler.[[BackingList]].
             if (!TRY(array.array_set(vm.names.length, JS::Value(index_to_delete), &array)))
                 return false;
+
+            observable_array.did_change_backing_list();
 
             // 3. Set indexToDelete to indexToDelete − 1.
         }
@@ -552493,7 +553657,10 @@ struct ObservableArrayHostClassTraits {
             descriptor.enumerable = true;
             descriptor.configurable = true;
         }
-        return array.internal_define_own_property(property_key, descriptor);
+        if (!TRY(array.internal_define_own_property(property_key, descriptor)))
+            return false;
+        observable_array.did_change_backing_list();
+        return true;
     }
 };
 
@@ -552522,6 +553689,7 @@ void ObservableArray::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_convert_to_idl_value);
     visitor.visit(m_on_set_an_indexed_value);
     visitor.visit(m_on_delete_an_indexed_value);
+    visitor.visit(m_on_backing_list_changed);
 }
 
 void ObservableArray::set_convert_to_idl_value_callback(GC::Ref<GC::Function<ConvertToIDLValueCallbackFunction::FunctionType>> callback)
@@ -552582,12 +553750,19 @@ JS::ThrowCompletionOr<void> ObservableArray::run_delete_an_indexed_value_callbac
     return {};
 }
 
+void ObservableArray::did_change_backing_list()
+{
+    if (m_on_backing_list_changed)
+        m_on_backing_list_changed->function()();
+}
+
 JS::ThrowCompletionOr<void> ObservableArray::append(JS::Value value)
 {
     TRY(run_convert_to_idl_value_callback(value));
     TRY(run_set_an_indexed_value_callback(length(), value));
     // Unlike CreateDataProperty, this also appends to an array that script has made non-extensible or frozen.
     m_array_object->indexed_append(value);
+    did_change_backing_list();
     return {};
 }
 
@@ -552600,6 +553775,7 @@ void ObservableArray::clear()
         if (auto deleted_value = element_value(0); deleted_value.has_value() && m_on_delete_an_indexed_value)
             MUST(m_on_delete_an_indexed_value->function()(*deleted_value, 0));
         m_array_object->indexed_take_first();
+        did_change_backing_list();
     }
 }
 
@@ -552648,6 +553824,8 @@ public:
     void set_on_set_an_indexed_value_callback(GC::Ref<GC::Function<SetAnIndexedValueCallbackFunction::FunctionType>> callback);
     void set_on_delete_an_indexed_value_callback(GC::Ref<GC::Function<DeleteAnIndexedValueCallbackFunction::FunctionType>> callback);
 
+    void set_on_backing_list_changed(GC::Ref<GC::Function<void()>> callback) { m_on_backing_list_changed = callback; }
+
     GC::Ref<JS::Object> array_object() const { return m_array_object; }
 
     u32 length() const;
@@ -552679,6 +553857,8 @@ private:
     JS::ThrowCompletionOr<void> run_set_an_indexed_value_callback(u32 index, JS::Value& value);
     JS::ThrowCompletionOr<void> run_delete_an_indexed_value_callback(u32 index);
 
+    void did_change_backing_list();
+
     using ConvertToIDLValueCallbackHeapFunction = GC::Function<ConvertToIDLValueCallbackFunction::FunctionType>;
     using SetAnIndexedValueCallbackHeapFunction = GC::Function<SetAnIndexedValueCallbackFunction::FunctionType>;
     using DeleteAnIndexedValueCallbackHeapFunction = GC::Function<DeleteAnIndexedValueCallbackFunction::FunctionType>;
@@ -552688,6 +553868,7 @@ private:
     GC::Ptr<ConvertToIDLValueCallbackHeapFunction> m_convert_to_idl_value;
     GC::Ptr<SetAnIndexedValueCallbackHeapFunction> m_on_set_an_indexed_value;
     GC::Ptr<DeleteAnIndexedValueCallbackHeapFunction> m_on_delete_an_indexed_value;
+    GC::Ptr<GC::Function<void()>> m_on_backing_list_changed;
 };
 
 }
@@ -603763,877 +604944,3 @@ void CanonicalNavigable::begin_navigation(Web::HTML::PreparedNavigationDescripto
     }
 
     // NB: Step 21 fires the navigate event at navigable's active window, which is gone with a lost document. It is not
-    //     fired for a navigation from the browser's UI, nor for a sourceDocument in another agent, which is never same
-    //     origin-domain with navigable's active document.
-
-    // FIXME: 22. If sourceDocument is navigable's container document, then reserve deferred fetch quota for navigable's
-    //            container given url's origin.
-
-    // 23. In parallel, run these steps:
-    // NB: The page hosting navigable's active document, or standing in for it, runs the unload check and population's
-    //     first steps.
-    auto worker = traversable.page_hosting(*this);
-    if (!worker || !worker->is_open()) {
-        clear_ongoing_navigation();
-        if (auto* webdriver_bidi = WebDriverBiDi::the())
-            webdriver_bidi->navigation_failed(*this, { .id = navigation_id, .status = WebDriverBiDi::NavigationStatusType::Canceled, .url = url });
-        return;
-    }
-    auto start_request = Web::HTML::NavigationStartRequest {
-        .navigable_id = id(),
-        .url = url,
-        .document_resource = move(navigation.document_resource),
-        .request_referrer = Web::Fetch::Infrastructure::RequestReferrer::Client,
-        .request_referrer_policy = navigation.referrer_policy,
-        .initiator_origin = navigation.initiator_origin_snapshot,
-        .initiator_base_url = navigation.initiator_base_url_snapshot,
-        .navigable_target_name = active_session_history_entry()->document_state->navigable_target_name,
-        .source_snapshot_params = move(navigation.source_snapshot_params),
-        .target_snapshot_params = target_snapshot_params,
-        .csp_navigation_type = navigation.csp_navigation_type,
-        .history_handling = history_handling,
-        .user_involvement = user_involvement,
-        .navigation_id = navigation_id,
-        .classic_history_api_state = Web::HTML::storage_serialization_record_for_null(),
-        .navigation_api_state = Web::HTML::storage_serialization_record_for_undefined(),
-        .navigation_api_key = generate_a_random_uuid(),
-        .navigation_api_id = generate_a_random_uuid(),
-        .directive_state_id = {},
-        .directive_state_value = {},
-    };
-    auto retry = prepare_navigation_to_retry(start_request);
-    set_ongoing_navigation({
-        .url = url,
-        .navigation_id = navigation_id,
-        .retry = move(retry),
-        .sequence_number = traversable.next_sequence_number(),
-        .state = CanonicalNavigation::CheckingIfUnloadingIsCanceled { move(start_request) },
-        .page = worker,
-        .source_page = move(source_page),
-        .local_file_access = move(local_file_access),
-    });
-    worker->async_set_ongoing_navigation(id(), navigation_id);
-    worker->begin_navigation_unload_check(*this, navigation_id);
-}
-
-// https://html.spec.whatwg.org/multipage/browsers.html#obtain-browsing-context-navigation
-// NB: The browsing context is returned with its active document, which nothing else holds for a new one.
-CanonicalBrowsingContext::BrowsingContextAndDocument CanonicalNavigable::obtain_a_browsing_context_to_use_for_a_navigation_response(NavigationLoader::ResponseDocument const& navigation_params)
-{
-    // 1. Let browsingContext be navigationParams's navigable's active browsing context.
-    CanonicalBrowsingContext::BrowsingContextAndDocument browsing_context { active_browsing_context(), active_document() };
-
-    // 2. If browsingContext is not a top-level browsing context, then return browsingContext.
-    if (!is_top_level_traversable())
-        return browsing_context;
-
-    // 3. Let coopEnforcementResult be navigationParams's COOP enforcement result.
-    auto const& coop_enforcement_result = navigation_params.coop_enforcement_result;
-
-    // 4. Let swapGroup be coopEnforcementResult's needs a browsing context group switch.
-    auto swap_group = coop_enforcement_result.needs_a_browsing_context_group_switch;
-
-    // NB: Steps 5-8 only affect swapGroup through optional choices. This implementation does not take them.
-
-    // 9. If swapGroup is false, then:
-    if (!swap_group) {
-        // FIXME: 1. If coopEnforcementResult's would need a browsing context group switch due to report-only is true,
-        //           set browsingContext's virtual browsing context group ID to a new unique identifier.
-
-        // 2. Return browsingContext.
-        return browsing_context;
-    }
-
-    // 10. Let newBrowsingContext be the first return value of creating a new top-level browsing context and document.
-    // NB: The navigation response's document replaces that document before any process creates it.
-    auto new_browsing_context = CanonicalBrowsingContext::create_a_new_top_level_browsing_context_and_document({});
-
-    // 11. Let navigationCOOP be navigationParams's cross-origin opener policy.
-    auto const& navigation_coop = navigation_params.opener_policy;
-
-    // 12. If navigationCOOP's value is "same-origin-plus-COEP", then set newBrowsingContext's group's cross-origin
-    //     isolation mode to either "logical" or "concrete". The choice of which is implementation-defined.
-    if (navigation_coop.value == Web::HTML::OpenerPolicyValue::SameOriginPlusCOEP)
-        new_browsing_context.browsing_context->group()->set_cross_origin_isolation_mode(Web::HTML::CrossOriginIsolationMode::Concrete);
-
-    // 13. Let sandboxFlags be a clone of navigationParams's final sandboxing flag set.
-    // FIXME: 14. If sandboxFlags is not empty, then:
-    //            1. Assert: navigationCOOP's value is "unsafe-none".
-    //            2. Assert: newBrowsingContext's popup sandboxing flag set is empty.
-    //            3. Set newBrowsingContext's popup sandboxing flag set to sandboxFlags.
-
-    // 15. Return newBrowsingContext.
-    return new_browsing_context;
-}
-
-// https://html.spec.whatwg.org/multipage/document-lifecycle.html#initialise-the-document-object
-NonnullRefPtr<CanonicalDocument> CanonicalNavigable::create_and_initialize_a_document(NavigationLoader::ResponseDocument const& navigation_params)
-{
-    // 1. Let browsingContext be the result of obtaining a browsing context to use for a navigation response given navigationParams.
-    auto browsing_context_and_document = obtain_a_browsing_context_to_use_for_a_navigation_response(navigation_params);
-    auto& browsing_context = browsing_context_and_document.browsing_context;
-
-    // 2. Let permissionsPolicy be the result of creating a permissions policy from a response given navigationParams's
-    //    navigable's container, navigationParams's origin, and navigationParams's response.
-    // NB: Navigation params the UI process handled carry the one it created from the response's headers. Any other
-    //     response, such as a javascript: URL's or inline content's, has no Permissions-Policy header.
-    auto permissions_policy = navigation_params.permissions_policy;
-    if (!permissions_policy.has_value())
-        permissions_policy = create_a_permissions_policy_from_a_response(navigation_params.origin, HTTP::HeaderList::create());
-
-    // 3. Let creationURL be navigationParams's response's URL.
-    auto creation_url = navigation_params.response_url;
-
-    // 4. If navigationParams's request is non-null, then set creationURL to navigationParams's request's current URL.
-    if (navigation_params.request_current_url.has_value())
-        creation_url = *navigation_params.request_current_url;
-
-    // 5. Let window be null.
-    RefPtr<CanonicalWindow> window;
-
-    // 6. If browsingContext's active document's is initial about:blank is true, and browsingContext's active document's
-    //    origin is same origin-domain with navigationParams's origin, then set window to browsingContext's active window.
-    if (browsing_context->active_document()->is_initial_about_blank()
-        && browsing_context->active_document()->origin().is_same_origin_domain(navigation_params.origin)) {
-        window = browsing_context->active_window();
-    }
-    // 7. Otherwise:
-    else {
-        // NB: NavigationLoader parsed the response's Origin-Agent-Cluster field for steps 1 and 2.
-        auto requests_oac = navigation_params.requests_oac;
-
-        // 3. If navigationParams's reserved environment is a non-secure context, then set requestsOAC to false.
-        // NB: Derive this from canonical navigation state, since WebContent supplies the reserved environment.
-        auto reserved_top_level_creation_url = m_parent ? m_parent->active_document().relevant_global_object().relevant_settings_object().top_level_creation_url().value() : creation_url;
-        if (reserved_top_level_creation_url.scheme() == "data"sv
-            || Web::SecureContexts::is_url_potentially_trustworthy(reserved_top_level_creation_url) == Web::SecureContexts::Trustworthiness::NotTrustworthy)
-            requests_oac = false;
-
-        // 4. Let agent be the result of obtaining a similar-origin window agent given navigationParams's origin,
-        //    browsingContext's group, and requestsOAC.
-        // AD-HOC: Only a top-level browsing context has a group. A child browsing context's is its top-level browsing
-        //         context's.
-        auto agent = browsing_context->top_level_browsing_context().group()->obtain_similar_origin_window_agent(navigation_params.origin, requests_oac);
-
-        // 5. Let realmExecutionContext be the result of creating a new realm given agent and the following customizations:
-        //    - For the global object, create a new Window object.
-        //    - For the global this binding, use browsingContext's WindowProxy object.
-        // 6. Set window to the global object of realmExecutionContext's Realm component.
-        // NB: The realm is in the process hosting agent.
-        window = CanonicalWindow::create(agent);
-
-        // 7. Let topLevelCreationURL be creationURL.
-        auto top_level_creation_url = creation_url;
-
-        // 8. Let topLevelOrigin be navigationParams's origin.
-        // NB: The UI process derives the top-level origin from the window's associated document.
-
-        // 9. If navigable's container is not null, then:
-        if (m_parent) {
-            // 1. Let parentEnvironment be navigable's container's relevant settings object.
-            auto const& parent_environment = m_parent->active_document().relevant_global_object().relevant_settings_object();
-
-            // 2. Set topLevelCreationURL to parentEnvironment's top-level creation URL.
-            top_level_creation_url = parent_environment.top_level_creation_url().value();
-
-            // 3. Set topLevelOrigin to parentEnvironment's top-level origin.
-        }
-
-        // 10. Set up a window environment settings object with creationURL, realmExecutionContext, navigationParams's
-        //     reserved environment, topLevelCreationURL, and topLevelOrigin.
-        window->set_up_a_window_environment_settings_object(navigation_params.environment_id, move(top_level_creation_url));
-    }
-
-    // 9. Let document be a new Document, with
-    //    origin: navigationParams's origin
-    //    browsing context: browsingContext
-    //    policy container: navigationParams's policy container
-    //    permissions policy: permissionsPolicy
-    //    active sandboxing flag set: navigationParams's final sandboxing flag set
-    //    opener policy: navigationParams's cross-origin opener policy
-    //    URL: creationURL
-    // NB: The process hosting window's agent creates the document, with its other fields, and runs the remaining steps.
-    //     The UI process holds the embedder policy of the document's policy container.
-    auto document = CanonicalDocument::create(navigation_params.document_id, move(creation_url), navigation_params.origin, browsing_context, window.release_nonnull(), navigation_params.final_sandboxing_flag_set, CanonicalDocument::IsInitialAboutBlank::No);
-    document->set_opener_policy(navigation_params.opener_policy);
-    document->set_embedder_policy(navigation_params.embedder_policy);
-    document->set_permissions_policy(permissions_policy.release_value());
-
-    // 22. Return document.
-    return document;
-}
-
-CanonicalNavigable::~CanonicalNavigable()
-{
-    if (m_active_session_history_entry)
-        m_active_session_history_entry->document_state->document = nullptr;
-}
-
-bool CanonicalNavigable::has_remote_host() const
-{
-    if (!m_parent || !m_active_session_history_entry || !active_document().host())
-        return false;
-    return active_document().host() != reporting_page();
-}
-
-// https://html.spec.whatwg.org/multipage/document-sequences.html#nav-top
-CanonicalTraversable& CanonicalNavigable::top_level_traversable()
-{
-    // 1. Let navigable be inputNavigable.
-    auto* navigable = this;
-
-    // 2. While navigable's parent is not null, set navigable to navigable's parent.
-    while (navigable->parent())
-        navigable = navigable->parent();
-
-    // 3. Return navigable.
-    VERIFY(navigable->is_top_level_traversable());
-    return static_cast<CanonicalTraversable&>(*navigable);
-}
-
-CanonicalTraversable const& CanonicalNavigable::top_level_traversable() const
-{
-    return const_cast<CanonicalNavigable&>(*this).top_level_traversable();
-}
-
-void CanonicalNavigable::set_container_document(Badge<CanonicalTraversable>, CanonicalDocument& document)
-{
-    m_container_document = document;
-}
-
-CanonicalNavigable& CanonicalNavigable::append_child(NonnullOwnPtr<CanonicalNavigable> child)
-{
-    VERIFY(!child->m_parent);
-    child->m_parent = this;
-    m_children.append(move(child));
-    return *m_children.last();
-}
-
-NonnullOwnPtr<CanonicalNavigable> CanonicalNavigable::remove_child(CanonicalNavigable& child)
-{
-    for (size_t i = 0; i < m_children.size(); ++i) {
-        if (m_children[i].ptr() != &child)
-            continue;
-
-        auto removed_child = m_children.take(i);
-        VERIFY(removed_child->m_parent == this);
-        removed_child->m_parent = nullptr;
-        return removed_child;
-    }
-
-    VERIFY_NOT_REACHED();
-}
-
-// https://html.spec.whatwg.org/multipage/document-sequences.html#nav-target-name
-Utf16String const& CanonicalNavigable::target_name() const
-{
-    // A navigable's target name is its active session history entry's document state's navigable target name.
-    return active_session_history_entry()->document_state->navigable_target_name;
-}
-
-bool CanonicalNavigable::is_ancestor_of(CanonicalNavigable const& potential_descendant) const
-{
-    for (auto const* parent = potential_descendant.parent(); parent; parent = parent->parent()) {
-        if (parent == this)
-            return true;
-    }
-    return false;
-}
-
-// https://html.spec.whatwg.org/multipage/interaction.html#fully-active-descendant-of-a-top-level-traversable-with-user-attention
-bool CanonicalNavigable::active_document_is_fully_active_descendant_of_a_top_level_traversable_with_user_attention() const
-{
-    // A Document d is a fully active descendant of a top-level traversable with user attention when d is fully active
-    // and d's node navigable's top-level traversable has user attention.
-    // NB: The process hosting the active document reports whether it is fully active. A lost document has no host, and
-    //     is not fully active whatever its host last reported.
-    if (!active_document().host())
-        return false;
-    return m_hosted_state.has_value() && m_hosted_state->active_document_is_fully_active && top_level_traversable().has_user_attention();
-}
-
-// https://html.spec.whatwg.org/multipage/interaction.html#activation-notification
-void CanonicalNavigable::run_activation_notification_steps_for_active_document(HashTable<Web::HTML::CrossProcessId>& notified_document_ids) const
-{
-    auto const& document = active_document();
-
-    // 2. Let windows be « document's relevant global object ».
-    Vector<NonnullRefPtr<CanonicalDocument const>> windows { document };
-
-    // 3. Extend windows with the active window of each of document's ancestor navigables.
-    for (auto const* ancestor = parent(); ancestor; ancestor = ancestor->parent())
-        windows.append(ancestor->active_document());
-
-    // 4. Extend windows with the active window of each of document's descendant navigables, filtered to include only
-    //    those navigables whose active document's origin is same origin with document's origin.
-    for_each_in_subtree([&](CanonicalNavigable const& descendant) {
-        auto const& descendant_document = descendant.active_document();
-        if (descendant_document.origin().is_same_origin(document.origin()))
-            windows.append(descendant_document);
-        return IterationDecision::Continue;
-    });
-
-    // 5. For each window in windows:
-    // NB: The page hosting the window's document runs steps 5.1 and 5.2. Running them again for the same input changes
-    //     nothing, so a window already notified for it is skipped.
-    for (auto const& window : windows) {
-        if (notified_document_ids.set(window->id()) != HashSetResult::InsertedNewEntry)
-            continue;
-        if (auto const& host = window->host())
-            host->notify_about_user_activation(window->id());
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/document-sequences.html#familiar-with
-// NB: Stated on the navigables whose active browsing contexts are compared, as in the renderer.
-bool CanonicalNavigable::is_familiar_with(CanonicalNavigable const& other) const
-{
-    // A browsing context A is familiar with a second browsing context B if the following algorithm returns true:
-    auto const& A = *this;
-    auto const& B = other;
-
-    // 1. If A's active document's origin is same origin with B's active document's origin, then return true.
-    if (A.active_document().origin().is_same_origin(B.active_document().origin()))
-        return true;
-
-    // 2. If A's top-level browsing context is B, then return true.
-    if (&A.top_level_traversable() == &B)
-        return true;
-
-    // 3. If B is an auxiliary browsing context and A is familiar with B's opener browsing context, then return true.
-    if (B.active_browsing_context().is_auxiliary()) {
-        if (auto opener = B.active_browsing_context().opener_browsing_context()) {
-            if (auto const* opener_navigable = CanonicalTraversable::navigable_with_active_browsing_context(*opener); opener_navigable && A.is_familiar_with(*opener_navigable))
-                return true;
-        }
-    }
-
-    // 4. If there exists an ancestor browsing context of B whose active document has the same origin as the active document of A, then return true.
-    // NOTE: This includes the case where A is an ancestor browsing context of B.
-    for (auto const* ancestor = B.parent(); ancestor; ancestor = ancestor->parent()) {
-        if (ancestor->active_document().origin().is_same_origin(A.active_document().origin()))
-            return true;
-    }
-
-    // 5. Return false.
-    return false;
-}
-
-// https://html.spec.whatwg.org/multipage/document-sequences.html#the-rules-for-choosing-a-navigable
-CanonicalNavigable::ChosenTopLevelTraversable CanonicalNavigable::choose_a_new_top_level_traversable(WebContentPage& current_page, Utf16View name, bool no_opener, Optional<URL::URL> current_document_base_url, Web::HTML::CrossProcessId id, Web::HTML::CrossProcessId document_id)
-{
-    // NB: The branch in which the user agent creates a new top-level traversable. The renderer runs the rules up to it,
-    //     and runs the branch for its page of the traversable with the windowType returned here.
-    auto& current_navigable = *this;
-
-    // NB: sandboxingFlagSet is currentNavigable's active document's active sandboxing flag set.
-    auto sandboxing_flag_set = current_navigable.active_document().active_sandboxing_flag_set();
-
-    // 1. Consume user activation of currentNavigable's active window.
-    // NB: The UI process holds the activation of the input it delivered to the page hosting currentNavigable.
-    current_page.consume_transient_user_activation();
-
-    // 2. Set windowType to "new and unrestricted".
-    auto window_type = Web::HTML::WindowType::NewAndUnrestricted;
-
-    // 3. Let currentDocument be currentNavigable's active document.
-    auto& current_document = current_navigable.active_document();
-
-    // 4. If currentDocument's opener policy's value is "same-origin" or "same-origin-plus-COEP", and currentDocument's
-    //    origin is not same origin with currentDocument's relevant settings object's top-level origin, then:
-    // NB: A document whose top-level browsing context was discarded has no top-level origin to be same origin with.
-    auto top_level_origin = current_document.relevant_global_object().relevant_settings_object().top_level_origin();
-    if ((current_document.opener_policy().value == Web::HTML::OpenerPolicyValue::SameOrigin || current_document.opener_policy().value == Web::HTML::OpenerPolicyValue::SameOriginPlusCOEP)
-        && (!top_level_origin.has_value() || !current_document.origin().is_same_origin(*top_level_origin))) {
-        // 1. Set noopener to true.
-        no_opener = true;
-
-        // 2. Set name to "_blank".
-        name = u"_blank"sv;
-
-        // 3. Set windowType to "new with no opener".
-        window_type = Web::HTML::WindowType::NewWithNoOpener;
-    }
-    // NOTE: In the presence of an opener policy, nested documents that are cross-origin with their top-level browsing
-    //       context's active document always set noopener to true.
-
-    // 5. Let targetName be the empty string.
-    Utf16String target_name;
-
-    // 6. If name is not an ASCII case-insensitive match for "_blank", then set targetName to name.
-    if (!name.equals_ignoring_ascii_case(u"_blank"sv))
-        target_name = Utf16String::from_utf16(name);
-
-    // 7. If noopener is true, then set chosen to the result of creating a new top-level traversable given null and targetName.
-    // 8. Otherwise:
-    //    1. Set chosen to the result of creating a new top-level traversable given currentNavigable's active browsing
-    //       context, targetName, and currentNavigable.
-    // NB: The about:blank document created with an opener takes the opener's document base URL, which the renderer
-    //     sends, as the UI process does not hold it.
-    auto opener = no_opener ? Optional<CanonicalNavigable&> {} : current_navigable;
-    auto initial_history_entry = Web::HTML::create_initial_session_history_entry_descriptor(Application::the().allocate_ui_process_cross_process_id(), opener.has_value() ? move(current_document_base_url) : Optional<URL::URL> {}, move(target_name));
-    auto& chosen = CanonicalTraversable::create_a_new_top_level_traversable(id, opener, move(initial_history_entry), document_id);
-
-    //    2. If sandboxingFlagSet's sandboxed navigation browsing context flag is set, then set chosen's active browsing
-    //       context's one permitted sandboxed navigator to currentNavigable's active browsing context.
-    // AD-HOC: For a noopener popup too. See https://github.com/whatwg/html/issues/12297
-    if (has_flag(sandboxing_flag_set, Web::HTML::SandboxingFlagSet::SandboxedNavigation))
-        chosen.active_browsing_context().set_the_one_permitted_sandboxed_navigator(current_navigable.active_browsing_context());
-
-    // 9. If sandboxingFlagSet's sandbox propagates to auxiliary browsing contexts flag is set, then all the flags that are
-    //    set in sandboxingFlagSet must be set in chosen's active browsing context's popup sandboxing flag set.
-    if (has_flag(sandboxing_flag_set, Web::HTML::SandboxingFlagSet::SandboxPropagatesToAuxiliaryBrowsingContexts))
-        chosen.active_browsing_context().set_popup_sandboxing_flag_set(sandboxing_flag_set);
-
-    // 10. Set chosen's is created by web content to true.
-    chosen.set_is_created_by_web_content(true);
-
-    return { chosen, window_type };
-}
-
-// https://html.spec.whatwg.org/multipage/browsing-the-web.html#allowed-to-navigate
-bool CanonicalNavigable::allowed_by_sandboxing_to_navigate(CanonicalNavigable const& target, Web::InitiatorSourceSnapshot const& source_snapshot_params) const
-{
-    auto const& source = *this;
-
-    // 1. If source is target, then return true.
-    if (&source == &target)
-        return true;
-
-    // 2. If source is an ancestor of target, then return true.
-    if (source.is_ancestor_of(target))
-        return true;
-
-    // 3. If target is an ancestor of source:
-    // AD-HOC: Only for a top-level target, which drops step 1, so that other ancestors reach step 5.
-    //         See https://github.com/whatwg/html/pull/13150
-    if (target.is_top_level_traversable() && target.is_ancestor_of(source)) {
-        // 2. If sourceSnapshotParams's has transient activation is true, and sourceSnapshotParams's sandboxing flags's
-        //    sandboxed top-level navigation with user activation browsing context flag is set, then return false.
-        if (source_snapshot_params.has_transient_activation
-            && has_flag(source_snapshot_params.sandboxing_flags, Web::HTML::SandboxingFlagSet::SandboxedTopLevelNavigationWithUserActivation)) {
-            return false;
-        }
-
-        // 3. If sourceSnapshotParams's has transient activation is false, and sourceSnapshotParams's sandboxing flags's
-        //    sandboxed top-level navigation without user activation browsing context flag is set, then return false.
-        if (!source_snapshot_params.has_transient_activation
-            && has_flag(source_snapshot_params.sandboxing_flags, Web::HTML::SandboxingFlagSet::SandboxedTopLevelNavigationWithoutUserActivation)) {
-            return false;
-        }
-
-        // 4. Return true.
-        return true;
-    }
-
-    // 4. If target is a top-level traversable:
-    if (target.is_top_level_traversable()) {
-        // 1. If source is the one permitted sandboxed navigator of target, then return true.
-        if (target.active_browsing_context().the_one_permitted_sandboxed_navigator() == &source.active_browsing_context())
-            return true;
-
-        // 2. If sourceSnapshotParams's sandboxing flags's sandboxed navigation browsing context flag is set, then return false.
-        if (has_flag(source_snapshot_params.sandboxing_flags, Web::HTML::SandboxingFlagSet::SandboxedNavigation))
-            return false;
-
-        // 3. Return true.
-        return true;
-    }
-
-    // 5. If sourceSnapshotParams's sandboxing flags's sandboxed navigation browsing context flag is set, then return false.
-    if (has_flag(source_snapshot_params.sandboxing_flags, Web::HTML::SandboxingFlagSet::SandboxedNavigation))
-        return false;
-
-    // 6. Return true.
-    return true;
-}
-
-Web::PermissionsPolicy::PermissionsPolicy CanonicalNavigable::create_a_permissions_policy_from_a_response(URL::Origin const& origin, HTTP::HeaderList const& response_header_list) const
-{
-    if (!m_container_document)
-        return Web::PermissionsPolicy::create_a_permissions_policy_for_a_navigable_from_response({}, origin, response_header_list);
-
-    Web::PermissionsPolicy::PolicyDirective container_policy;
-    if (m_hosted_state.has_value())
-        container_policy = m_hosted_state->container.container_policy;
-    Web::PermissionsPolicy::NavigableContainerPolicyInputs container { m_container_document->permissions_policy(), m_container_document->origin(), container_policy };
-    return Web::PermissionsPolicy::create_a_permissions_policy_for_a_navigable_from_response(container, origin, response_header_list);
-}
-
-Web::HTML::TargetSnapshotParams CanonicalNavigable::snapshot_target_snapshot_params() const
-{
-    Optional<Web::HTML::ReplicatedContainerState const&> container;
-    if (m_hosted_state.has_value() && m_hosted_state->container.local_name.has_value())
-        container = m_hosted_state->container;
-
-    // To snapshot target snapshot params given a navigable targetNavigable, return a new target snapshot params with:
-    return {
-        // sandboxing flags
-        //     the result of determining the creation sandboxing flags given targetNavigable's active browsing context
-        //     and targetNavigable's container
-        .sandboxing_flags = determine_the_creation_sandboxing_flags(active_browsing_context(), container),
-
-        // iframe element referrer policy
-        //     the result of determining the iframe element referrer policy given targetNavigable's container
-        .iframe_element_referrer_policy = container.has_value() ? container->iframe_referrer_policy : Web::ReferrerPolicy::ReferrerPolicy::EmptyString,
-    };
-}
-
-IterationDecision CanonicalNavigable::for_each_in_inclusive_subtree(Function<IterationDecision(CanonicalNavigable&)> const& callback)
-{
-    if (callback(*this) == IterationDecision::Break)
-        return IterationDecision::Break;
-
-    return for_each_in_subtree(callback);
-}
-
-IterationDecision CanonicalNavigable::for_each_in_subtree(Function<IterationDecision(CanonicalNavigable&)> const& callback)
-{
-    for (auto const& child : m_children) {
-        if (child->for_each_in_inclusive_subtree(callback) == IterationDecision::Break)
-            return IterationDecision::Break;
-    }
-
-    return IterationDecision::Continue;
-}
-
-IterationDecision CanonicalNavigable::for_each_in_inclusive_subtree(Function<IterationDecision(CanonicalNavigable const&)> const& callback) const
-{
-    if (callback(*this) == IterationDecision::Break)
-        return IterationDecision::Break;
-
-    return for_each_in_subtree(callback);
-}
-
-IterationDecision CanonicalNavigable::for_each_in_subtree(Function<IterationDecision(CanonicalNavigable const&)> const& callback) const
-{
-    for (auto const& child : m_children) {
-        if (child->for_each_in_inclusive_subtree(callback) == IterationDecision::Break)
-            return IterationDecision::Break;
-    }
-
-    return IterationDecision::Continue;
-}
-
-WebContentPage& CanonicalNavigable::remote_host() const
-{
-    VERIFY(has_remote_host());
-    return *active_document().host();
-}
-
-void CanonicalNavigable::hand_pending_webdriver_commands_to(WebContentPage& new_host)
-{
-    auto& traversable = top_level_traversable();
-    auto old_host = traversable.page_hosting(*this);
-    if (!old_host)
-        return;
-    if (auto view = traversable.view(); view.has_value())
-        view->move_pending_webdriver_commands_to_new_host({}, id(), *old_host, new_host);
-}
-
-static auto const serialized_file_origin = "file://"sv;
-
-// The serialized origin of a URL a document can be fetched from, or nothing for a URL that holds its own content.
-static Optional<String> serialized_origin_of_fetched_url(URL::URL const& url)
-{
-    if (url.scheme().is_one_of("http"sv, "https"sv))
-        return url.origin().serialize();
-    if (url.scheme() == "file"sv)
-        return String::from_utf8_without_validation(serialized_file_origin.bytes());
-    return {};
-}
-
-// The origin whose sandboxed documents a sandboxed document is hosted with: that of its URL when it was fetched, or
-// that of the nearest ancestor fetched so when it holds what its embedder gave it, as a srcdoc or data: URL iframe
-// does. Any other document stays with its initiator, as an about:blank document can, since nothing else can script it.
-static Optional<String> origin_of_sandboxed_document(CanonicalNavigable const& navigable, CanonicalDocument const& document)
-{
-    if (!document.origin().is_opaque() || !has_flag(document.active_sandboxing_flag_set(), Web::HTML::SandboxingFlagSet::SandboxedOrigin))
-        return {};
-
-    auto const& url = document.creation_url();
-    if (auto origin = serialized_origin_of_fetched_url(url); origin.has_value())
-        return origin;
-    if (!Web::HTML::url_matches_about_srcdoc(url) && url.scheme() != "data"sv)
-        return {};
-
-    for (auto const* ancestor = navigable.parent(); ancestor; ancestor = ancestor->parent()) {
-        if (auto origin = serialized_origin_of_fetched_url(ancestor->active_document().creation_url()); origin.has_value())
-            return origin;
-    }
-    return {};
-}
-
-// The inherited root is settled before a process is chosen, so that reusing a process can't combine roots.
-static Optional<LocalFileRoot> local_file_root_to_host(CanonicalNavigable const& navigable, CanonicalDocument const& document)
-{
-    if (document.is_local_file_content())
-        return document.local_file_root();
-    auto const& url = document.creation_url();
-    if (!document.origin().is_file_origin() && !Web::HTML::url_matches_about_srcdoc(url) && url.scheme() != "data"sv)
-        return {};
-    for (auto const* ancestor = navigable.parent(); ancestor; ancestor = ancestor->parent()) {
-        if (auto const& root = ancestor->active_document().local_file_root(); root.has_value())
-            return root;
-    }
-    return {};
-}
-
-static bool may_read_local_files_under(WebContentClient const& process, Optional<LocalFileRoot> const& root)
-{
-    return !root.has_value() || process.local_file_roots() == Vector { *root };
-}
-
-static RefPtr<WebContentClient> lowest_process_hosting_only_tabs_like(CanonicalDocument const& document, BrowsingSession const& session)
-{
-    RefPtr<WebContentClient> process;
-    WebContentClient::for_each_client([&](WebContentClient& client) {
-        if (&client.session() == &session && client.is_open() && !client.has_requested_close() && client.has_hosted_only_tabs_like(document) && (!process || client.child_id() < process->child_id()))
-            process = client;
-        return IterationDecision::Continue;
-    });
-    return process;
-}
-
-RefPtr<WebContentClient> CanonicalNavigable::process_to_host_for_site_isolation(CanonicalDocument const& document, Optional<URL::Origin> const& initiator_origin) const
-{
-    RefPtr<WebContentPage> page_holding_navigable = parent() ? reporting_page() : top_level_traversable().page_hosting(*this);
-    RefPtr<WebContentClient> process_holding_navigable = page_holding_navigable ? &page_holding_navigable->client() : nullptr;
-
-    // An agent runs in one process: its documents go where it is hosted.
-    if (auto process = document.relevant_global_object().agent().hosting_process())
-        return process;
-
-    // Documents that are not isolated go with the page holding the navigable.
-    if (Application::the().tab_processes() == TabProcesses::PerTabWithoutSiteIsolation)
-        return process_holding_navigable;
-
-    // A sandboxed document stays out of its initiator's process, and the sandboxed documents of an origin share one
-    // process rather than having a process per agent cluster. A traversable's first document can still take the process
-    // its initial about:blank came with, below.
-    auto sandboxed_origin = origin_of_sandboxed_document(*this, document);
-    if (sandboxed_origin.has_value()) {
-        if (auto process = document.browsing_context().top_level_browsing_context().group()->process_hosting_sandboxed_documents_of_origin(*sandboxed_origin))
-            return process;
-        if (parent())
-            return nullptr;
-    }
-
-    // A tab goes to a process that has hosted only tabs of its origin that are origin-keyed just as it is, or of its
-    // site if the user chose so, to share what the process holds. Nothing else can reach a browsing context group of
-    // one, whereas an opener could make a process it can connect to host the tab. A tab recovering from a crash gets a
-    // process of its own, so that it can't take the tabs it joins down with it again.
-    if (!parent() && process_holding_navigable && document.may_share_a_process_with_tabs_of_its_origin()
-        && document.browsing_context().top_level_browsing_context().group()->browsing_context_set().size() == 1
-        && !top_level_traversable().has_page_standing_in_for_lost_document()
-        && Application::the().tabs_may_share_processes()) {
-        if (auto process = lowest_process_hosting_only_tabs_like(document, process_holding_navigable->session()))
-            return process;
-    }
-
-    // Any other opaque origin keys an agent cluster of its own, which nothing but the documents it was created from can
-    // address: it goes with the initiator's agent. A traversable's document of an opaque origin that no such agent
-    // hosts, as a file's opened from the browser's UI is, keeps the process of a document of an opaque origin.
-    if (document.origin().is_opaque() && !sandboxed_origin.has_value()) {
-        if (initiator_origin.has_value()) {
-            if (auto initiator_agent = document.browsing_context().top_level_browsing_context().group()->similar_origin_window_agent_for(*initiator_origin)) {
-                if (auto process = initiator_agent->hosting_process())
-                    return process;
-            }
-        }
-        if (!parent() && active_document().origin().is_opaque())
-            return process_holding_navigable;
-    }
-
-    // A traversable's first document takes the process its initial about:blank came with, unless that document
-    // inherited its creator's origin and shares the creator's process, or a browsing context group switch leaves the
-    // initial about:blank's group. A noopener popup's initial about:blank came with the process of the document that
-    // opened it, which a document unlike the tabs of that process stays out of if the process hosts tabs of one
-    // origin.
-    if (!parent() && active_document().is_initial_about_blank() && active_document().origin().is_opaque() && !active_browsing_context().is_auxiliary() && &document.browsing_context() == &active_browsing_context()) {
-        if (process_holding_navigable && process_holding_navigable->has_hosted_only_tabs_unlike(document))
-            return nullptr;
-        return process_holding_navigable;
-    }
-
-    return nullptr;
-}
-
-// A process that has hosted local file content may read local files, so site isolation has it host no content a site
-// could have made: only local file content, documents of its origin, documents local file content made from what it
-// holds, and about:blank documents no other process can reach. Local file content goes to no other process.
-// Likewise, a process that has hosted a WebUI's documents may speak for that WebUI, so it hosts only that WebUI's
-// documents and about:blank documents no other process can reach, and a WebUI's documents go to no other process.
-RefPtr<WebContentClient> CanonicalNavigable::process_to_host(CanonicalDocument const& document, Optional<URL::Origin> const& initiator_origin) const
-{
-    auto process = process_to_host_for_site_isolation(document, initiator_origin);
-
-    // NB: Without site isolation, every document stays with the process holding its navigable, local file content and
-    //     WebUI documents too, and that process may then read local files or speak for the WebUI for as long as it lives.
-    if (Application::the().tab_processes() == TabProcesses::PerTabWithoutSiteIsolation)
-        return process;
-    auto process_has_hosted_local_file_content = process && process->may_read_local_files();
-    auto process_has_hosted_web_ui = process && process->hosted_web_ui().has_value();
-
-    if (document.web_ui_host().has_value())
-        return process && process->hosted_web_ui() == document.web_ui_host() ? process : nullptr;
-    auto root = local_file_root_to_host(*this, document);
-    if (document.is_local_file_content())
-        return process && may_read_local_files_under(*process, root) ? process : nullptr;
-    if (!process_has_hosted_local_file_content && !process_has_hosted_web_ui)
-        return process;
-    if (process_has_hosted_local_file_content && document.origin().is_file_origin() && may_read_local_files_under(*process, root))
-        return process;
-
-    // An agent runs in one process, and one the process hosts was let in with the documents it has there.
-    if (document.relevant_global_object().agent().hosting_process() == process)
-        return process;
-
-    // An about:blank document of an agent no process hosts yet is empty, and nothing else can script it. The browser's
-    // UI creates one between documents.
-    auto const& url = document.creation_url();
-    if (Web::HTML::url_matches_about_blank(url))
-        return process;
-
-    auto is_made_from_what_its_initiator_holds = Web::HTML::url_matches_about_srcdoc(url) || url.scheme() == "data"sv;
-    if (process_has_hosted_local_file_content && is_made_from_what_its_initiator_holds && initiator_origin.has_value() && initiator_origin->is_file_origin()
-        && may_read_local_files_under(*process, root)) {
-        return process;
-    }
-    return nullptr;
-}
-
-ErrorOr<NonnullRefPtr<WebContentPage>> CanonicalNavigable::obtain_page_to_host(CanonicalDocument const& document, Optional<URL::Origin> const& initiator_origin)
-{
-    auto page = TRY(obtain_page_to_host_in(process_to_host(document, initiator_origin)));
-    if (Application::the().tab_processes() != TabProcesses::PerTabWithoutSiteIsolation) {
-        if (auto origin = origin_of_sandboxed_document(*this, document); origin.has_value()) {
-            document.browsing_context().top_level_browsing_context().group()->set_process_hosting_sandboxed_documents_of_origin(*origin, page->client());
-            // NB: A sandboxed srcdoc or data: URL iframe of local file content loads files as that content can.
-            if (*origin == serialized_file_origin) {
-                if (auto root = local_file_root_to_host(*this, document); root.has_value())
-                    TRY(page->client().add_local_file_root(root.release_value()));
-            }
-        }
-    }
-    if (document.is_local_file_content())
-        TRY(page->client().add_local_file_root(*document.local_file_root()));
-    if (auto const& web_ui_host = document.web_ui_host(); web_ui_host.has_value()) {
-        page->client().set_hosted_web_ui(*web_ui_host);
-        // NB: The page took the view's preferences before it hosted the WebUI, so it now takes the interface theme.
-        page->async_set_preferred_color_scheme(Application::the().interface_color_scheme());
-    }
-    return page;
-}
-
-ErrorOr<NonnullRefPtr<WebContentPage>> CanonicalNavigable::obtain_page_to_host_in(RefPtr<WebContentClient> host)
-{
-    auto& traversable = top_level_traversable();
-    if (!parent())
-        return traversable.obtain_page_to_host_traversable(move(host));
-
-    // A page beginning to host the navigable starts from a document standing in for the current entry's.
-    auto current_entry_descriptor = [&] {
-        // NB: Until the update for its creation, the navigable's entry is the one initializing it created.
-        if (auto const* current_entry = traversable.session_history().get_the_target_history_entry(*this, traversable.session_history().current_step()))
-            return current_entry->descriptor();
-        return active_session_history_entry()->descriptor();
-    };
-
-    // The host takes the navigable's node over once the document it is to display is activated; until then, the page
-    // hosting the displayed document keeps it.
-    if (host && host == &reporting_page()->client()) {
-        // The page holding the container populates the document in a provisional navigable while another page hosts
-        // the displayed document.
-        if (has_remote_host())
-            host->async_begin_hosting_navigable(reporting_page()->id(), id(), current_entry_descriptor(), traversable.system_visibility_state());
-        return *reporting_page();
-    }
-    if (host && has_remote_host() && host == &remote_host().client())
-        return remote_host();
-
-    // A process holds one page per tab, with the tab's whole graph: the process displaying the tab hosts a document
-    // in the view's page, another process in the page it has for the tab, or in a page created for it.
-    Web::PageId page_id;
-    if (host && host->page_id_for_traversable(traversable).has_value()) {
-        page_id = *host->page_id_for_traversable(traversable);
-        host->async_begin_hosting_navigable(page_id, id(), current_entry_descriptor(), traversable.system_visibility_state());
-    } else if (host) {
-        page_id = Application::the().allocate_page_id();
-        host->async_create_embedded_page(page_id, traversable.remote_navigable_graph(), id(), current_entry_descriptor(), traversable.system_visibility_state());
-        host->register_embedded_page(page_id, traversable);
-        traversable.represent_group_in(*host);
-    } else {
-        auto process = TRY(Application::the().launch_child_frame_web_content_process(reporting_page()->client().is_private(), traversable.remote_navigable_graph(), id(), current_entry_descriptor(), traversable.system_visibility_state()));
-        host = move(process.client);
-        page_id = process.page_id;
-        host->register_embedded_page(page_id, traversable);
-        traversable.represent_group_in(*host);
-    }
-
-    auto& page = *host->page(page_id);
-    if (auto view = traversable.view(); view.has_value())
-        view->prepare_page_for_navigable(page);
-    return page;
-}
-
-ErrorOr<CanonicalNavigable::PageToPopulateDocument> CanonicalNavigable::obtain_page_to_populate_document(CanonicalSessionHistoryEntry& entry, NavigationLoader& loader, WebContentPage& page_that_created_navigation_params)
-{
-    auto response_document = loader.response_document();
-    if (!response_document.has_value())
-        return PageToPopulateDocument { page_that_created_navigation_params, nullptr };
-
-    NonnullRefPtr document_state = entry.document_state;
-    response_document->document_id = Application::the().allocate_ui_process_cross_process_id();
-    auto document = create_and_initialize_a_document(*response_document);
-    loader.set_document(*document, *this);
-    populate_document(document_state, document, loader.result().inline_content_origin, loader.local_file_root());
-
-    // A document created for inline content stands in for the resource the process that fetched it could not load; that
-    // process hosts it.
-    NonnullRefPtr<WebContentPage> host = page_that_created_navigation_params;
-    if (!response_document->is_inline_content || is_top_level_traversable()) {
-        auto host_or_error = obtain_page_to_host(*document, document_state->initiator_origin);
-        if (host_or_error.is_error()) {
-            abandon_populated_document(document_state, *document);
-            return host_or_error.release_error();
-        }
-        host = host_or_error.release_value();
-
-        // Obtaining the page can replace the tab's process, whose change callbacks can abandon the document.
-        if (!document_state->populated_document.has_value() || document_state->populated_document->document != document)
-            return Error::from_string_literal("The populated document was abandoned");
-    }
-
-    // The host takes the navigable over when the document is activated, after the displayed document is unloaded.
-    place_populated_document(*document, *host);
-    return PageToPopulateDocument { move(host), move(document) };
-}
-
-RefPtr<CanonicalDocument> CanonicalNavigable::document_with_id(Web::HTML::CrossProcessId id) const
-{
-    if (active_document().id() == id)
-        return active_document();
-    RefPtr<CanonicalDocument> document;
-    for_each_populated_document_state([&](CanonicalDocumentState const& document_state) {
-        if (document_state.populated_document->document->id() == id)
-            document = document_state.populated_document->document;
-    });
-    return document;
-}
-
-// A document state that is not a navigation's is a history job's, which the navigable holds while the job runs.
-void CanonicalNavigable::populate_document(NonnullRefPtr<CanonicalDocumentState> document_state, NonnullRefPtr<CanonicalDocument> document, Optional<URL::Origin> inline_content_origin, Optional<LocalFileRoot> root_of_read_file)
-{
-    document->determine_whether_it_is_local_file_content(blob_url_store(), move(root_of_read_file));
-    if (document->is_local_file_content())
-        document_state->local_file_root = document->local_file_root();
-    abandon_populated_document(document_state);
-    auto is_for_navigation = any_of(m_navigations, [&](auto const& navigation) {
-        return navigation->history_entry && navigation->history_entry->document_state == document_state;
-    });
-    if (!is_for_navigation) {
-        if (m_document_state_populated_by_history_job)
-            abandon_populated_document(m_document_state_populated_by_history_job.release_nonnull());
-        m_document_state_populated_by_history_job = document_state;
-    }
