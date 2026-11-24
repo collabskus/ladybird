@@ -1,4 +1,487 @@
-﻿            deliver_without_an_answer();
+﻿        return;
+    if (engagement.destination_kind == OmniboxDestinationKind::Search && !m_host.autocomplete_settings().search_engine_settings().engine.has_value())
+        return;
+    m_host.autocomplete_service().record_engagement(move(engagement));
+}
+
+size_t autocomplete_preliminary_limit(size_t max_suggestions)
+{
+    return max(max_suggestions * 4, 32uz);
+}
+
+String autocomplete_suggestion_display_text(AutocompleteSuggestion const& suggestion)
+{
+    if (suggestion.source == AutocompleteSuggestionSource::Search)
+        return suggestion.text;
+    // NB: Choosing a search engine leaves the query in the field, rather than the address of the settings.
+    if (suggestion.source == AutocompleteSuggestionSource::ChooseSearchEngine)
+        return suggestion.highlight_input.is_empty() ? suggestion.text : suggestion.highlight_input;
+
+    auto url = classify_user_input(suggestion.text).url;
+    if (!url.has_value())
+        url = URL::create_with_url_or_path(suggestion.text.to_byte_string());
+    if (!url.has_value())
+        return suggestion.text;
+    return url_for_display(*url);
+}
+
+Vector<AutocompleteMatchRange> autocomplete_match_ranges(StringView input, StringView text)
+{
+    Vector<AutocompleteMatchRange> ranges;
+
+    for (auto token : input.split_view_if([](char ch) { return is_ascii_space(ch); })) {
+        if (token.is_empty())
+            continue;
+
+        for (size_t offset = 0; offset + token.length() <= text.length();) {
+            auto candidate = text.substring_view(offset, token.length());
+            if (candidate.equals_ignoring_ascii_case(token)) {
+                ranges.append({ offset, token.length() });
+                offset += token.length();
+            } else {
+                ++offset;
+            }
+        }
+    }
+
+    quick_sort(ranges, [](auto const& left, auto const& right) {
+        return left.start < right.start;
+    });
+
+    Vector<AutocompleteMatchRange> merged_ranges;
+    for (auto const& range : ranges) {
+        if (merged_ranges.is_empty() || merged_ranges.last().start + merged_ranges.last().length < range.start) {
+            merged_ranges.append(range);
+            continue;
+        }
+        auto end = max(merged_ranges.last().start + merged_ranges.last().length, range.start + range.length);
+        merged_ranges.last().length = end - merged_ranges.last().start;
+    }
+    return merged_ranges;
+}
+
+bool remote_autocomplete_suggestion_matches_input(StringView suggestion, StringView input)
+{
+    return suggestion.starts_with(input, CaseSensitivity::CaseInsensitive);
+}
+
+Vector<AutocompleteSuggestion> web_ui_autocomplete_suggestions(StringView input)
+{
+    if (!input.starts_with(about_url_prefix, CaseSensitivity::CaseInsensitive))
+        return {};
+
+    Vector<AutocompleteSuggestion> suggestions;
+    suggestions.ensure_capacity(WebUI::pages().size());
+
+    for (auto const& page : WebUI::pages()) {
+        auto url = MUST(String::formatted("about:{}", page.host));
+        if (!url.bytes_as_string_view().starts_with(input, CaseSensitivity::CaseInsensitive))
+            continue;
+
+        suggestions.unchecked_append({
+            .source = AutocompleteSuggestionSource::WebUI,
+            .text = move(url),
+            .title = MUST(String::from_utf8(page.title)),
+            .subtitle = {},
+            .favicon_png = {},
+            .highlight_input = {},
+            .match_class = AutocompleteMatchClass::URLPrefix,
+            .relevance = 1100,
+            .is_verbatim = false,
+            .can_be_automatically_selected = true,
+            .can_be_inline_completed = true,
+        });
+    }
+
+    return suggestions;
+}
+
+[[maybe_unused]] static ByteString log_autocomplete_suggestions(Vector<AutocompleteSuggestion> const& suggestions)
+{
+    Vector<ByteString> values;
+    values.ensure_capacity(suggestions.size());
+
+    for (auto const& suggestion : suggestions)
+        values.unchecked_append(suggestion.text.bytes_as_string_view());
+
+    return ByteString::formatted("[{}]", ByteString::join(", "sv, values));
+}
+
+static Optional<AutocompleteSuggestion> search_for_query_suggestion(Optional<SearchEngine> const& search_engine, StringView query)
+{
+    if (query.is_empty())
+        return {};
+
+    auto query_string = MUST(String::from_utf8(query));
+    auto contains_whitespace = any_of(query, [](auto code_unit) { return is_ascii_space(code_unit); });
+
+    if (!search_engine.has_value()) {
+        return AutocompleteSuggestion {
+            .source = AutocompleteSuggestionSource::ChooseSearchEngine,
+            .text = "about:settings#search"_string,
+            .title = "Choose a search engine…"_string,
+            .subtitle = MUST(String::formatted("to search for “{}”", query_string)),
+            .favicon_png = {},
+            .highlight_input = {},
+            .relevance = contains_whitespace ? 1000 : 900,
+            .is_verbatim = true,
+            .can_be_automatically_selected = true,
+            .can_be_inline_completed = false,
+        };
+    }
+
+    return AutocompleteSuggestion {
+        .source = AutocompleteSuggestionSource::Search,
+        .text = query_string,
+        .title = query_string,
+        .subtitle = {},
+        .favicon_png = {},
+        .highlight_input = {},
+        .relevance = contains_whitespace ? 1000 : 900,
+        .is_verbatim = true,
+        .can_be_automatically_selected = true,
+        .can_be_inline_completed = false,
+    };
+}
+
+static AutocompleteSuggestion make_literal_url_suggestion(StringView query)
+{
+    return {
+        .source = AutocompleteSuggestionSource::LiteralURL,
+        .text = MUST(String::from_utf8(query)),
+        .title = {},
+        .subtitle = {},
+        .favicon_png = {},
+        .highlight_input = {},
+        .relevance = 900,
+        .is_verbatim = true,
+        .can_be_automatically_selected = true,
+        .can_be_inline_completed = false,
+    };
+}
+
+// Whether the text starts with a scheme for the web, rather than one being guessed for it.
+static bool starts_with_web_scheme(StringView text)
+{
+    text = text.trim_whitespace();
+    return text.starts_with("http://"sv, CaseSensitivity::CaseInsensitive) || text.starts_with("https://"sv, CaseSensitivity::CaseInsensitive);
+}
+
+Optional<AutocompleteSuggestion> make_verbatim_autocomplete_suggestion(StringView query, ClassifiedUserInput const& classified_query, Optional<SearchEngine> const& search_engine)
+{
+    if (!query.is_empty() && classified_query.classification == UserInputClassification::InternalURL)
+        return make_literal_url_suggestion(query);
+    return search_for_query_suggestion(search_engine, query);
+}
+
+// A search for the text as typed, offered below the address that the text is, which is where Return goes. It is not
+// the row for the text as typed, so it never becomes the default, even when it would outrank the address.
+static Optional<AutocompleteSuggestion> search_below_address_for_query_suggestion(Optional<SearchEngine> const& search_engine, StringView query)
+{
+    auto suggestion = search_for_query_suggestion(search_engine, query);
+    if (!suggestion.has_value())
+        return {};
+    suggestion->relevance = 850;
+    suggestion->is_verbatim = false;
+    suggestion->can_be_automatically_selected = false;
+    return suggestion;
+}
+
+Optional<AutocompleteSuggestion> make_search_suggestion_for_address_like_text(StringView query, ClassifiedUserInput const& classified_query, Optional<SearchEngine> const& search_engine)
+{
+    if (!search_engine.has_value() || starts_with_web_scheme(query))
+        return {};
+    if (classified_query.classification != UserInputClassification::InternalURL || !classified_query.url.has_value())
+        return {};
+    if (!classified_query.url->scheme().is_one_of("http"sv, "https"sv))
+        return {};
+
+    return search_below_address_for_query_suggestion(search_engine, query);
+}
+
+// A remote suggestion that is a web address goes to that address rather than to a search for it. Only a public site
+// counts: the search engine must not name the user's own machine or network. Text without a scheme, such as
+// "google.com", may well be a phrase like "setup.py" instead, so it counts only for a site the user has been to.
+static RemoteAutocompleteSuggestion classify_remote_autocomplete_suggestion(String suggestion)
+{
+    auto as_search = [&] { return RemoteAutocompleteSuggestion { .text = move(suggestion), .url = {}, .host_family_the_user_must_have_visited = {} }; };
+
+    auto classified_suggestion = classify_user_input_ignoring_local_files(suggestion);
+    if (classified_suggestion.classification != UserInputClassification::InternalURL || !classified_suggestion.url.has_value())
+        return as_search();
+
+    // NB: Rows do not show the scheme, so an http address would look like the https one for the same site. An address
+    //     with a user name, such as "https://bank.example@evil.example/", names one site and goes to another.
+    auto const& url = *classified_suggestion.url;
+    if (url.scheme() != "https"sv || url.port().has_value() || !url.username().is_empty() || !url.password().is_empty())
+        return as_search();
+
+    auto const& host = url.host();
+    if (!host.has_value() || !host->is_domain() || host->is_loopback_or_localhost())
+        return as_search();
+
+    auto const& domain = host->get<String>();
+    auto public_suffix = URL::PublicSuffixData::find_matching_public_suffix(domain, URL::PublicSuffixData::IncludeStarRule::No);
+    if (!public_suffix.has_value() || *public_suffix == domain)
+        return as_search();
+
+    Optional<String> host_family_the_user_must_have_visited;
+    if (!starts_with_web_scheme(suggestion)) {
+        host_family_the_user_must_have_visited = autocomplete_host_family(url);
+        if (!host_family_the_user_must_have_visited.has_value())
+            return as_search();
+    }
+
+    return { .text = move(suggestion), .url = url.serialize(), .host_family_the_user_must_have_visited = move(host_family_the_user_must_have_visited) };
+}
+
+static Vector<RemoteAutocompleteSuggestion> classify_remote_autocomplete_suggestions(Vector<String> suggestions)
+{
+    static constexpr auto maximum_remote_candidates = 50uz;
+    Vector<RemoteAutocompleteSuggestion> classified_suggestions;
+    classified_suggestions.ensure_capacity(min(suggestions.size(), maximum_remote_candidates));
+    for (size_t index = 0; index < suggestions.size() && index < maximum_remote_candidates; ++index)
+        classified_suggestions.unchecked_append(classify_remote_autocomplete_suggestion(move(suggestions[index])));
+    return classified_suggestions;
+}
+
+static void add_visited_host_families(HashTable<String>& visited_host_families, ReadonlySpan<AutocompleteSuggestion> local_suggestions)
+{
+    for (auto const& suggestion : local_suggestions) {
+        if (suggestion.source == AutocompleteSuggestionSource::Search || suggestion.source == AutocompleteSuggestionSource::ChooseSearchEngine)
+            continue;
+        auto url = URL::Parser::basic_parse(suggestion.text);
+        // NB: A learned row holds the address the user went to as they typed it, such as "google.com" or
+        //     "google.com:8443", which the URL parser takes for a scheme and a path. Such text is classified as Return
+        //     would take it.
+        if (suggestion.source == AutocompleteSuggestionSource::Adaptive && (!url.has_value() || url->has_an_opaque_path()))
+            url = classify_user_input(suggestion.text).url;
+        if (!url.has_value())
+            continue;
+        if (auto family = autocomplete_host_family(*url); family.has_value())
+            visited_host_families.set(family.release_value());
+    }
+}
+
+static Vector<AutocompleteSuggestion> make_remote_autocomplete_suggestions(ReadonlySpan<RemoteAutocompleteSuggestion> remote_suggestions, HashTable<String> const& visited_host_families, LocalSuggestionsAreComplete local_suggestions_are_complete)
+{
+    if (remote_suggestions.is_empty())
+        return {};
+
+    Vector<AutocompleteSuggestion> suggestions;
+    suggestions.ensure_capacity(remote_suggestions.size());
+
+    for (size_t index = 0; index < remote_suggestions.size(); ++index) {
+        auto const& remote_suggestion = remote_suggestions[index];
+
+        auto is_url = false;
+        if (remote_suggestion.url.has_value()) {
+            auto const& required_host_family = remote_suggestion.host_family_the_user_must_have_visited;
+            is_url = !required_host_family.has_value() || visited_host_families.contains(*required_host_family);
+            // NB: Shown as a search now, it could turn into a page under the user once the local rows arrive.
+            if (!is_url && local_suggestions_are_complete == LocalSuggestionsAreComplete::No)
+                continue;
+        }
+
+        suggestions.unchecked_append({
+            .source = is_url ? AutocompleteSuggestionSource::RemoteURL : AutocompleteSuggestionSource::Search,
+            .text = is_url ? *remote_suggestion.url : remote_suggestion.text,
+            .title = {},
+            .subtitle = {},
+            .favicon_png = {},
+            .highlight_input = {},
+            .relevance = 700 - static_cast<i32>(index),
+            .is_verbatim = false,
+            .can_be_automatically_selected = false,
+            .can_be_inline_completed = false,
+        });
+    }
+
+    return suggestions;
+}
+
+Vector<AutocompleteSuggestion> make_remote_autocomplete_suggestions(Vector<String> remote_suggestions, ReadonlySpan<AutocompleteSuggestion> local_suggestions, LocalSuggestionsAreComplete local_suggestions_are_complete)
+{
+    HashTable<String> visited_host_families;
+    add_visited_host_families(visited_host_families, local_suggestions);
+    return make_remote_autocomplete_suggestions(classify_remote_autocomplete_suggestions(move(remote_suggestions)).span(), visited_host_families, local_suggestions_are_complete);
+}
+
+void Autocomplete::search_engine_settings_changed()
+{
+    cancel_pending_query();
+}
+
+void Autocomplete::query_autocomplete_engine(AutocompleteQueryID query_id, String query, size_t max_suggestions, Vector<AutocompleteSuggestion> additional_suggestions)
+{
+    stop_remote_query_timers();
+    if (auto cancel_remote_query = move(m_cancel_remote_query))
+        cancel_remote_query();
+    m_host.autocomplete_service().cancel(m_service_client_id);
+
+    m_max_suggestions = max_suggestions;
+    m_query_id = query_id;
+
+    // NB: The remote rows for the previous text stay until the ones for this text arrive. Dropping them now would
+    //     shrink the list at every key press, only for it to grow again when the search engine answers. They are never
+    //     where Return goes, as no remote row is selected automatically.
+    // NB: The sites the user visited only matter for remote rows that carry over to this query.
+    if (m_remote_suggestions.is_empty())
+        m_visited_host_families.clear();
+    m_trimmed_query = MUST(String::from_utf8(query.bytes_as_string_view().trim_whitespace()));
+    m_query = move(query);
+    m_local_query_complete = false;
+    m_remote_query_complete = false;
+    m_stopped_waiting_for_remote_query = false;
+    m_classified_query = classify_user_input(m_trimmed_query);
+    m_external_url = m_classified_query.classification == UserInputClassification::ExternalURL
+        ? m_classified_query.url
+        : Optional<URL::URL> {};
+    m_external_url_handler_query_complete = !m_external_url.has_value();
+    m_external_url_has_handler = false;
+    m_local_suggestions.clear();
+
+    dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Autocomplete query='{}' trimmed='{}'", m_query, m_trimmed_query);
+
+    // Private windows may read normal-profile history but never write through this worker connection.
+    m_host.autocomplete_service().query(m_service_client_id, query_id, m_trimmed_query, m_max_suggestions, move(additional_suggestions));
+
+    if (m_external_url.has_value()) {
+        auto weak_this = make_weak_ptr();
+        m_host.resolve_external_url_handler(*m_external_url, [weak_this, query_id](RefPtr<ExternalURLHandler> handler) mutable {
+            if (!weak_this)
+                return;
+            weak_this->external_url_handler_query_complete(query_id, move(handler));
+        });
+    }
+
+    if (m_trimmed_query.is_empty()) {
+        m_remote_suggestions.clear();
+        m_remote_query_complete = true;
+        dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Skipping remote autocomplete for empty query");
+        return;
+    }
+
+    if (m_trimmed_query.starts_with_bytes(file_url_prefix)) {
+        m_remote_suggestions.clear();
+        m_remote_query_complete = true;
+        dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Skipping remote autocomplete for file URL query '{}'", m_trimmed_query);
+        return;
+    }
+
+    if (m_trimmed_query.bytes_as_string_view().starts_with(about_url_prefix, CaseSensitivity::CaseInsensitive)) {
+        m_remote_suggestions.clear();
+        m_remote_query_complete = true;
+        dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Skipping remote autocomplete for about URL query '{}'", m_trimmed_query);
+        return;
+    }
+
+    auto const& settings = m_host.autocomplete_settings();
+    auto engine = settings.search_engine_settings().engine;
+    if (!settings.search_engine_settings().suggestions || !engine.has_value() || !engine->suggestions_url.has_value()) {
+        m_remote_suggestions.clear();
+        m_remote_query_complete = true;
+        dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Skipping remote autocomplete because search suggestions are disabled or unavailable");
+        return;
+    }
+
+    dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Scheduling remote autocomplete suggestions from {} for '{}'", engine->name, m_query);
+
+    // The search engine is asked right away, unless it was asked less than this long ago. The first key press after a
+    // pause is thus answered as soon as can be, and fast typing asks no more often than this.
+    // NB: The request starts from the timer even without a delay, as its answer must not arrive before this returns.
+    static constexpr auto minimum_time_between_remote_queries = AK::Duration::from_milliseconds(100);
+    auto remote_query_delay = AK::Duration::zero();
+    if (m_last_remote_query_time.has_value())
+        remote_query_delay = max(AK::Duration::zero(), minimum_time_between_remote_queries - (MonotonicTime::now() - *m_last_remote_query_time));
+    m_remote_query_timer = Core::Timer::create_single_shot(remote_query_delay, [this, query_id, engine = engine.release_value(), query = m_query] {
+        if (m_query_id != query_id)
+            return;
+        start_remote_query(query_id, engine, move(query));
+    });
+    m_remote_query_timer->start();
+
+    // The search engine only has so long after the key press to answer. After that, the rows without its answer are
+    // final, as the popup waits for the final rows to change, and a late answer makes new final rows.
+    // NB: Of the remote rows for the previous text, the ones that start with the new text stand in for the answer then.
+    //     The others would show the new text among suggestions for another.
+    static constexpr auto remote_query_deadline_ms = 400;
+    m_remote_query_deadline_timer = Core::Timer::create_single_shot(AK::Duration::from_milliseconds(remote_query_deadline_ms), [this, query_id] {
+        if (m_query_id != query_id || m_remote_query_complete)
+            return;
+        m_stopped_waiting_for_remote_query = true;
+        drop_remote_suggestions_for_other_text();
+        if (m_local_query_complete && m_external_url_handler_query_complete)
+            deliver_current_result();
+    });
+    m_remote_query_deadline_timer->start();
+}
+
+void Autocomplete::stop_remote_query_timers()
+{
+    for (auto* timer : { &m_remote_query_timer, &m_remote_query_deadline_timer }) {
+        if (!*timer)
+            continue;
+        (*timer)->stop();
+        timer->clear();
+    }
+}
+
+// Lets go of the remote suggestions for the previous text that the current text no longer starts.
+void Autocomplete::drop_remote_suggestions_for_other_text()
+{
+    m_remote_suggestions.remove_all_matching([&](auto const& suggestion) {
+        return !remote_autocomplete_suggestion_matches_input(suggestion.text, m_trimmed_query);
+    });
+}
+
+void Autocomplete::start_remote_query(AutocompleteQueryID query_id, SearchEngine engine, String query)
+{
+    dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Fetching remote autocomplete suggestions from {} for '{}'", engine.name, query);
+
+    m_last_remote_query_time = MonotonicTime::now();
+    if (!engine.suggestions_url_for_query(query).has_value()) {
+        m_remote_query_complete = true;
+        drop_remote_suggestions_for_other_text();
+        deliver_current_result();
+        return;
+    }
+
+    m_cancel_remote_query = m_host.fetch_remote_suggestions(engine, query, m_is_private, [this, query_id, engine, query](AutocompleteHost::RemoteResponse response) {
+        // NB: The request is over. Canceling the query from inside the callbacks below must not cancel it again.
+        m_cancel_remote_query = nullptr;
+
+        if (m_query_id != query_id) {
+            dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Discarding stale remote autocomplete response for '{}' while current query is '{}'", query, m_query);
+            return;
+        }
+
+        m_remote_query_complete = true;
+        // NB: Without an answer, the remote rows for the previous text are all there is. Only the ones that still start
+        //     with the text stay then.
+        auto deliver_without_an_answer = [&] {
+            drop_remote_suggestions_for_other_text();
+            deliver_current_result();
+        };
+
+        if (response.had_network_error) {
+            warnln("Unable to fetch autocomplete suggestions");
+            deliver_without_an_answer();
+            return;
+        }
+        if (response.response_code.has_value() && *response.response_code >= 400) {
+            warnln("Received error response code {} from autocomplete engine", *response.response_code);
+            deliver_without_an_answer();
+            return;
+        }
+
+        Optional<ByteString const&> content_type;
+        if (response.content_type.has_value())
+            content_type = *response.content_type;
+
+        if (auto result = received_autocomplete_response(content_type, StringView { response.body.bytes() }); result.is_error()) {
+            warnln("Unable to handle autocomplete response: {}", result.error());
+            deliver_without_an_answer();
         } else {
             dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Remote autocomplete suggestions for '{}': {}", query, history_log_suggestions(result.value()));
             m_remote_suggestions = classify_remote_autocomplete_suggestions(result.release_value());
@@ -33546,6 +34029,7 @@ static auto const& s_builtin_search_engines = *new auto(to_array<SearchEngine>({
     { "Google"_string, "https://www.google.com/search?q=%s"_string, "https://www.google.com/complete/search?client=chrome&q=%s"_string },
     { "Kagi"_string, "https://kagi.com/search?q=%s"_string, "https://kagisuggest.com/api/autosuggest?q=%s"_string },
     { "Mojeek"_string, "https://www.mojeek.com/search?q=%s"_string },
+    { "Qwant"_string, "https://www.qwant.com/?q=%s&t=web"_string, "https://api.qwant.com/api/suggest/?client=opensearch&q=%s"_string },
     { "Startpage"_string, "https://startpage.com/search?q=%s"_string, "https://www.startpage.com/osuggestions?q=%s"_string },
     { "Yahoo"_string, "https://search.yahoo.com/search?p=%s"_string, "https://search.yahoo.com/sugg/gossip/gossip-us-ura/?output=fxjson&command=%s"_string },
     { "Yandex"_string, "https://yandex.com/search/?text=%s"_string, "https://suggest.yandex.com/suggest-ff.cgi?part=%s&uil=en&v=3"_string },
@@ -192211,6 +192695,8 @@ void Application::ui_did_start()
     for (auto const& handle : m_webdriver_windows_awaiting_ui)
         WebView::Application::notify_webdriver_window_created(handle);
     m_webdriver_windows_awaiting_ui.clear();
+    if (m_openssl_mismatch_awaiting_ui.has_value())
+        display_openssl_mismatch(m_openssl_mismatch_awaiting_ui.release_value());
 }
 
 void Application::set_active_view(Optional<u64> view_id)
@@ -192348,6 +192834,18 @@ void Application::display_error_dialog(StringView error_message) const
         ui->async_app_display_error_dialog(MUST(String::from_utf8(error_message)));
     else
         WebView::Application::display_error_dialog(error_message);
+}
+
+void Application::display_openssl_mismatch(PlatformFeatures::OpenSSLFacts const& facts)
+{
+    auto* ui = ConnectionFromUI::the();
+    if (!ui)
+        return;
+    if (!m_ui_did_start) {
+        m_openssl_mismatch_awaiting_ui = facts;
+        return;
+    }
+    ui->async_app_display_openssl_mismatch(facts.curl_version.value_or({}), facts.linked_version);
 }
 
 #if defined(LADYBIRD_HAS_UPDATE_CHECK)
@@ -192840,6 +193338,7 @@ private:
     virtual NonnullRefPtr<Core::Promise<ByteString>> ask_user_for_download_path(ByteString const& file) const override;
     virtual void display_download_confirmation_dialog(StringView download_name, LexicalPath const& path) const override;
     virtual void display_error_dialog(StringView error_message) const override;
+    virtual void display_openssl_mismatch(PlatformFeatures::OpenSSLFacts const&) override;
 #if defined(LADYBIRD_HAS_UPDATE_CHECK)
     virtual void display_update_check_result(WebView::UpdateCheckResult const&, WebView::UpdateCheckTrigger) override;
 #endif
@@ -192890,6 +193389,8 @@ private:
     Optional<u64> m_active_view_id;
     bool m_ui_did_start { false };
     Vector<String> m_webdriver_windows_awaiting_ui;
+    // The system probe reports while the UI may still be opening its windows.
+    Optional<PlatformFeatures::OpenSSLFacts> m_openssl_mismatch_awaiting_ui;
 
     // What the Hub waits to hear from the UI.
     mutable HashMap<u64, Function<void(Utf16String)>> m_pending_clipboard_text_reads;
@@ -192960,6 +193461,7 @@ FILE: Services/Hub/ConnectionFromUI.cpp
 #include <LibCore/EventLoop.h>
 #include <LibHTTP/HeaderList.h>
 #include <LibRequests/RequestClient.h>
+#include <LibWebCommon/Loader/UserAgent.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/CrashReportStore.h>
 #include <LibWebView/DefaultBrowser.h>
@@ -193617,8 +194119,12 @@ void ConnectionFromUI::fetch_search_suggestions(u64 request_id, String engine_na
         async_request_finished(request_id, true, {}, {}, {});
         return;
     }
+
+    auto request_headers = HTTP::HeaderList::create();
+    request_headers->set({ "User-Agent"sv, Web::default_user_agent });
+
     static constexpr Array response_header_names { "Content-Type"sv };
-    start_request(request_id, "GET"sv, *url, *HTTP::HeaderList::create(), {}, HTTP::CacheMode::Default, HTTP::Cookie::IncludeCredentials::Yes, is_private, response_header_names);
+    start_request(request_id, "GET"sv, *url, request_headers, {}, HTTP::CacheMode::Default, HTTP::Cookie::IncludeCredentials::Yes, is_private, response_header_names);
 }
 
 // NB: A report goes only to the report server, with no credentials, and with only the headers that reports carry.
@@ -195050,6 +195556,7 @@ endpoint HubClient
     app_activate_or_open_tab_with_url(URL::URL url) =|
     app_open_view_in_new_tab(u64 view_id, Optional<u64> source_view_id, WebView::IsPrivate is_private, Web::HTML::ActivateTab activate_tab) =|
     app_display_error_dialog(String message) =|
+    app_display_openssl_mismatch(String curl_openssl_version, String linked_openssl_version) =|
     app_display_update_check_result(WebView::UpdateCheckResult::Kind kind, Optional<String> version, WebView::InstallMethod install_method, WebView::UpdateCheckTrigger trigger) =|
     app_display_download_confirmation_dialog(String download_name, ByteString path) =|
     app_read_clipboard_text(u64 request_id, WebView::Application::ClipboardType type) =|
@@ -200865,7 +201372,7 @@ target_include_directories(requestserverservice PRIVATE ${CMAKE_CURRENT_BINARY_D
 target_include_directories(requestserverservice PRIVATE ${LADYBIRD_SOURCE_DIR}/Services/)
 
 target_link_libraries(RequestServer PRIVATE requestserverservice LibFileSystem)
-target_link_libraries(requestserverservice PUBLIC LibCore LibDNS LibHTTP LibIPC LibMain LibRequests LibSandbox LibTLS LibWebSocket LibURL LibTextCodec CURL::libcurl)
+target_link_libraries(requestserverservice PUBLIC LibCore LibDNS LibHTTP LibIPC LibMain LibPlatformFeatures LibRequests LibSandbox LibTLS LibWebSocket LibURL LibTextCodec CURL::libcurl)
 target_link_libraries(requestserverservice PRIVATE OpenSSL::Crypto OpenSSL::SSL)
 
 if (WIN32)
@@ -202700,12 +203207,15 @@ FILE: Services/RequestServer/CURL.cpp
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/ByteString.h>
 #include <AK/Enumerate.h>
 #include <AK/Format.h>
+#include <LibPlatformFeatures/SystemFacts.h>
 #include <RequestServer/AIA.h>
 #include <RequestServer/CURL.h>
 #include <RequestServer/CertificateExceptions.h>
 #include <RequestServer/Resolver.h>
+#include <openssl/crypto.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
@@ -202784,10 +203294,27 @@ static int verify_server_certificate_has_subject_alt_name(int preverify_ok, X509
 // Our SSL context callbacks require OpenSSL's SSL_CTX.
 static bool curl_uses_openssl()
 {
+    // Those callbacks change curl's SSL_CTX through the OpenSSL we link, which only holds when curl uses that same
+    // OpenSSL. A system curl can load another one, for instance once the system has moved on to a newer OpenSSL than
+    // the one Ladybird was built against. Both are then loaded, and the structures of one handed to the other corrupt
+    // memory, so leave curl's SSL_CTX alone in that case.
     static auto const uses_openssl = [] {
         auto const* version_info = curl_version_info(CURLVERSION_NOW);
         VERIFY(version_info);
-        return version_info->ssl_version && StringView { version_info->ssl_version, strlen(version_info->ssl_version) }.starts_with("OpenSSL/"sv);
+        if (!version_info->ssl_version)
+            return false;
+        auto curl_openssl_version = PlatformFeatures::OpenSSLFacts::openssl_version_from_curl_ssl_version({ version_info->ssl_version, strlen(version_info->ssl_version) });
+        if (!curl_openssl_version.has_value())
+            return false;
+
+        // The Browser tells the user about this as well, from what the system probe found.
+        auto our_openssl_version = ByteString::formatted("{}.{}.{}", OPENSSL_version_major(), OPENSSL_version_minor(), OPENSSL_version_patch());
+        if (*curl_openssl_version != our_openssl_version) {
+            warnln("RequestServer: curl uses OpenSSL {}, but Ladybird uses OpenSSL {}. Ladybird has to be rebuilt against the OpenSSL that curl uses, until then it leaves curl's TLS configuration as it is.",
+                *curl_openssl_version, our_openssl_version);
+            return false;
+        }
+        return true;
     }();
     return uses_openssl;
 }
@@ -207679,6 +208206,7 @@ private:
 FILE: Services/SystemProbe/CMakeLists.txt
 set(SOURCES
     main.cpp
+    OpenSSLDescription.cpp
 )
 
 if (HAS_VULKAN)
@@ -207692,7 +208220,7 @@ endif()
 add_executable(SystemProbe ${SOURCES})
 
 target_include_directories(SystemProbe PRIVATE ${LADYBIRD_SOURCE_DIR}/Services/)
-target_link_libraries(SystemProbe PRIVATE LibCore LibGfx LibMain LibPlatformFeatures)
+target_link_libraries(SystemProbe PRIVATE LibCore LibGfx LibMain LibPlatformFeatures CURL::libcurl OpenSSL::Crypto)
 if (HAS_VULKAN)
     target_link_libraries(SystemProbe PRIVATE Vulkan::Vulkan)
 endif()
@@ -207768,10 +208296,12 @@ FILE: Services/SystemProbe/main.cpp
 #include <LibPlatformFeatures/Build.h>
 #include <LibPlatformFeatures/SystemFacts.h>
 #include <SystemProbe/FFmpegDescription.h>
+#include <SystemProbe/OpenSSLDescription.h>
 #include <SystemProbe/VulkanDescription.h>
 
-// Describes the system for the Browser's feature blocklist, and exits. It takes nothing but its arguments and writes
-// nothing but its report, so that it can run with the GPU driver loaded and no sandbox.
+// Describes the system for the Browser's feature blocklist and its warnings about the system, and exits. It takes
+// nothing but its arguments and writes nothing but its report, so that it can run with the GPU driver loaded and no
+// sandbox.
 
 ErrorOr<int> ladybird_main(Main::Arguments arguments)
 {
@@ -207795,6 +208325,7 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
         facts.bundled_ffmpeg = describe_bundled_ffmpeg();
         facts.system_ffmpeg = describe_system_ffmpeg();
     }
+    facts.openssl = describe_openssl();
 
     auto report = facts.to_json().serialized();
     auto output = TRY(Core::File::standard_output());
@@ -207804,6 +208335,54 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     output->close();
     return 0;
 }
+
+FILE: Services/SystemProbe/OpenSSLDescription.cpp
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/Format.h>
+#include <SystemProbe/OpenSSLDescription.h>
+#include <curl/curl.h>
+#include <openssl/crypto.h>
+#include <string.h>
+
+PlatformFeatures::OpenSSLFacts describe_openssl()
+{
+    PlatformFeatures::OpenSSLFacts facts;
+    facts.linked_version = MUST(String::formatted("{}.{}.{}", OPENSSL_version_major(), OPENSSL_version_minor(), OPENSSL_version_patch()));
+
+    // A MultiSSL curl only settles on its backend once initialized, so it's initialized the way RequestServer does it
+    // before being asked which one that is.
+    if (auto result = curl_global_init(CURL_GLOBAL_ALL); result != CURLE_OK) {
+        warnln("curl_global_init failed: {}", curl_easy_strerror(result));
+        return facts;
+    }
+
+    auto const* version_info = curl_version_info(CURLVERSION_NOW);
+    if (version_info && version_info->ssl_version) {
+        if (auto version = PlatformFeatures::OpenSSLFacts::openssl_version_from_curl_ssl_version({ version_info->ssl_version, strlen(version_info->ssl_version) }); version.has_value())
+            facts.curl_version = MUST(String::from_utf8(*version));
+    }
+    curl_global_cleanup();
+    return facts;
+}
+
+FILE: Services/SystemProbe/OpenSSLDescription.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <LibPlatformFeatures/SystemFacts.h>
+
+// The probe links curl and OpenSSL the way RequestServer does, so it loads the same libraries that RequestServer does.
+PlatformFeatures::OpenSSLFacts describe_openssl();
 
 FILE: Services/SystemProbe/VulkanDescription.cpp
 /*
@@ -378952,6 +379531,26 @@ test("alternatives that start with literal characters", () => {
     expect(/(?:[a-c]x|[a-c]y)/.exec("by")[0]).toBe("by");
 });
 
+test("runs of literal characters", () => {
+    expect(/&(?:zwnj;|zwj;|zscr;)/.exec("a&zwj;b")[0]).toBe("&zwj;");
+    expect(/&(?:zwnj;|zwj;|zscr;)/.exec("a&zw;b")).toBeNull();
+    expect(/:(?:smile-cat|smile):/i.exec(":SMILE-Cat:")[0]).toBe(":SMILE-Cat:");
+    expect(/abc$/.exec("xxabc")[0]).toBe("abc");
+    expect(/x.*abc/.exec("xabc_abc_ab")[0]).toBe("xabc_abc");
+    expect(/a(?i:bc-d)e/.exec("aBC-De")[0]).toBe("aBC-De");
+    expect(/a(?i:bc-d)e/.exec("aBC-DE")).toBeNull();
+    expect(/a(?-i:bc)d/i.exec("ABcD")).toBeNull();
+    expect(/a(?-i:bc)d/i.exec("AbcD")[0]).toBe("AbcD");
+    expect(/(?<=ab)cd/.exec("abcd")[0]).toBe("cd");
+    expect(/(?<!ab)cd/.exec("abcd")).toBeNull();
+    expect(/\u{1F600}ab/u.exec("x\u{1F600}ab")[0]).toBe("\u{1F600}ab");
+    expect(/a\uD83Db/u.exec("a\uD83D\uDE00b")).toBeNull();
+    expect(/a\uD83Db/u.exec("a\uD83Db")[0]).toBe("a\uD83Db");
+    expect(/a\uD83D\uDE00b/.exec("a\u{1F600}b")[0]).toBe("a\u{1F600}b");
+    expect(/\u017Fx/i.exec("Sx")).toBeNull();
+    expect(/\u017Fx/iu.exec("Sx")[0]).toBe("Sx");
+});
+
 test("modifiers end with their group after backtracking into it", () => {
     expect(/(?i:[^\s"]+)x/.exec('x"yX')).toBeNull();
     expect(/(?i:[^\s"]+)x/.exec("xyX")).toBeNull();
@@ -493948,6 +494547,7 @@ FILE: Tests/LibSandbox/TestSeccomp.cpp
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -494353,6 +494953,37 @@ TEST_CASE(gpu_policy_refuses_path_permission_changes_without_crashing)
     EXPECT_EQ(metadata.st_mode & 0777, 0600u);
     VERIFY(close(fd) == 0);
     VERIFY(unlink(path) == 0);
+}
+
+TEST_CASE(gpu_policy_refuses_device_node_creation_without_crashing)
+{
+    char directory[] = "/tmp/ladybird-mknod-XXXXXX";
+    VERIFY(mkdtemp(directory));
+    auto path = ByteString::formatted("{}/nvidiactl", directory);
+
+    auto status = run_with_policy(
+        [](auto& policy) {
+            policy.allow_filesystem_writes();
+            policy.allow_gpu_device_operations();
+        },
+        [&] {
+#ifdef __NR_mknod
+            VERIFY(syscall(__NR_mknod, path.characters(), S_IFCHR | 0666, makedev(195, 255)) == -1);
+            VERIFY(errno == EPERM);
+#endif
+#ifdef __NR_mknodat
+            VERIFY(syscall(__NR_mknodat, AT_FDCWD, path.characters(), S_IFCHR | 0666, makedev(195, 255)) == -1);
+            VERIFY(errno == EPERM);
+#endif
+        });
+
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+
+    struct stat metadata {};
+    EXPECT_EQ(lstat(path.characters(), &metadata), -1);
+    VERIFY(rmdir(directory) == 0);
 }
 
 TEST_CASE(readonly_open_policy_accepts_the_flags_opendir_and_libpulse_use)
@@ -646878,940 +647509,3 @@ FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/highlight-text-
             background: grey;
         }
         .obscurer2 {
-            position: absolute;
-            top: 35px;
-            left: 180px;
-            width: 10px;
-            height: 10px;
-            background: grey;
-        }
-    </style>
-</head>
-<body>
-    O<span class="style1">n</span>e t<span class="style2">w</span>o th<span class="style3">ree</span>
-    <div class='obscurer1'></div>
-    <div class='obscurer2'></div>
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/highlight-text-dynamic-notref.html
-<!DOCTYPE html>
-<html>
-<body>
-    <span id="text1">One two three</span>
-</body>
-</html>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/highlight-text-ref.html
-<!DOCTYPE html>
-<html>
-<head>
-    <style>
-        :root {
-            font-family: monospace;
-            letter-spacing: 2px;
-        }
-        #style1 {
-            background-color: yellow;
-            color:green;
-        }
-        #style2 {
-            background-color: blue;
-            color:red;
-        }
-        #style3 {
-            background-color: purple;
-            color:pink;
-        }
-    </style>
-</head>
-<body>
-    O<span id="style1">n</span>e<span id="style2"> </span>t<span id="style2">w</span>o<span id="style3"> </span>t<span id="style3">h</span>re<span id="style3">e</span>
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/css-highlight-painting-underline-offset-001-ref.html
-<!DOCTYPE html>
-<html>
-<meta charset="utf-8">
-<title>CSS Highlight API Test: ::highlight with text-underline-offset, reference</title>
-<style>
-  #target {
-    text-decoration: wavy underline green 5px;
-    text-underline-offset: 20px;
-  }
-</style>
-<p id="target">The underline should be offset.</p>
-</html>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-container-metrics-001-ref.html
-<!DOCTYPE html>
-<meta charset="UTF-8">
-<title>CSS Highlight API Test Reference</title>
-<head>
-  <style>
-    div {
-      width: 200px;
-      height: 100px;
-    }
-    #h1 {
-      text-underline-offset: 1svw;
-      text-decoration-line: underline;
-      text-decoration-color: green;
-      text-decoration-thickness: 2svh;
-    }
-  </style>
-</head>
-<body>
-  <div id="h1">With container size</div>
-</body>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-container-metrics-002-ref.html
-<!DOCTYPE html>
-<meta charset="UTF-8">
-<title>CSS Highlight API Test Reference</title>
-<head>
-  <style>
-    .wrapper {
-      width: 200px;
-      height: 100px;
-      text-underline-offset: 4px;
-      text-decoration-line: underline;
-      text-decoration-color: green;
-      text-decoration-thickness: 4px;
-    }
-    #h2 {
-      text-underline-offset: 2svw;
-      text-decoration-line: underline;
-      text-decoration-color: green;
-      text-decoration-thickness: 4svh;
-    }
-  </style>
-</head>
-<body>
-  <div class="wrapper">With container size</div>
-  <div id="h2">Without container size</div>
-</body>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-container-metrics-003-ref.html
-<!DOCTYPE html>
-<meta charset="UTF-8">
-<title>CSS Highlight API Test Reference</title>
-<head>
-  <style>
-    .wrapper {
-      width: 200px;
-      height: 100px;
-      text-underline-offset: 4px;
-      text-decoration-line: underline;
-      text-decoration-color: green;
-      text-decoration-thickness: 4px;
-    }
-  </style>
-</head>
-<body>
-  <div class="wrapper">With container size</div>
-  <div>Should be no highlight</div>
-</body>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-container-metrics-004-ref.html
-<!DOCTYPE html>
-<meta charset="UTF-8">
-<title>CSS Highlight API Test Reference</title>
-<head>
-  <style>
-    .wrapper {
-      width: 200px;
-      height: 100px;
-      text-underline-offset: 4px;
-      text-decoration-line: underline;
-      text-decoration-color: green;
-      text-decoration-thickness: 4px;
-    }
-    #h2 {
-      text-underline-offset: 2svw;
-      text-decoration-line: underline;
-      text-decoration-color: green;
-      text-decoration-thickness: 4svh;
-    }
-  </style>
-</head>
-<body>
-  <div class="wrapper">With container size</div>
-  <div id="h2">Without container size</div>
-</body>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-font-metrics-001-ref.html
-<!DOCTYPE html>
-<meta charset="UTF-8">
-<title>CSS Highlight API Test: </title>
-<head>
-  <style>
-    div {
-      margin: 50px;
-      font-size: 40px;
-      text-underline-offset: 0.5em;
-      text-decoration-line: underline;
-      text-decoration-color: green;
-      text-decoration-thickness: 0.25rem;
-    }
-    #h2 {
-      font-size: 20px;
-    }
-  </style>
-</head>
-<body>
-  <div id="h1">Font relative units with 40px font</div>
-  <div id="h2">Font relative units with 20px font</div>
-</body>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-font-metrics-002-ref.html
-<!DOCTYPE html>
-<meta charset="UTF-8">
-<title>CSS Highlight API Test: </title>
-<head>
-  <style>
-    div {
-      margin: 40px;
-      font-size: 20px;
-    }
-    #h1 {
-      text-underline-offset: 10px;
-      text-decoration-line: underline;
-      text-decoration-color: green;
-      text-decoration-thickness: 4px;
-    }
-    #h2 {
-      text-underline-offset: 20px;
-      text-decoration-line: underline;
-      text-decoration-color: blue;
-      text-decoration-thickness: 2px;
-    }
-  </style>
-</head>
-<body>
-  <div id="h1">A green 10px offset underline 4px thick</div>
-  <div id="h2">A blue 20px offset underline 2px thick</div>
-</body>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-font-metrics-004-ref.html
-<!DOCTYPE html>
-<meta charset="UTF-8">
-<title>CSS Highlight API Test: </title>
-<head>
-  <style>
-    div {
-      margin: 40px;
-      font-size: 20px;
-      text-underline-offset: 10px;
-      text-decoration-line: underline overline;
-      text-decoration-color: green;
-      text-decoration-thickness: 4px;
-    }
-  </style>
-</head>
-<body>
-  <div id="h1">A green 10px offset underline 4px thick and green overline 4px thick</div>
-</body>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-font-metrics-005-ref.html
-<!DOCTYPE html>
-<meta charset="UTF-8">
-<title>CSS Highlight API Test: </title>
-<head>
-  <style>
-    div {
-      margin: 50px;
-      font-size: 20px;
-      text-underline-offset: 0.5em;
-      text-decoration-line: underline;
-      text-decoration-color: green;
-      text-decoration-thickness: 0.25rem;
-    }
-  </style>
-</head>
-<body>
-  <div id="h1">Font relative units with 20px font</div>
-  <div id="h2">Font relative units with 20px font</div>
-</body>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-logical-metrics-001-ref.html
-<!DOCTYPE html>
-<meta charset="UTF-8">
-<title>CSS Highlight API Test Reference</title>
-<head>
-  <style>
-    div {
-      width: 200px;
-      height: 100px;
-      line-height: 3em;
-      text-underline-offset: 1svb;
-      text-decoration-line: underline;
-      text-decoration-color: green;
-      text-decoration-thickness: 1svi;
-    }
-</style>
-</head>
-<body>
-  <div>With viewport size</div>
-</body>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-logical-metrics-002-ref.html
-<!DOCTYPE html>
-<meta charset="UTF-8">
-<title>CSS Highlight API Test Reference</title>
-<head>
-  <style>
-    div {
-      width: 100px;
-      height: 200px;
-      writing-mode: vertical-lr;
-      line-height: 3em;
-      text-underline-offset: 1svb;
-      text-decoration-line: underline;
-      text-decoration-color: green;
-      text-decoration-thickness: 1svi;
-    }
-</style>
-</head>
-<body>
-  <div id="h1">With viewport size</div>
-</body>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-painting-001-ref.html
-<!doctype html>
-<meta charset="utf-8">
-<style>
-    .highlighted {
-      background-color: yellow;
-      color: blue;
-    }
-</style>
-<body><span class="highlighted">One two </span><span>three…</span>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-painting-002-ref.html
-<!doctype html>
-<meta charset="utf-8">
-<style>
-  div {
-    color: red;
-  }
-</style>
-<body><div>abc</div>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-painting-003-ref.html
-<!doctype html>
-<meta charset="utf-8">
-<style>
-  span { background-color: rgba(0, 0, 255, 0.3); }
-</style>
-<body>L<span>orem I</span>psum.
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-painting-004-2-ref.html
-<!doctype html>
-<meta charset="utf-8">
-<style>
-  .foo {
-    color:blue;
-    background-color:yellow;
-  }
-  .bar {
-    color:orange;
-  }
-  .bar-over-foo {
-    color:orange;
-    background-color:yellow;
-  }
-</style>
-<body><span class="foo">Som</span><span class="bar-over-foo">e t</span><span class="bar">ext</span>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-painting-004-ref.html
-<!doctype html>
-<meta charset="utf-8">
-<style>
-  .foo {
-    color:blue;
-    background-color:yellow;
-  }
-  .bar {
-    background-color:orange;
-  }
-  .bar-over-foo {
-    color:blue;
-    background-color:orange;
-  }
-</style>
-<body><span class="foo">Som</span><span class="bar-over-foo">e t</span><span class="bar">ext</span>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-painting-anonymous-block-001-ref.html
-<!DOCTYPE html>
-<meta charset="UTF-8">
-<link rel="stylesheet" type="text/css" href="../../../fonts/ahem.css">
-<style>
-  #target {
-    font: 40px/1 Ahem;
-  }
-  span {
-    background-color: yellow;
-  }
-</style>
-<body>
-<div id="target"><div><span>X X X X</span></div><div>X</div></div>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-painting-below-selection-ref.html
-<!DOCTYPE html>
-<meta charset="UTF-8">
-<style>
-  #highlighted {
-    background: cyan;
-    color: blue;
-  }
-  ::selection {
-    background: blue;
-    color: cyan;
-  }
-</style>
-<body><span id="highlighted">Text should be blue over cyan here and <span id="selected">cyan over blue here</span>.</span>
-<script>
-  getSelection().setBaseAndExtent(selected, 0, selected, 1);
-</script>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-painting-below-selection-transparency-ref.html
-<!DOCTYPE html>
-<meta charset="UTF-8">
-<style>
-  #highlighted {
-    background: yellow;
-  }
-</style>
-
-<body><span id="highlighted">This should be yellow, <span id="selected">this should mix with the
-      selection,</span></span> this should have no background.
-  <script>
-    getSelection().setBaseAndExtent(selected, 0, selected, 1);
-  </script>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-painting-display-types-ref.html
-<!DOCTYPE html>
-<meta charset="UTF-8">
-<link rel="author" title="Karl Dubost" href="https://otsukare.info/">
-<style>
-  .highlighted {
-    background-color: yellow;
-    color: blue;
-  }
-  body {
-    font-family: monospace;
-    font-size: 16px;
-  }
-  .container {
-    margin: 10px 0;
-  }
-</style>
-<div class="container"><div>Block: <span class="highlighted">text content</span></div></div></div>
-<div class="container" style="display: flex;"><div>Flex: <span class="highlighted">text content</span></div></div>
-<div class="container" style="display: inline-flex;"><div>Inline-flex: <span class="highlighted">text content</span></div></div>
-<div class="container" style="display: grid;"><div>Grid: <span class="highlighted">text content</span></div></div>
-<div class="container" style="display: table;"><div>Table: <span class="highlighted">text content</span></div></div>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-painting-iframe-001-ref.html
-<!DOCTYPE html>
-<meta charset="UTF-8">
-<body>
-<iframe
-  id="iframe"
-  srcdoc="
-    <style>
-      span {
-        color: blue;
-        background-color: cyan;
-      }
-    </style>
-    <span id='span-iframe'>abc</span>
-  "
-  >
-</iframe>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-painting-iframe-003-ref.html
-<!DOCTYPE html>
-<meta charset="UTF-8">
-<style>
-  #span-doc {
-    color: green;
-    background-color: greenyellow;
-  }
-</style>
-<body>
-<iframe
-  id="iframe"
-  srcdoc="
-    <style>
-      span {
-        color: blue;
-        background-color: cyan;
-      }
-    </style>
-    <span id='span-iframe'>abc</span>
-  "
-  >
-</iframe>
-<br>
-<span id="span-doc">abc</span>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-painting-iframe-004-ref.html
-<!DOCTYPE html>
-<meta charset="UTF-8">
-<style>
-  #span-doc {
-    color: green;
-    background-color: greenyellow;
-  }
-</style>
-<body>
-<iframe
-  id="iframe"
-  srcdoc="<span id='span-iframe'>abc</span>"
-  >
-</iframe>
-<br>
-<span id="span-doc">abc</span>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-painting-iframe-005-ref.html
-<!DOCTYPE html>
-<meta charset="UTF-8">
-<body>
-<iframe
-  id="iframe"
-  srcdoc="
-    <style>
-      span {
-        color: blue;
-        background-color: cyan;
-      }
-    </style>
-    <span id='span-iframe'>abc</span>
-  "
-  >
-</iframe>
-<br>
-<span id="span-doc">abc</span>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-painting-inheritance-001-ref.html
-<!DOCTYPE html>
-<meta charset="UTF-8">
-<style>
-  span {
-    background-color: green;
-  }
-</style>
-<body>
-<div>There should be only one green rectangle below from [ to ]:</div>
-<div>[<span>&nbsp;&nbsp;&nbsp;<strong>&nbsp;&nbsp;&nbsp;</strong>&nbsp;&nbsp;&nbsp;</span>]</div>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-painting-insert-node-001-ref.html
-<!DOCTYPE html>
-<meta charset="utf-8">
-<pre>Hello <span style="color: red;">world</span></pre>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-painting-invalidation-007-ref.html
-<!doctype html>
-<meta charset="utf-8">
-<style>
-    .highlighted {
-      background: blue;
-    }
-</style>
-<body>
-    <span class="highlighted">Hello</span>
-</body>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-painting-overlapping-highlights-001-ref.html
-<!DOCTYPE html>
-<meta charset="UTF-8">
-<style>
-  body {
-    font-size: 3em;
-    font-weight: bolder;
-
-  }
-  #affected1 {
-    color: red;
-  }
-  #affected2 {
-    color: green;
-  }
-</style>
-<body><span id="affected1">This should have 'highlight1' style (red).</span><span id="affected2">This should have 'highlight2' style (green).</span>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-painting-overlapping-highlights-002-ref.html
-<!DOCTYPE html>
-<meta charset="UTF-8">
-<style>
-  div {
-      font-size: 3em;
-      font-weight: bolder;
-  }
-  #affected1 {
-    color: green;
-    background-color: rgb(0, 255, 0, 0.5);
-  }
-  #affected2 {
-    color: red;
-    background-color: rgba(100, 0, 100, 0.5);
-  }
-</style>
-<body><div><span id="affected1">Green on lime.</span><span id="affected2">Red on maroon.</span></div>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-painting-prioritization-003-ref.html
-<!DOCTYPE html>
-<meta charset="UTF-8">
-<title>CSS Highlight API Test: Non-conflicting attributes</title>
-<style>
-    #blue {
-        background-color: blue;
-        color: white;
-    }
-    #yellow {
-        background-color: yellow;
-    }
-</style>
-<body>
-    <p>This <span id="blue">is an</span><span id="yellow"> example</span> of two overlapping highlights</p>
-</body>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-painting-priority-text-decoration-001-ref.html
-<!DOCTYPE html>
-<html>
-<head>
-    <title>CSS Highlight API Test: ::highlight text-decoration paints over higher priority when not clashing</title>
-    <style>
-        #yellow-highlight {
-            background-color: yellow;
-            text-decoration: underline;
-            text-decoration-color: red;
-        }
-    </style>
-</head>
-<body>
-    <span id="yellow-highlight">Yellow</span>
-</body>
-</html>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-painting-selection-text-decoration-currentcolor-ref.html
-<!DOCTYPE html>
-<meta charset="utf-8">
-<title>CSS Highlight API Test: Reference for ::highlight text-decoration with currentColor</title>
-<style>
-  #target {
-    font-size: 50px;
-    color: green;
-    text-decoration: overline;
-  }
-</style>
-<p>The test passes if the text below has a green overline.</p>
-<p id="target">Highlighted text</p>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-painting-staticrange-004-ref.html
-<!DOCTYPE html>
-<meta charset="UTF-8">
-<title>CSS Highlight API Test: </title>
-<style>
-  span {
-    background-color: rgba(0, 128, 0, 0.5);
-    color: blue;
-  }
-</style>
-<body><span>One </span><span>two </span><span>one-point-five </span><span>three…</span>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-painting-text-decoration-001-ref.html
-<!DOCTYPE html>
-<meta charset="utf-8">
-<title>CSS Highlight API Test: Reference ::highlight painting text-decoration</title>
-<style>
-  div {
-    float: left;
-    margin: 0.5em;
-    /* Setting transparent color is a workaround to avoid hitting the following Chromium bug: https://crbug.com/1179938.
-       This could be removed once that bug is fixed. */
-    color: transparent;
-  }
-</style>
-<p>The test passes if it matches the reference file.</p>
-<script>
-  let textDecorationStyles = [
-    "solid green underline", "double green underline", "dotted green underline", "dashed green underline", "wavy green underline",
-    "solid blue overline", "double blue overline", "dotted blue overline", "dashed blue overline", "wavy blue overline",
-    "solid magenta line-through", "double magenta line-through", "dotted magenta line-through", "dashed magenta line-through", "wavy magenta line-through",
-    "solid brown underline overline line-through", "double brown underline overline line-through", "dotted brown underline overline line-through", "dashed brown underline overline line-through", "wavy brown underline overline line-through",
-  ];
-
-  textDecorationStyles.forEach((textDecorationStyle, index) => {
-    document.styleSheets[0].insertRule(`#id${index} { text-decoration: ${textDecorationStyle}; }`);
-    let element = document.createElement("div");
-    element.id = `id${index}`;
-    element.innerHTML = textDecorationStyle;
-    document.body.appendChild(element);
-  });
-</script>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/custom-highlight-painting-text-shadow-ref.html
-<!doctype html>
-<meta charset="utf-8">
-<style>
-    .highlighted {
-      background-color: yellow;
-      color: blue;
-      text-shadow: 5px 10px rgba(0, 255, 0, 0.5);
-    }
-</style>
-<body>
-  <span class="highlighted">One two </span><span>three…</span>
-</body>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-highlight-api/painting/invalidation/css-highlight-invalidation-001-ref.html
-<!DOCTYPE html>
-<meta charset="utf-8">
-<title>CSS Highlight API Test: ::highlight dynamic remove text decoration - reference</title>
-<style>
-  #upper {
-    text-decoration: wavy underline overline green 5px;
-    text-underline-offset: 20px;
-  }
-  div {
-    border: solid 1px black;
-    padding: 50px;
-  }
-</style>
-<div id="upper">This line starts with under/over lines that remain.</div>
-<div id="lower">This line starts with under/over lines that are removed.</div>
-</html>
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-images/gradient/conic-gradient-001-ref.html
-<!DOCTYPE html>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Tests the maximum value of color stops in conic-gradient().</title>
-<style>
-    body {
-        background-color: lightblue;
-    }
-
-    .test {
-        display: flex;
-        flex-wrap: wrap;
-    }
-
-    li {
-        width: 100px;
-        height: 100px;
-        margin-right: 30px;
-        margin-bottom: 30px;
-        outline: 1px solid black;
-        font-size: 14px;
-        text-align: center;
-        background: lime;
-    }
-</style>
-<p>Should be lime in the background of all boxes.</p>
-<ol class="test">
-    <li>0 999999999%</li>
-    <li>0 calc(Infinity * 0%)</li>
-    <li>0 calc(Infinity * 1%)</li>
-    <li>calc(Infinity * 0%) 100%</li>
-    <li>calc(Infinity * 1%) 100%</li>
-    <li>calc(Infinity * -1%) 100%</li>
-    <li>0% calc(Infinity * 1%)</li>
-    <li>from calc(Infinity * 1deg)</li>
-    <li>from calc(Infinity * 0deg)</li>
-</ol>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-images/object-fit-contain-png-001-ref.html
-<!DOCTYPE html>
-<!--
-     Any copyright is dedicated to the Public Domain.
-     http://creativecommons.org/publicdomain/zero/1.0/
--->
-<html>
-  <head>
-    <meta charset="utf-8">
-    <title>CSS Reftest Reference</title>
-    <link rel="author" title="Daniel Holbert" href="mailto:dholbert@mozilla.com">
-    <style type="text/css">
-      .objectOuter {
-        border: 1px dashed gray;
-        padding: 1px;
-        float: left;
-      }
-      .objectOuter > * {
-        background-image: url("support/colors-16x8.png");
-        background-size: contain;
-        background-repeat: no-repeat;
-        image-rendering: pixelated; /* for UAs that don't support crisp-edges */
-        image-rendering: crisp-edges;
-      }
-      .bigWide {
-        width: 48px;
-        height: 32px;
-      }
-      .bigTall {
-        width: 32px;
-        height: 48px;
-      }
-      .small {
-        width: 8px;
-        height: 8px;
-      }
-
-      br { clear: both; }
-
-      .tr { background-position: top right }
-      .bl { background-position: bottom left }
-      .tl { background-position: top 25% left 25% }
-      .br { background-position: bottom 1px right 2px }
-
-      .tc { background-position: top 3px center }
-      .cr { background-position: center right 25% }
-      .default { background-position: 50% 50% }
-    </style>
-  </head>
-  <body>
-    <!-- big/wide: -->
-    <div class="objectOuter"><div class="bigWide tr"></div></div>
-    <div class="objectOuter"><div class="bigWide bl"></div></div>
-    <div class="objectOuter"><div class="bigWide tl"></div></div>
-    <div class="objectOuter"><div class="bigWide br"></div></div>
-    <div class="objectOuter"><div class="bigWide tc"></div></div>
-    <div class="objectOuter"><div class="bigWide cr"></div></div>
-    <div class="objectOuter"><div class="bigWide default"></div></div>
-    <br>
-    <!-- big/tall: -->
-    <div class="objectOuter"><div class="bigTall tr"></div></div>
-    <div class="objectOuter"><div class="bigTall bl"></div></div>
-    <div class="objectOuter"><div class="bigTall tl"></div></div>
-    <div class="objectOuter"><div class="bigTall br"></div></div>
-    <div class="objectOuter"><div class="bigTall tc"></div></div>
-    <div class="objectOuter"><div class="bigTall cr"></div></div>
-    <div class="objectOuter"><div class="bigTall default"></div></div>
-    <br>
-    <!-- small: -->
-    <div class="objectOuter"><div class="small tr"></div></div>
-    <div class="objectOuter"><div class="small bl"></div></div>
-    <div class="objectOuter"><div class="small tl"></div></div>
-    <div class="objectOuter"><div class="small br"></div></div>
-    <div class="objectOuter"><div class="small tc"></div></div>
-    <div class="objectOuter"><div class="small cr"></div></div>
-    <div class="objectOuter"><div class="small default"></div></div>
-    <br>
-  </body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-images/object-fit-contain-png-002-ref.html
-<!DOCTYPE html>
-<!--
-     Any copyright is dedicated to the Public Domain.
-     http://creativecommons.org/publicdomain/zero/1.0/
--->
-<html>
-  <head>
-    <meta charset="utf-8">
-    <title>CSS Reftest Reference</title>
-    <link rel="author" title="Daniel Holbert" href="mailto:dholbert@mozilla.com">
-    <style type="text/css">
-      .objectOuter {
-        border: 1px dashed gray;
-        padding: 1px;
-        float: left;
-      }
-      .objectOuter > * {
-        background-image: url("support/colors-8x16.png");
-        background-size: contain;
-        background-repeat: no-repeat;
-        image-rendering: pixelated; /* for UAs that don't support crisp-edges */
-        image-rendering: crisp-edges;
-      }
-      .bigWide {
-        width: 48px;
-        height: 32px;
-      }
-      .bigTall {
-        width: 32px;
-        height: 48px;
-      }
-      .small {
-        width: 8px;
-        height: 8px;
-      }
-
-      br { clear: both; }
-
-      .tr { background-position: top right }
-      .bl { background-position: bottom left }
-      .tl { background-position: top 25% left 25% }
-      .br { background-position: bottom 1px right 2px }
-
-      .tc { background-position: top 3px center }
-      .cr { background-position: center right 25% }
-      .default { background-position: 50% 50% }
-    </style>
-  </head>
-  <body>
-    <!-- big/wide: -->
-    <div class="objectOuter"><div class="bigWide tr"></div></div>
-    <div class="objectOuter"><div class="bigWide bl"></div></div>
-    <div class="objectOuter"><div class="bigWide tl"></div></div>
-    <div class="objectOuter"><div class="bigWide br"></div></div>
-    <div class="objectOuter"><div class="bigWide tc"></div></div>
-    <div class="objectOuter"><div class="bigWide cr"></div></div>
-    <div class="objectOuter"><div class="bigWide default"></div></div>
-    <br>
-    <!-- big/tall: -->
-    <div class="objectOuter"><div class="bigTall tr"></div></div>
-    <div class="objectOuter"><div class="bigTall bl"></div></div>
-    <div class="objectOuter"><div class="bigTall tl"></div></div>
-    <div class="objectOuter"><div class="bigTall br"></div></div>
-    <div class="objectOuter"><div class="bigTall tc"></div></div>
-    <div class="objectOuter"><div class="bigTall cr"></div></div>
-    <div class="objectOuter"><div class="bigTall default"></div></div>
-    <br>
-    <!-- small: -->
-    <div class="objectOuter"><div class="small tr"></div></div>
-    <div class="objectOuter"><div class="small bl"></div></div>
-    <div class="objectOuter"><div class="small tl"></div></div>
-    <div class="objectOuter"><div class="small br"></div></div>
-    <div class="objectOuter"><div class="small tc"></div></div>
-    <div class="objectOuter"><div class="small cr"></div></div>
-    <div class="objectOuter"><div class="small default"></div></div>
-    <br>
-  </body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-images/object-fit-contain-svg-003-ref.html
-<!DOCTYPE html>
-<!--
-     Any copyright is dedicated to the Public Domain.
-     http://creativecommons.org/publicdomain/zero/1.0/
--->
-<html>
-  <head>
-    <meta charset="utf-8">
-    <title>CSS Reftest Reference</title>
-    <link rel="author" title="Daniel Holbert" href="mailto:dholbert@mozilla.com">
-    <style type="text/css">
-      .objectOuter {
-        border: 1px dashed gray;
-        padding: 1px;
-        float: left;
-      }
-      .objectOuter > * {
-        background-image: url("support/colors-16x8-noSize.svg");
-        background-size: contain;
-        background-repeat: no-repeat;
-      }
-      .bigWide {
-        width: 48px;
-        height: 32px;
-      }
-      .bigTall {
-        width: 32px;
-        height: 48px;
-      }
-      .small {
-        width: 8px;
-        height: 8px;
-      }
-
-      br { clear: both; }
-
-      .tr { background-position: top right }
-      .bl { background-position: bottom left }
-      .tl { background-position: top 25% left 25% }
-      .br { background-position: bottom 1px right 2px }
-
-      .tc { background-position: top 3px center }
-      .cr { background-position: center right 25% }
-      .default { background-position: 50% 50% }
-    </style>
-  </head>
-  <body>
-    <!-- big/wide: -->
-    <div class="objectOuter"><div class="bigWide tr"></div></div>
-    <div class="objectOuter"><div class="bigWide bl"></div></div>
-    <div class="objectOuter"><div class="bigWide tl"></div></div>
-    <div class="objectOuter"><div class="bigWide br"></div></div>
-    <div class="objectOuter"><div class="bigWide tc"></div></div>

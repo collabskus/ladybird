@@ -48013,7 +48013,20 @@ void SourceBufferProcessor::run_coded_frame_processing(Vector<DemuxedCodedFrame>
         //    frame's duration in seconds.
         auto frame_duration = frame.duration();
 
-        // FIXME: 3. If mode equals "sequence" and group start timestamp is set, then run the following steps:
+        // 3. If mode equals "sequence" and [[group start timestamp]] is set, then run the following steps:
+        if (m_mode == AppendMode::Sequence && m_group_start_timestamp.has_value()) {
+            // 1. Set timestampOffset equal to [[group start timestamp]] minus presentation timestamp.
+            m_timestamp_offset = m_group_start_timestamp.value() - presentation_timestamp;
+
+            // 2. Set [[group end timestamp]] equal to [[group start timestamp]].
+            m_group_end_timestamp = m_group_start_timestamp.value();
+
+            // 3. Set the need random access point flag on all track buffers to true.
+            set_need_random_access_point_flag_on_all_track_buffers(true);
+
+            // 4. Unset [[group start timestamp]].
+            m_group_start_timestamp.clear();
+        }
 
         // 4. If timestampOffset is not 0, then run the following steps:
         if (!m_timestamp_offset.is_zero()) {
@@ -62031,12 +62044,10 @@ void RemotePlaybackManager::handle_connection_lost()
     dispatch_playback_state_settled_change_if_changed(was_settled);
     for (auto& [id, source_buffer] : m_source_buffers)
         source_buffer->connection_lost({});
+    // The pending media sources can't be added anymore, and the sources already added can't play anymore.
     auto pending_media_stream_sources = move(m_pending_media_stream_sources);
-    if (!pending_media_stream_sources.is_empty()) {
-        for (auto& [id, promise] : pending_media_stream_sources)
-            promise->reject(media_server_gone_error());
-        return;
-    }
+    for (auto& [id, promise] : pending_media_stream_sources)
+        promise->reject(media_server_gone_error());
     dispatch_error(media_server_gone_error());
 }
 
@@ -77316,6 +77327,25 @@ static JsonObject ffmpeg_to_json(FFmpegFacts const& facts)
     return object;
 }
 
+Optional<StringView> OpenSSLFacts::openssl_version_from_curl_ssl_version(StringView ssl_version)
+{
+    // MultiSSL builds list every backend and parenthesize the inactive ones, in no particular order.
+    for (auto backend : ssl_version.split_view(' ')) {
+        if (backend.starts_with("OpenSSL/"sv))
+            return backend.substring_view("OpenSSL/"sv.length());
+    }
+    return {};
+}
+
+static JsonObject openssl_to_json(OpenSSLFacts const& facts)
+{
+    JsonObject object;
+    object.set("linked_version"sv, facts.linked_version);
+    if (facts.curl_version.has_value())
+        object.set("curl_version"sv, *facts.curl_version);
+    return object;
+}
+
 JsonObject SystemFacts::to_json() const
 {
     JsonObject object;
@@ -77344,6 +77374,8 @@ JsonObject SystemFacts::to_json() const
         object.set("bundled_ffmpeg"sv, ffmpeg_to_json(*bundled_ffmpeg));
     if (system_ffmpeg.has_value())
         object.set("system_ffmpeg"sv, ffmpeg_to_json(*system_ffmpeg));
+    if (openssl.has_value())
+        object.set("openssl"sv, openssl_to_json(*openssl));
     return object;
 }
 
@@ -77400,6 +77432,15 @@ static ErrorOr<FFmpegFacts> ffmpeg_from_json(JsonObject const& object)
     return facts;
 }
 
+static ErrorOr<OpenSSLFacts> openssl_from_json(JsonObject const& object)
+{
+    OpenSSLFacts facts;
+    facts.linked_version = TRY(read_string(object, "linked_version"sv));
+    if (object.has("curl_version"sv))
+        facts.curl_version = TRY(read_string(object, "curl_version"sv));
+    return facts;
+}
+
 ErrorOr<SystemFacts> SystemFacts::from_json(StringView json)
 {
     auto value = TRY(JsonValue::from_string(json));
@@ -77437,6 +77478,8 @@ ErrorOr<SystemFacts> SystemFacts::from_json(JsonObject const& object)
         facts.bundled_ffmpeg = TRY(ffmpeg_from_json(*TRY(read_object(object, "bundled_ffmpeg"sv))));
     if (object.has("system_ffmpeg"sv))
         facts.system_ffmpeg = TRY(ffmpeg_from_json(*TRY(read_object(object, "system_ffmpeg"sv))));
+    if (object.has("openssl"sv))
+        facts.openssl = TRY(openssl_from_json(*TRY(read_object(object, "openssl"sv))));
     return facts;
 }
 
@@ -77508,11 +77551,30 @@ struct FFmpegFacts {
     bool operator==(FFmpegFacts const&) const = default;
 };
 
+// The OpenSSL that Ladybird links, and the one that curl uses. RequestServer configures curl's SSL_CTX through its own
+// OpenSSL, which is only sound when the two are the same library: a system curl can load another one, for instance once
+// the system has moved on to a newer OpenSSL than the one Ladybird was built against.
+struct OpenSSLFacts {
+    // As major.minor.patch, which is how curl names the OpenSSL it uses.
+    String linked_version;
+    // Empty when curl uses another TLS library.
+    Optional<String> curl_version;
+
+    bool operator==(OpenSSLFacts const&) const = default;
+
+    bool curl_uses_another_openssl() const { return curl_version.has_value() && *curl_version != linked_version; }
+
+    // Picks the OpenSSL version out of curl_version_info()'s ssl_version, which names the TLS library curl uses first, as
+    // in "OpenSSL/3.5.1" or "OpenSSL/3.5.1 (GnuTLS/3.8.9)". Empty when that library is not OpenSSL.
+    static Optional<StringView> openssl_version_from_curl_ssl_version(StringView);
+};
+
 // Everything the blocklist decides from, collected by the system probe.
 struct SystemFacts {
     Optional<GpuFacts> gpu;
     Optional<FFmpegFacts> bundled_ffmpeg;
     Optional<FFmpegFacts> system_ffmpeg;
+    Optional<OpenSSLFacts> openssl;
     // Set instead of the facts when the probe crashed, hung or reported something unreadable. Never serialized.
     Optional<String> probe_failure;
 
@@ -78082,6 +78144,15 @@ const NON_WHITESPACE_RANGES: &[CodePointRange] = &[
     char_range(0xFF00, 0x10FFFF),
 ];
 
+/// Whether the character `cp` has a different lowercase and uppercase form, so that it matches more than itself under
+/// case folding.
+fn has_case(cp: u32) -> bool {
+    let Some(ch) = char::from_u32(cp) else {
+        return false;
+    };
+    ch.to_lowercase().next() != ch.to_uppercase().next()
+}
+
 /// Sorts `ranges` and merges the ones that overlap or touch, which the binary search of the VM relies on.
 fn normalize_char_ranges(ranges: &mut ZoneVec<'_, CodePointRange>) {
     // NB: Ranges with the same start always merge, so their order does not matter.
@@ -78477,17 +78548,11 @@ impl<'z> Compiler<'z> {
     /// Emit a Char or CharNoCase instruction for a single code point,
     /// depending on whether case-insensitive mode is active.
     fn emit_char_maybe_case_fold(&mut self, cp: u32) {
-        if self.effective_ignore_case
-            && let Some(ch) = char::from_u32(cp)
-        {
-            let lower = ch.to_lowercase().next().unwrap_or(ch) as u32;
-            let upper = ch.to_uppercase().next().unwrap_or(ch) as u32;
-            if lower != upper {
-                self.emit(ZoneInstruction::CharNoCase(cp, cp));
-                return;
-            }
+        if self.effective_ignore_case && has_case(cp) {
+            self.emit(ZoneInstruction::CharNoCase(cp, cp));
+        } else {
+            self.emit(ZoneInstruction::Char(cp));
         }
-        self.emit(ZoneInstruction::Char(cp));
     }
 
     fn alloc_register(&mut self) -> u32 {
@@ -78634,11 +78699,53 @@ impl<'z> Compiler<'z> {
             for term in alt.terms.iter().rev() {
                 self.compile_term(term);
             }
-        } else {
-            for term in alt.terms {
+            return;
+        }
+        let mut terms = alt.terms;
+        while let Some(term) = terms.first() {
+            let run = terms
+                .iter()
+                .take_while(|term| self.literal_code_unit(term).is_some())
+                .count();
+            if run >= 2 {
+                self.emit_literal(&terms[..run]);
+                terms = &terms[run..];
+            } else {
                 self.compile_term(term);
+                terms = &terms[1..];
             }
         }
+    }
+
+    /// The code unit that `term` matches, if it is a single literal character that the VM can match as one code unit
+    /// of a `Literal` instruction: a character of the BMP, and not a surrogate in Unicode mode, where a surrogate of
+    /// the pattern must not match half of a surrogate pair of the input.
+    fn literal_code_unit(&self, term: &Term<'z>) -> Option<u16> {
+        if term.quantifier.is_some() {
+            return None;
+        }
+        let Atom::Literal(code_point) = term.atom else {
+            return None;
+        };
+        let code_unit = u16::try_from(code_point).ok()?;
+        if self.unicode && (0xD800..=0xDFFF).contains(&code_unit) {
+            return None;
+        }
+        Some(code_unit)
+    }
+
+    /// Emit one `Literal` instruction for a run of forward literal terms, which would otherwise be a `Char` or
+    /// `CharNoCase` instruction each.
+    fn emit_literal(&mut self, terms: &[Term<'z>]) {
+        let mut code_units = ZoneVec::with_capacity_in(terms.len(), self.zone);
+        code_units.extend(terms.iter().filter_map(|term| self.literal_code_unit(term)));
+        // NB: A literal of characters without case compares as plain code units, as their `Char` instructions would,
+        //     which keeps it visible to the analyses that only look at case-sensitive literals.
+        let ignore_case = self.effective_ignore_case && code_units.iter().any(|&code_unit| has_case(code_unit.into()));
+        self.emit(ZoneInstruction::Literal {
+            code_units: code_units.into_slice(),
+            ignore_case,
+        });
     }
 
     /// Lower `Term`, delegating to either `CompileAtom` or the quantified path.
@@ -82176,6 +82283,10 @@ pub enum ZoneInstruction<'z> {
     /// Match a single character, case-insensitive (u32 code points).
     CharNoCase(u32, u32),
 
+    /// Match a run of literal characters, as the `Char` instructions of its code units would, which compare under
+    /// case folding if `ignore_case` is set.
+    Literal { code_units: &'z [u16], ignore_case: bool },
+
     /// Match any character (`.`). If `dot_all` is true, matches newlines too.
     AnyChar { dot_all: bool },
 
@@ -82665,12 +82776,31 @@ pub struct Program {
     pub dot_all: bool,
     /// Named capture groups (name → group index).
     pub named_groups: Vec<NamedGroupEntry>,
+
+    // The data of the instructions that do not fit in an instruction. An instruction refers to its data by its index in
+    // one of these tables, so that each instruction is as small as the most common instructions.
+    /// The code units of `Literal` instructions after their first.
+    pub literals: Vec<u16>,
+    /// The character classes of `CharClass` instructions.
+    pub classes: Vec<CharRanges>,
+    /// The properties of `UnicodeProperty` instructions.
+    pub unicode_properties: Vec<UnicodePropertyData>,
+    /// The group names of `BackrefNamed` instructions.
+    pub backref_names: Vec<String>,
+    /// The data of `RepeatCheck` instructions.
+    pub repeat_checks: Vec<RepeatCheck>,
+    /// The data of `StringPropertyMatch` instructions.
+    pub string_properties: Vec<StringProperty>,
+    /// The registers that `ProgressCheck` instructions clear, as lists packed as [len, reg0, reg1, ..., len, ...].
+    pub register_lists: Vec<u32>,
+    /// The data of `GreedyLoop` and `LazyLoop` instructions.
+    pub loops: Vec<SimpleLoop>,
 }
 
 /// A single bytecode instruction in Ladybird's concrete implementation of the
 /// abstract matchers from ECMA-262 Pattern Semantics.
 /// <https://tc39.es/ecma262/#sec-pattern-semantics>
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Instruction {
     /// Match a single character (u32 code point, supports WTF-16 lone surrogates).
     Char(u32),
@@ -82678,17 +82808,27 @@ pub enum Instruction {
     /// Match a single character, case-insensitive (u32 code points).
     CharNoCase(u32, u32),
 
+    /// Match the run of literal code units of `first` and then `Program::literals[rest_start..rest_start + rest_len]`,
+    /// as the `Char` instructions of each code unit would, which compare under case folding if `ignore_case` is set.
+    /// The first code unit is in the instruction, as most attempts to match a literal fail at it.
+    Literal {
+        first: u16,
+        ignore_case: bool,
+        rest_start: u32,
+        rest_len: u32,
+    },
+
     /// Match any character (`.`). If `dot_all` is true, matches newlines too.
     AnyChar { dot_all: bool },
 
-    /// Match a character in a set of ranges. `negated` inverts the match.
-    CharClass { ranges: CharRanges, negated: bool },
+    /// Match a character in the set of ranges `Program::classes[class]`. `negated` inverts the match.
+    CharClass { class: u32, negated: bool },
 
     /// Match a built-in character class (\d, \w, \s and negations).
     BuiltinClass(BuiltinCharacterClass),
 
-    /// Match a Unicode property (boxed to keep Instruction small).
-    UnicodeProperty(Box<UnicodePropertyData>),
+    /// Match the Unicode property `Program::unicode_properties[index]`.
+    UnicodeProperty(u32),
 
     /// Unconditional jump to target instruction.
     Jump(u32),
@@ -82724,8 +82864,8 @@ pub enum Instruction {
     /// Backreference: match the same string as capture group `index`.
     Backref(u32),
 
-    /// Named backreference.
-    BackrefNamed(String),
+    /// Named backreference, to the group named `Program::backref_names[index]`.
+    BackrefNamed(u32),
 
     /// Begin a repetition counter at register `counter_reg`.
     /// Sets the register to 0.
@@ -82733,13 +82873,8 @@ pub enum Instruction {
 
     /// Check repetition: if counter < max, increment and jump to `body`.
     /// Otherwise fall through. Used with Split for greedy/lazy.
-    RepeatCheck {
-        counter_reg: u32,
-        min: u32,
-        max: Option<u32>,
-        body: u32,
-        greedy: bool,
-    },
+    /// The bounds of the check are `Program::repeat_checks[check]`.
+    RepeatCheck { check: u32, body: u32 },
 
     /// Lookahead/lookbehind assertion.
     /// `positive`: whether match must succeed or fail.
@@ -82764,41 +82899,63 @@ pub enum Instruction {
     /// No-op, used as a placeholder during compilation.
     Nop,
 
-    /// Atomically match one string from a Unicode string property.
+    /// Atomically match one string from the Unicode string property `Program::string_properties[index]`.
     /// Tries multi-codepoint strings first (longest match wins), then falls
     /// back to single-codepoint UnicodeProperty match. Does not create
     /// backtrack points -- once a match is found, it's committed.
-    StringPropertyMatch {
-        /// Multi-codepoint strings, sorted longest first and packed as:
-        /// [len, cp0, cp1, ..., len, cp0, ...]
-        strings: Box<[u32]>,
-        /// Fallback for single-codepoint matches.
-        property: Box<UnicodePropertyData>,
-    },
+    StringPropertyMatch(u32),
 
     /// Progress check: save position at `reg`, fail if no progress since last visit.
     /// Used to prevent infinite loops in zero-width quantifier bodies.
-    /// When `clear_captures` is set, those registers are cleared to -1 before
+    /// The registers of the list at `Program::register_lists[clear_captures]` are cleared to -1 before
     /// backtracking on zero-width, per ECMA-262 RepeatMatcher step 2.b.
-    ProgressCheck { reg: u32, clear_captures: Vec<u32> },
+    ProgressCheck { reg: u32, clear_captures: u32 },
 
     /// Greedy loop for simple character matchers.
     /// Greedily consumes as many matching characters as possible, then pushes a
     /// single backtrack state. On backtrack, gives up one character at a time.
     /// This avoids per-iteration Split/backtrack overhead for simple quantifiers.
-    GreedyLoop {
-        matcher: SimpleMatch,
-        min: u32,
-        max: Option<u32>,
-    },
+    /// The loop is `Program::loops[index]`. `same_matcher_suffix` tells if the loop has a `same_matcher_suffix_min`,
+    /// so that a backtrack into the loop looks at the table only then.
+    GreedyLoop { index: u32, same_matcher_suffix: bool },
 
     /// Lazy loop for simple character matchers.
     /// Tries to match as few characters as possible, then on backtrack consumes one more.
-    LazyLoop {
-        matcher: SimpleMatch,
-        min: u32,
-        max: Option<u32>,
-    },
+    /// The loop is `Program::loops[index]`.
+    LazyLoop(u32),
+}
+
+// A program is mostly instructions, so their size is most of the memory of a regex.
+const _: () = assert!(size_of::<Instruction>() == 12);
+
+/// The data of a `RepeatCheck` instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepeatCheck {
+    pub counter_reg: u32,
+    pub min: u32,
+    pub max: Option<u32>,
+    pub greedy: bool,
+}
+
+/// The data of a `StringPropertyMatch` instruction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StringProperty {
+    /// Multi-codepoint strings, sorted longest first and packed as:
+    /// [len, cp0, cp1, ..., len, cp0, ...]
+    pub strings: Box<[u32]>,
+    /// Fallback for single-codepoint matches.
+    pub property: UnicodePropertyData,
+}
+
+/// The data of a `GreedyLoop` or `LazyLoop` instruction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimpleLoop {
+    pub matcher: SimpleMatch,
+    pub min: u32,
+    pub max: Option<u32>,
+    /// The sum of the minimum counts of the loops right after this one that match with the same matcher, if one of
+    /// them has a minimum count, so a greedy loop can give back that suffix in one step.
+    pub same_matcher_suffix_min: Option<u32>,
 }
 
 /// Data for a Unicode property match instruction.
@@ -82899,6 +83056,116 @@ impl Program {
             multiline: false,
             dot_all: false,
             named_groups: Vec::new(),
+            literals: Vec::new(),
+            classes: Vec::new(),
+            unicode_properties: Vec::new(),
+            backref_names: Vec::new(),
+            repeat_checks: Vec::new(),
+            string_properties: Vec::new(),
+            register_lists: Vec::new(),
+            loops: Vec::new(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn literal_rest(&self, start: u32, len: u32) -> &[u16] {
+        &self.literals[start as usize..start as usize + len as usize]
+    }
+
+    /// The code unit that `instruction` matches first, if it is a `Char` of the BMP or a `Literal` without case
+    /// folding.
+    #[inline(always)]
+    pub fn leading_code_unit(&self, instruction: Option<&Instruction>) -> Option<u16> {
+        match instruction? {
+            Instruction::Char(code_point) => u16::try_from(*code_point).ok(),
+            Instruction::Literal {
+                first,
+                ignore_case: false,
+                ..
+            } => Some(*first),
+            _ => None,
+        }
+    }
+
+    #[inline(always)]
+    pub fn class(&self, index: u32) -> &CharRanges {
+        &self.classes[index as usize]
+    }
+
+    #[inline(always)]
+    pub fn unicode_property(&self, index: u32) -> &UnicodePropertyData {
+        &self.unicode_properties[index as usize]
+    }
+
+    #[inline(always)]
+    pub fn backref_name(&self, index: u32) -> &str {
+        &self.backref_names[index as usize]
+    }
+
+    #[inline(always)]
+    pub fn repeat_check(&self, index: u32) -> &RepeatCheck {
+        &self.repeat_checks[index as usize]
+    }
+
+    #[inline(always)]
+    pub fn string_property(&self, index: u32) -> &StringProperty {
+        &self.string_properties[index as usize]
+    }
+
+    /// The registers of the list that starts at `index` in `register_lists`.
+    #[inline(always)]
+    pub fn register_list(&self, index: u32) -> &[u32] {
+        let start = index as usize;
+        let len = self.register_lists[start] as usize;
+        &self.register_lists[start + 1..start + 1 + len]
+    }
+
+    #[inline(always)]
+    pub fn simple_loop(&self, index: u32) -> &SimpleLoop {
+        &self.loops[index as usize]
+    }
+
+    /// Set `same_matcher_suffix_min` of the loop of each `GreedyLoop` instruction.
+    ///
+    /// The suffix of a loop is the run of `GreedyLoop` and `LazyLoop` instructions right after it
+    /// that have the same matcher. One backward pass keeps the run that starts at `pc + 1`.
+    pub fn compute_same_matcher_suffix_mins(&mut self) {
+        // The loop at `pc + 1`, and the sum (None on overflow) and positive-min flag of the run
+        // of loops with its matcher that starts there.
+        let mut next_run: Option<(u32, Option<u32>, bool)> = None;
+
+        for pc in (0..self.instructions.len()).rev() {
+            let index = match self.instructions[pc] {
+                Instruction::GreedyLoop { index, .. } | Instruction::LazyLoop(index) => index,
+                _ => {
+                    next_run = None;
+                    continue;
+                }
+            };
+            let simple_loop = &self.loops[index as usize];
+
+            let (suffix_total, suffix_has_positive_min) = match next_run {
+                Some((next_index, total, has_positive_min))
+                    if self.loops[next_index as usize].matcher == simple_loop.matcher =>
+                {
+                    (total, has_positive_min)
+                }
+                _ => (Some(0), false),
+            };
+            next_run = Some((
+                index,
+                suffix_total.and_then(|total| total.checked_add(simple_loop.min)),
+                suffix_has_positive_min || simple_loop.min > 0,
+            ));
+
+            if let Instruction::GreedyLoop { .. } = self.instructions[pc] {
+                let suffix_min = if suffix_has_positive_min { suffix_total } else { None };
+                self.loops[index as usize].same_matcher_suffix_min = suffix_min;
+                self.instructions[pc] = Instruction::GreedyLoop {
+                    index,
+                    same_matcher_suffix: suffix_min.is_some(),
+                };
+            }
         }
     }
 
@@ -82961,42 +83228,85 @@ use crate::bytecode::CharRanges;
 use crate::bytecode::Instruction;
 use crate::bytecode::NamedGroupEntry;
 use crate::bytecode::Program;
+use crate::bytecode::RepeatCheck;
+use crate::bytecode::SimpleLoop;
 use crate::bytecode::SimpleMatch;
+use crate::bytecode::StringProperty;
 use crate::bytecode::UnicodePropertyData;
 use crate::vm;
 
-pub(crate) fn program(program: &ZoneProgram<'_>) -> Program {
-    let mut instructions = Vec::with_capacity(program.instructions.len());
-    instructions.extend(program.instructions.iter().map(instruction));
-    let mut named_groups = Vec::with_capacity(program.named_groups.len());
-    named_groups.extend(program.named_groups.iter().map(|group| NamedGroupEntry {
+pub(crate) fn program(zone_program: &ZoneProgram<'_>) -> Program {
+    let mut named_groups = Vec::with_capacity(zone_program.named_groups.len());
+    named_groups.extend(zone_program.named_groups.iter().map(|group| NamedGroupEntry {
         name: group.name.to_string(),
         index: group.index,
     }));
-    Program {
-        instructions,
-        capture_count: program.capture_count,
-        register_count: program.register_count,
-        unicode: program.unicode,
-        unicode_sets: program.unicode_sets,
-        ignore_case: program.ignore_case,
-        multiline: program.multiline,
-        dot_all: program.dot_all,
+    let mut program = Program {
+        capture_count: zone_program.capture_count,
+        register_count: zone_program.register_count,
+        unicode: zone_program.unicode,
+        unicode_sets: zone_program.unicode_sets,
+        ignore_case: zone_program.ignore_case,
+        multiline: zone_program.multiline,
+        dot_all: zone_program.dot_all,
         named_groups,
-    }
+        ..Program::new()
+    };
+    let mut instructions = Vec::with_capacity(zone_program.instructions.len());
+    instructions.extend(
+        zone_program
+            .instructions
+            .iter()
+            .map(|zone_instruction| instruction(zone_instruction, &mut program)),
+    );
+    program.instructions = instructions;
+    program.compute_same_matcher_suffix_mins();
+    program.literals.shrink_to_fit();
+    program.classes.shrink_to_fit();
+    program.unicode_properties.shrink_to_fit();
+    program.backref_names.shrink_to_fit();
+    program.repeat_checks.shrink_to_fit();
+    program.string_properties.shrink_to_fit();
+    program.register_lists.shrink_to_fit();
+    program.loops.shrink_to_fit();
+    program
 }
 
-fn instruction(instruction: &ZoneInstruction<'_>) -> Instruction {
+/// Appends `item` to `table` and returns its index.
+fn push<T>(table: &mut Vec<T>, item: T) -> u32 {
+    let index = table.len() as u32;
+    table.push(item);
+    index
+}
+
+/// The kept instruction of `instruction`, with the data that does not fit in an instruction appended to the tables
+/// of `program`.
+fn instruction(instruction: &ZoneInstruction<'_>, program: &mut Program) -> Instruction {
     match *instruction {
         ZoneInstruction::Char(cp) => Instruction::Char(cp),
         ZoneInstruction::CharNoCase(lhs, rhs) => Instruction::CharNoCase(lhs, rhs),
+        ZoneInstruction::Literal {
+            code_units,
+            ignore_case,
+        } => {
+            let rest_start = program.literals.len() as u32;
+            program.literals.extend_from_slice(&code_units[1..]);
+            Instruction::Literal {
+                first: code_units[0],
+                ignore_case,
+                rest_start,
+                rest_len: code_units.len() as u32 - 1,
+            }
+        }
         ZoneInstruction::AnyChar { dot_all } => Instruction::AnyChar { dot_all },
         ZoneInstruction::CharClass { ranges, negated } => Instruction::CharClass {
-            ranges: char_ranges(ranges),
+            class: push(&mut program.classes, char_ranges(ranges)),
             negated,
         },
         ZoneInstruction::BuiltinClass(class) => Instruction::BuiltinClass(class),
-        ZoneInstruction::UnicodeProperty(property) => Instruction::UnicodeProperty(unicode_property(property)),
+        ZoneInstruction::UnicodeProperty(property) => {
+            Instruction::UnicodeProperty(push(&mut program.unicode_properties, unicode_property(property)))
+        }
         ZoneInstruction::Jump(target) => Instruction::Jump(target),
         ZoneInstruction::Split { prefer, other } => Instruction::Split { prefer, other },
         ZoneInstruction::Save(reg) => Instruction::Save(reg),
@@ -83008,7 +83318,9 @@ fn instruction(instruction: &ZoneInstruction<'_>) -> Instruction {
         ZoneInstruction::Match => Instruction::Match,
         ZoneInstruction::Fail => Instruction::Fail,
         ZoneInstruction::Backref(index) => Instruction::Backref(index),
-        ZoneInstruction::BackrefNamed(name) => Instruction::BackrefNamed(name.to_string()),
+        ZoneInstruction::BackrefNamed(name) => {
+            Instruction::BackrefNamed(push(&mut program.backref_names, name.to_string()))
+        }
         ZoneInstruction::RepeatStart { counter_reg } => Instruction::RepeatStart { counter_reg },
         ZoneInstruction::RepeatCheck {
             counter_reg,
@@ -83017,11 +83329,16 @@ fn instruction(instruction: &ZoneInstruction<'_>) -> Instruction {
             body,
             greedy,
         } => Instruction::RepeatCheck {
-            counter_reg,
-            min,
-            max,
+            check: push(
+                &mut program.repeat_checks,
+                RepeatCheck {
+                    counter_reg,
+                    min,
+                    max,
+                    greedy,
+                },
+            ),
             body,
-            greedy,
         },
         ZoneInstruction::LookStart { positive, forward, end } => Instruction::LookStart { positive, forward, end },
         ZoneInstruction::LookEnd => Instruction::LookEnd,
@@ -83035,24 +83352,43 @@ fn instruction(instruction: &ZoneInstruction<'_>) -> Instruction {
             dot_all,
         },
         ZoneInstruction::PopModifiers => Instruction::PopModifiers,
-        ZoneInstruction::StringPropertyMatch { strings, property } => Instruction::StringPropertyMatch {
-            strings: strings.into(),
-            property: unicode_property(property),
-        },
-        ZoneInstruction::ProgressCheck { reg, clear_captures } => Instruction::ProgressCheck {
-            reg,
-            clear_captures: clear_captures.to_vec(),
-        },
+        ZoneInstruction::StringPropertyMatch { strings, property } => Instruction::StringPropertyMatch(push(
+            &mut program.string_properties,
+            StringProperty {
+                strings: strings.into(),
+                property: unicode_property(property),
+            },
+        )),
+        ZoneInstruction::ProgressCheck { reg, clear_captures } => {
+            let list = program.register_lists.len() as u32;
+            program.register_lists.push(clear_captures.len() as u32);
+            program.register_lists.extend_from_slice(clear_captures);
+            Instruction::ProgressCheck {
+                reg,
+                clear_captures: list,
+            }
+        }
         ZoneInstruction::GreedyLoop { matcher, min, max } => Instruction::GreedyLoop {
-            matcher: simple_match(&matcher),
-            min,
-            max,
+            index: push(
+                &mut program.loops,
+                SimpleLoop {
+                    matcher: simple_match(&matcher),
+                    min,
+                    max,
+                    same_matcher_suffix_min: None,
+                },
+            ),
+            same_matcher_suffix: false,
         },
-        ZoneInstruction::LazyLoop { matcher, min, max } => Instruction::LazyLoop {
-            matcher: simple_match(&matcher),
-            min,
-            max,
-        },
+        ZoneInstruction::LazyLoop { matcher, min, max } => Instruction::LazyLoop(push(
+            &mut program.loops,
+            SimpleLoop {
+                matcher: simple_match(&matcher),
+                min,
+                max,
+                same_matcher_suffix_min: None,
+            },
+        )),
     }
 }
 
@@ -83066,7 +83402,9 @@ fn simple_match(matcher: &ZoneSimpleMatch<'_>) -> SimpleMatch {
             negated,
         },
         ZoneSimpleMatch::BuiltinClass(class) => SimpleMatch::BuiltinClass(class),
-        ZoneSimpleMatch::UnicodeProperty(property) => SimpleMatch::UnicodeProperty(unicode_property(property)),
+        ZoneSimpleMatch::UnicodeProperty(property) => {
+            SimpleMatch::UnicodeProperty(Box::new(unicode_property(property)))
+        }
         ZoneSimpleMatch::Union(lhs, rhs) => {
             SimpleMatch::Union(Box::new(simple_match(lhs)), Box::new(simple_match(rhs)))
         }
@@ -83084,13 +83422,13 @@ fn char_ranges(ranges: &[CodePointRange]) -> CharRanges {
 
 /// The data of a Unicode property match, with the property resolved to an ICU enum ID. This allows O(1) trie lookups
 /// at match time instead of string-based resolution.
-fn unicode_property(property: &UnicodeProperty<'_>) -> Box<UnicodePropertyData> {
-    Box::new(UnicodePropertyData {
+fn unicode_property(property: &UnicodeProperty<'_>) -> UnicodePropertyData {
+    UnicodePropertyData {
         negated: property.negated,
         name: property.name.to_string(),
         value: property.value.map(str::to_string),
         resolved: compiler::resolve_property(property.name, property.value),
-    })
+    }
 }
 
 pub(crate) fn required_literal_hint(hint: &RequiredLiteral<'_>) -> vm::RequiredLiteralHint {
@@ -84399,7 +84737,8 @@ fn next_search_position(match_start: i32, match_end: i32) -> usize {
 
 use crate::bytecode::append_code_point_wtf16;
 
-fn extract_trailing_literal(instructions: &[Instruction], assert_end_pc: usize) -> Option<Vec<u16>> {
+fn extract_trailing_literal(program: &Program, assert_end_pc: usize) -> Option<Vec<u16>> {
+    let instructions = &program.instructions;
     let mut trailing_code_points = Vec::new();
     let mut suffix_start = assert_end_pc;
     let mut pc = assert_end_pc;
@@ -84409,6 +84748,18 @@ fn extract_trailing_literal(instructions: &[Instruction], assert_end_pc: usize) 
         match &instructions[prev_pc] {
             Instruction::Char(cp) => {
                 trailing_code_points.push(*cp);
+                suffix_start = prev_pc;
+                pc = prev_pc;
+            }
+            Instruction::Literal {
+                first,
+                rest_start,
+                rest_len,
+                ignore_case: false,
+            } => {
+                let rest = program.literal_rest(*rest_start, *rest_len);
+                trailing_code_points.extend(rest.iter().rev().map(|&code_unit| u32::from(code_unit)));
+                trailing_code_points.push(u32::from(*first));
                 suffix_start = prev_pc;
                 pc = prev_pc;
             }
@@ -85246,7 +85597,8 @@ enum SimpleScan {
 
 /// Find a common first character across all alternatives in a Split chain.
 /// Returns Some((char, case_insensitive)) if all branches start with the same character.
-fn find_common_first_char(instructions: &[Instruction], start: u32) -> Option<(u32, bool)> {
+fn find_common_first_char(program: &Program, start: u32) -> Option<(u32, bool)> {
+    let instructions = &program.instructions;
     let mut common: Option<(u32, bool)> = None;
     let mut pc = start as usize;
     loop {
@@ -85256,7 +85608,7 @@ fn find_common_first_char(instructions: &[Instruction], start: u32) -> Option<(u
         match &instructions[pc] {
             Instruction::Split { prefer, other } => {
                 // Check the preferred branch's first char instruction.
-                let prefer_char = first_char_at(instructions, *prefer as usize)?;
+                let prefer_char = first_char_at(program, *prefer as usize)?;
                 match common {
                     None => common = Some(prefer_char),
                     Some(c) if c.0 == prefer_char.0 => {}
@@ -85267,7 +85619,7 @@ fn find_common_first_char(instructions: &[Instruction], start: u32) -> Option<(u
             }
             // The last alternative in the chain (no more Splits).
             _ => {
-                let last_char = first_char_at(instructions, pc)?;
+                let last_char = first_char_at(program, pc)?;
                 match common {
                     None => return Some(last_char),
                     Some(c) if c.0 == last_char.0 => return common,
@@ -85279,12 +85631,13 @@ fn find_common_first_char(instructions: &[Instruction], start: u32) -> Option<(u
 }
 
 /// Get the first character-matching instruction at a given position.
-fn first_char_at(instructions: &[Instruction], pc: usize) -> Option<(u32, bool)> {
-    match instructions.get(pc)? {
+fn first_char_at(program: &Program, pc: usize) -> Option<(u32, bool)> {
+    match program.instructions.get(pc)? {
         Instruction::Char(c) => Some((*c, false)),
         Instruction::CharNoCase(c, _) => Some((*c, true)),
+        Instruction::Literal { first, ignore_case, .. } => Some((u32::from(*first), *ignore_case)),
         // Skip Save instructions (capture group starts) to find the actual char.
-        Instruction::Save(_) => first_char_at(instructions, pc + 1),
+        Instruction::Save(_) => first_char_at(program, pc + 1),
         _ => None,
     }
 }
@@ -85294,16 +85647,22 @@ enum LeadingAlternativeStart {
     LiteralCodeUnit(u16),
 }
 
-fn leading_alternative_start_at(instructions: &[Instruction], pc: usize) -> Option<LeadingAlternativeStart> {
-    match instructions.get(pc)? {
+fn leading_alternative_start_at(program: &Program, pc: usize) -> Option<LeadingAlternativeStart> {
+    match program.instructions.get(pc)? {
         Instruction::AssertStart { multiline: false } => Some(LeadingAlternativeStart::InputStart),
         Instruction::Char(c) if *c <= 0xFFFF => Some(LeadingAlternativeStart::LiteralCodeUnit(*c as u16)),
-        Instruction::Save(_) | Instruction::Nop => leading_alternative_start_at(instructions, pc + 1),
+        Instruction::Literal {
+            first,
+            ignore_case: false,
+            ..
+        } => Some(LeadingAlternativeStart::LiteralCodeUnit(*first)),
+        Instruction::Save(_) | Instruction::Nop => leading_alternative_start_at(program, pc + 1),
         _ => None,
     }
 }
 
-fn analyze_start_position_hint(instructions: &[Instruction], start: usize) -> Option<StartPositionHint> {
+fn analyze_start_position_hint(program: &Program, start: usize) -> Option<StartPositionHint> {
+    let instructions = &program.instructions;
     let Instruction::Split { .. } = instructions.get(start)? else {
         return None;
     };
@@ -85317,7 +85676,7 @@ fn analyze_start_position_hint(instructions: &[Instruction], start: usize) -> Op
     loop {
         match instructions.get(pc)? {
             Instruction::Split { prefer, other } => {
-                match leading_alternative_start_at(instructions, *prefer as usize)? {
+                match leading_alternative_start_at(program, *prefer as usize)? {
                     LeadingAlternativeStart::InputStart => hint.includes_input_start = true,
                     LeadingAlternativeStart::LiteralCodeUnit(ch) => {
                         if !hint.literal_code_units.contains(&ch) {
@@ -85328,7 +85687,7 @@ fn analyze_start_position_hint(instructions: &[Instruction], start: usize) -> Op
                 pc = *other as usize;
             }
             _ => {
-                match leading_alternative_start_at(instructions, pc)? {
+                match leading_alternative_start_at(program, pc)? {
                     LeadingAlternativeStart::InputStart => hint.includes_input_start = true,
                     LeadingAlternativeStart::LiteralCodeUnit(ch) => {
                         if !hint.literal_code_units.contains(&ch) {
@@ -85389,11 +85748,12 @@ pub(crate) fn analyze_pattern(program: &Program, ast_required_literal: Option<Re
     };
 
     let first_char = match filter_inst {
-        Some(Instruction::Char(c)) => Some((*c, false)),
-        Some(Instruction::CharNoCase(c, _)) => Some((*c, true)),
+        Some(Instruction::Char(_) | Instruction::CharNoCase(..) | Instruction::Literal { .. }) => {
+            first_char_at(program, filter_offset)
+        }
         // For disjunctions (Split chains), find the common first character
         // across all alternatives. E.g., /<script|<style|<link/ all start with '<'.
-        Some(Instruction::Split { .. }) => find_common_first_char(&program.instructions, filter_offset as u32),
+        Some(Instruction::Split { .. }) => find_common_first_char(program, filter_offset as u32),
         _ => None,
     };
 
@@ -85403,11 +85763,13 @@ pub(crate) fn analyze_pattern(program: &Program, ast_required_literal: Option<Re
     let first_filter = if first_char.is_none() && !program.ignore_case {
         match filter_inst {
             Some(Instruction::BuiltinClass(class)) => Some(SimpleMatch::BuiltinClass(*class)),
-            Some(Instruction::CharClass { ranges, negated }) => Some(SimpleMatch::CharClass {
-                ranges: ranges.clone(),
+            Some(Instruction::CharClass { class, negated }) => Some(SimpleMatch::CharClass {
+                ranges: program.class(*class).clone(),
                 negated: *negated,
             }),
-            Some(Instruction::GreedyLoop { matcher, min, .. }) if *min >= 1 => Some(matcher.clone()),
+            Some(Instruction::GreedyLoop { index, .. }) if program.simple_loop(*index).min >= 1 => {
+                Some(program.simple_loop(*index).matcher.clone())
+            }
             _ => None,
         }
     } else {
@@ -85415,7 +85777,7 @@ pub(crate) fn analyze_pattern(program: &Program, ast_required_literal: Option<Re
     };
 
     let start_position_hint = if !program.unicode {
-        analyze_start_position_hint(&program.instructions, filter_offset)
+        analyze_start_position_hint(program, filter_offset)
     } else {
         None
     };
@@ -85432,7 +85794,7 @@ pub(crate) fn analyze_pattern(program: &Program, ast_required_literal: Option<Re
             Instruction::Save(1),
             Instruction::Match,
         ] if !(program.ignore_case || *multiline || program.multiline) => {
-            extract_trailing_literal(&program.instructions, program.instructions.len() - 3)
+            extract_trailing_literal(program, program.instructions.len() - 3)
         }
         _ => None,
     };
@@ -85441,11 +85803,9 @@ pub(crate) fn analyze_pattern(program: &Program, ast_required_literal: Option<Re
         ast_required_literal,
         match program.instructions.as_slice() {
             [.., Instruction::Save(1), Instruction::Match] if !program.ignore_case => {
-                extract_trailing_literal(&program.instructions, program.instructions.len() - 2).map(|literal| {
-                    RequiredLiteralHint {
-                        literal,
-                        ascii_case_insensitive: false,
-                    }
+                extract_trailing_literal(program, program.instructions.len() - 2).map(|literal| RequiredLiteralHint {
+                    literal,
+                    ascii_case_insensitive: false,
                 })
             }
             [
@@ -85454,11 +85814,9 @@ pub(crate) fn analyze_pattern(program: &Program, ast_required_literal: Option<Re
                 Instruction::Save(1),
                 Instruction::Match,
             ] if !program.ignore_case => {
-                extract_trailing_literal(&program.instructions, program.instructions.len() - 3).map(|literal| {
-                    RequiredLiteralHint {
-                        literal,
-                        ascii_case_insensitive: false,
-                    }
+                extract_trailing_literal(program, program.instructions.len() - 3).map(|literal| RequiredLiteralHint {
+                    literal,
+                    ascii_case_insensitive: false,
                 })
             }
             _ => None,
@@ -85473,19 +85831,22 @@ pub(crate) fn analyze_pattern(program: &Program, ast_required_literal: Option<Re
         && matches!(program.instructions.get(3), Some(Instruction::Match))
     {
         match &program.instructions[1] {
-            Instruction::CharClass { ranges, negated } => Some(SimpleScan::CharClass {
-                ranges: ranges.clone(),
+            Instruction::CharClass { class, negated } => Some(SimpleScan::CharClass {
+                ranges: program.class(*class).clone(),
                 negated: *negated,
             }),
             Instruction::BuiltinClass(class) => Some(SimpleScan::BuiltinClass(*class)),
             Instruction::Char(c) => Some(SimpleScan::Char(*c)),
             // GreedyLoop of a simple matcher: e.g., \s+, \d+, .+
             // Only when min >= 1 (min=0 means every position matches, complicating the scan).
-            Instruction::GreedyLoop { matcher, min, max } if *min >= 1 => Some(SimpleScan::GreedyQuantifier {
-                matcher: matcher.clone(),
-                min: *min,
-                max: *max,
-            }),
+            Instruction::GreedyLoop { index, .. } if program.simple_loop(*index).min >= 1 => {
+                let simple_loop = program.simple_loop(*index);
+                Some(SimpleScan::GreedyQuantifier {
+                    matcher: simple_loop.matcher.clone(),
+                    min: simple_loop.min,
+                    max: simple_loop.max,
+                })
+            }
             _ => None,
         }
     } else {
@@ -85733,8 +86094,11 @@ impl<'a, I: Input> Vm<'a, I> {
 
         // A single pass through the instructions can settle a prefix mismatch without searching the rest of the input.
         // Keep the literal check for patterns that would otherwise spend their match budget backtracking.
+        // NB: A literal costs a step for each of its code units, so the pass gets a step for each code unit of the
+        //     literals after their first too.
         let start = self.pos;
-        self.step_limit = self.step_limit.min(self.program.instructions.len() as u64 + 1);
+        let single_pass_steps = self.program.instructions.len() as u64 + self.program.literals.len() as u64;
+        self.step_limit = self.step_limit.min(single_pass_steps + 1);
         self.next_checkpoint = self.next_interrupt_poll.min(self.step_limit);
         let result = self.run();
         if result != VmResult::LimitExceeded {
@@ -85758,7 +86122,8 @@ impl<'a, I: Input> Vm<'a, I> {
     /// Fast VM loop specialized for non-Unicode, forward-only patterns.
     /// Eliminates surrogate pair checks and backward mode branches.
     fn run_fast(&mut self) -> VmResult {
-        let instructions = &self.program.instructions;
+        let program = self.program;
+        let instructions = &program.instructions;
         let num_instructions = instructions.len();
         let input = self.input;
         let input_len = input.len();
@@ -85800,6 +86165,39 @@ impl<'a, I: Input> Vm<'a, I> {
                     }
                 }
 
+                Instruction::Literal {
+                    first,
+                    ignore_case,
+                    rest_start,
+                    rest_len,
+                } => {
+                    // NB: Each code unit after the first that is compared costs a step, as the Char instructions of
+                    //     the literal did. A match needs no checkpoint here, as the next instruction looks first.
+                    match literal_matches_at(input, self.pos, *first, *ignore_case, false, || {
+                        program.literal_rest(*rest_start, *rest_len)
+                    }) {
+                        Ok(()) => {
+                            self.steps += u64::from(*rest_len);
+                            self.pos += 1 + *rest_len as usize;
+                            self.pc += 1;
+                            continue;
+                        }
+                        Err(rest_compared) => {
+                            if rest_compared != 0 {
+                                self.steps += rest_compared as u64;
+                                if self.steps >= self.next_checkpoint
+                                    && let Some(result) = self.reach_checkpoint()
+                                {
+                                    return result;
+                                }
+                            }
+                        }
+                    }
+                    if !self.backtrack() {
+                        return VmResult::NoMatch;
+                    }
+                }
+
                 Instruction::CharNoCase(lo, _hi) => {
                     if self.pos < input_len {
                         let input_cp = input.code_unit(self.pos) as u32;
@@ -85828,7 +86226,8 @@ impl<'a, I: Input> Vm<'a, I> {
                     }
                 }
 
-                Instruction::CharClass { ranges, negated } => {
+                Instruction::CharClass { class, negated } => {
+                    let ranges = program.class(*class);
                     if self.pos < input_len {
                         let cp = input.code_unit(self.pos) as u32;
                         let in_class = if self.modifiers.ignore_case {
@@ -85862,7 +86261,8 @@ impl<'a, I: Input> Vm<'a, I> {
                     }
                 }
 
-                Instruction::UnicodeProperty(data) => {
+                Instruction::UnicodeProperty(index) => {
+                    let data = program.unicode_property(*index);
                     if self.pos < input_len {
                         let cp = input.code_unit(self.pos) as u32;
                         // NB: run_fast is only entered when !unicode, so the
@@ -85897,9 +86297,7 @@ impl<'a, I: Input> Vm<'a, I> {
                     // OPTIMIZATION: A preferred path that starts by matching a character the input does not have here
                     //               fails right away, which would backtrack to the other path with nothing changed. So
                     //               take the other path without saving a backtrack state.
-                    if !self.modifiers.ignore_case
-                        && Self::fails_at_first_code_unit(instructions, prefer, input, self.pos)
-                    {
+                    if !self.modifiers.ignore_case && Self::fails_at_first_code_unit(program, prefer, input, self.pos) {
                         self.pc = other;
                         continue;
                     }
@@ -86005,8 +86403,8 @@ impl<'a, I: Input> Vm<'a, I> {
                     }
                 }
 
-                Instruction::BackrefNamed(name) => {
-                    if let Some(result) = self.handle_backref_named(name) {
+                Instruction::BackrefNamed(index) => {
+                    if let Some(result) = self.handle_backref_named(program.backref_name(*index)) {
                         return result;
                     }
                 }
@@ -86015,14 +86413,8 @@ impl<'a, I: Input> Vm<'a, I> {
                     self.handle_repeat_start(*counter_reg);
                 }
 
-                Instruction::RepeatCheck {
-                    counter_reg,
-                    min,
-                    max,
-                    body,
-                    greedy,
-                } => {
-                    self.handle_repeat_check(*counter_reg, *min, *max, *body, *greedy);
+                Instruction::RepeatCheck { check, body } => {
+                    self.handle_repeat_check(program.repeat_check(*check), *body);
                 }
 
                 Instruction::LookStart { positive, forward, end } => {
@@ -86051,8 +86443,11 @@ impl<'a, I: Input> Vm<'a, I> {
                     self.pc += 1;
                 }
 
-                Instruction::StringPropertyMatch { strings, property } => {
-                    if let Some(result) = self.handle_string_property_match(strings, property) {
+                Instruction::StringPropertyMatch(index) => {
+                    let string_property = program.string_property(*index);
+                    if let Some(result) =
+                        self.handle_string_property_match(&string_property.strings, &string_property.property)
+                    {
                         return result;
                     }
                 }
@@ -86063,7 +86458,7 @@ impl<'a, I: Input> Vm<'a, I> {
                     if last_pos == self.pos as i32 {
                         // Zero-width match detected. Per ECMA-262, captures from the
                         // body should be cleared to undefined before exiting.
-                        for &cap_reg in clear_captures {
+                        for &cap_reg in program.register_list(*clear_captures) {
                             let r = cap_reg as usize;
                             if r < self.registers.len() {
                                 self.set_register(r, -1);
@@ -86078,7 +86473,8 @@ impl<'a, I: Input> Vm<'a, I> {
                     }
                 }
 
-                Instruction::GreedyLoop { matcher, min, max } => {
+                Instruction::GreedyLoop { index, .. } => {
+                    let SimpleLoop { matcher, min, max, .. } = program.simple_loop(*index);
                     let min = *min;
                     let max = *max;
                     let start_pos = self.pos;
@@ -86099,7 +86495,8 @@ impl<'a, I: Input> Vm<'a, I> {
                     }
                 }
 
-                Instruction::LazyLoop { matcher, min, max } => {
+                Instruction::LazyLoop(index) => {
+                    let SimpleLoop { matcher, min, max, .. } = program.simple_loop(*index);
                     let min = *min;
                     let max = *max;
                     let start_pos = self.pos;
@@ -86134,7 +86531,8 @@ impl<'a, I: Input> Vm<'a, I> {
 
     /// General VM loop for Unicode and backward patterns.
     fn run_general(&mut self) -> VmResult {
-        let instructions = &self.program.instructions;
+        let program = self.program;
+        let instructions = &program.instructions;
         let num_instructions = instructions.len();
         'vm_loop: loop {
             self.steps += 1;
@@ -86162,6 +86560,41 @@ impl<'a, I: Input> Vm<'a, I> {
                         }
                     } else {
                         self.pc += 1;
+                    }
+                }
+
+                Instruction::Literal {
+                    first,
+                    ignore_case,
+                    rest_start,
+                    rest_len,
+                } => {
+                    // NB: The compiler emits literals only for forward matching, of code units that are characters of
+                    //     their own in Unicode mode too.
+                    debug_assert!(!self.backward);
+                    // NB: Each code unit after the first that is compared costs a step, as the Char instructions of
+                    //     the literal did. A match needs no checkpoint here, as the next instruction looks first.
+                    match literal_matches_at(self.input, self.pos, *first, *ignore_case, program.unicode, || {
+                        program.literal_rest(*rest_start, *rest_len)
+                    }) {
+                        Ok(()) => {
+                            self.steps += u64::from(*rest_len);
+                            self.pos += 1 + *rest_len as usize;
+                            self.pc += 1;
+                        }
+                        Err(rest_compared) => {
+                            if rest_compared != 0 {
+                                self.steps += rest_compared as u64;
+                                if self.steps >= self.next_checkpoint
+                                    && let Some(result) = self.reach_checkpoint()
+                                {
+                                    return result;
+                                }
+                            }
+                            if !self.backtrack() {
+                                return VmResult::NoMatch;
+                            }
+                        }
                     }
                 }
 
@@ -86194,7 +86627,8 @@ impl<'a, I: Input> Vm<'a, I> {
                     }
                 }
 
-                Instruction::CharClass { ranges, negated } => {
+                Instruction::CharClass { class, negated } => {
+                    let ranges = program.class(*class);
                     if let Some(cp) = self.current_code_point() {
                         let in_class = match_char_class(
                             cp,
@@ -86231,7 +86665,8 @@ impl<'a, I: Input> Vm<'a, I> {
                     }
                 }
 
-                Instruction::UnicodeProperty(data) => {
+                Instruction::UnicodeProperty(index) => {
+                    let data = program.unicode_property(*index);
                     if let Some(cp) = self.current_code_point() {
                         let result = if self.modifiers.ignore_case && self.program.unicode {
                             if data.negated && !self.program.unicode_sets {
@@ -86339,8 +86774,8 @@ impl<'a, I: Input> Vm<'a, I> {
                     }
                 }
 
-                Instruction::BackrefNamed(name) => {
-                    if let Some(result) = self.handle_backref_named(name) {
+                Instruction::BackrefNamed(index) => {
+                    if let Some(result) = self.handle_backref_named(program.backref_name(*index)) {
                         return result;
                     }
                 }
@@ -86349,14 +86784,8 @@ impl<'a, I: Input> Vm<'a, I> {
                     self.handle_repeat_start(*counter_reg);
                 }
 
-                Instruction::RepeatCheck {
-                    counter_reg,
-                    min,
-                    max,
-                    body,
-                    greedy,
-                } => {
-                    self.handle_repeat_check(*counter_reg, *min, *max, *body, *greedy);
+                Instruction::RepeatCheck { check, body } => {
+                    self.handle_repeat_check(program.repeat_check(*check), *body);
                 }
 
                 Instruction::LookStart { positive, forward, end } => {
@@ -86385,8 +86814,11 @@ impl<'a, I: Input> Vm<'a, I> {
                     self.pc += 1;
                 }
 
-                Instruction::StringPropertyMatch { strings, property } => {
-                    if let Some(result) = self.handle_string_property_match(strings, property) {
+                Instruction::StringPropertyMatch(index) => {
+                    let string_property = program.string_property(*index);
+                    if let Some(result) =
+                        self.handle_string_property_match(&string_property.strings, &string_property.property)
+                    {
                         return result;
                     }
                 }
@@ -86395,7 +86827,7 @@ impl<'a, I: Input> Vm<'a, I> {
                     let reg = *reg as usize;
                     let last_pos = self.registers[reg];
                     if last_pos == self.pos as i32 {
-                        for &cap_reg in clear_captures {
+                        for &cap_reg in program.register_list(*clear_captures) {
                             let r = cap_reg as usize;
                             if r < self.registers.len() {
                                 self.set_register(r, -1);
@@ -86410,7 +86842,8 @@ impl<'a, I: Input> Vm<'a, I> {
                     }
                 }
 
-                Instruction::GreedyLoop { matcher, min, max } => {
+                Instruction::GreedyLoop { index, .. } => {
+                    let SimpleLoop { matcher, min, max, .. } = program.simple_loop(*index);
                     let min = *min;
                     let max = *max;
                     let start_pos = self.pos;
@@ -86451,7 +86884,8 @@ impl<'a, I: Input> Vm<'a, I> {
                     }
                 }
 
-                Instruction::LazyLoop { matcher, min, max } => {
+                Instruction::LazyLoop(index) => {
+                    let SimpleLoop { matcher, min, max, .. } = program.simple_loop(*index);
                     let min = *min;
                     let max = *max;
                     let start_pos = self.pos;
@@ -86561,7 +86995,13 @@ impl<'a, I: Input> Vm<'a, I> {
     }
 
     #[inline(always)]
-    fn handle_repeat_check(&mut self, counter_reg: u32, min: u32, max: Option<u32>, body: u32, greedy: bool) {
+    fn handle_repeat_check(&mut self, check: &RepeatCheck, body: u32) {
+        let RepeatCheck {
+            counter_reg,
+            min,
+            max,
+            greedy,
+        } = *check;
         let reg = counter_reg as usize;
         let count = self.registers[reg] as u32;
 
@@ -86882,14 +87322,40 @@ impl<'a, I: Input> Vm<'a, I> {
     /// of which fails on the input from `pos` on. Saves and clears of registers in between change nothing a failure
     /// would not undo.
     #[inline(always)]
-    fn fails_at_first_code_unit(instructions: &[Instruction], mut pc: u32, input: I, mut pos: usize) -> bool {
+    fn fails_at_first_code_unit(program: &Program, mut pc: u32, input: I, mut pos: usize) -> bool {
         const MAX_CODE_UNITS_CHECKED: usize = 4;
         let mut checked = 0;
         while checked < MAX_CODE_UNITS_CHECKED {
             let code_unit = (pos < input.len()).then(|| u32::from(input.code_unit(pos)));
-            let matches = match instructions.get(pc as usize) {
+            let matches = match program.instructions.get(pc as usize) {
                 Some(Instruction::Char(character)) => code_unit == Some(*character),
-                Some(Instruction::CharClass { ranges, negated }) => {
+                Some(Instruction::Literal {
+                    first,
+                    rest_start,
+                    rest_len,
+                    ignore_case: false,
+                }) => {
+                    if code_unit != Some(u32::from(*first)) {
+                        return true;
+                    }
+                    let rest = program.literal_rest(*rest_start, *rest_len);
+                    let budget = MAX_CODE_UNITS_CHECKED - checked - 1;
+                    for (offset, &expected) in rest.iter().take(budget).enumerate() {
+                        let position = pos + 1 + offset;
+                        if position >= input.len() || input.code_unit(position) != expected {
+                            return true;
+                        }
+                    }
+                    if rest.len() >= budget {
+                        return false;
+                    }
+                    pc += 1;
+                    pos += 1 + rest.len();
+                    checked += 1 + rest.len();
+                    continue;
+                }
+                Some(Instruction::CharClass { class, negated }) => {
+                    let ranges = program.class(*class);
                     code_unit.is_some_and(|code_unit| ranges.contains(code_unit) != *negated)
                 }
                 Some(Instruction::Save(_) | Instruction::ClearRegister(_)) => {
@@ -87010,34 +87476,6 @@ impl<'a, I: Input> Vm<'a, I> {
         }
     }
 
-    // Sum the minimum counts of immediately following loops that match the
-    // same simple atom, so a greedy loop can leave that suffix in one step.
-    fn same_matcher_loop_suffix_min(&self, mut pc: usize, matcher: &SimpleMatch) -> Option<u32> {
-        let mut total = 0u32;
-        let mut saw_positive_min = false;
-
-        while let Some(instruction) = self.program.instructions.get(pc) {
-            let min = match instruction {
-                Instruction::GreedyLoop {
-                    matcher: next_matcher,
-                    min,
-                    ..
-                }
-                | Instruction::LazyLoop {
-                    matcher: next_matcher,
-                    min,
-                    ..
-                } if next_matcher == matcher => *min,
-                _ => break,
-            };
-            total = total.checked_add(min)?;
-            saw_positive_min |= min > 0;
-            pc += 1;
-        }
-
-        if saw_positive_min { Some(total) } else { None }
-    }
-
     fn count_available_same_matcher_chars(
         &self,
         mut pos: usize,
@@ -87075,12 +87513,19 @@ impl<'a, I: Input> Vm<'a, I> {
     }
 
     fn same_matcher_loop_suffix_deficit(&self, pc: usize, current_pos: usize, backward: bool) -> Option<u32> {
-        let matcher = match self.program.instructions.get(pc) {
-            Some(Instruction::GreedyLoop { matcher, .. }) => matcher,
+        let SimpleLoop {
+            matcher,
+            same_matcher_suffix_min,
+            ..
+        } = match self.program.instructions.get(pc) {
+            Some(Instruction::GreedyLoop {
+                index,
+                same_matcher_suffix: true,
+            }) => self.program.simple_loop(*index),
             _ => return None,
         };
 
-        let suffix_min = self.same_matcher_loop_suffix_min(pc + 1, matcher)?;
+        let suffix_min = (*same_matcher_suffix_min)?;
         let available = self.count_available_same_matcher_chars(current_pos, matcher, suffix_min, backward);
         let deficit = suffix_min.saturating_sub(available);
         (deficit > 0).then_some(deficit)
@@ -87285,10 +87730,9 @@ impl<'a, I: Input> Vm<'a, I> {
                             }
                             pos
                         } else {
-                            match next_inst {
-                                Some(Instruction::Char(target)) if !self.modifiers.ignore_case && *target <= 0xFFFF => {
+                            match (next_inst, self.program.leading_code_unit(next_inst)) {
+                                (_, Some(target)) if !self.modifiers.ignore_case => {
                                     // BMP char: scan code units directly.
-                                    let target = *target as u16;
                                     let mut scan_pos = if current_pos > 0 { current_pos - 1 } else { 0 };
                                     loop {
                                         if scan_pos < min_pos {
@@ -87303,7 +87747,9 @@ impl<'a, I: Input> Vm<'a, I> {
                                         scan_pos -= 1;
                                     }
                                 }
-                                Some(Instruction::Char(target)) if !self.modifiers.ignore_case && *target > 0xFFFF => {
+                                (Some(Instruction::Char(target)), _)
+                                    if !self.modifiers.ignore_case && *target > 0xFFFF =>
+                                {
                                     // Supplementary char: scan for the surrogate pair.
                                     let hi = ((*target - 0x10000) >> 10) as u16 + 0xD800;
                                     let lo = ((*target - 0x10000) & 0x3FF) as u16 + 0xDC00;
@@ -87376,8 +87822,9 @@ impl<'a, I: Input> Vm<'a, I> {
                     // Try to consume one more character.
                     self.pos = pos;
                     if let Some(cp) = self.current_code_point() {
-                        let matcher = match &self.program.instructions[pc as usize] {
-                            Instruction::LazyLoop { matcher, .. } => matcher,
+                        let program = self.program;
+                        let matcher = match &program.instructions[pc as usize] {
+                            Instruction::LazyLoop(index) => &program.simple_loop(*index).matcher,
                             _ => unreachable!(),
                         };
                         if self.match_simple(cp, matcher) {
@@ -87829,6 +88276,38 @@ fn case_fold(cp: u32, unicode_mode: bool) -> u32 {
     }
     // Non-ASCII: call FFI which handles both modes correctly.
     libunicode_rust::character_types::simple_case_fold(cp, unicode_mode)
+}
+
+/// Whether the input from `pos` on starts with `first` and then the code units of `rest`, compared as `Char`
+/// instructions compare each of them. Most attempts fail at the first code unit, so the rest is only fetched after it.
+/// On a mismatch, the error is how many code units of `rest` were compared, the failed one included, as that many more
+/// `Char` instructions ran. The input ending counts as a failed compare.
+#[inline(always)]
+fn literal_matches_at<'a, I: Input>(
+    input: I,
+    pos: usize,
+    first: u16,
+    ignore_case: bool,
+    unicode_mode: bool,
+    rest: impl FnOnce() -> &'a [u16],
+) -> Result<(), usize> {
+    let code_units_match = |actual: u16, expected: u16| {
+        actual == expected || (ignore_case && case_fold_eq(u32::from(actual), u32::from(expected), unicode_mode))
+    };
+    if pos >= input.len() || !code_units_match(input.code_unit(pos), first) {
+        return Err(0);
+    }
+    let rest = rest();
+    let comparable = rest.len().min(input.len() - pos - 1);
+    for (offset, &expected) in rest[..comparable].iter().enumerate() {
+        if !code_units_match(input.code_unit(pos + 1 + offset), expected) {
+            return Err(offset + 1);
+        }
+    }
+    if comparable < rest.len() {
+        return Err(comparable + 1);
+    }
+    Ok(())
 }
 
 /// Compare two code points for case-insensitive equality.
@@ -96120,6 +96599,17 @@ void SeccompPolicy::allow_gpu_device_operations()
 #endif
 #ifdef __NR_fchmodat2
     append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_fchmodat2, 0, 1));
+    append(SECCOMP_ERRNO(EPERM));
+#endif
+
+    // NVIDIA also tries to make its device nodes when they are missing, as they are on a machine without an NVIDIA
+    // GPU. Refuse mknod() the same way, whatever it would make.
+#ifdef __NR_mknod
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_mknod, 0, 1));
+    append(SECCOMP_ERRNO(EPERM));
+#endif
+#ifdef __NR_mknodat
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_mknodat, 0, 1));
     append(SECCOMP_ERRNO(EPERM));
 #endif
 
@@ -547103,7 +547593,7 @@ void HTMLMediaElement::set_up_playback_manager_for_remote()
     //     https://html.spec.whatwg.org/multipage/media.html#media-elements
     //     Therefore, we enumerate all the available tracks into our VideoTrackList and AudioTrackList.
 
-    set_up_playback_manager_error_handler(GC::create_function(GC::Heap::the(), GC::captures(GC::Weak { *this }), [](auto& weak_self, Utf16String error_message) {
+    m_playback_manager_failure_callback = GC::create_function(GC::Heap::the(), GC::captures(GC::Weak { *this }), [](auto& weak_self, Utf16String error_message) {
         if (!weak_self)
             return;
         auto& self = *weak_self;
@@ -547115,10 +547605,12 @@ void HTMLMediaElement::set_up_playback_manager_for_remote()
 
         // 2. Abort this subalgorithm, returning to the resource selection algorithm.
         failure_callback->function()(move(error_message));
-    }));
+    });
 
     m_playback_manager->add_media_source(*m_remote_fetch_data->stream)
         ->when_resolved(GC::weak_callback(*this, [weak_manager = m_playback_manager->make_weak_ptr()](auto& self, MediaClient::RemotePlaybackManager::AddedTracks& added_tracks) {
+            self.listen_for_playback_manager_errors();
+
             // -> If the media resource is found to have an audio track
             for (auto const& track : added_tracks.audio_tracks) {
                 self.on_audio_track_added(track);
@@ -547169,9 +547661,8 @@ void HTMLMediaElement::set_up_playback_manager_for_remote()
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#media-data-processing-steps-list
-void HTMLMediaElement::set_up_playback_manager_error_handler(GC::Ref<GC::Function<void(Utf16String)>> failure_callback)
+void HTMLMediaElement::listen_for_playback_manager_errors()
 {
-    m_playback_manager_failure_callback = failure_callback;
     m_playback_manager->on_error = GC::weak_callback(*this, [](auto& self, Media::DecoderError&& error) {
         self.handle_playback_manager_error(move(error));
     });
@@ -547220,7 +547711,7 @@ void HTMLMediaElement::set_up_playback_manager_for_local(GC::Ref<GC::Function<vo
     // NB: The Media Source Extensions spec creates the tracks in its initialization segment received algorithm, and
     //     SourceBuffer runs the steps once enough of the media data has been fetched to determine its metadata.
 
-    set_up_playback_manager_error_handler(GC::create_function(GC::Heap::the(), GC::captures(GC::Weak { *this }, failure_callback), [](auto& weak_self, auto& failure_callback, Utf16String error_message) {
+    m_playback_manager_failure_callback = GC::create_function(GC::Heap::the(), GC::captures(GC::Weak { *this }, failure_callback), [](auto& weak_self, auto& failure_callback, Utf16String error_message) {
         if (!weak_self)
             return;
         auto& self = *weak_self;
@@ -547230,7 +547721,8 @@ void HTMLMediaElement::set_up_playback_manager_for_local(GC::Ref<GC::Function<vo
 
         // 2. Abort this subalgorithm, returning to the resource selection algorithm.
         failure_callback->function()(move(error_message));
-    }));
+    });
+    listen_for_playback_manager_errors();
 
     m_playback_manager->on_playback_state_change = GC::weak_callback(*this, [](auto& self) {
         self.on_playback_manager_state_change();
@@ -549081,7 +549573,7 @@ private:
 
     void set_up_playback_manager_for_remote();
     void set_up_playback_manager_for_local(GC::Ref<GC::Function<void(Utf16String)>> failure_callback);
-    void set_up_playback_manager_error_handler(GC::Ref<GC::Function<void(Utf16String)>> failure_callback);
+    void listen_for_playback_manager_errors();
     void handle_playback_manager_error(Media::DecoderError&&);
     enum class FetchingStatus : u8 {
         Ongoing,
@@ -618237,573 +618729,3 @@ void merge_existing_and_new_import_maps(Window& global, ImportMap& new_import_ma
     // 4. For each scopePrefix → scopeImports of newImportMapScopes:
     for (auto& [scope_prefix, scope_imports] : new_import_map_scopes) {
         // 1. For each record of global's resolved module set:
-        for (auto const& record : global.resolved_module_set()) {
-            // 1. If scopePrefix is record's serialized base URL, or if scopePrefix ends with U+002F (/) and scopePrefix is a code unit prefix of record's serialized base URL, then:
-            if (record.serialized_base_url.has_value()
-                && (scope_prefix == *record.serialized_base_url
-                    || (scope_prefix.utf16_view().ends_with('/')
-                        && Infra::is_code_unit_prefix(scope_prefix.utf16_view(), record.serialized_base_url->utf16_view())))) {
-                // 1. For each specifierKey → resolutionResult of scopeImports:
-                scope_imports.remove_all_matching([&](Utf16String const& specifier_key, Optional<URL::URL> const&) {
-                    // 1. If specifierKey is record's specifier, or if all of the following conditions are true:
-                    //      * specifierKey ends with U+002F (/);
-                    //      * specifierKey is a code unit prefix of record's specifier;
-                    //      * either record's specifier as a URL is null or is special,
-                    //    then:
-                    if (specifier_key == record.specifier
-                        || (specifier_key.utf16_view().ends_with('/')
-                            && Infra::is_code_unit_prefix(specifier_key.utf16_view(), record.specifier.utf16_view())
-                            && record.specifier_is_null_or_url_like_that_is_special)) {
-                        // 1. The user agent may report a warning to the console indicating the ignored rule. They
-                        //    may choose to avoid reporting if the rule is identical to an existing one.
-                        auto& console = realm.intrinsics().console_object()->console();
-                        console.output_debug_message(JS::Console::LogLevel::Warn,
-                            Utf16String::formatted("An import map rule for specifier '{}' was ignored as one was already present in the existing import map", specifier_key));
-
-                        // 2. Remove scopeImports[specifierKey].
-                        return true;
-                    }
-
-                    return false;
-                });
-            }
-        }
-
-        // 2. If scopePrefix exists in oldImportMap's scopes, then set oldImportMap's scopes[scopePrefix] to the result
-        //    of merging module specifier maps, given scopeImports and oldImportMap's scopes[scopePrefix].
-        if (auto* old_scope_imports = old_import_map.scopes().find(scope_prefix)) {
-            *old_scope_imports = merge_module_specifier_maps(realm, scope_imports, *old_scope_imports);
-        }
-        // 3. Otherwise, set oldImportMap's scopes[scopePrefix] to scopeImports.
-        else {
-            // AD-HOC: This inserts in sorted order rather than appending, as resolution relies on the order.
-            old_import_map.scopes().set(scope_prefix, scope_imports);
-        }
-    }
-
-    // 5. For each url → integrity of newImportMap's integrity:
-    for (auto const& [url, integrity] : new_import_map.integrity()) {
-        // 1. If url exists in oldImportMap's integrity, then:
-        if (old_import_map.integrity().contains(url)) {
-            // 1. The user agent may report a warning to the console indicating the ignored rule. They may choose to
-            //    avoid reporting if the rule is identical to an existing one.
-            auto& console = realm.intrinsics().console_object()->console();
-            console.output_debug_message(JS::Console::LogLevel::Warn,
-                Utf16String::formatted("An import map integrity rule for url '{}' was ignored as one was already present in the existing import map", url));
-
-            // 2. Continue.
-            continue;
-        }
-
-        // 2. Set oldImportMap's integrity[url] to integrity.
-        old_import_map.integrity().set(url, integrity);
-    }
-
-    // 6. For each record of global's resolved module set:
-    for (auto const& record : global.resolved_module_set()) {
-        // 1. For each specifier → url of newImportMapImports:
-        new_import_map_imports.remove_all_matching([&](Utf16String const& specifier, Optional<URL::URL> const&) {
-            // 1. If specifier starts with record's specifier, then:
-            if (specifier.utf16_view().starts_with(record.specifier.utf16_view())) {
-                // 1. The user agent may report a warning to the console indicating the ignored rule. They may choose to
-                //    avoid reporting if the rule is identical to an existing one.
-                auto& console = realm.intrinsics().console_object()->console();
-                console.output_debug_message(JS::Console::LogLevel::Warn,
-                    Utf16String::formatted("An import map rule for specifier '{}' was ignored as one was already present in the existing import map", specifier));
-
-                // 2. Remove newImportMapImports[specifier].
-                return true;
-            }
-
-            return false;
-        });
-    }
-
-    // 7. Set oldImportMap's imports to the result of merge module specifier maps, given newImportMapImports and oldImportMap's imports.
-    old_import_map.set_imports(merge_module_specifier_maps(realm, new_import_map_imports, old_import_map.imports()));
-}
-
-}
-
-FILE: Libraries/LibWeb/HTML/Scripting/ImportMap.h
-/*
- * Copyright (c) 2022, networkException <networkexception@serenityos.org>
- * Copyright (c) 2024, Jamie Mansfield <jmansfield@cadixdev.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/HashMap.h>
-#include <AK/Utf16String.h>
-#include <AK/Vector.h>
-#include <LibURL/URL.h>
-#include <LibWeb/WebIDL/ExceptionOr.h>
-
-namespace Web::HTML {
-
-// An ordered map kept sorted in descending code unit order of its keys.
-template<typename T>
-class DescendingCodeUnitOrderedMap {
-public:
-    struct Entry {
-        Utf16String key;
-        T value;
-    };
-
-    auto begin() const { return m_entries.begin(); }
-    auto end() const { return m_entries.end(); }
-    auto begin() { return m_entries.begin(); }
-    auto end() { return m_entries.end(); }
-
-    bool contains(Utf16View key) const { return index_of(key).has_value(); }
-
-    T const* find(Utf16View key) const
-    {
-        auto index = index_of(key);
-        return index.has_value() ? &m_entries[*index].value : nullptr;
-    }
-
-    T* find(Utf16View key)
-    {
-        auto index = index_of(key);
-        return index.has_value() ? &m_entries[*index].value : nullptr;
-    }
-
-    void set(Utf16String key, T value)
-    {
-        auto index = lower_bound(key);
-        if (index < m_entries.size() && m_entries[index].key == key)
-            m_entries[index].value = move(value);
-        else
-            m_entries.insert(index, Entry { move(key), move(value) });
-    }
-
-    template<typename Predicate>
-    void remove_all_matching(Predicate const& predicate)
-    {
-        m_entries.remove_all_matching([&](Entry const& entry) { return predicate(entry.key, entry.value); });
-    }
-
-private:
-    Optional<size_t> index_of(Utf16View key) const
-    {
-        auto index = lower_bound(key);
-        if (index < m_entries.size() && m_entries[index].key == key)
-            return index;
-        return {};
-    }
-
-    size_t lower_bound(Utf16View key) const
-    {
-        size_t low = 0;
-        size_t high = m_entries.size();
-        while (low < high) {
-            auto middle = low + (high - low) / 2;
-            if (key.is_code_unit_less_than(m_entries[middle].key))
-                low = middle + 1;
-            else
-                high = middle;
-        }
-        return low;
-    }
-
-    Vector<Entry> m_entries;
-};
-
-using ModuleSpecifierMap = DescendingCodeUnitOrderedMap<Optional<URL::URL>>;
-using ModuleScopesMap = DescendingCodeUnitOrderedMap<ModuleSpecifierMap>;
-using ModuleIntegrityMap = HashMap<URL::URL, Utf16String>;
-
-// https://html.spec.whatwg.org/multipage/webappapis.html#import-map
-class ImportMap {
-public:
-    ImportMap() = default;
-
-    ModuleSpecifierMap const& imports() const { return m_imports; }
-    ModuleSpecifierMap& imports() { return m_imports; }
-    void set_imports(ModuleSpecifierMap const& imports) { m_imports = imports; }
-
-    ModuleScopesMap const& scopes() const { return m_scopes; }
-    ModuleScopesMap& scopes() { return m_scopes; }
-    void set_scopes(ModuleScopesMap const& scopes) { m_scopes = scopes; }
-
-    ModuleIntegrityMap const& integrity() const { return m_integrity; }
-    ModuleIntegrityMap integrity() { return m_integrity; }
-    void set_integrity(ModuleIntegrityMap const& integrity) { m_integrity = integrity; }
-
-private:
-    ModuleSpecifierMap m_imports;
-    ModuleScopesMap m_scopes;
-    ModuleIntegrityMap m_integrity;
-};
-
-WebIDL::ExceptionOr<ImportMap> parse_import_map_string(JS::Realm& realm, Utf16View input, URL::URL base_url);
-Optional<Utf16String> normalize_specifier_key(JS::Realm& realm, Utf16View specifier_key, URL::URL base_url);
-WebIDL::ExceptionOr<ModuleSpecifierMap> sort_and_normalise_module_specifier_map(JS::Realm& realm, JS::Object& original_map, URL::URL base_url);
-WebIDL::ExceptionOr<ModuleScopesMap> sort_and_normalise_scopes(JS::Realm& realm, JS::Object& original_map, URL::URL base_url);
-WebIDL::ExceptionOr<ModuleIntegrityMap> normalize_module_integrity_map(JS::Realm& realm, JS::Object& original_map, URL::URL base_url);
-void merge_existing_and_new_import_maps(Window&, ImportMap&);
-
-}
-
-FILE: Libraries/LibWeb/HTML/Scripting/ImportMapParseResult.cpp
-/*
- * Copyright (c) 2024, Jamie Mansfield <jmansfield@cadixdev.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibGC/Heap.h>
-#include <LibJS/Runtime/ModuleRequest.h>
-#include <LibWeb/HTML/Scripting/ExceptionReporter.h>
-#include <LibWeb/HTML/Scripting/ImportMapParseResult.h>
-#include <LibWeb/HTML/Window.h>
-#include <LibWeb/WebIDL/DOMException.h>
-#include <LibWeb/WebIDL/ExceptionOrUtils.h>
-
-namespace Web::HTML {
-
-GC_DEFINE_ALLOCATOR(ImportMapParseResult);
-
-ImportMapParseResult::ImportMapParseResult() = default;
-
-ImportMapParseResult::~ImportMapParseResult() = default;
-
-// https://html.spec.whatwg.org/multipage/webappapis.html#create-an-import-map-parse-result
-GC::Ref<ImportMapParseResult> ImportMapParseResult::parse(JS::Realm& realm, Utf16View input, URL::URL base_url)
-{
-    // 1. Let result be an import map parse result whose import map is null and whose error to rethrow is null.
-    auto result = GC::Heap::the().allocate<ImportMapParseResult>();
-
-    // 2. Parse an import map string given input and baseURL, catching any exceptions.
-    auto import_map = parse_import_map_string(realm, input, base_url);
-
-    // 2.1. If this threw an exception, then set result's error to rethrow to that exception.
-    if (import_map.is_exception())
-        result->set_error_to_rethrow(import_map.exception());
-
-    // 2.2. Otherwise, set result's import map to the return value.
-    else
-        result->set_import_map(import_map.release_value());
-
-    // 3. Return result.
-    return result;
-}
-
-void ImportMapParseResult::visit_edges(Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-    if (m_error_to_rethrow.has_value()) {
-        m_error_to_rethrow.value().visit(
-            [&](WebIDL::SimpleException const&) {
-                // ignore
-            },
-            [&](GC::Ref<WebIDL::DOMException> exception) {
-                visitor.visit(exception);
-            },
-            [&](JS::Completion const& completion) {
-                visitor.visit(completion.value());
-            });
-    }
-}
-
-// https://html.spec.whatwg.org/multipage/webappapis.html#register-an-import-map
-void ImportMapParseResult::register_import_map(Window& global)
-{
-    // 1. If result's error to rethrow is not null, then report the exception given by result's error to rethrow and return.
-    if (m_error_to_rethrow.has_value()) {
-        auto completion = WebIDL::exception_to_throw_completion(global.vm(), global.principal_realm(), m_error_to_rethrow.value());
-        HTML::report_exception(completion, global.principal_realm());
-        return;
-    }
-
-    // 2. Merge existing and new import maps, given global and result's import map.
-    VERIFY(m_import_map.has_value());
-    merge_existing_and_new_import_maps(global, m_import_map.value());
-}
-
-}
-
-FILE: Libraries/LibWeb/HTML/Scripting/ImportMapParseResult.h
-/*
- * Copyright (c) 2024, Jamie Mansfield <jmansfield@cadixdev.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <LibJS/Heap/Cell.h>
-#include <LibURL/URL.h>
-#include <LibWeb/Forward.h>
-#include <LibWeb/HTML/Scripting/ImportMap.h>
-#include <LibWeb/WebIDL/ExceptionOr.h>
-
-namespace Web::HTML {
-
-// https://html.spec.whatwg.org/multipage/webappapis.html#import-map-parse-result
-class ImportMapParseResult : public JS::Cell {
-    GC_CELL(ImportMapParseResult, JS::Cell);
-    GC_DECLARE_ALLOCATOR(ImportMapParseResult);
-
-public:
-    virtual ~ImportMapParseResult() override;
-
-    static GC::Ref<ImportMapParseResult> parse(JS::Realm&, Utf16View input, URL::URL base_url);
-
-    [[nodiscard]] Optional<ImportMap> const& import_map() const { return m_import_map; }
-    void set_import_map(ImportMap const& value) { m_import_map = value; }
-
-    [[nodiscard]] Optional<WebIDL::Exception> const& error_to_rethrow() const { return m_error_to_rethrow; }
-    void set_error_to_rethrow(WebIDL::Exception const& value) { m_error_to_rethrow = value; }
-
-    void register_import_map(Window& global);
-
-protected:
-    ImportMapParseResult();
-
-    virtual void visit_edges(Visitor&) override;
-
-private:
-    // https://html.spec.whatwg.org/multipage/webappapis.html#impr-import-map
-    Optional<ImportMap> m_import_map;
-
-    // https://html.spec.whatwg.org/multipage/webappapis.html#impr-error-to-rethrow
-    Optional<WebIDL::Exception> m_error_to_rethrow;
-};
-
-}
-
-FILE: Libraries/LibWeb/HTML/Scripting/ModuleMap.cpp
-/*
- * Copyright (c) 2022-2023, networkException <networkexception@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibWeb/HTML/Scripting/ModuleMap.h>
-
-namespace Web::HTML {
-
-GC_DEFINE_ALLOCATOR(ModuleMap);
-
-void ModuleMap::visit_edges(Visitor& visitor)
-{
-    Base::visit_edges(visitor);
-    for (auto& it : m_values)
-        it.value.visit(
-            [&](GC::Ref<ModuleScript> module_script) { visitor.visit(module_script); },
-            [&](CallbackList const& callbacks) { visitor.visit(callbacks); });
-}
-
-Optional<ModuleMap::Entry const&> ModuleMap::get(URL::URL const& url, Utf16View type) const
-{
-    return m_values.get({ url, type });
-}
-
-void ModuleMap::set(URL::URL const& url, Utf16View type, CallbackList&& callbacks)
-{
-    VERIFY(!m_values.contains({ url, type }));
-    m_values.set({ url, type }, move(callbacks));
-}
-
-void ModuleMap::append(URL::URL const& url, Utf16View type, CallbackFunction callback)
-{
-    auto entry = m_values.find({ url, type });
-    VERIFY(entry != m_values.end());
-    entry->value.get<CallbackList>().append(move(callback));
-}
-
-void ModuleMap::complete_fetch(URL::URL const& url, Utf16View type, GC::Ptr<ModuleScript> module_script)
-{
-    auto entry = m_values.find({ url, type });
-    VERIFY(entry != m_values.end());
-    GC::RootVector callbacks { move(entry->value.get<CallbackList>()) };
-    m_values.remove(entry);
-
-    if (module_script)
-        m_values.set({ url, type }, GC::Ref { *module_script });
-
-    for (auto const& callback : callbacks)
-        callback->function()(module_script);
-}
-
-}
-
-FILE: Libraries/LibWeb/HTML/Scripting/ModuleMap.h
-/*
- * Copyright (c) 2022-2023, networkException <networkexception@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/Utf16String.h>
-#include <AK/Utf16View.h>
-#include <AK/Variant.h>
-#include <LibGC/Function.h>
-#include <LibJS/Heap/Cell.h>
-#include <LibURL/URL.h>
-#include <LibWeb/Export.h>
-#include <LibWeb/HTML/Scripting/ModuleScript.h>
-
-namespace Web::HTML {
-
-class ModuleLocationTuple {
-public:
-    ModuleLocationTuple(URL::URL url, Utf16View type)
-        : m_url(move(url))
-        , m_type(Utf16String::from_utf16(type))
-    {
-    }
-
-    URL::URL const& url() const { return m_url; }
-    Utf16String const& type() const { return m_type; }
-
-    bool operator==(ModuleLocationTuple const& other) const
-    {
-        return other.url() == m_url && other.type() == m_type;
-    }
-
-private:
-    URL::URL m_url;
-    Utf16String m_type;
-};
-
-// https://html.spec.whatwg.org/multipage/webappapis.html#module-map
-class WEB_API ModuleMap final : public JS::Cell {
-    GC_CELL(ModuleMap, JS::Cell);
-    GC_DECLARE_ALLOCATOR(ModuleMap);
-
-public:
-    ModuleMap() = default;
-    ~ModuleMap() = default;
-
-    using CallbackFunction = GC::Ref<GC::Function<void(GC::Ptr<ModuleScript>)>>;
-    using CallbackList = Vector<CallbackFunction>;
-
-    // A module map is a map keyed by tuples consisting of a URL record and a string. The URL record is the request URL
-    // at which the module was fetched, and the string indicates the type of the module (e.g. "javascript-or-wasm").
-    // The module map's values are either a module script or a list of algorithms (that are waiting for the fetch to
-    // complete).
-    using Entry = Variant<GC::Ref<ModuleScript>, CallbackList>;
-
-    Optional<Entry const&> get(URL::URL const& url, Utf16View type) const;
-
-    void set(URL::URL const& url, Utf16View type, CallbackList&&);
-    void append(URL::URL const& url, Utf16View type, CallbackFunction);
-    void complete_fetch(URL::URL const& url, Utf16View type, GC::Ptr<ModuleScript>);
-
-private:
-    virtual void visit_edges(JS::Cell::Visitor&) override;
-
-    HashMap<ModuleLocationTuple, Entry> m_values;
-};
-
-}
-
-namespace AK {
-
-template<>
-struct Traits<Web::HTML::ModuleLocationTuple> : public DefaultTraits<Web::HTML::ModuleLocationTuple> {
-    static unsigned hash(Web::HTML::ModuleLocationTuple const& tuple)
-    {
-        return pair_int_hash(tuple.url().to_byte_string().hash(), tuple.type().hash());
-    }
-};
-
-}
-
-FILE: Libraries/LibWeb/HTML/Scripting/ModuleScript.cpp
-/*
- * Copyright (c) 2022, networkException <networkexception@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibGC/Heap.h>
-#include <LibJS/Runtime/ModuleRequest.h>
-#include <LibJS/ScriptCompilation.h>
-#include <LibWeb/CSS/StyleSheetState.h>
-#include <LibWeb/HTML/Scripting/Environments.h>
-#include <LibWeb/HTML/Scripting/ExceptionReporter.h>
-#include <LibWeb/HTML/Scripting/Fetching.h>
-#include <LibWeb/HTML/Scripting/ModuleScript.h>
-#include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
-#include <LibWeb/WebAssembly/WebAssembly.h>
-#include <LibWeb/WebIDL/DOMException.h>
-#include <LibWeb/WebIDL/ExceptionOr.h>
-#include <LibWeb/WebIDL/ExceptionOrUtils.h>
-#include <LibWeb/WebIDL/QuotaExceededError.h>
-
-namespace Web::HTML {
-
-GC_DEFINE_ALLOCATOR(ModuleScript);
-
-static void register_source(ModuleScript& script, ScriptRegistry::IsInlineSource is_inline_source, size_t source_line_number)
-{
-    auto record = script.record();
-    auto* module_record = record.get_pointer<GC::Ref<JS::SourceTextModule>>();
-    if (!module_record)
-        return;
-
-    auto source_code = JS::top_level_source_code(**module_record);
-    if (!source_code)
-        return;
-
-    register_javascript_source(script, source_code.release_nonnull(), ScriptRegistry::JavaScriptSource::Type::Module, is_inline_source, source_line_number);
-}
-
-ModuleScript::~ModuleScript() = default;
-
-ModuleScript::ModuleScript(Optional<URL::URL> base_url, ByteString filename, EnvironmentSettingsObject& settings)
-    : Script(move(base_url), move(filename), settings)
-{
-}
-
-GC::Ref<ModuleScript> ModuleScript::create_internal(Optional<URL::URL> base_url, ByteString const& filename, EnvironmentSettingsObject& settings)
-{
-    return settings.realm().create<ModuleScript>(move(base_url), filename, settings);
-}
-
-// https://html.spec.whatwg.org/multipage/webappapis.html#creating-a-javascript-module-script
-WebIDL::ExceptionOr<GC::Ptr<ModuleScript>> ModuleScript::create_a_javascript_module_script(ByteString const& filename, Utf16View source, EnvironmentSettingsObject& settings, URL::URL base_url, size_t source_line_number, ScriptRegistry::IsInlineSource is_inline_source)
-{
-    auto& realm = settings.realm();
-
-    // 1. If scripting is disabled for settings, then set source to the empty string.
-    if (HTML::is_scripting_disabled(settings))
-        source = {};
-
-    // 2. Let script be a new module script that this algorithm will subsequently initialize.
-    // 3. Set script's settings object to settings.
-    // 4. Set script's base URL to baseURL.
-    auto script = create_internal(move(base_url), filename, settings);
-
-    // 5. Set script's fetch options to options.
-    // NB: Callers set the script's fetch options once it has been created.
-
-    // 6. Set script's parse error and error to rethrow to null.
-    script->set_parse_error(JS::js_null());
-    script->set_error_to_rethrow(JS::js_null());
-
-    // 7. Let result be ParseModule(source, realm, script).
-    auto result = JS::SourceTextModule::parse(source, realm, script->filename(), script->display_filename(), script.ptr(), source_line_number);
-
-    // 8. If result is a list of errors, then:
-    if (result.is_error()) {
-        auto& parse_error = result.error().first();
-        dbgln("JavaScriptModuleScript: Failed to parse: {}", parse_error.to_utf16_string());
-
-        // 1. Set script's parse error to result[0].
-        script->set_parse_error(JS::SyntaxError::create(realm, parse_error.to_utf16_string()), parse_error.position);
-
-        // 2. Return script.
-        return script;
-    }
-
-    // 9. Set script's record to result.
-    script->m_record = result.value();
