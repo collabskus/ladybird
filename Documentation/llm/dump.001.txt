@@ -11718,6 +11718,7 @@ FILE: AK/ConditionVariablePOSIX.cpp
 
 #include <AK/ConditionVariable.h>
 #include <AK/Mutex.h>
+#include <AK/Platform.h>
 #include <AK/Time.h>
 #include <errno.h>
 #include <pthread.h>
@@ -11739,8 +11740,20 @@ ConditionVariableBase<MutexType>::ConditionVariableBase(MutexType& to_wait_on)
     : m_to_wait_on(to_wait_on)
 {
     static_assert(sizeof(m_storage) == sizeof(pthread_cond_t));
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
     int result = pthread_cond_init(to_impl(m_storage), nullptr);
     VERIFY(result == 0);
+#else
+    pthread_condattr_t attributes;
+    int result = pthread_condattr_init(&attributes);
+    VERIFY(result == 0);
+    result = pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC);
+    VERIFY(result == 0);
+    result = pthread_cond_init(to_impl(m_storage), &attributes);
+    VERIFY(result == 0);
+    result = pthread_condattr_destroy(&attributes);
+    VERIFY(result == 0);
+#endif
 }
 
 template<typename MutexType>
@@ -11766,8 +11779,14 @@ bool ConditionVariableBase<MutexType>::wait_for(AK::Duration const& timeout)
     if (timeout <= AK::Duration::zero())
         return false;
 
-    auto absolute_timeout = (AK::UnixDateTime::now() + timeout).to_timespec();
-    int result = pthread_cond_timedwait(to_impl(m_storage), reinterpret_cast<pthread_mutex_t*>(m_to_wait_on.m_storage), &absolute_timeout);
+    auto* mutex = reinterpret_cast<pthread_mutex_t*>(m_to_wait_on.m_storage);
+#if defined(AK_OS_MACOS) || defined(AK_OS_IOS)
+    auto relative_timeout = timeout.to_timespec();
+    int result = pthread_cond_timedwait_relative_np(to_impl(m_storage), mutex, &relative_timeout);
+#else
+    auto absolute_timeout = (MonotonicTime::now() + timeout).to_timespec();
+    int result = pthread_cond_timedwait(to_impl(m_storage), mutex, &absolute_timeout);
+#endif
     if (result == ETIMEDOUT)
         return false;
     VERIFY(result == 0);
@@ -44848,6 +44867,10 @@ public:
     [[nodiscard]] i64 nanoseconds_within_second() const { return to_timespec().tv_nsec; }
     [[nodiscard]] f64 to_seconds_f64() const { return m_offset.to_seconds_f64(); }
 
+    [[nodiscard]] timespec to_timespec() const { return m_offset.to_timespec(); }
+    // Rounds towards -inf.
+    [[nodiscard]] timeval to_timeval() const { return m_offset.to_timeval(); }
+
     constexpr bool operator==(MonotonicTime const& other) const { return this->m_offset == other.m_offset; }
     constexpr int operator<=>(MonotonicTime const& other) const { return this->m_offset <=> other.m_offset; }
 
@@ -47623,6 +47646,7 @@ FILE: AK/Utf16String.cpp
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/RefPtr.h>
 #include <AK/Stream.h>
 #include <AK/StringNumber.h>
 #include <AK/Utf16String.h>
@@ -47634,32 +47658,62 @@ namespace AK {
 
 static_assert(sizeof(Detail::ShortString) == sizeof(Detail::Utf16StringData*));
 
-static Utf16String from_bytes_with_replacement_character(StringView string, AllowLonelySurrogates allow_lonely_surrogates)
+Utf16String Utf16String::from_utf8_with_replacement_character(StringView utf8_string, WithBOMHandling with_bom_handling)
 {
-    Utf8View utf8_view { string };
+    if (auto bytes = utf8_string.bytes(); with_bom_handling == WithBOMHandling::Yes && bytes.starts_with({ { 0xEF, 0xBB, 0xBF } }))
+        utf8_string = utf8_string.substring_view(3);
 
-    if (utf8_view.validate(AllowLonelySurrogates::No))
-        return Utf16String::from_utf8_without_validation(string);
+    if (utf8_string.length() <= Detail::MAX_SHORT_STRING_BYTE_COUNT && utf8_string.is_ascii())
+        return from_utf8_without_validation(utf8_string);
+
+    return Utf16String { Detail::Utf16StringData::from_utf8_with_replacement_character(utf8_string) };
+}
+
+Utf16String Utf16String::from_wtf8_with_replacement_character(StringView wtf8_string)
+{
+    // NB: This cannot use simdutf's replacement, which turns each byte of an encoded lone surrogate into U+FFFD. WTF-8
+    //     decoding replaces the whole surrogate with a single U+FFFD.
+    if (auto string = from_well_formed_utf8(wtf8_string); string.has_value())
+        return string.release_value();
+
+    Utf8View utf8_view { wtf8_string };
 
     Utf16StringBuilder builder;
-    utf8_view.for_each_code_point_with_replacement_character(allow_lonely_surrogates, [&](u32 code_point) {
+    utf8_view.for_each_code_point_with_replacement_character(AllowLonelySurrogates::Yes, [&](u32 code_point) {
         builder.append_code_point(code_point);
     });
 
     return builder.to_string();
 }
 
-Utf16String Utf16String::from_utf8_with_replacement_character(StringView utf8_string, WithBOMHandling with_bom_handling)
+Utf16String Utf16String::from_utf8(StringView utf8_string)
 {
-    if (auto bytes = utf8_string.bytes(); with_bom_handling == WithBOMHandling::Yes && bytes.starts_with({ { 0xEF, 0xBB, 0xBF } }))
-        utf8_string = utf8_string.substring_view(3);
-
-    return from_bytes_with_replacement_character(utf8_string, AllowLonelySurrogates::No);
+    return MUST(try_from_utf8(utf8_string));
 }
 
-Utf16String Utf16String::from_wtf8_with_replacement_character(StringView wtf8_string)
+ErrorOr<Utf16String> Utf16String::try_from_utf8(StringView utf8_string)
 {
-    return from_bytes_with_replacement_character(wtf8_string, AllowLonelySurrogates::Yes);
+    // NB: Converting well-formed UTF-8 already validates it, so only the remaining input (WTF-8 with lone surrogates)
+    //     needs a separate validation pass.
+    if (auto string = from_well_formed_utf8(utf8_string); string.has_value())
+        return string.release_value();
+
+    Utf8View utf8_view { utf8_string };
+    if (!utf8_view.validate())
+        return Error::from_string_literal("Input was not valid UTF-8");
+
+    // NB: Utf16StringData::from_utf8() would try the conversion that just failed again before decoding code points.
+    return Utf16String { Detail::Utf16StringData::create_from_code_point_iterable(utf8_view) };
+}
+
+Optional<Utf16String> Utf16String::from_well_formed_utf8(StringView utf8_string)
+{
+    if (utf8_string.length() <= Detail::MAX_SHORT_STRING_BYTE_COUNT && utf8_string.is_ascii())
+        return from_utf8_without_validation(utf8_string);
+
+    if (auto string = Detail::Utf16StringData::from_well_formed_utf8(utf8_string))
+        return Utf16String { string.release_nonnull() };
+    return {};
 }
 
 Utf16String Utf16String::from_ascii_without_validation(ReadonlyBytes ascii_string)
@@ -47853,11 +47907,7 @@ public:
     {
     }
 
-    ALWAYS_INLINE static Utf16String from_utf8(StringView utf8_string)
-    {
-        VERIFY(Utf8View { utf8_string }.validate());
-        return from_utf8_without_validation(utf8_string);
-    }
+    static Utf16String from_utf8(StringView);
 
     ALWAYS_INLINE static Utf16String from_utf8(String const& utf8_string)
     {
@@ -47876,12 +47926,11 @@ public:
     static Utf16String from_utf8_with_replacement_character(StringView, WithBOMHandling = WithBOMHandling::Yes);
     static Utf16String from_wtf8_with_replacement_character(StringView);
 
-    ALWAYS_INLINE static ErrorOr<Utf16String> try_from_utf8(StringView utf8_string)
-    {
-        if (!Utf8View { utf8_string }.validate())
-            return Error::from_string_literal("Input was not valid UTF-8");
-        return from_utf8_without_validation(utf8_string);
-    }
+    static ErrorOr<Utf16String> try_from_utf8(StringView);
+
+    // Returns an empty Optional if the input is not well-formed UTF-8. Unlike try_from_utf8(), this also rejects WTF-8
+    // input that encodes lone surrogates.
+    static Optional<Utf16String> from_well_formed_utf8(StringView);
 
     static Utf16String from_utf8_without_validation(StringView);
     static Utf16String from_ascii_without_validation(ReadonlyBytes);
@@ -49432,6 +49481,9 @@ NonnullRefPtr<Utf16StringData> Utf16StringData::create_from_code_point_iterable(
     return string;
 }
 
+// NB: Utf16String decodes WTF-8 with this too.
+template NonnullRefPtr<Utf16StringData> Utf16StringData::create_from_code_point_iterable(Utf8View const&);
+
 NonnullRefPtr<Utf16StringData> Utf16StringData::from_ascii(ReadonlyBytes ascii_string)
 {
     VERIFY_UTF16_LENGTH(ascii_string.size());
@@ -49449,60 +49501,110 @@ NonnullRefPtr<Utf16StringData> Utf16StringData::create_uninitialized_ascii(size_
     return string;
 }
 
-// Valid UTF-8 encodes nothing above U+00FF if no lead byte is above 0xC3, and then each 0xC2 or 0xC3 lead byte and its
-// continuation byte are one code unit.
-static Optional<size_t> latin1_length_of_valid_utf8(ReadonlyBytes utf8_string)
+// Valid UTF-8 encodes nothing above U+00FF if no lead byte is above 0xC3.
+static bool could_be_latin1(ReadonlyBytes utf8_string)
 {
-    size_t two_byte_sequences = 0;
-    for (auto byte : utf8_string) {
-        if (byte > 0xC3)
-            return {};
-        two_byte_sequences += byte >= 0xC2;
+    // OPTIMIZATION: Scan fixed-size blocks without an early exit inside each one, so the compiler can vectorize it.
+    static constexpr size_t BLOCK_SIZE = 64;
+    static constexpr u8 MAX_LATIN1_LEAD_BYTE = 0xC3;
+
+    auto const* bytes = utf8_string.data();
+    auto size = utf8_string.size();
+    size_t offset = 0;
+
+    for (; offset + BLOCK_SIZE <= size; offset += BLOCK_SIZE) {
+        u8 max_byte = 0;
+        for (size_t i = 0; i < BLOCK_SIZE; ++i)
+            max_byte = max(max_byte, bytes[offset + i]);
+        if (max_byte > MAX_LATIN1_LEAD_BYTE)
+            return false;
     }
-    return utf8_string.size() - two_byte_sequences;
+
+    u8 max_byte = 0;
+    for (; offset < size; ++offset)
+        max_byte = max(max_byte, bytes[offset]);
+    return max_byte <= MAX_LATIN1_LEAD_BYTE;
 }
 
-static bool fits_in_latin1(ReadonlySpan<char16_t> utf16_string)
+// The bitwise OR of all code units: it is at most 0xFF if they all fit in Latin-1, and at most 0x7F if they are ASCII.
+static char16_t combined_code_units(ReadonlySpan<char16_t> utf16_string)
 {
     char16_t combined = 0;
     for (auto code_unit : utf16_string)
         combined |= code_unit;
-    return combined <= 0xFF;
+    return combined;
+}
+
+RefPtr<Utf16StringData> Utf16StringData::from_well_formed_utf8(StringView utf8_string)
+{
+    auto const* input = utf8_string.characters_without_null_termination();
+    auto input_length = utf8_string.length();
+
+    if (utf8_string.is_ascii()) {
+        VERIFY_UTF16_LENGTH(input_length);
+
+        auto string = create_uninitialized(StorageType::Latin1, input_length);
+        TypedTransfer<u8>::copy(string->latin1_data(), utf8_string.bytes().data(), input_length);
+        return string;
+    }
+
+    // NB: simdutf validates the input while converting it, and does not write past the length it computes even if the
+    //     input turns out to be invalid. The conversions that report errors stop near the first one, so callers can
+    //     fall back cheaply.
+    if (could_be_latin1(utf8_string.bytes())) {
+        auto latin1_length = simdutf::latin1_length_from_utf8(input, input_length);
+        VERIFY_UTF16_LENGTH(latin1_length);
+
+        auto string = create_uninitialized(StorageType::Latin1, latin1_length);
+
+        auto result = simdutf::convert_utf8_to_latin1_with_errors(input, input_length, reinterpret_cast<char*>(string->latin1_data()));
+        if (result.error != simdutf::SUCCESS)
+            return nullptr;
+        VERIFY(result.count == latin1_length);
+
+        string->m_header.flags |= ContainsNonAscii;
+        return string;
+    }
+
+    auto code_unit_length = simdutf::utf16_length_from_utf8(input, input_length);
+    VERIFY_UTF16_LENGTH(code_unit_length);
+
+    auto string = create_uninitialized(StorageType::UTF16, code_unit_length);
+
+    auto result = simdutf::convert_utf8_to_utf16_with_errors(input, input_length, string->utf16_data());
+    if (result.error != simdutf::SUCCESS)
+        return nullptr;
+    VERIFY(result.count == code_unit_length);
+
+    return string;
 }
 
 NonnullRefPtr<Utf16StringData> Utf16StringData::from_utf8(StringView utf8_string)
 {
-    RefPtr<Utf16StringData> string;
+    if (auto string = from_well_formed_utf8(utf8_string))
+        return string.release_nonnull();
+    return create_from_code_point_iterable(Utf8View { utf8_string });
+}
 
-    if (utf8_string.is_ascii()) {
-        VERIFY_UTF16_LENGTH(utf8_string.length());
+NonnullRefPtr<Utf16StringData> Utf16StringData::from_utf8_with_replacement_character(StringView utf8_string)
+{
+    if (auto string = from_well_formed_utf8(utf8_string))
+        return string.release_nonnull();
 
-        string = create_uninitialized(StorageType::Latin1, utf8_string.length());
-        TypedTransfer<u8>::copy(string->latin1_data(), utf8_string.bytes().data(), utf8_string.length());
-    } else if (Utf8View view { utf8_string }; view.validate(AllowLonelySurrogates::No)) {
-        if (auto latin1_length = latin1_length_of_valid_utf8(utf8_string.bytes()); latin1_length.has_value()) {
-            VERIFY_UTF16_LENGTH(*latin1_length);
+    auto const* input = utf8_string.characters_without_null_termination();
+    auto input_length = utf8_string.length();
 
-            string = create_uninitialized(StorageType::Latin1, *latin1_length);
-            string->m_header.flags |= ContainsNonAscii;
+    // NB: simdutf replaces each maximal subpart of an ill-formed sequence with U+FFFD, which matches the UTF-8 decoder
+    //     of the Encoding Standard.
+    auto length_result = simdutf::utf16_length_from_utf8_with_replacement(input, input_length);
+    VERIFY_UTF16_LENGTH(length_result.count);
 
-            auto result = simdutf::convert_valid_utf8_to_latin1(utf8_string.characters_without_null_termination(), utf8_string.length(), reinterpret_cast<char*>(string->latin1_data()));
-            VERIFY(result == *latin1_length);
-            return string.release_nonnull();
-        }
+    auto string = create_uninitialized(StorageType::UTF16, length_result.count);
 
-        auto code_unit_length = simdutf::utf16_length_from_utf8(utf8_string.characters_without_null_termination(), utf8_string.length());
-        VERIFY_UTF16_LENGTH(code_unit_length);
+    auto result = simdutf::convert_utf8_to_utf16_with_replacement(input, input_length, string->utf16_data(), length_result);
+    VERIFY(result == length_result.count);
 
-        string = create_uninitialized(StorageType::UTF16, code_unit_length);
-
-        auto result = simdutf::convert_utf8_to_utf16(utf8_string.characters_without_null_termination(), utf8_string.length(), string->utf16_data());
-        VERIFY(result == code_unit_length);
-    } else {
-        string = create_from_code_point_iterable(view);
-    }
-
-    return string.release_nonnull();
+    return string;
 }
 
 NonnullRefPtr<Utf16StringData> Utf16StringData::from_utf16(Utf16View const& utf16_string)
@@ -49515,13 +49617,13 @@ NonnullRefPtr<Utf16StringData> Utf16StringData::from_utf16(Utf16View const& utf1
         TypedTransfer<u8>::copy(string->latin1_data(), utf16_string.latin1_span().data(), utf16_string.length_in_code_units());
         if (!utf16_string.is_ascii())
             string->m_header.flags |= ContainsNonAscii;
-    } else if (fits_in_latin1(utf16_string.utf16_span())) {
+    } else if (auto combined = combined_code_units(utf16_string.utf16_span()); combined <= 0xFF) {
         string = create_uninitialized(StorageType::Latin1, utf16_string.length_in_code_units());
 
         auto* latin1_data = reinterpret_cast<char*>(string->latin1_data());
         auto result = simdutf::convert_valid_utf16_to_latin1(utf16_string.utf16_span().data(), utf16_string.length_in_code_units(), latin1_data);
         VERIFY(result == utf16_string.length_in_code_units());
-        if (!simdutf::validate_ascii(latin1_data, result))
+        if (combined > 0x7F)
             string->m_header.flags |= ContainsNonAscii;
     } else {
         string = create_uninitialized(StorageType::UTF16, utf16_string.length_in_code_units());
@@ -49689,6 +49791,8 @@ public:
     static_assert(ContainsNonAscii == 8);
 
     static NonnullRefPtr<Utf16StringData> from_utf8(StringView);
+    static RefPtr<Utf16StringData> from_well_formed_utf8(StringView);
+    static NonnullRefPtr<Utf16StringData> from_utf8_with_replacement_character(StringView);
     static NonnullRefPtr<Utf16StringData> from_ascii(ReadonlyBytes);
     static NonnullRefPtr<Utf16StringData> from_utf16(Utf16View const&);
     static NonnullRefPtr<Utf16StringData> from_string_builder(Utf16StringBuilder&);
@@ -49932,14 +50036,16 @@ ErrorOr<String> Utf16View::to_utf8(AllowLonelySurrogates allow_lonely_surrogates
     }
 
     if (allow_lonely_surrogates == AllowLonelySurrogates::No) {
-        if (!validate())
-            return Error::from_string_literal("Input was not valid UTF-16");
-
         String result;
         auto utf8_length = simdutf::utf8_length_from_utf16(m_string.utf16, length_in_code_units());
 
         TRY(result.replace_with_new_string(Badge<Utf16View> {}, utf8_length, [&](Bytes buffer) -> ErrorOr<void> {
-            [[maybe_unused]] auto result = simdutf::convert_utf16_to_utf8(m_string.utf16, length_in_code_units(), reinterpret_cast<char*>(buffer.data()));
+            // NB: utf8_length_from_utf16() is a safe buffer size even for invalid input, and the conversion validates
+            //     the input and returns 0 if it is invalid. The empty string returned early above, so 0 cannot mean a
+            //     successful conversion here.
+            auto result = simdutf::convert_utf16_to_utf8(m_string.utf16, length_in_code_units(), reinterpret_cast<char*>(buffer.data()));
+            if (result == 0)
+                return Error::from_string_literal("Input was not valid UTF-16");
             ASSERT(result == buffer.size());
             return {};
         }));
@@ -61477,7 +61583,7 @@ FILE: Base/res/ladybird/about-pages/support.html
                 return [
                     ["libavcodec", libraryVersion(ffmpeg.avcodec_version)],
                     ["libavutil", libraryVersion(ffmpeg.avutil_version)],
-                    ["Matches the bundled struct layouts", yesNo(ffmpeg.shares_bundled_struct_layouts)],
+                    ["Has a Vulkan decoder built for its version", yesNo(ffmpeg.has_vulkan_decoder_for_its_version)],
                 ];
             }
 
@@ -65766,6 +65872,7 @@ dependencies = [
  "cbindgen",
  "cc",
  "flapc",
+ "getrandom 0.4.2",
  "ladybird_allocator",
  "libc",
  "libwasm_jit",
@@ -82560,7 +82667,6 @@ struct Compositing::AsyncScrollingMetadata {
     bool viewport_keeps_horizontal_scrolls;
     bool viewport_keeps_vertical_scrolls;
     double device_pixels_per_css_pixel;
-    Compositing::KeyboardScrollState keyboard_scroll_state;
 }
 
 struct Compositing::DisplayListWindow {
@@ -107964,6 +108070,8 @@ pub trait ReplayPainter {
     fn canvas_matrix(&mut self) -> FloatMatrix4x4;
     fn set_matrix(&mut self, matrix: &FloatMatrix4x4);
     fn would_be_fully_clipped_by_painter(&mut self, rect: IntRect) -> bool;
+    /// The bounds of the area the clips leave the next draw, in the pixels of the canvas.
+    fn device_clip_bounds(&mut self) -> IntRect;
     fn push_clip(&mut self, clip: &ReplayClip);
     fn push_clip_path(&mut self, path: &Path, winding_rule: WindingRule);
     fn push_layer(&mut self, layer: &ReplayLayer);
@@ -108032,17 +108140,21 @@ pub fn scrollbar_shown_by_frame<'a>(
 pub struct ResolvedCompositedContext {
     pub surface: *mut std::ffi::c_void,
     pub content_rect: FloatRect,
+    /// The part of `content_rect` the surface holds, which is less than all of it where the frame was too large to
+    /// raster whole.
+    pub held_content_rect: FloatRect,
 }
 
 /// Where a replay finds the frames of the contexts the list draws.
 pub trait CompositedContexts {
-    /// The frame of the child context as it is drawn into `destination_rect` under `canvas_matrix`, none where the
-    /// context shows nothing there.
+    /// The frame of the child context as it is drawn into `destination_rect` under `canvas_matrix`, where the clips
+    /// leave it `visible_device_rect` of the canvas; none where the context shows nothing there.
     fn resolve(
         &self,
         child_context_id: u64,
         destination_rect: FloatRect,
         canvas_matrix: &FloatMatrix4x4,
+        visible_device_rect: IntRect,
     ) -> Option<ResolvedCompositedContext>;
 }
 
@@ -108055,6 +108167,7 @@ impl CompositedContexts for NoCompositedContexts {
         _child_context_id: u64,
         _destination_rect: FloatRect,
         _canvas_matrix: &FloatMatrix4x4,
+        _visible_device_rect: IntRect,
     ) -> Option<ResolvedCompositedContext> {
         None
     }
@@ -108335,21 +108448,32 @@ fn play_record_resolving_frame_state<'t, Painter: ReplayPainter + ?Sized>(
                 dst_rect.y = dst_rect.y.round();
             }
             let canvas_matrix = painter.canvas_matrix();
-            let Some(resolved_context) =
-                context
-                    .frame
-                    .composited_contexts
-                    .resolve(command.child_context_id.0, dst_rect, &canvas_matrix)
-            else {
+            let visible_device_rect = painter.device_clip_bounds();
+            let Some(resolved_context) = context.frame.composited_contexts.resolve(
+                command.child_context_id.0,
+                dst_rect,
+                &canvas_matrix,
+                visible_device_rect,
+            ) else {
                 return;
             };
-            if resolved_context.surface.is_null() || resolved_context.content_rect.is_empty() {
+            let (content_rect, held_rect) = (resolved_context.content_rect, resolved_context.held_content_rect);
+            if resolved_context.surface.is_null() || content_rect.is_empty() || held_rect.is_empty() {
                 return;
             }
+            // Only the part of the destination that shows the held part of the frame is drawn.
+            let horizontal_scale = dst_rect.width / content_rect.width;
+            let vertical_scale = dst_rect.height / content_rect.height;
+            let held_dst_rect = FloatRect::new(
+                dst_rect.x + (held_rect.x - content_rect.x) * horizontal_scale,
+                dst_rect.y + (held_rect.y - content_rect.y) * vertical_scale,
+                held_rect.width * horizontal_scale,
+                held_rect.height * vertical_scale,
+            );
             painter.draw_composited_context(&CompositedContextDraw {
                 surface: resolved_context.surface,
-                src_rect: resolved_context.content_rect,
-                dst_rect,
+                src_rect: held_rect,
+                dst_rect: held_dst_rect,
                 scaling_mode: command.scaling_mode,
             });
         }
@@ -109809,6 +109933,9 @@ mod tests {
         }
         fn would_be_fully_clipped_by_painter(&mut self, rect: IntRect) -> bool {
             rect.x == self.fully_clipped_x
+        }
+        fn device_clip_bounds(&mut self) -> IntRect {
+            IntRect::new(i32::MIN / 2, i32::MIN / 2, i32::MAX, i32::MAX)
         }
         fn push_clip(&mut self, clip: &ReplayClip) {
             self.events.push(PainterEvent::PushClip(clip.rect));
@@ -121111,6 +121238,7 @@ fn recorded_scroll_tree_of(
 ) -> (
     crate::scrolling::AsyncScrollTree,
     AccumulatedVisualContextTree,
+    crate::scrolling::ScrollStateSnapshot,
     crate::scrolling::WheelRoutingAdmission,
 ) {
     let visual_context_tree = AccumulatedVisualContextTree::from_arc(visual_context_tree.clone());
@@ -121124,7 +121252,7 @@ fn recorded_scroll_tree_of(
     let mut scroll_tree = crate::scrolling::AsyncScrollTree::default();
     scroll_tree.set_state(async_scrolling_state);
     scroll_tree.rebuild_wheel_hit_test_targets(Some(display_list), Some(&visual_context_tree), &snapshot);
-    (scroll_tree, visual_context_tree, admission)
+    (scroll_tree, visual_context_tree, snapshot, admission)
 }
 
 /// Where the first step of a wheel gesture goes, as `Compositing::FirstWheelStepRouteForTesting` holds it.
@@ -121149,7 +121277,7 @@ pub fn recorded_display_list_route_first_wheel_step(
     position: FloatPoint,
     delta_in_css_pixels: FloatPoint,
 ) -> FfiFirstWheelStepRouteForTesting {
-    let (scroll_tree, visual_context_tree, admission) = recorded_scroll_tree_of(
+    let (scroll_tree, visual_context_tree, snapshot, admission) = recorded_scroll_tree_of(
         display_list,
         visual_context_tree,
         snapshot,
@@ -121159,6 +121287,7 @@ pub fn recorded_display_list_route_first_wheel_step(
     let first_step = scroll_tree.route_first_wheel_step(
         admission,
         &visual_context_tree,
+        &snapshot,
         position,
         delta,
         crate::scrolling::NestedContextRegions::LeaveToMainThread,
@@ -121185,8 +121314,9 @@ pub fn recorded_display_list_blocks_wheel_event_at(
     snapshot: crate::scrolling::ScrollStateSnapshot,
     position: FloatPoint,
 ) -> bool {
-    let (scroll_tree, visual_context_tree, _) = recorded_scroll_tree_of(display_list, visual_context_tree, snapshot, 0);
-    scroll_tree.blocks_wheel_event_at_position(&visual_context_tree, position)
+    let (scroll_tree, visual_context_tree, snapshot, _) =
+        recorded_scroll_tree_of(display_list, visual_context_tree, snapshot, 0);
+    scroll_tree.blocks_wheel_event_at_position(&visual_context_tree, &snapshot, position)
 }
 
 FILE: Libraries/LibCompositing/Rust/src/filter_bytes.rs
@@ -122662,6 +122792,7 @@ pub struct FfiRasterPainter {
     pub canvas_matrix: unsafe extern "C" fn(*mut c_void) -> FloatMatrix4x4,
     pub set_matrix: unsafe extern "C" fn(*mut c_void, *const FloatMatrix4x4),
     pub would_be_fully_clipped_by_painter: unsafe extern "C" fn(*mut c_void, IntRect) -> bool,
+    pub device_clip_bounds: unsafe extern "C" fn(*mut c_void) -> IntRect,
     pub push_clip: unsafe extern "C" fn(*mut c_void, *const ReplayClip),
     /// Takes the contours of the path, the identity of the path, and the fill rule.
     pub push_clip_path: unsafe extern "C" fn(*mut c_void, *const PathGeometryData, u64, WindingRule),
@@ -122710,6 +122841,11 @@ impl ReplayPainter for FfiRasterPainter {
     fn would_be_fully_clipped_by_painter(&mut self, rect: IntRect) -> bool {
         // SAFETY: The C++ painter answers synchronously.
         unsafe { (self.would_be_fully_clipped_by_painter)(self.context, rect) }
+    }
+
+    fn device_clip_bounds(&mut self) -> IntRect {
+        // SAFETY: The C++ painter answers synchronously.
+        unsafe { (self.device_clip_bounds)(self.context) }
     }
 
     fn push_clip(&mut self, clip: &ReplayClip) {
@@ -123369,7 +123505,7 @@ pub struct AsyncScrollTree {
     cached_nested_context_wheel_regions: Vec<CachedNestedContextWheelRegion>,
     cached_blocking_wheel_event_targets: Vec<CachedBlockingWheelEventTarget>,
     visual_context_tree_structural_epoch: Option<u64>,
-    scroll_state_snapshot: ScrollStateSnapshot,
+    cached_viewport_rects_are_stale: bool,
 }
 
 struct NestedContextWheelRegionHit<'a> {
@@ -123396,6 +123532,12 @@ impl AsyncScrollTree {
     pub fn has_wheel_hit_test_targets_for(&self, visual_context_tree: &AccumulatedVisualContextTree) -> bool {
         self.visual_context_tree_structural_epoch == Some(visual_context_tree.structural_epoch())
     }
+    pub fn mark_cached_viewport_rects_stale(&mut self) {
+        self.cached_viewport_rects_are_stale = true;
+    }
+    pub fn cached_viewport_rects_are_stale(&self) -> bool {
+        self.cached_viewport_rects_are_stale
+    }
 
     pub fn set_state(&mut self, state: AsyncScrollingState) {
         self.state = state;
@@ -123404,6 +123546,7 @@ impl AsyncScrollTree {
         self.cached_nested_context_wheel_regions.clear();
         self.cached_blocking_wheel_event_targets.clear();
         self.visual_context_tree_structural_epoch = None;
+        self.cached_viewport_rects_are_stale = false;
     }
 
     pub fn state(&self) -> &AsyncScrollingState {
@@ -123456,13 +123599,14 @@ impl AsyncScrollTree {
         &self,
         scroll_node_index: SpatialNodeIndex,
         delta: FloatPoint,
+        scroll_state_snapshot: &ScrollStateSnapshot,
         in_flight_destination_for: &dyn Fn(AsyncScrollNodeStableID) -> Option<FloatPoint>,
     ) -> WheelHitTestResult {
         let can_take_step = |node: &AsyncScrollNode| {
             let in_flight_destination = in_flight_destination_for(node.stable_node_id);
             Self::can_scroll_node_from_offset_by_delta(
                 node,
-                in_flight_destination.unwrap_or(Self::scroll_offset_for_scroll_node(node, &self.scroll_state_snapshot)),
+                in_flight_destination.unwrap_or(Self::scroll_offset_for_scroll_node(node, scroll_state_snapshot)),
                 delta,
             )
         };
@@ -123610,11 +123754,10 @@ impl AsyncScrollTree {
         None
     }
 
-    fn apply_scroll_delta_to_node(
-        &self,
+    fn scroll_offset_of_node_moved_by_delta(
         node: &AsyncScrollNode,
         delta: FloatPoint,
-        scroll_state_snapshot: &mut ScrollStateSnapshot,
+        scroll_state_snapshot: &ScrollStateSnapshot,
     ) -> FloatPoint {
         let old_scroll_offset = Self::scroll_offset_for_scroll_node(node, scroll_state_snapshot);
         let wheel_scrollable_delta = FloatPoint {
@@ -123629,35 +123772,17 @@ impl AsyncScrollTree {
                 0.0
             },
         };
-        let new_scroll_offset = Self::clamp_scroll_offset_to_node(node, old_scroll_offset + wheel_scrollable_delta);
-        if new_scroll_offset == old_scroll_offset {
-            return delta;
-        }
-        scroll_state_snapshot.set_device_offset_for_index(
-            node.scroll_node_index,
-            FloatPoint {
-                x: -new_scroll_offset.x,
-                y: -new_scroll_offset.y,
-            },
-        );
-        let consumed_delta = FloatPoint {
-            x: new_scroll_offset.x - old_scroll_offset.x,
-            y: new_scroll_offset.y - old_scroll_offset.y,
-        };
-        FloatPoint {
-            x: delta.x - consumed_delta.x,
-            y: delta.y - consumed_delta.y,
-        }
+        Self::clamp_scroll_offset_to_node(node, old_scroll_offset + wheel_scrollable_delta)
     }
 
-    pub fn apply_scroll_delta(
-        &mut self,
+    // The scroller a delta moves, of the given one and those it passes the delta on to, and where it moves it.
+    pub fn scroll_destination_for_delta(
+        &self,
         mut scroll_node_index: SpatialNodeIndex,
         delta: FloatPoint,
-        visual_context_tree: &AccumulatedVisualContextTree,
-        scroll_state_snapshot: &mut ScrollStateSnapshot,
+        scroll_state_snapshot: &ScrollStateSnapshot,
         scroll_chaining: ScrollChaining,
-    ) -> Option<AsyncScrollOffset> {
+    ) -> Option<(SpatialNodeIndex, FloatPoint)> {
         // The compositor can advance only the scroll offsets it owns in this snapshot. Hit testing already selects an
         // ancestor when the target cannot scroll in the wheel direction at all, so once a node moves it consumes the event.
         for _ in 0..self.state.scroll_nodes.len() {
@@ -123667,19 +123792,9 @@ impl AsyncScrollTree {
             let Some(node) = self.scroll_node_for_index(scroll_node_index) else {
                 break;
             };
-            let remaining_delta = self.apply_scroll_delta_to_node(node, delta, scroll_state_snapshot);
-            if remaining_delta != delta {
-                resolve_sticky_offsets(visual_context_tree, scroll_state_snapshot);
-                return Some(AsyncScrollOffset {
-                    stable_node_id: node.stable_node_id,
-                    compositor_scroll_offset: Self::scroll_offset_for_scroll_node(node, scroll_state_snapshot),
-                    unadopted_scroll_delta: delta - remaining_delta,
-                    last_relative_scroll_delta: FloatPoint::default(),
-                    visual_viewport_scale: None,
-                    applied_scroll_request_id: 0,
-                    user_input_scroll_count: 0,
-                    context_user_input_scroll_count: 0,
-                });
+            let destination = Self::scroll_offset_of_node_moved_by_delta(node, delta, scroll_state_snapshot);
+            if destination != Self::scroll_offset_for_scroll_node(node, scroll_state_snapshot) {
+                return Some((scroll_node_index, destination));
             }
             if scroll_chaining == ScrollChaining::None {
                 break;
@@ -123748,7 +123863,7 @@ impl AsyncScrollTree {
         self.cached_nested_context_wheel_regions.clear();
         self.cached_blocking_wheel_event_targets.clear();
         self.visual_context_tree_structural_epoch = None;
-        self.scroll_state_snapshot = scroll_state_snapshot.clone();
+        self.cached_viewport_rects_are_stale = false;
         let (Some(display_list), Some(visual_context_tree)) = (display_list, visual_context_tree) else {
             return;
         };
@@ -123915,8 +124030,10 @@ impl AsyncScrollTree {
     pub fn blocks_wheel_event_at_position(
         &self,
         visual_context_tree: &AccumulatedVisualContextTree,
+        scroll_state_snapshot: &ScrollStateSnapshot,
         position: FloatPoint,
     ) -> bool {
+        assert!(!self.cached_viewport_rects_are_stale);
         if self.state.has_blocking_wheel_event_region_covering_viewport
             || !self.has_wheel_hit_test_targets_for(visual_context_tree)
         {
@@ -123932,7 +124049,7 @@ impl AsyncScrollTree {
             let position_in_context = visual_context_tree.transform_point_for_hit_test(
                 target.context,
                 position,
-                &self.scroll_state_snapshot,
+                scroll_state_snapshot,
                 ClipBehavior::Respect,
             );
             if position_in_context.is_some_and(|point| target.rect.contains_point(point)) {
@@ -123945,8 +124062,10 @@ impl AsyncScrollTree {
     pub fn main_thread_wheel_event_region_contains(
         &self,
         visual_context_tree: &AccumulatedVisualContextTree,
+        scroll_state_snapshot: &ScrollStateSnapshot,
         position: FloatPoint,
     ) -> bool {
+        assert!(!self.cached_viewport_rects_are_stale);
         for target in &self.cached_main_thread_wheel_event_targets {
             if target.viewport_rect.is_some_and(|rect| !rect.contains_point(position)) {
                 continue;
@@ -123957,7 +124076,7 @@ impl AsyncScrollTree {
             let position_in_context = visual_context_tree.transform_point_for_hit_test(
                 target.context,
                 position,
-                &self.scroll_state_snapshot,
+                scroll_state_snapshot,
                 ClipBehavior::Respect,
             );
             if position_in_context.is_some_and(|point| target.rect.contains_point(point)) {
@@ -123970,8 +124089,10 @@ impl AsyncScrollTree {
     fn topmost_nested_context_wheel_region_at(
         &self,
         visual_context_tree: &AccumulatedVisualContextTree,
+        scroll_state_snapshot: &ScrollStateSnapshot,
         position: FloatPoint,
     ) -> Option<NestedContextWheelRegionHit<'_>> {
+        assert!(!self.cached_viewport_rects_are_stale);
         for cached_region in self.cached_nested_context_wheel_regions.iter().rev() {
             let region = &cached_region.region;
             if cached_region
@@ -123986,7 +124107,7 @@ impl AsyncScrollTree {
             let position_in_context = visual_context_tree.transform_point_for_hit_test(
                 region.context,
                 position,
-                &self.scroll_state_snapshot,
+                scroll_state_snapshot,
                 ClipBehavior::Respect,
             );
             if let Some(point) = position_in_context
@@ -124026,14 +124147,19 @@ impl AsyncScrollTree {
     pub fn nested_context_at(
         &self,
         visual_context_tree: &AccumulatedVisualContextTree,
+        scroll_state_snapshot: &ScrollStateSnapshot,
         position: FloatPoint,
     ) -> Option<NestedContextHit> {
         if self.visual_context_tree_structural_epoch != Some(visual_context_tree.structural_epoch()) {
             return None;
         }
-        let hit = self.topmost_nested_context_wheel_region_at(visual_context_tree, position)?;
-        if self.is_covered_by_hit_test_target_painted_after(hit.region.paint_order_index, visual_context_tree, position)
-        {
+        let hit = self.topmost_nested_context_wheel_region_at(visual_context_tree, scroll_state_snapshot, position)?;
+        if self.is_covered_by_hit_test_target_painted_after(
+            hit.region.paint_order_index,
+            visual_context_tree,
+            scroll_state_snapshot,
+            position,
+        ) {
             return None;
         }
         Some(nested_context_hit_in_region(hit.region, hit.position_in_context))
@@ -124043,15 +124169,16 @@ impl AsyncScrollTree {
     pub fn nested_context_for_wheel_at(
         &self,
         visual_context_tree: &AccumulatedVisualContextTree,
+        scroll_state_snapshot: &ScrollStateSnapshot,
         position: FloatPoint,
     ) -> Option<NestedContextHit> {
         if self.visual_context_tree_structural_epoch != Some(visual_context_tree.structural_epoch()) {
             return None;
         }
-        if self.main_thread_wheel_event_region_contains(visual_context_tree, position) {
+        if self.main_thread_wheel_event_region_contains(visual_context_tree, scroll_state_snapshot, position) {
             return None;
         }
-        self.nested_context_at(visual_context_tree, position)
+        self.nested_context_at(visual_context_tree, scroll_state_snapshot, position)
     }
 
     // Where the position lands in the content of the nested context, even outside of that content and its clips, as
@@ -124060,6 +124187,7 @@ impl AsyncScrollTree {
         &self,
         child_context_id: CompositorContextId,
         visual_context_tree: &AccumulatedVisualContextTree,
+        scroll_state_snapshot: &ScrollStateSnapshot,
         position: FloatPoint,
     ) -> Option<NestedContextHit> {
         if self.visual_context_tree_structural_epoch != Some(visual_context_tree.structural_epoch()) {
@@ -124076,7 +124204,7 @@ impl AsyncScrollTree {
             let position_in_context = visual_context_tree.transform_point_for_hit_test(
                 region.context,
                 position,
-                &self.scroll_state_snapshot,
+                scroll_state_snapshot,
                 ClipBehavior::Ignore,
             )?;
             return Some(nested_context_hit_in_region(region, position_in_context));
@@ -124091,6 +124219,7 @@ impl AsyncScrollTree {
         position_in_nested_context: FloatPoint,
         nested_context_viewport_size: FloatSize,
         visual_context_tree: &AccumulatedVisualContextTree,
+        scroll_state_snapshot: &ScrollStateSnapshot,
     ) -> Option<FloatPoint> {
         if self.visual_context_tree_structural_epoch != Some(visual_context_tree.structural_epoch())
             || nested_context_viewport_size.is_empty()
@@ -124118,7 +124247,7 @@ impl AsyncScrollTree {
             let result = visual_context_tree.transform_rect_to_viewport(
                 region.context.spatial,
                 point_in_context,
-                &self.scroll_state_snapshot,
+                scroll_state_snapshot,
                 IncludeVisualViewportTransform::Yes,
             );
             return Some(FloatPoint {
@@ -124129,15 +124258,18 @@ impl AsyncScrollTree {
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn hit_test_scroll_node_for_wheel(
         &self,
         visual_context_tree: &AccumulatedVisualContextTree,
+        scroll_state_snapshot: &ScrollStateSnapshot,
         position: FloatPoint,
         delta: FloatPoint,
         in_flight_destination_for: &dyn Fn(AsyncScrollNodeStableID) -> Option<FloatPoint>,
         wheel_step_dispatch: WheelStepDispatch,
         nested_context_regions: NestedContextRegions,
     ) -> WheelHitTestResult {
+        assert!(!self.cached_viewport_rects_are_stale);
         if self.visual_context_tree_structural_epoch != Some(visual_context_tree.structural_epoch()) {
             return WheelHitTestResult {
                 outcome: WheelHitTestOutcome::HitTestTargetsOfAnotherVisualContextTree,
@@ -124153,7 +124285,9 @@ impl AsyncScrollTree {
                 ..Default::default()
             };
         }
-        if page_has_yet_to_see_the_step && self.main_thread_wheel_event_region_contains(visual_context_tree, position) {
+        if page_has_yet_to_see_the_step
+            && self.main_thread_wheel_event_region_contains(visual_context_tree, scroll_state_snapshot, position)
+        {
             return WheelHitTestResult {
                 outcome: WheelHitTestOutcome::BlockedByMainThreadRegion,
                 ..Default::default()
@@ -124161,7 +124295,7 @@ impl AsyncScrollTree {
         }
         if nested_context_regions == NestedContextRegions::LeaveToMainThread
             && self
-                .topmost_nested_context_wheel_region_at(visual_context_tree, position)
+                .topmost_nested_context_wheel_region_at(visual_context_tree, scroll_state_snapshot, position)
                 .is_some()
         {
             return WheelHitTestResult {
@@ -124169,7 +124303,9 @@ impl AsyncScrollTree {
                 ..Default::default()
             };
         }
-        if page_has_yet_to_see_the_step && self.blocks_wheel_event_at_position(visual_context_tree, position) {
+        if page_has_yet_to_see_the_step
+            && self.blocks_wheel_event_at_position(visual_context_tree, scroll_state_snapshot, position)
+        {
             return WheelHitTestResult {
                 outcome: WheelHitTestOutcome::BlockedByWheelEventRegion,
                 ..Default::default()
@@ -124185,7 +124321,7 @@ impl AsyncScrollTree {
             let position_in_context = visual_context_tree.transform_point_for_hit_test(
                 target.context,
                 position,
-                &self.scroll_state_snapshot,
+                scroll_state_snapshot,
                 ClipBehavior::Respect,
             );
             if !position_in_context.is_some_and(|point| wheel_hit_test_target_contains_point(target, point)) {
@@ -124197,7 +124333,12 @@ impl AsyncScrollTree {
                     ..Default::default()
                 };
             };
-            return self.hit_test_result_for_scroll_node(index, delta, in_flight_destination_for);
+            return self.hit_test_result_for_scroll_node(
+                index,
+                delta,
+                scroll_state_snapshot,
+                in_flight_destination_for,
+            );
         }
         let Some(index_of_viewport_scroll_node) = self.viewport_scroll_node_index() else {
             return WheelHitTestResult {
@@ -124212,7 +124353,12 @@ impl AsyncScrollTree {
                 ..Default::default()
             };
         }
-        self.hit_test_result_for_scroll_node(index_of_viewport_scroll_node, delta, in_flight_destination_for)
+        self.hit_test_result_for_scroll_node(
+            index_of_viewport_scroll_node,
+            delta,
+            scroll_state_snapshot,
+            in_flight_destination_for,
+        )
     }
 
     // Leaves out what only a compositor holding a gesture decides: whether a step continues a latched gesture, which
@@ -124221,6 +124367,7 @@ impl AsyncScrollTree {
         &self,
         admission: WheelRoutingAdmission,
         visual_context_tree: &AccumulatedVisualContextTree,
+        scroll_state_snapshot: &ScrollStateSnapshot,
         position: FloatPoint,
         delta: FloatPoint,
         nested_context_regions: NestedContextRegions,
@@ -124233,6 +124380,7 @@ impl AsyncScrollTree {
         }
         let scroll_target = self.hit_test_scroll_node_for_wheel(
             visual_context_tree,
+            scroll_state_snapshot,
             position,
             delta,
             &|_| None,
@@ -124257,8 +124405,10 @@ impl AsyncScrollTree {
         &self,
         paint_order_index: u32,
         visual_context_tree: &AccumulatedVisualContextTree,
+        scroll_state_snapshot: &ScrollStateSnapshot,
         position: FloatPoint,
     ) -> bool {
+        assert!(!self.cached_viewport_rects_are_stale);
         if self.visual_context_tree_structural_epoch != Some(visual_context_tree.structural_epoch()) {
             return true;
         }
@@ -124275,7 +124425,7 @@ impl AsyncScrollTree {
             let position_in_context = visual_context_tree.transform_point_for_hit_test(
                 target.context,
                 position,
-                &self.scroll_state_snapshot,
+                scroll_state_snapshot,
                 ClipBehavior::Respect,
             );
             if position_in_context.is_some_and(|point| wheel_hit_test_target_contains_point(target, point)) {
@@ -124326,20 +124476,16 @@ impl AsyncScrollTree {
     }
 
     pub fn set_scroll_offset(
-        &mut self,
+        &self,
         scroll_node_index: SpatialNodeIndex,
         scroll_offset: FloatPoint,
-        visual_context_tree: &AccumulatedVisualContextTree,
         scroll_state_snapshot: &mut ScrollStateSnapshot,
     ) -> Option<FloatPoint> {
         let node = self.scroll_node_for_index(scroll_node_index)?;
-        let new_scroll_offset =
-            self.set_scroll_offset_leaving_sticky_offsets_unresolved(node, scroll_offset, scroll_state_snapshot);
-        resolve_sticky_offsets(visual_context_tree, scroll_state_snapshot);
-        Some(new_scroll_offset)
+        Some(self.set_scroll_offset_of_node(node, scroll_offset, scroll_state_snapshot))
     }
 
-    pub fn set_scroll_offset_leaving_sticky_offsets_unresolved(
+    pub fn set_scroll_offset_of_node(
         &self,
         node: &AsyncScrollNode,
         scroll_offset: FloatPoint,
@@ -124390,14 +124536,10 @@ impl AsyncScrollOffset {
         self.applied_scroll_request_id = later.applied_scroll_request_id;
         // How many times the compositor had scrolled the box for user input of its own when it reported this.
         self.user_input_scroll_count = later.user_input_scroll_count;
-        // How many times the compositor had scrolled any box of the context for user input of its own when it reported
-        // this. Not every such scroll is reported, as one the next input turns back moves no box.
-        self.context_user_input_scroll_count = later.context_user_input_scroll_count;
         // The scale the visual viewport was zoomed to, which only its scroll node reports.
         if later.visual_viewport_scale.is_some() {
             self.visual_viewport_scale = later.visual_viewport_scale;
         }
-        self.unadopted_scroll_delta.translate_by(later.unadopted_scroll_delta);
         // The most recent nonzero delta of a relative scroll in each axis, such as a wheel or panning scroll. Absolute
         // scrolls, such as dragging a scrollbar thumb, leave it as it is.
         if later.last_relative_scroll_delta.x != 0.0 {
@@ -126651,14 +126793,6 @@ impl ScrollStateSnapshot {
             self.device_offsets.resize(index + 1, FloatPoint::default());
         }
         self.device_offsets[index] = offset;
-    }
-
-    // Replaces every offset with a freshly derived dense array, keeping the node count bound.
-    pub fn assign_device_offsets(&mut self, offsets: &[FloatPoint]) {
-        self.world_transforms_cache.clear();
-        self.device_offsets.clear();
-        self.device_offsets
-            .extend_from_slice(&offsets[..offsets.len().min(self.node_count)]);
     }
 
     // Bind the snapshot to the authoritative node count from the AccumulatedVisualContextTree that owns these nodes.
@@ -137033,7 +137167,6 @@ using AsyncScrollOperationID = u64;
 struct AsyncScrollOffset {
     Web::AsyncScrollNodeStableID stable_node_id;
     Gfx::FloatPoint compositor_scroll_offset;
-    Gfx::FloatPoint unadopted_scroll_delta;
     // The most recent nonzero delta of a relative scroll in each axis, such as a wheel or panning scroll. Absolute
     // scrolls, such as dragging a scrollbar thumb, leave it as it is.
     Gfx::FloatPoint last_relative_scroll_delta;
@@ -137043,19 +137176,14 @@ struct AsyncScrollOffset {
     u64 applied_scroll_request_id { 0 };
     // How many times the compositor had scrolled the box for user input of its own when it reported this.
     u64 user_input_scroll_count { 0 };
-    // How many times the compositor had scrolled any box of the context for user input of its own when it reported
-    // this. Not every such scroll is reported, as one the next input turns back moves no box.
-    u64 context_user_input_scroll_count { 0 };
 
     void merge_later_scroll(AsyncScrollOffset const& later)
     {
         compositor_scroll_offset = later.compositor_scroll_offset;
         applied_scroll_request_id = later.applied_scroll_request_id;
         user_input_scroll_count = later.user_input_scroll_count;
-        context_user_input_scroll_count = later.context_user_input_scroll_count;
         if (later.visual_viewport_scale.has_value())
             visual_viewport_scale = later.visual_viewport_scale;
-        unadopted_scroll_delta.translate_by(later.unadopted_scroll_delta);
         if (later.last_relative_scroll_delta.x() != 0)
             last_relative_scroll_delta.set_x(later.last_relative_scroll_delta.x());
         if (later.last_relative_scroll_delta.y() != 0)
@@ -137351,7 +137479,6 @@ struct StartedUserScroll {
 // actions on WebContent. The epoch also binds incremental updates to the tree whose target they describe.
 struct KeyboardScrollState {
     u64 generation { 0 };
-    u64 visual_context_tree_structural_epoch { 0 };
     Optional<Web::AsyncScrollNodeStableID> target;
     float page_scroll_distance { 0 };
     float arrow_scroll_distance { 0 };
@@ -137366,8 +137493,7 @@ struct AppliedScrollRequest {
 
 struct PendingAsyncScrollUpdates {
     Optional<Web::UniqueNodeID> document_id;
-    // The publication these updates were handed out in, per context and increasing. A scroll state
-    // snapshot WebContent produces after adopting them carries it back.
+    // The publication these updates were handed out in, per context and increasing.
     u64 sequence { 0 };
     Vector<AsyncScrollOffset> scroll_offsets;
     Vector<AsyncScrollOperationID> completed_operation_ids;
@@ -137379,6 +137505,9 @@ struct PendingAsyncScrollUpdates {
     Vector<Web::AsyncScrollNodeStableID> boxes_in_user_scroll_gesture;
     Vector<Web::AsyncScrollNodeStableID> boxes_whose_user_scroll_gesture_ended;
     Optional<Web::AsyncScrollNodeStableID> wheel_latched_scroller;
+    // How many times the compositor had scrolled any box of the context for user input of its own when it published
+    // these.
+    u64 context_user_input_scroll_count { 0 };
 };
 
 // What the compositor did with a wheel event that WebContent's main thread passed on to it, as the compositor does with
@@ -137703,7 +137832,6 @@ enum Compositing::WebGL::WebGLVersion : u8 {
 [ExistingCpp]
 struct Compositing::KeyboardScrollState {
     u64 generation;
-    u64 visual_context_tree_structural_epoch;
     Optional<Web::AsyncScrollNodeStableID> target;
     float page_scroll_distance;
     float arrow_scroll_distance;
@@ -137713,12 +137841,10 @@ struct Compositing::KeyboardScrollState {
 struct Compositing::AsyncScrollOffset {
     Web::AsyncScrollNodeStableID stable_node_id;
     Gfx::FloatPoint compositor_scroll_offset;
-    Gfx::FloatPoint unadopted_scroll_delta;
     Gfx::FloatPoint last_relative_scroll_delta;
     Optional<float> visual_viewport_scale;
     u64 applied_scroll_request_id;
     u64 user_input_scroll_count;
-    u64 context_user_input_scroll_count;
 }
 
 [ExistingCpp, RustDerive=Copy+Eq+Hash+Default]
@@ -137776,6 +137902,7 @@ struct Compositing::PendingAsyncScrollUpdates {
     Vector<Web::AsyncScrollNodeStableID> boxes_in_user_scroll_gesture;
     Vector<Web::AsyncScrollNodeStableID> boxes_whose_user_scroll_gesture_ended;
     Optional<Web::AsyncScrollNodeStableID> wheel_latched_scroller;
+    u64 context_user_input_scroll_count;
 }
 
 [ExistingCpp]
@@ -141039,6 +141166,99 @@ FILE: Libraries/LibCompositing/WebGL/GLFunctions.json
         "category": "sync"
     },
     {
+        "name": "glGetUniformfvRobustANGLE",
+        "return": "void",
+        "args": [
+            {
+                "type": "GLuint",
+                "name": "program",
+                "object": true
+            },
+            {
+                "type": "GLint",
+                "name": "location"
+            },
+            {
+                "type": "GLsizei",
+                "name": "bufSize"
+            },
+            {
+                "type": "GLsizei*",
+                "name": "length",
+                "out": true
+            },
+            {
+                "type": "GLfloat*",
+                "name": "params",
+                "out": true,
+                "payload": "bufSize"
+            }
+        ],
+        "category": "sync"
+    },
+    {
+        "name": "glGetUniformivRobustANGLE",
+        "return": "void",
+        "args": [
+            {
+                "type": "GLuint",
+                "name": "program",
+                "object": true
+            },
+            {
+                "type": "GLint",
+                "name": "location"
+            },
+            {
+                "type": "GLsizei",
+                "name": "bufSize"
+            },
+            {
+                "type": "GLsizei*",
+                "name": "length",
+                "out": true
+            },
+            {
+                "type": "GLint*",
+                "name": "params",
+                "out": true,
+                "payload": "bufSize"
+            }
+        ],
+        "category": "sync"
+    },
+    {
+        "name": "glGetUniformuivRobustANGLE",
+        "return": "void",
+        "args": [
+            {
+                "type": "GLuint",
+                "name": "program",
+                "object": true
+            },
+            {
+                "type": "GLint",
+                "name": "location"
+            },
+            {
+                "type": "GLsizei",
+                "name": "bufSize"
+            },
+            {
+                "type": "GLsizei*",
+                "name": "length",
+                "out": true
+            },
+            {
+                "type": "GLuint*",
+                "name": "params",
+                "out": true,
+                "payload": "bufSize"
+            }
+        ],
+        "category": "sync"
+    },
+    {
         "name": "glGetUniformBlockIndex",
         "return": "GLuint",
         "args": [
@@ -141158,6 +141378,66 @@ FILE: Libraries/LibCompositing/WebGL/GLFunctions.json
                 "name": "pointer"
             }
         ]
+    },
+    {
+        "name": "glGetVertexAttribIivRobustANGLE",
+        "return": "void",
+        "args": [
+            {
+                "type": "GLuint",
+                "name": "index"
+            },
+            {
+                "type": "GLenum",
+                "name": "pname"
+            },
+            {
+                "type": "GLsizei",
+                "name": "bufSize"
+            },
+            {
+                "type": "GLsizei*",
+                "name": "length",
+                "out": true
+            },
+            {
+                "type": "GLint*",
+                "name": "params",
+                "out": true,
+                "payload": "bufSize * sizeof(GLint)"
+            }
+        ],
+        "category": "sync"
+    },
+    {
+        "name": "glGetVertexAttribIuivRobustANGLE",
+        "return": "void",
+        "args": [
+            {
+                "type": "GLuint",
+                "name": "index"
+            },
+            {
+                "type": "GLenum",
+                "name": "pname"
+            },
+            {
+                "type": "GLsizei",
+                "name": "bufSize"
+            },
+            {
+                "type": "GLsizei*",
+                "name": "length",
+                "out": true
+            },
+            {
+                "type": "GLuint*",
+                "name": "params",
+                "out": true,
+                "payload": "bufSize * sizeof(GLuint)"
+            }
+        ],
+        "category": "sync"
     },
     {
         "name": "glGetVertexAttribfvRobustANGLE",
@@ -184457,13 +184737,16 @@ public:
         // Resolves a name to the addresses of one family. It runs on a thread pool worker.
         Function<ErrorOr<Vector<Variant<IPv4Address, IPv6Address>>>(ByteString const&, Core::Socket::AddressFamily)> resolve_host;
         Function<bool()> is_ipv6_globally_reachable;
+        Optional<AK::Duration> resolution_timeout;
     };
 
     using SystemResolution = ErrorOr<Vector<Variant<IPv4Address, IPv6Address>>>;
 
     // Resolves a name to the addresses of one family somewhere else, such as in another process, and calls back on the
     // thread that asked, once it has them.
-    using RemoteSystemResolver = Function<void(ByteString const&, Core::Socket::AddressFamily, Function<void(SystemResolution)>)>;
+    // Forgets a lookup handed to the remote resolver, whose answer, if any comes, is then dropped.
+    using CancelRemoteSystemResolution = Function<void()>;
+    using RemoteSystemResolver = Function<CancelRemoteSystemResolution(ByteString const&, Core::Socket::AddressFamily, Function<void(SystemResolution)>)>;
 
     // An empty result means no server is configured and the system resolver should be used instead.
     Resolver(Function<ErrorOr<Optional<SocketResult>>()> create_socket, SystemResolverForTesting system_resolver_for_testing = {})
@@ -184786,10 +185069,52 @@ public:
 
             lookup_path = "system-resolver-bg"sv;
 
+            auto timeout = m_system_resolver_for_testing.resolution_timeout.value_or(SYSTEM_RESOLVER_TIMEOUT);
+            our_state->deadline_timer = Core::Timer::create_single_shot(timeout,
+                [this, shared = m_shared_with_workers, name, pending_key, weak_state = our_state->make_weak_ptr()] {
+                    if (!shared->resolver_is_alive.load())
+                        return;
+                    auto state = weak_state.strong_ref();
+                    if (!state)
+                        return;
+                    auto removed = m_pending_system_resolutions.with_write_locked([&](auto& pending) {
+                        auto it = pending.find(pending_key);
+                        if (it == pending.end() || it->value.ptr() != state.ptr())
+                            return false;
+                        pending.remove(it);
+                        return true;
+                    });
+                    if (!removed)
+                        return;
+                    state->abandoned.store(true);
+                    if (state->grace_timer)
+                        state->grace_timer->stop();
+                    // The remote resolver forgets the halves still out, and with them the callbacks holding this state.
+                    auto cancel_remote_resolutions = move(state->cancel_remote_resolutions);
+                    for (auto& cancel : cancel_remote_resolutions) {
+                        if (cancel)
+                            cancel();
+                    }
+                    dbgln_if(REQUESTSERVER_WIRE_DEBUG, "LibDNS wire-dns: lookup({}) path=system-resolver-timeout total={} ms",
+                        name, (MonotonicTime::now() - state->dispatched_at).to_milliseconds());
+                    if (state->promise_resolved)
+                        return;
+                    // Addresses that one side found still serve the lookup, even though the other side never answered.
+                    if (!state->result->records().is_empty()) {
+                        try_finalize_pending_system_resolution(*state);
+                        return;
+                    }
+                    state->promise_resolved = true;
+                    auto promises = move(state->waiting_promises);
+                    for (auto& waiter : promises)
+                        waiter->reject(Error::from_string_literal("System DNS resolution timed out"));
+                });
+            our_state->deadline_timer->start();
+
             auto& main_thread_event_loop = Core::EventLoop::current();
 
             auto ask_remote_resolver = [&, this](Core::Socket::AddressFamily family) {
-                m_remote_system_resolver(name, family, [this, shared = m_shared_with_workers, name, pending_key, state = our_state, family](SystemResolution record_or_error) mutable {
+                our_state->cancel_remote_resolutions.append(m_remote_system_resolver(name, family, [this, shared = m_shared_with_workers, name, pending_key, state = our_state, family](SystemResolution record_or_error) mutable {
                     if (!shared->resolver_is_alive.load())
                         return;
                     PendingSystemResolution::SideTiming timing {
@@ -184797,7 +185122,7 @@ public:
                         .work_ms = (MonotonicTime::now() - state->dispatched_at).to_milliseconds(),
                     };
                     handle_system_resolver_completion(name, pending_key, *state, family, move(record_or_error), timing);
-                });
+                }));
             };
 
             auto submit_worker = [&, this](Core::Socket::AddressFamily family) {
@@ -184805,9 +185130,13 @@ public:
                     ask_remote_resolver(family);
                     return;
                 }
-                Threading::ThreadPool::the().submit(
+                Threading::ThreadPool::for_name_resolution().submit(
                     [this, shared = m_shared_with_workers, name, pending_key, state = our_state, family,
                         &main_thread_event_loop]() mutable {
+                        // A lookup given up on while this waited in the queue has no one left to answer, so it isn't
+                        // made, and the worker goes on to the next one.
+                        if (state->abandoned.load())
+                            return;
                         auto worker_started_at = MonotonicTime::now();
                         auto record_or_error = shared->resolve_host_for_testing
                             ? shared->resolve_host_for_testing(name, family)
@@ -185154,6 +185483,8 @@ private:
         return m_ipv6_is_globally_reachable;
     }
 
+    static constexpr auto SYSTEM_RESOLVER_TIMEOUT = AK::Duration::from_seconds(15);
+
     // Per-name state for an in-flight system-resolver lookup. We split the
     // single AF_UNSPEC `getaddrinfo` call into two parallel calls (AF_INET +
     // AF_INET6) so that buggy stub resolvers (notably systemd-resolved under
@@ -185188,7 +185519,11 @@ private:
         Optional<SideTiming> a;
         Optional<SideTiming> aaaa;
         bool promise_resolved { false };
+        // Set on the main thread once the deadline gives up on this resolution, and read by the workers.
+        Atomic<bool> abandoned { false };
         RefPtr<Core::Timer> grace_timer;
+        RefPtr<Core::Timer> deadline_timer;
+        Vector<CancelRemoteSystemResolution> cancel_remote_resolutions;
 
         explicit PendingSystemResolution(NonnullRefPtr<LookupResult> r)
             : result(move(r))
@@ -185227,6 +185562,13 @@ private:
         ErrorOr<Vector<Variant<IPv4Address, IPv6Address>>> record_or_error,
         PendingSystemResolution::SideTiming timing)
     {
+        auto is_current = m_pending_system_resolutions.with_read_locked([&](auto const& pending) {
+            auto it = pending.find(pending_key);
+            return it != pending.end() && it->value.ptr() == &state;
+        });
+        if (!is_current)
+            return;
+
         (family == Core::Socket::AddressFamily::IPv4Only ? state.a : state.aaaa) = timing;
 
         // Merge this side's records into the (shared, main-thread-only) LookupResult. Late-arriving records still
@@ -185250,6 +185592,7 @@ private:
         bool both_completed = state.a.has_value() && state.aaaa.has_value();
 
         if (both_completed) {
+            state.deadline_timer->stop();
             state.result->finished_request();
             m_cache.with_write_locked([&](auto& cache) {
                 make_room_in_cache(cache);
@@ -477216,7 +477559,7 @@ pub use crate::runtime::regexp_object::{RegExpObject, regexp_create};
 pub use crate::runtime::set::Set;
 pub use crate::runtime::set_iterator::SetIterator;
 pub use crate::runtime::shared_backing_store::{
-    SharedBackingStore, SharedStoreLifeline, SharedStorePin, duplicate_lifeline_from_raw_descriptor,
+    SharedBackingStore, SharedByMessage, SharedStoreLifeline, SharedStorePin, duplicate_lifeline_from_raw_descriptor,
     lifeline_from_raw_descriptor, lifeline_into_raw_descriptor, release_stores_of_lost_messages,
 };
 pub use crate::runtime::string_object::StringObject;
@@ -641735,6 +642078,7 @@ FILE: Libraries/LibJS/Rust/src/runtime/shared_backing_store.rs
 //! as it does for any descriptor in flight, so it does not matter whether the message is delivered to one receiver, to
 //! many, to a process that has no use for it, or to nobody.
 
+use core::any::Any;
 use core::ffi::c_int;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
@@ -641860,10 +642204,13 @@ pub unsafe fn duplicate_lifeline_from_raw_descriptor(descriptor: c_int) -> std::
     }
 }
 
+/// Something that a message names, which the agents of the process share: a store, or the shared memory of an embedder.
+pub type SharedByMessage = Arc<dyn Any + Send + Sync>;
+
 /// What keeps the stores that a message names.
 pub enum SharedStorePin {
     /// For a message in memory of this process.
-    Counted(Vec<Arc<SharedBackingStore>>),
+    Counted(Vec<SharedByMessage>),
     /// For a message that has been through a socket, or is about to go through one.
     Lifeline(SharedStoreLifeline),
 }
@@ -641902,7 +642249,7 @@ struct PinnedStores {
     #[cfg_attr(windows, allow(dead_code))]
     write_end: std::io::PipeWriter,
     /// NB: Only dropped for what it keeps alive.
-    _stores: Vec<Arc<SharedBackingStore>>,
+    _stores: Vec<SharedByMessage>,
 }
 
 fn pinned_stores() -> std::sync::MutexGuard<'static, Vec<PinnedStores>> {
@@ -641952,7 +642299,7 @@ pub fn release_stores_of_lost_messages() {
 }
 
 /// A new lifeline that keeps `stores` for as long as it, or a duplicate of it, is open anywhere.
-fn pin_stores_for_a_message(stores: Vec<Arc<SharedBackingStore>>) -> std::io::Result<SharedStoreLifeline> {
+fn pin_stores_for_a_message(stores: Vec<SharedByMessage>) -> std::io::Result<SharedStoreLifeline> {
     release_stores_of_lost_messages();
     let (read_end, write_end) = std::io::pipe()?;
     pinned_stores().push(PinnedStores {
@@ -669401,260 +669748,3 @@ impl ZonedDateTimePrototype {
     fn days_in_year_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
         // 1. Let zonedDateTime be the this value.
         // 2. Perform ? RequireInternalSlot(zonedDateTime, [[InitializedTemporalZonedDateTime]]).
-        let zoned_date_time = typed_this_zoned_date_time(vm)?;
-
-        // 3. Let isoDateTime be GetISODateTimeFor(zonedDateTime.[[TimeZone]], zonedDateTime.[[EpochNanoseconds]]).
-        let iso_date_time = iso_date_time_of(&zoned_date_time);
-
-        // 4. Return 𝔽(CalendarISOToDate(zonedDateTime.[[Calendar]], isoDateTime.[[ISODate]]).[[DaysInYear]]).
-        Ok(Value::from_i32(i32::from(
-            calendar_date_of(&zoned_date_time, &iso_date_time).days_in_year,
-        )))
-    }
-
-    // 6.3.27 get Temporal.ZonedDateTime.prototype.monthsInYear, https://tc39.es/proposal-temporal/#sec-get-temporal.zoneddatetime.prototype.monthsinyear
-    fn months_in_year_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let zonedDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(zonedDateTime, [[InitializedTemporalZonedDateTime]]).
-        let zoned_date_time = typed_this_zoned_date_time(vm)?;
-
-        // 3. Let isoDateTime be GetISODateTimeFor(zonedDateTime.[[TimeZone]], zonedDateTime.[[EpochNanoseconds]]).
-        let iso_date_time = iso_date_time_of(&zoned_date_time);
-
-        // 4. Return 𝔽(CalendarISOToDate(zonedDateTime.[[Calendar]], isoDateTime.[[ISODate]]).[[MonthsInYear]]).
-        Ok(Value::from_i32(i32::from(
-            calendar_date_of(&zoned_date_time, &iso_date_time).months_in_year,
-        )))
-    }
-
-    // 6.3.28 get Temporal.ZonedDateTime.prototype.inLeapYear, https://tc39.es/proposal-temporal/#sec-get-temporal.zoneddatetime.prototype.inleapyear
-    fn in_leap_year_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let zonedDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(zonedDateTime, [[InitializedTemporalZonedDateTime]]).
-        let zoned_date_time = typed_this_zoned_date_time(vm)?;
-
-        // 3. Let isoDateTime be GetISODateTimeFor(zonedDateTime.[[TimeZone]], zonedDateTime.[[EpochNanoseconds]]).
-        let iso_date_time = iso_date_time_of(&zoned_date_time);
-
-        // 4. Return CalendarISOToDate(zonedDateTime.[[Calendar]], isoDateTime.[[ISODate]]).[[InLeapYear]].
-        Ok(Value::from_bool(
-            calendar_date_of(&zoned_date_time, &iso_date_time).in_leap_year,
-        ))
-    }
-
-    // 6.3.29 get Temporal.ZonedDateTime.prototype.offsetNanoseconds, https://tc39.es/proposal-temporal/#sec-get-temporal.zoneddatetime.prototype.offsetnanoseconds
-    fn offset_nanoseconds_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let zonedDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(zonedDateTime, [[InitializedTemporalZonedDateTime]]).
-        let zoned_date_time = typed_this_zoned_date_time(vm)?;
-
-        // 3. Return 𝔽(GetOffsetNanosecondsFor(zonedDateTime.[[TimeZone]], zonedDateTime.[[EpochNanoseconds]])).
-        let time_zone = zoned_date_time.time_zone();
-        let offset_nanoseconds = get_offset_nanoseconds_for(
-            Utf16View::of_string(&time_zone),
-            zoned_date_time.epoch_nanoseconds().big_integer(),
-        );
-        Ok(Value::from_f64(offset_nanoseconds as f64))
-    }
-
-    // 6.3.30 get Temporal.ZonedDateTime.prototype.offset, https://tc39.es/proposal-temporal/#sec-get-temporal.zoneddatetime.prototype.offset
-    fn offset_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let zonedDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(zonedDateTime, [[InitializedTemporalZonedDateTime]]).
-        let zoned_date_time = typed_this_zoned_date_time(vm)?;
-
-        // 3. Let offsetNanoseconds be GetOffsetNanosecondsFor(zonedDateTime.[[TimeZone]], zonedDateTime.[[EpochNanoseconds]]).
-        let time_zone = zoned_date_time.time_zone();
-        let offset_nanoseconds = get_offset_nanoseconds_for(
-            Utf16View::of_string(&time_zone),
-            zoned_date_time.epoch_nanoseconds().big_integer(),
-        );
-
-        // 4. Return FormatUTCOffsetNanoseconds(offsetNanoseconds).
-        Ok(string_value(vm, &format_utc_offset_nanoseconds(offset_nanoseconds)))
-    }
-
-    // 6.3.31 Temporal.ZonedDateTime.prototype.with ( temporalZonedDateTimeLike [ , options ] ), https://tc39.es/proposal-temporal/#sec-temporal.zoneddatetime.prototype.with
-    fn with(vm: &Vm) -> ThrowCompletionOr<Value> {
-        let temporal_zoned_date_time_like = vm.argument(0);
-        let options = vm.argument(1);
-
-        // 1. Let zonedDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(zonedDateTime, [[InitializedTemporalZonedDateTime]]).
-        let zoned_date_time = typed_this_zoned_date_time(vm)?;
-
-        // 3. If ? IsPartialTemporalObject(temporalZonedDateTimeLike) is false, throw a TypeError exception.
-        if !is_partial_temporal_object(vm, temporal_zoned_date_time_like)? {
-            return vm.throw_completion(
-                ErrorKind::TypeError,
-                ErrorType::TemporalObjectMustBePartialTemporalObject,
-                &[],
-            );
-        }
-
-        // 4. Let epochNs be zonedDateTime.[[EpochNanoseconds]].
-        let epoch_nanoseconds = zoned_date_time.epoch_nanoseconds().big_integer().clone();
-
-        // 5. Let timeZone be zonedDateTime.[[TimeZone]].
-        let time_zone = zoned_date_time.time_zone();
-        let time_zone_view = Utf16View::of_string(&time_zone);
-
-        // 6. Let calendar be zonedDateTime.[[Calendar]].
-        let calendar = zoned_date_time.calendar();
-        let calendar_view = Utf16View::of_string(&calendar);
-
-        // 7. Let offsetNanoseconds be GetOffsetNanosecondsFor(timeZone, epochNs).
-        let offset_nanoseconds = get_offset_nanoseconds_for(time_zone_view, &epoch_nanoseconds);
-
-        // 8. Let isoDateTime be GetISODateTimeFor(timeZone, epochNs).
-        let iso_date_time = get_iso_date_time_for(time_zone_view, &epoch_nanoseconds);
-
-        // 9. Let fields be ISODateToFields(calendar, isoDateTime.[[ISODate]], DATE).
-        let mut fields = iso_date_to_fields(calendar_view, iso_date_time.iso_date, DateType::Date);
-
-        // 10. Set fields.[[Hour]] to isoDateTime.[[Time]].[[Hour]].
-        fields.hour = Some(f64::from(iso_date_time.time.hour));
-
-        // 11. Set fields.[[Minute]] to isoDateTime.[[Time]].[[Minute]].
-        fields.minute = Some(f64::from(iso_date_time.time.minute));
-
-        // 12. Set fields.[[Second]] to isoDateTime.[[Time]].[[Second]].
-        fields.second = Some(f64::from(iso_date_time.time.second));
-
-        // 13. Set fields.[[Millisecond]] to isoDateTime.[[Time]].[[Millisecond]].
-        fields.millisecond = Some(f64::from(iso_date_time.time.millisecond));
-
-        // 14. Set fields.[[Microsecond]] to isoDateTime.[[Time]].[[Microsecond]].
-        fields.microsecond = Some(f64::from(iso_date_time.time.microsecond));
-
-        // 15. Set fields.[[Nanosecond]] to isoDateTime.[[Time]].[[Nanosecond]].
-        fields.nanosecond = Some(f64::from(iso_date_time.time.nanosecond));
-
-        // 16. Set fields.[[OffsetString]] to FormatUTCOffsetNanoseconds(offsetNanoseconds).
-        fields.offset_string = Some(Utf16String::from_utf8(&format_utc_offset_nanoseconds(
-            offset_nanoseconds,
-        )));
-
-        // 17. Let partialZonedDateTime be ? PrepareCalendarFields(calendar, temporalZonedDateTimeLike, « YEAR, MONTH, MONTH-CODE, DAY », « HOUR, MINUTE, SECOND, MILLISECOND, MICROSECOND, NANOSECOND, OFFSET », PARTIAL).
-        let partial_zoned_date_time = prepare_calendar_fields(
-            vm,
-            calendar_view,
-            &temporal_zoned_date_time_like.as_object(),
-            &[
-                CalendarField::Year,
-                CalendarField::Month,
-                CalendarField::MonthCode,
-                CalendarField::Day,
-            ],
-            &[
-                CalendarField::Hour,
-                CalendarField::Minute,
-                CalendarField::Second,
-                CalendarField::Millisecond,
-                CalendarField::Microsecond,
-                CalendarField::Nanosecond,
-                CalendarField::Offset,
-            ],
-            CalendarFieldListOrPartial::Partial,
-        )?;
-
-        // 18. Set fields to CalendarMergeFields(calendar, fields, partialZonedDateTime).
-        let mut fields = calendar_merge_fields(calendar_view, &fields, &partial_zoned_date_time);
-
-        // 19. Let resolvedOptions be ? GetOptionsObject(options).
-        let resolved_options = get_options_object(vm, options)?;
-
-        // 20. Let disambiguation be ? GetTemporalDisambiguationOption(resolvedOptions).
-        let disambiguation = get_temporal_disambiguation_option(vm, &resolved_options)?;
-
-        // 21. Let offset be ? GetTemporalOffsetOption(resolvedOptions, PREFER).
-        let offset = get_temporal_offset_option(vm, &resolved_options, OffsetOption::Prefer)?;
-
-        // 22. Let overflow be ? GetTemporalOverflowOption(resolvedOptions).
-        let overflow = get_temporal_overflow_option(vm, &resolved_options)?;
-
-        // 23. Let dateTimeResult be ? InterpretTemporalDateTimeFields(calendar, fields, overflow).
-        let date_time_result = interpret_temporal_date_time_fields(vm, calendar_view, &mut fields, overflow)?;
-
-        // 24. Let newOffsetNanoseconds be ! ParseDateTimeUTCOffset(fields.[[OffsetString]]).
-        let new_offset_nanoseconds = parse_date_time_utc_offset(Utf16View::of_string(
-            fields
-                .offset_string
-                .as_ref()
-                .expect("the merged fields have an offset string"),
-        ));
-
-        // 25. Let epochNanoseconds be ? InterpretISODateTimeOffset(dateTimeResult.[[ISODate]], dateTimeResult.[[Time]], OPTION, newOffsetNanoseconds, timeZone, disambiguation, offset, MATCH-EXACTLY).
-        let new_epoch_nanoseconds = interpret_iso_date_time_offset(
-            vm,
-            date_time_result.iso_date,
-            TimeOrStartOfDay::Time(date_time_result.time),
-            OffsetBehavior::Option,
-            new_offset_nanoseconds,
-            time_zone_view,
-            disambiguation,
-            offset,
-            MatchBehavior::MatchExactly,
-        )?;
-
-        // 26. Return ! CreateTemporalZonedDateTime(epochNanoseconds, timeZone, calendar).
-        Ok(Value::from_object(
-            create_temporal_zoned_date_time(vm, BigInt::create(vm, new_epoch_nanoseconds), time_zone, calendar, None)
-                .must(),
-        ))
-    }
-
-    // 6.3.32 Temporal.ZonedDateTime.prototype.withPlainTime ( [ plainTimeLike ] ), https://tc39.es/proposal-temporal/#sec-temporal.zoneddatetime.prototype.withplaintime
-    fn with_plain_time(vm: &Vm) -> ThrowCompletionOr<Value> {
-        let plain_time_like = vm.argument(0);
-
-        // 1. Let zonedDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(zonedDateTime, [[InitializedTemporalZonedDateTime]]).
-        let zoned_date_time = typed_this_zoned_date_time(vm)?;
-
-        // 3. Let timeZone be zonedDateTime.[[TimeZone]].
-        let time_zone = zoned_date_time.time_zone();
-
-        // 4. Let calendar be zonedDateTime.[[Calendar]].
-        let calendar = zoned_date_time.calendar();
-
-        // 5. Let isoDateTime be GetISODateTimeFor(timeZone, zonedDateTime.[[EpochNanoseconds]]).
-        let iso_date_time = get_iso_date_time_for(
-            Utf16View::of_string(&time_zone),
-            zoned_date_time.epoch_nanoseconds().big_integer(),
-        );
-
-        // 6. If plainTimeLike is undefined, then
-        let epoch_nanoseconds = if plain_time_like.is_undefined() {
-            // a. Let epochNs be ? GetStartOfDay(timeZone, isoDateTime.[[ISODate]]).
-            get_start_of_day(vm, Utf16View::of_string(&time_zone), iso_date_time.iso_date)?
-        }
-        // 7. Else,
-        else {
-            // a. Let plainTime be ? ToTemporalTime(plainTimeLike).
-            let plain_time = to_temporal_time(vm, plain_time_like, Value::UNDEFINED)?;
-
-            // b. Let resultISODateTime be CombineISODateAndTimeRecord(isoDateTime.[[ISODate]], plainTime.[[Time]]).
-            let result_iso_date_time = combine_iso_date_and_time_record(iso_date_time.iso_date, plain_time.time());
-
-            // c. Let epochNs be ? GetEpochNanosecondsFor(timeZone, resultISODateTime, COMPATIBLE).
-            get_epoch_nanoseconds_for(
-                vm,
-                Utf16View::of_string(&time_zone),
-                &result_iso_date_time,
-                Disambiguation::Compatible,
-            )?
-        };
-
-        // 8. Return ! CreateTemporalZonedDateTime(epochNs, timeZone, calendar).
-        Ok(Value::from_object(
-            create_temporal_zoned_date_time(vm, BigInt::create(vm, epoch_nanoseconds), time_zone, calendar, None)
-                .must(),
-        ))
-    }
-
-    // 6.3.33 Temporal.ZonedDateTime.prototype.withTimeZone ( timeZoneLike ), https://tc39.es/proposal-temporal/#sec-temporal.zoneddatetime.prototype.withtimezone
-    fn with_time_zone(vm: &Vm) -> ThrowCompletionOr<Value> {
-        let time_zone_like = vm.argument(0);
-
-        // 1. Let zonedDateTime be the this value.
