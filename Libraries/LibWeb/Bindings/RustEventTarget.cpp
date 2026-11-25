@@ -11,6 +11,7 @@
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/DOM/EventDispatcher.h>
 #include <LibWeb/DOM/IDLEventListener.h>
+#include <LibWeb/DOM/Utils.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HighResolutionTime/TimeOrigin.h>
 #include <LibWeb/WebIDL/CallbackType.h>
@@ -95,6 +96,16 @@ void RustEvent::visit_edges(Visitor& visitor)
     visitor.visit(m_owner);
 }
 
+RustInterfaceCell* rust_event_owner(DOM::Event const& event, InterfaceName interface_name)
+{
+    if (!event.is_owned_by_rust_interface_object())
+        return nullptr;
+    auto const& rust_event = static_cast<RustEvent const&>(event);
+    if (rust_event.m_owner_interface_name != interface_name)
+        return nullptr;
+    return rust_event.m_owner.ptr();
+}
+
 }
 
 using namespace Web;
@@ -126,6 +137,7 @@ bool web_bindings_event_is_trusted(DOM::Event const*);
 double web_bindings_event_time_stamp(DOM::Event const*);
 bool web_bindings_event_cancelable(DOM::Event const*);
 void web_bindings_initialize_event(RustEvent*, FlatPtr type, bool bubbles, bool cancelable);
+DOM::EventTarget* web_bindings_event_retarget_against_current_target(DOM::Event*, DOM::EventTarget* object);
 }
 
 RustEventTarget* web_bindings_create_event_target()
@@ -262,4 +274,9 @@ void web_bindings_initialize_event(RustEvent* event, FlatPtr type, bool bubbles,
 {
     auto type_string = Utf16String::from_raw(type);
     event->initialize_event(Utf16FlyString::from_utf16(type_string.utf16_view()), bubbles, cancelable);
+}
+
+DOM::EventTarget* web_bindings_event_retarget_against_current_target(DOM::Event* event, DOM::EventTarget* object)
+{
+    return DOM::retarget(object, event->current_target().ptr());
 }

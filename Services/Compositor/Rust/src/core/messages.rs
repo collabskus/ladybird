@@ -20,34 +20,40 @@ use libcompositing_rust::display_list::replay::{ReplayFrame, ReplaySelection, re
 use libcompositing_rust::display_list::storage::DisplayListStorage;
 use libcompositing_rust::display_list::window::RecordedWindow;
 use libcompositing_rust::ipc_types::compositor_control_server::messages::{
-    AwaitSynchronizedResizeFrame, BeginSynchronizedResize, CommitSynchronizedResize, CreateRemoteLayer,
-    CreateRemoteLayerResponse, DestroyRemoteLayer, SetRemoteLayerFit, ShowContextInRemoteLayer,
+    AwaitSynchronizedResizeFrame, BeginSynchronizedResize, BindPresentation, BindPresentationResponse,
+    CommitSynchronizedResize, CreateRemoteLayer, CreateRemoteLayerResponse, DestroyRemoteLayer,
+    SetContextPresentsFromCpuMemory, SetContextScalesFramesToFit, SetDisplayMetadata, SetRemoteLayerFit, SetUiOverlays,
+    SetWindowServerMayShowHighDynamicRange, ShowContextInRemoteLayer,
 };
 use libcompositing_rust::ipc_types::compositor_presentation_client::messages::DidNotDispatchInputEvent;
 use libcompositing_rust::ipc_types::compositor_presentation_server::messages::{
-    HandleAndDispatchKeyEvent, HandleAndDispatchMouseEvent, HandleAndDispatchPinchEvent,
+    HandleAndDispatchKeyEvent, HandleAndDispatchMouseEvent, HandleAndDispatchPinchEvent, PresentedBitmapReadyToPaint,
+    SetClientGpuPresentationCapability, SetScrollbarTrackPressJumps,
 };
 use libcompositing_rust::ipc_types::compositor_web_content_server::messages::{
     ApplyScrollRequests, BeginInputTraceForTesting, BeginInputTraceForTestingResponse,
     ClearPerTestInputStateForTesting, ClearPerTestInputStateForTestingResponse, CreateCanvas2dContext,
     CreateWebglContext, CreateWebglContextResponse, DestroyCanvas2dContext, DestroyWebglContext,
-    InvalidateKeyboardScrollState, InvalidateKeyboardScrollStateResponse, InvalidateWheelEventListenerState,
-    RasterizeDisplayList, RasterizeDisplayListResponse, ReadBackCanvas2dPixels, ReadBackCanvas2dPixelsResponse,
-    ReserveCanvasIds, ReserveCanvasIdsResponse, RouteFirstWheelStepForTesting, RouteFirstWheelStepForTestingResponse,
-    ScrollStateForTesting, ScrollStateForTestingResponse, TakeInputTraceForTesting, TakeInputTraceForTestingResponse,
-    TakePendingAsyncScrollUpdates, TakePendingAsyncScrollUpdatesResponse, TakeWheelEventFromMainThread,
-    TakeWheelEventFromMainThreadResponse, UpdateCanvas2dStream, UpdateDisplayList, UpdateScrollState,
-    UpdateVisualContextTree, WebglClearDrawingBuffer, WebglCommands, WebglCommandsFromSharedBuffer,
-    WebglDrainCommandBuffer, WebglDrainCommandBufferResponse, WebglPresentCanvas, WebglReadBackDrawingBuffer,
-    WebglReadBackDrawingBufferResponse, WebglReadBufferSubData, WebglReadBufferSubDataResponse, WebglReadPixels,
-    WebglReadPixelsResponse, WebglSetCommandBuffer, WebglSyncCall, WebglSyncCallResponse, WheelEventCanceled,
-    WheelEventLetThrough, WheelEventLetThroughResponse,
+    HurryRenderingOpportunity, InvalidateKeyboardScrollState, InvalidateKeyboardScrollStateResponse,
+    InvalidateWheelEventListenerState, PresentFrame, RasterizeDisplayList, RasterizeDisplayListResponse,
+    ReadBackCanvas2dPixels, ReadBackCanvas2dPixelsResponse, RequestRenderingOpportunity, ReserveCanvasIds,
+    ReserveCanvasIdsResponse, RouteFirstWheelStepForTesting, RouteFirstWheelStepForTestingResponse,
+    ScrollStateForTesting, ScrollStateForTestingResponse, SetParentContext, StopPresentingToClient,
+    TakeInputTraceForTesting, TakeInputTraceForTestingResponse, TakePendingAsyncScrollUpdates,
+    TakePendingAsyncScrollUpdatesResponse, TakeWheelEventFromMainThread, TakeWheelEventFromMainThreadResponse,
+    UpdateCanvas2dStream, UpdateDisplayList, UpdateScrollState, UpdateVisualContextTree, WebglClearDrawingBuffer,
+    WebglCommands, WebglCommandsFromSharedBuffer, WebglDrainCommandBuffer, WebglDrainCommandBufferResponse,
+    WebglPresentCanvas, WebglReadBackDrawingBuffer, WebglReadBackDrawingBufferResponse, WebglReadBufferSubData,
+    WebglReadBufferSubDataResponse, WebglReadPixels, WebglReadPixelsResponse, WebglSetCommandBuffer, WebglSyncCall,
+    WebglSyncCallResponse, WheelEventCanceled, WheelEventLetThrough, WheelEventLetThroughResponse,
 };
+use libcompositing_rust::ipc_types::render_clock_server::messages::RequestClockTick;
 use libcompositing_rust::ipc_types::{
     Compositing_RemoteLayerHostHandle, Compositing_RemoteLayerHostKind, Compositing_WebGL_WebGLVersion,
     Compositing_WheelEventAnswer as WheelEventAnswer, Compositing_WheelStepLetThrough as WheelStepLetThrough,
-    Core_AnonymousBuffer, LayerPlanOnWire, SharedDisplayList, compositor_control_server,
-    compositor_presentation_server, compositor_web_content_server,
+    Compositing_WindowResizingInProgress as WindowResizingInProgress, Core_AnonymousBuffer, LayerPlanOnWire,
+    SharedDisplayList, compositor_control_server, compositor_presentation_server, compositor_web_content_server,
+    render_clock_server,
 };
 use libcompositing_rust::scrolling::{AccumulatedVisualContextTree, DisplayList};
 use libcompositing_rust::scrolling::{
@@ -77,6 +83,10 @@ fn misbehavior_of_layer_plan(why_plan_fails_checks: &'static str) -> Misbehavior
         "Compositor: Rejecting plan of layers from WebContent: {why_plan_fails_checks}"
     );
     Misbehavior("WebContent sent a plan of layers that does not fit its display list and visual context tree")
+}
+
+fn is_valid_device_pixel_ratio(device_pixel_ratio: f64) -> bool {
+    device_pixel_ratio.is_finite() && device_pixel_ratio > 0.0
 }
 
 // Wheel deltas are scrolled by as floats.
@@ -932,6 +942,92 @@ impl compositor_web_content_server::Stub for MessagesFromWebContent<'_> {
         };
         Ok(TakePendingAsyncScrollUpdatesResponse { updates })
     }
+
+    fn set_parent_context(&mut self, message: SetParentContext) -> Result<(), Misbehavior> {
+        if !self.context_is_owned_by_sender(message.context_id)? {
+            return Ok(());
+        }
+        if let Some(parent_context_id) = message.parent_context_id
+            && !self
+                .core
+                .context_can_be_nested_in(message.context_id, parent_context_id)
+        {
+            return Err(Misbehavior(
+                "WebContent nested a compositor context that cannot be nested",
+            ));
+        }
+        self.core
+            .set_parent_context(message.context_id, message.parent_context_id, self.now);
+        Ok(())
+    }
+
+    fn stop_presenting_to_client(&mut self, message: StopPresentingToClient) -> Result<(), Misbehavior> {
+        if self.context_is_owned_by_sender(message.context_id)? {
+            self.core.stop_presenting_to_client(message.context_id, self.now);
+        }
+        Ok(())
+    }
+
+    fn viewport_size_updated(
+        &mut self,
+        message: compositor_web_content_server::messages::ViewportSizeUpdated,
+    ) -> Result<(), Misbehavior> {
+        if !self.context_is_owned_by_sender(message.context_id)? {
+            return Ok(());
+        }
+        if !is_valid_device_pixel_ratio(message.device_pixel_ratio) {
+            return Err(Misbehavior("WebContent sent an invalid device pixel ratio"));
+        }
+        self.core.viewport_size_updated(
+            message.context_id,
+            message.viewport_size,
+            message.device_pixel_ratio,
+            message.window_resize_in_progress == WindowResizingInProgress::Yes,
+            self.now,
+        );
+        Ok(())
+    }
+
+    fn request_rendering_opportunity(&mut self, message: RequestRenderingOpportunity) -> Result<(), Misbehavior> {
+        if !self.context_is_owned_by_sender(message.context_id)? {
+            return Ok(());
+        }
+        if !message.maximum_frames_per_second.is_finite() || message.maximum_frames_per_second <= 0.0 {
+            return Err(Misbehavior("WebContent sent an invalid maximum frame rate"));
+        }
+        self.core
+            .request_rendering_opportunity(message.context_id, message.maximum_frames_per_second, self.now);
+        Ok(())
+    }
+
+    fn hurry_rendering_opportunity(&mut self, message: HurryRenderingOpportunity) -> Result<(), Misbehavior> {
+        if self.context_is_owned_by_sender(message.context_id)? {
+            self.core.hurry_rendering_opportunity(message.context_id, self.now);
+        }
+        Ok(())
+    }
+
+    fn present_frame(&mut self, message: PresentFrame) -> Result<(), Misbehavior> {
+        if self.context_is_owned_by_sender(message.context_id)? {
+            self.core
+                .present_frame_of_page(message.context_id, message.viewport_rect, self.now);
+        }
+        Ok(())
+    }
+}
+
+impl render_clock_server::Stub for MessagesFromWebContent<'_> {
+    fn request_clock_tick(&mut self, message: RequestClockTick) -> Result<(), Misbehavior> {
+        if !self.context_is_owned_by_sender(message.context_id)? {
+            return Ok(());
+        }
+        if !message.maximum_frames_per_second.is_finite() || message.maximum_frames_per_second <= 0.0 {
+            return Err(Misbehavior("WebContent sent an invalid maximum clock tick rate"));
+        }
+        self.core
+            .request_clock_tick(message.context_id, message.maximum_frames_per_second);
+        Ok(())
+    }
 }
 
 pub struct MessagesFromPresentation<'a> {
@@ -987,6 +1083,33 @@ impl compositor_presentation_server::Stub for MessagesFromPresentation<'_> {
             self.core
                 .handle_and_dispatch_mouse_event(message.context_id, message.event, self.now);
         }
+        Ok(())
+    }
+
+    fn presented_bitmap_ready_to_paint(&mut self, message: PresentedBitmapReadyToPaint) -> Result<(), Misbehavior> {
+        if self.core.is_bound_to(message.context_id, self.presentation_id) {
+            self.core
+                .presented_store_released(message.context_id, message.bitmap_id, self.now);
+        }
+        Ok(())
+    }
+
+    fn set_client_gpu_presentation_capability(
+        &mut self,
+        message: SetClientGpuPresentationCapability,
+    ) -> Result<(), Misbehavior> {
+        self.core.set_presentation_gpu_capability(
+            self.presentation_id,
+            message.supported,
+            message.adapter_luid,
+            self.now,
+        );
+        Ok(())
+    }
+
+    fn set_scrollbar_track_press_jumps(&mut self, message: SetScrollbarTrackPressJumps) -> Result<(), Misbehavior> {
+        self.core
+            .set_scrollbar_track_press_jumps(self.presentation_id, message.jumps);
         Ok(())
     }
 }
@@ -1051,6 +1174,68 @@ impl compositor_control_server::Stub for MessagesFromControl<'_> {
     fn commit_synchronized_resize(&mut self, message: CommitSynchronizedResize) -> Result<(), Misbehavior> {
         self.core
             .commit_synchronized_resize(message.remote_layer_id, message.token);
+        Ok(())
+    }
+
+    fn set_window_server_may_show_high_dynamic_range(
+        &mut self,
+        message: SetWindowServerMayShowHighDynamicRange,
+    ) -> Result<(), Misbehavior> {
+        self.core
+            .set_window_server_may_show_high_dynamic_range(message.may_show, self.now);
+        Ok(())
+    }
+
+    fn bind_presentation(&mut self, message: BindPresentation) -> Result<BindPresentationResponse, Misbehavior> {
+        self.core
+            .bind_presentation(message.context_id, PresentationId(message.presentation_id), self.now);
+        Ok(BindPresentationResponse)
+    }
+
+    fn viewport_size_updated(
+        &mut self,
+        message: compositor_control_server::messages::ViewportSizeUpdated,
+    ) -> Result<(), Misbehavior> {
+        if !is_valid_device_pixel_ratio(message.device_pixel_ratio) {
+            return Err(Misbehavior("Invalid device pixel ratio"));
+        }
+        self.core.viewport_size_updated(
+            message.context_id,
+            message.viewport_size,
+            message.device_pixel_ratio,
+            message.window_resize_in_progress == WindowResizingInProgress::Yes,
+            self.now,
+        );
+        Ok(())
+    }
+
+    fn set_ui_overlays(&mut self, message: SetUiOverlays) -> Result<(), Misbehavior> {
+        self.core
+            .set_ui_overlays(message.context_id, message.overlays.into(), self.now);
+        Ok(())
+    }
+
+    fn set_display_metadata(&mut self, message: SetDisplayMetadata) -> Result<(), Misbehavior> {
+        if !message.refresh_rate.is_finite() || message.refresh_rate <= 0.0 {
+            return Err(Misbehavior("Invalid display refresh rate"));
+        }
+        self.core
+            .set_display_metadata(message.context_id, message.display_id, message.refresh_rate, self.now);
+        Ok(())
+    }
+
+    fn set_context_presents_from_cpu_memory(
+        &mut self,
+        message: SetContextPresentsFromCpuMemory,
+    ) -> Result<(), Misbehavior> {
+        self.core
+            .set_presents_from_cpu_memory(message.context_id, message.presents_from_cpu_memory, self.now);
+        Ok(())
+    }
+
+    fn set_context_scales_frames_to_fit(&mut self, message: SetContextScalesFramesToFit) -> Result<(), Misbehavior> {
+        self.core
+            .set_scales_frames_to_fit(message.context_id, message.scales_frames_to_fit, self.now);
         Ok(())
     }
 }

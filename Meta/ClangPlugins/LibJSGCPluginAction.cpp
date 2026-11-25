@@ -99,6 +99,72 @@ static bool type_has_visit_edges_method(clang::CXXRecordDecl const* record)
     return false;
 }
 
+// The definition of the record a type names, or for a dependent specialization, of the template it specializes.
+static clang::CXXRecordDecl const* record_named_by_type(clang::QualType type)
+{
+    if (auto const* record = type->getAsCXXRecordDecl())
+        return record->getDefinition();
+    if (auto const* specialization = type->getAs<clang::TemplateSpecializationType>()) {
+        if (auto const* class_template = llvm::dyn_cast_or_null<clang::ClassTemplateDecl>(specialization->getTemplateName().getAsTemplateDecl()))
+            return class_template->getTemplatedDecl()->getDefinition();
+    }
+    return nullptr;
+}
+
+static bool record_inherits_from_weak_container(clang::CXXRecordDecl const& record)
+{
+    for (auto const& base : record.bases()) {
+        auto const* base_record = record_named_by_type(base.getType());
+        if (!base_record)
+            continue;
+        if (base_record->getQualifiedNameAsString() == "GC::WeakContainer" || record_inherits_from_weak_container(*base_record))
+            return true;
+    }
+    return false;
+}
+
+static bool type_names_weak_vector(clang::QualType type)
+{
+    if (auto const* specialization = type->getAs<clang::TemplateSpecializationType>()) {
+        auto const* template_decl = specialization->getTemplateName().getAsTemplateDecl();
+        return template_decl && template_decl->getQualifiedNameAsString() == "GC::WeakVector";
+    }
+    auto const* specialization = llvm::dyn_cast_or_null<clang::ClassTemplateSpecializationDecl>(type->getAsCXXRecordDecl());
+    return specialization && specialization->getSpecializedTemplate()->getQualifiedNameAsString() == "GC::WeakVector";
+}
+
+// Whether a value of the type holds a GC::WeakVector, itself or in an array element, template argument, base or field
+// of a type it holds.
+static bool type_holds_weak_vector(clang::QualType type, std::set<clang::CXXRecordDecl const*>& visited)
+{
+    while (auto const* array = type->getAsArrayTypeUnsafe())
+        type = array->getElementType();
+
+    if (type_names_weak_vector(type))
+        return true;
+
+    auto const* record = record_named_by_type(type);
+    if (!record || record_inherits_from_cell(*record) || !visited.insert(record).second)
+        return false;
+
+    if (auto const* specialization = llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(record)) {
+        for (auto const& argument : specialization->getTemplateArgs().asArray()) {
+            if (argument.getKind() == clang::TemplateArgument::Type && type_holds_weak_vector(argument.getAsType(), visited))
+                return true;
+        }
+    }
+
+    for (auto const& base : record->bases()) {
+        if (type_holds_weak_vector(base.getType(), visited))
+            return true;
+    }
+    for (auto const* field : record->fields()) {
+        if (type_holds_weak_vector(field->getType(), visited))
+            return true;
+    }
+    return false;
+}
+
 enum class ContainsGCPtrResult {
     No,
     Yes,
@@ -207,8 +273,8 @@ static ContainsGCPtrResult type_contains_gc_ptr(clang::QualType const& type, std
         if (template_name == "GC::Ptr" || template_name == "GC::Ref")
             return ContainsGCPtrResult::Yes;
 
-        // Raw pointers don't need visiting
-        if (template_name == "GC::RawPtr" || template_name == "GC::RawRef")
+        // A weak vector's owner prunes it of dead cells instead of visiting it
+        if (template_name == "GC::WeakVector")
             return ContainsGCPtrResult::No;
 
         // Root types handle their own visiting
@@ -249,8 +315,6 @@ static std::vector<clang::QualType> get_all_qualified_types(clang::QualType cons
         static std::unordered_set<std::string> gc_relevant_type_names {
             "GC::Ptr",
             "GC::Ref",
-            "GC::RawPtr",
-            "GC::RawRef",
             "GC::RootVector",
             "GC::RootHashMap",
             "GC::RootHashTable",
@@ -277,7 +341,6 @@ static std::vector<clang::QualType> get_all_qualified_types(clang::QualType cons
 }
 enum class OuterType {
     GCPtr,
-    RawPtr,
     Root,
     Ptr,
     Ref,
@@ -303,8 +366,6 @@ static std::optional<QualTypeGCInfo> validate_qualified_type(clang::QualType con
         OuterType outer_type;
         if (template_type_name == "GC::Ptr" || template_type_name == "GC::Ref") {
             outer_type = OuterType::GCPtr;
-        } else if (template_type_name == "GC::RawPtr" || template_type_name == "GC::RawRef") {
-            outer_type = OuterType::RawPtr;
         } else if (template_type_name == "GC::Root") {
             outer_type = OuterType::Root;
         } else {
@@ -417,11 +478,11 @@ bool LibJSGCVisitor::VisitCXXRecordDecl(clang::CXXRecordDecl* record)
                                 << "GC::Ptr";
                     }
                 }
-            } else if (outer_type == OuterType::GCPtr || outer_type == OuterType::RawPtr || outer_type == OuterType::Value) {
+            } else if (outer_type == OuterType::GCPtr || outer_type == OuterType::Value) {
                 if (!base_type_inherits_from_cell) {
                     auto diag_id = diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Error, "Specialization type must inherit from GC::Cell");
                     diag_engine.Report(field->getLocation(), diag_id);
-                } else if (outer_type != OuterType::RawPtr) {
+                } else {
                     fields_that_need_visiting.push_back(field);
                 }
             } else if (outer_type == OuterType::Root) {
@@ -440,6 +501,23 @@ bool LibJSGCVisitor::VisitCXXRecordDecl(clang::CXXRecordDecl* record)
         auto contains_result = type_contains_gc_ptr(field->getType());
         if (contains_result == ContainsGCPtrResult::YesRequiresVisitEdges) {
             substruct_fields_that_need_visiting.push_back(field);
+        }
+    }
+
+    if (record_is_cell && !record_inherits_from_weak_container(*record)) {
+        auto member_diag_id = diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Error,
+            "Member %0 holds a GC::WeakVector, but %1 is not a GC::WeakContainer that removes its dead cells");
+        auto base_diag_id = diag_engine.getCustomDiagID(clang::DiagnosticsEngine::Error,
+            "Base %0 holds a GC::WeakVector, but %1 is not a GC::WeakContainer that removes its dead cells");
+        for (auto const& base : record->bases()) {
+            std::set<clang::CXXRecordDecl const*> visited;
+            if (type_holds_weak_vector(base.getType(), visited))
+                diag_engine.Report(base.getBeginLoc(), base_diag_id) << base.getType() << record;
+        }
+        for (auto const* field : record->fields()) {
+            std::set<clang::CXXRecordDecl const*> visited;
+            if (type_holds_weak_vector(field->getType(), visited))
+                diag_engine.Report(field->getLocation(), member_diag_id) << field << record;
         }
     }
 
@@ -1106,8 +1184,6 @@ static bool is_type_that_does_not_store_gc_pointers_by_value(std::string const& 
         "AK::RefPtr",
         "AK::Span",
         "AK::WeakPtr",
-        "GC::RawPtr",
-        "GC::RawRef",
         "GC::Root",
         "GC::RootHashMap",
         "GC::RootHashTable",
@@ -1115,12 +1191,12 @@ static bool is_type_that_does_not_store_gc_pointers_by_value(std::string const& 
         "GC::Weak",
         "GC::WeakHashMap",
         "GC::WeakHashSet",
+        "GC::WeakVector",
     };
     return template_names.contains(template_name);
 }
 
-// The template arguments as written keep alias templates such as GC::RawPtr, which the canonical arguments of a
-// specialization resolve to the template they alias. A dependent type such as Vector<GC::Ref<T>> only has those.
+// A dependent type such as Vector<GC::Ref<T>> only has the template arguments as written.
 static std::optional<TemplateInstance> template_instance_of_type(clang::QualType type)
 {
     if (auto const* specialization_type = type->getAs<clang::TemplateSpecializationType>()) {
@@ -1128,7 +1204,7 @@ static std::optional<TemplateInstance> template_instance_of_type(clang::QualType
         if (!template_decl)
             return {};
         auto template_name = template_decl->getQualifiedNameAsString();
-        if (specialization_type->isTypeAlias() && !is_type_that_does_not_store_gc_pointers_by_value(template_name))
+        if (specialization_type->isTypeAlias())
             return template_instance_of_type(specialization_type->getAliasedType());
 
         TemplateInstance instance { std::move(template_name), {} };
@@ -1257,7 +1333,7 @@ static bool type_violates_claim_of_no_cell_edges(clang::QualType type, ClaimViol
     if (auto instance = template_instance_of_type(type)) {
         if (instance->name == "AK::Function")
             return violation == ClaimViolation::OpaqueFunction;
-        if (instance->name == "GC::Ptr" || instance->name == "GC::Ref" || instance->name == "GC::RawPtr" || instance->name == "GC::RawRef" || instance->name == "GC::Member" || instance->name == "GC::NonnullMember")
+        if (instance->name == "GC::Ptr" || instance->name == "GC::Ref" || instance->name == "GC::Member" || instance->name == "GC::NonnullMember")
             return violation == ClaimViolation::GCPointer;
         if (is_owning_pointer(instance->name)) {
             if (violation != ClaimViolation::GCPointer || instance->type_arguments.empty())

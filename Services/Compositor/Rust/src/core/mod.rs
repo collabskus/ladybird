@@ -253,13 +253,6 @@ impl CompositorCore {
         !context.borrow().presents_to_client() && parent_context_id != context_id
     }
 
-    pub fn presents_to_client(&self, context_id: CompositorContextId) -> bool {
-        let _entered = self.enter();
-
-        self.context_if_present(context_id)
-            .is_some_and(|context| context.borrow().presents_to_client())
-    }
-
     pub fn context_is_effectively_visible(&self, context_id: CompositorContextId) -> bool {
         let _entered = self.enter();
 
@@ -474,6 +467,16 @@ impl CompositorCore {
     ) {
         let _entered = self.enter();
 
+        if !self.presentations.borrow().contains_key(&presentation_id) {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
+                "Compositor: Ignoring binding of context {} to presentation {}, which is already gone",
+                context_id.0,
+                presentation_id.0
+            );
+            return;
+        }
         let Some(context) = self.context_if_present(context_id) else {
             return;
         };

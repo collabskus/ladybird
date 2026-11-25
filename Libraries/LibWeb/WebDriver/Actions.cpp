@@ -1497,7 +1497,7 @@ public:
         };
 
         // 3. Try to dispatch tick actions with input state, tick actions, tick duration, browsing context, and actions options.
-        if (auto result = dispatch_tick_actions(m_input_state, tick_actions, tick_duration, m_browsing_context, m_actions_options, dispatch_mouse_event); result.is_error()) {
+        if (auto result = dispatch_tick_actions(*m_input_state, tick_actions, tick_duration, m_browsing_context, m_actions_options, dispatch_mouse_event); result.is_error()) {
             m_on_complete->function()(result.release_error());
             return;
         }
@@ -1542,8 +1542,8 @@ public:
         HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
         GC::RootVector<GC::Ref<WebIDL::Promise>> scroll_promises;
         for (auto& navigable : HTML::all_local_navigables()) {
-            if (&navigable->page() == &m_browsing_context->page() && !navigable->has_been_destroyed())
-                navigable->wait_for_wheel_scrolls(scroll_promises);
+            if (&navigable.page() == &m_browsing_context->page() && !navigable.has_been_destroyed())
+                navigable.wait_for_wheel_scrolls(scroll_promises);
         }
         if (scroll_promises.is_empty()) {
             queue_next_tick->function()();
@@ -1565,7 +1565,7 @@ private:
 
     GC::Ref<HTML::BrowsingContext> m_browsing_context;
 
-    InputState& m_input_state;
+    NonnullRefPtr<InputState> m_input_state;
     ActionsOptions m_actions_options;
 
     Vector<Vector<ActionObject>> m_actions_by_tick;

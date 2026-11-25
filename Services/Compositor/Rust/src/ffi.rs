@@ -11,19 +11,15 @@ use crate::core::messages::{MessagesFromControl, MessagesFromPresentation, Messa
 use crate::core::presenting::{GpuBackend, PresentationCapabilities};
 use crate::core::{CompositorCore, ContextOwnerCheckResult};
 use crate::host::{FfiCompositorCoreHost, Host, PresentationId, WebContentClientId};
-use crate::overlays::{
-    CompositorLayersOverlayState, PausedDebuggerOverlayAction, PausedDebuggerOverlayState, PictureInPictureControl,
-    PictureInPictureControlsState, UIOverlays,
-};
 use crate::raster_host::{FfiRasterHost, RasterHost};
 use crate::surfaces::painting_surface::PaintingSurface;
 use libcompositing_rust::display_list::commands::CompositorContextId;
 use libcompositing_rust::ipc_types::{
     Compositing_ContextVisibility as ContextVisibility, compositor_control_server, compositor_presentation_server,
-    compositor_web_content_server,
+    compositor_web_content_server, render_clock_server,
 };
 use libcompositing_rust::time::MonotonicTime;
-use libgfx_rust::{IntRect, IntSize};
+use libgfx_rust::IntSize;
 use libipc_rust::cpp_connection::RawMessage;
 use std::rc::Rc;
 
@@ -84,20 +80,6 @@ pub extern "C" fn compositor_core_destroy_context(core: &mut CompositorCore, con
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn compositor_core_context_can_be_nested_in(
-    core: &CompositorCore,
-    context_id: u64,
-    parent_context_id: u64,
-) -> bool {
-    core.context_can_be_nested_in(CompositorContextId(context_id), CompositorContextId(parent_context_id))
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_core_presents_to_client(core: &CompositorCore, context_id: u64) -> bool {
-    core.presents_to_client(CompositorContextId(context_id))
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn compositor_core_context_is_effectively_visible(core: &CompositorCore, context_id: u64) -> bool {
     core.context_is_effectively_visible(CompositorContextId(context_id))
 }
@@ -128,48 +110,6 @@ pub extern "C" fn compositor_core_bound_presentation(
     };
     *presentation_id = bound_presentation.0;
     true
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_core_set_parent_context(
-    core: &CompositorCore,
-    context_id: u64,
-    has_parent_context: bool,
-    parent_context_id: u64,
-    now_nanoseconds: i64,
-) {
-    core.set_parent_context(
-        CompositorContextId(context_id),
-        has_parent_context.then_some(CompositorContextId(parent_context_id)),
-        time(now_nanoseconds),
-    );
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_core_stop_presenting_to_client(
-    core: &CompositorCore,
-    context_id: u64,
-    now_nanoseconds: i64,
-) {
-    core.stop_presenting_to_client(CompositorContextId(context_id), time(now_nanoseconds));
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_core_viewport_size_updated(
-    core: &CompositorCore,
-    context_id: u64,
-    viewport_size: IntSize,
-    device_pixel_ratio: f64,
-    window_resize_in_progress: bool,
-    now_nanoseconds: i64,
-) {
-    core.viewport_size_updated(
-        CompositorContextId(context_id),
-        viewport_size,
-        device_pixel_ratio,
-        window_resize_in_progress,
-        time(now_nanoseconds),
-    );
 }
 
 /// What a presentation makes of the frames and the scrolling of the contexts it shows.
@@ -210,141 +150,6 @@ pub extern "C" fn compositor_core_unregister_presentation(
     now_nanoseconds: i64,
 ) {
     core.unregister_presentation(PresentationId(presentation_id), time(now_nanoseconds));
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_core_set_presentation_gpu_capability(
-    core: &CompositorCore,
-    presentation_id: u64,
-    supported: bool,
-    adapter_luid: u64,
-    now_nanoseconds: i64,
-) {
-    core.set_presentation_gpu_capability(
-        PresentationId(presentation_id),
-        supported,
-        adapter_luid,
-        time(now_nanoseconds),
-    );
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_core_set_scrollbar_track_press_jumps(
-    core: &CompositorCore,
-    presentation_id: u64,
-    jumps: bool,
-) {
-    core.set_scrollbar_track_press_jumps(PresentationId(presentation_id), jumps);
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_core_bind_presentation(
-    core: &CompositorCore,
-    context_id: u64,
-    presentation_id: u64,
-    now_nanoseconds: i64,
-) {
-    core.bind_presentation(
-        CompositorContextId(context_id),
-        PresentationId(presentation_id),
-        time(now_nanoseconds),
-    );
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_core_set_display_metadata(
-    core: &CompositorCore,
-    context_id: u64,
-    has_display_id: bool,
-    display_id: u64,
-    refresh_rate: f64,
-    now_nanoseconds: i64,
-) {
-    core.set_display_metadata(
-        CompositorContextId(context_id),
-        has_display_id.then_some(display_id),
-        refresh_rate,
-        time(now_nanoseconds),
-    );
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_core_set_window_server_may_show_high_dynamic_range(
-    core: &CompositorCore,
-    may_show: bool,
-    now_nanoseconds: i64,
-) {
-    core.set_window_server_may_show_high_dynamic_range(may_show, time(now_nanoseconds));
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_core_set_presents_from_cpu_memory(
-    core: &CompositorCore,
-    context_id: u64,
-    presents_from_cpu_memory: bool,
-    now_nanoseconds: i64,
-) {
-    core.set_presents_from_cpu_memory(
-        CompositorContextId(context_id),
-        presents_from_cpu_memory,
-        time(now_nanoseconds),
-    );
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_core_set_scales_frames_to_fit(
-    core: &CompositorCore,
-    context_id: u64,
-    scales_frames_to_fit: bool,
-    now_nanoseconds: i64,
-) {
-    core.set_scales_frames_to_fit(
-        CompositorContextId(context_id),
-        scales_frames_to_fit,
-        time(now_nanoseconds),
-    );
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_core_request_rendering_opportunity(
-    core: &CompositorCore,
-    context_id: u64,
-    maximum_frames_per_second: f64,
-    now_nanoseconds: i64,
-) {
-    core.request_rendering_opportunity(
-        CompositorContextId(context_id),
-        maximum_frames_per_second,
-        time(now_nanoseconds),
-    );
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_core_request_clock_tick(
-    core: &CompositorCore,
-    context_id: u64,
-    maximum_frames_per_second: f64,
-) {
-    core.request_clock_tick(CompositorContextId(context_id), maximum_frames_per_second);
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_core_hurry_rendering_opportunity(
-    core: &CompositorCore,
-    context_id: u64,
-    now_nanoseconds: i64,
-) {
-    core.hurry_rendering_opportunity(CompositorContextId(context_id), time(now_nanoseconds));
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_core_present_frame_of_page(
-    core: &CompositorCore,
-    context_id: u64,
-    viewport_rect: IntRect,
-    now_nanoseconds: i64,
-) {
-    core.present_frame_of_page(CompositorContextId(context_id), viewport_rect, time(now_nanoseconds));
 }
 
 #[unsafe(no_mangle)]
@@ -464,6 +269,31 @@ pub unsafe extern "C" fn compositor_core_handle_web_content_message(
     core.finish_message(time(now_nanoseconds));
 }
 
+/// Takes a message of the RenderClockServer endpoint that is marked [RustReceiver], from the render clock channel of a
+/// WebContent process.
+///
+/// # Safety
+///
+/// `message` must be one `IPC::RawMessage::hand_to_rust()` made.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn compositor_core_handle_render_clock_message(
+    core: &CompositorCore,
+    web_content_client_id: u64,
+    message: RawMessage<'_>,
+    now_nanoseconds: i64,
+) {
+    let mut stub = MessagesFromWebContent {
+        core,
+        client_id: WebContentClientId(web_content_client_id),
+        now: time(now_nanoseconds),
+    };
+    // SAFETY: The caller hands over a message of that endpoint.
+    unsafe {
+        message.hand_to(|bytes, attachments| render_clock_server::dispatch(&mut stub, bytes, attachments));
+    };
+    core.finish_message(time(now_nanoseconds));
+}
+
 /// Takes a message of the CompositorPresentationServer endpoint that is marked [RustReceiver].
 ///
 /// # Safety
@@ -510,28 +340,6 @@ pub unsafe extern "C" fn compositor_core_handle_control_message(
     core.finish_message(time(now_nanoseconds));
 }
 
-/// What the browser draws over a context's page. An action or control is none where it is out of range.
-#[repr(C)]
-pub struct FfiUIOverlays<'a> {
-    pub has_paused_debugger: bool,
-    pub paused_debugger_has_font_family: bool,
-    pub paused_debugger_font_family: ak::Span<'a, u8>,
-    pub paused_debugger_has_hovered_action: bool,
-    pub paused_debugger_hovered_action: u8,
-    pub has_picture_in_picture_controls: bool,
-    pub picture_in_picture_controls_shown: bool,
-    pub picture_in_picture_controls_has_hovered_control: bool,
-    pub picture_in_picture_controls_hovered_control: u8,
-    pub has_compositor_layers: bool,
-    pub compositor_layers_has_font_family: bool,
-    pub compositor_layers_font_family: ak::Span<'a, u8>,
-    pub compositor_layers_hidden_layer_ids: ak::Span<'a, u64>,
-    pub compositor_layers_selected_layer_ids: ak::Span<'a, u64>,
-    pub compositor_layers_has_hovered_layer_id: bool,
-    pub compositor_layers_hovered_layer_id: u64,
-    pub compositor_layers_raster_count_reset_generation: u64,
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn compositor_core_set_visibility(
     core: &CompositorCore,
@@ -554,61 +362,6 @@ pub extern "C" fn compositor_core_set_visibility(
 #[unsafe(no_mangle)]
 pub extern "C" fn compositor_core_timer_fired(core: &CompositorCore, timer_number: u64, now_nanoseconds: i64) {
     core.timer_fired(timer_number, MonotonicTime::from_nanoseconds(now_nanoseconds));
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn compositor_core_set_ui_overlays(
-    core: &CompositorCore,
-    context_id: u64,
-    ui_overlays: &FfiUIOverlays<'_>,
-    now_nanoseconds: i64,
-) {
-    let paused_debugger = ui_overlays.has_paused_debugger.then(|| PausedDebuggerOverlayState {
-        font_family: ui_overlays
-            .paused_debugger_has_font_family
-            .then(|| String::from_utf8_lossy(ui_overlays.paused_debugger_font_family.as_slice()).into_owned()),
-        hovered_action: match (
-            ui_overlays.paused_debugger_has_hovered_action,
-            ui_overlays.paused_debugger_hovered_action,
-        ) {
-            (true, 0) => Some(PausedDebuggerOverlayAction::StepOver),
-            (true, 1) => Some(PausedDebuggerOverlayAction::Continue),
-            _ => None,
-        },
-    });
-    let picture_in_picture_controls =
-        ui_overlays
-            .has_picture_in_picture_controls
-            .then_some(PictureInPictureControlsState {
-                shown: ui_overlays.picture_in_picture_controls_shown,
-                hovered_control: match (
-                    ui_overlays.picture_in_picture_controls_has_hovered_control,
-                    ui_overlays.picture_in_picture_controls_hovered_control,
-                ) {
-                    (true, 0) => Some(PictureInPictureControl::BackToTab),
-                    (true, 1) => Some(PictureInPictureControl::Close),
-                    _ => None,
-                },
-            });
-    core.set_ui_overlays(
-        CompositorContextId(context_id),
-        UIOverlays {
-            paused_debugger,
-            picture_in_picture_controls,
-            compositor_layers: ui_overlays.has_compositor_layers.then(|| CompositorLayersOverlayState {
-                font_family: ui_overlays.compositor_layers_has_font_family.then(|| {
-                    String::from_utf8_lossy(ui_overlays.compositor_layers_font_family.as_slice()).into_owned()
-                }),
-                hidden_layer_ids: ui_overlays.compositor_layers_hidden_layer_ids.as_slice().to_vec(),
-                selected_layer_ids: ui_overlays.compositor_layers_selected_layer_ids.as_slice().to_vec(),
-                hovered_layer_id: ui_overlays
-                    .compositor_layers_has_hovered_layer_id
-                    .then_some(ui_overlays.compositor_layers_hovered_layer_id),
-                raster_count_reset_generation: ui_overlays.compositor_layers_raster_count_reset_generation,
-            }),
-        },
-        MonotonicTime::from_nanoseconds(now_nanoseconds),
-    );
 }
 
 #[unsafe(no_mangle)]

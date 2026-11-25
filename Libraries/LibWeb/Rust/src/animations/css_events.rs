@@ -329,7 +329,6 @@ mod tests {
             custom_property_name: RetainedUtf16FlyString::none(),
             generation: 0,
             start_time: 0.0,
-            end_time: 0.0,
             start_value: RetainedStyleValueData::none(),
             end_value: RetainedStyleValueData::none(),
             reversing_adjusted_start_value: RetainedStyleValueData::none(),
@@ -337,6 +336,7 @@ mod tests {
             property_id: 1,
             previous_phase: TransitionPhase::Idle,
             provisional: false,
+            initial_ready_time: None,
             adopted_from_lane: false,
             effect_started_with: None,
         }));

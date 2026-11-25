@@ -150,7 +150,7 @@ static Utf16String generated_content_accessible_text(Element const& element, CSS
 static constexpr u32 max_node_directory_generation = (1u << 21) - 1;
 
 struct NodeDirectorySlot {
-    GC::RawPtr<Node> node;
+    GC::Weak<Node> node;
     u32 generation { 0 };
     // The free slot freed after this one, while this one is free.
     u32 next_free { 0 };
@@ -209,7 +209,7 @@ Node* Node::from_unique_id(UniqueNodeID unique_id)
     auto const& directory = node_directory();
     if (index >= directory.size() || directory[index].generation != generation)
         return nullptr;
-    return directory[index].node.ptr();
+    return directory[index].node.ptr().ptr();
 }
 
 Node::Node(Document& document, NodeType type)
@@ -278,7 +278,7 @@ void Node::register_html_collection_with_valid_cache(HTMLCollection& collection)
     auto& collections = ensure_rare_data().html_collections_with_valid_caches;
     if (!collections)
         collections = make<HTMLCollectionCacheRegistration::List>();
-    collections->append(collection.m_cache_registration);
+    collections->append(collection);
 }
 
 void Node::invalidate_html_collection_caches_in_ancestors(ChildrenChangedMetadata::AffectsElements affects_elements)
@@ -292,7 +292,7 @@ void Node::invalidate_html_collection_caches_in_ancestors(ChildrenChangedMetadat
 
         GC::RootVector<GC::Ref<HTMLCollection>> collections;
         for (auto& registration : *ancestor->m_rare_data->html_collections_with_valid_caches)
-            collections.append(registration.collection());
+            collections.append(static_cast<HTMLCollection&>(registration));
         for (auto& collection : collections)
             collection->invalidate_cache_for_tree_mutation(*this);
     }
@@ -307,7 +307,7 @@ void Node::invalidate_html_collection_caches_in_ancestors_for_attribute_change(H
 
         GC::RootVector<GC::Ref<HTMLCollection>> collections;
         for (auto& registration : *ancestor->m_rare_data->html_collections_with_valid_caches)
-            collections.append(registration.collection());
+            collections.append(static_cast<HTMLCollection&>(registration));
         for (auto& collection : collections)
             collection->invalidate_cache_for_attribute_change(element, invalidation_types);
     }

@@ -12,7 +12,6 @@
 #include <Compositor/CompositorCoreHost.h>
 #include <Compositor/PaintingSurface.h>
 #include <LibCompositing/Types.h>
-#include <LibCompositing/UIOverlays.h>
 #include <LibIPC/Message.h>
 #include <LibIPC/RawMessage.h>
 
@@ -36,34 +35,17 @@ public:
     // Also leaves the contexts nested in it without a parent.
     void destroy_context(Web::CompositorContextId);
     ContextOwnerCheckResult check_context_owner(Web::CompositorContextId, WebContentClientId) const;
-    bool context_can_be_nested_in(Web::CompositorContextId, Web::CompositorContextId parent_context_id) const;
-    bool presents_to_client(Web::CompositorContextId) const;
     bool context_is_effectively_visible(Web::CompositorContextId) const;
     Optional<Web::CompositorContextId> parent_context(Web::CompositorContextId) const;
     Optional<PresentationId> bound_presentation(Web::CompositorContextId) const;
-    void set_parent_context(Web::CompositorContextId, Optional<Web::CompositorContextId>);
-    void stop_presenting_to_client(Web::CompositorContextId);
     // Ends the fling of a context that is hidden, whether or not it was visible. Answers whether the context became
     // visible.
     bool set_visibility(Web::CompositorContextId, Compositing::ContextVisibility);
-    void viewport_size_updated(Web::CompositorContextId, Gfx::IntSize, double device_pixel_ratio, Compositing::WindowResizingInProgress);
-    void set_ui_overlays(Web::CompositorContextId, Compositing::UIOverlays const&);
 
     void register_presentation(PresentationId, PresentationCapabilities const&);
     // Leaves every context bound to the presentation unbound.
     void unregister_presentation(PresentationId);
-    void set_presentation_gpu_capability(PresentationId, bool supported, u64 adapter_luid);
-    void set_scrollbar_track_press_jumps(PresentationId, bool jumps);
-    void bind_presentation(Web::CompositorContextId, PresentationId);
-    void set_display_metadata(Web::CompositorContextId, Optional<u64> display_id, double refresh_rate);
-    void set_window_server_may_show_high_dynamic_range(bool);
-    void set_presents_from_cpu_memory(Web::CompositorContextId, bool);
-    void set_scales_frames_to_fit(Web::CompositorContextId, bool);
 
-    void request_rendering_opportunity(Web::CompositorContextId, double maximum_frames_per_second);
-    void request_clock_tick(Web::CompositorContextId, double maximum_frames_per_second);
-    void hurry_rendering_opportunity(Web::CompositorContextId);
-    void present_frame_of_page(Web::CompositorContextId, Gfx::IntRect viewport_rect);
     void presented_store_released(Web::CompositorContextId, i32 bitmap_id);
     void vsync(Optional<u64> display_id, MonotonicTime frame_time);
     void gpu_work_finished(u64 token);
@@ -84,11 +66,12 @@ public:
 
     void timer_fired(u64 timer_number);
 
-    // The messages of CompositorWebContentServer, CompositorPresentationServer and CompositorControlServer that are marked
-    // [RustReceiver].
+    // The messages of CompositorWebContentServer, CompositorPresentationServer, CompositorControlServer and
+    // RenderClockServer that are marked [RustReceiver].
     IPC::RawMessage::OutcomeInRust handle_message_from_web_content(WebContentClientId, IPC::RawMessage&);
     IPC::RawMessage::OutcomeInRust handle_message_from_presentation(PresentationId, IPC::RawMessage&);
     IPC::RawMessage::OutcomeInRust handle_message_from_control(IPC::RawMessage&);
+    IPC::RawMessage::OutcomeInRust handle_message_from_render_clock(WebContentClientId, IPC::RawMessage&);
 
 private:
     RustFFI::CompositorCore* m_core { nullptr };

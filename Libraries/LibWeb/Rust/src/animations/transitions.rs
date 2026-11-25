@@ -14,7 +14,7 @@ use super::effect::{AnimationEffectId, EffectHandle};
 use super::element_animations::{AnimationOwnerSlot, ElementAnimations};
 use super::host_effects::{HostEffectKind, HostEffects};
 use super::procedures::{Invalidate, Procedures};
-use super::timing::{AnimationPlayState, FillMode, SpecifiedIterationDuration};
+use super::timing::{self, AnimationEffectPhase, AnimationPlayState, FillMode, SpecifiedIterationDuration};
 use crate::css::retained_fly_string::RetainedUtf16FlyString;
 use crate::css::transition::{FfiExistingTransition, FfiLaneTransition};
 
@@ -98,10 +98,9 @@ impl AnimationRecord {
         }
     }
 
-    /// What a style change event that decides the transitions of the transition's target reads of the transition, at
-    /// time `t` of the document timeline, in milliseconds. The host gives the current value of a running transition of
-    /// a custom property.
-    pub(crate) fn existing_transition(&self, t: f64) -> FfiExistingTransition {
+    /// What a style change event that decides the transitions of the transition's target reads of the transition. The
+    /// host gives the current value of a running transition of a custom property.
+    pub(crate) fn existing_transition(&self) -> FfiExistingTransition {
         let state = self.css_transition();
         let running = !self.playback().is_finished && self.play_state() != AnimationPlayState::Idle;
         FfiExistingTransition {
@@ -109,36 +108,52 @@ impl AnimationRecord {
             custom_name: state.custom_property_name.raw(),
             custom_current_value: std::ptr::null(),
             running,
+            ended: self.effect_ended(),
             end_value: state.end_value.pointer(),
             reversing_adjusted_start_value: state.reversing_adjusted_start_value.pointer(),
-            timing_function_output: if running {
-                self.timing_function_output_at_time(t)
-            } else {
-                0.0
-            },
+            timing_function_output: if running { self.timing_function_output() } else { 0.0 },
             reversing_shortening_factor: state.reversing_shortening_factor,
         }
     }
 
-    /// The output of the timing function of the effect the transition was started with at time `t` of the document
-    /// timeline, in milliseconds, through the transition's interval.
-    fn timing_function_output_at_time(&self, t: f64) -> f64 {
+    /// Whether the associated effect is past its active interval at the current time of the animation and no longer
+    /// contributes a value.
+    fn effect_ended(&self) -> bool {
+        let Some(effect) = self.effect() else {
+            return false;
+        };
+        let sample = self.timeline().map(|timeline| timeline.sample());
+        let timeline_time = sample.as_ref().and_then(|sample| sample.current_time.get());
+        let current_time = timing::current_time_at(self.playback(), timeline_time);
+        let resolved = timing::resolve_timing(
+            &effect.borrow().timing(),
+            current_time,
+            Some(self.playback()),
+            sample.as_ref(),
+        );
+        resolved.phase == AnimationEffectPhase::After && !timing::is_in_effect(&resolved)
+    }
+
+    /// The output of the timing function of the effect the transition was started with at the current time of the
+    /// animation, before its active interval as at its start and after it as at its end.
+    fn timing_function_output(&self) -> f64 {
         let state = self.css_transition();
         let effect = state
             .effect_started_with
             .as_ref()
             .expect("a transition is started with an effect")
             .borrow();
-        // AD-HOC: If the transition has an empty duration then we get NaN here,
-        // setting progress to 1 because an instant transition may be considered "finished".
-        let mut progress = 1.0;
-        if state.start_time < state.end_time {
-            progress = (t - state.start_time) / (state.end_time - state.start_time);
-        }
-
-        // FIXME: Is this before_flag value correct?
-        let before_flag = t < state.start_time;
-        effect.timing_function().as_easing().evaluate_at(progress, before_flag)
+        let timing = effect.timing();
+        let sample = self.timeline().map(|timeline| timeline.sample());
+        let timeline_time = sample.as_ref().and_then(|sample| sample.current_time.get());
+        let playback = self.playback();
+        let current_time = timing::current_time_at(playback, timeline_time);
+        let resolved =
+            timing::resolve_timing_using_fill(&timing, current_time, Some(playback), sample.as_ref(), FillMode::Both);
+        let output = timing::transformed_progress_with(&timing, &resolved, |progress, before_flag| {
+            effect.timing_function().as_easing().evaluate_at(progress, before_flag)
+        });
+        output.unwrap_or(0.0)
     }
 }
 

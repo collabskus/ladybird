@@ -75,6 +75,11 @@ IPC::RawMessage::OutcomeInRust CompositorState::handle_message_from_control(IPC:
     return m_core.handle_message_from_control(message);
 }
 
+IPC::RawMessage::OutcomeInRust CompositorState::handle_message_from_render_clock(WebContentClientId client_id, IPC::RawMessage& message)
+{
+    return m_core.handle_message_from_render_clock(client_id, message);
+}
+
 CompositorState::PresentedContext::PresentedContext(CompositorStateWebContentClient& web_content_client, OwnedCanvasSurfaces canvas_surfaces)
     : web_content_client(web_content_client)
     , raster_targets(canvas_surfaces)
@@ -170,14 +175,6 @@ void CompositorState::unregister_presentation(CompositorStateClient& presentatio
 {
     m_core.unregister_presentation(presentation.presentation_id());
     m_presentations_by_id.remove(presentation.presentation_id());
-}
-
-void CompositorState::bind_presentation(Web::CompositorContextId context_id, CompositorStateClient& presentation)
-{
-    VERIFY(presentation_if_present(presentation.presentation_id()) == &presentation);
-    if (!presented_context_if_present(context_id))
-        return;
-    m_core.bind_presentation(context_id, presentation.presentation_id());
 }
 
 CompositorStateClient* CompositorState::presentation_for_context(Web::CompositorContextId context_id) const
@@ -315,24 +312,6 @@ void CompositorState::destroy_context(Web::CompositorContextId context_id)
     m_core.destroy_context(context_id);
     m_presented_contexts.remove(context_id);
     update_unpainted_video_update_scheduling();
-}
-
-bool CompositorState::context_can_be_nested_in(Web::CompositorContextId context_id, Web::CompositorContextId parent_context_id) const
-{
-    VERIFY(presented_context_if_present(context_id));
-    return m_core.context_can_be_nested_in(context_id, parent_context_id);
-}
-
-void CompositorState::set_parent_context(Web::CompositorContextId context_id, Optional<Web::CompositorContextId> parent_context_id)
-{
-    VERIFY(presented_context_if_present(context_id));
-    m_core.set_parent_context(context_id, parent_context_id);
-}
-
-void CompositorState::stop_presenting_to_client(Web::CompositorContextId context_id)
-{
-    VERIFY(presented_context_if_present(context_id));
-    m_core.stop_presenting_to_client(context_id);
 }
 
 bool CompositorState::describe_display_list_fonts(Web::CompositorContextId context_id, ReadonlySpan<Compositing::DisplayListFontDescription> fonts, Compositing::RegisteredTypefaces const& registered_typefaces)
@@ -718,37 +697,12 @@ bool CompositorState::context_video_sinks_require_updates(Web::CompositorContext
     return false;
 }
 
-void CompositorState::viewport_size_updated(Web::CompositorContextId context_id, Gfx::IntSize viewport_size, double device_pixel_ratio, Compositing::WindowResizingInProgress window_resize_in_progress)
-{
-    if (!presented_context_if_present(context_id))
-        return;
-    m_core.viewport_size_updated(context_id, viewport_size, device_pixel_ratio, window_resize_in_progress);
-}
-
 Optional<OverlayLabel> CompositorState::shape_overlay_label(Web::CompositorContextId context_id, Optional<StringView> font_family, float font_size_in_points, double device_pixel_ratio, StringView text)
 {
     auto* context = presented_context_if_present(context_id);
     if (!context)
         return {};
     return context->raster_targets.shape_overlay_label(font_family, font_size_in_points, device_pixel_ratio, text);
-}
-
-void CompositorState::set_ui_overlays(Web::CompositorContextId context_id, Compositing::UIOverlays overlays)
-{
-    if (!presented_context_if_present(context_id))
-        return;
-    m_core.set_ui_overlays(context_id, overlays);
-}
-
-void CompositorState::set_display_metadata(Web::CompositorContextId context_id, Optional<u64> display_id, double refresh_rate)
-{
-    if (!presented_context_if_present(context_id))
-        return;
-
-    VERIFY(refresh_rate == refresh_rate);
-    VERIFY(refresh_rate > 0);
-    VERIFY(refresh_rate < AK::Infinity<double>);
-    m_core.set_display_metadata(context_id, display_id, refresh_rate);
 }
 
 void CompositorState::set_context_visibility(Web::CompositorContextId context_id, Compositing::ContextVisibility visibility)
@@ -759,51 +713,6 @@ void CompositorState::set_context_visibility(Web::CompositorContextId context_id
     // An image that was hidden finds its place by the clock again.
     if (m_core.set_visibility(context_id, visibility))
         schedule_animated_image_update({});
-}
-
-void CompositorState::set_window_server_may_show_high_dynamic_range(bool may_show)
-{
-    m_core.set_window_server_may_show_high_dynamic_range(may_show);
-}
-
-void CompositorState::set_context_presents_from_cpu_memory(Web::CompositorContextId context_id, bool presents_from_cpu_memory)
-{
-    if (!presented_context_if_present(context_id))
-        return;
-    m_core.set_presents_from_cpu_memory(context_id, presents_from_cpu_memory);
-}
-
-void CompositorState::set_context_scales_frames_to_fit(Web::CompositorContextId context_id, bool scales_frames_to_fit)
-{
-    if (!presented_context_if_present(context_id))
-        return;
-    m_core.set_scales_frames_to_fit(context_id, scales_frames_to_fit);
-}
-
-void CompositorState::request_rendering_opportunity(Web::CompositorContextId context_id, double maximum_frames_per_second)
-{
-    VERIFY(presented_context_if_present(context_id));
-    m_core.request_rendering_opportunity(context_id, maximum_frames_per_second);
-}
-
-void CompositorState::request_clock_tick(Web::CompositorContextId context_id, double maximum_frames_per_second)
-{
-    if (!presented_context_if_present(context_id))
-        return;
-    m_core.request_clock_tick(context_id, maximum_frames_per_second);
-}
-
-void CompositorState::hurry_rendering_opportunity(Web::CompositorContextId context_id)
-{
-    if (!presented_context_if_present(context_id))
-        return;
-    m_core.hurry_rendering_opportunity(context_id);
-}
-
-void CompositorState::present_frame(Web::CompositorContextId context_id, Gfx::IntRect viewport_rect)
-{
-    VERIFY(presented_context_if_present(context_id));
-    m_core.present_frame_of_page(context_id, viewport_rect);
 }
 
 // How long a screenshot waits for the video sinks it draws to catch up to their clocks, after which it shows the frames
@@ -1032,16 +941,6 @@ void CompositorState::presented_bitmap_ready_to_paint(Web::CompositorContextId c
     if (!presented_context_if_present(context_id))
         return;
     m_core.presented_store_released(context_id, bitmap_id);
-}
-
-void CompositorState::set_scrollbar_track_press_jumps(CompositorStateClient& presentation, bool jumps)
-{
-    m_core.set_scrollbar_track_press_jumps(presentation.presentation_id(), jumps);
-}
-
-void CompositorState::set_client_gpu_presentation_capability(CompositorStateClient& presentation, bool supported, u64 adapter_luid)
-{
-    m_core.set_presentation_gpu_capability(presentation.presentation_id(), supported, adapter_luid);
 }
 
 CompositorState::PresentedContext* CompositorState::presented_context_if_present(Web::CompositorContextId context_id)

@@ -5,7 +5,6 @@
  */
 
 #include <AK/Debug.h>
-#include <AK/Math.h>
 #include <Compositor/ConnectionFromWebContent.h>
 #include <LibGfx/ColorSpace.h>
 #include <LibWebCommon/Page/InputEvent.h>
@@ -51,14 +50,10 @@ void ConnectionFromWebContent::install_render_clock_channel(IPC::TransportHandle
     }
     // A new channel replaces the one before it, whose requests were for the contexts the process armed then.
     m_render_clock_connection = RenderClockConnection::construct(transport_or_error.release_value(), client_id());
-    m_render_clock_connection->on_request_clock_tick = [this](Web::CompositorContextId context_id, double maximum_frames_per_second) {
-        if (!context_is_owned_by_this_connection(context_id))
-            return;
-        if (!isfinite(maximum_frames_per_second) || maximum_frames_per_second <= 0) {
-            did_misbehave("WebContent sent an invalid maximum clock tick rate");
-            return;
-        }
-        m_compositor_state->request_clock_tick(context_id, maximum_frames_per_second);
+    m_render_clock_connection->on_raw_message = [this](IPC::RawMessage& message) {
+        auto outcome = m_compositor_state->handle_message_from_render_clock(web_content_client_id(), message);
+        if (outcome.misbehavior.has_value())
+            did_misbehave(outcome.misbehavior->characters());
     };
 }
 
@@ -233,42 +228,6 @@ bool ConnectionFromWebContent::context_is_owned_by_this_connection(Web::Composit
     VERIFY_NOT_REACHED();
 }
 
-void ConnectionFromWebContent::request_rendering_opportunity(Web::CompositorContextId context_id, double maximum_frames_per_second)
-{
-    if (!context_is_owned_by_this_connection(context_id))
-        return;
-    if (!isfinite(maximum_frames_per_second) || maximum_frames_per_second <= 0) {
-        did_misbehave("WebContent sent an invalid maximum frame rate");
-        return;
-    }
-    m_compositor_state->request_rendering_opportunity(context_id, maximum_frames_per_second);
-}
-
-void ConnectionFromWebContent::hurry_rendering_opportunity(Web::CompositorContextId context_id)
-{
-    if (!context_is_owned_by_this_connection(context_id))
-        return;
-    m_compositor_state->hurry_rendering_opportunity(context_id);
-}
-
-void ConnectionFromWebContent::set_parent_context(Web::CompositorContextId context_id, Optional<Web::CompositorContextId> parent_context_id)
-{
-    if (!context_is_owned_by_this_connection(context_id))
-        return;
-    if (parent_context_id.has_value() && !m_compositor_state->context_can_be_nested_in(context_id, *parent_context_id)) {
-        did_misbehave("WebContent nested a compositor context that cannot be nested");
-        return;
-    }
-    m_compositor_state->set_parent_context(context_id, parent_context_id);
-}
-
-void ConnectionFromWebContent::stop_presenting_to_client(Web::CompositorContextId context_id)
-{
-    if (!context_is_owned_by_this_connection(context_id))
-        return;
-    m_compositor_state->stop_presenting_to_client(context_id);
-}
-
 void ConnectionFromWebContent::destroy_context(Web::CompositorContextId context_id)
 {
     if (!context_is_owned_by_this_connection(context_id))
@@ -349,24 +308,6 @@ Messages::CompositorWebContentServer::GetPlaceholderCanvasPixelsResponse Connect
 void ConnectionFromWebContent::placeholder_canvas_committed(Compositing::CanvasId canvas_id, Gfx::IntSize size, bool origin_clean)
 {
     async_placeholder_canvas_committed(canvas_id, size, origin_clean);
-}
-
-void ConnectionFromWebContent::viewport_size_updated(Web::CompositorContextId context_id, Gfx::IntSize viewport_size, double device_pixel_ratio, Compositing::WindowResizingInProgress window_resize_in_progress)
-{
-    if (!context_is_owned_by_this_connection(context_id))
-        return;
-    if (!isfinite(device_pixel_ratio) || device_pixel_ratio <= 0) {
-        did_misbehave("WebContent sent an invalid device pixel ratio");
-        return;
-    }
-    m_compositor_state->viewport_size_updated(context_id, viewport_size, device_pixel_ratio, window_resize_in_progress);
-}
-
-void ConnectionFromWebContent::present_frame(Web::CompositorContextId context_id, Gfx::IntRect viewport_rect)
-{
-    if (!context_is_owned_by_this_connection(context_id))
-        return;
-    m_compositor_state->present_frame(context_id, viewport_rect);
 }
 
 void ConnectionFromWebContent::prepare_remote_descendants_for_screenshot(Web::CompositorContextId context_id, u64 request_id)

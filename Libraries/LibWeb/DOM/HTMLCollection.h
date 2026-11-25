@@ -9,8 +9,10 @@
 
 #include <LibGC/Function.h>
 #include <LibGC/Ptr.h>
+#include <LibGC/RootVector.h>
 #include <LibGC/Weak.h>
 #include <LibGC/WeakContainer.h>
+#include <LibGC/WeakVector.h>
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/DOM/HTMLCollectionCacheRegistration.h>
 #include <LibWeb/Forward.h>
@@ -32,7 +34,8 @@ namespace Web::DOM {
 
 class HTMLCollection
     : public Bindings::GCAllocatedWrappable
-    , public GC::WeakContainer {
+    , public GC::WeakContainer
+    , public HTMLCollectionCacheRegistration {
     WEB_WRAPPABLE(HTMLCollection, Bindings::GCAllocatedWrappable);
     GC_DECLARE_ALLOCATOR(HTMLCollection);
 
@@ -74,7 +77,7 @@ protected:
     GC::Ref<ParentNode const> root() const { return *m_root; }
     bool element_matches_filter(Element const& element) const { return (*m_filter)(element); }
 
-    virtual void collect_elements_into(Vector<GC::RawPtr<Element>>&) const;
+    virtual void collect_elements_into(GC::RootVector<GC::Ref<Element>>&) const;
 
     virtual void visit_edges(GC::Cell::Visitor&) override;
 
@@ -98,14 +101,12 @@ private:
 
     mutable GC::Weak<Document const> m_cached_document;
     mutable u64 m_cached_invalidation_version { 0 };
-    mutable Vector<GC::RawPtr<Element>> m_cached_elements;
-    mutable OwnPtr<OrderedHashMap<Utf16FlyString, GC::RawPtr<Element>>> m_cached_name_to_element_mappings;
+    mutable GC::WeakVector<Element> m_cached_elements;
+    mutable OwnPtr<OrderedHashMap<Utf16FlyString, GC::Weak<Element>>> m_cached_name_to_element_mappings;
 
     GC::Ref<ParentNode> m_root;
     Filter m_filter;
     Sort m_sort;
-
-    mutable HTMLCollectionCacheRegistration m_cache_registration;
 
     Scope m_scope { Scope::Descendants };
     Kind m_kind { Kind::Generic };

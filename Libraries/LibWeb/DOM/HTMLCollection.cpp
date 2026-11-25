@@ -29,7 +29,6 @@ HTMLCollection::HTMLCollection(ParentNode& root, Scope scope, Filter filter, Att
     , m_root(root)
     , m_filter(filter)
     , m_sort(sort)
-    , m_cache_registration(*this)
     , m_scope(scope)
     , m_kind(kind)
     , m_attribute_invalidation_type(attribute_invalidation_type)
@@ -59,12 +58,10 @@ GC::Cell const& HTMLCollection::owner_cell(Badge<GC::Heap>) const
 
 void HTMLCollection::remove_dead_cells(Badge<GC::Heap>)
 {
-    m_cached_elements.remove_all_matching([&](GC::RawPtr<Element> const& element) {
-        return !heap().is_live_cell(element.ptr()) || !element->is_marked();
-    });
+    m_cached_elements.remove_dead_cells(heap());
     if (m_cached_name_to_element_mappings) {
-        m_cached_name_to_element_mappings->remove_all_matching([&](Utf16FlyString const&, GC::RawPtr<Element> const& element) {
-            return !heap().is_live_cell(element.ptr()) || !element->is_marked();
+        m_cached_name_to_element_mappings->remove_all_matching([](Utf16FlyString const&, GC::Weak<Element> const& element) {
+            return !element;
         });
     }
 }
@@ -74,17 +71,17 @@ void HTMLCollection::update_name_to_element_mappings_if_needed() const
     update_cache_if_needed();
     if (m_cached_name_to_element_mappings)
         return;
-    m_cached_name_to_element_mappings = make<OrderedHashMap<Utf16FlyString, GC::RawPtr<Element>>>();
-    for (auto const& element : m_cached_elements) {
+    m_cached_name_to_element_mappings = make<OrderedHashMap<Utf16FlyString, GC::Weak<Element>>>();
+    for (auto& element : m_cached_elements) {
         // 1. If element has an ID which is not in result, append element’s ID to result.
-        if (auto const& id = element->id(); id.has_value()) {
+        if (auto const& id = element.id(); id.has_value()) {
             if (!id.value().is_empty() && !m_cached_name_to_element_mappings->contains(id.value()))
                 m_cached_name_to_element_mappings->set(id.value(), element);
         }
 
         // 2. If element is in the HTML namespace and has a name attribute whose value is neither the empty string nor is in result, append element’s name attribute value to result.
-        if (element->namespace_uri() == Namespace::HTML && element->name().has_value()) {
-            auto element_name = element->name().value();
+        if (element.namespace_uri() == Namespace::HTML && element.name().has_value()) {
+            auto element_name = element.name().value();
             if (!element_name.is_empty() && !m_cached_name_to_element_mappings->contains(element_name))
                 m_cached_name_to_element_mappings->set(move(element_name), element);
         }
@@ -92,7 +89,7 @@ void HTMLCollection::update_name_to_element_mappings_if_needed() const
     m_cached_document->register_valid_html_collection_cache(AttributeInvalidationType::IdOrName);
 }
 
-void HTMLCollection::collect_elements_into(Vector<GC::RawPtr<Element>>& elements) const
+void HTMLCollection::collect_elements_into(GC::RootVector<GC::Ref<Element>>& elements) const
 {
     if (m_scope == Scope::Descendants) {
         m_root->for_each_in_subtree_of_type<Element>([&](auto& element) {
@@ -112,7 +109,7 @@ void HTMLCollection::collect_elements_into(Vector<GC::RawPtr<Element>>& elements
 bool HTMLCollection::cache_is_valid() const
 {
     auto& document = root()->document();
-    return m_cache_registration.list_node.is_in_list()
+    return list_node.is_in_list()
         && m_cached_document.ptr().ptr() == &document
         && m_cached_invalidation_version == invalidation_version(document);
 }
@@ -126,15 +123,16 @@ void HTMLCollection::update_cache_if_needed() const
 
     invalidate_cache();
 
-    m_cached_elements.clear();
     m_cached_name_to_element_mappings = nullptr;
-    collect_elements_into(m_cached_elements);
+    GC::RootVector<GC::Ref<Element>> elements;
+    collect_elements_into(elements);
 
     if (m_sort) {
-        insertion_sort(m_cached_elements, [this](auto const& a, auto const& b) {
+        insertion_sort(elements, [this](auto const& a, auto const& b) {
             return (*this->m_sort)(*a, *b);
         });
     }
+    m_cached_elements = GC::WeakVector<Element> { elements };
 
     m_cached_document = document;
     m_cached_invalidation_version = invalidation_version;
@@ -144,12 +142,12 @@ void HTMLCollection::update_cache_if_needed() const
 
 void HTMLCollection::invalidate_cache() const
 {
-    if (!m_cache_registration.list_node.is_in_list())
+    if (!list_node.is_in_list())
         return;
     invalidate_name_to_element_mappings();
     if (auto cached_document = m_cached_document.ptr())
         cached_document->unregister_valid_html_collection_cache(m_attribute_invalidation_type);
-    m_cache_registration.list_node.remove();
+    list_node.remove();
     m_cached_elements.clear();
 }
 
@@ -190,7 +188,7 @@ void HTMLCollection::invalidate_cache_for_attribute_change(Element const& elemen
 
     // OPTIMIZATION: The cache still records whether the element matched before the attribute
     // change. Keep the element vector when reevaluating the filter produces the same result.
-    bool was_matching = m_cached_elements.contains([&](auto const& cached_element) { return cached_element.ptr() == &element; });
+    bool was_matching = m_cached_elements.contains(element);
     if (was_matching != (*m_filter)(element)) {
         invalidate_cache();
         return;
@@ -218,7 +216,7 @@ GC::RootVector<GC::Ref<Element>> HTMLCollection::collect_matching_elements() con
     update_cache_if_needed();
     GC::RootVector<GC::Ref<Element>> elements;
     for (auto& element : m_cached_elements)
-        elements.append(*element);
+        elements.append(element);
     return elements;
 }
 
@@ -237,7 +235,7 @@ Element* HTMLCollection::item(size_t index) const
     update_cache_if_needed();
     if (index >= m_cached_elements.size())
         return nullptr;
-    return m_cached_elements[index].ptr();
+    return &m_cached_elements[index];
 }
 
 // https://dom.spec.whatwg.org/#dom-htmlcollection-nameditem-key
@@ -249,7 +247,7 @@ Element* HTMLCollection::named_item(Utf16View key) const
 
     update_name_to_element_mappings_if_needed();
     if (auto it = m_cached_name_to_element_mappings->get(key); it.has_value())
-        return it.value().ptr();
+        return it.value().ptr().ptr();
     return nullptr;
 }
 

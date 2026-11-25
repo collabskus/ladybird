@@ -100,7 +100,6 @@ public:
     // Each root context presents to the presentation it is bound to. Unbound contexts keep rendering, but publish nothing.
     PresentationId register_presentation(CompositorStateClient&, PresentationCapabilities);
     void unregister_presentation(CompositorStateClient&);
-    void bind_presentation(Web::CompositorContextId, CompositorStateClient&);
     CompositorStateClient* presentation_for_context(Web::CompositorContextId) const;
     WebContentClientId register_web_content_client(CompositorStateWebContentClient&);
     ContextOwnerCheckResult check_context_owner(Web::CompositorContextId, WebContentClientId);
@@ -113,9 +112,6 @@ public:
     void create_context(Web::CompositorContextId, Optional<u64> page_id, CompositorStateWebContentClient&);
     void destroy_context(Web::CompositorContextId);
 
-    bool context_can_be_nested_in(Web::CompositorContextId, Web::CompositorContextId parent_context_id) const;
-    void set_parent_context(Web::CompositorContextId, Optional<Web::CompositorContextId> parent_context_id);
-    void stop_presenting_to_client(Web::CompositorContextId);
     [[nodiscard]] bool describe_display_list_fonts(Web::CompositorContextId, ReadonlySpan<Compositing::DisplayListFontDescription>, Compositing::RegisteredTypefaces const&);
     // The fonts and image frames that the display list of the next rasterization under the token draws, and the bitmap
     // it is rasterized into. Answers false for a token in use, for more rasterizations than a client can have
@@ -140,20 +136,8 @@ public:
     IPC::RawMessage::OutcomeInRust handle_message_from_web_content(WebContentClientId, IPC::RawMessage&);
     IPC::RawMessage::OutcomeInRust handle_message_from_presentation(PresentationId, IPC::RawMessage&);
     IPC::RawMessage::OutcomeInRust handle_message_from_control(IPC::RawMessage&);
-    void viewport_size_updated(Web::CompositorContextId, Gfx::IntSize, double device_pixel_ratio, Compositing::WindowResizingInProgress);
-    void request_rendering_opportunity(Web::CompositorContextId, double maximum_frames_per_second);
-    void set_ui_overlays(Web::CompositorContextId, Compositing::UIOverlays);
-    void set_display_metadata(Web::CompositorContextId, Optional<u64> display_id, double refresh_rate);
+    IPC::RawMessage::OutcomeInRust handle_message_from_render_clock(WebContentClientId, IPC::RawMessage&);
     void set_context_visibility(Web::CompositorContextId, Compositing::ContextVisibility);
-    void set_context_presents_from_cpu_memory(Web::CompositorContextId, bool);
-    void set_context_scales_frames_to_fit(Web::CompositorContextId, bool);
-    void set_window_server_may_show_high_dynamic_range(bool);
-    void present_frame(Web::CompositorContextId, Gfx::IntRect viewport_rect);
-    // Delivers the rendering opportunity a context requested now rather than at the next display tick: a
-    // viewport change that arrived while an animation's opportunity was outstanding starts its update at once.
-    void hurry_rendering_opportunity(Web::CompositorContextId);
-    // Asks for the next display tick the context's maximum rate lets through, for its render clock.
-    void request_clock_tick(Web::CompositorContextId, double maximum_frames_per_second);
     // Paints once the video sinks that the screenshot draws have frames following their clocks, and tells the client.
     void request_screenshot(CompositorStateWebContentClient&, Web::CompositorContextId, Compositing::ScreenshotRequestId, Gfx::ShareableBitmap);
     // Has each process that owns a descendant of the context in another process paint it, along with whatever lies below
@@ -162,8 +146,6 @@ public:
     void did_paint_contexts_for_screenshot(CompositorStateWebContentClient& painter, u64 preparation_id);
     Optional<Gfx::ShareableBitmap> take_frame_snapshot(Web::CompositorContextId);
     void presented_bitmap_ready_to_paint(Web::CompositorContextId, i32 bitmap_id);
-    void set_client_gpu_presentation_capability(CompositorStateClient&, bool supported, u64 adapter_luid);
-    void set_scrollbar_track_press_jumps(CompositorStateClient&, bool jumps);
 
     // A remote layer shows the frames of one root context at a time, in a view of the presentation it was created
     // for. Answers how that view finds the layer, whose kind is None where the presentation has no remote layers.

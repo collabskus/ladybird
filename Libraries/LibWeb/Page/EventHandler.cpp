@@ -294,6 +294,8 @@ void EventHandler::visit_edges(JS::Cell::Visitor& visitor) const
     for (auto const& entry : m_additional_pointers)
         visitor.visit(entry.value->state.touch);
     m_drag_and_drop_event_handler->visit_edges(visitor);
+    if (m_captured_chrome_widget)
+        m_captured_chrome_widget->visit_edges(visitor);
     if (m_auto_scroll_handler)
         m_auto_scroll_handler->visit_edges(visitor);
     if (m_middle_button_scroll_handler)
@@ -1007,7 +1009,7 @@ static Layout::Node* scroll_containing_block_chain_smoothly(HTML::LocalNavigable
 static GC::Ptr<HTML::LocalNavigable> local_navigable_with_compositor_context(Page& page, Web::CompositorContextId context_id)
 {
     for (auto& navigable : HTML::all_local_navigables()) {
-        if (&navigable->page() == &page && navigable->has_compositor_context() && navigable->compositor_context().id() == context_id)
+        if (&navigable.page() == &page && navigable.has_compositor_context() && navigable.compositor_context().id() == context_id)
             return navigable;
     }
     return {};
