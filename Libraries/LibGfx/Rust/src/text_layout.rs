@@ -187,6 +187,7 @@ unsafe extern "C" {
         glyphs: *const ShapedGlyph,
         glyph_count: usize,
         scale: f32,
+        origin_y: f32,
         y_top: f32,
         y_bottom: f32,
         sink: *mut c_void,
@@ -237,19 +238,28 @@ pub fn glyph_run_ink_bounding_box(font: &FontHandle, glyphs: &GlyphBuffer, scale
     out_rect
 }
 
+/// Where the ink of the glyphs crosses the band from `y_top` to `y_bottom`, as pairs of left and right edges, leaving out
+/// the glyphs of the clusters that `ignores_cluster` picks out by the code unit offset they start at. The band is in
+/// device pixels from the run's origin, which falls at `origin_y`.
 #[must_use]
 pub fn glyph_run_glyph_intercepts(
     font: &FontHandle,
     glyphs: &GlyphBuffer,
     scale: f32,
+    origin_y: f32,
     y_top: f32,
     y_bottom: f32,
+    ignores_cluster: impl Fn(u32) -> bool,
 ) -> Vec<f32> {
     unsafe extern "C" fn push(sink: *mut c_void, value: f32) {
         // SAFETY: `sink` is the Vec passed below, live for the synchronous call.
         unsafe { (*sink.cast::<Vec<f32>>()).push(value) };
     }
-    let glyphs = shaped_glyphs_of(glyphs);
+    let glyphs: Vec<ShapedGlyph> = glyphs
+        .placed()
+        .filter(|placed| !ignores_cluster(placed.cluster_start))
+        .map(ShapedGlyph::from)
+        .collect();
     let mut intercepts: Vec<f32> = Vec::new();
     // SAFETY: The handle keeps the font live and the glyph slice stays valid
     // for the synchronous call; the push callback runs against the local Vec.
@@ -259,6 +269,7 @@ pub fn glyph_run_glyph_intercepts(
             glyphs.as_ptr(),
             glyphs.len(),
             scale,
+            origin_y,
             y_top,
             y_bottom,
             (&raw mut intercepts).cast(),

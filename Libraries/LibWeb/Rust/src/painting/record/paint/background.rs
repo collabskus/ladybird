@@ -27,6 +27,7 @@ use crate::painting::record::paint::background_resolution::{
 };
 use crate::painting::record::paint::gradient_resolution::{gradient_paint_value, record_gradient_fill};
 use crate::painting::record::paint::table_backgrounds;
+use crate::painting::record::paint::text_decoration;
 use crate::painting::visual_context::SpatialData;
 use libgfx_rust::{
     CompositingAndBlendingOperator, FloatRect, FloatSize, IntRect, IntSize, MaskKind, ScalingMode, WindingRule,
@@ -138,22 +139,35 @@ pub(crate) fn paint_resolved_background<O: Observer>(
     };
 
     // https://drafts.csswg.org/css-backgrounds-4/#valdef-background-clip-text
-    let needs_text_clip = resolved.needs_text_clip && !inputs.is_root_element;
-    let text_clip_fragments = if needs_text_clip {
+    let clips_to_text = resolved.clips_any_part_to_text() && !inputs.is_root_element;
+    let text_clip_fragments = if clips_to_text {
         text_clip_fragments(recorder, paintable)
     } else {
         Vec::new()
     };
     // With no text, nothing clipped to it shows: Paint just the layers clipped to some other box, without a mask.
-    let omit_text_clipped = needs_text_clip && text_clip_fragments.is_empty();
-    let needs_text_clip = needs_text_clip && !omit_text_clipped;
-    // A blending layer can't blend with the color under it when the color is left out.
+    let omit_text_clipped = clips_to_text && text_clip_fragments.is_empty();
+    let clips_to_text = clips_to_text && !omit_text_clipped;
+    // One mask covers the whole stack when every part of it is clipped to the text. Otherwise, each part clipped to the
+    // text is masked on its own, and the parts clipped to some other box paint unmasked between them.
+    let masks_whole_stack = clips_to_text && resolved.clips_every_part_to_text();
+    let text_mask_per_part = (clips_to_text && !masks_whole_stack).then_some(text_clip_fragments.as_slice());
+    // A blending layer can't blend with the color under it when the color is left out, or masked to the text.
     let backdrop = match backdrop {
-        LayerBackdrop::OpaqueColorUnderLoneLayer(_) if omit_text_clipped => LayerBackdrop::IsolatedGroup,
+        LayerBackdrop::OpaqueColorUnderLoneLayer(_) if omit_text_clipped || text_mask_per_part.is_some() => {
+            LayerBackdrop::IsolatedGroup
+        }
         backdrop => backdrop,
     };
-    if !backdrop.is_isolated_group() && !needs_text_clip {
-        paint_background_layers(recorder, paintable, inputs, backdrop, omit_text_clipped);
+    if !backdrop.is_isolated_group() && !masks_whole_stack {
+        paint_background_layers(
+            recorder,
+            paintable,
+            inputs,
+            backdrop,
+            omit_text_clipped,
+            text_mask_per_part,
+        );
         return;
     }
 
@@ -161,7 +175,7 @@ pub(crate) fn paint_resolved_background<O: Observer>(
     // Blending layers render into an isolated group, and background-clip: text masks the whole
     // stack by its glyphs, so the layers are recorded as one group command that plays them inside
     // its own saveLayer, masked by the glyph runs recorded after them.
-    let group_device_rect = if needs_text_clip {
+    let group_device_rect = if masks_whole_stack {
         converter.rounded_device_rect(background_rect)
     } else {
         converter
@@ -170,9 +184,16 @@ pub(crate) fn paint_resolved_background<O: Observer>(
     };
     let mut group = recorder.recorder.begin_isolated_group();
     recorder.trace_paint(Operation::Named(Some(paintable), "background-group"), |recorder| {
-        paint_background_layers(recorder, paintable, inputs, backdrop, omit_text_clipped);
+        paint_background_layers(
+            recorder,
+            paintable,
+            inputs,
+            backdrop,
+            omit_text_clipped,
+            text_mask_per_part,
+        );
     });
-    if needs_text_clip {
+    if masks_whole_stack {
         recorder.recorder.begin_group_mask(&mut group);
         recorder.trace_paint(Operation::Named(Some(paintable), "background-text-mask"), |recorder| {
             append_text_clip_paths(recorder, &text_clip_fragments);
@@ -193,6 +214,8 @@ fn paint_background_layers<O: Observer>(
     backdrop: LayerBackdrop,
     // Leaves out the color and the layers clipped to the text, which the caller found none of.
     omit_text_clipped: bool,
+    // The text that masks each part clipped to it, when only some parts are.
+    text_mask_per_part: Option<&[(NodeSlotId, usize)]>,
 ) {
     let converter = recorder.converter;
     let resolved = &inputs.resolved;
@@ -252,34 +275,48 @@ fn paint_background_layers<O: Observer>(
         })
     };
 
-    if omit_text_clipped {
-        // The color is clipped to the text.
-    } else if is_root_element {
-        recorder.recorder.fill_animated_background_color(
-            converter.enclosing_device_rect(color_box.rect),
-            color,
-            libgfx_rust::CornerRadii::default(),
-            background_color_animation_effect,
-            ForceDarkRole::Background,
-        );
-    } else if let Some(clip) = contour_clip(color_box.rect) {
-        recorder.recorder.record_with_inline_clips(&[clip], |painter| {
-            painter.fill_animated_background_color(
-                converter.rounded_device_rect(color_box.rect),
+    let paint_color = |recorder: &mut PaintRecorder<'_, O>| {
+        if is_root_element {
+            recorder.recorder.fill_animated_background_color(
+                converter.enclosing_device_rect(color_box.rect),
                 color,
                 libgfx_rust::CornerRadii::default(),
                 background_color_animation_effect,
                 ForceDarkRole::Background,
             );
-        });
-    } else {
-        recorder.recorder.fill_animated_background_color(
-            converter.rounded_device_rect(color_box.rect),
-            color,
-            color_box.radii.as_corners(&converter),
-            background_color_animation_effect,
-            ForceDarkRole::Background,
+        } else if let Some(clip) = contour_clip(color_box.rect) {
+            recorder.recorder.record_with_inline_clips(&[clip], |painter| {
+                painter.fill_animated_background_color(
+                    converter.rounded_device_rect(color_box.rect),
+                    color,
+                    libgfx_rust::CornerRadii::default(),
+                    background_color_animation_effect,
+                    ForceDarkRole::Background,
+                );
+            });
+        } else {
+            recorder.recorder.fill_animated_background_color(
+                converter.rounded_device_rect(color_box.rect),
+                color,
+                color_box.radii.as_corners(&converter),
+                background_color_animation_effect,
+                ForceDarkRole::Background,
+            );
+        }
+    };
+    if omit_text_clipped && resolved.color_clips_to_text {
+        // The color is clipped to the text.
+    } else if let Some(fragments) = text_mask_per_part.filter(|_| resolved.color_clips_to_text) {
+        paint_masked_by_text(
+            recorder,
+            paintable,
+            fragments,
+            background_rect,
+            CompositingAndBlendingOperator::Normal,
+            paint_color,
         );
+    } else {
+        paint_color(recorder);
     }
 
     // Shrink the effective clip rect to account for the bits the borders will definitely paint
@@ -401,6 +438,13 @@ fn paint_background_layers<O: Observer>(
             continue;
         }
 
+        // A layer clipped to the text paints into a group masked by the text, which composites it with its operator.
+        let text_mask = text_mask_per_part.filter(|_| layer.clip == css_enums::background_box::TEXT);
+        let (layer_operator, layer_backdrop) = if text_mask.is_some() {
+            (CompositingAndBlendingOperator::Normal, LayerBackdrop::Canvas)
+        } else {
+            (compositing_and_blending_operator, backdrop)
+        };
         let paint_layer = |recorder: &mut PaintRecorder<'_, O>| {
             if layer.image.is_some() {
                 paint_image_layer(
@@ -410,15 +454,51 @@ fn paint_background_layers<O: Observer>(
                     inputs.image_rendering,
                     css_clip_rect,
                     clip_rect,
-                    compositing_and_blending_operator,
-                    backdrop,
+                    layer_operator,
+                    layer_backdrop,
                     inputs.visible_device_rect,
                 );
             }
         };
 
-        recorder.record_with_inline_clips(&layer_inline_clips, paint_layer);
+        match text_mask {
+            Some(fragments) => paint_masked_by_text(
+                recorder,
+                paintable,
+                fragments,
+                background_rect,
+                compositing_and_blending_operator,
+                |recorder| recorder.record_with_inline_clips(&layer_inline_clips, paint_layer),
+            ),
+            None => recorder.record_with_inline_clips(&layer_inline_clips, paint_layer),
+        }
     }
+}
+
+// https://drafts.csswg.org/css-backgrounds-4/#valdef-background-clip-text
+// Paints one part of a background stack that's clipped to the text, in a group masked by the text and its decorations,
+// and composited with the part's operator.
+fn paint_masked_by_text<'a, O: Observer>(
+    recorder: &mut PaintRecorder<'a, O>,
+    paintable: NodeSlotId,
+    fragments: &[(NodeSlotId, usize)],
+    background_rect: CssPixelRect,
+    compositing_and_blending_operator: CompositingAndBlendingOperator,
+    paint: impl FnOnce(&mut PaintRecorder<'a, O>),
+) {
+    let group_device_rect = recorder.converter.rounded_device_rect(background_rect);
+    let mut group = recorder.recorder.begin_isolated_group();
+    recorder.trace_paint(Operation::Named(Some(paintable), "background-text-clipped-part"), paint);
+    recorder.recorder.begin_group_mask(&mut group);
+    recorder.trace_paint(Operation::Named(Some(paintable), "background-text-mask"), |recorder| {
+        append_text_clip_paths(recorder, fragments);
+    });
+    recorder.recorder.finish_isolated_group(
+        group,
+        group_device_rect.to_float(),
+        compositing_and_blending_operator,
+        MaskKind::Alpha,
+    );
 }
 
 pub(crate) fn background_box_for(
@@ -1281,6 +1361,32 @@ fn append_text_clip_paths<O: Observer>(recorder: &mut PaintRecorder<'_, O>, frag
                 scale,
                 emission.orientation,
                 emission.glyph_bounding_rect,
+                ForceDarkRole::None,
+            );
+        }
+
+        // https://drafts.csswg.org/css-backgrounds-4/#valdef-background-clip-text
+        // The background is painted within (clipped to) the intersection of the border box and the geometry of the
+        // text including any decorations [...]
+        // NB: Like the glyphs, the lines mask the background with their whole coverage, whatever their color.
+        let span = crate::painting::record::paint::text::RenderSpan {
+            fragment_index: fragment_index as u32,
+            start_code_unit: 0,
+            end_code_unit: fragment.length_in_code_units,
+            text_color: 0,
+            shadow_layers: Vec::new(),
+            highlights: Vec::new(),
+            decoration_color: None,
+        };
+        for mut set in text_decoration::decoration_sets_for_span(recorder.source, owner, &span) {
+            set.color = libgfx_rust::Color::from_rgb(0, 0, 0).0;
+            text_decoration::paint_decoration_lines(
+                recorder,
+                owner,
+                span.fragment_index,
+                fragment_absolute_rect,
+                &set,
+                libgfx_rust::IntPoint::default(),
                 ForceDarkRole::None,
             );
         }
