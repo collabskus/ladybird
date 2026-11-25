@@ -420,7 +420,6 @@ impl ContextState {
             step.wheel_delta_precision,
             step.scroll_gesture_phase,
             step.operation_tracking,
-            self.async_scrolling_viewport_rect,
             ScrollChaining::ToScrollableAncestors,
             now,
         );
@@ -525,8 +524,10 @@ impl ContextState {
             WheelStepDispatch::DispatchedAndNotCanceled
         };
         if is_first_step_of_gesture && wheel_step_dispatch == WheelStepDispatch::NotYetDispatched {
+            self.prepare_wheel_hit_test_targets();
             let initial_scroll_target = self.async_scroll_tree.hit_test_scroll_node_for_wheel(
                 self.scene.visual_context_tree_for_compositing(),
+                &self.scroll_state_snapshot,
                 step.position,
                 delta,
                 &|_| None,
@@ -588,7 +589,6 @@ impl ContextState {
             step.wheel_delta_precision,
             step.scroll_gesture_phase,
             step.operation_tracking,
-            self.async_scrolling_viewport_rect,
             scroll_chaining,
             VisualViewportPanning::BeforeScrolling,
             now,
@@ -613,23 +613,31 @@ impl ContextState {
 
     /// Whether this context's page may cancel the ctrl+wheel event of a pinch at the position, or has yet to tell.
     pub fn page_may_cancel_pinch_at(&mut self, position: FloatPoint) -> bool {
+        self.prepare_wheel_hit_test_targets();
         if !self.has_async_scrolling_state || !self.wheel_gesture_routing.admits_async_pinch() {
             return true;
         }
         let tree = self.scene.visual_context_tree_for_compositing();
         // NB: The main thread takes the wheel events of a nested document the compositor cannot reach.
-        self.async_scroll_tree.blocks_wheel_event_at_position(tree, position)
-            || self
-                .async_scroll_tree
-                .main_thread_wheel_event_region_contains(tree, position)
+        self.async_scroll_tree
+            .blocks_wheel_event_at_position(tree, &self.scroll_state_snapshot, position)
+            || self.async_scroll_tree.main_thread_wheel_event_region_contains(
+                tree,
+                &self.scroll_state_snapshot,
+                position,
+            )
     }
 
     pub fn nested_context_for_wheel_at(&mut self, position: FloatPoint) -> Option<NestedContextHit> {
+        self.prepare_wheel_hit_test_targets();
         if !self.has_async_scrolling_state {
             return None;
         }
-        self.async_scroll_tree
-            .nested_context_for_wheel_at(self.scene.visual_context_tree_for_compositing(), position)
+        self.async_scroll_tree.nested_context_for_wheel_at(
+            self.scene.visual_context_tree_for_compositing(),
+            &self.scroll_state_snapshot,
+            position,
+        )
     }
 
     pub fn latch_wheel_gesture_to_nested_context(
@@ -664,6 +672,7 @@ impl ContextState {
                 height: nested_context_viewport_size.height as f32,
             },
             self.scene.visual_context_tree_for_compositing(),
+            &self.scroll_state_snapshot,
         )
     }
 
@@ -678,6 +687,7 @@ impl ContextState {
         admission: WheelStepAdmission,
         scroll_chain: &[AsyncScrollNodeStableID],
     ) -> FirstWheelStepRoute {
+        self.prepare_wheel_hit_test_targets();
         use FirstWheelStepRouteKind as Kind;
         let route = |kind, decision, scroll_node_index, scroller, nested_context_hit| FirstWheelStepRoute {
             kind,
@@ -699,7 +709,9 @@ impl ContextState {
         // A document's wheel event listeners never see the wheel events over a document nested in it.
         let tree = self.scene.visual_context_tree_for_compositing();
         if nested_context_regions == NestedContextRegions::HandToNestedContext
-            && let Some(hit) = self.async_scroll_tree.nested_context_for_wheel_at(tree, position)
+            && let Some(hit) =
+                self.async_scroll_tree
+                    .nested_context_for_wheel_at(tree, &self.scroll_state_snapshot, position)
         {
             return route(
                 Kind::NestedContext,
@@ -903,7 +915,6 @@ impl ContextState {
             step.wheel_delta_precision,
             step.scroll_gesture_phase,
             step.operation_tracking,
-            self.async_scrolling_viewport_rect,
             scroll_chaining,
             VisualViewportPanning::No,
             now,

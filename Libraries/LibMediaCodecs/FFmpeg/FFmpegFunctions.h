@@ -12,12 +12,9 @@
 #include <AK/kmalloc.h>
 #include <LibMediaCodecs/CodecID.h>
 #include <LibMediaCodecs/Export.h>
+#include <LibMediaCodecs/FFmpeg/FFmpegABI.h>
 
-extern "C" {
-#include <libavcodec/avcodec.h>
-#include <libavutil/hwcontext.h>
-#include <libavutil/opt.h>
-}
+#ifndef LADYBIRD_SYSTEM_FFMPEG_NAMESPACE
 
 // The decoders reach into these structs directly, so a libavcodec they run against must lay them out
 // this way. Every major from 60 through 63 does; a newer one is refused until it has been checked.
@@ -35,12 +32,15 @@ static_assert(offsetof(AVCodecDescriptor, id) == 0);
 static_assert(sizeof(void*) != 8 || (sizeof(AVChannelLayout) == 24 && offsetof(AVChannelLayout, nb_channels) == 4 && offsetof(AVChannelLayout, u) == 8));
 static_assert(sizeof(void*) != 8 || (sizeof(AVChannelCustom) == 32 && offsetof(AVChannelCustom, id) == 0));
 
+#endif
+
 #define FFMPEG_ENUMERATE_FUNCTIONS(F)       \
     F(avcodec_version)                      \
     F(avutil_version)                       \
     F(avcodec_find_decoder)                 \
     F(avcodec_find_decoder_by_name)         \
     F(avcodec_find_encoder)                 \
+    F(avcodec_descriptor_get)               \
     F(avcodec_descriptor_get_by_name)       \
     F(avcodec_alloc_context3)               \
     F(avcodec_free_context)                 \
@@ -53,6 +53,7 @@ static_assert(sizeof(void*) != 8 || (sizeof(AVChannelCustom) == 32 && offsetof(A
     F(avcodec_get_hw_config)                \
     F(avcodec_get_hw_frames_parameters)     \
     F(avcodec_default_get_buffer2)          \
+    F(avcodec_default_get_format)           \
     F(avcodec_parameters_alloc)             \
     F(avcodec_parameters_free)              \
     F(avcodec_parameters_to_context)        \
@@ -75,7 +76,6 @@ static_assert(sizeof(void*) != 8 || (sizeof(AVChannelCustom) == 32 && offsetof(A
     F(av_hwframe_ctx_alloc)                 \
     F(av_hwframe_ctx_init)                  \
     F(av_hwframe_get_buffer)                \
-    F(av_hwframe_map)                       \
     F(av_malloc)                            \
     F(av_opt_set_int)                       \
     F(av_opt_set_chlayout)                  \
@@ -86,23 +86,53 @@ static_assert(sizeof(void*) != 8 || (sizeof(AVChannelCustom) == 32 && offsetof(A
     F(av_channel_layout_uninit)             \
     F(av_sample_fmt_is_planar)              \
     F(av_get_planar_sample_fmt)             \
-    F(av_rescale_q)
+    F(av_rescale_q)                         \
+    F(av_rescale_rnd)
 
-namespace Media::FFmpeg {
+// Audio is only ever converted through the bundled libswresample.
+#define FFMPEG_ENUMERATE_BUNDLED_FUNCTIONS(F) \
+    F(swr_alloc_set_opts2)                    \
+    F(swr_init)                               \
+    F(swr_free)                               \
+    F(swr_get_delay)                          \
+    F(swr_get_out_samples)                    \
+    F(swr_convert)
+
+namespace FFMPEG_ABI_NAMESPACE {
+
+namespace FFmpegFunctionPointers {
+
+#define FFMPEG_FUNCTION_POINTER_TYPE(name) using name = decltype(&name);
+FFMPEG_ENUMERATE_FUNCTIONS(FFMPEG_FUNCTION_POINTER_TYPE)
+#ifndef LADYBIRD_SYSTEM_FFMPEG_NAMESPACE
+FFMPEG_ENUMERATE_BUNDLED_FUNCTIONS(FFMPEG_FUNCTION_POINTER_TYPE)
+#endif
+#undef FFMPEG_FUNCTION_POINTER_TYPE
+
+}
 
 // Every libavcodec and libavutil entry point the decoders and encoders call, so they can run against a copy loaded at runtime.
 struct MEDIACODECS_API FFmpegFunctions {
     AK_ALLOC_WITH_KMALLOC;
 
-#define FFMPEG_FUNCTION_POINTER(name) decltype(&::name) name;
+#define FFMPEG_FUNCTION_POINTER(name) FFmpegFunctionPointers::name name;
     FFMPEG_ENUMERATE_FUNCTIONS(FFMPEG_FUNCTION_POINTER)
+#ifndef LADYBIRD_SYSTEM_FFMPEG_NAMESPACE
+    FFMPEG_ENUMERATE_BUNDLED_FUNCTIONS(FFMPEG_FUNCTION_POINTER)
+#endif
 #undef FFMPEG_FUNCTION_POINTER
 
     using CodecIDTable = Array<AVCodecID, all_codec_ids.size() + 1>;
     CodecIDTable codec_ids;
     AVCodecID ffmpeg_codec_id(CodecID codec_id) const { return codec_ids[to_underlying(codec_id)]; }
 
+#ifdef LADYBIRD_SYSTEM_FFMPEG_NAMESPACE
+    // Null if the library lacks any of the functions.
+    static FFmpegFunctions const* resolved_from_library(void* library_handle);
+#else
+    // Only valid once load_bundled_ffmpeg() has succeeded.
     static FFmpegFunctions const& bundled();
+#endif
 };
 
 }

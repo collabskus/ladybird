@@ -100,7 +100,6 @@ struct StartedUserScroll {
 // actions on WebContent. The epoch also binds incremental updates to the tree whose target they describe.
 struct KeyboardScrollState {
     u64 generation { 0 };
-    u64 visual_context_tree_structural_epoch { 0 };
     Optional<Web::AsyncScrollNodeStableID> target;
     float page_scroll_distance { 0 };
     float arrow_scroll_distance { 0 };
@@ -115,8 +114,7 @@ struct AppliedScrollRequest {
 
 struct PendingAsyncScrollUpdates {
     Optional<Web::UniqueNodeID> document_id;
-    // The publication these updates were handed out in, per context and increasing. A scroll state
-    // snapshot WebContent produces after adopting them carries it back.
+    // The publication these updates were handed out in, per context and increasing.
     u64 sequence { 0 };
     Vector<AsyncScrollOffset> scroll_offsets;
     Vector<AsyncScrollOperationID> completed_operation_ids;
@@ -128,6 +126,9 @@ struct PendingAsyncScrollUpdates {
     Vector<Web::AsyncScrollNodeStableID> boxes_in_user_scroll_gesture;
     Vector<Web::AsyncScrollNodeStableID> boxes_whose_user_scroll_gesture_ended;
     Optional<Web::AsyncScrollNodeStableID> wheel_latched_scroller;
+    // How many times the compositor had scrolled any box of the context for user input of its own when it published
+    // these.
+    u64 context_user_input_scroll_count { 0 };
 };
 
 // What the compositor did with a wheel event that WebContent's main thread passed on to it, as the compositor does with

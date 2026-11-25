@@ -30,14 +30,10 @@ impl AsyncScrollOffset {
         self.applied_scroll_request_id = later.applied_scroll_request_id;
         // How many times the compositor had scrolled the box for user input of its own when it reported this.
         self.user_input_scroll_count = later.user_input_scroll_count;
-        // How many times the compositor had scrolled any box of the context for user input of its own when it reported
-        // this. Not every such scroll is reported, as one the next input turns back moves no box.
-        self.context_user_input_scroll_count = later.context_user_input_scroll_count;
         // The scale the visual viewport was zoomed to, which only its scroll node reports.
         if later.visual_viewport_scale.is_some() {
             self.visual_viewport_scale = later.visual_viewport_scale;
         }
-        self.unadopted_scroll_delta.translate_by(later.unadopted_scroll_delta);
         // The most recent nonzero delta of a relative scroll in each axis, such as a wheel or panning scroll. Absolute
         // scrolls, such as dragging a scrollbar thumb, leave it as it is.
         if later.last_relative_scroll_delta.x != 0.0 {

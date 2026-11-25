@@ -29,7 +29,7 @@ use super::constants::{
 };
 use super::gl_string::{utf8_bytes, utf16_string_from_gl_string};
 use super::proxy::recorder::bytes_of;
-use super::state::{Binding, RenderingContext, VertexArrayBinding, WebGL2};
+use super::state::{Binding, RenderingContext, VertexArrayBinding, VertexAttribValueType, WebGL2};
 use super::types::Float32List;
 use super::web_gl_buffer::WebGLBuffer;
 use super::web_gl_program::WebGLProgram;
@@ -911,6 +911,7 @@ impl RenderingContext<WebGL2> {
         z: i32,
         w: i32,
     ) -> WebIdlResult<()> {
+        self.note_current_vertex_attrib_value_type(index, VertexAttribValueType::Int);
         self.proxy.vertex_attrib_i4i(index, x, y, z, w);
         Ok(())
     }
@@ -920,6 +921,7 @@ impl RenderingContext<WebGL2> {
             self.set_error(GL_INVALID_VALUE);
             return Ok(());
         };
+        self.note_current_vertex_attrib_value_type(index, VertexAttribValueType::Int);
         self.proxy.vertex_attrib_i4iv(index, &values);
         Ok(())
     }
@@ -933,6 +935,7 @@ impl RenderingContext<WebGL2> {
         z: u32,
         w: u32,
     ) -> WebIdlResult<()> {
+        self.note_current_vertex_attrib_value_type(index, VertexAttribValueType::UnsignedInt);
         self.proxy.vertex_attrib_i4ui(index, x, y, z, w);
         Ok(())
     }
@@ -942,6 +945,7 @@ impl RenderingContext<WebGL2> {
             self.set_error(GL_INVALID_VALUE);
             return Ok(());
         };
+        self.note_current_vertex_attrib_value_type(index, VertexAttribValueType::UnsignedInt);
         self.proxy.vertex_attrib_i4uiv(index, &values);
         Ok(())
     }
@@ -955,6 +959,9 @@ impl RenderingContext<WebGL2> {
         stride: i32,
         offset: i64,
     ) -> WebIdlResult<()> {
+        if !self.validate_vertex_attrib_offset(offset) {
+            return Ok(());
+        }
         self.proxy.vertex_attrib_i_pointer(index, size, r#type, stride, offset);
         Ok(())
     }
@@ -1398,7 +1405,7 @@ impl RenderingContext<WebGL2> {
         varyings: Vec<Utf16String>,
         buffer_mode: u32,
     ) -> WebIdlResult<()> {
-        let Some(program_handle) = self.handle_of(program) else {
+        let Some(program_handle) = self.handle_of_program_or_shader(program) else {
             return Ok(());
         };
         let varyings: Vec<Vec<u8>> = varyings.iter().map(utf8_bytes).collect();
@@ -1471,7 +1478,7 @@ impl RenderingContext<WebGL2> {
         program: Ref<WebGLProgram>,
         uniform_names: Vec<Utf16String>,
     ) -> WebIdlResult<Option<Vec<u32>>> {
-        let Some(program_handle) = self.handle_of(program) else {
+        let Some(program_handle) = self.handle_of_program_or_shader(program) else {
             return Ok(None);
         };
         let uniform_names: Vec<Vec<u8>> = uniform_names.iter().map(utf8_bytes).collect();
@@ -1489,7 +1496,7 @@ impl RenderingContext<WebGL2> {
         uniform_indices: Vec<u32>,
         pname: u32,
     ) -> WebIdlResult<Value> {
-        let Some(program_handle) = self.handle_of(program) else {
+        let Some(program_handle) = self.handle_of_program_or_shader(program) else {
             return Ok(Value::NULL);
         };
         let Ok(uniform_count) = i32::try_from(uniform_indices.len()) else {
@@ -1532,7 +1539,7 @@ impl RenderingContext<WebGL2> {
         program: Ref<WebGLProgram>,
         uniform_block_name: Utf16String,
     ) -> WebIdlResult<u32> {
-        let Some(program_handle) = self.handle_of(program) else {
+        let Some(program_handle) = self.handle_of_program_or_shader(program) else {
             return Ok(GL_INVALID_INDEX);
         };
         Ok(self
@@ -1547,7 +1554,7 @@ impl RenderingContext<WebGL2> {
         uniform_block_index: u32,
         pname: u32,
     ) -> WebIdlResult<Value> {
-        let Some(program_handle) = self.handle_of(program) else {
+        let Some(program_handle) = self.handle_of_program_or_shader(program) else {
             return Ok(Value::NULL);
         };
         match pname {
@@ -1610,7 +1617,7 @@ impl RenderingContext<WebGL2> {
         program: Ref<WebGLProgram>,
         uniform_block_index: u32,
     ) -> WebIdlResult<Option<Utf16String>> {
-        let Some(program_handle) = self.handle_of(program) else {
+        let Some(program_handle) = self.handle_of_program_or_shader(program) else {
             return Ok(None);
         };
         let mut uniform_block_name_length = [0];
@@ -1645,7 +1652,7 @@ impl RenderingContext<WebGL2> {
         uniform_block_index: u32,
         uniform_block_binding: u32,
     ) -> WebIdlResult<()> {
-        let Some(program_handle) = self.handle_of(program) else {
+        let Some(program_handle) = self.handle_of_program_or_shader(program) else {
             return Ok(());
         };
         self.proxy

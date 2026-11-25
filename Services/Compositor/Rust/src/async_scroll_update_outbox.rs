@@ -9,6 +9,10 @@ use libcompositing_rust::scrolling::{
     PendingAsyncScrollUpdates, StartedUserScroll,
 };
 
+// The main thread allocates the ids of the scrolls it requests from here up, so that they never meet the ids the
+// compositor allocates for scrolls of its own.
+pub const FIRST_OPERATION_ID_THE_MAIN_THREAD_REQUESTS: AsyncScrollOperationID = 1 << 63;
+
 #[derive(Default)]
 pub struct AsyncScrollUpdateOutbox {
     pending_scroll_offsets: Vec<AsyncScrollOffset>,
@@ -27,6 +31,7 @@ pub struct AsyncScrollUpdateOutbox {
 pub struct UserScrollGestureState {
     pub boxes_in_user_scroll_gesture: Vec<AsyncScrollNodeStableID>,
     pub wheel_latched_scroller: Option<AsyncScrollNodeStableID>,
+    pub context_user_input_scroll_count: u64,
 }
 
 impl AsyncScrollUpdateOutbox {
@@ -66,10 +71,8 @@ fn set_or_append_pending_scroll_offset(
 }
 
 impl AsyncScrollUpdateOutbox {
-    pub fn record_scroll_offsets(&mut self, scroll_offsets: &[AsyncScrollOffset]) {
-        for scroll_offset in scroll_offsets {
-            set_or_append_pending_scroll_offset(&mut self.pending_scroll_offsets, scroll_offset);
-        }
+    pub fn record_scroll_offset(&mut self, scroll_offset: &AsyncScrollOffset) {
+        set_or_append_pending_scroll_offset(&mut self.pending_scroll_offsets, scroll_offset);
     }
 
     pub fn note_user_scroll_gesture_ended(&mut self, stable_node_ids: &[AsyncScrollNodeStableID]) {
@@ -103,6 +106,7 @@ impl AsyncScrollUpdateOutbox {
             boxes_whose_user_scroll_gesture_ended: std::mem::take(&mut self.boxes_whose_user_scroll_gesture_ended),
             boxes_in_user_scroll_gesture: user_scroll_gesture_state.boxes_in_user_scroll_gesture.clone(),
             wheel_latched_scroller: user_scroll_gesture_state.wheel_latched_scroller,
+            context_user_input_scroll_count: user_scroll_gesture_state.context_user_input_scroll_count,
         };
         self.published_user_scroll_gesture_state = user_scroll_gesture_state;
         updates

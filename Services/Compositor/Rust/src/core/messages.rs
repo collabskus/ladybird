@@ -8,6 +8,7 @@
 //! sender may ask for, and the answer a synchronous one gets.
 
 use super::{CompositorCore, ContextOwnerCheckResult};
+use crate::async_scroll_update_outbox::FIRST_OPERATION_ID_THE_MAIN_THREAD_REQUESTS;
 use crate::canvas_2d_contexts::ContextCreation;
 use crate::display_list_chunk_stores::chunks_of_list_sent_whole;
 use crate::host::{PresentationId, WebContentClientId};
@@ -48,7 +49,6 @@ use libcompositing_rust::ipc_types::{
     Core_AnonymousBuffer, LayerPlanOnWire, SharedDisplayList, compositor_control_server,
     compositor_presentation_server, compositor_web_content_server,
 };
-use libcompositing_rust::scrolling::async_scrolling_state::AsyncScrollOperationID;
 use libcompositing_rust::scrolling::{AccumulatedVisualContextTree, DisplayList};
 use libcompositing_rust::scrolling::{
     CompositorContextId, KeyEvent, KeyModifier, MouseButton, MouseEvent, MouseEventType, PendingAsyncScrollUpdates,
@@ -78,10 +78,6 @@ fn misbehavior_of_layer_plan(why_plan_fails_checks: &'static str) -> Misbehavior
     );
     Misbehavior("WebContent sent a plan of layers that does not fit its display list and visual context tree")
 }
-
-// The main thread allocates the ids of the scrolls it requests from here up, so that they never meet the ids the
-// compositor allocates for scrolls of its own.
-const FIRST_OPERATION_ID_THE_MAIN_THREAD_REQUESTS: AsyncScrollOperationID = 1 << 63;
 
 // Wheel deltas are scrolled by as floats.
 fn is_valid_wheel_delta(delta: f64) -> bool {
@@ -665,6 +661,7 @@ impl compositor_web_content_server::Stub for MessagesFromWebContent<'_> {
             Rc::new(display_list),
             AccumulatedVisualContextTree::from_arc(tree),
             scroll_state_snapshot,
+            message.keyboard_scroll_state,
             self.now,
         ) {
             return Err(Misbehavior(DISPLAY_LIST_WITH_UNUSABLE_SCROLLING_STATE));
@@ -748,8 +745,19 @@ impl compositor_web_content_server::Stub for MessagesFromWebContent<'_> {
             return Err(Misbehavior("Invalid scroll state"));
         }
         if self.context_is_owned_by_sender(message.context_id)? {
-            self.core
-                .update_scroll_state(message.context_id, scroll_state_snapshot, message.keyboard_scroll_state);
+            if !self.core.update_scroll_state(
+                message.context_id,
+                message.visual_context_tree_structural_epoch,
+                scroll_state_snapshot,
+                message.keyboard_scroll_state,
+            ) {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "Compositor: Dropping scroll state update built for another visual context tree (epoch {})",
+                    message.visual_context_tree_structural_epoch
+                );
+                return Ok(());
+            }
             self.core
                 .take_layer_plan_of_scroll_state(
                     message.context_id,
