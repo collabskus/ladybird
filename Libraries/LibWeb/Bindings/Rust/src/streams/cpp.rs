@@ -11,7 +11,7 @@ use core::ffi::c_void;
 
 use libjs_rust::api::{Trace, Value};
 
-use crate::bindings::cpp_cell::CppCell;
+use crate::bindings::cpp_cell::{CppCell, LentCppCell, cpp_class};
 use crate::bindings::promise::{WebIdlPromise, promise_from_abi};
 
 unsafe extern "C" {
@@ -40,9 +40,13 @@ unsafe extern "C" {
 /// A promise-returning algorithm with no arguments that C++ set a stream up with, a pullAlgorithm or a flushAlgorithm.
 #[derive(Clone, Trace)]
 #[gc(crate = libjs_rust)]
-pub(crate) struct CppPromiseAlgorithm(pub(crate) CppCell);
+pub(crate) struct CppPromiseAlgorithm(CppCell);
 
 impl CppPromiseAlgorithm {
+    pub(crate) fn from_lent(cell: &LentCppCell<cpp_class::PromiseAlgorithm>) -> Self {
+        Self(CppCell::from_lent(cell))
+    }
+
     pub(crate) fn call(&self) -> WebIdlPromise {
         // SAFETY: The cell is a live GC::Function<GC::Ref<WebIDL::Promise>()>, which returns a live promise.
         unsafe { promise_from_abi(web_streams_call_promise_algorithm(self.0.as_ptr())) }
@@ -53,9 +57,13 @@ impl CppPromiseAlgorithm {
 /// transformAlgorithm.
 #[derive(Clone, Trace)]
 #[gc(crate = libjs_rust)]
-pub(crate) struct CppPromiseAlgorithmWithArgument(pub(crate) CppCell);
+pub(crate) struct CppPromiseAlgorithmWithArgument(CppCell);
 
 impl CppPromiseAlgorithmWithArgument {
+    pub(crate) fn from_lent(cell: &LentCppCell<cpp_class::PromiseAlgorithmWithArgument>) -> Self {
+        Self(CppCell::from_lent(cell))
+    }
+
     pub(crate) fn call(&self, argument: Value) -> WebIdlPromise {
         // SAFETY: The cell is a live GC::Function<GC::Ref<WebIDL::Promise>(JS::Value)>, which returns a live promise.
         unsafe {
@@ -70,9 +78,13 @@ impl CppPromiseAlgorithmWithArgument {
 /// A read request of LibWeb's C++ code, https://streams.spec.whatwg.org/#read-request
 #[derive(Clone, Trace)]
 #[gc(crate = libjs_rust)]
-pub(crate) struct CppReadRequest(pub(crate) CppCell);
+pub(crate) struct CppReadRequest(CppCell);
 
 impl CppReadRequest {
+    pub(crate) fn from_lent(cell: &LentCppCell<cpp_class::ReadRequest>) -> Self {
+        Self(CppCell::from_lent(cell))
+    }
+
     pub(crate) fn chunk_steps(&self, chunk: Value) {
         // SAFETY: The cell is a live Streams::ReadRequest.
         unsafe { web_streams_read_request_chunk_steps(self.0.as_ptr(), chunk.to_raw()) };
@@ -92,9 +104,13 @@ impl CppReadRequest {
 /// Steps of LibWeb's C++ code that take a byte sequence.
 #[derive(Clone, Trace)]
 #[gc(crate = libjs_rust)]
-pub(crate) struct CppBytesSteps(pub(crate) CppCell);
+pub(crate) struct CppBytesSteps(CppCell);
 
 impl CppBytesSteps {
+    pub(crate) fn from_lent(cell: &LentCppCell<cpp_class::BytesSteps>) -> Self {
+        Self(CppCell::from_lent(cell))
+    }
+
     pub(crate) fn call(&self, bytes: &[u8]) {
         // SAFETY: The cell is a live GC::Function<void(ByteBuffer)>, which copies the bytes.
         unsafe { web_streams_call_bytes_steps(self.0.as_ptr(), ak::Span::new(bytes)) };
@@ -104,9 +120,13 @@ impl CppBytesSteps {
 /// Steps of LibWeb's C++ code that take a JS value.
 #[derive(Clone, Trace)]
 #[gc(crate = libjs_rust)]
-pub(crate) struct CppValueSteps(pub(crate) CppCell);
+pub(crate) struct CppValueSteps(CppCell);
 
 impl CppValueSteps {
+    pub(crate) fn from_lent(cell: &LentCppCell<cpp_class::ValueSteps>) -> Self {
+        Self(CppCell::from_lent(cell))
+    }
+
     pub(crate) fn call(&self, value: Value) {
         // SAFETY: The cell is a live GC::Function<void(JS::Value)>.
         unsafe { web_streams_call_value_steps(self.0.as_ptr(), value.to_raw()) };

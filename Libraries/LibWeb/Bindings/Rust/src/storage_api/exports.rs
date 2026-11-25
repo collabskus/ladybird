@@ -13,14 +13,14 @@ use core::ptr::NonNull;
 use std::rc::Rc;
 
 use ak::Utf16String;
-use libjs_rust::api::Vm;
+use libjs_rust::api::{Gc, Realm, Vm};
 
 use super::storage_area_mirror::{
     RemoteChanges, Requester, StorageAreaConnection, StorageAreaMirror, StorageAreaMirrorClient, StorageEndpointType,
     set_storage_area_mirror_client,
 };
 use super::storage_manager::StorageManager;
-use crate::bindings::interface::{cell_into_abi, realm_arguments};
+use crate::bindings::interface::cell_into_abi;
 use crate::html::storage::{StorageType, dispatch_storage_events};
 
 unsafe extern "C" {
@@ -50,17 +50,8 @@ unsafe extern "C" {
 }
 
 /// A new StorageManager in the realm, the StorageManager object of the realm's settings object.
-///
-/// # Safety
-///
-/// The pointers must be the live VM and a live realm.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn web_rust_storage_api_create_storage_manager(
-    vm: *mut c_void,
-    realm: *mut c_void,
-) -> *mut c_void {
-    // SAFETY: The caller passes the live VM and a live realm.
-    let (vm, realm) = unsafe { realm_arguments(vm, realm) };
+pub extern "C" fn web_rust_storage_api_create_storage_manager(vm: &Vm, realm: Gc<Realm>) -> *mut c_void {
     cell_into_abi(StorageManager::create(vm, realm))
 }
 
@@ -78,8 +69,8 @@ unsafe fn adopt_strings(raws: *const usize, count: usize) -> Vec<Utf16String> {
     }
     // SAFETY: The caller passes count raw strings.
     let raws = unsafe { ak::slice_from_raw_parts(raws, count) };
-    // SAFETY: The caller hands over every string.
     raws.iter()
+        // SAFETY: The caller hands over every string.
         .map(|&raw| unsafe { Utf16String::from_raw_owned(raw) })
         .collect()
 }
@@ -205,34 +196,23 @@ fn dispatch(vm: &Vm, changes: Option<RemoteChanges>) {
     }
 }
 
-/// The change another process made to the storage area, with the strings, raw AK::Utf16Strings that C++ hands over,
+/// The change another process made to the storage area, with the strings that C++ hands over, if there are any,
 /// and the URL, which C++ lends.
-///
-/// # Safety
-///
-/// The VM must be live, and every string that the flag next to it says is there must be one that C++ hands over.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments, reason = "a change has these parts")]
-pub unsafe extern "C" fn web_rust_storage_api_storage_area_did_change(
-    vm: *mut c_void,
+pub extern "C" fn web_rust_storage_api_storage_area_did_change(
+    vm: &Vm,
     id: u64,
-    has_key: bool,
-    key: usize,
-    has_old_value: bool,
-    old_value: usize,
-    has_new_value: bool,
-    new_value: usize,
+    key: Option<Utf16String>,
+    old_value: Option<Utf16String>,
+    new_value: Option<Utf16String>,
     url: ak::Span<'_, u8>,
 ) {
-    // SAFETY: The caller passes the live VM.
-    let vm = unsafe { &*vm.cast::<Vm>() };
-    // SAFETY: The caller hands over the strings that the flags say are there.
-    let string = |is_there: bool, raw: usize| is_there.then(|| unsafe { Utf16String::from_raw_owned(raw) });
     let changes = StorageAreaMirror::did_change(
         id,
-        string(has_key, key),
-        string(has_old_value, old_value),
-        string(has_new_value, new_value),
+        key,
+        old_value,
+        new_value,
         String::from_utf8_lossy(url.as_slice()).into_owned(),
     );
     dispatch(vm, changes);
@@ -251,20 +231,14 @@ pub extern "C" fn web_rust_storage_api_storage_area_did_acknowledge_write(id: u6
 /// The VM must be live, and `keys` and `values` must each point to `count` strings that C++ hands over.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn web_rust_storage_api_storage_area_did_refuse_write(
-    vm: *mut c_void,
+    vm: &Vm,
     id: u64,
     keys: *const usize,
     values: *const usize,
     count: usize,
 ) {
-    // SAFETY: The caller passes the live VM and hands over the strings.
-    let (vm, keys, values) = unsafe {
-        (
-            &*vm.cast::<Vm>(),
-            adopt_strings(keys, count),
-            adopt_strings(values, count),
-        )
-    };
+    // SAFETY: The caller hands over the strings.
+    let (keys, values) = unsafe { (adopt_strings(keys, count), adopt_strings(values, count)) };
     dispatch(vm, StorageAreaMirror::did_refuse_write(id, keys, values));
 }
 
@@ -275,19 +249,13 @@ pub unsafe extern "C" fn web_rust_storage_api_storage_area_did_refuse_write(
 /// The VM must be live, and `keys` and `values` must each point to `count` strings that C++ hands over.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn web_rust_storage_api_storage_area_did_reset(
-    vm: *mut c_void,
+    vm: &Vm,
     id: u64,
     keys: *const usize,
     values: *const usize,
     count: usize,
 ) {
-    // SAFETY: The caller passes the live VM and hands over the strings.
-    let (vm, keys, values) = unsafe {
-        (
-            &*vm.cast::<Vm>(),
-            adopt_strings(keys, count),
-            adopt_strings(values, count),
-        )
-    };
+    // SAFETY: The caller hands over the strings.
+    let (keys, values) = unsafe { (adopt_strings(keys, count), adopt_strings(values, count)) };
     dispatch(vm, StorageAreaMirror::did_reset(id, keys, values));
 }

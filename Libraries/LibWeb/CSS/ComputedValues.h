@@ -321,9 +321,9 @@ inline BoxSizing box_sizing_from_reset_bits(ComputedValuesFFI::ResetBits bits) {
 class StyleRecordRef {
 public:
     StyleRecordRef() = default;
-    explicit StyleRecordRef(void const* record);
+    explicit StyleRecordRef(StyleEngineFFI::Record const* record);
     // Takes over the reference to `record` the caller holds.
-    static StyleRecordRef adopt(void const* record)
+    static StyleRecordRef adopt(StyleEngineFFI::Record const* record)
     {
         StyleRecordRef adopted;
         adopted.m_record = record;
@@ -353,10 +353,10 @@ public:
         return *this;
     }
 
-    void const* get() const { return m_record; }
+    StyleEngineFFI::Record const* get() const { return m_record; }
 
 private:
-    void const* m_record { nullptr };
+    StyleEngineFFI::Record const* m_record { nullptr };
 };
 
 class WEB_API ComputedValues final : public RefCounted<ComputedValues> {
@@ -482,11 +482,11 @@ public:
     Color background_color() const { return m_noninherited.background->background_color_value(color()); }
     RefPtr<StyleValue const> background_color_style_value() const;
 
-    void const* list_style_type_data() const { return m_inherited.list_table->list_style_type.pointer; }
+    StyleValueFFI::StyleValueData const* list_style_type_data() const { return static_cast<StyleValueFFI::StyleValueData const*>(m_inherited.list_table->list_style_type.pointer); }
     RefPtr<AbstractImageStyleValue const> list_style_image() const { return m_inherited.list_table->list_style_image_value(); }
     // Whether this style reads its tree scope's counter-style registry, which a pseudo-element's does for any named
     // counter style.
-    bool reads_counter_style_environment(bool is_pseudo) const { return ComputedValuesFFI::rust_style_reads_counter_style_environment(static_cast<StyleValueFFI::StyleValueData const*>(m_noninherited.content_data->content.pointer), static_cast<StyleValueFFI::StyleValueData const*>(list_style_type_data()), is_pseudo); }
+    bool reads_counter_style_environment(bool is_pseudo) const { return ComputedValuesFFI::rust_style_reads_counter_style_environment(static_cast<StyleValueFFI::StyleValueData const*>(m_noninherited.content_data->content.pointer), list_style_type_data(), is_pseudo); }
 
     Color flood_color() const { return resolve_style_color(m_noninherited.svg_reset->flood_color, color()); }
     float flood_opacity() const { return m_noninherited.svg_reset->flood_opacity; }
@@ -529,7 +529,7 @@ public:
     explicit ComputedValues(BorrowedStyleRecord);
 
 private:
-    void borrow_style_record_groups(void const* groups);
+    void borrow_style_record_groups(ComputedValuesFFI::StyleRecordGroups const* groups);
 
     RefPtr<StyleValue const> style_value_from_handle(PropertyID, RustStyleValueHandle const&) const;
 
@@ -894,10 +894,10 @@ private:
 // made of its own. This is the only place C++ knows how a style finds a group: the groups from
 // ROOT_START on are in the style's root, and a pointer to each of its group sets follows them.
 template<size_t index>
-void const* style_record_group_payload(void const* record)
+void const* style_record_group_payload(ComputedValuesFFI::StyleRecordGroups const* record)
 {
     VERIFY(record);
-    auto const* slots = static_cast<void const* const*>(record);
+    auto const* slots = reinterpret_cast<void const* const*>(record);
     constexpr auto root_count = to_underlying(StyleGroupIndex::Count) - ComputedValuesFFI::STYLE_GROUP_ROOT_START;
     if constexpr (index >= ComputedValuesFFI::STYLE_GROUP_ROOT_START)
         return slots[index - ComputedValuesFFI::STYLE_GROUP_ROOT_START];
@@ -911,20 +911,20 @@ void const* style_record_group_payload(void const* record)
 
 // Reads what the inherited set of the style whose groups `record` points at holds beside its
 // groups, which follow them in the set.
-inline ComputedValuesFFI::InheritedSetValues const& style_record_inherited_values(void const* record)
+inline ComputedValuesFFI::InheritedSetValues const& style_record_inherited_values(ComputedValuesFFI::StyleRecordGroups const* record)
 {
     VERIFY(record);
-    auto const* slots = static_cast<void const* const*>(record);
+    auto const* slots = reinterpret_cast<void const* const*>(record);
     constexpr auto root_count = to_underlying(StyleGroupIndex::Count) - ComputedValuesFFI::STYLE_GROUP_ROOT_START;
     auto const* inherited_set = static_cast<void const* const*>(slots[root_count]);
     return *reinterpret_cast<ComputedValuesFFI::InheritedSetValues const*>(inherited_set + ComputedValuesFFI::STYLE_GROUP_RARE_SET_START);
 }
 
 // Reads the reset bits of the style whose groups `record` points at, which follow its set pointers.
-inline ComputedValuesFFI::ResetBits style_record_reset_bits(void const* record)
+inline ComputedValuesFFI::ResetBits style_record_reset_bits(ComputedValuesFFI::StyleRecordGroups const* record)
 {
     VERIFY(record);
-    auto const* slots = static_cast<void const* const*>(record);
+    auto const* slots = reinterpret_cast<void const* const*>(record);
     constexpr auto root_count = to_underlying(StyleGroupIndex::Count) - ComputedValuesFFI::STYLE_GROUP_ROOT_START;
     return *reinterpret_cast<ComputedValuesFFI::ResetBits const*>(slots + root_count + 3);
 }
@@ -968,7 +968,7 @@ private:
 };
 
 template<typename StyleGroup>
-StyleGroup const& style_record_group(void const* record)
+StyleGroup const& style_record_group(ComputedValuesFFI::StyleRecordGroups const* record)
 {
     auto const* payload = style_record_group_payload<StyleGroup::style_group_index>(record);
     VERIFY(payload);

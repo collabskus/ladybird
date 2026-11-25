@@ -9,11 +9,12 @@
 use core::ffi::c_void;
 
 use ak::Utf16String;
-use libjs_rust::api::Vm;
+use libjs_rust::api::{Gc, Realm, Vm};
 use liburl_rust::FfiOrigin;
 
-use crate::bindings::cpp_cell::CppCell;
-use crate::bindings::interface::{cell_into_abi, realm_arguments};
+use crate::bindings::cpp_cell::{CppCell, LentCppCell, cpp_class};
+use crate::bindings::interface::cell_into_abi;
+use crate::bindings::lent_string::LentUtf16String;
 use crate::indexed_db::cpp::json_value_of_key;
 use crate::indexed_db::idb_factory::IDBFactory;
 use crate::indexed_db::idb_key_range::IDBKeyRange;
@@ -34,60 +35,25 @@ unsafe fn storage_key_from_abi(origin: *const FfiOrigin) -> StorageKey {
     }
 }
 
-/// # Safety
-///
-/// `vm` must be the live VM.
-unsafe fn vm_from_abi<'vm>(vm: *mut c_void) -> &'vm Vm {
-    // SAFETY: The caller passes the live VM.
-    unsafe { &*vm.cast::<Vm>() }
-}
-
-/// # Safety
-///
-/// `string` must be a raw AK::Utf16String that LibWeb lends.
-unsafe fn utf16_string_from_abi(string: usize) -> Utf16String {
-    // SAFETY: The caller lends a live string, whose reference the copy takes one of its own.
-    unsafe {
-        ak::reference_utf16_string(string);
-        Utf16String::from_raw_owned(string)
-    }
-}
-
-/// # Safety
-///
-/// The pointers must be the live VM and a live realm.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn web_rust_indexed_db_create_factory(vm: *mut c_void, realm: *mut c_void) -> *mut c_void {
-    // SAFETY: The caller passes the live VM and a live realm.
-    let (vm, realm) = unsafe { realm_arguments(vm, realm) };
+pub extern "C" fn web_rust_indexed_db_create_factory(vm: &Vm, realm: Gc<Realm>) -> *mut c_void {
     cell_into_abi(IDBFactory::create(vm, realm))
 }
 
 /// https://w3c.github.io/IndexedDB/#cleanup-indexed-database-transactions
-///
-/// # Safety
-///
-/// The pointers must be the live VM and a live HTML::EventLoop.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn web_rust_indexed_db_cleanup_indexed_database_transactions(
-    vm: *mut c_void,
-    event_loop: *mut c_void,
+pub extern "C" fn web_rust_indexed_db_cleanup_indexed_database_transactions(
+    vm: &Vm,
+    event_loop: &LentCppCell<cpp_class::EventLoop>,
 ) -> bool {
-    // SAFETY: The caller passes the live VM and a live event loop.
-    let (vm, event_loop) = unsafe { (vm_from_abi(vm), CppCell::from_raw(event_loop)) };
+    let event_loop = CppCell::from_lent(event_loop);
     cleanup_indexed_database_transactions(vm, &event_loop)
 }
 
 /// Runs close a database connection with every connection of the realm's global object whose close pending flag is
 /// unset.
-///
-/// # Safety
-///
-/// The pointers must be the live VM and a live realm.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn web_rust_indexed_db_close_all_connections(vm: *mut c_void, realm: *mut c_void) {
-    // SAFETY: The caller passes the live VM and a live realm.
-    let (vm, realm) = unsafe { realm_arguments(vm, realm) };
+pub extern "C" fn web_rust_indexed_db_close_all_connections(vm: &Vm, realm: Gc<Realm>) {
     Database::for_each_database(vm, |database| {
         for connection in database.associated_connections(vm).values().iter() {
             if connection.close_pending() {
@@ -142,13 +108,13 @@ fn with_key_path_abi<R>(key_path: Option<&KeyPath>, function: impl FnOnce(&KeyPa
 /// The VM must be live, the origin lent, and `on_database` must not keep what it borrows.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn web_rust_indexed_db_inspect_databases(
-    vm: *mut c_void,
+    vm: &Vm,
     origin: *const FfiOrigin,
     ctx: *mut c_void,
     on_database: unsafe extern "C" fn(*mut c_void, usize, u64, *const usize, usize),
 ) {
-    // SAFETY: The caller passes the live VM and lends the origin.
-    let (vm, storage_key) = unsafe { (vm_from_abi(vm), storage_key_from_abi(origin)) };
+    // SAFETY: The caller lends the origin.
+    let storage_key = unsafe { storage_key_from_abi(origin) };
     for database in Database::for_key(vm, &storage_key).values().iter() {
         let names: Vec<Utf16String> = database
             .object_stores(vm)
@@ -179,21 +145,15 @@ pub unsafe extern "C" fn web_rust_indexed_db_inspect_databases(
 /// The VM must be live, the origin and the name lent, and the callbacks must not keep what they borrow.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn web_rust_indexed_db_inspect_object_stores(
-    vm: *mut c_void,
+    vm: &Vm,
     origin: *const FfiOrigin,
-    database_name: usize,
+    database_name: LentUtf16String<'_>,
     ctx: *mut c_void,
     on_object_store: unsafe extern "C" fn(*mut c_void, usize, *const KeyPathAbi, bool),
     on_index: unsafe extern "C" fn(*mut c_void, usize, *const KeyPathAbi, bool, bool),
 ) -> bool {
-    // SAFETY: The caller passes the live VM and lends the origin and the name.
-    let (vm, storage_key, database_name) = unsafe {
-        (
-            vm_from_abi(vm),
-            storage_key_from_abi(origin),
-            utf16_string_from_abi(database_name),
-        )
-    };
+    // SAFETY: The caller lends the origin.
+    let (storage_key, database_name) = unsafe { (storage_key_from_abi(origin), database_name.to_utf16_string()) };
     let Some(database) = Database::for_key_and_name(vm, &storage_key, &database_name) else {
         return false;
     };
@@ -230,20 +190,19 @@ pub unsafe extern "C" fn web_rust_indexed_db_inspect_object_stores(
 /// The VM must be live, the origin and the names lent, and the callback must not keep the bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn web_rust_indexed_db_inspect_records(
-    vm: *mut c_void,
+    vm: &Vm,
     origin: *const FfiOrigin,
-    database_name: usize,
-    object_store_name: usize,
+    database_name: LentUtf16String<'_>,
+    object_store_name: LentUtf16String<'_>,
     ctx: *mut c_void,
     on_record: unsafe extern "C" fn(*mut c_void, *mut c_void, ak::Span<'_, u8>),
 ) {
-    // SAFETY: The caller passes the live VM and lends the origin and the names.
-    let (vm, storage_key, database_name, object_store_name) = unsafe {
+    // SAFETY: The caller lends the origin.
+    let (storage_key, database_name, object_store_name) = unsafe {
         (
-            vm_from_abi(vm),
             storage_key_from_abi(origin),
-            utf16_string_from_abi(database_name),
-            utf16_string_from_abi(object_store_name),
+            database_name.to_utf16_string(),
+            object_store_name.to_utf16_string(),
         )
     };
     let Some(database) = Database::for_key_and_name(vm, &storage_key, &database_name) else {
@@ -275,18 +234,12 @@ pub enum InspectionStatus {
 /// The VM must be live, and the origin and the name lent.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn web_rust_indexed_db_delete_database_for_inspection(
-    vm: *mut c_void,
+    vm: &Vm,
     origin: *const FfiOrigin,
-    database_name: usize,
+    database_name: LentUtf16String<'_>,
 ) -> InspectionStatus {
-    // SAFETY: The caller passes the live VM and lends the origin and the name.
-    let (vm, storage_key, database_name) = unsafe {
-        (
-            vm_from_abi(vm),
-            storage_key_from_abi(origin),
-            utf16_string_from_abi(database_name),
-        )
-    };
+    // SAFETY: The caller lends the origin.
+    let (storage_key, database_name) = unsafe { (storage_key_from_abi(origin), database_name.to_utf16_string()) };
     if let Some(database) = Database::for_key_and_name(vm, &storage_key, &database_name)
         && !database.associated_connections(vm).is_empty()
     {
@@ -304,18 +257,17 @@ pub unsafe extern "C" fn web_rust_indexed_db_delete_database_for_inspection(
 /// The VM must be live, and the origin and the names lent.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn web_rust_indexed_db_clear_object_store_for_inspection(
-    vm: *mut c_void,
+    vm: &Vm,
     origin: *const FfiOrigin,
-    database_name: usize,
-    object_store_name: usize,
+    database_name: LentUtf16String<'_>,
+    object_store_name: LentUtf16String<'_>,
 ) -> InspectionStatus {
-    // SAFETY: The caller passes the live VM and lends the origin and the names.
-    let (vm, storage_key, database_name, object_store_name) = unsafe {
+    // SAFETY: The caller lends the origin.
+    let (storage_key, database_name, object_store_name) = unsafe {
         (
-            vm_from_abi(vm),
             storage_key_from_abi(origin),
-            utf16_string_from_abi(database_name),
-            utf16_string_from_abi(object_store_name),
+            database_name.to_utf16_string(),
+            object_store_name.to_utf16_string(),
         )
     };
     let Some(database) = Database::for_key_and_name(vm, &storage_key, &database_name) else {
@@ -337,20 +289,19 @@ pub unsafe extern "C" fn web_rust_indexed_db_clear_object_store_for_inspection(
 /// The VM must be live, and the origin and the names lent.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn web_rust_indexed_db_delete_record_for_inspection(
-    vm: *mut c_void,
+    vm: &Vm,
     origin: *const FfiOrigin,
-    database_name: usize,
-    object_store_name: usize,
+    database_name: LentUtf16String<'_>,
+    object_store_name: LentUtf16String<'_>,
     ctx: *mut c_void,
     matches: unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool,
 ) -> InspectionStatus {
-    // SAFETY: The caller passes the live VM and lends the origin and the names.
-    let (vm, storage_key, database_name, object_store_name) = unsafe {
+    // SAFETY: The caller lends the origin.
+    let (storage_key, database_name, object_store_name) = unsafe {
         (
-            vm_from_abi(vm),
             storage_key_from_abi(origin),
-            utf16_string_from_abi(database_name),
-            utf16_string_from_abi(object_store_name),
+            database_name.to_utf16_string(),
+            object_store_name.to_utf16_string(),
         )
     };
     let Some(database) = Database::for_key_and_name(vm, &storage_key, &database_name) else {

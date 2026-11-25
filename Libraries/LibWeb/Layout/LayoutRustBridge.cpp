@@ -141,7 +141,7 @@ static CSS::StyleAtomID svg_style_reference_fragment_atom(DOM::Element& element,
 // The four resources `mask`, `clip-path`, `fill` and `stroke` name. Read from the record's group payloads rather than
 // through a materialized view: this runs for every SVG graphics element whose style record is replaced, and pinning a
 // record to look at four properties is most of the cost of looking at them.
-static Array<Optional<CSS::URL>, 4> svg_style_reference_urls(void const* record_groups)
+static Array<Optional<CSS::URL>, 4> svg_style_reference_urls(CSS::ComputedValuesFFI::StyleRecordGroups const* record_groups)
 {
     if (!record_groups)
         return {};
@@ -407,7 +407,7 @@ void publish_writing_suggestion(DOM::Document& document, DOM::Text const* text, 
     code_units.ensure_capacity(remainder.length_in_code_units());
     for (size_t i = 0; i < remainder.length_in_code_units(); ++i)
         code_units.unchecked_append(remainder.code_unit_at(i));
-    RustFFI::render_state_set_writing_suggestion(document.layout_node_arena().host(), identity, offset, code_units.data(), code_units.size());
+    RustFFI::render_state_set_writing_suggestion(document.layout_node_arena().host(), identity, offset, code_units.span());
 }
 
 void publish_table_spans(DOM::Element const& element)

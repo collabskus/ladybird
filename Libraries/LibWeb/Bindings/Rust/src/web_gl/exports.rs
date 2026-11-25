@@ -8,10 +8,9 @@
 //! context of either kind.
 
 use core::ffi::c_void;
-use core::marker::PhantomData;
 use core::ptr::NonNull;
 
-use libjs_rust::api::Vm;
+use libjs_rust::api::{Gc, Realm, Vm};
 
 use super::canvas::Canvas;
 use super::context_loss::{
@@ -25,7 +24,7 @@ use super::state::{
 };
 use super::web_gl_rendering_context::WebGLPowerPreference;
 use super::web_gl_rendering_context_base::WebGLContextAttributes;
-use crate::bindings::interface::{Interface, allocate, cell_into_abi, realm_arguments};
+use crate::bindings::interface::{InterfaceCell, allocate, cell_into_abi};
 
 /// Mirrors `Web::WebGL::ContextAttributes`.
 #[derive(Clone, Copy)]
@@ -88,7 +87,7 @@ impl From<WebGLContextAttributes> for ContextAttributes {
 #[repr(C)]
 pub struct ContextCreationArguments {
     is_webgl2: bool,
-    realm: *mut c_void,
+    realm: Gc<Realm>,
     canvas: *mut c_void,
     canvas_host: *mut c_void,
     canvas_is_offscreen: bool,
@@ -116,40 +115,19 @@ pub(super) fn create_remote_context(
     unsafe { RemoteContext::create(connection, &creation) }
 }
 
-/// The cell of a WebGLRenderingContext or of a WebGL2RenderingContext, which only C++ lends out, for as long as the
-/// context is live.
-#[repr(C)]
-pub struct ContextCell {
-    // NB: The cell is mutable behind a shared reference, and bigger than Rust sees, so a reference to one must not tell
-    //     the compiler that the memory behind it is read only or unaliased.
-    _opaque: core::cell::UnsafeCell<[u8; 0]>,
-    _not_send_sync_or_unpin: PhantomData<(*const (), core::marker::PhantomPinned)>,
-}
-
-fn with_context<R>(context: &ContextCell, function: impl FnOnce(&ContextState) -> R) -> R {
-    let cell = NonNull::from(context).cast();
-    // SAFETY: A ContextCell is the live cell of one of the two classes, which the downcasts tell apart.
-    unsafe {
-        if let Some(context) = RenderingContext::<WebGL1>::CELL_CLASS.downcast(cell) {
-            return function(&context);
-        }
-        let context = RenderingContext::<WebGL2>::CELL_CLASS
-            .downcast(cell)
-            .expect("the cell is a WebGL context");
-        function(&context)
+fn with_context<R>(context: &InterfaceCell, function: impl FnOnce(&ContextState) -> R) -> R {
+    if let Some(context) = context.object_if::<RenderingContext<WebGL1>>() {
+        return function(&context);
     }
+    function(&context.object::<RenderingContext<WebGL2>>())
 }
 
 /// # Safety
 ///
 /// The pointers are the live VM and what [`ContextCreationArguments`] describes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn web_webgl_context_create(
-    vm: *mut c_void,
-    arguments: &ContextCreationArguments,
-) -> *mut c_void {
-    // SAFETY: The caller passes the live VM and a live realm.
-    let (vm, realm) = unsafe { realm_arguments(vm, arguments.realm) };
+pub unsafe extern "C" fn web_webgl_context_create(vm: &Vm, arguments: &ContextCreationArguments) -> *mut c_void {
+    let realm = arguments.realm;
 
     let canvas = Canvas {
         cell: NonNull::new(arguments.canvas).expect("C++ passes the canvas"),
@@ -202,12 +180,12 @@ pub unsafe extern "C" fn web_webgl_context_create(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn web_webgl_context_is_lost(context: &ContextCell) -> bool {
+pub extern "C" fn web_webgl_context_is_lost(context: &InterfaceCell) -> bool {
     with_context(context, ContextState::is_context_lost)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn web_webgl_context_canvas_id(context: &ContextCell, out_canvas_id: &mut u64) -> bool {
+pub extern "C" fn web_webgl_context_canvas_id(context: &InterfaceCell, out_canvas_id: &mut u64) -> bool {
     let Some(canvas_id) = with_context(context, |context| context.proxy.canvas_id()) else {
         return false;
     };
@@ -216,7 +194,7 @@ pub extern "C" fn web_webgl_context_canvas_id(context: &ContextCell, out_canvas_
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn web_webgl_context_set_size(context: &ContextCell, width: i32, height: i32) {
+pub extern "C" fn web_webgl_context_set_size(context: &InterfaceCell, width: i32, height: i32) {
     with_context(context, |context| {
         context
             .proxy
@@ -225,7 +203,7 @@ pub extern "C" fn web_webgl_context_set_size(context: &ContextCell, width: i32, 
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn web_webgl_context_present_for_compositing(context: &ContextCell) {
+pub extern "C" fn web_webgl_context_present_for_compositing(context: &InterfaceCell) {
     with_context(context, |context| {
         let preserve_drawing_buffer = context.context_creation_parameters.preserve_drawing_buffer;
         context.proxy.present_canvas_for_compositing(preserve_drawing_buffer);
@@ -233,14 +211,14 @@ pub extern "C" fn web_webgl_context_present_for_compositing(context: &ContextCel
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn web_webgl_context_clear_drawing_buffer(context: &ContextCell) {
+pub extern "C" fn web_webgl_context_clear_drawing_buffer(context: &InterfaceCell) {
     with_context(context, |context| context.proxy.clear_drawing_buffer());
 }
 
 /// A Gfx::DecodedImageFrame allocated with new that the caller takes over, or null.
 #[unsafe(no_mangle)]
 pub extern "C" fn web_webgl_context_read_back_drawing_buffer(
-    context: &ContextCell,
+    context: &InterfaceCell,
     x: i32,
     y: i32,
     width: i32,
@@ -252,47 +230,28 @@ pub extern "C" fn web_webgl_context_read_back_drawing_buffer(
     frame.map_or(core::ptr::null_mut(), |frame| frame.hand_over_copy())
 }
 
-/// # Safety
-///
-/// `vm` must be the live VM of the thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn web_webgl_lose_contexts_of_this_thread(vm: *mut c_void) {
-    // SAFETY: The caller passes the live VM.
-    lose_contexts_of_this_thread(unsafe { &*vm.cast::<Vm>() });
+pub extern "C" fn web_webgl_lose_contexts_of_this_thread(vm: &Vm) {
+    lose_contexts_of_this_thread(vm);
 }
 
-/// # Safety
-///
-/// `vm` must be the live VM of the thread.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn web_webgl_restore_contexts_of_this_thread(vm: *mut c_void) {
-    // SAFETY: The caller passes the live VM.
-    restore_contexts_of_this_thread(unsafe { &*vm.cast::<Vm>() });
+pub extern "C" fn web_webgl_restore_contexts_of_this_thread(vm: &Vm) {
+    restore_contexts_of_this_thread(vm);
 }
 
 /// Converts the options of getContext() to the dictionary, and answers true with the exception that the conversion
 /// threw.
-///
-/// # Safety
-///
-/// `vm` must be the live VM and `value` a live value.
 #[cfg(web_idl_bindings)]
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn web_webgl_context_attributes_from_value(
-    vm: *mut c_void,
-    value: u64,
+pub extern "C" fn web_webgl_context_attributes_from_value(
+    vm: &Vm,
+    value: libjs_rust::api::Value,
     out_context_attributes: &mut ContextAttributes,
     out_exception: &mut u64,
 ) -> bool {
     use crate::bindings::conversions::FromJs;
 
-    // SAFETY: The caller passes the live VM and a live value.
-    let (vm, value) = unsafe {
-        (
-            &*vm.cast::<libjs_rust::api::Vm>(),
-            libjs_rust::api::Value::from_raw(value),
-        )
-    };
     match WebGLContextAttributes::from_js(vm, value) {
         Ok(context_attributes) => {
             *out_context_attributes = context_attributes.into();

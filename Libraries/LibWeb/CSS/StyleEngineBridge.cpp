@@ -208,7 +208,7 @@ StyleRecordID StyleEngine::install_host_style_record(Layout::BegunRead const& re
     return StyleRecordID { StyleEngineFFI::style_engine_install_host_style_record(host(), &read, payloads.data(), payloads.size(), inherited.bits, inherited.effective_zoom_bits, reset, custom_property_environment, counter_style_environment_identity, source_record, custom_property_store) };
 }
 
-void const* StyleEngine::host_record(Layout::BegunRead const& read, StyleRecordID style_record) const
+StyleEngineFFI::Record const* StyleEngine::host_record(Layout::BegunRead const& read, StyleRecordID style_record) const
 {
     return StyleEngineFFI::style_engine_host_record(host(), &read, style_record.value());
 }
@@ -866,7 +866,7 @@ bool StyleEngine::matched_rules(Layout::BegunRead const& read, StyleNodeID node,
     auto raw_node = node.value();
     matches.resize(64);
     auto match = [&] {
-        return StyleEngineFFI::style_engine_matched_rules(host(), &read, &raw_node, 1, matches.data(), matches.size(), true);
+        return StyleEngineFFI::style_engine_matched_rules(host(), &read, { &raw_node, 1 }, matches.span(), true);
     };
     auto count = match();
     if (count > matches.size()) {

@@ -2490,6 +2490,19 @@ fn declare_animation_effect_id_of_animations_header(config: &mut cbindgen::Confi
         .push_str("\nnamespace Web::Animations::RustFFI { using AnimationEffectId = uint64_t; }");
 }
 
+/// Names the groups of a style record, which are opaque to C++, in the namespace of the computed values that C++ reads
+/// from them, for a header whose entries take them.
+fn declare_style_record_groups_of_computed_values_header(config: &mut cbindgen::Config) {
+    config.export.rename.insert(
+        "StyleRecordGroups".to_string(),
+        "Web::CSS::ComputedValuesFFI::StyleRecordGroups".to_string(),
+    );
+    config
+        .after_includes
+        .get_or_insert_with(String::new)
+        .push_str("\nnamespace Web::CSS::ComputedValuesFFI { struct StyleRecordGroups; }");
+}
+
 /// Names the document host and the begun read as the layout header declares them, for a header whose entries take them.
 fn declare_document_host_of_layout_header(config: &mut cbindgen::Config) {
     for name in ["DocumentHost", "BegunRead"] {
@@ -2903,6 +2916,21 @@ fn main() -> Result<(), Box<dyn Error>> {
             "\nnamespace Web::CSS::Parser::ValueParserFFI { struct DeclarationBlock; struct NativeRule; struct NativeStyleSheet; }",
         );
 
+    // An element's style record and the sizer of a memory report are opaque to C++, which holds each by pointer, and so
+    // is an element's animation overlay, which crosses as the computed values header declares it.
+    style_engine_config.export.rename.insert(
+        "AnimatedOverlay".to_string(),
+        "Web::CSS::ComputedValuesFFI::AnimatedOverlay".to_string(),
+    );
+    style_engine_config
+        .after_includes
+        .get_or_insert_with(String::new)
+        .push_str(
+            "\nnamespace Web::CSS::StyleEngineFFI { struct Record; struct HeapSizer; }\nnamespace Web::CSS::ComputedValuesFFI { struct AnimatedOverlay; }",
+        );
+    // So are the groups of a record, which a view of one names.
+    declare_style_record_groups_of_computed_values_header(&mut style_engine_config);
+
     // The effects whose descriptions and samples cross here are named by their identities.
     declare_animation_effect_id_of_animations_header(&mut style_engine_config);
     generate_ffi_header(
@@ -3010,6 +3038,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             .insert(name.to_string(), "void".to_string());
         computed_values_config.export.exclude.push(name.to_string());
     }
+    // The style record a computed value is read from is the style engine header's.
+    computed_values_config
+        .export
+        .rename
+        .insert("Record".to_string(), "Web::CSS::StyleEngineFFI::Record".to_string());
+    computed_values_config
+        .after_includes
+        .get_or_insert_with(String::new)
+        .push_str("\nnamespace Web::CSS::StyleEngineFFI { struct Record; }");
     computed_values_config.export.rename.insert(
         "DeclarationBlockHeader".to_string(),
         "Web::CSS::Parser::ValueParserFFI::DeclarationBlockHeader".to_string(),
@@ -3126,6 +3163,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         "ladybird_layout_node_shell_destroy".to_string(),
         "rust_calc_resolve".to_string(),
     ];
+    // The groups of a style record are opaque to C++, which holds them by pointer.
+    declare_style_record_groups_of_computed_values_header(&mut tree_builder_config);
     expose_css_pixel_types_as_web_types(&mut tree_builder_config);
     expose_compositing_types_as_cpp_types(&mut tree_builder_config);
     generate_ffi_header(
@@ -3218,6 +3257,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         .export
         .rename
         .insert("CompositorAnimationEffectState".to_string(), "void".to_string());
+    // The view of a `@keyframes` rule a keyframe set is made from is the value parser header's.
+    animations_config.export.rename.insert(
+        "NativeRuleView".to_string(),
+        "Web::CSS::Parser::ValueParserFFI::NativeRuleView".to_string(),
+    );
+    animations_config
+        .after_includes
+        .get_or_insert_with(String::new)
+        .push_str("\nnamespace Web::CSS::Parser::ValueParserFFI { struct NativeRuleView; }");
     // The host defines what the timeline records ask of documents, which the tests stub.
     animations_config
         .export
@@ -3294,6 +3342,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/animations/timeline.rs"),
             manifest_dir.join("src/animations/timeline_host.rs"),
             manifest_dir.join("src/animations/transitions.rs"),
+            manifest_dir.join("src/css/ffi_support.rs"),
         ],
         &out_dir,
         Path::new("Animations/RustFFI.h"),
@@ -3393,6 +3442,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .export
         .include
         .extend(["FfiCompositorAnimationRequest", "FfiCompositorAnimationHost"].map(String::from));
+    // The line content of a text geometry source is opaque to C++, which holds it by pointer.
+    layout_config
+        .after_includes
+        .get_or_insert_with(String::new)
+        .push_str("\nnamespace Web::Layout::RustFFI { struct InlineContent; }");
     // The effects whose descriptions and samples cross here are named by their identities.
     declare_animation_effect_id_of_animations_header(&mut layout_config);
     generate_ffi_header(

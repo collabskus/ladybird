@@ -143,7 +143,7 @@ void const* ComputedValues::style_group_payload(StyleGroupIndex group) const
     VERIFY_NOT_REACHED();
 }
 
-void ComputedValues::borrow_style_record_groups(void const* groups)
+void ComputedValues::borrow_style_record_groups(ComputedValuesFFI::StyleRecordGroups const* groups)
 {
     VERIFY(groups);
 #define LIBWEB_BORROW_STYLE_GROUP(name, path, sharing_name) \
@@ -375,7 +375,7 @@ Vector<RefPtr<AbstractImageStyleValue const>> ComputedValues::MaskValues::mask_i
 
 ComputedValues::ComputedValues() = default;
 
-StyleRecordRef::StyleRecordRef(void const* record)
+StyleRecordRef::StyleRecordRef(StyleEngineFFI::Record const* record)
     : m_record(record)
 {
     if (m_record)

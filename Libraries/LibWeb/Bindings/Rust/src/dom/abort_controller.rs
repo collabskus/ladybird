@@ -7,9 +7,9 @@
 
 use core::ffi::c_void;
 
-use libjs_rust::api::{Trace, Value, Vm};
+use libjs_rust::api::{Gc, Realm, Trace, Value, Vm};
 
-use crate::bindings::interface::{Ref, Wrappable, allocate, cell_from_abi, cell_into_abi, realm_arguments};
+use crate::bindings::interface::{InterfaceCell, Ref, Wrappable, allocate, cell_into_abi};
 use crate::bindings::{CallContext, WebIdlResult};
 use crate::dom::abort_signal::AbortSignal;
 
@@ -56,40 +56,25 @@ impl AbortController {
 }
 
 /// Creates an AbortController.
-///
-/// # Safety
-///
-/// `vm` must be the live VM.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn web_rust_abort_controller_create(vm: &Vm) -> *mut c_void {
+pub extern "C" fn web_rust_abort_controller_create(vm: &Vm) -> *mut c_void {
     cell_into_abi(AbortController::create(vm))
 }
 
 /// Returns the controller’s signal.
-///
-/// # Safety
-///
-/// `controller` must be a live AbortController cell.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn web_rust_abort_controller_signal(controller: *mut c_void) -> *mut c_void {
-    // SAFETY: The caller passes a live AbortController.
-    cell_into_abi(unsafe { cell_from_abi::<AbortController>(controller) }.signal)
+pub extern "C" fn web_rust_abort_controller_signal(controller: &InterfaceCell) -> *mut c_void {
+    cell_into_abi(controller.object::<AbortController>().signal)
 }
 
 /// Aborts the controller with the reason in the realm.
-///
-/// # Safety
-///
-/// `vm`, `realm`, `controller`, and `reason` must be live.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn web_rust_abort_controller_abort(
-    vm: *mut c_void,
-    realm: *mut c_void,
-    controller: *mut c_void,
-    reason: u64,
+pub extern "C" fn web_rust_abort_controller_abort(
+    vm: &Vm,
+    realm: Gc<Realm>,
+    controller: &InterfaceCell,
+    reason: Value,
 ) {
-    // SAFETY: The caller passes the live VM, realm, controller, and reason.
-    let (vm, realm) = unsafe { realm_arguments(vm, realm) };
-    let controller = unsafe { cell_from_abi::<AbortController>(controller) };
-    controller.signal_abort(&CallContext::new(vm, realm), Some(unsafe { Value::from_raw(reason) }));
+    let controller = controller.object::<AbortController>();
+    controller.signal_abort(&CallContext::new(vm, realm), Some(reason));
 }

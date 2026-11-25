@@ -21,14 +21,14 @@ class InstalledStyle {
 public:
     InstalledStyle() = default;
     // Takes a reference to `record`, a record the engine handed out, or none for null.
-    explicit InstalledStyle(void const* record)
+    explicit InstalledStyle(StyleEngineFFI::Record const* record)
         : m_record(record)
     {
         if (m_record)
             StyleEngineFFI::style_engine_record_retain(m_record);
     }
     // Takes over a reference to `record` the engine handed out, or none for null.
-    static InstalledStyle adopt(void const* record)
+    static InstalledStyle adopt(StyleEngineFFI::Record const* record)
     {
         InstalledStyle installed;
         installed.m_record = record;
@@ -77,11 +77,11 @@ public:
     u64 custom_property_environment() const { return m_record ? StyleEngineFFI::style_engine_record_custom_property_environment(m_record) : 0; }
 
     // The record itself, as the engine's entries that read a record the host holds take it, or null.
-    void const* record_pointer() const { return m_record; }
+    StyleEngineFFI::Record const* record_pointer() const { return m_record; }
 
     // The record's groups, which `CSS::style_record_group` reads, or null where nothing is installed. NB: A record's
     // groups are at its head.
-    void const* groups() const { return m_record; }
+    ComputedValuesFFI::StyleRecordGroups const* groups() const { return reinterpret_cast<ComputedValuesFFI::StyleRecordGroups const*>(m_record); }
 
     // Whether the record's own display, beneath any animation, is none, read straight out of its box group payload.
     bool display_is_none() const;
@@ -89,7 +89,7 @@ public:
 
     // Whether `animated_overlay` changes any effective value of the record in place of its own overlay, read from the
     // record itself.
-    bool animation_overlay_changed(void const* animated_overlay) const
+    bool animation_overlay_changed(ComputedValuesFFI::AnimatedOverlay const* animated_overlay) const
     {
         VERIFY(m_record);
         auto view = this->view();
@@ -97,7 +97,7 @@ public:
     }
 
 private:
-    void const* m_record { nullptr };
+    StyleEngineFFI::Record const* m_record { nullptr };
 };
 
 // NB: Every element and pseudo-element the host styles holds one of these.
