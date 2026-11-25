@@ -1,4 +1,775 @@
-﻿        .relevance = contains_whitespace ? 1000 : 900,
+﻿#include <LibWebView/SessionHistoryTraversalQueue.h>
+
+namespace WebView {
+
+// One of a run's changingNavigables: its history step job, and the changing navigable continuation the job enqueues.
+// NB: The process running the job retains the rest of the continuation's state. What waits on the job looks the record
+//     up again by its operation and navigable, which name it for as long as its run lasts.
+struct WEBVIEW_API ChangingNavigable {
+    AK_ALLOC_WITH_KMALLOC;
+
+    ChangingNavigable(CanonicalNavigable& navigable, NonnullRefPtr<CanonicalSessionHistoryEntry> target_entry)
+        : id(navigable.id())
+        , target_entry(move(target_entry))
+        , m_navigable(navigable.make_weak_ptr())
+    {
+    }
+
+    CanonicalNavigable& navigable() const
+    {
+        VERIFY(m_navigable);
+        return *m_navigable;
+    }
+
+    bool has_pending_job() const { return !job_ended; }
+
+    Web::HTML::CrossProcessId id;
+
+    // The process running the job retains this exact entry instead of resolving a target step against its local session
+    // history projection. The run looks it up again before it is activated, and follows a sync navigation that changed
+    // it (whatwg/html#12961).
+    NonnullRefPtr<CanonicalSessionHistoryEntry> target_entry;
+    // Whether targetEntry's document state's reload pending was true when the job claimed it, and whether that reload
+    // bypasses the HTTP cache. Populating the document sets both to false.
+    bool target_entry_reload_pending { false };
+    bool target_entry_reload_bypasses_cache { false };
+    // The target entry as the job claimed it, for the processes the job runs in.
+    Web::HTML::SessionHistoryEntryDescriptor target_entry_descriptor() const;
+
+    // Nothing more comes from the process running the job, and it counts towards completedChangeJobs.
+    bool job_ended { false };
+    // The run's part of the continuation, which the process running the job applies with the rest.
+    struct Continuation {
+        Web::HTML::HistoryObjectLengthAndIndex history_object_length_and_index;
+        Vector<Web::HTML::SessionHistoryEntryDescriptor> entries_for_navigation_api;
+    };
+    Optional<Continuation> continuation;
+
+    // https://html.spec.whatwg.org/multipage/browsing-the-web.html#changing-navigable-continuation-state
+    // NB: Its target entry and navigable are the record's. The process running the job reports update-only.
+    RefPtr<CanonicalDocument> displayed_document;
+    bool update_only { false };
+
+    // Steps 2 and 3 of afterDocumentPopulated, which the continuation applies after potential unloads.
+    bool clears_classic_history_api_state { false };
+    bool clears_navigable_target_name { false };
+
+    // targetEntry's document, as the job's process has it.
+    RefPtr<CanonicalDocument> target_document(WebContentPage const& job_page) const;
+
+    // Step 8 of the job, populating targetEntry's document, as its parts run across processes.
+    struct AwaitingPopulation { };
+    struct CreatingNavigationParams {
+        NonnullRefPtr<NavigationLoader> loader;
+    };
+    struct AcquiringResponseBody {
+        NonnullRefPtr<NavigationLoader> loader;
+    };
+    struct Populating {
+        NonnullRefPtr<NavigationLoader> loader;
+    };
+    Variant<Empty, AwaitingPopulation, CreatingNavigationParams, AcquiringResponseBody, Populating> population;
+    RefPtr<NavigationLoader> population_loader() const;
+    RefPtr<CanonicalDocument> populated_document;
+
+private:
+    WeakPtr<CanonicalNavigable> m_navigable;
+};
+
+// The apply-history-step state a traversable navigable shares across runs.
+struct TraversableApplyHistoryStepState {
+    // https://html.spec.whatwg.org/multipage/document-sequences.html#tn-running-nested-apply-history-step
+    bool running_nested_apply_history_step { false };
+
+    // AD-HOC: Concurrent runs share the current-step commit: a run commits its target step only if no newer run (a
+    //         synchronous navigation that jumped the queue while it was paused) has moved the current step first, so
+    //         the current step cannot move backwards past a newer run's commit. A newer run whose commit moves nothing
+    //         (a synchronous replace re-commits the step it started from) leaves the paused run's own commit intact.
+    //         See https://github.com/whatwg/html/issues/12576.
+    u64 generation_counter { 0 };
+    u64 committed_generation { 0 };
+};
+
+// https://html.spec.whatwg.org/multipage/browsing-the-web.html#apply-the-history-step
+//
+// One run of the apply-the-history-step algorithm, coordinated from the UI process. The algorithm's traversal-wide
+// variables live on this object; the traversable runs the per-navigable jobs in the processes hosting the documents,
+// and their completions resume the algorithm at the phase that dispatched them. Each job reports to the run exactly
+// once, including after its process is lost.
+class WEBVIEW_API ApplyHistoryStep {
+    AK_MAKE_NONCOPYABLE(ApplyHistoryStep);
+    AK_MAKE_NONMOVABLE(ApplyHistoryStep);
+
+public:
+    AK_ALLOC_WITH_KMALLOC;
+
+    ApplyHistoryStep(
+        CanonicalTraversable& traversable,
+        HistoryOperation& operation,
+        Web::HTML::CrossProcessId operation_id,
+        u64 operation_sequence_number,
+        i32 step,
+        bool check_for_cancelation,
+        Optional<Web::HTML::CrossProcessId> initiator_to_check,
+        Optional<Web::HTML::NavigationSourceSnapshot> source_snapshot_params,
+        Web::HTML::UserNavigationInvolvement user_involvement,
+        Optional<Web::Bindings::NavigationType> navigation_type);
+    ~ApplyHistoryStep();
+
+    void apply_the_history_step();
+    // The run's operation finished. Its pending jobs end, and it calls none of its jobs from then on.
+    void abandon();
+
+    // The step this run committed as the current session history step, if it was the run that committed.
+    Optional<i32> committed_step() const { return m_committed_step; }
+
+    HistoryOperation& operation() const { return m_operation; }
+    Web::HTML::UserNavigationInvolvement user_involvement() const { return m_user_involvement; }
+    Optional<Web::Bindings::NavigationType> navigation_type() const { return m_navigation_type; }
+    Optional<Web::HTML::NavigationSourceSnapshot> const& source_snapshot_params() const { return m_source_snapshot_params; }
+
+    Vector<NonnullOwnPtr<ChangingNavigable>> const& changing_navigables() const { return m_changing_navigables; }
+    ChangingNavigable* changing_navigable(Web::HTML::CrossProcessId) const;
+
+    void changing_navigable_job_completed(ChangingNavigable&, Web::HTML::ChangingNavigableHistoryStepJobDisposition);
+    void nonchanging_navigable_updated();
+    // The run goes on once its continuations are processed again.
+    void end_changing_navigable_job(ChangingNavigable&);
+    void process_changing_navigable_continuations();
+
+private:
+    void get_changing_and_nonchanging_navigables();
+    void run_changing_navigable_jobs();
+    void update_nonchanging_navigables();
+    void set_current_session_history_step();
+    void append_the_claimed_target_entry_again(CanonicalNavigable&, CanonicalSessionHistoryEntry& claimed_target_entry);
+
+    void set_ongoing_navigation_to_traversal(CanonicalNavigable&, CanonicalSessionHistoryEntry const&);
+    void return_result(Web::HTML::HistoryStepResult);
+
+    CanonicalTraversable& m_traversable;
+    TraversableSessionHistory& m_session_history;
+    SessionHistoryTraversalQueue& m_session_history_traversal_queue;
+    TraversableApplyHistoryStepState& m_traversable_state;
+
+    HistoryOperation& m_operation;
+    Web::HTML::CrossProcessId const m_operation_id;
+    u64 const m_operation_sequence_number;
+
+    // The algorithm's arguments.
+    // NB: A run that appends its claimed target entry again moves to that entry's step.
+    i32 m_step;
+    // NB: The HTML Standard spells this algorithm argument "checkForCancelation".
+    bool const m_check_for_cancelation;
+    Optional<Web::HTML::CrossProcessId> const m_initiator_to_check;
+    Optional<Web::HTML::NavigationSourceSnapshot> const m_source_snapshot_params;
+    Web::HTML::UserNavigationInvolvement const m_user_involvement;
+    Optional<Web::Bindings::NavigationType> const m_navigation_type;
+
+    // The algorithm's variables.
+    i32 m_target_step { 0 };
+    Vector<NonnullOwnPtr<ChangingNavigable>> m_changing_navigables;
+    Vector<Web::HTML::CrossProcessId> m_nonchanging_navigables_that_still_need_updates;
+    size_t m_completed_change_jobs { 0 };
+    Vector<ChangingNavigable*> m_changing_navigable_continuations;
+    // AD-HOC: One continuation is applied at a time, so synchronous navigations queued by its application are in the
+    //         traversal queue before the next continuation checks for them.
+    ChangingNavigable* m_continuation_being_applied { nullptr };
+    HashTable<Web::HTML::CrossProcessId> m_navigables_that_must_wait_before_handling_sync_navigation;
+    size_t m_completed_nonchanging_jobs { 0 };
+
+    // AD-HOC: The generation that orders the runs' commits of the current step (whatwg/html#12576).
+    u64 m_generation;
+    // How far the run lets synchronous navigation steps jump.
+    Optional<u64> m_synchronous_navigation_steps_to_jump_through;
+
+    // The synchronous navigation steps this run is paused on ("running nested apply history step" is true).
+    RefPtr<Core::Promise<Empty>> m_running_synchronous_navigation_steps;
+
+    Optional<i32> m_committed_step;
+};
+
+}
+
+FILE: Libraries/LibWebView/AudioDaemonSocket.cpp
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <LibWebView/AudioDaemonSocket.h>
+
+#if defined(HAVE_PULSEAUDIO)
+#    include <AK/ScopeGuard.h>
+#    include <AK/Time.h>
+#    include <pulse/pulseaudio.h>
+#    include <string.h>
+#endif
+
+namespace WebView {
+
+Optional<ByteString> unix_path_from_server_string(StringView server)
+{
+    server = server.trim_whitespace();
+
+    // A machine identifier may be carried in front of the address.
+    if (server.starts_with('{')) {
+        auto closing_brace = server.find('}');
+        if (!closing_brace.has_value())
+            return {};
+        server = server.substring_view(closing_brace.value() + 1);
+    }
+
+    if (server.starts_with("unix:"sv))
+        server = server.substring_view("unix:"sv.length());
+
+    if (!server.starts_with('/'))
+        return {};
+
+    return ByteString { server };
+}
+
+#if defined(HAVE_PULSEAUDIO)
+
+ErrorOr<ByteString> audio_daemon_socket_path()
+{
+    auto* main_loop = pa_mainloop_new();
+    if (!main_loop)
+        return Error::from_string_literal("Unable to create a PulseAudio main loop");
+    ScopeGuard free_main_loop = [&] { pa_mainloop_free(main_loop); };
+
+    auto* context = pa_context_new(pa_mainloop_get_api(main_loop), "Ladybird");
+    if (!context)
+        return Error::from_string_literal("Unable to create a PulseAudio context");
+    ScopeGuard free_context = [&] {
+        pa_context_disconnect(context);
+        pa_context_unref(context);
+    };
+
+    // Only the attempt that succeeds says which of the library's candidates is the daemon, so this runs the
+    // connection to its end.
+    if (pa_context_connect(context, nullptr, PA_CONTEXT_NOFLAGS, nullptr) < 0) {
+        warnln("Unable to look for the audio daemon: {}", pa_strerror(pa_context_errno(context)));
+        return Error::from_string_literal("Unable to look for the audio daemon");
+    }
+
+    auto deadline = MonotonicTime::now() + AK::Duration::from_seconds(4);
+    for (;;) {
+        switch (pa_context_get_state(context)) {
+        case PA_CONTEXT_READY: {
+            auto const* server = pa_context_get_server(context);
+            if (!server)
+                return Error::from_string_literal("The audio daemon did not say where it was reached");
+            auto path = unix_path_from_server_string({ server, strlen(server) });
+            if (!path.has_value())
+                return Error::from_string_literal("The audio daemon is not reachable over a UNIX socket");
+            return path.release_value();
+        }
+        case PA_CONTEXT_FAILED:
+        case PA_CONTEXT_TERMINATED:
+            warnln("The audio daemon could not be reached: {}", pa_strerror(pa_context_errno(context)));
+            return Error::from_string_literal("The audio daemon could not be reached");
+        default:
+            break;
+        }
+
+        auto remaining = (deadline - MonotonicTime::now()).to_microseconds();
+        if (remaining <= 0)
+            return Error::from_string_literal("The audio daemon did not answer in time");
+        if (pa_mainloop_prepare(main_loop, static_cast<int>(remaining)) < 0 || pa_mainloop_poll(main_loop) < 0 || pa_mainloop_dispatch(main_loop) < 0)
+            return Error::from_string_literal("The PulseAudio main loop failed");
+    }
+}
+
+#else
+
+ErrorOr<ByteString> audio_daemon_socket_path()
+{
+    return Error::from_string_literal("No audio daemon is known on this platform");
+}
+
+#endif
+
+}
+
+FILE: Libraries/LibWebView/AudioDaemonSocket.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/ByteString.h>
+#include <AK/Error.h>
+#include <AK/Optional.h>
+#include <AK/StringView.h>
+#include <LibWebView/Export.h>
+
+namespace WebView {
+
+// The UNIX socket the audio daemon answers on right now, found by connecting as any client would and asking the
+// library what it connected to rather than predicting its lookup. A daemon reached over TCP is an error.
+WEBVIEW_API ErrorOr<ByteString> audio_daemon_socket_path();
+
+// The socket a PulseAudio server string names, in whichever form it was configured, or nothing for a host name.
+WEBVIEW_API Optional<ByteString> unix_path_from_server_string(StringView);
+
+}
+
+FILE: Libraries/LibWebView/AudioServerActivity.cpp
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <LibWebView/AudioServerActivity.h>
+#include <LibWebView/AudioServerControlClient.h>
+
+namespace WebView {
+
+AudioServerActivity::AudioServerActivity(OnAudibilityChange on_audibility_change, OnCaptureChange on_capture_change)
+    : m_on_audibility_change(move(on_audibility_change))
+    , m_on_capture_change(move(on_capture_change))
+{
+}
+
+AudioServerActivity::~AudioServerActivity()
+{
+    stop_watching();
+}
+
+void AudioServerActivity::watch(AudioServerControlClient& controller, AudibilityFilter audibility_filter, CaptureFilter capture_filter)
+{
+    stop_watching();
+    forget_everything();
+    m_controller = controller.make_weak_ptr<AudioServerControlClient>();
+    controller.on_playback_group_audibility_changed = [this, filter = move(audibility_filter)](u64 tab_id, Audio::PlaybackGroupId group, Audio::Audibility audibility) {
+        if (filter(tab_id, group, audibility))
+            set_audibility(group, audibility);
+    };
+    controller.on_capture_activity_changed = [this, filter = move(capture_filter)](u64 tab_id, Audio::PlaybackGroupId group, bool capturing) {
+        if (filter(tab_id))
+            set_capturing(group, capturing);
+    };
+    controller.on_death = [this] {
+        forget_everything();
+    };
+}
+
+void AudioServerActivity::forget_audibility(Audio::PlaybackGroupId group)
+{
+    set_audibility(group, Audio::Audibility::Inaudible);
+}
+
+void AudioServerActivity::stop_watching()
+{
+    // A replaced AudioServer's death can be noticed after its replacement has begun reporting.
+    if (auto controller = m_controller.strong_ref()) {
+        controller->on_playback_group_audibility_changed = nullptr;
+        controller->on_capture_activity_changed = nullptr;
+        controller->on_death = nullptr;
+    }
+    m_controller.clear();
+}
+
+void AudioServerActivity::set_audibility(Audio::PlaybackGroupId group, Audio::Audibility audibility)
+{
+    switch (audibility) {
+    case Audio::Audibility::Audible:
+        if (m_audible_groups.set(group) != HashSetResult::InsertedNewEntry)
+            return;
+        break;
+    case Audio::Audibility::Inaudible:
+        if (!m_audible_groups.remove(group))
+            return;
+        break;
+    }
+    m_on_audibility_change(group, audibility);
+}
+
+void AudioServerActivity::set_capturing(Audio::PlaybackGroupId group, bool capturing)
+{
+    auto changed = capturing ? m_capturing_groups.set(group) == HashSetResult::InsertedNewEntry : m_capturing_groups.remove(group);
+    if (changed)
+        m_on_capture_change();
+}
+
+void AudioServerActivity::forget_everything()
+{
+    for (auto group : exchange(m_audible_groups, {}))
+        m_on_audibility_change(group, Audio::Audibility::Inaudible);
+    if (!exchange(m_capturing_groups, {}).is_empty())
+        m_on_capture_change();
+}
+
+}
+
+FILE: Libraries/LibWebView/AudioServerActivity.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Function.h>
+#include <AK/HashTable.h>
+#include <AK/WeakPtr.h>
+#include <LibAudio/Audibility.h>
+#include <LibAudio/PlaybackGroupId.h>
+#include <LibWebView/Export.h>
+#include <LibWebView/Forward.h>
+
+namespace WebView {
+
+// Which groups a process's AudioServer has recently heard, and which hold capture streams. Only the watched AudioServer
+// is heard: what it reported is forgotten once it dies or another is watched instead, and one that has been replaced is
+// heard from no more.
+class WEBVIEW_API AudioServerActivity {
+public:
+    using OnAudibilityChange = Function<void(Audio::PlaybackGroupId, Audio::Audibility)>;
+    using OnCaptureChange = Function<void()>;
+    // Whether to take the AudioServer's report.
+    using AudibilityFilter = Function<bool(u64 tab_id, Audio::PlaybackGroupId, Audio::Audibility)>;
+    using CaptureFilter = Function<bool(u64 tab_id)>;
+
+    AudioServerActivity(OnAudibilityChange, OnCaptureChange);
+    ~AudioServerActivity();
+
+    void watch(AudioServerControlClient&, AudibilityFilter, CaptureFilter);
+    void forget_audibility(Audio::PlaybackGroupId);
+
+    // The renderer labels its capture streams, so these name the pages it says it captures for.
+    HashTable<Audio::PlaybackGroupId> const& capturing_groups() const { return m_capturing_groups; }
+    void set_capturing_for_testing(Audio::PlaybackGroupId group, bool capturing) { set_capturing(group, capturing); }
+
+private:
+    void stop_watching();
+    void set_audibility(Audio::PlaybackGroupId, Audio::Audibility);
+    void set_capturing(Audio::PlaybackGroupId, bool);
+    void forget_everything();
+
+    OnAudibilityChange m_on_audibility_change;
+    OnCaptureChange m_on_capture_change;
+    WeakPtr<AudioServerControlClient> m_controller;
+    HashTable<Audio::PlaybackGroupId> m_audible_groups;
+    HashTable<Audio::PlaybackGroupId> m_capturing_groups;
+};
+
+}
+
+FILE: Libraries/LibWebView/AudioServerControlClient.cpp
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <LibWebView/AudioServerControlClient.h>
+
+namespace WebView {
+
+AudioServerControlClient::AudioServerControlClient(NonnullOwnPtr<IPC::Transport> transport)
+    : IPC::ConnectionToServer<AudioServerControlClientEndpoint, AudioServerControlEndpoint>(*this, move(transport))
+{
+}
+
+AudioServerControlClient::~AudioServerControlClient() = default;
+
+void AudioServerControlClient::die()
+{
+    // The holder launches a new AudioServer when it next connects a client; the clients of this one hear about it from
+    // their own connections.
+    if (on_death)
+        on_death();
+}
+
+void AudioServerControlClient::capture_requested(u64 tab_id, u64 request_id, ByteString device_id, Audio::PlaybackGroupId group)
+{
+    if (on_capture_requested)
+        on_capture_requested(tab_id, request_id, device_id, group);
+}
+
+void AudioServerControlClient::playback_group_audibility_changed(u64 tab_id, Audio::PlaybackGroupId group, Audio::Audibility audibility)
+{
+    // Reports queued before the connection closed still arrive, from an AudioServer that is gone.
+    if (!is_open())
+        return;
+    if (on_playback_group_audibility_changed)
+        on_playback_group_audibility_changed(tab_id, group, audibility);
+}
+
+void AudioServerControlClient::capture_activity_changed(u64 tab_id, Audio::PlaybackGroupId group, bool capturing)
+{
+    if (!is_open())
+        return;
+    if (on_capture_activity_changed)
+        on_capture_activity_changed(tab_id, group, capturing);
+}
+
+}
+
+FILE: Libraries/LibWebView/AudioServerControlClient.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AudioServer/AudioServerControlClientEndpoint.h>
+#include <AudioServer/AudioServerControlEndpoint.h>
+#include <LibIPC/ConnectionToServer.h>
+#include <LibWebView/Export.h>
+
+namespace WebView {
+
+// The control plane of a renderer's AudioServer, spoken only by the Browser, which launched it.
+class WEBVIEW_API AudioServerControlClient final
+    : public IPC::ConnectionToServer<AudioServerControlClientEndpoint, AudioServerControlEndpoint>
+    , public AudioServerControlClientEndpoint {
+    C_OBJECT_ABSTRACT(AudioServerControlClient);
+
+public:
+    explicit AudioServerControlClient(NonnullOwnPtr<IPC::Transport>);
+    virtual ~AudioServerControlClient() override;
+
+    // A client of the tab asks to capture from the device for a page; the holder answers with capture_decided.
+    Function<void(u64 tab_id, u64 request_id, ByteString const& device_id, Audio::PlaybackGroupId)> on_capture_requested;
+    Function<void(u64 tab_id, Audio::PlaybackGroupId, Audio::Audibility)> on_playback_group_audibility_changed;
+    Function<void(u64 tab_id, Audio::PlaybackGroupId, bool capturing)> on_capture_activity_changed;
+    // Whatever the AudioServer heard goes with it.
+    Function<void()> on_death;
+
+private:
+    virtual void die() override;
+    virtual void capture_requested(u64 tab_id, u64 request_id, ByteString device_id, Audio::PlaybackGroupId group) override;
+    virtual void playback_group_audibility_changed(u64 tab_id, Audio::PlaybackGroupId group, Audio::Audibility audibility) override;
+    virtual void capture_activity_changed(u64 tab_id, Audio::PlaybackGroupId group, bool capturing) override;
+};
+
+}
+
+FILE: Libraries/LibWebView/Autocomplete.cpp
+/*
+ * Copyright (c) 2023, Cameron Youell <cameronyouell@gmail.com>
+ * Copyright (c) 2025, Tim Flynn <trflynn89@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/CharacterTypes.h>
+#include <AK/Debug.h>
+#include <AK/Find.h>
+#include <AK/HashTable.h>
+#include <AK/QuickSort.h>
+#include <LibCore/EventLoop.h>
+#include <LibCore/Timer.h>
+#include <LibTextCodec/Decoder.h>
+#include <LibURL/Parser.h>
+#include <LibURL/PublicSuffixData.h>
+#include <LibURL/URL.h>
+#include <LibWebCommon/MimeSniff/MimeType.h>
+#include <LibWebView/Autocomplete.h>
+#include <LibWebView/AutocompleteMuxer.h>
+#include <LibWebView/AutocompleteService.h>
+#include <LibWebView/HistoryDebug.h>
+#include <LibWebView/HistoryStore.h>
+#include <LibWebView/URL.h>
+#include <LibWebView/WebUI.h>
+
+namespace WebView {
+
+static constexpr auto file_url_prefix = "file://"sv;
+static constexpr auto about_url_prefix = "about:"sv;
+
+Autocomplete::Autocomplete(AutocompleteHost& host, IsPrivate is_private)
+    : SettingsObserver(host.autocomplete_settings())
+    , m_host(host)
+    , m_is_private(is_private)
+{
+    m_service_client_id = m_host.autocomplete_service().register_client([this](auto query_id, auto entries) {
+        local_query_complete(query_id, move(entries));
+    });
+}
+
+Autocomplete::~Autocomplete()
+{
+    cancel_pending_query();
+    m_host.autocomplete_service().unregister_client(m_service_client_id);
+}
+
+void Autocomplete::cancel_pending_query()
+{
+    stop_remote_query_timers();
+
+    if (auto cancel_remote_query = move(m_cancel_remote_query))
+        cancel_remote_query();
+
+    // Buffered callbacks may still arrive after we stop the request, so clear
+    // the active query as well and let the stale-response check discard them.
+    m_host.autocomplete_service().cancel(m_service_client_id);
+    m_query_id = {};
+    m_query = {};
+    m_trimmed_query = {};
+    m_classified_query = {};
+    m_local_suggestions.clear();
+    m_remote_suggestions.clear();
+    m_visited_host_families.clear();
+    m_external_url.clear();
+    m_external_url_handler_query_complete = true;
+    m_external_url_has_handler = false;
+}
+
+void Autocomplete::record_engagement(OmniboxEngagement engagement)
+{
+    if (m_is_private == IsPrivate::Yes)
+        return;
+    if (engagement.destination_kind == OmniboxDestinationKind::Search && !m_host.autocomplete_settings().search_engine_settings().engine.has_value())
+        return;
+    m_host.autocomplete_service().record_engagement(move(engagement));
+}
+
+size_t autocomplete_preliminary_limit(size_t max_suggestions)
+{
+    return max(max_suggestions * 4, 32uz);
+}
+
+String autocomplete_suggestion_display_text(AutocompleteSuggestion const& suggestion)
+{
+    if (suggestion.source == AutocompleteSuggestionSource::Search)
+        return suggestion.text;
+    // NB: Choosing a search engine leaves the query in the field, rather than the address of the settings.
+    if (suggestion.source == AutocompleteSuggestionSource::ChooseSearchEngine)
+        return suggestion.highlight_input.is_empty() ? suggestion.text : suggestion.highlight_input;
+
+    auto url = classify_user_input(suggestion.text).url;
+    if (!url.has_value())
+        url = URL::create_with_url_or_path(suggestion.text.to_byte_string());
+    if (!url.has_value())
+        return suggestion.text;
+    return url_for_display(*url);
+}
+
+Vector<AutocompleteMatchRange> autocomplete_match_ranges(StringView input, StringView text)
+{
+    Vector<AutocompleteMatchRange> ranges;
+
+    for (auto token : input.split_view_if([](char ch) { return is_ascii_space(ch); })) {
+        if (token.is_empty())
+            continue;
+
+        for (size_t offset = 0; offset + token.length() <= text.length();) {
+            auto candidate = text.substring_view(offset, token.length());
+            if (candidate.equals_ignoring_ascii_case(token)) {
+                ranges.append({ offset, token.length() });
+                offset += token.length();
+            } else {
+                ++offset;
+            }
+        }
+    }
+
+    quick_sort(ranges, [](auto const& left, auto const& right) {
+        return left.start < right.start;
+    });
+
+    Vector<AutocompleteMatchRange> merged_ranges;
+    for (auto const& range : ranges) {
+        if (merged_ranges.is_empty() || merged_ranges.last().start + merged_ranges.last().length < range.start) {
+            merged_ranges.append(range);
+            continue;
+        }
+        auto end = max(merged_ranges.last().start + merged_ranges.last().length, range.start + range.length);
+        merged_ranges.last().length = end - merged_ranges.last().start;
+    }
+    return merged_ranges;
+}
+
+bool remote_autocomplete_suggestion_matches_input(StringView suggestion, StringView input)
+{
+    return suggestion.starts_with(input, CaseSensitivity::CaseInsensitive);
+}
+
+Vector<AutocompleteSuggestion> web_ui_autocomplete_suggestions(StringView input)
+{
+    if (!input.starts_with(about_url_prefix, CaseSensitivity::CaseInsensitive))
+        return {};
+
+    Vector<AutocompleteSuggestion> suggestions;
+    suggestions.ensure_capacity(WebUI::pages().size());
+
+    for (auto const& page : WebUI::pages()) {
+        auto url = MUST(String::formatted("about:{}", page.host));
+        if (!url.bytes_as_string_view().starts_with(input, CaseSensitivity::CaseInsensitive))
+            continue;
+
+        suggestions.unchecked_append({
+            .source = AutocompleteSuggestionSource::WebUI,
+            .text = move(url),
+            .title = MUST(String::from_utf8(page.title)),
+            .subtitle = {},
+            .favicon_png = {},
+            .highlight_input = {},
+            .match_class = AutocompleteMatchClass::URLPrefix,
+            .relevance = 1100,
+            .is_verbatim = false,
+            .can_be_automatically_selected = true,
+            .can_be_inline_completed = true,
+        });
+    }
+
+    return suggestions;
+}
+
+[[maybe_unused]] static ByteString log_autocomplete_suggestions(Vector<AutocompleteSuggestion> const& suggestions)
+{
+    Vector<ByteString> values;
+    values.ensure_capacity(suggestions.size());
+
+    for (auto const& suggestion : suggestions)
+        values.unchecked_append(suggestion.text.bytes_as_string_view());
+
+    return ByteString::formatted("[{}]", ByteString::join(", "sv, values));
+}
+
+static Optional<AutocompleteSuggestion> search_for_query_suggestion(Optional<SearchEngine> const& search_engine, StringView query)
+{
+    if (query.is_empty())
+        return {};
+
+    auto query_string = MUST(String::from_utf8(query));
+    auto contains_whitespace = any_of(query, [](auto code_unit) { return is_ascii_space(code_unit); });
+
+    if (!search_engine.has_value()) {
+        return AutocompleteSuggestion {
+            .source = AutocompleteSuggestionSource::ChooseSearchEngine,
+            .text = "about:settings#search"_string,
+            .title = "Choose a search engine…"_string,
+            .subtitle = MUST(String::formatted("to search for “{}”", query_string)),
+            .favicon_png = {},
+            .highlight_input = {},
+            .relevance = contains_whitespace ? 1000 : 900,
+            .is_verbatim = true,
+            .can_be_automatically_selected = true,
+            .can_be_inline_completed = false,
+        };
+    }
+
+    return AutocompleteSuggestion {
+        .source = AutocompleteSuggestionSource::Search,
+        .text = query_string,
+        .title = query_string,
+        .subtitle = {},
+        .favicon_png = {},
+        .highlight_input = {},
+        .relevance = contains_whitespace ? 1000 : 900,
         .is_verbatim = true,
         .can_be_automatically_selected = true,
         .can_be_inline_completed = false,
@@ -5009,29 +5780,35 @@ void CanonicalNavigable::run_activation_notification_steps_for_active_document(H
     auto const& document = active_document();
 
     // 2. Let windows be « document's relevant global object ».
-    Vector<NonnullRefPtr<CanonicalDocument const>> windows { document };
+    // NB: Each window is held as the navigable it is the active window of, since that navigable's replicated state
+    //     carries the window's sticky activation.
+    Vector<CanonicalNavigable const*> windows { this };
 
     // 3. Extend windows with the active window of each of document's ancestor navigables.
     for (auto const* ancestor = parent(); ancestor; ancestor = ancestor->parent())
-        windows.append(ancestor->active_document());
+        windows.append(ancestor);
 
     // 4. Extend windows with the active window of each of document's descendant navigables, filtered to include only
     //    those navigables whose active document's origin is same origin with document's origin.
     for_each_in_subtree([&](CanonicalNavigable const& descendant) {
-        auto const& descendant_document = descendant.active_document();
-        if (descendant_document.origin().is_same_origin(document.origin()))
-            windows.append(descendant_document);
+        if (descendant.active_document().origin().is_same_origin(document.origin()))
+            windows.append(&descendant);
         return IterationDecision::Continue;
     });
 
-    // 5. For each window in windows:
-    // NB: The page hosting the window's document runs steps 5.1 and 5.2. Running them again for the same input changes
-    //     nothing, so a window already notified for it is skipped.
-    for (auto const& window : windows) {
-        if (notified_document_ids.set(window->id()) != HashSetResult::InsertedNewEntry)
+    // 5. For each window of windows:
+    for (auto const* navigable : windows) {
+        auto const& window_document = navigable->active_document();
+
+        // 3. Set window's has sticky activation to true.
+        navigable->give_sticky_activation_to_window_of(window_document);
+
+        // NB: The page hosting the window's document runs the steps for its own copy of the window. Running them again
+        //     for the same input changes nothing, so a window already notified for it is skipped.
+        if (notified_document_ids.set(window_document.id()) != HashSetResult::InsertedNewEntry)
             continue;
-        if (auto const& host = window->host())
-            host->notify_about_user_activation(window->id());
+        if (auto const& host = window_document.host())
+            host->notify_about_user_activation(window_document.id());
     }
 }
 
@@ -5855,6 +6632,7 @@ Optional<Web::HTML::ReplicatedNavigableState> CanonicalNavigable::replicated_sta
         .active_document_origin = active_document().origin(),
         .active_document_sandboxing_flag_set = active_document().active_sandboxing_flag_set(),
         .active_document_is_fully_active = hosted_state.active_document_is_fully_active,
+        .active_window_has_sticky_activation = active_document().relevant_global_object().has_sticky_activation(),
         .top_level_creation_url = active_document().relevant_global_object().relevant_settings_object().top_level_creation_url().value(),
         .top_level_origin = traversable.active_document().origin(),
         .top_level_is_created_by_web_content = traversable.is_created_by_web_content(),
@@ -5872,6 +6650,19 @@ Optional<Web::HTML::ReplicatedNavigableState> CanonicalNavigable::replicated_sta
         .has_session_history_entry_and_ready_for_navigation = has_session_history_entry_and_ready_for_navigation(),
         .compositor_context_id = hosted_state.compositor_context_id,
     };
+}
+
+void CanonicalNavigable::give_sticky_activation_to_window_of(CanonicalDocument const& document) const
+{
+    auto& window = document.relevant_global_object();
+    if (window.has_sticky_activation())
+        return;
+    window.set_has_sticky_activation(true);
+
+    // Documents in other processes read the sticky activation of the active document's window from the replicated
+    // state.
+    if (&active_document() == &document)
+        send_replicated_state();
 }
 
 void CanonicalNavigable::send_replicated_state() const
@@ -6526,6 +7317,7 @@ public:
     // The navigable's replicated state: what its host reports, and what the UI process knows of it.
     Optional<Web::HTML::ReplicatedNavigableState> replicated_state() const;
     void send_replicated_state() const;
+    void give_sticky_activation_to_window_of(CanonicalDocument const&) const;
     Optional<Web::HTML::HostedNavigableState> const& hosted_state() const { return m_hosted_state; }
     void set_hosted_state(Web::HTML::HostedNavigableState);
     void did_lose_active_document();
@@ -10561,12 +11353,19 @@ public:
     CanonicalDocument const& associated_document() const;
     void set_associated_document(Badge<CanonicalDocument>, CanonicalDocument&);
 
+    // https://html.spec.whatwg.org/multipage/interaction.html#sticky-activation
+    bool has_sticky_activation() const { return m_has_sticky_activation; }
+    void set_has_sticky_activation(bool value) { m_has_sticky_activation = value; }
+
 private:
     explicit CanonicalWindow(NonnullRefPtr<CanonicalSimilarOriginWindowAgent>);
 
     NonnullRefPtr<CanonicalSimilarOriginWindowAgent> m_agent;
     OwnPtr<CanonicalEnvironmentSettingsObject> m_relevant_settings_object;
     WeakPtr<CanonicalDocument> m_associated_document;
+
+    // https://html.spec.whatwg.org/multipage/interaction.html#has-sticky-activation
+    bool m_has_sticky_activation { false };
 };
 
 }
@@ -25581,7 +26380,7 @@ void NotificationManager::install_backend_callbacks()
     m_backend->on_closed = [this](u64 id, NotificationBackend::ByUser by_user) { backend_did_close(id, by_user); };
 }
 
-void NotificationManager::show(WebContentPage& page, u64 page_notification_id, URL::Origin top_level_origin, Web::NotificationsAPI::NotificationData data, RefPtr<Gfx::Bitmap const> icon)
+void NotificationManager::show(WebContentPage& page, u64 page_notification_id, Web::HTML::CrossProcessId document_id, URL::Origin top_level_origin, Web::NotificationsAPI::NotificationData data, RefPtr<Gfx::Bitmap const> icon)
 {
     // Only the page that shows the tab's document may notify for that document. A page hosting a cross-site frame
     // in the tab has its own process, and its renderer refuses the notification; one that asks anyway is misbehaving,
@@ -25606,6 +26405,7 @@ void NotificationManager::show(WebContentPage& page, u64 page_notification_id, U
         .page = page,
         .page_id = page.id(),
         .page_notification_id = page_notification_id,
+        .document_id = document_id,
         .origin = origin,
         .origin_url = URL::Parser::basic_parse(origin.serialize()).value_or(url),
         .traversable = page.traversable().make_weak_ptr<CanonicalTraversable>(),
@@ -25788,6 +26588,9 @@ void NotificationManager::backend_did_click(u64 id)
         // The click is the user's, so the page may open a window from its handler: The UI process checks the
         // activation it granted, not the one the renderer reports.
         record.page->give_user_activation();
+        // The renderer gives the notification's window activation too. The UI process keeps that window's sticky
+        // activation for documents in other processes.
+        record.page->give_sticky_activation_to_window_of(record.document_id);
         m_clicks_awaiting_reply.append({ record.page, record.page_notification_id });
         record.page->async_notification_clicked(record.page_notification_id);
         return;
@@ -25832,6 +26635,7 @@ FILE: Libraries/LibWebView/NotificationManager.h
 #include <LibGfx/Bitmap.h>
 #include <LibURL/Origin.h>
 #include <LibURL/URL.h>
+#include <LibWebCommon/HTML/CrossProcessId.h>
 #include <LibWebCommon/NotificationsAPI/NotificationData.h>
 #include <LibWebCommon/Page/PageId.h>
 #include <LibWebView/BrowsingSession.h>
@@ -25855,7 +26659,7 @@ public:
     static constexpr int icon_maximum_side = 128;
 
     // The origin is the top-level origin of the document the notification came from, as the UI process knows it.
-    void show(WebContentPage&, u64 page_notification_id, URL::Origin top_level_origin, Web::NotificationsAPI::NotificationData, RefPtr<Gfx::Bitmap const> icon);
+    void show(WebContentPage&, u64 page_notification_id, Web::HTML::CrossProcessId document_id, URL::Origin top_level_origin, Web::NotificationsAPI::NotificationData, RefPtr<Gfx::Bitmap const> icon);
     void close(WebContentPage&, u64 page_notification_id);
     // The page's document is gone: The notification stays up, and a click on it opens the site in a new tab.
     void abandon(WebContentPage&, u64 page_notification_id);
@@ -25879,6 +26683,7 @@ private:
         RefPtr<WebContentPage> page;
         Web::PageId page_id;
         u64 page_notification_id { 0 };
+        Web::HTML::CrossProcessId document_id;
         URL::Origin origin;
         // What a click opens once the page is gone.
         URL::URL origin_url;
@@ -54232,6 +55037,17 @@ void WebContentPage::give_user_activation()
     m_last_user_activation = MonotonicTime::now();
 }
 
+void WebContentPage::give_sticky_activation_to_window_of(Web::HTML::CrossProcessId document_id)
+{
+    traversable().for_each_in_inclusive_subtree([&](CanonicalNavigable const& navigable) {
+        auto document = navigable.document_with_id(document_id);
+        if (!document || document->host() != this)
+            return IterationDecision::Continue;
+        navigable.give_sticky_activation_to_window_of(*document);
+        return IterationDecision::Break;
+    });
+}
+
 void WebContentPage::notify_about_user_activation(Web::HTML::CrossProcessId document_id)
 {
     give_user_activation();
@@ -54845,7 +55661,7 @@ void WebContentPage::did_request_show_notification(u64 notification_id, Web::HTM
     RefPtr<Gfx::Bitmap const> icon_bitmap;
     if (icon.has_value() && icon->is_valid())
         icon_bitmap = icon->bitmap();
-    NotificationManager::the().show(*this, notification_id, *document->top_level_origin(), move(data), move(icon_bitmap));
+    NotificationManager::the().show(*this, notification_id, document_id, *document->top_level_origin(), move(data), move(icon_bitmap));
 }
 
 void WebContentPage::did_request_close_notification(u64 notification_id)
@@ -56850,6 +57666,7 @@ public:
     // The user activation the UI process gives a page when it delivers input the user produced. Unlike the activation
     // a renderer reports, a compromised renderer cannot claim it.
     void give_user_activation();
+    void give_sticky_activation_to_window_of(Web::HTML::CrossProcessId document_id);
     void notify_about_user_activation(Web::HTML::CrossProcessId document_id);
     bool has_transient_user_activation() const;
     // Consumes the activation of every page of the tab, as consuming a window's activation does for the windows of its
@@ -594180,6 +594997,48 @@ FILE: Tests/LibWeb/Ref/expected/background-clip-text-inside-scrollable-ref.html
     Clip<span id="text">Text</span>
 </div>
 
+FILE: Tests/LibWeb/Ref/expected/background-clip-text-multiple-layers-ref.html
+<!DOCTYPE html>
+<style>
+    body {
+        margin: 0;
+        font: bold 40px/1 sans-serif;
+    }
+    .box {
+        position: relative;
+        width: 300px;
+        height: 50px;
+        margin-bottom: 10px;
+    }
+    .text {
+        height: 100%;
+        color: transparent;
+        background-image: linear-gradient(90deg, red, blue);
+        background-clip: text;
+    }
+    .square {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 60px;
+        height: 50px;
+        background-image: linear-gradient(rgb(0 128 0 / 60%), rgb(0 128 0 / 60%));
+    }
+    .yellow {
+        background-color: yellow;
+    }
+    #color {
+        background-image: linear-gradient(yellow, yellow);
+        background-size: 150px 50px;
+        background-repeat: no-repeat;
+        background-color: cyan;
+    }
+</style>
+<div class="box yellow"><div class="text">Text on top</div></div>
+<div class="box yellow"><div class="text">Text between</div><div class="square"></div></div>
+<div class="box"><div class="text">Text below</div><div class="square"></div></div>
+<div class="box" id="color"><div class="text">Over a color</div></div>
+
 FILE: Tests/LibWeb/Ref/expected/background-clip-text-ref.html
 <!doctype html>
 <style>
@@ -597299,6 +598158,24 @@ FILE: Tests/LibWeb/Ref/expected/css/svg-element-should-be-allowed-to-establish-s
     <div id="overlay"></div>
     <div id="sc"></div>
 </div>
+
+FILE: Tests/LibWeb/Ref/expected/css/text-decoration-skip-ink-auto-cjk-ref.html
+<!DOCTYPE html>
+<meta charset="utf-8">
+<style>
+@font-face { font-family: mplus; src: url(../../input/wpt-import/fonts/mplus-1p-regular.woff) format("woff"); }
+div {
+    font: 50px mplus, sans-serif;
+    color: #00008080;
+    letter-spacing: 10px;
+    text-decoration: green underline 3px;
+    text-underline-offset: -3px;
+    text-decoration-skip-ink: none;
+}
+</style>
+<div>中文</div>
+<div>「かな」、カナ。</div>
+<div lang="zh-TW">注音ㄅㄆㄇ</div>
 
 FILE: Tests/LibWeb/Ref/expected/css/transform-behind-eye-plane-not-painted-ref.html
 <!DOCTYPE html>
@@ -611146,6 +612023,23 @@ FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-backgrounds/background-attach
 </style>
 <div></div>
 
+FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-backgrounds/background-clip/clip-text-text-decorations-ref.html
+<!DOCTYPE html>
+<meta charset="utf-8">
+<style>
+    .test {
+        line-height: 2em;
+        font-size: 40px;
+        color: green;
+        text-decoration-thickness: 20px;
+    }
+</style>
+<body>
+    <div class="test" style="text-decoration: underline">AAAA</div>
+    <div class="test" style="text-decoration: line-through">AAAA</div>
+    <div class="test" style="text-decoration: overline">AAAA</div>
+</body>
+
 FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-backgrounds/background-margin-iframe-root-ref.html
 <!doctype HTML>
 <iframe srcdoc="
@@ -611515,6 +612409,44 @@ body {
 }
 </style>
 <div id="target"></div>
+
+FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-backgrounds/reference/background-clip-text-and-blend-mode-ref.html
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        .box {
+            margin: 20px;
+            width: 400px;
+            border: 1px solid black;
+            padding: 20px;
+            font-size: 40pt;
+            font-weight: 900;
+            font-family: sans-serif;
+            text-align: center;
+        }
+
+        .single-background {
+            color: cyan;
+        }
+
+        .middle-background {
+            background-color: cyan;
+            color: blue;
+        }
+
+        .last-background {
+            background-color: lime;
+            color: red;
+        }
+    </style>
+</head>
+<body>
+    <div class="box single-background">Cyan text on white</div>
+    <div class="box middle-background">Blue text on cyan</div>
+    <div class="box last-background">Red text on lime</div>
+</body>
+</html>
 
 FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-backgrounds/reference/border-image-repeat-002-ref.html
 <!DOCTYPE html>
@@ -645896,1217 +646828,3 @@ html,body {
   <div style="grid-column:4"></div>
   <div style="grid-column:4"></div>
   <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0j">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0k">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0l">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0m">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-1a">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-1b">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-1c">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-1d">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-1e">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-2a">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-2b">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-2c">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-2d">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-3a">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-3b">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-3c">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-4a">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-4b">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-5">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-grid/subgrid/repeat-auto-fill-004-ref.html
-<!DOCTYPE HTML>
-<!--
-     Any copyright is dedicated to the Public Domain.
-     http://creativecommons.org/publicdomain/zero/1.0/
--->
-<html><head>
-  <meta charset="utf-8">
-  <title>Reference: repeat(auto-fill, line-names) in RTL/LTR subgrids</title>
-  <link rel="author" title="Mats Palmgren" href="mailto:mats@mozilla.com">
-  <style>
-html,body {
-  color:black; background-color:white; font:10px/1 monospace; padding:0; margin:0;
-}
-
-.grid {
-  display: inline-grid;
-  grid-auto-columns: 15px;
-  border: 1px solid;
-}
-
-.subgrid {
-  display: grid;
-  grid-template-columns: subgrid;
-  grid-column: 3 / span 4;
-  grid-auto-rows: 8px;
-  background: grey;
-}
-
-.subgrid > :nth-child(2n)   {  background: black; }
-.subgrid > :nth-child(2n+1) {  background: pink; }
-
-  </style>
-</head>
-<body>
-
-<div class="grid"><div class="subgrid fill-0a">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0b">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0c">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0d">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0e">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0f">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0g">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0h">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0i">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0j">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0k">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0l">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0m">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-1a">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-1b">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-1c">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-1d">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-1e">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-2a">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-2b">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-2c">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-2d">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-3a">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-3b">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-3c">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-4a">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-4b">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-5">
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:1"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:4"></div>
-  <div style="grid-column:3"></div>
-  <div style="grid-column:2"></div>
-  <div style="grid-column:1"></div>
-</div></div>
-
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-grid/subgrid/repeat-auto-fill-005-ref.html
-<!DOCTYPE HTML>
-<!--
-     Any copyright is dedicated to the Public Domain.
-     http://creativecommons.org/publicdomain/zero/1.0/
--->
-<html><head>
-  <meta charset="utf-8">
-  <title>Reference: repeat(auto-fill / INTEGER, line-names)</title>
-  <link rel="author" title="Mats Palmgren" href="mailto:mats@mozilla.com">
-  <style>
-html,body {
-  color:black; background-color:white; font:10px/1 monospace; padding:0; margin:0;
-}
-
-.grid {
-  display: inline-grid;
-  grid-auto-columns: 20px;
-  background: lightgrey;
-}
-
-.subgrid {
-  display: grid;
-  grid: auto / subgrid;
-  grid-column: 2 / span 4;
-  background: black;
-}
-
-item {
-  min-width: 0;
-  min-height: 10px;
-  background: grey;
-}
-
-  </style>
-</head>
-<body>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-column:1 / 5"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-column:1 / 5"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-column:1 / 2"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-column:2 / 5"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-column:2 / 4"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-column:3 / 4"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-column:1 / 2"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-column:1 / 4"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-column:1 / 5"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-column:1 / 2"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-column:1 / 2"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-column:1 / 5"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-column:2 / 5"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-column:2 / 3"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-column:1 / 5"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-column:1 / 5"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-column:1 / 5"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-column:1 / 5"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-column:1 / 5"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-column:1 / 5"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-column:1 / 2"></item>
-  </div>
-</div>
-
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-grid/subgrid/repeat-auto-fill-007-ref.html
-<!DOCTYPE HTML>
-<!--
-     Any copyright is dedicated to the Public Domain.
-     http://creativecommons.org/publicdomain/zero/1.0/
--->
-<html><head>
-  <meta charset="utf-8">
-  <title>Reference: repeat(auto-fill / INTEGER, line-names)</title>
-  <link rel="author" title="Mats Palmgren" href="mailto:mats@mozilla.com">
-  <style>
-html,body {
-  color:black; background-color:white; font:10px/1 monospace; padding:0; margin:0;
-}
-
-.grid {
-  display: inline-grid;
-  grid-auto-columns: 20px;
-  background: lightgrey;
-}
-
-.subgrid {
-  display: grid;
-  grid: subgrid / auto;
-  grid-column: 2 / span 4;
-  background: black;
-  writing-mode: vertical-rl;
-}
-
-item {
-  min-width: 0;
-  min-height: 10px;
-  background: grey;
-  writing-mode: horizontal-tb;
-}
-
-  </style>
-</head>
-<body>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-row:1 / 5"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-row:1 / 5"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-row:1 / 2"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-row:2 / 5"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-row:2 / 4"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-row:3 / 4"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-row:1 / 2"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-row:1 / 4"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-row:1 / 5"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-row:1 / 2"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-row:1 / 2"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-row:1 / 5"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-row:2 / 5"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-row:2 / 3"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-row:1 / 5"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-row:1 / 5"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-row:1 / 5"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-row:1 / 5"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-row:1 / 5"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-row:1 / 5"></item>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="subgrid">
-    <item style="grid-row:1 / 2"></item>
-  </div>
-</div>
-
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-grid/subgrid/repeat-auto-fill-008-ref.html
-<!DOCTYPE HTML>
-<!--
-     Any copyright is dedicated to the Public Domain.
-     http://creativecommons.org/publicdomain/zero/1.0/
--->
-<html>
-  <head>
-    <style>
-html,body {
-  color:black; background-color:white; font:10px/1 monospace; padding:0; margin:0;
-}
-
-.grid {
-  display: inline-grid;
-  grid-auto-columns: 15px;
-  border: 1px solid;
-}
-
-.subgrid {
-  display: grid;
-  grid-column: 3 / span 4;
-  grid-auto-rows: 8px;
-  background: grey;
-}
-
-.fill-0a  { grid-template-columns: subgrid [z] [z] [z] [z] [z] }  /* [z] [z] [z] [z] [z] */
-.fill-0b  { grid-template-columns: subgrid [z] [z] [z] [z] [z] }  /* [z] [z] [z] [z] [z] */
-.fill-0c  { grid-template-columns: subgrid [x] [y] [y] [y] [z] }  /* [x] [y] [y] [y] [z] */
-.fill-0d  { grid-template-columns: subgrid [x] [z] [z] [z] [z] }  /* [x] [z] [z] [z] [z] */
-.fill-0e  { grid-template-columns: subgrid [x] [x] [x] [x] [z] }  /* [x] [x] [x] [x] [z] */
-.fill-0f  { grid-template-columns: subgrid [x] [x] [z] [z] [z] }  /* [x] [x] [z] [z] [z] */
-.fill-0g  { grid-template-columns: subgrid [x] [y] [z] [z]  }  /* [x] [y] [z] [z] [] */
-.fill-0h  { grid-template-columns: subgrid [x] [y] [x] [y] [z] }  /* [x] [y] [x] [y] [z] */
-.fill-0i  { grid-template-columns: subgrid [x] [y] [x] [y] }  /* [x] [y] [x] [y] [] */
-.fill-0j  { grid-template-columns: subgrid [y] [y] [y] [z] [z] }  /* [y] [y] [y] [z] [z] */
-.fill-0k  { grid-template-columns: subgrid [x] [y] [z] [z] }  /* [x] [y] [z] [z] [] */
-.fill-0l  { grid-template-columns: subgrid [z] [x] [y] [z] }  /* [z] [x] [y] [z] [] */
-.fill-0m  { grid-template-columns: subgrid [z] [x] [y] [x] [y] }  /* [z] [x] [y] [x] [y] */
-.fill-0n  { grid-template-columns: subgrid [z] [z] [z] [z] [z] }  /* [z] [z] [z] [z] [z] */
-.fill-0o  { grid-template-columns: subgrid [z] [x] [y] [z] }  /* [z] [x] [y] [z] [] */
-.fill-0p  { grid-template-columns: subgrid [z] [x] [y] [z] [x] }  /* [z] [x] [y] [z] [x] */
-.fill-0q  { grid-template-columns: subgrid [x] [y] [z] [x] }  /* [x] [y] [z] [x] [] */
-.fill-0r  { grid-template-columns: subgrid [x] [y] [z] [y] [z] }  /* [x] [y] [z] [y] [z] */
-
-.fill-0s  {
-  grid-column: 2 / span 5;
-  grid-template-columns: subgrid [w] [y] [z] [y] [z] [x];  /* [w] [y] [z] [y] [z] [x] */
-}
-
-.fill-0t  {
-  grid-column: 1 / span 6;
-  grid-template-columns: subgrid [w] [y] [z] [y] [z] [x];  /* [w] [y] [z] [y] [z] [x] [] */
-}
-
-.subgrid > :nth-child(2n)   {  background: black; }
-.subgrid > :nth-child(2n+1) {  background: pink; }
-
-    </style>
-  </head>
-<body>
-
-<div class="grid"><div class="subgrid fill-0a">
-  <div style="grid-column:y 5"></div>
-  <div style="grid-column:y 4"></div>
-  <div style="grid-column:y 3"></div>
-  <div style="grid-column:y 2"></div>
-  <div style="grid-column:y 1"></div>
-  <div style="grid-column:y -1"></div>
-  <div style="grid-column:y -2"></div>
-  <div style="grid-column:y -3"></div>
-  <div style="grid-column:y -4"></div>
-  <div style="grid-column:y -5"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0b">
-  <div style="grid-column:y 5"></div>
-  <div style="grid-column:y 4"></div>
-  <div style="grid-column:y 3"></div>
-  <div style="grid-column:y 2"></div>
-  <div style="grid-column:y 1"></div>
-  <div style="grid-column:y -1"></div>
-  <div style="grid-column:y -2"></div>
-  <div style="grid-column:y -3"></div>
-  <div style="grid-column:y -4"></div>
-  <div style="grid-column:y -5"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0c">
-  <div style="grid-column:y 5"></div>
-  <div style="grid-column:y 4"></div>
-  <div style="grid-column:y 3"></div>
-  <div style="grid-column:y 2"></div>
-  <div style="grid-column:y 1"></div>
-  <div style="grid-column:y -1"></div>
-  <div style="grid-column:y -2"></div>
-  <div style="grid-column:y -3"></div>
-  <div style="grid-column:y -4"></div>
-  <div style="grid-column:y -5"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0d">
-  <div style="grid-column:y 5"></div>
-  <div style="grid-column:y 4"></div>
-  <div style="grid-column:y 3"></div>
-  <div style="grid-column:y 2"></div>
-  <div style="grid-column:y 1"></div>
-  <div style="grid-column:y -1"></div>
-  <div style="grid-column:y -2"></div>
-  <div style="grid-column:y -3"></div>
-  <div style="grid-column:y -4"></div>
-  <div style="grid-column:y -5"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0e">
-  <div style="grid-column:y 5"></div>
-  <div style="grid-column:y 4"></div>
-  <div style="grid-column:y 3"></div>
-  <div style="grid-column:y 2"></div>
-  <div style="grid-column:y 1"></div>
-  <div style="grid-column:y -1"></div>
-  <div style="grid-column:y -2"></div>
-  <div style="grid-column:y -3"></div>
-  <div style="grid-column:y -4"></div>
-  <div style="grid-column:y -5"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0f">
-  <div style="grid-column:y 5"></div>
-  <div style="grid-column:y 4"></div>
-  <div style="grid-column:y 3"></div>
-  <div style="grid-column:y 2"></div>
-  <div style="grid-column:y 1"></div>
-  <div style="grid-column:y -1"></div>
-  <div style="grid-column:y -2"></div>
-  <div style="grid-column:y -3"></div>
-  <div style="grid-column:y -4"></div>
-  <div style="grid-column:y -5"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0g">
-  <div style="grid-column:y 5"></div>
-  <div style="grid-column:y 4"></div>
-  <div style="grid-column:y 3"></div>
-  <div style="grid-column:y 2"></div>
-  <div style="grid-column:y 1"></div>
-  <div style="grid-column:y -1"></div>
-  <div style="grid-column:y -2"></div>
-  <div style="grid-column:y -3"></div>
-  <div style="grid-column:y -4"></div>
-  <div style="grid-column:y -5"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0h">
-  <div style="grid-column:y 5"></div>
-  <div style="grid-column:y 4"></div>
-  <div style="grid-column:y 3"></div>
-  <div style="grid-column:y 2"></div>
-  <div style="grid-column:y 1"></div>
-  <div style="grid-column:y -1"></div>
-  <div style="grid-column:y -2"></div>
-  <div style="grid-column:y -3"></div>
-  <div style="grid-column:y -4"></div>
-  <div style="grid-column:y -5"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0i">
-  <div style="grid-column:y 5"></div>
-  <div style="grid-column:y 4"></div>
-  <div style="grid-column:y 3"></div>
-  <div style="grid-column:y 2"></div>
-  <div style="grid-column:y 1"></div>
-  <div style="grid-column:y -1"></div>
-  <div style="grid-column:y -2"></div>
-  <div style="grid-column:y -3"></div>
-  <div style="grid-column:y -4"></div>
-  <div style="grid-column:y -5"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0j">
-  <div style="grid-column:y 5"></div>
-  <div style="grid-column:y 4"></div>
-  <div style="grid-column:y 3"></div>
-  <div style="grid-column:y 2"></div>
-  <div style="grid-column:y 1"></div>
-  <div style="grid-column:y -1"></div>
-  <div style="grid-column:y -2"></div>
-  <div style="grid-column:y -3"></div>
-  <div style="grid-column:y -4"></div>
-  <div style="grid-column:y -5"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0k">
-  <div style="grid-column:y 5"></div>
-  <div style="grid-column:y 4"></div>
-  <div style="grid-column:y 3"></div>
-  <div style="grid-column:y 2"></div>
-  <div style="grid-column:y 1"></div>
-  <div style="grid-column:y -1"></div>
-  <div style="grid-column:y -2"></div>
-  <div style="grid-column:y -3"></div>
-  <div style="grid-column:y -4"></div>
-  <div style="grid-column:y -5"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0l">
-  <div style="grid-column:y 5"></div>
-  <div style="grid-column:y 4"></div>
-  <div style="grid-column:y 3"></div>
-  <div style="grid-column:y 2"></div>
-  <div style="grid-column:y 1"></div>
-  <div style="grid-column:y -1"></div>
-  <div style="grid-column:y -2"></div>
-  <div style="grid-column:y -3"></div>
-  <div style="grid-column:y -4"></div>
-  <div style="grid-column:y -5"></div>
-</div></div>
-
-<div class="grid"><div class="subgrid fill-0m">
