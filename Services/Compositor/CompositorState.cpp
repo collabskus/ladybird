@@ -1455,6 +1455,7 @@ Vector<RemoteSublayer>* CompositorState::build_sublayers(Web::CompositorContextI
             case RustFFI::SublayerContentKind::Tile:
                 content = RemoteSublayer::Tile {
                     .surface = const_cast<PresentableSurface*>(sublayer.presentable_surface)->lease(),
+                    .rect_in_surface = sublayer.rect_in_surface,
                     .every_pixel_is_opaque = sublayer.every_pixel_is_opaque,
                 };
                 break;
@@ -1701,11 +1702,12 @@ RustFFI::FfiRasterHost CompositorState::raster_host(CompositorState& state)
         .surface_scale = [](Gfx::PaintingSurface const* surface, float x, float y) { canvas_of(surface).scale(x, y); },
         .surface_clip_rect = [](Gfx::PaintingSurface const* surface, Gfx::IntRect rect) { canvas_of(surface).clipIRect(SkIRect::MakeXYWH(rect.x(), rect.y(), rect.width(), rect.height())); },
         .surface_clear = [](Gfx::PaintingSurface const* surface, Gfx::Color color) { canvas_of(surface).clear(Gfx::to_skia_color(color)); },
-        .surface_draw_surface = [](Gfx::PaintingSurface const* target, Gfx::PaintingSurface const* source, Gfx::IntRect source_rect, Gfx::IntRect target_rect, RustFFI::SurfaceBlend blend) {
+        .surface_draw_surface = [](Gfx::PaintingSurface const* target, Gfx::PaintingSurface const* source, Gfx::IntRect source_rect, Gfx::IntRect target_rect, RustFFI::SurfaceBlend blend, RustFFI::SurfaceSampling sampling) {
             auto image = source->sk_image_snapshot<sk_sp<SkImage>>();
             SkPaint paint;
             paint.setBlendMode(blend == RustFFI::SurfaceBlend::Source ? SkBlendMode::kSrc : SkBlendMode::kSrcOver);
-            canvas_of(target).drawImageRect(image.get(), Gfx::to_skia_rect(source_rect), Gfx::to_skia_rect(target_rect), SkSamplingOptions {}, &paint, SkCanvas::kStrict_SrcRectConstraint); },
+            // Only tiles are drawn filtered.
+            Gfx::draw_tile_image_rect(canvas_of(target), *image, Gfx::to_skia_rect(source_rect), Gfx::to_skia_rect(target_rect), sampling == RustFFI::SurfaceSampling::Linear, paint); },
         .flush_surface = [](Gfx::PaintingSurface const* surface) { DisplayListPlayerSkia::flush(mutable_surface(surface)); },
         .begin_painting = [](void* host, u64 context_id, Gfx::PaintingSurface const* surface, RustFFI::PaintingResources resources, bool allows_lcd_text, Compositing::RustFFI::FfiRasterPainter* painter) { *painter = state_of(host).begin_painting(Context { context_id }, mutable_surface(surface), resources, allows_lcd_text); },
         .end_painting = [](void* host) { state_of(host).end_painting(); },

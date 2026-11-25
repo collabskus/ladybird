@@ -45,6 +45,16 @@ pub enum SurfaceBlend {
     SourceOver,
 }
 
+/// How a surface drawn into another is sampled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SurfaceSampling {
+    /// For a surface drawn at whole pixels of the target, at its own size.
+    Nearest,
+    /// For a surface drawn scaled, or at a fraction of a pixel of the target.
+    Linear,
+}
+
 /// Whose resources a painting draws with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -260,6 +270,8 @@ pub struct FfiSublayer {
     pub group: FfiSublayerGroup,
     /// Of a tile or a fill, in the pixels of the group it is in.
     pub rect: IntRect,
+    /// Of a tile, what of its surface shows at `rect`.
+    pub rect_in_surface: IntRect,
     pub color: Color,
     /// Of a tile.
     pub every_pixel_is_opaque: bool,
@@ -278,6 +290,7 @@ impl FfiSublayer {
             placement: FfiSublayerPlacement::default(),
             group: FfiSublayerGroup::default(),
             rect: IntRect::default(),
+            rect_in_surface: IntRect::default(),
             color: Color::TRANSPARENT,
             every_pixel_is_opaque: false,
             backdrop: FfiSublayerBackdrop::default(),
@@ -346,10 +359,16 @@ pub struct FfiRasterHost {
     pub surface_scale: unsafe extern "C" fn(*const PaintingSurface, f32, f32),
     pub surface_clip_rect: unsafe extern "C" fn(*const PaintingSurface, IntRect),
     pub surface_clear: unsafe extern "C" fn(*const PaintingSurface, Color),
-    /// Arguments: the target, the source, the rect of the source drawn, the rect of the target it is drawn into, and
-    /// how it is blended.
-    pub surface_draw_surface:
-        unsafe extern "C" fn(*const PaintingSurface, *const PaintingSurface, IntRect, IntRect, SurfaceBlend),
+    /// Arguments: the target, the source, the rect of the source drawn, the rect of the target it is drawn into, how
+    /// it is blended, and how it is sampled.
+    pub surface_draw_surface: unsafe extern "C" fn(
+        *const PaintingSurface,
+        *const PaintingSurface,
+        IntRect,
+        IntRect,
+        SurfaceBlend,
+        SurfaceSampling,
+    ),
     pub flush_surface: unsafe extern "C" fn(*const PaintingSurface),
 
     /// Arguments: the host, the context, the surface, whose resources it draws with, whether it allows LCD text,
@@ -697,10 +716,18 @@ impl RasterHost {
         source_rect: IntRect,
         target_rect: IntRect,
         blend: SurfaceBlend,
+        sampling: SurfaceSampling,
     ) {
         // SAFETY: Both surfaces are live.
         unsafe {
-            (self.0.surface_draw_surface)(Rc::as_ptr(target), Rc::as_ptr(source), source_rect, target_rect, blend);
+            (self.0.surface_draw_surface)(
+                Rc::as_ptr(target),
+                Rc::as_ptr(source),
+                source_rect,
+                target_rect,
+                blend,
+                sampling,
+            );
         }
     }
 
