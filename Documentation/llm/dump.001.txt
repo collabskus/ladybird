@@ -78639,7 +78639,7 @@ address field → page. F6 moves between the chrome and the page.
 | New window | ⌘N | Ctrl+N |
 | New private window | ⇧⌘N | Ctrl+Shift+N |
 | Next / previous tab | ⌃Tab, ⌥⌘→ / ⌃⇧Tab, ⌥⌘← | Ctrl+Tab / Ctrl+Shift+Tab |
-| Go to tab 1–8 / last tab | ⌘1–8 / ⌘9 | Ctrl+1–8 / Ctrl+9 |
+| Go to tab 1–8 / last tab | ⌘1–8 / ⌘9 | Ctrl+1–8 / Ctrl+9, and Alt+1–8 / Alt+9 on Linux |
 | Search all tabs | ⇧⌘A | Ctrl+Shift+A |
 | Focus address field | ⌘L | Ctrl+L, Alt+D |
 | Back / forward | ⌘[ / ⌘] | Alt+← / Alt+→ |
@@ -193409,6 +193409,42 @@ fn closed_tls_connection_is_replaced_and_questions_are_asked_again() {
 }
 
 #[test]
+fn udp_connection_whose_send_fails_is_replaced() {
+    let mut harness = Harness::udp();
+    let lookup = harness.lookup_with("example.com", &[ResourceType::A], LookupOptions::default());
+    let first = harness.connects[0].connection;
+    harness.connected(first);
+    assert_eq!(harness.take_writes().len(), 1);
+
+    // A connected UDP socket keeps the source address it got when it connected, so once the network it was opened on
+    // is gone, every send on it fails. That's what the socket owner reports here.
+    harness
+        .resolver
+        .on_connect_failed(first, "Network is unreachable (errno=101)".to_owned(), harness.now);
+    harness.drain();
+    assert_eq!(harness.closes, vec![first]);
+    assert!(harness.done.is_empty());
+
+    // The next lookup goes out on a new connection.
+    let later = harness.lookup_with("ladybird.org", &[ResourceType::A], LookupOptions::default());
+    assert_eq!(harness.connects.len(), 2);
+    let second = harness.connects[1].connection;
+    assert_ne!(second, first);
+    harness.connected(second);
+
+    // And the question that was in flight goes out again on it at its next retry.
+    harness.advance(QUERY_RETRY_INTERVAL);
+    let writes = harness.take_writes();
+    assert!(writes.iter().all(|(connection, _)| *connection == second));
+    for (connection, query) in writes {
+        let response = respond(&query, |_| {});
+        harness.receive(connection, &response);
+    }
+    assert!(harness.result(lookup).is_ok());
+    assert!(harness.result(later).is_ok());
+}
+
+#[test]
 fn malformed_stream_message_leaves_the_next_one_alone() {
     let mut harness = Harness::tls("9.9.9.9");
     let lookup = harness.lookup_with("example.com", &[ResourceType::A], LookupOptions::default());
@@ -213392,6 +213428,9 @@ endif()
 
 if (HAS_VULKAN)
     list(APPEND SOURCES ImportedYCbCrVulkanImage.cpp VulkanContext.cpp VulkanImage.cpp)
+    if (USE_VULKAN_DMABUF_IMAGES)
+        list(APPEND SOURCES GBMAllocation.cpp)
+    endif()
 endif()
 
 if (HAS_FONTCONFIG)
@@ -213457,6 +213496,7 @@ if (HAS_VULKAN)
     if (USE_VULKAN_DMABUF_IMAGES)
         pkg_check_modules(LibDRM REQUIRED libdrm)
         target_include_directories(LibGfx PUBLIC ${LibDRM_INCLUDE_DIRS})
+        target_link_libraries(LibGfx PRIVATE ${CMAKE_DL_LIBS})
     endif()
 endif()
 
@@ -223404,6 +223444,161 @@ struct AK::Traits<Gfx::FourCC> : public AK::DefaultTraits<Gfx::FourCC> {
         return key.to_u32();
     }
 };
+
+FILE: Libraries/LibGfx/GBMAllocation.cpp
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/ByteString.h>
+#include <AK/Format.h>
+#include <AK/ScopeGuard.h>
+#include <LibGfx/GBMAllocation.h>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#ifdef AK_OS_LINUX
+#    include <sys/sysmacros.h>
+#endif
+#include <unistd.h>
+
+namespace Gfx {
+
+namespace {
+
+// NB: libgbm is loaded at runtime, so that a system without it falls back to the allocations that need none. These
+//     are the parts of its stable ABI that we use, from <gbm.h>.
+struct GBMDevice;
+struct GBMBufferObject;
+
+constexpr u32 GBM_BO_USE_SCANOUT = 1 << 0;
+constexpr u32 GBM_BO_USE_RENDERING = 1 << 2;
+
+struct GBMFunctions {
+    GBMDevice* (*gbm_create_device)(int fd);
+    GBMBufferObject* (*gbm_bo_create_with_modifiers2)(GBMDevice*, u32 width, u32 height, u32 format, u64 const* modifiers, unsigned count, u32 flags);
+    void (*gbm_bo_destroy)(GBMBufferObject*);
+    int (*gbm_bo_get_plane_count)(GBMBufferObject*);
+    int (*gbm_bo_get_fd)(GBMBufferObject*);
+    u32 (*gbm_bo_get_stride_for_plane)(GBMBufferObject*, int plane);
+    u32 (*gbm_bo_get_offset)(GBMBufferObject*, int plane);
+    u64 (*gbm_bo_get_modifier)(GBMBufferObject*);
+};
+
+struct OpenGBMDevice {
+    GBMFunctions const& functions;
+    dev_t render_node;
+    GBMDevice* device;
+};
+
+}
+
+static ErrorOr<GBMFunctions> load_gbm_functions()
+{
+    auto* library = dlopen("libgbm.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!library)
+        return Error::from_string_literal("libgbm is unavailable");
+
+    GBMFunctions functions {};
+#define RESOLVE_FUNCTION(name)                                                          \
+    functions.name = reinterpret_cast<decltype(functions.name)>(dlsym(library, #name)); \
+    if (!functions.name)                                                                \
+        return Error::from_string_literal("libgbm lacks " #name);
+    RESOLVE_FUNCTION(gbm_create_device)
+    RESOLVE_FUNCTION(gbm_bo_create_with_modifiers2)
+    RESOLVE_FUNCTION(gbm_bo_destroy)
+    RESOLVE_FUNCTION(gbm_bo_get_plane_count)
+    RESOLVE_FUNCTION(gbm_bo_get_fd)
+    RESOLVE_FUNCTION(gbm_bo_get_stride_for_plane)
+    RESOLVE_FUNCTION(gbm_bo_get_offset)
+    RESOLVE_FUNCTION(gbm_bo_get_modifier)
+#undef RESOLVE_FUNCTION
+    return functions;
+}
+
+static ErrorOr<OpenGBMDevice> open_gbm_device(dev_t render_node)
+{
+    static auto const functions = load_gbm_functions();
+    if (functions.is_error())
+        return Error::copy(functions.error());
+
+    auto path = ByteString::formatted("/dev/dri/renderD{}", minor(render_node));
+    int fd = open(path.characters(), O_RDWR | O_CLOEXEC);
+    if (fd < 0)
+        return Error::from_errno(errno);
+    struct stat render_node_stat {};
+    if (fstat(fd, &render_node_stat) < 0 || render_node_stat.st_rdev != render_node) {
+        close(fd);
+        return Error::from_string_literal("The render node is not at its usual path");
+    }
+
+    // NB: The device keeps using the descriptor for as long as it lives, which is as long as the process.
+    auto* device = functions.value().gbm_create_device(fd);
+    if (!device) {
+        close(fd);
+        return Error::from_string_literal("GBM cannot open the render node");
+    }
+    return OpenGBMDevice { .functions = functions.value(), .render_node = render_node, .device = device };
+}
+
+ErrorOr<LinuxDmaBufHandle> allocate_scanout_capable_linux_dmabuf(dev_t render_node, IntSize size, u32 drm_format, ReadonlySpan<u64> modifiers)
+{
+    // NB: A process allocates from the one GPU it renders on.
+    static auto const gbm = open_gbm_device(render_node);
+    if (gbm.is_error())
+        return Error::copy(gbm.error());
+    if (gbm.value().render_node != render_node)
+        return Error::from_string_literal("GBM is open on another render node");
+    auto const& functions = gbm.value().functions;
+
+    auto* buffer_object = functions.gbm_bo_create_with_modifiers2(gbm.value().device, size.width(), size.height(), drm_format,
+        modifiers.data(), modifiers.size(), GBM_BO_USE_RENDERING | GBM_BO_USE_SCANOUT);
+    if (!buffer_object)
+        return Error::from_string_literal("GBM cannot allocate a scanout buffer in any of the layouts");
+    // NB: The dma-buf keeps the memory alive once the buffer object is destroyed.
+    ScopeGuard destroy_buffer_object = [&] { functions.gbm_bo_destroy(buffer_object); };
+
+    if (functions.gbm_bo_get_plane_count(buffer_object) != 1)
+        return Error::from_string_literal("GBM allocated more than one plane");
+    int fd = functions.gbm_bo_get_fd(buffer_object);
+    if (fd < 0)
+        return Error::from_string_literal("GBM cannot export the buffer as a dma-buf");
+
+    LinuxDmaBufHandle dmabuf;
+    dmabuf.size = size;
+    dmabuf.drm_format = drm_format;
+    dmabuf.modifier = functions.gbm_bo_get_modifier(buffer_object);
+    dmabuf.objects.append(IPC::File::adopt_fd(fd));
+    dmabuf.planes.append({ .object_index = 0, .offset = functions.gbm_bo_get_offset(buffer_object, 0), .pitch = functions.gbm_bo_get_stride_for_plane(buffer_object, 0) });
+    return dmabuf;
+}
+
+}
+
+FILE: Libraries/LibGfx/GBMAllocation.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Error.h>
+#include <AK/Span.h>
+#include <LibGfx/LinuxDmaBufHandle.h>
+#include <LibGfx/Size.h>
+#include <sys/types.h>
+
+namespace Gfx {
+
+// Allocates a single-plane dma-buf through the system's GBM on the render node, in one of the layouts. Unlike Vulkan,
+// GBM can tell the driver that a display may scan the memory out.
+ErrorOr<LinuxDmaBufHandle> allocate_scanout_capable_linux_dmabuf(dev_t render_node, IntSize, u32 drm_format, ReadonlySpan<u64> modifiers);
+
+}
 
 FILE: Libraries/LibGfx/GlyphOutlines.cpp
 /*
@@ -245194,6 +245389,10 @@ FILE: Libraries/LibGfx/VulkanContext.cpp
 #include <LibGfx/VulkanContext.h>
 #include <string.h>
 
+#if defined(USE_VULKAN_DMABUF_IMAGES) && defined(AK_OS_LINUX)
+#    include <sys/sysmacros.h>
+#endif
+
 namespace Gfx {
 
 #if VULKAN_VALIDATION_LAYERS_DEBUG
@@ -245283,18 +245482,38 @@ static constexpr Array<char const*, 5> s_enabled_device_extensions = {
     VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
 };
 
-static ReadonlySpan<char const*> device_extensions_to_enable(VkPhysicalDevice physical_device)
+static bool device_has_extension(VkPhysicalDevice physical_device, char const* extension_name)
 {
     uint32_t extension_count = 0;
     vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &extension_count, nullptr);
     Vector<VkExtensionProperties> extensions;
     extensions.resize(extension_count);
     vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &extension_count, extensions.data());
+    return any_of(extensions, [&](auto const& extension) { return strcmp(extension.extensionName, extension_name) == 0; });
+}
 
+static ReadonlySpan<char const*> device_extensions_to_enable(VkPhysicalDevice physical_device)
+{
     ReadonlySpan<char const*> enabled_extensions = s_enabled_device_extensions;
-    if (any_of(extensions, [](auto const& extension) { return strcmp(extension.extensionName, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME) == 0; }))
+    if (device_has_extension(physical_device, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME))
         return enabled_extensions;
     return enabled_extensions.trim(enabled_extensions.size() - 1);
+}
+
+static Optional<dev_t> render_node_of(VkPhysicalDevice physical_device)
+{
+    if (!device_has_extension(physical_device, VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME))
+        return {};
+
+    VkPhysicalDeviceDrmPropertiesEXT drm_properties {};
+    drm_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT;
+    VkPhysicalDeviceProperties2 properties {};
+    properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    properties.pNext = &drm_properties;
+    vkGetPhysicalDeviceProperties2(physical_device, &properties);
+    if (!drm_properties.hasRender)
+        return {};
+    return makedev(drm_properties.renderMajor, drm_properties.renderMinor);
 }
 #else
 static ReadonlySpan<char const*> device_extensions_to_enable(VkPhysicalDevice)
@@ -245468,6 +245687,7 @@ ErrorOr<VulkanContext> create_vulkan_context(Optional<GpuDeviceIdentity> const& 
 #ifdef USE_VULKAN_DMABUF_IMAGES
         .command_pool = command_pool,
         .command_buffer = command_buffer,
+        .render_node = render_node_of(physical_device),
         .ext_procs = {
             .get_memory_fd = pfn_vk_get_memory_fd_khr,
             .get_memory_fd_properties = pfn_vk_get_memory_fd_properties_khr,
@@ -245555,6 +245775,11 @@ FILE: Libraries/LibGfx/VulkanContext.h
 #    include <LibGfx/GpuDeviceIdentity.h>
 #    include <vulkan/vulkan.h>
 
+#    ifdef USE_VULKAN_DMABUF_IMAGES
+#        include <AK/Optional.h>
+#        include <sys/types.h>
+#    endif
+
 namespace Gfx {
 
 struct VulkanContext {
@@ -245573,6 +245798,8 @@ struct VulkanContext {
 #    ifdef USE_VULKAN_DMABUF_IMAGES
     VkCommandPool command_pool { VK_NULL_HANDLE };
     VkCommandBuffer command_buffer { VK_NULL_HANDLE };
+    // The DRM render node of the device, for allocating memory outside of Vulkan.
+    Optional<dev_t> render_node;
     struct
     {
         PFN_vkGetMemoryFdKHR get_memory_fd { nullptr };
@@ -245607,6 +245834,7 @@ FILE: Libraries/LibGfx/VulkanImage.cpp
 #    include <AK/ScopeGuard.h>
 #    include <AK/Vector.h>
 #    include <LibGfx/Bitmap.h>
+#    include <LibGfx/GBMAllocation.h>
 #    include <LibGfx/VulkanImage.h>
 #    include <fcntl.h>
 #    include <string.h>
@@ -245633,6 +245861,8 @@ VulkanImage::~VulkanImage()
     if (memory != VK_NULL_HANDLE) {
         vkFreeMemory(context.logical_device, memory, nullptr);
     }
+    if (imported_dma_buf_fd >= 0)
+        ::close(imported_dma_buf_fd);
 }
 
 void VulkanImage::transition_layout(VkImageLayout old_layout, VkImageLayout new_layout)
@@ -245682,6 +245912,9 @@ void VulkanImage::transition_layout(VkImageLayout old_layout, VkImageLayout new_
 
 int VulkanImage::get_dma_buf_fd() const
 {
+    if (imported_dma_buf_fd >= 0)
+        return fcntl(imported_dma_buf_fd, F_DUPFD_CLOEXEC, 0);
+
     VkMemoryGetFdInfoKHR get_fd_info = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
         .pNext = nullptr,
@@ -245769,10 +246002,9 @@ Vector<uint64_t> renderable_drm_format_modifiers(VulkanContext const& context, V
     return format_mods;
 }
 
-ErrorOr<NonnullRefPtr<VulkanImage>> create_shared_vulkan_image(VulkanContext const& context, uint32_t width, uint32_t height, VkFormat format, ReadonlySpan<uint64_t> modifiers)
+// The format modifiers that are both renderable, sampleable, and accepted by the caller.
+static ErrorOr<Vector<uint64_t>> shared_image_drm_format_modifiers(VulkanContext const& context, VkFormat format, ReadonlySpan<uint64_t> modifiers)
 {
-    // populate a list of all format modifiers that are both renderable, sampleable,
-    // and accepted by the caller
     Vector<uint64_t> format_mods;
     for (auto modifier : renderable_drm_format_modifiers(context, format)) {
         if (modifiers.is_empty() || modifiers.contains_slow(modifier))
@@ -245783,6 +246015,12 @@ ErrorOr<NonnullRefPtr<VulkanImage>> create_shared_vulkan_image(VulkanContext con
     // code can fall back to a different backing-store type.
     if (format_mods.is_empty())
         return Error::from_string_literal("no supported DRM format modifiers for shared image");
+    return format_mods;
+}
+
+ErrorOr<NonnullRefPtr<VulkanImage>> create_shared_vulkan_image(VulkanContext const& context, uint32_t width, uint32_t height, VkFormat format, ReadonlySpan<uint64_t> modifiers)
+{
+    auto format_mods = TRY(shared_image_drm_format_modifiers(context, format, modifiers));
 
     NonnullRefPtr<VulkanImage> image = make_ref_counted<VulkanImage>(context);
     VkImageDrmFormatModifierListCreateInfoEXT image_drm_format_modifier_list_info = {
@@ -246018,6 +246256,43 @@ ErrorOr<ImportedDmaBufImage> import_linux_dmabuf_image(VkPhysicalDevice physical
     return imported;
 }
 
+ErrorOr<NonnullRefPtr<VulkanImage>> create_scanout_capable_shared_vulkan_image(VulkanContext const& context, uint32_t width, uint32_t height, VkFormat format, ReadonlySpan<uint64_t> modifiers)
+{
+    if (!context.render_node.has_value())
+        return Error::from_string_literal("The device has no known render node");
+    auto format_mods = TRY(shared_image_drm_format_modifiers(context, format, modifiers));
+    // NB: The importers map a linear image's memory, which GBM does not promise to make visible to the CPU.
+    format_mods.remove_all_matching([](uint64_t modifier) { return modifier == DRM_FORMAT_MOD_LINEAR; });
+    if (format_mods.is_empty())
+        return Error::from_string_literal("no tiled DRM format modifiers for a scanout-capable shared image");
+    auto dmabuf = TRY(allocate_scanout_capable_linux_dmabuf(*context.render_node, { width, height }, vk_format_to_drm_format(format), format_mods));
+    // NB: Our dma-bufs name a single plane at the start of its memory, as the importers expect.
+    if (dmabuf.planes.first().offset != 0)
+        return Error::from_string_literal("image plane does not start at the start of its memory");
+
+    auto imported = TRY(import_linux_dmabuf_image(context.physical_device, context.logical_device, context.ext_procs.get_memory_fd_properties, dmabuf, format, shared_image_usage));
+    NonnullRefPtr<VulkanImage> image = make_ref_counted<VulkanImage>(context);
+    image->image = imported.image;
+    image->memory = imported.memory;
+    image->imported_dma_buf_fd = dmabuf.objects.first().take_fd();
+
+    // external APIs require general layout
+    VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL;
+    image->transition_layout(VK_IMAGE_LAYOUT_UNDEFINED, layout);
+
+    image->info = {
+        .format = format,
+        .extent = { .width = width, .height = height, .depth = 1 },
+        .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+        .usage = shared_image_usage,
+        .sharing_mode = VK_SHARING_MODE_EXCLUSIVE,
+        .layout = layout,
+        .row_pitch = dmabuf.planes.first().pitch,
+        .modifier = dmabuf.modifier,
+    };
+    return image;
+}
+
 ErrorOr<NonnullRefPtr<Bitmap>> read_linux_dmabuf_into_bitmap(VulkanContext const& context, LinuxDmaBufHandle const& dmabuf)
 {
     if (dmabuf.drm_format != DRM_FORMAT_ARGB8888)
@@ -246201,6 +246476,8 @@ struct VulkanImage : public RefCounted<VulkanImage> {
         uint64_t modifier { DRM_FORMAT_MOD_INVALID };
     } info;
     VulkanContext const& context;
+    // The dma-buf that the memory was imported from, which is shared in its place.
+    int imported_dma_buf_fd { -1 };
 
     int get_dma_buf_fd() const;
     void transition_layout(VkImageLayout old_layout, VkImageLayout new_layout);
@@ -246229,6 +246506,9 @@ Vector<uint64_t> renderable_drm_format_modifiers(VulkanContext const& context, V
 bool can_import_dmabuf_image(VkPhysicalDevice, VkFormat, uint64_t modifier, VkImageUsageFlags);
 
 ErrorOr<NonnullRefPtr<VulkanImage>> create_shared_vulkan_image(VulkanContext const& context, uint32_t width, uint32_t height, VkFormat format, ReadonlySpan<uint64_t> modifiers);
+// Like create_shared_vulkan_image(), but the memory is allocated so that a display can scan it out. Vulkan cannot ask for
+// that, and NVIDIA's displays can show garbage in place of memory that was not allocated for them.
+ErrorOr<NonnullRefPtr<VulkanImage>> create_scanout_capable_shared_vulkan_image(VulkanContext const& context, uint32_t width, uint32_t height, VkFormat format, ReadonlySpan<uint64_t> modifiers);
 
 struct ImportedDmaBufImage {
     VkImage image { VK_NULL_HANDLE };
@@ -671133,265 +671413,3 @@ impl PlainDateTimePrototype {
 
         // 1. Let plainDateTime be the this value.
         // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Return ? AddDurationToDateTime(ADD, plainDateTime, temporalDurationLike, options).
-        Ok(Value::from_object(add_duration_to_date_time(
-            vm,
-            ArithmeticOperation::Add,
-            &plain_date_time,
-            temporal_duration_like,
-            options,
-        )?))
-    }
-
-    // 5.3.29 Temporal.PlainDateTime.prototype.subtract ( temporalDurationLike [ , options ] ), https://tc39.es/proposal-temporal/#sec-temporal.plaindatetime.prototype.add
-    fn subtract(vm: &Vm) -> ThrowCompletionOr<Value> {
-        let temporal_duration_like = vm.argument(0);
-        let options = vm.argument(1);
-
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Return ? AddDurationToDateTime(SUBTRACT, plainDateTime, temporalDurationLike, options).
-        Ok(Value::from_object(add_duration_to_date_time(
-            vm,
-            ArithmeticOperation::Subtract,
-            &plain_date_time,
-            temporal_duration_like,
-            options,
-        )?))
-    }
-
-    // 5.3.30 Temporal.PlainDateTime.prototype.until ( other [ , options ] ), https://tc39.es/proposal-temporal/#sec-temporal.plaindatetime.prototype.until
-    fn until(vm: &Vm) -> ThrowCompletionOr<Value> {
-        let other = vm.argument(0);
-        let options = vm.argument(1);
-
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Return ? DifferenceTemporalPlainDateTime(UNTIL, plainDateTime, other, options).
-        Ok(Value::from_object(difference_temporal_plain_date_time(
-            vm,
-            DurationOperation::Until,
-            &plain_date_time,
-            other,
-            options,
-        )?))
-    }
-
-    // 5.3.31 Temporal.PlainDateTime.prototype.since ( other [ , options ] ), https://tc39.es/proposal-temporal/#sec-temporal.plaindatetime.prototype.since
-    fn since(vm: &Vm) -> ThrowCompletionOr<Value> {
-        let other = vm.argument(0);
-        let options = vm.argument(1);
-
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Return ? DifferenceTemporalPlainDateTime(SINCE, plainDateTime, other, options).
-        Ok(Value::from_object(difference_temporal_plain_date_time(
-            vm,
-            DurationOperation::Since,
-            &plain_date_time,
-            other,
-            options,
-        )?))
-    }
-
-    // 5.3.32 Temporal.PlainDateTime.prototype.round ( roundTo ), https://tc39.es/proposal-temporal/#sec-temporal.plaindatetime.prototype.round
-    fn round(vm: &Vm) -> ThrowCompletionOr<Value> {
-        let realm = vm.current_realm().expect("a builtin runs in a realm");
-
-        let round_to_value = vm.argument(0);
-
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. If roundTo is undefined, throw a TypeError exception.
-        if round_to_value.is_undefined() {
-            return vm.throw_completion(ErrorKind::TypeError, ErrorType::TemporalMissingOptionsObject, &[]);
-        }
-
-        // 4. If roundTo is a String, then
-        let round_to = if round_to_value.is_string() {
-            // a. Let paramString be roundTo.
-            let param_string = round_to_value;
-
-            // b. Set roundTo to OrdinaryObjectCreate(null).
-            let round_to = Object::create(vm, realm, None);
-
-            // c. Perform ! CreateDataPropertyOrThrow(roundTo, "smallestUnit", paramString).
-            round_to
-                .create_data_property_or_throw(vm, &vm.names.smallestUnit, param_string)
-                .must();
-            round_to
-        }
-        // 5. Else,
-        else {
-            // a. Set roundTo to ? GetOptionsObject(roundTo).
-            get_options_object(vm, round_to_value)?
-        };
-
-        // 6. NOTE: The following steps read options and perform independent validation in alphabetical order
-        //    (GetRoundingIncrementOption reads "roundingIncrement" and GetRoundingModeOption reads "roundingMode").
-
-        // 7. Let roundingIncrement be ? GetRoundingIncrementOption(roundTo).
-        let rounding_increment = get_rounding_increment_option(vm, &round_to)?;
-
-        // 8. Let roundingMode be ? GetRoundingModeOption(roundTo, HALF-EXPAND).
-        let rounding_mode = get_rounding_mode_option(vm, &round_to, RoundingMode::HalfExpand)?;
-
-        // 9. Let smallestUnit be ? GetTemporalUnitValuedOption(roundTo, "smallestUnit", REQUIRED).
-        let smallest_unit =
-            get_temporal_unit_valued_option(vm, &round_to, &vm.names.smallestUnit, UnitDefault::Required)?;
-
-        // 10. Perform ? ValidateTemporalUnitValue(smallestUnit, TIME, « DAY »).
-        validate_temporal_unit_value(
-            vm,
-            &vm.names.smallestUnit,
-            smallest_unit,
-            UnitGroup::Time,
-            &[UnitValue::Unit(Unit::Day)],
-        )?;
-        let UnitValue::Unit(smallest_unit_value) = smallest_unit else {
-            unreachable!("the smallest unit was validated");
-        };
-
-        // 11. If smallestUnit is DAY, then
-        let (maximum, inclusive) = if smallest_unit_value == Unit::Day {
-            // a. Let maximum be 1.
-            // b. Let inclusive be true.
-            (1, true)
-        }
-        // 12. Else,
-        else {
-            // a. Let maximum be MaximumTemporalDurationRoundingIncrement(smallestUnit).
-            // b. Assert: maximum is not UNSET.
-            let maximum = maximum_temporal_duration_rounding_increment(smallest_unit_value)
-                .expect("a time unit has a maximum rounding increment");
-
-            // c. Let inclusive be false.
-            (maximum, false)
-        };
-
-        // 13. Perform ? ValidateTemporalRoundingIncrement(roundingIncrement, maximum, inclusive).
-        validate_temporal_rounding_increment(vm, rounding_increment, maximum, inclusive)?;
-
-        // 14. If smallestUnit is NANOSECOND and roundingIncrement = 1, then
-        if smallest_unit_value == Unit::Nanosecond && rounding_increment == 1 {
-            // a. Return ! CreateTemporalDateTime(plainDateTime.[[ISODateTime]], plainDateTime.[[Calendar]]).
-            return Ok(Value::from_object(
-                create_temporal_date_time(vm, &plain_date_time.iso_date_time(), plain_date_time.calendar(), None)
-                    .must(),
-            ));
-        }
-
-        // 15. Let result be RoundISODateTime(plainDateTime.[[ISODateTime]], roundingIncrement, smallestUnit, roundingMode).
-        let result = round_iso_date_time(
-            &plain_date_time.iso_date_time(),
-            rounding_increment,
-            smallest_unit_value,
-            rounding_mode,
-        );
-
-        // 16. Return ? CreateTemporalDateTime(result, plainDateTime.[[Calendar]]).
-        Ok(Value::from_object(create_temporal_date_time(
-            vm,
-            &result,
-            plain_date_time.calendar(),
-            None,
-        )?))
-    }
-
-    // 5.3.33 Temporal.PlainDateTime.prototype.equals ( other ), https://tc39.es/proposal-temporal/#sec-temporal.plaindatetime.prototype.equals
-    fn equals(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Set other to ? ToTemporalDateTime(other).
-        let other = to_temporal_date_time(vm, vm.argument(0), Value::UNDEFINED)?;
-
-        // 4. If CompareISODateTime(plainDateTime.[[ISODateTime]], other.[[ISODateTime]]) ≠ 0, return false.
-        if compare_iso_date_time(&plain_date_time.iso_date_time(), &other.iso_date_time()) != 0 {
-            return Ok(Value::from_bool(false));
-        }
-
-        // 5. Return CalendarEquals(plainDateTime.[[Calendar]], other.[[Calendar]]).
-        Ok(Value::from_bool(calendar_equals(
-            Utf16View::of_string(&plain_date_time.calendar()),
-            Utf16View::of_string(&other.calendar()),
-        )))
-    }
-
-    // 5.3.34 Temporal.PlainDateTime.prototype.toString ( [ options ] ), https://tc39.es/proposal-temporal/#sec-temporal.plaindatetime.prototype.tostring
-    fn to_string(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Let resolvedOptions be ? GetOptionsObject(options).
-        let resolved_options = get_options_object(vm, vm.argument(0))?;
-
-        // 4. NOTE: The following steps read options and perform independent validation in alphabetical order
-        //    (GetTemporalShowCalendarNameOption reads "calendarName", GetTemporalFractionalSecondDigitsOption reads
-        //    "fractionalSecondDigits", and GetRoundingModeOption reads "roundingMode").
-
-        // 5. Let showCalendar be ? GetTemporalShowCalendarNameOption(resolvedOptions).
-        let show_calendar = get_temporal_show_calendar_name_option(vm, &resolved_options)?;
-
-        // 6. Let digits be ? GetTemporalFractionalSecondDigitsOption(resolvedOptions).
-        let digits = get_temporal_fractional_second_digits_option(vm, &resolved_options)?;
-
-        // 7. Let roundingMode be ? GetRoundingModeOption(resolvedOptions, TRUNC).
-        let rounding_mode = get_rounding_mode_option(vm, &resolved_options, RoundingMode::Trunc)?;
-
-        // 8. Let smallestUnit be ? GetTemporalUnitValuedOption(resolvedOptions, "smallestUnit", UNSET).
-        let smallest_unit =
-            get_temporal_unit_valued_option(vm, &resolved_options, &vm.names.smallestUnit, UnitDefault::Unset)?;
-
-        // 9. Perform ? ValidateTemporalUnitValue(smallestUnit, TIME).
-        validate_temporal_unit_value(vm, &vm.names.smallestUnit, smallest_unit, UnitGroup::Time, &[])?;
-
-        // 10. If smallestUnit is HOUR, throw a RangeError exception.
-        if smallest_unit == UnitValue::Unit(Unit::Hour) {
-            return vm.throw_completion(
-                ErrorKind::RangeError,
-                ErrorType::OptionIsNotValidValue,
-                &[&temporal_unit_to_string(Unit::Hour), &vm.names.smallestUnit],
-            );
-        }
-
-        // 11. Let precision be ToSecondsStringPrecisionRecord(smallestUnit, digits).
-        let precision = to_seconds_string_precision_record(smallest_unit, digits);
-
-        // 12. Let result be RoundISODateTime(plainDateTime.[[ISODateTime]], precision.[[Increment]], precision.[[Unit]], roundingMode).
-        let result = round_iso_date_time(
-            &plain_date_time.iso_date_time(),
-            u64::from(precision.increment),
-            precision.unit,
-            rounding_mode,
-        );
-
-        // 13. If ISODateTimeWithinLimits(result) is false, throw a RangeError exception.
-        if !iso_date_time_within_limits(&result) {
-            return vm.throw_completion(ErrorKind::RangeError, ErrorType::TemporalInvalidPlainDateTime, &[]);
-        }
-
-        // 14. Return ISODateTimeToString(result, plainDateTime.[[Calendar]], precision.[[Precision]], showCalendar).
-        Ok(string_value(
-            vm,
-            &iso_date_time_to_string(
-                &result,
-                Utf16View::of_string(&plain_date_time.calendar()),
-                precision.precision,
-                show_calendar,
-            ),
-        ))
-    }
-
