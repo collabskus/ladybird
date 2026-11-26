@@ -91,23 +91,29 @@ public:
     sk_sp<SkImage> image_for_video_sink(Media::VideoSinkHandle, Media::VideoFrame const&, RefPtr<Gfx::SkiaBackendContext> const&, Gfx::IntSize& visible_size);
     sk_sp<SkImage> repeated_tile_raster(u64 tile_key, Gfx::IntSize, RefPtr<Gfx::SkiaBackendContext> const&) const;
     void add_repeated_tile_raster(u64 tile_key, Gfx::IntSize, RefPtr<Gfx::SkiaBackendContext> const&, sk_sp<SkImage>);
-    sk_sp<SkImage> vector_image_raster(Compositing::DisplayListResourceId, RefPtr<Gfx::SkiaBackendContext> const&, Gfx::IntRect visible_rect_in_recorded_space, Gfx::IntRect& raster_rect_in_recorded_space);
-    bool has_rasterized_vector_image(Compositing::DisplayListResourceId) const;
+    // The rasters of an SVG image are made at a raster scale, a power of two of the size its records were recorded at.
+    // Their rects are in the pixels of the image at that scale.
+    sk_sp<SkImage> vector_image_raster(Compositing::DisplayListResourceId, int raster_scale, RefPtr<Gfx::SkiaBackendContext> const&, Gfx::IntRect visible_rect_in_raster_pixels, Gfx::IntRect& raster_rect_in_raster_pixels);
+    bool has_rasterized_vector_image(Compositing::DisplayListResourceId, int raster_scale) const;
     // Makes room for a raster of the image, which then counts against the budget until it is finished, and answers false
     // where the rasters in use leave no room for it.
-    bool reserve_vector_image_raster(Compositing::DisplayListResourceId, RefPtr<Gfx::SkiaBackendContext> const&, Gfx::IntRect rect_in_recorded_space);
+    bool reserve_vector_image_raster(Compositing::DisplayListResourceId, RefPtr<Gfx::SkiaBackendContext> const&, Gfx::IntRect rect_in_raster_pixels);
     // Keeps the raster that was reserved, unless it could not be made.
-    sk_sp<SkImage> finish_vector_image_raster(Compositing::DisplayListResourceId, RefPtr<Gfx::SkiaBackendContext> const&, Gfx::IntRect rect_in_recorded_space, sk_sp<SkImage>);
+    sk_sp<SkImage> finish_vector_image_raster(Compositing::DisplayListResourceId, int raster_scale, RefPtr<Gfx::SkiaBackendContext> const&, Gfx::IntRect rect_in_raster_pixels, sk_sp<SkImage>);
     sk_sp<SkTextBlob> text_blob(Gfx::Font const&, Compositing::FontResourceId, float scale, ReadonlySpan<Compositing::DisplayListGlyph>, u8 font_smoothing, bool uses_lcd_text = false);
 
     sk_sp<SkImageFilter> layer_image_filter(Compositing::ReplayLayer const&, Function<sk_sp<SkImageFilter>()> const& create);
     sk_sp<SkImageFilter> backdrop_image_filter(Compositing::ReplayLayer const&, Optional<Gfx::FloatRect> blur_edge, bool limited_to_region, Function<sk_sp<SkImageFilter>()> const& create);
+    // Drops the filters of every layer but these, which are the ones whose effects the visual context tree of the
+    // context holds.
+    void keep_only_layer_filters(ReadonlySpan<u64> drawn_layer_filter_cache_keys);
 
     // The Skia path for a path that stays the same for as long as it has this identity. Keeping one Skia path lets
     // the caches that are keyed on it work.
     SkPath clip_path(u64 path_identity, Gfx::PathData const&);
-    // Drops the clip paths and layer filters that were not used since the last call.
-    void drop_what_was_not_used_since_last_frame();
+    // Drops the Skia paths of every path but these, which are the ones that the clips of the visual context tree of
+    // the context clip to.
+    void keep_only_clip_paths(ReadonlySpan<u64> drawn_path_identities);
 
 private:
     struct ImageFrameImage;
@@ -131,7 +137,6 @@ private:
     size_t m_text_blob_cache_bytes { 0 };
     MonotonicTime m_text_blob_cache_sweep_time { MonotonicTime::now() };
     HashMap<u64, NonnullOwnPtr<ClipPath>> m_clip_paths;
-    HashMap<u64, NonnullOwnPtr<ClipPath>> m_clip_paths_from_last_frame;
 };
 
 }

@@ -81,6 +81,7 @@ truncations, unless their flags say they cannot), and are neither removed nor mo
 | FAdd ... FNearest, FloatCompare | Float arithmetic and comparison (`FloatCondition`). |
 | TruncS, TruncU, TruncSatS, TruncSatU, ConvertS, ConvertU, Demote, Promote, Reinterpret | Conversions to the node's type from the input's. The plain truncations trap on NaN and out of range values. |
 | Select | Input 1 where input 0 is nonzero, else input 2. |
+| SelectCompare | A select of integers on a comparison of its operands 1 and 2 (or on whether their `and` is zero): operand 3 where it holds, else operand 0. |
 | InstanceField, LoadPointer | Pointers in instance data that never change, like `globals` and `globals[i]`, and type identities. |
 | Offset | A pointer plus a constant, like the address of a segment. |
 | ReadField, WriteField | Fields of runtime data that change, like the size of a memory or table, or a segment's length. |
@@ -154,8 +155,12 @@ a large one do not pay for its capacity.
 
 `passes/cleanup.rs` forwards trivial phis to a fixed point, rewrites every use of a forwarded phi,
 counts uses, removes pure nodes without uses (transitively), and unlinks dead phis. Then a branch on
-a comparison (or `eqz`) in its own block that nothing else uses compares itself
-(`BranchCompare`, `BranchFloatCompare`).
+a comparison (or `eqz`) in its own block that nothing else uses compares itself (`BranchCompare`,
+`BranchFloatCompare`). A select of integers on a comparison, an `eqz` or an `and` that only selects
+in its block use compares or tests itself (`SelectCompare`), which x86-64 lowers to a compare or
+test and a conditional move into the register of the value where the condition fails, if that value
+dies there.
+These are the only pure variadic nodes but phis: they are made after value numbering.
 
 ## 6. Loop invariant code motion and scheduling
 
@@ -196,22 +201,30 @@ be immediates, which need fixed registers, what it clobbers and where its output
 and temps are placed first; an input of the same node in the way moves to another free register.
 When no register is free, the value used furthest in the future is evicted. Inside a loop, the
 values the rest of the iteration uses come first, then those the next iteration reads, then those
-used after the loop. Values first used by a call argument or a return value prefer that register.
+used after the loop. Values first used by a call argument or a return value prefer that register. A
+value a loop's back edge carries into a phi of its header prefers the phi's register, so that the
+edge moves nothing: it takes it where it is free, or where an input dying there is the first one, or
+either one of an integer add, and, or, xor or mul.
 
 **Spilling** happens at the definition: a value that ever needs a stack slot gets one for its whole
 life, and code generation stores it right after defining it, so a slot always holds its value once
-it has one. Parameters use their home slots and the instance its frame header slot. Every value
-live across a call gets a slot, since calls clobber every register. A phi and its inputs (its web)
-share slots wherever their intervals do not overlap, so that the moves into a spilled phi on its
-edges, a loop's back edge above all, are mostly no moves at all.
+it has one. A value evicted from its register needs a slot only if its block or a successor of its
+block still uses it: its interval may go on past a block that returns. Parameters use their home
+slots and the instance its frame header slot. Every value live across a call gets a slot, since
+calls clobber every register. A phi and its inputs (its web) share slots wherever their intervals do
+not overlap, so that the moves into a spilled phi on its edges, a loop's back edge above all, are
+mostly no moves at all.
 
 **Blocks.** A block with one predecessor starts with that predecessor's registers. A merge starts
 with those of the predecessor that keeps the most of its values in registers, so that a path that
 called a function, which leaves none in registers, does not make the others give theirs up; a loop
 header starts with those of the block entering the loop, without the values the loop only carries
-through that have a slot already. Their phis get registers free there, preferably the input's own
-from that predecessor. Every other edge moves its values into place, as parallel moves with cycles
-broken through a slot; back edges get theirs when their source block ends.
+through that have a slot already. A value the loop only carries through that gets its slot later,
+when the loop needs its register, would be reloaded by every back edge: the allocator then allocates
+the function again, with such values in their slots from the loop's header on (at most three
+passes). Their phis get registers free there, preferably the input's own from that predecessor.
+Every other edge moves its values into place, as parallel moves with cycles broken through a slot;
+back edges get theirs when their source block ends.
 
 **The verifier** (`regalloc/verify.rs`) simulates every register from the state each block starts
 with, checks that every input is where the allocation says, and that every edge's moves produce its
@@ -351,6 +364,10 @@ there; a phi in a register with a slot is stored where its block starts.
   the taken target is a loop header the edge needs moves into: the exit jumps (to a stub if it needs
   moves), and the back edge moves inline, so that an iteration takes one jump rather than two.
   `br_table` is a jump table of 32-bit offsets, with stubs for the edges that need moves.
+- **Flags.** A branch on whether a value is zero right after the add, sub, and, or or xor that
+  computed it, with nothing emitted in between, uses the flags that instruction set rather than
+  testing the value again, if the two fit in one 32-byte window: they can macro-fuse, and the
+  branch's padding would go between them.
 - **Traps** jump to one stub per trap code, which puts the code in edi and jumps to
   `RuntimeInfo::trap_exit` with rbp still the trapping frame's fp. Memory accesses rely on guard
   pages: the runtime's fault handler turns faults in compiled code into the same trap exit.

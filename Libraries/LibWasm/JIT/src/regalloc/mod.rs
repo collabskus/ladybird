@@ -36,7 +36,7 @@ pub use aarch64::fits_immediate;
 use crate::codegen;
 use crate::convention::{self, Place, Register};
 use crate::ir::{BlockId, Func, NONE, Op, Type, Value};
-use liveness::{Liveness, NO_HINT, block_start_position, node_position, predecessor_index};
+use liveness::{Liveness, NO_HINT, block_start_position, edge_position, node_position, predecessor_index};
 
 /// No register.
 pub const NO_REGISTER: u8 = u8::MAX;
@@ -93,9 +93,9 @@ struct MoveScratch {
 /// How the allocator placed one node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeAllocation {
-    /// The registers of the first three inputs, or CONSTANT_INPUT for immediates. Variadic nodes but stores get
+    /// The registers of the first four inputs, or CONSTANT_INPUT for immediates. Variadic nodes but stores get
     /// theirs moved into place instead.
-    pub inputs: [u8; 3],
+    pub inputs: [u8; 4],
     pub output: u8,
     pub temps: [u8; 2],
     /// The moves before the node: `Allocation::moves[start..start + count]`.
@@ -106,7 +106,7 @@ pub struct NodeAllocation {
 impl Default for NodeAllocation {
     fn default() -> Self {
         Self {
-            inputs: [NO_REGISTER; 3],
+            inputs: [NO_REGISTER; 4],
             output: NO_REGISTER,
             temps: [NO_REGISTER; 2],
             moves_start: 0,
@@ -180,7 +180,7 @@ enum Temp {
 }
 
 struct Constraints {
-    inputs: [Input; 3],
+    inputs: [Input; 4],
     output: Output,
     temps: [Temp; 2],
     /// The registers the node overwrites once it has read its inputs.
@@ -226,7 +226,7 @@ fn constraints_for_cpu(func: &Func, value: Value, cpu_features: crate::asm::x86_
         Output::Register
     };
     let mut constraints = Constraints {
-        inputs: [Input::Register; 3],
+        inputs: [Input::Register; 4],
         output,
         temps: [Temp::None; 2],
         clobbers: 0,
@@ -284,6 +284,15 @@ fn constraints_for_cpu(func: &Func, value: Value, cpu_features: crate::asm::x86_
             if !node.ty.uses_xmm() {
                 constraints.reuse_first = false;
             }
+        }
+        // NB: The output takes the register of the value if the condition fails where it can, so that the select
+        //     is a compare and a conditional move.
+        Op::SelectCompare => {
+            constraints.inputs[2] = Input::RegisterOrConstant;
+            if node.flags & crate::ir::SELECT_TEST == 0 {
+                constraints.slot_inputs = 0b0100;
+            }
+            constraints.reuse_first = true;
         }
         Op::TruncS | Op::TruncU | Op::TruncSatS | Op::TruncSatU => {
             constraints.temps[0] = Temp::Fpr;
@@ -384,6 +393,8 @@ pub struct Allocator {
     pub liveness: Liveness,
     /// The time stamp counter ticks the last liveness computation took.
     pub liveness_ticks: u64,
+    /// How many times the last allocation went over the function (see MAX_PASSES).
+    pub passes: u32,
     dominators: crate::passes::dominators::Dominators,
     contents: [u32; REGISTER_COUNT],
     value_registers: Vec<u8>,
@@ -409,7 +420,14 @@ pub struct Allocator {
     /// The fp offset and the values of each spill slot a web has.
     slot_offsets: Vec<i32>,
     slot_values: Vec<Vec<Value>>,
+    /// The values each loop's header keeps in their slots, though they have none yet when the header is allocated.
+    header_drops: Vec<Vec<Value>>,
+    /// For each value a loop's back edge carries into a phi of its header, that phi, else NONE.
+    back_edge_phis: Vec<Value>,
 }
+
+/// The most times a function is allocated, each time with more values in their slots at loop headers.
+const MAX_PASSES: u32 = 3;
 
 use convention::{STRESS_FPRS, STRESS_GPRS};
 
@@ -425,6 +443,32 @@ impl Allocator {
         self.liveness.compute(func);
         self.liveness_ticks = crate::ticks() - start;
         self.dominators.compute(func);
+        self.header_drops.clear();
+        self.header_drops.resize(func.loops.len(), Vec::new());
+        self.back_edge_phis.clear();
+        self.back_edge_phis.resize(func.nodes.len(), NONE);
+        for loop_ in &func.loops {
+            for phi in func.phis(loop_.header) {
+                for (index, &predecessor) in func.predecessors(loop_.header).iter().enumerate() {
+                    if predecessor >= loop_.header {
+                        self.back_edge_phis[func.inputs(phi)[index] as usize] = phi;
+                    }
+                }
+            }
+        }
+        // NB: A value that a loop only carries through stays in a register at its header if it has no slot yet. If the
+        //     loop then needs the register, every back edge reloads the value. Such values stay in their slots in the
+        //     next pass, so that the loop has the register to itself.
+        for pass in 0..MAX_PASSES {
+            self.allocate_pass(func, allocation);
+            self.passes = pass + 1;
+            if pass + 1 == MAX_PASSES || !self.find_header_drops(func, allocation) {
+                break;
+            }
+        }
+    }
+
+    fn allocate_pass(&mut self, func: &Func, allocation: &mut Allocation) {
         let count = func.nodes.len();
         allocation.nodes.clear();
         allocation.nodes.resize(count, NodeAllocation::default());
@@ -478,6 +522,47 @@ impl Allocator {
                 }
             }
         }
+    }
+
+    /// Adds the values that the back edges of loops reload from their slots but that the loops do not use to
+    /// `header_drops`, and returns whether there were any.
+    fn find_header_drops(&mut self, func: &Func, allocation: &Allocation) -> bool {
+        let mut found = false;
+        for block in 0..func.blocks.len() as BlockId {
+            let data = func.blocks[block as usize];
+            for (index, &successor) in func.successors(block).iter().enumerate() {
+                if successor > block {
+                    continue;
+                }
+                let loop_index = func.blocks[successor as usize].loop_index;
+                let loop_end = self.liveness.loop_ends[loop_index as usize];
+                let header_position = block_start_position(func, successor);
+                let state = self.header_states[loop_index as usize];
+                for edge_move in allocation.edge(data.successors_start + index as u32) {
+                    let (Location::Slot(slot), Location::Register(register)) = (edge_move.from, edge_move.to) else {
+                        continue;
+                    };
+                    let value = state[register as usize];
+                    // NB: A move from the slot that breaks a cycle of moves reloads nothing.
+                    if value == NONE
+                        || allocation.slots[value as usize] != slot
+                        || self.liveness.block[value as usize] == successor
+                        || self
+                            .liveness
+                            .next_use(value, header_position)
+                            .is_some_and(|position| position <= loop_end)
+                    {
+                        continue;
+                    }
+                    let drops = &mut self.header_drops[loop_index as usize];
+                    if !drops.contains(&value) {
+                        drops.push(value);
+                        found = true;
+                    }
+                }
+            }
+        }
+        found
     }
 
     // Register state.
@@ -628,10 +713,28 @@ impl Allocator {
         if value == NONE {
             return;
         }
-        if self.liveness.is_live_after(value, self.position) {
+        if self.is_needed_after(func, value) {
             self.ensure_slot(func, allocation, value);
         }
         self.free(register);
+    }
+
+    /// Whether the current block or one of its successors still uses `value`. Its interval may go on past a block that
+    /// returns, where nothing reads it any more.
+    fn is_needed_after(&self, func: &Func, value: Value) -> bool {
+        if !self.liveness.is_live_after(value, self.position) {
+            return false;
+        }
+        if self
+            .liveness
+            .next_use(value, self.position)
+            .is_some_and(|next| next <= edge_position(func, self.current_block))
+        {
+            return true;
+        }
+        func.successors(self.current_block)
+            .iter()
+            .any(|&successor| self.liveness.is_live_at(value, block_start_position(func, successor)))
     }
 
     fn location(&self, func: &Func, allocation: &Allocation, value: Value) -> Location {
@@ -668,6 +771,19 @@ impl Allocator {
             return (1, position - loop_start);
         }
         next.map_or((3, 0), |position| (2, position))
+    }
+
+    /// The register `value` should get: its phi's, if a loop's back edge carries it into a phi that has one, so that
+    /// the edge moves nothing, else its hint.
+    fn preferred_register(&self, func: &Func, allocation: &Allocation, value: Value) -> u8 {
+        let phi = self.back_edge_phis[value as usize];
+        if phi != NONE {
+            let register = allocation.nodes[phi as usize].output;
+            if register != NO_REGISTER && convention::is_fpr(register) == is_float(func.node(value).ty) {
+                return register;
+            }
+        }
+        self.liveness.hint[value as usize]
     }
 
     /// A register of the class that is not `blocked`, preferably `hint`, freeing one if necessary.
@@ -748,18 +864,20 @@ impl Allocator {
             let entry = predecessors[0];
             debug_assert!(entry < block);
             let mut state = self.filtered(func, &self.end_states[entry as usize], block);
-            // The values the loop only carries through stay in their slots, if they have one, so that the loop can
-            // use their registers.
+            // The values the loop only carries through stay in their slots, if they have one or an earlier pass found
+            // that back edges reload them (they get their slot here), so that the loop can use their registers.
             let loop_index = func.blocks[block as usize].loop_index;
             let loop_end = self.liveness.loop_ends[loop_index as usize];
             for value in &mut state {
                 if *value != NONE
-                    && allocation.slots[*value as usize] != NO_SLOT
+                    && (allocation.slots[*value as usize] != NO_SLOT
+                        || self.header_drops[loop_index as usize].contains(value))
                     && self
                         .liveness
                         .next_use(*value, self.position)
                         .is_none_or(|position| position > loop_end)
                 {
+                    self.ensure_slot(func, allocation, *value);
                     *value = NONE;
                 }
             }
@@ -1174,7 +1292,7 @@ impl Allocator {
         let node = *func.node(value);
         let inputs = func.inputs(value);
         let mut blocked = 0u32;
-        let mut registers = [NO_REGISTER; 3];
+        let mut registers = [NO_REGISTER; 4];
         // Fixed temps first, then fixed inputs, so that other inputs do not take their registers.
         for temp in constraints.temps {
             if let Temp::Fixed(register) = temp {
@@ -1182,14 +1300,14 @@ impl Allocator {
                 blocked |= 1 << register;
             }
         }
-        for (index, &input) in inputs.iter().enumerate().take(3) {
+        for (index, &input) in inputs.iter().enumerate().take(4) {
             if let Input::Fixed(register) = constraints.inputs[index] {
                 self.fix_input(func, allocation, input, register, blocked);
                 blocked |= 1 << register;
                 registers[index] = register;
             }
         }
-        for (index, &input) in inputs.iter().enumerate().take(3) {
+        for (index, &input) in inputs.iter().enumerate().take(4) {
             match constraints.inputs[index] {
                 Input::Fixed(_) => continue,
                 Input::RegisterOrConstant if func.node(input).op.is_constant() && fits_immediate(func, input) => {
@@ -1232,26 +1350,34 @@ impl Allocator {
                 register
             }
             Output::Register => {
-                let first = inputs.first().copied().unwrap_or(NONE);
                 let float = is_float(node.ty);
-                if constraints.reuse_first
-                    && registers[0] != CONSTANT_INPUT
-                    && registers[0] != NO_REGISTER
-                    && !func.node(first).op.is_constant()
-                    && !self.liveness.is_live_after(first, self.position)
-                    && convention::is_fpr(registers[0]) == float
-                    && !inputs[1..].contains(&first)
-                {
+                // Whether input `index` dies here, in a register of the output's class that only it has.
+                let dies = |index: usize| {
+                    let input = inputs[index];
+                    !matches!(registers[index], CONSTANT_INPUT | SLOT_INPUT | NO_REGISTER)
+                        && !func.node(input).op.is_constant()
+                        && !self.liveness.is_live_after(input, self.position)
+                        && convention::is_fpr(registers[index]) == float
+                        && inputs.iter().filter(|other| **other == input).count() == 1
+                };
+                let preferred = self.preferred_register(func, allocation, value);
+                // NB: The lowerings of these write either operand's register.
+                let commutative = !float && node.op.is_commutative();
+                if constraints.reuse_first && dies(0) && registers[0] == preferred {
+                    registers[0]
+                } else if constraints.reuse_first && commutative && dies(1) && registers[1] == preferred {
+                    registers[1]
+                } else if constraints.reuse_first && dies(0) {
                     registers[0]
                 } else {
-                    self.pick(func, allocation, blocked, float, self.liveness.hint[value as usize])
+                    self.pick(func, allocation, blocked, float, preferred)
                 }
             }
         };
         self.free_dying_inputs(func, value);
         if output != NO_REGISTER {
             if self.contents[output as usize] != NONE {
-                // The first input, which dies here.
+                // An input, which dies here.
                 self.free(output);
             }
             self.define(func, allocation, value, output);

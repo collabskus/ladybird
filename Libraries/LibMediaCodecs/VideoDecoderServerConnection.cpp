@@ -313,14 +313,21 @@ private:
         auto pixels = frame->storage()->pixels();
 
         auto should_close_connection = false;
+        auto should_stall = false;
         m_connection.with_target([&](auto& connection) {
             // The frame is held before the client hears of it, so that its release cannot arrive first.
             auto frame_id = connection.hold_frame_until_released(move(frame));
             connection.async_frame_decoded(m_decoder_id, m_generation, frame_id, metadata, move(pixels));
             should_close_connection = connection.should_close_after_decoding_frame();
+            should_stall = connection.should_stall_after_decoding_frame();
         });
         if (should_close_connection)
             close_connection();
+        if (should_stall) {
+            MutexLocker locker { m_wait_state->mutex };
+            while (!m_exit_requested)
+                m_wait_state->condition.wait();
+        }
     }
 
     void close_connection()
@@ -374,6 +381,9 @@ VideoDecoderServerConnection::~VideoDecoderServerConnection()
 void VideoDecoderServerConnection::die()
 {
     revoke_weak_refs();
+    // A process that exits here does not wait for its decoders, which may be stuck on their device for good.
+    if (on_death)
+        on_death();
     // The client may still be showing frames in the slots held for it, so nothing may decode into them anymore.
     for (auto& entry : m_sessions)
         entry.value->exit_and_join();
@@ -385,9 +395,6 @@ void VideoDecoderServerConnection::die()
         held_frames = move(m_held_frames);
     }
     held_frames.clear();
-
-    if (on_death)
-        on_death();
 }
 
 void VideoDecoderServerConnection::close_after_decoded_frame_count(u32 frame_count)
@@ -482,16 +489,31 @@ u64 VideoDecoderServerConnection::hold_frame_until_released(NonnullRefPtr<VideoF
     return frame_id;
 }
 
-bool VideoDecoderServerConnection::should_close_after_decoding_frame()
+void VideoDecoderServerConnection::stall_after_decoded_frame_count(u32 frame_count)
 {
-    auto frames_until_close = m_frames_until_close.load(AK::MemoryOrder::memory_order_relaxed);
+    m_frames_until_stall.store(frame_count, AK::MemoryOrder::memory_order_relaxed);
+}
+
+static bool count_down_decoded_frame(Atomic<u32>& frames_remaining)
+{
+    auto frames = frames_remaining.load(AK::MemoryOrder::memory_order_relaxed);
     while (true) {
-        if (frames_until_close == 0)
+        if (frames == 0)
             return false;
-        if (m_frames_until_close.compare_exchange_strong(frames_until_close, frames_until_close - 1, AK::MemoryOrder::memory_order_relaxed))
+        if (frames_remaining.compare_exchange_strong(frames, frames - 1, AK::MemoryOrder::memory_order_relaxed))
             break;
     }
-    return frames_until_close == 1;
+    return frames == 1;
+}
+
+bool VideoDecoderServerConnection::should_close_after_decoding_frame()
+{
+    return count_down_decoded_frame(m_frames_until_close);
+}
+
+bool VideoDecoderServerConnection::should_stall_after_decoding_frame()
+{
+    return count_down_decoded_frame(m_frames_until_stall);
 }
 
 }
