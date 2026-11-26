@@ -30,6 +30,11 @@
 #include <core/SkCanvas.h>
 #include <core/SkImage.h>
 
+#ifdef USE_DIRECTX
+#    include <LibGfx/Direct3DContext.h>
+#    include <gpu/ganesh/GrDirectContext.h>
+#endif
+
 namespace Compositor {
 
 static constexpr int gpu_completion_check_interval_ms = 1;
@@ -999,9 +1004,9 @@ struct SharedImageToPublish {
 
 }
 
-bool CompositorState::create_store(Web::CompositorContextId context_id, RustFFI::StoreKind kind, Gfx::IntSize size, WindowServer* window_server_showing_stores, RustFFI::FfiNewStore& new_store)
+bool CompositorState::create_store(Web::CompositorContextId context_id, RustFFI::StoreKind kind, Gfx::IntSize size, RustFFI::FfiNewStore& new_store)
 {
-    auto store_or_error = create_backing_store(kind, size, m_skia_backend_context, window_server_showing_stores);
+    auto store_or_error = create_backing_store(kind, size, m_skia_backend_context);
     if (store_or_error.is_error()) {
         if (kind == RustFFI::StoreKind::ShownByWindowServer)
             dbgln("Compositor: Failed to allocate a store of context {} that a remote layer shows, which its presentation shows again: {}", context_id, store_or_error.error());
@@ -1210,10 +1215,42 @@ void CompositorState::finish_staged_rasterization(WebContentClientId client, u64
     }
 }
 
-static bool video_frame_holds_high_dynamic_range(Media::VideoFrame const& frame)
+namespace {
+
+struct VideoFrameForRust {
+    AK_ALLOC_WITH_KMALLOC;
+
+    NonnullRefPtr<Media::VideoFrame> frame;
+};
+
+}
+
+static RustFFI::FfiVideoColorMetadata ffi_video_color_metadata_of(Media::ColorMetadata const& color_metadata)
 {
-    auto transfer_characteristics = frame.cicp().transfer_characteristics();
-    return transfer_characteristics == Media::TransferCharacteristics::SMPTE2084 || transfer_characteristics == Media::TransferCharacteristics::HLG;
+    auto const& cicp = color_metadata.cicp;
+    RustFFI::FfiVideoColorMetadata metadata {};
+    metadata.color_primaries = to_underlying(cicp.color_primaries());
+    metadata.transfer_characteristics = to_underlying(cicp.transfer_characteristics());
+    metadata.matrix_coefficients = to_underlying(cicp.matrix_coefficients());
+    if (auto const& volume = color_metadata.mastering_display_color_volume; volume.has_value()) {
+        metadata.has_mastering_display_color_volume = true;
+        metadata.mastering_display_color_volume = {
+            .red = { volume->red.x, volume->red.y },
+            .green = { volume->green.x, volume->green.y },
+            .blue = { volume->blue.x, volume->blue.y },
+            .white_point = { volume->white_point.x, volume->white_point.y },
+            .maximum_luminance = volume->maximum_luminance,
+            .minimum_luminance = volume->minimum_luminance,
+        };
+    }
+    if (auto const& information = color_metadata.content_light_level_information; information.has_value()) {
+        metadata.has_content_light_level_information = true;
+        metadata.content_light_level_information = {
+            .maximum_content_light_level = information->maximum_content_light_level,
+            .maximum_frame_average_light_level = information->maximum_frame_average_light_level,
+        };
+    }
+    return metadata;
 }
 
 void CompositorState::report_live_content(Web::CompositorContextId context_id, ReadonlySpan<u64> canvas_ids, void* receiver, void (*receive)(void*, RustFFI::FfiLiveContent const*))
@@ -1221,26 +1258,45 @@ void CompositorState::report_live_content(Web::CompositorContextId context_id, R
     auto& context = presented_context(context_id);
     auto& raster_targets = context.raster_targets;
 
+    // The surfaces are lent for the call.
+    Vector<RefPtr<PresentableSurface>> canvas_surfaces;
+    canvas_surfaces.ensure_capacity(canvas_ids.size());
     Vector<RustFFI::FfiCanvasContent> canvases;
     canvases.ensure_capacity(canvas_ids.size());
     for (auto id : canvas_ids) {
         Compositing::CanvasId canvas_id { id };
+        canvas_surfaces.unchecked_append(raster_targets.canvas_surfaces().presentable_canvas_surface(canvas_id));
         canvases.unchecked_append({
             .id = id,
             .content_generation = raster_targets.canvas_surfaces().canvas_content_generation(canvas_id),
-            .has_presentable_surface = raster_targets.canvas_surfaces().presentable_canvas_surface(canvas_id) != nullptr,
+            .presentable_surface = canvas_surfaces.last().ptr(),
         });
     }
     Vector<RustFFI::FfiVideoSinkContent> video_sinks;
     video_sinks.ensure_capacity(raster_targets.drawn_video_sinks().size());
     for (auto handle : raster_targets.drawn_video_sinks()) {
         auto frame = current_video_frame(context.web_content_client, handle);
+        RustFFI::FfiCppObject frame_object {};
+        void* frame_surface = nullptr;
+        RustFFI::FfiVideoColorMetadata frame_color {};
+        if (frame) {
+            frame_object.object = make<VideoFrameForRust>(*frame).leak_ptr();
+            frame_object.destroy = [](void* object) { delete static_cast<VideoFrameForRust*>(object); };
+#ifdef AK_OS_MACOS
+            // The frame holds its surface, so the IOSurface lives as long as the frame.
+            if (auto surface = frame->surface())
+                frame_surface = surface->io_surface().core_foundation_pointer();
+#endif
+            frame_color = ffi_video_color_metadata_of(frame->color_metadata());
+        }
         video_sinks.unchecked_append({
             .handle = handle.value(),
-            .has_frame = frame != nullptr,
             .frame_id = frame ? frame->id() : 0,
-            .frame_holds_high_dynamic_range = frame && video_frame_holds_high_dynamic_range(*frame),
             .frame_has_surface = frame && frame->surface(),
+            .frame = frame_object,
+            .frame_surface = frame_surface,
+            .frame_visible_size = frame ? frame->size().to_type<int>() : Gfx::IntSize {},
+            .frame_color = frame_color,
         });
     }
     Vector<RustFFI::FfiImageFrameContent> image_frames;
@@ -1257,166 +1313,52 @@ void CompositorState::report_live_content(Web::CompositorContextId context_id, R
     receive(receiver, &content);
 }
 
-Optional<RemoteLayer::Content> CompositorState::remote_layer_content(PresentedContext& context, RustFFI::MediaKind kind, u64 media_id)
+bool CompositorState::window_server_gpu_device([[maybe_unused]] RustFFI::FfiWindowServerGpuDevice& device)
 {
-    switch (kind) {
-    case RustFFI::MediaKind::Canvas:
-        if (auto surface = context.raster_targets.canvas_surfaces().presentable_canvas_surface(Compositing::CanvasId { media_id }))
-            return RemoteLayer::Content { surface.release_nonnull() };
-        return {};
-    case RustFFI::MediaKind::Video:
-        if (auto frame = current_video_frame(context.web_content_client, Media::VideoSinkHandle { media_id }))
-            return RemoteLayer::Content { frame.release_nonnull() };
-        return {};
-    }
-    VERIFY_NOT_REACHED();
-}
-
-static Optional<RemoteSublayer::RoundedClip> rounded_clip_of(RustFFI::FfiSublayerPlacement const& placement)
-{
-    if (!placement.has_rounded_clip)
-        return {};
-    return RemoteSublayer::RoundedClip {
-        .rect = placement.rounded_clip_rect,
-        .radius = placement.rounded_clip_radius,
-        .rounds_top_left = placement.rounds_top_left,
-        .rounds_top_right = placement.rounds_top_right,
-        .rounds_bottom_right = placement.rounds_bottom_right,
-        .rounds_bottom_left = placement.rounds_bottom_left,
-    };
-}
-
-static Gfx::AffineTransform content_to_frame_of(RustFFI::FfiSublayerPlacement const& placement)
-{
-    auto const* transform = placement.content_to_frame;
-    return { transform[0], transform[1], transform[2], transform[3], transform[4], transform[5] };
-}
-
-static Optional<RemoteSublayer::PathClip> path_clip_of(RustFFI::FfiSublayerPlacement const& placement)
-{
-    if (!placement.is_clipped_by_path)
-        return {};
-    auto contours = Gfx::PathData::from_ffi(placement.clip_path_contours);
-    auto const* path_to_frame = placement.clip_path_to_frame;
-    RemoteSublayer::PathClip path_clip;
-    path_clip.path_identity = placement.clip_path_identity;
-    path_clip.verbs.append(contours.verbs.data(), contours.verbs.size());
-    path_clip.points.append(contours.points.data(), contours.points.size());
-    path_clip.conic_weights.append(contours.conic_weights.data(), contours.conic_weights.size());
-    path_clip.winding_rule = placement.clip_path_fill_rule;
-    path_clip.path_to_frame = { path_to_frame[0], path_to_frame[1], path_to_frame[2], path_to_frame[3], path_to_frame[4], path_to_frame[5] };
-    return path_clip;
-}
-
-bool CompositorState::remote_layer_can_show(RemoteLayer& remote_layer, Web::CompositorContextId context_id, RustFFI::MediaKind kind, u64 media_id, RustFFI::FfiSublayerPlacement const& placement, double device_pixel_ratio)
-{
-    auto content = remote_layer_content(presented_context(context_id), kind, media_id);
-    if (!content.has_value())
+#ifdef USE_DIRECTX
+    auto skia_backend_context = Gfx::SkiaBackendContext::the_main_thread_context();
+    if (!skia_backend_context || !skia_backend_context->sk_context() || skia_backend_context->sk_context()->backend() != GrBackendApi::kDirect3D)
         return false;
-    WindowServerPlacement window_server_placement {
-        .content_rect = placement.content_rect,
-        .content_to_viewport = content_to_frame_of(placement),
-        .clip_rect = placement.clip_rect,
-        .rounded_clip = rounded_clip_of(placement),
-        .is_clipped_by_path = placement.is_clipped_by_path,
-        .scaling_mode = placement.scaling_mode,
-    };
-    return remote_layer.can_show(window_server_placement, *content, device_pixel_ratio);
+    auto& direct3d_context = skia_backend_context->direct3d_context();
+    device.adapter = direct3d_context.adapter();
+    device.queue = direct3d_context.queue();
+    device.backend_context = skia_backend_context.ptr();
+    return true;
+#else
+    return false;
+#endif
 }
 
-Vector<RemoteSublayer>* CompositorState::build_sublayers(Web::CompositorContextId context_id, ReadonlySpan<RustFFI::FfiSublayer> sublayers_to_build)
+Gfx::PaintingSurface const* CompositorState::wrap_d3d12_resource_as_surface([[maybe_unused]] void* resource, [[maybe_unused]] Gfx::IntSize size)
 {
-    auto sublayers = make<Vector<RemoteSublayer>>();
-    auto& context = presented_context(context_id);
-    auto& raster_targets = context.raster_targets;
-    // A sublayer without content is left out, and so are the sublayers of a group that is.
-    Vector<Optional<size_t>> index_of_built_sublayer;
-    index_of_built_sublayer.ensure_capacity(sublayers_to_build.size());
-    for (auto const& sublayer : sublayers_to_build) {
-        Optional<size_t> group_index;
-        bool is_in_group = sublayer.group_index >= 0;
-        if (is_in_group && static_cast<size_t>(sublayer.group_index) < index_of_built_sublayer.size())
-            group_index = index_of_built_sublayer[sublayer.group_index];
-        Optional<decltype(RemoteSublayer::content)> content;
-        if (!is_in_group || group_index.has_value()) {
-            switch (sublayer.content_kind) {
-            case RustFFI::SublayerContentKind::Canvas:
-                if (auto surface = raster_targets.canvas_surfaces().presentable_canvas_surface(Compositing::CanvasId { sublayer.media_id }))
-                    content = surface->lease();
-                break;
-            case RustFFI::SublayerContentKind::Video:
-                if (auto frame = current_video_frame(context.web_content_client, Media::VideoSinkHandle { sublayer.media_id }); frame && frame->surface())
-                    content = frame.release_nonnull();
-                break;
-            case RustFFI::SublayerContentKind::PresentableSurface:
-                content = const_cast<PresentableSurface*>(sublayer.presentable_surface)->lease();
-                break;
-            case RustFFI::SublayerContentKind::Group: {
-                auto const* to_parent = sublayer.group.to_parent;
-                content = RemoteSublayer::Group {
-                    .to_parent = { to_parent[0], to_parent[1], to_parent[2], to_parent[3], to_parent[4], to_parent[5] },
-                    .clip_rect = sublayer.group.clips ? Optional<Gfx::FloatRect> { sublayer.group.clip_rect } : OptionalNone {},
-                    .corner_radii = sublayer.group.corner_radii,
-                    .opacity = sublayer.group.opacity,
-                };
-                break;
-            }
-            case RustFFI::SublayerContentKind::Tile:
-                content = RemoteSublayer::Tile {
-                    .surface = const_cast<PresentableSurface*>(sublayer.presentable_surface)->lease(),
-                    .rect_in_surface = sublayer.rect_in_surface,
-                    .every_pixel_is_opaque = sublayer.every_pixel_is_opaque,
-                };
-                break;
-            case RustFFI::SublayerContentKind::Color:
-                content = sublayer.color;
-                break;
-            case RustFFI::SublayerContentKind::Backdrop: {
-                auto const& backdrop = sublayer.backdrop;
-                RemoteSublayer::Backdrop built_backdrop;
-                built_backdrop.region = backdrop.region;
-                auto append_color_matrix = [&](float const* color_matrix) {
-                    RemoteSublayer::Backdrop::Filter filter;
-                    filter.kind = RemoteSublayer::Backdrop::Filter::Kind::ColorMatrix;
-                    for (size_t index = 0; index < filter.color_matrix.size(); ++index)
-                        filter.color_matrix[index] = color_matrix[index];
-                    built_backdrop.filters.append(filter);
-                };
-                if (backdrop.has_color_matrix_before_blur)
-                    append_color_matrix(backdrop.color_matrix_before_blur);
-                if (backdrop.has_blur) {
-                    RemoteSublayer::Backdrop::Filter blur;
-                    blur.kind = RemoteSublayer::Backdrop::Filter::Kind::Blur;
-                    blur.blur_standard_deviation = backdrop.blur_standard_deviation;
-                    built_backdrop.filters.append(blur);
-                }
-                if (backdrop.has_color_matrix_after_blur)
-                    append_color_matrix(backdrop.color_matrix_after_blur);
-                content = move(built_backdrop);
-                break;
-            }
-            }
-        }
-        if (!content.has_value()) {
-            index_of_built_sublayer.unchecked_append({});
-            continue;
-        }
-        index_of_built_sublayer.unchecked_append(sublayers->size());
-        auto const& placement = sublayer.placement;
-        bool is_placed_by_group = content->has<RemoteSublayer::Tile>() || content->has<Gfx::Color>();
-        sublayers->append({
-            .identity = sublayer.identity,
-            .group_index = group_index,
-            .content = content.release_value(),
-            .content_rect = is_placed_by_group ? sublayer.rect : placement.content_rect,
-            .content_to_frame = content_to_frame_of(placement),
-            .clip_rect = placement.clip_rect,
-            .rounded_clip = rounded_clip_of(placement),
-            .path_clip = path_clip_of(placement),
-            .scaling_mode = placement.scaling_mode,
-        });
+#ifdef USE_DIRECTX
+    auto skia_backend_context = Gfx::SkiaBackendContext::the_main_thread_context();
+    if (!skia_backend_context)
+        return nullptr;
+    auto surface = Gfx::PaintingSurface::create_over_swap_chain_buffer(skia_backend_context.release_nonnull(), resource, size);
+    if (surface.is_error()) {
+        dbgln("Compositor: {}", surface.error());
+        return nullptr;
     }
-    return sublayers.leak_ptr();
+    return &surface.release_value().leak_ref();
+#else
+    return nullptr;
+#endif
+}
+
+static void flush_surface_for_presentation([[maybe_unused]] Gfx::PaintingSurface& surface)
+{
+#ifdef USE_DIRECTX
+    surface.flush_for_presentation();
+#endif
+}
+
+void CompositorState::finish_gpu_work()
+{
+#ifdef USE_DIRECTX
+    if (auto skia_backend_context = Gfx::SkiaBackendContext::the_main_thread_context(); skia_backend_context && skia_backend_context->sk_context())
+        skia_backend_context->sk_context()->flushAndSubmit(GrSyncCpu::kYes);
+#endif
 }
 
 u64 CompositorState::submit_frame(Gfx::PaintingSurface* surface)
@@ -1528,12 +1470,6 @@ VSyncScheduler& CompositorState::vsync_scheduler_for_display(Optional<u64> displ
 
 namespace {
 
-struct VideoFrameForRust {
-    AK_ALLOC_WITH_KMALLOC;
-
-    NonnullRefPtr<Media::VideoFrame> frame;
-};
-
 struct VideoFrameImageForRust {
     AK_ALLOC_WITH_KMALLOC;
 
@@ -1614,14 +1550,17 @@ RustFFI::FfiRasterHost CompositorState::raster_host(CompositorState& state)
         .surface_clear = [](Gfx::PaintingSurface const* surface, Gfx::Color color) { canvas_of(surface).clear(Gfx::to_skia_color(color)); },
         .surface_draw_surface = [](Gfx::PaintingSurface const* target, Gfx::PaintingSurface const* source, Gfx::IntRect source_rect, Gfx::IntRect target_rect, RustFFI::SurfaceBlend blend, RustFFI::SurfaceSampling sampling) {
             auto image = source->sk_image_snapshot<sk_sp<SkImage>>();
+            if (!image)
+                return false;
             SkPaint paint;
             paint.setBlendMode(blend == RustFFI::SurfaceBlend::Source ? SkBlendMode::kSrc : SkBlendMode::kSrcOver);
             // Only tiles are drawn filtered.
-            Gfx::draw_tile_image_rect(canvas_of(target), *image, Gfx::to_skia_rect(source_rect), Gfx::to_skia_rect(target_rect), sampling == RustFFI::SurfaceSampling::Linear, paint); },
+            Gfx::draw_tile_image_rect(canvas_of(target), *image, Gfx::to_skia_rect(source_rect), Gfx::to_skia_rect(target_rect), sampling == RustFFI::SurfaceSampling::Linear, paint);
+            return true; },
         .flush_surface = [](Gfx::PaintingSurface const* surface) { DisplayListPlayerSkia::flush(mutable_surface(surface)); },
         .begin_painting = [](void* host, u64 context_id, Gfx::PaintingSurface const* surface, RustFFI::PaintingResources resources, bool allows_lcd_text, Compositing::RustFFI::FfiRasterPainter* painter) { *painter = state_of(host).begin_painting(Context { context_id }, mutable_surface(surface), resources, allows_lcd_text); },
         .end_painting = [](void* host) { state_of(host).end_painting(); },
-        .create_store = [](void* host, u64 context_id, RustFFI::StoreKind kind, Gfx::IntSize size, void* window_server, RustFFI::FfiNewStore* new_store) { return state_of(host).create_store(Context { context_id }, kind, size, static_cast<WindowServer*>(window_server), *new_store); },
+        .create_store = [](void* host, u64 context_id, RustFFI::StoreKind kind, Gfx::IntSize size, RustFFI::FfiNewStore* new_store) { return state_of(host).create_store(Context { context_id }, kind, size, *new_store); },
         .publish_stores = [](void* host, u64 presentation_id, u64 context_id, bool added, ReadonlySpan<i32> bitmap_ids, ReadonlySpan<void*> images) { state_of(host).publish_stores(PresentationId { presentation_id }, Context { context_id }, added, bitmap_ids, images); },
         .retire_published_stores = [](void* host, u64 presentation_id, u64 context_id, ReadonlySpan<i32> bitmap_ids) { state_of(host).retire_published_stores(PresentationId { presentation_id }, Context { context_id }, bitmap_ids); },
         .create_presentable_surface = [](void*, Gfx::IntSize size, Gfx::PaintingSurface const* like) -> PresentableSurface const* {
@@ -1630,58 +1569,13 @@ RustFFI::FfiRasterHost CompositorState::raster_host(CompositorState& state)
                 return nullptr;
             return &surface.release_value().leak_ref();
         },
-        .window_server_compositing = [](void* window_server) -> RustFFI::FfiWindowServerCompositing {
-            auto const& compositing_window_server = *static_cast<WindowServer*>(window_server);
-            return {
-                .shows_tiles_of_painted_layers = compositing_window_server.shows_tiles_of_painted_layers(),
-                .filters_what_is_below_layers = compositing_window_server.filters_what_is_below_layers(),
-            };
-        },
         .live_content = [](void* host, u64 context_id, ReadonlySpan<u64> canvas_ids, void* receiver, void (*receive)(void*, RustFFI::FfiLiveContent const*)) { state_of(host).report_live_content(Context { context_id }, canvas_ids, receiver, receive); },
-        .remote_layer_can_show = [](void* host, void* remote_layer, u64 context_id, RustFFI::MediaKind kind, u64 media_id, RustFFI::FfiSublayerPlacement const* placement, double device_pixel_ratio) { return state_of(host).remote_layer_can_show(*static_cast<RemoteLayer*>(remote_layer), Context { context_id }, kind, media_id, *placement, device_pixel_ratio); },
-        .build_sublayers = [](void* host, u64 context_id, ReadonlySpan<RustFFI::FfiSublayer> sublayers) -> void* {
-            return state_of(host).build_sublayers(Context { context_id }, sublayers);
-        },
-        .destroy_sublayers = [](void* sublayers) { delete static_cast<Vector<RemoteSublayer>*>(sublayers); },
         .submit_frame = [](void* host, u64, Gfx::PaintingSurface const* surface) { return state_of(host).submit_frame(const_cast<Gfx::PaintingSurface*>(surface)); },
         .hand_off_once_gpu_work_is_scheduled = [](void* host, u64 token) { state_of(host).hand_off_once_gpu_work_is_scheduled(token); },
-        .create_window_server = [](void*, RustFFI::FfiCppObject* window_server) {
-            auto created = WindowServer::try_create_for_presentation();
-            if (!created)
-                return false;
-            window_server->object = &created.release_nonnull().leak_ref();
-            window_server->destroy = [](void* object) { static_cast<WindowServer*>(object)->unref(); };
-            return true; },
-        .window_server_frame_hand_off = [](void* window_server) { return static_cast<WindowServer*>(window_server)->frame_hand_off() == WindowServer::FrameHandOff::OnceGpuWorkIsScheduled
-                                                                      ? RustFFI::FrameHandOff::OnceGpuWorkIsScheduled
-                                                                      : RustFFI::FrameHandOff::OnceGpuWorkIsFinished; },
-        .window_server_hold_changes_on_screen = [](void* window_server) { static_cast<WindowServer*>(window_server)->hold_changes_on_screen(); },
-        .window_server_release_changes_held_off_screen = [](void* window_server) { static_cast<WindowServer*>(window_server)->release_changes_held_off_screen(); },
-        .create_remote_layer = [](void* window_server, u64 remote_layer_id, RustFFI::FfiCppObject* remote_layer, RustFFI::FfiRemoteLayerHostHandle* host_handle) {
-            auto layer = static_cast<WindowServer*>(window_server)->try_create_remote_layer(remote_layer_id);
-            if (!layer)
-                return false;
-            auto handle = layer->host_handle();
-            host_handle->kind = to_underlying(handle.kind);
-            host_handle->id = handle.id;
-            remote_layer->object = layer.leak_ptr();
-            remote_layer->destroy = [](void* object) { (void)adopt_own(*static_cast<RemoteLayer*>(object)); };
-            return true; },
-        .remote_layer_place_frame = [](void* remote_layer, bool has_fit_within, Gfx::IntSize fit_within) { static_cast<RemoteLayer*>(remote_layer)->place_frame(has_fit_within ? Optional<Gfx::IntSize> { fit_within } : OptionalNone {}); },
-        .remote_layer_show_frame = [](void* remote_layer, RustFFI::FfiRemoteLayerFrame const* frame, void* sublayers) {
-            auto owned_sublayers = adopt_own(*static_cast<Vector<RemoteSublayer>*>(sublayers));
-            auto* store = const_cast<PresentableSurface*>(frame->store);
-            auto shown = static_cast<RemoteLayer*>(remote_layer)->show_frame({
-                .store = store ? Optional<PresentableSurface::Lease> { store->lease() } : OptionalNone {},
-                .shows_no_store = frame->shows_no_store,
-                .painted_size = frame->painted_size,
-                .device_pixel_ratio = frame->device_pixel_ratio,
-                .fit_within = frame->has_fit_within ? Optional<Gfx::IntSize> { frame->fit_within } : OptionalNone {},
-                .sublayers = move(*owned_sublayers),
-            });
-            if (!shown)
-                dbgln("Compositor: A remote layer failed to show a frame, which its presentation shows again");
-            return shown; },
+        .window_server_gpu_device = [](void* host, RustFFI::FfiWindowServerGpuDevice* device) { return state_of(host).window_server_gpu_device(*device); },
+        .wrap_d3d12_resource_as_surface = [](void* host, void* resource, Gfx::IntSize size) { return state_of(host).wrap_d3d12_resource_as_surface(resource, size); },
+        .flush_surface_for_presentation = [](Gfx::PaintingSurface const* surface) { flush_surface_for_presentation(mutable_surface(surface)); },
+        .finish_gpu_work = [](void* host) { state_of(host).finish_gpu_work(); },
         .log_presented_frame = [](void*, u64 page_id, Gfx::IntRect damage_rect) { log_presented_frame(page_id, damage_rect); },
         .release_store_later = [](void* host, u64 context_id, i32 bitmap_id) { state_of(host).release_store_later(Context { context_id }, bitmap_id); },
         .request_vsync = [](void* host, bool has_display_id, u64 display_id, double refresh_rate) { state_of(host).vsync_scheduler_for_display(display_of(has_display_id, display_id)).schedule(refresh_rate); },

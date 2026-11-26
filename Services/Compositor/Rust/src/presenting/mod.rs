@@ -18,11 +18,12 @@ mod window_server;
 use crate::backing_stores::{AllocationOutcome, BackingStores, Publication, StorePublication, StoreResizeOutcome};
 use crate::frame_inputs::FrameInputs;
 use crate::host::{ContextTimer, Host, PendingFrame};
-use crate::raster_host::{FfiSublayer, PaintingResources, RasterHost, SurfaceBlend, SurfaceSampling};
-use crate::remote_layers::{ShowingLayer, WindowServerObject};
+use crate::raster_host::{PaintingResources, RasterHost, SurfaceBlend, SurfaceSampling};
+use crate::remote_layers::ShowingLayer;
 use crate::surfaces::painting_surface::PaintingSurface;
 use crate::surfaces::presentable_surface::PresentableSurface;
-use damage::{PaintedFrame, StoreDamage};
+use crate::window_server::{FrameSublayer, PlannedSublayer, WindowServer, sublayers_for_frame};
+use damage::{FrameDamage, PaintedFrame, StoreDamage};
 use layer_overlay::LayerOverlaySwitch;
 use layers::ContextLayers;
 use libcompositing_rust::display_list::commands::CompositorContextId;
@@ -75,7 +76,7 @@ pub struct PresentingEnvironment<'a> {
 }
 
 impl PresentingEnvironment<'_> {
-    pub fn window_server_showing_context(&self) -> Option<&WindowServerObject> {
+    pub fn window_server_showing_context(&self) -> Option<&dyn WindowServer> {
         self.remote_layer
             .as_ref()
             .map(|remote_layer| &*remote_layer.window_server)
@@ -88,9 +89,8 @@ pub struct PreparedFrame {
     pub bitmap_id: i32,
     pub damage_rect: IntRect,
     pub device_pixel_ratio: f64,
-    /// What the window server shows of the frame by itself, bottom to top, lent by the presenting state until the next
-    /// frame.
-    pub sublayers: Vec<FfiSublayer>,
+    /// What the window server shows of the frame by itself, bottom to top.
+    pub sublayers: Vec<FrameSublayer>,
     /// Whether the sublayers are all of the frame, so that the window server shows no store below them.
     pub window_server_shows_every_layer: bool,
 }
@@ -232,11 +232,11 @@ fn raster_region_around(
     Some(IntRect::new(x, y, width, height))
 }
 
-fn rect_of_size(size: IntSize) -> IntRect {
+pub(crate) fn rect_of_size(size: IntSize) -> IntRect {
     IntRect::new(0, 0, size.width, size.height)
 }
 
-fn size_of(rect: IntRect) -> IntSize {
+pub(crate) fn size_of(rect: IntRect) -> IntSize {
     IntSize {
         width: rect.width,
         height: rect.height,
@@ -277,7 +277,7 @@ pub struct ContextPresenting {
 
     frame_without_store_in_flight: bool,
     backing_stores: BackingStores,
-    sublayers_of_latest_frame: Vec<FfiSublayer>,
+    sublayers_of_latest_frame: Vec<PlannedSublayer>,
     /// Whether the window server showed every layer of the frame presented last by itself, with no store below them.
     latest_frame_was_presented_without_store_below_sublayers: bool,
     size_of_latest_rendered_frame: IntSize,
@@ -412,8 +412,7 @@ impl ContextPresenting {
             match self
                 .backing_stores
                 .allocate(allocation, publication, shares_gpu_images, &mut |kind, size| {
-                    env.raster
-                        .create_store(env.context_id, kind, size, env.window_server_showing_context())
+                    env.raster.create_store(env.context_id, kind, size)
                 }) {
                 AllocationOutcome::Offscreen => StoreResizeOutcome::ReallocatedOffscreen,
                 AllocationOutcome::Failed => StoreResizeOutcome::Failed,
@@ -515,12 +514,11 @@ impl ContextPresenting {
         raster: &RasterHost,
         context_id: CompositorContextId,
         publishing_presentation: Option<u64>,
-        window_server: Option<&WindowServerObject>,
     ) -> bool {
         let Some(stores) = self
             .backing_stores
             .add_store_if_window_server_still_reads_every_released_store(&mut |kind, size| {
-                raster.create_store(context_id, kind, size, window_server)
+                raster.create_store(context_id, kind, size)
             })
         else {
             return false;
@@ -561,11 +559,11 @@ impl ContextPresenting {
         raster: &RasterHost,
         context_id: CompositorContextId,
         publishing_presentation: Option<u64>,
-        window_server: Option<&WindowServerObject>,
     ) -> bool {
-        let Some(stores) = self.backing_stores.add_stores_up_to_initial_count(&mut |kind, size| {
-            raster.create_store(context_id, kind, size, window_server)
-        }) else {
+        let Some(stores) = self
+            .backing_stores
+            .add_stores_up_to_initial_count(&mut |kind, size| raster.create_store(context_id, kind, size))
+        else {
             return false;
         };
         Self::publish_added_stores(raster, context_id, publishing_presentation, stores);
@@ -895,50 +893,80 @@ impl ContextPresenting {
             frame_inputs: &frame_inputs,
         };
         let mut frame_damage = self.frame_damage_for(env, &pending_frame, &frame, &live_content);
-        let mut damage_rect = frame_damage.rect_in_raster_device_pixels;
-        let window_server_shows_every_layer = frame_damage.layers.window_server_shows_every_layer();
         let frame_was_presented_within_same_viewport_rect = self.presented_frame == Some(pending_frame.viewport_rect);
         // NB: A changed content rect must still reach the client even if the pixels are identical.
-        let frame_changes_nothing_it_holds = window_server_shows_every_layer
-            || (damage_rect.is_empty() && frame_was_presented_within_same_viewport_rect);
-        if frame_changes_nothing_it_holds {
-            let only_media_shown_by_window_server_changed = frame_damage.layers.media_shown_by_window_server_changed;
-            let overlays_draw_same_as_in_latest_frame = self.painted_frame.as_ref().is_some_and(|painted_frame| {
-                frame_inputs
-                    .overlays
-                    .draws_same_as(&painted_frame.frame_inputs.overlays)
-            });
-            let sublayers_of_tiles_rastered_for_frame = if frame_damage.layers.window_server_shows_tiles() {
-                Some(self.present_layers_of_frame_painted_into_no_store(
-                    env,
-                    &frame,
-                    &mut frame_damage.layers,
-                    &live_content,
-                    overlays_draw_same_as_in_latest_frame,
-                ))
-            } else {
-                None
-            };
-            // A frame the window server cannot be given the layers of holds them all, and so is painted in full.
-            let window_server_was_given_layers = !matches!(sublayers_of_tiles_rastered_for_frame, Some(None));
-            if window_server_was_given_layers {
-                self.remember_painted_frame(
-                    env,
-                    pending_frame.viewport_rect,
-                    display_list,
-                    frame_inputs,
-                    frame_damage.layers,
-                );
-                let sublayers = match sublayers_of_tiles_rastered_for_frame {
-                    Some(Some(sublayers)) => sublayers,
-                    _ => self.painted_frame.as_ref().map_or_else(Vec::new, |painted_frame| {
-                        self.sublayers_shown_by_window_server(&painted_frame.layers, &live_content)
-                    }),
-                };
+        let frame_changes_nothing_it_holds = |frame_damage: &FrameDamage| {
+            frame_damage.layers.window_server_shows_every_layer()
+                || (frame_damage.rect_in_raster_device_pixels.is_empty()
+                    && frame_was_presented_within_same_viewport_rect)
+        };
+        let overlays_draw_same_as_in_latest_frame = self.painted_frame.as_ref().is_some_and(|painted_frame| {
+            frame_inputs
+                .overlays
+                .draws_same_as(&painted_frame.frame_inputs.overlays)
+        });
+        // Tiles are made like the store the frame is painted into, before it is known whether the frame needs one.
+        let surface_tiles_are_made_like = self
+            .backing_stores
+            .surface_of_next_render_target()
+            .expect("a frame that is not blocked has a store to render into");
+        let frame_changes_nothing_it_holds_if_window_server_is_given_its_layers =
+            frame_changes_nothing_it_holds(&frame_damage);
+        let (sublayers, rects_painted_straight) = self.raster_and_present_layers(
+            env,
+            &surface_tiles_are_made_like,
+            &frame,
+            &mut frame_damage,
+            &live_content,
+            frame_changes_nothing_it_holds_if_window_server_is_given_its_layers,
+            overlays_draw_same_as_in_latest_frame,
+        );
+        let window_server_shows_every_layer = frame_damage.layers.window_server_shows_every_layer();
+        let presents_frame_in_full = std::mem::take(&mut self.presents_next_frame_in_full);
+        let painted_store = if frame_changes_nothing_it_holds(&frame_damage) {
+            None
+        } else {
+            let (bitmap_id, store) = self
+                .backing_stores
+                .acquire_render_target()
+                .expect("the store tiles were made like is free");
+            let mut damage_rect = frame_damage.rect_in_raster_device_pixels;
+            let repaint_rect = self
+                .store_damage
+                .take(bitmap_id, damage_rect, rect_of_size(store.size()));
+            let painted_rect = self.composite_frame_from_layers(
+                env,
+                &store,
+                &frame,
+                repaint_rect,
+                &frame_damage.layers,
+                &rects_painted_straight,
+                true,
+            );
+            // The other stores miss all of what this one now holds.
+            if painted_rect != repaint_rect {
+                damage_rect = rect_of_size(size_of(pending_frame.viewport_rect));
+                self.store_damage.add_damage_to_other_stores(bitmap_id, painted_rect);
+            }
+            Some((bitmap_id, store, damage_rect))
+        };
+        let only_media_shown_by_window_server_changed = frame_damage.layers.media_shown_by_window_server_changed;
+        self.remember_painted_frame(
+            env,
+            pending_frame.viewport_rect,
+            display_list,
+            frame_inputs,
+            frame_damage.layers,
+        );
+        let (rendered_surface, bitmap_id, damage_rect) = match painted_store {
+            Some((bitmap_id, store, damage_rect)) => {
+                self.latest_frame_was_presented_without_store_below_sublayers = false;
+                (Some(store), bitmap_id, damage_rect)
+            }
+            None => {
                 let window_server_shows_other_sublayers = sublayers != self.sublayers_of_latest_frame;
                 // A frame presented in full, as one shown in another remote layer than the frame before, or one whose
                 // overlays draw otherwise, is presented even where the window server already shows its sublayers.
-                let presents_frame_in_full = std::mem::take(&mut self.presents_next_frame_in_full);
                 let frame_is_made_to_repaint = presents_frame_in_full || !overlays_draw_same_as_in_latest_frame;
                 let hides_store_shown_with_latest_frame =
                     window_server_shows_every_layer && !self.latest_frame_was_presented_without_store_below_sublayers;
@@ -951,73 +979,30 @@ impl ContextPresenting {
                     return None;
                 }
                 self.frame_without_store_in_flight = true;
-                self.sublayers_of_latest_frame = sublayers.clone();
                 if window_server_shows_every_layer {
                     // No store holds what the frame shows, so each is painted in full once a frame holds layers again,
                     // and a snapshot of the frame on screen is composited from the layers.
                     self.latest_frame_was_presented_without_store_below_sublayers = true;
                     self.store_damage.forget_every_store();
-                    self.size_of_latest_rendered_frame = IntSize {
-                        width: pending_frame.viewport_rect.width,
-                        height: pending_frame.viewport_rect.height,
-                    };
+                    self.size_of_latest_rendered_frame = size_of(pending_frame.viewport_rect);
                 }
-                return Some(PreparedFrame {
-                    rendered_surface: None,
-                    bitmap_id: -1,
-                    damage_rect: if window_server_shows_other_sublayers {
-                        self.raster_rect()
-                    } else {
-                        IntRect::default()
-                    },
-                    device_pixel_ratio: self.device_pixel_ratio,
-                    sublayers,
-                    window_server_shows_every_layer,
-                });
+                let damage_rect = if window_server_shows_other_sublayers {
+                    self.raster_rect()
+                } else {
+                    IntRect::default()
+                };
+                (None, -1, damage_rect)
             }
-            frame_damage.layers.hold_every_layer_in_frame();
-            damage_rect = self.raster_rect();
-        }
-        let Some((bitmap_id, store)) = self.backing_stores.acquire_render_target() else {
-            self.queue_present_frame(pending_frame);
-            return None;
         };
-        self.presents_next_frame_in_full = false;
-        let store_rect = rect_of_size(store.size());
-        let repaint_rect = self.store_damage.take(bitmap_id, damage_rect, store_rect);
-        let (painted_rect, sublayers) = self.paint_layered_frame(
-            env,
-            &store,
-            &frame,
-            repaint_rect,
-            &mut frame_damage.layers,
-            &live_content,
-            true,
-        );
-        // The other stores miss all of what this one now holds.
-        if painted_rect != repaint_rect {
-            damage_rect = rect_of_size(IntSize {
-                width: pending_frame.viewport_rect.width,
-                height: pending_frame.viewport_rect.height,
-            });
-            self.store_damage.add_damage_to_other_stores(bitmap_id, painted_rect);
-        }
-        self.remember_painted_frame(
-            env,
-            pending_frame.viewport_rect,
-            display_list,
-            frame_inputs,
-            frame_damage.layers,
-        );
-        self.sublayers_of_latest_frame = sublayers.clone();
-        self.latest_frame_was_presented_without_store_below_sublayers = false;
+        let sublayers_for_frame = sublayers_for_frame(&sublayers, &live_content);
+        self.sublayers_of_latest_frame = sublayers;
         Some(PreparedFrame {
-            rendered_surface: Some(store),
+            rendered_surface,
             bitmap_id,
             damage_rect,
             device_pixel_ratio: self.device_pixel_ratio,
-            sublayers,
-            window_server_shows_every_layer: false,
+            sublayers: sublayers_for_frame,
+            window_server_shows_every_layer,
         })
     }
 
@@ -1063,18 +1048,20 @@ impl ContextPresenting {
             frame_inputs: &frame_inputs,
         };
         let mut frame_damage = self.frame_damage_for(env, &pending_frame, &frame, &live_content);
+        let (_, rects_painted_straight) =
+            self.raster_and_present_layers(env, &surface, &frame, &mut frame_damage, &live_content, false, false);
         let repaint_rect = if holds_earlier_frame {
             frame_damage.rect_in_raster_device_pixels
         } else {
             rect_of_size(raster_size)
         };
-        let _ = self.paint_layered_frame(
+        self.composite_frame_from_layers(
             env,
             &surface,
             &frame,
             repaint_rect,
-            &mut frame_damage.layers,
-            &live_content,
+            &frame_damage.layers,
+            &rects_painted_straight,
             true,
         );
         self.remember_painted_frame(
@@ -1137,13 +1124,15 @@ impl ContextPresenting {
             let live_content = this.live_content(env, frame.display_list);
             let pending_frame = PendingFrame::within(rect_of_size(target_size));
             let mut frame_damage = this.frame_damage_for(env, &pending_frame, frame, &live_content);
-            let _ = this.paint_layered_frame(
+            let (_, rects_painted_straight) =
+                this.raster_and_present_layers(env, target, frame, &mut frame_damage, &live_content, false, false);
+            this.composite_frame_from_layers(
                 env,
                 target,
                 frame,
                 frame_damage.rect_in_raster_device_pixels,
-                &mut frame_damage.layers,
-                &live_content,
+                &frame_damage.layers,
+                &rects_painted_straight,
                 false,
             );
         });

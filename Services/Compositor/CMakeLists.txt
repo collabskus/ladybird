@@ -24,7 +24,6 @@ set(SOURCES
     VideoFrameHolds.cpp
     VideoFrameSkia.cpp
     VSyncScheduler.cpp
-    WindowServer.cpp
 )
 
 set(GENERATED_SOURCES
@@ -82,15 +81,8 @@ if (USE_VULKAN_DMABUF_IMAGES)
 endif()
 
 if (APPLE)
-    target_sources(compositorservice PRIVATE CoreAnimationWindowServer.mm MainDispatchQueue.mm VideoFrameSkia.mm)
-    target_link_libraries(compositorservice PUBLIC "-framework AVFoundation" "-framework CoreGraphics" "-framework CoreMedia" "-framework CoreVideo" "-framework QuartzCore")
-endif()
-
-if (WIN32 AND HAS_DIRECTX)
-    target_sources(compositorservice PRIVATE DirectCompositionWindowServer.cpp)
-    # dcomp.h declares composition textures only from NTDDI_WIN10_NI on.
-    set_source_files_properties(DirectCompositionWindowServer.cpp PROPERTIES COMPILE_DEFINITIONS NTDDI_VERSION=0x0A00000C)
-    target_link_libraries(compositorservice PRIVATE LibThreading d3d11 dcomp)
+    target_sources(compositorservice PRIVATE MainDispatchQueue.mm VideoFrameSkia.mm)
+    target_link_libraries(compositorservice PUBLIC "-framework AVFoundation" "-framework CoreGraphics" "-framework CoreMedia" "-framework CoreVideo" "-framework IOSurface" "-framework QuartzCore")
 endif()
 
 if (WIN32)

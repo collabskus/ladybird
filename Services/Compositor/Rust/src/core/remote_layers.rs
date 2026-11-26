@@ -31,7 +31,7 @@ impl CompositorCore {
         Some(
             self.remote_layers
                 .borrow_mut()
-                .create_remote_layer(presentation_id, remote_layer_id, &self.raster),
+                .create_remote_layer(presentation_id, remote_layer_id),
         )
     }
 
@@ -39,10 +39,7 @@ impl CompositorCore {
         let _entered = self.enter();
 
         let was_holding_changes = self.remote_layers.borrow().is_holding_changes();
-        let stopped = self
-            .remote_layers
-            .borrow_mut()
-            .destroy_remote_layer(remote_layer_id, &self.raster);
+        let stopped = self.remote_layers.borrow_mut().destroy_remote_layer(remote_layer_id);
         self.update_synchronized_resize_hold_timer(was_holding_changes);
         if let Some(context_id) = stopped {
             self.stop_showing_context_in_remote_layer(context_id, now);
@@ -89,7 +86,7 @@ impl CompositorCore {
 
         self.remote_layers
             .borrow_mut()
-            .set_remote_layer_fit(remote_layer_id, fit_within, &self.raster);
+            .set_remote_layer_fit(remote_layer_id, fit_within);
     }
 
     pub fn begin_synchronized_resize(&self, remote_layer_id: u64, token: u64) {
@@ -98,7 +95,7 @@ impl CompositorCore {
         let was_holding_changes = self.remote_layers.borrow().is_holding_changes();
         self.remote_layers
             .borrow_mut()
-            .begin_synchronized_resize(remote_layer_id, token, &self.raster);
+            .begin_synchronized_resize(remote_layer_id, token);
         self.update_synchronized_resize_hold_timer(was_holding_changes);
     }
 
@@ -116,10 +113,10 @@ impl CompositorCore {
         let _entered = self.enter();
 
         let was_holding_changes = self.remote_layers.borrow().is_holding_changes();
-        let committed =
-            self.remote_layers
-                .borrow_mut()
-                .commit_synchronized_resize(remote_layer_id, token, &self.raster);
+        let committed = self
+            .remote_layers
+            .borrow_mut()
+            .commit_synchronized_resize(remote_layer_id, token);
         self.update_synchronized_resize_hold_timer(was_holding_changes);
         if let Some(notice) = committed {
             self.host.post_to_presentation(
@@ -137,9 +134,8 @@ impl CompositorCore {
             std::io::stderr(),
             "Compositor: Releasing the window resize that was never committed"
         );
-        self.remote_layers
-            .borrow_mut()
-            .release_synchronized_resize_hold(&self.raster);
+        self.remote_layers.borrow_mut().release_synchronized_resize_hold();
+        self.release_content_window_server_let_go_of();
     }
 
     pub(super) fn update_synchronized_resize_hold_timer(&self, was_holding_changes: bool) {
@@ -149,6 +145,21 @@ impl CompositorCore {
                 .schedule(Timer::SynchronizedResizeHold, SYNCHRONIZED_RESIZE_HOLD_LIMIT);
         } else if !is_holding_changes && was_holding_changes {
             self.host.unschedule(Timer::SynchronizedResizeHold);
+            // What the layers stopped showing while changes were held is let go of once the changes reach the screen.
+            self.release_content_window_server_let_go_of();
+        }
+    }
+
+    /// Lets the remote layers go of what the window server can no longer be reading, and asks again once more of it
+    /// can be let go of.
+    pub(super) fn release_content_window_server_let_go_of(&self) {
+        let ask_again_in = self.remote_layers.borrow().release_content_window_server_let_go_of();
+        match ask_again_in {
+            Some(delay) => self.host.schedule(
+                Timer::ReleaseContentWindowServerLetGoOf,
+                Duration::from_nanoseconds(i64::try_from(delay.as_nanos()).unwrap_or(i64::MAX)),
+            ),
+            None => self.host.unschedule(Timer::ReleaseContentWindowServerLetGoOf),
         }
     }
 }
