@@ -88768,275 +88768,6 @@ impl From<CssPixelRect> for FfiCssPixelRect {
     }
 }
 
-FILE: Libraries/LibCompositing/Rust/src/display_list/animated_content.rs
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-//! Whether what the animations of a visual context tree move can reach the viewport.
-
-use super::replay::{OwnSpaceClipExtent, own_space_clip_extent};
-use super::storage::DisplayListStorage;
-use crate::display_list::builder::{
-    bounding_rect_computed_from_payload, for_each_command, has_inline_clip_in_its_own_space, inline_clips_of,
-};
-use crate::display_list::commands::{EffectNodeIndex, SpatialNodeIndex};
-use crate::host::FfiAnimatedContentViewportEffect;
-use crate::visual_context::{EffectNodeData, VisualContextTree, WorldTransforms};
-use libgfx_rust::{FloatMatrix4x4, FloatPoint, IntRect};
-use std::cell::OnceCell;
-
-/// Whether the content the tree's animations move at `sample_time_ns` can reach the viewport. The
-/// finished animations keep their final values in place; the running ones must all be opacity or
-/// plane rotations, whose extents the bounds query can replace, for the answer to be anything but
-/// yes. The answer is cached until scene geometry or scrolling changes, and bounding rotating
-/// content deliberately ignores clips, so no animation phase can reveal pixels outside the bounds.
-pub fn animated_content_may_affect_viewport_at(
-    display_list: &DisplayListStorage,
-    tree: &VisualContextTree,
-    scroll_offsets: &[FloatPoint],
-    viewport_rect: IntRect,
-    sample_time_ns: i64,
-) -> FfiAnimatedContentViewportEffect {
-    let extents = tree.visual_animation_extents_at(sample_time_ns);
-    if !extents.all_running_animations_are_bounded {
-        return FfiAnimatedContentViewportEffect {
-            may_affect_viewport: true,
-            stable_until_scene_changes: false,
-        };
-    }
-    let may_affect_viewport_with_tree = |tree: &VisualContextTree| {
-        animated_content_may_affect_viewport(
-            display_list,
-            tree,
-            scroll_offsets,
-            &extents.rotation_nodes,
-            &extents.opacity_nodes,
-            viewport_rect,
-        )
-    };
-    let may_affect_viewport = if extents.has_finished_animation {
-        may_affect_viewport_with_tree(&tree.with_visual_animation_samples(sample_time_ns))
-    } else {
-        may_affect_viewport_with_tree(tree)
-    };
-    FfiAnimatedContentViewportEffect {
-        may_affect_viewport,
-        stable_until_scene_changes: !extents.has_unfinished_finite_animation,
-    }
-}
-
-pub fn animated_content_may_affect_viewport(
-    display_list: &DisplayListStorage,
-    tree: &VisualContextTree,
-    scroll_offsets: &[FloatPoint],
-    rotation_nodes: &[SpatialNodeIndex],
-    opacity_nodes: &[EffectNodeIndex],
-    viewport_rect: IntRect,
-) -> bool {
-    let is_in_rotating_subtree_by_spatial_node = tree.spatial_nodes_in_subtrees_of(rotation_nodes);
-    let mut is_rotation_node_by_spatial_node = vec![false; tree.spatial_nodes.len()];
-    for node in rotation_nodes {
-        let Some(is_rotation_node) = is_rotation_node_by_spatial_node.get_mut(node.0 as usize) else {
-            return true;
-        };
-        *is_rotation_node = true;
-    }
-    let world_made_on_first_use = OnceCell::new();
-    let mut may_affect_viewport = false;
-    for chunk in display_list.chunks() {
-        let records = chunk.records();
-        for run in chunk.runs() {
-            let run_bytes = &records[run.offset as usize..(run.offset + run.size) as usize];
-            for_each_command(run_bytes, |header, _, payload| {
-                if may_affect_viewport || header.command_type.is_compositor_metadata() {
-                    return;
-                }
-                let spatial_is_animated = is_in_rotating_subtree_by_spatial_node[run.context.spatial.0 as usize];
-                let has_inline_clip_in_its_own_space =
-                    header.inline_clip_count != 0 && has_inline_clip_in_its_own_space(header, payload);
-                if has_inline_clip_in_its_own_space
-                    && !spatial_is_animated
-                    && inline_clips_of(header, payload).any(|inline_clip| {
-                        inline_clip.has_own_space
-                            && is_in_rotating_subtree_by_spatial_node
-                                .get(inline_clip.space.0 as usize)
-                                .is_none_or(|is_animated| *is_animated)
-                    })
-                {
-                    may_affect_viewport = true;
-                    return;
-                }
-                let mut clip = run.context.clip;
-                while !clip.is_none() {
-                    let node = &tree.clip_nodes[clip.0 as usize];
-                    if !spatial_is_animated && is_in_rotating_subtree_by_spatial_node[node.spatial.0 as usize] {
-                        may_affect_viewport = true;
-                        return;
-                    }
-                    clip = node.parent;
-                }
-                let mut effect = run.context.effect;
-                let mut opacity_is_animated = false;
-                let mut filter_can_draw_past_record_bounds = false;
-                while !effect.is_none() {
-                    let node = &tree.effect_nodes[effect.0 as usize];
-                    opacity_is_animated |= opacity_nodes.contains(&effect);
-                    if !spatial_is_animated && is_in_rotating_subtree_by_spatial_node[node.spatial.0 as usize] {
-                        may_affect_viewport = true;
-                        return;
-                    }
-                    if let EffectNodeData::Effects(effects) = &node.data
-                        && (effects.filter.is_some() || effects.backdrop_filter.is_some())
-                    {
-                        filter_can_draw_past_record_bounds = true;
-                    }
-                    effect = node.parent;
-                }
-                if !spatial_is_animated && !opacity_is_animated {
-                    return;
-                }
-                if filter_can_draw_past_record_bounds {
-                    may_affect_viewport = true;
-                    return;
-                }
-                let bounding_rect = bounding_rect_computed_from_payload(header, payload);
-                let mut rect = bounding_rect.unwrap_or_default().to_float();
-                if has_inline_clip_in_its_own_space && bounding_rect.is_some() {
-                    let world = world_made_on_first_use
-                        .get_or_init(|| WorldTransforms::new(tree, scroll_offsets, Some(FloatMatrix4x4::identity())));
-                    if let Some(command_to_root) = world.draw_matrix_if_known(run.context.spatial)
-                        && let Some(OwnSpaceClipExtent::Within(clipped_rect)) =
-                            own_space_clip_extent(header, payload, rect, command_to_root, |space| {
-                                world.draw_matrix_if_known(space)
-                            })
-                    {
-                        if clipped_rect.is_empty() {
-                            return;
-                        }
-                        rect = clipped_rect;
-                    }
-                }
-                let Some(bounds) = tree.rect_with_rotation_bounds_to_viewport(
-                    run.context.spatial,
-                    rect,
-                    &is_rotation_node_by_spatial_node,
-                    scroll_offsets,
-                ) else {
-                    may_affect_viewport = true;
-                    return;
-                };
-                let bounds = bounds.inflated(2.0, 2.0);
-                may_affect_viewport = bounds.x <= viewport_rect.right() as f32
-                    && bounds.right() >= viewport_rect.x as f32
-                    && bounds.y <= viewport_rect.bottom() as f32
-                    && bounds.bottom() >= viewport_rect.y as f32;
-            });
-        }
-    }
-    may_affect_viewport
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::display_list::builder::{DisplayListBuilder, PendingInlineClip};
-    use crate::display_list::commands::{ContextRef, FillRect, VISUAL_VIEWPORT_NODE_INDEX};
-    use crate::node_slot_id::NodeSlotId;
-    use crate::visual_context::{
-        ClipNodeIndex, EffectsData, ScrollData, SpatialData, TransformData, TransformDataRole,
-    };
-    use libgfx_rust::{Color, CompositingAndBlendingOperator, FloatRect};
-
-    fn transform(matrix: FloatMatrix4x4) -> TransformData {
-        TransformData {
-            matrix,
-            origin: FloatPoint::default(),
-            sorting_context_root_index: None,
-            flattens_inherited_transform: false,
-            role: TransformDataRole::CssTransform,
-            synthetic_plane: false,
-            establishes_sorting_context: false,
-            bounds: FloatRect::default(),
-        }
-    }
-
-    #[test]
-    fn animated_content_follows_inline_clips_in_spaces_of_their_own() {
-        let mut tree = VisualContextTree::create(transform(FloatMatrix4x4::identity()));
-        let scroll = tree.append_spatial(
-            SpatialData::Scroll(ScrollData {
-                state_slot: 1,
-                owner_paintable: NodeSlotId::INVALID,
-            }),
-            VISUAL_VIEWPORT_NODE_INDEX,
-        );
-        let rotating = tree.append_spatial(
-            SpatialData::Transform(transform(FloatMatrix4x4::identity())),
-            VISUAL_VIEWPORT_NODE_INDEX,
-        );
-        let effect = tree.append_effect(
-            EffectNodeData::Effects(EffectsData {
-                isolation: false,
-                opacity: 0.5,
-                blend_mode: CompositingAndBlendingOperator::Normal,
-                filter: None,
-                backdrop_filter: None,
-            }),
-            EffectNodeIndex::NONE,
-            VISUAL_VIEWPORT_NODE_INDEX,
-            ClipNodeIndex::NONE,
-        );
-        let viewport = IntRect::new(0, 0, 800, 600);
-        let draw_clipped_to = |clip_space: SpatialNodeIndex, clip_rect: IntRect, context: ContextRef| {
-            let mut builder = DisplayListBuilder::new();
-            builder.append_with_inline_clips(
-                &FillRect {
-                    rect: viewport,
-                    color: Color::from_rgb(255, 0, 0),
-                    compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
-                    background_color_animation_effect: EffectNodeIndex::NONE,
-                },
-                &[],
-                context,
-                &[PendingInlineClip::intersecting_float_rect(clip_rect.to_float()).in_space(clip_space)],
-            );
-            DisplayListStorage::of_builder(&builder)
-        };
-        let may_affect_viewport = |display_list: &DisplayListStorage, rotation_nodes: &[SpatialNodeIndex]| {
-            animated_content_may_affect_viewport(
-                display_list,
-                &tree,
-                &[FloatPoint::default(), FloatPoint::default()],
-                rotation_nodes,
-                &[effect],
-                viewport,
-            )
-        };
-        let faded = ContextRef {
-            effect,
-            ..ContextRef::default()
-        };
-
-        // An animated opacity only affects the viewport where the clip lets the draw show.
-        let box_on_screen = IntRect::new(0, 10, 10, 10);
-        let box_off_screen = IntRect::new(0, 2000, 10, 10);
-        assert!(may_affect_viewport(&draw_clipped_to(scroll, box_on_screen, faded), &[]));
-        assert!(!may_affect_viewport(
-            &draw_clipped_to(scroll, box_off_screen, faded),
-            &[]
-        ));
-
-        // A clip in a rotating space moves the draw it clips, though the draw's own space stands still.
-        assert!(may_affect_viewport(
-            &draw_clipped_to(rotating, box_on_screen, ContextRef::default()),
-            &[rotating]
-        ));
-    }
-}
-
 FILE: Libraries/LibCompositing/Rust/src/display_list/animated_transform_spaces.rs
 /*
  * Copyright (c) 2026-present, the Ladybird developers.
@@ -96716,6 +96447,17 @@ pub struct StackLayer {
     pub reach: IntRect,
 }
 
+/// Where content whose pixels an animation of the tree changes can show, in the raster coordinates of a space. Content
+/// of a space whose anchor the compositor animates is told in the space that space is in, wherever the animation takes
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct AnimatedContentReach {
+    /// The index of the animation among the visual animations of the tree.
+    pub animation_index: u32,
+    pub raster_space_index: RasterSpaceIndex,
+    pub reach: IntRect,
+}
+
 /// An effect that the compositor composites the layers of its content inside.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CompositedEffect {
@@ -96776,6 +96518,9 @@ pub struct LayerStack {
     /// Per raster space whose anchor the compositor animates and that holds content, where that content can show in
     /// the raster coordinates of the space it is in wherever the animation takes it.
     pub swept_reach_in_parent_space_by_space_index: Vec<Option<IntRect>>,
+    /// Per animation of the tree and raster space, where content whose pixels the animation changes can show, sorted by
+    /// animation and space, or none where the plan cannot tell.
+    pub reach_of_animated_content: Option<Vec<AnimatedContentReach>>,
     /// Per band, the innermost band at or around it whose node the compositor composites inside its effect.
     innermost_composited_band_at_or_around_band: Vec<Option<BandIndex>>,
     /// How many raster pixels each device pixel of the plan is: 1 for a stack as planned, and the power of two a stack
@@ -97005,6 +96750,8 @@ pub struct LayeredPlan {
     tiles_hold_content_moving_within_space_by_space_index: Vec<bool>,
     #[ipc(max_size = MAXIMUM_RASTER_SPACE_COUNT)]
     swept_reach_in_parent_space_by_space_index: Vec<Option<IntRect>>,
+    #[ipc(max_size = wire::MAXIMUM_ANIMATED_CONTENT_REACH_COUNT_OF_RECEIVED_STACK)]
+    reach_of_animated_content: Option<Vec<AnimatedContentReach>>,
 }
 
 /// A placement node without its identity, which the stack works out of the node, the node it is in and the spaces.
@@ -97083,7 +96830,8 @@ fn painted_layer_of_band(
 }
 
 impl LayerStack {
-    /// One layer that replays the whole list, which is always correct.
+    /// One layer that replays the whole list, which is always correct. It cannot tell where animated content shows,
+    /// but in an empty viewport or of an empty list, where none does.
     pub fn one_layer_replaying_whole_list(
         viewport_rect: IntRect,
         whole_list_span: ListSpan,
@@ -97111,6 +96859,11 @@ impl LayerStack {
             may_hold_content: true,
             reach: viewport_rect,
         }];
+        let reach_of_animated_content = matches!(
+            why_list_is_one_layer,
+            Some(WhyListIsOneLayer::EmptyViewport | WhyListIsOneLayer::EmptyDisplayList)
+        )
+        .then(Vec::new);
         Self {
             layers,
             bands: vec![PlacementNodeBand {
@@ -97129,6 +96882,7 @@ impl LayerStack {
             layering_obstacles,
             tiles_hold_content_moving_within_space_by_space_index: vec![true],
             swept_reach_in_parent_space_by_space_index: vec![None],
+            reach_of_animated_content,
             innermost_composited_band_at_or_around_band: Vec::new(),
             raster_scale: 1,
         }
@@ -97329,6 +97083,7 @@ impl LayerStack {
             tiles_hold_content_moving_within_space_by_space_index: plan
                 .tiles_hold_content_moving_within_space_by_space_index,
             swept_reach_in_parent_space_by_space_index: plan.swept_reach_in_parent_space_by_space_index,
+            reach_of_animated_content: plan.reach_of_animated_content,
             innermost_composited_band_at_or_around_band: Vec::new(),
             raster_scale: 1,
         }
@@ -97377,6 +97132,9 @@ impl LayerStack {
         for swept_reach in stack.swept_reach_in_parent_space_by_space_index.iter_mut().flatten() {
             *swept_reach = scaled(*swept_reach);
         }
+        for animated_content in stack.reach_of_animated_content.iter_mut().flatten() {
+            animated_content.reach = scaled(animated_content.reach);
+        }
         stack
     }
 
@@ -97416,6 +97174,12 @@ impl LayerStack {
         self.nodes[self.layers[layer_index.0].placement_node_index.0].raster_space_index
     }
 
+    /// What a raster of several tiles of the space at once stays within: the extent of the viewport's space, which no
+    /// frame drawn with the stack shows past, and nothing for the other spaces.
+    pub fn rect_rasters_of_space_stay_within(&self, raster_space_index: RasterSpaceIndex) -> Option<IntRect> {
+        (raster_space_index == RasterSpaceIndex::VIEWPORT).then(|| self.spaces[RasterSpaceIndex::VIEWPORT.0].extent)
+    }
+
     // An offset past the coordinate limit shows nothing of the space, and is kept within the limit so that a rect of the
     // stack offset by it still fits in an `IntRect`.
     fn composite_offset_of_space(
@@ -97449,6 +97213,31 @@ impl LayerStack {
         (0..self.spaces.len())
             .map(|space_index| self.composite_offset_of_space(RasterSpaceIndex(space_index), scroll_offsets))
             .collect()
+    }
+
+    /// Whether content whose pixels an animation that `animation_is_running` takes changes can show within `rect` of
+    /// the viewport, where the frame composites each space at its offset of `composite_offsets`. A stack that cannot
+    /// tell where animated content shows answers yes.
+    pub fn running_animations_can_show_within(
+        &self,
+        animation_is_running: impl Fn(u32) -> bool,
+        composite_offsets: &[IntPoint],
+        rect: IntRect,
+    ) -> bool {
+        let Some(reach_of_animated_content) = &self.reach_of_animated_content else {
+            return true;
+        };
+        reach_of_animated_content
+            .iter()
+            .filter(|animated_content| animation_is_running(animated_content.animation_index))
+            .any(|animated_content| {
+                let offset = composite_offsets[animated_content.raster_space_index.0];
+                !animated_content
+                    .reach
+                    .translated(offset.x, offset.y)
+                    .intersected(rect)
+                    .is_empty()
+            })
     }
 
     /// Per raster space, by its index, how the frame composites its rasters: at `composite_offsets`, or for a space
@@ -98084,33 +97873,40 @@ FILE: Libraries/LibCompositing/Rust/src/display_list/layers/planning.rs
 //! not their tiles.
 
 use super::wire::{
-    CANVAS_VIDEO_AND_NESTED_CONTEXT_LAYERS_A_BAND_LEAVES_CUTS_FOR, plan_holds_more_than_compositor_decodes,
+    CANVAS_VIDEO_AND_NESTED_CONTEXT_LAYERS_A_BAND_LEAVES_CUTS_FOR,
+    MAXIMUM_ANIMATED_CONTENT_REACH_COUNT_OF_RECEIVED_STACK, plan_holds_more_than_compositor_decodes,
 };
 use super::{
-    BandOfPlan, BarrierCut, BarrierOfPlan, CutOfPlan, LayerIndex, LayerStack, LayeredPlan, LayeringObstacles,
-    MAXIMUM_LAYER_COUNT_OF_LIVE_CONTENT_DRAWN_BY_ITS_RECORD, MAXIMUM_NESTING_OF_COMPOSITED_EFFECTS, NodeOfPlan,
-    PlacementNodeIndex, StackOnWire, WhyCompositorCannotCompositeEffect, WhyListIsOneLayer, media_name,
+    AnimatedContentReach, BandOfPlan, BarrierCut, BarrierOfPlan, CutOfPlan,
+    LARGEST_SUMMED_READ_REACH_OF_COMPOSITED_FILTERS_IN_DEVICE_PIXELS, LayerIndex, LayerStack, LayeredPlan,
+    LayeringObstacles, MAXIMUM_LAYER_COUNT_OF_LIVE_CONTENT_DRAWN_BY_ITS_RECORD, MAXIMUM_NESTING_OF_COMPOSITED_EFFECTS,
+    NodeOfPlan, PlacementNodeIndex, StackOnWire, WhyCompositorCannotCompositeEffect, WhyListIsOneLayer, media_name,
+    rect_at_raster_scale,
 };
 use crate::display_list::animated_transform_spaces::{effect_reads_below_it, spatial_nodes_under_transform_animations};
-use crate::display_list::builder::{bounding_rect_computed_from_payload, record_can_paint_within};
-use crate::display_list::commands::{EffectNodeIndex, SpatialNodeIndex};
+use crate::display_list::builder::{
+    bounding_rect_computed_from_payload, for_each_command, has_inline_clip_in_its_own_space, record_can_paint_within,
+};
+use crate::display_list::commands::{ClipNodeIndex, EffectNodeIndex, SpatialNodeIndex, VISUAL_VIEWPORT_NODE_INDEX};
 use crate::display_list::effect_geometry::{
     FiltersOfEffects, KeyframeFiltersOfEffects, backdrop_filter_read_reach, filter_may_spread_at_some_sample,
     filter_read_reach_in_device_pixels,
 };
 use crate::display_list::placement::{
     ANTIALIASING_MARGIN_IN_DEVICE_PIXELS, CompositeClip, FiltersAndClipsOfList, RasterSpace, RasterSpaceAnchorKind,
-    RasterSpaceIndex, RunGroupIndex, RunGroups, compositor_scroll_record_of, enclosing_int_rect_within_extent_limit,
-    is_finite_rect,
+    RasterSpaceIndex, RunGroupIndex, RunGroups, ValuesFoldedDownSpatialChains, compositor_scroll_record_of,
+    enclosing_int_rect_within_extent_limit, is_finite_rect,
 };
 use crate::display_list::reach::Reach;
+use crate::display_list::replay::{OwnSpaceClipExtent, own_space_clip_extent};
 use crate::display_list::storage::{DisplayListStorage, ListPosition, ListSpan, RunIndexInChunk, RunIndexInList};
 use crate::display_list::summary::{IndexedRecord, LiveContent};
 use crate::display_list::tiles::{CellRange, reaches_too_many_cells_to_follow_one_by_one, tile_coords_touching};
+use crate::host::FfiVisualAnimationTargetKind;
 use crate::visual_context::queries::{BackdropReader, NestingOfLiveEffects, backdrop_reader_by_reading_effect_index};
 use crate::visual_context::{EffectNodeData, VisualContextTree};
 use libgfx_rust::{FloatPoint, FloatRect, IntRect};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 use std::sync::Arc;
 
@@ -98505,9 +98301,16 @@ fn backdrop_filter_reads_nothing_past_mirrored_edge(filter: &[u8]) -> bool {
     !reads_past_each_pixel || libgfx_rust::filter::Filter::serialized_has_mirroring_blur(filter)
 }
 
+/// What placing a list works out per raster space and per animation that a plan carries beside where the parts of the
+/// list are placed, as `LayerStack` holds it.
+struct WhatPlacingCarriesIntoPlan {
+    swept_reach_in_parent_space_by_space_index: Vec<Option<IntRect>>,
+    tiles_hold_content_moving_within_space_by_space_index: Vec<bool>,
+    reach_of_animated_content: Option<Vec<AnimatedContentReach>>,
+}
+
 /// Where each part of the list is placed among `spaces`, given the geometry of each of them, with what the stack holds
-/// per space of them: `LayerStack::swept_reach_in_parent_space_by_space_index` and
-/// `LayerStack::tiles_hold_content_moving_within_space_by_space_index`. Canvases, videos and nested contexts past
+/// per space of them and per animation of the tree. Canvases, videos and nested contexts past
 /// `most_canvas_video_and_nested_context_layers`, in paint order, get no layers.
 fn place_list(
     inputs: &LayerStackInputs<'_>,
@@ -98515,7 +98318,7 @@ fn place_list(
     geometries: &[RasterSpaceGeometryForPlacing],
     nesting_of_live_effects: &NestingOfLiveEffects<'_>,
     most_canvas_video_and_nested_context_layers: Option<usize>,
-) -> (ListPlacement, Vec<Option<IntRect>>, Vec<bool>) {
+) -> (ListPlacement, WhatPlacingCarriesIntoPlan) {
     let tree = inputs.tree;
     // Placing decides for the filter that the tree holds and for each filter that an animation can give the effect.
     let filters_at_some_sample = FiltersOfEffects::of(tree, None, true);
@@ -98531,6 +98334,11 @@ fn place_list(
         placing.effects_composited_regardless_of_layer_content(&runs, &placed_media, &mut animations_without_layers);
     let (backdrop_read_reach_by_effect_index, backdrop_readers_in_paint_order, reads_root_group_by_effect_index) =
         placing.note_backdrop_readers(&runs, &placed_media, &mut why_composited_regardless_of_layer_content);
+    let reach_of_animated_content = placing.reach_of_animated_content(
+        &runs,
+        &backdrop_read_reach_by_effect_index,
+        &backdrop_readers_in_paint_order,
+    );
     let (placed_effects, innermost_placed_effect_at_or_around_by_effect_index) = placing.place_effects(
         &runs,
         &why_composited_regardless_of_layer_content,
@@ -98555,13 +98363,30 @@ fn place_list(
     };
     (
         placement,
-        runs.swept_reach_in_parent_space_by_space_index,
-        tiles_hold_content_moving_within_space_by_space_index,
+        WhatPlacingCarriesIntoPlan {
+            swept_reach_in_parent_space_by_space_index: runs.swept_reach_in_parent_space_by_space_index,
+            tiles_hold_content_moving_within_space_by_space_index,
+            reach_of_animated_content,
+        },
     )
 }
 
 fn is_animated_space(space: &RasterSpace) -> bool {
     matches!(space.anchor_kind, RasterSpaceAnchorKind::AnimatedTransform { .. })
+}
+
+fn spatial_nodes_of_clip_chain(
+    tree: &VisualContextTree,
+    mut clip: ClipNodeIndex,
+) -> impl Iterator<Item = SpatialNodeIndex> + '_ {
+    std::iter::from_fn(move || {
+        if clip.is_none() {
+            return None;
+        }
+        let clip_node = &tree.clip_nodes[clip.0 as usize];
+        clip = clip_node.parent;
+        Some(clip_node.spatial)
+    })
 }
 
 // What placing a list reads: its inputs, and what is worked out of them alone before anything is placed.
@@ -99852,6 +99677,320 @@ impl<'a> ListBeingPlaced<'a> {
         )
     }
 
+    /// Per animation of the tree and raster space, where content whose pixels the animation changes can show, sorted by
+    /// animation and space, or none past the most a plan carries or where a spatial chain of the tree breaks.
+    ///
+    /// A run depends on the opacity and filter animations of the effects around it, and on the transform animations at
+    /// or above each spatial node it is drawn, clipped or composited in: its own, those of its clips, of its effects and
+    /// their clips, and the spaces of its inline clips. A backdrop reader painted after a run reads what changes of it,
+    /// and draws that change as far past each pixel as it reads, so the reach of an animation widens by that much for
+    /// each backdrop reader painted after its first run. A background color animation can show anywhere in the
+    /// viewport.
+    fn reach_of_animated_content(
+        &self,
+        runs: &RunGroupsPlaced,
+        backdrop_read_reach_by_effect_index: &[Reach<IntRect>],
+        backdrop_readers_in_paint_order: &[EffectNodeIndex],
+    ) -> Option<Vec<AnimatedContentReach>> {
+        let (tree, list) = (self.tree, self.list);
+        let animations = tree.visual_animations();
+        if animations.is_empty() {
+            return Some(Vec::new());
+        }
+        let viewport_extent = self.geometries[RasterSpaceIndex::VIEWPORT.0].extent;
+        let mut reach_by_animation_and_space: BTreeMap<(u32, RasterSpaceIndex), IntRect> = BTreeMap::new();
+        let mut first_run_index_by_animation_index = vec![usize::MAX; animations.len()];
+        let mut opacity_and_filter_animations_by_effect_index: Vec<Vec<u32>> =
+            vec![Vec::new(); tree.effect_nodes.len()];
+        let mut transform_animations_by_spatial_index: Vec<Vec<u32>> = vec![Vec::new(); tree.spatial_nodes.len()];
+        for (animation_index, animation) in animations.iter().enumerate() {
+            let animation_index = animation_index as u32;
+            let animations_by_target_index = match animation.target_kind {
+                FfiVisualAnimationTargetKind::Opacity | FfiVisualAnimationTargetKind::Filter => {
+                    &mut opacity_and_filter_animations_by_effect_index
+                }
+                FfiVisualAnimationTargetKind::Transform => &mut transform_animations_by_spatial_index,
+                FfiVisualAnimationTargetKind::BackgroundColor => {
+                    reach_by_animation_and_space.insert((animation_index, RasterSpaceIndex::VIEWPORT), viewport_extent);
+                    continue;
+                }
+            };
+            for &node_index in &animation.node_indices {
+                if let Some(animations_of_target) = animations_by_target_index.get_mut(node_index as usize) {
+                    animations_of_target.push(animation_index);
+                }
+            }
+        }
+
+        let some_transform_is_animated = transform_animations_by_spatial_index
+            .iter()
+            .any(|animations_of_node| !animations_of_node.is_empty());
+        let transform_animated_node_or_none = |node: SpatialNodeIndex| {
+            transform_animations_by_spatial_index
+                .get(node.0 as usize)
+                .is_some_and(|animations_of_node| !animations_of_node.is_empty())
+                .then_some(node)
+        };
+        let mut nearest_transform_animated_node_at_or_above =
+            ValuesFoldedDownSpatialChains::<Option<SpatialNodeIndex>>::new();
+        // Answers false where the chain of `node` leaves the tree or loops.
+        let mut add_transform_animations_at_or_above = |node: SpatialNodeIndex, animations_of_run: &mut Vec<u32>| {
+            let mut node_on_chain = node;
+            loop {
+                let Some(nearest_animated_node) = nearest_transform_animated_node_at_or_above.value_of(
+                    tree,
+                    node_on_chain,
+                    transform_animated_node_or_none(VISUAL_VIEWPORT_NODE_INDEX),
+                    |node, nearest_animated_node_above| {
+                        transform_animated_node_or_none(node).or(nearest_animated_node_above)
+                    },
+                ) else {
+                    return false;
+                };
+                let Some(animated_node) = nearest_animated_node else {
+                    return true;
+                };
+                animations_of_run.extend_from_slice(&transform_animations_by_spatial_index[animated_node.0 as usize]);
+                if animated_node == VISUAL_VIEWPORT_NODE_INDEX {
+                    return true;
+                }
+                node_on_chain = tree.spatial_nodes[animated_node.0 as usize].parent;
+            }
+        };
+
+        let mut animations_of_run: Vec<u32> = Vec::new();
+        let mut spatial_nodes_of_run: Vec<SpatialNodeIndex> = Vec::new();
+        for run_index in 0..list.run_count() {
+            let context = list.run(run_index).context;
+            animations_of_run.clear();
+            spatial_nodes_of_run.clear();
+            spatial_nodes_of_run.push(context.spatial);
+            spatial_nodes_of_run.extend(spatial_nodes_of_clip_chain(tree, context.clip));
+            let mut effect = context.effect;
+            while !effect.is_none() {
+                let effect_node = &tree.effect_nodes[effect.0 as usize];
+                animations_of_run.extend_from_slice(&opacity_and_filter_animations_by_effect_index[effect.0 as usize]);
+                spatial_nodes_of_run.push(effect_node.spatial);
+                spatial_nodes_of_run.extend(spatial_nodes_of_clip_chain(tree, effect_node.local_clip));
+                effect = effect_node.parent;
+            }
+            // An inline clip in a space the tree does not hold applies in the space of its record.
+            spatial_nodes_of_run.extend(
+                self.runs_reaching_outside
+                    .inline_clip_spaces_of_run(run_index)
+                    .iter()
+                    .filter(|clip_space| (clip_space.0 as usize) < tree.spatial_nodes.len()),
+            );
+            if some_transform_is_animated {
+                spatial_nodes_of_run.sort_unstable();
+                spatial_nodes_of_run.dedup();
+                for &node in &spatial_nodes_of_run {
+                    if !add_transform_animations_at_or_above(node, &mut animations_of_run) {
+                        return None;
+                    }
+                }
+            }
+            if animations_of_run.is_empty() {
+                continue;
+            }
+            let Some((raster_space_index, reach)) =
+                self.where_content_of_run_can_show(runs, run_index, backdrop_read_reach_by_effect_index)
+            else {
+                continue;
+            };
+            animations_of_run.sort_unstable();
+            animations_of_run.dedup();
+            for &animation_index in &animations_of_run {
+                let united_reach = reach_by_animation_and_space
+                    .entry((animation_index, raster_space_index))
+                    .or_default();
+                *united_reach = united_reach.united(reach);
+                let first_run_index = &mut first_run_index_by_animation_index[animation_index as usize];
+                *first_run_index = (*first_run_index).min(run_index);
+            }
+        }
+
+        // The backdrop readers in paint order, by the first run each reads what is painted before, with how far the
+        // readers from each one on read past each pixel, summed, or none where one reads farther than is known.
+        let first_run_index_of_backdrop_readers: Vec<usize> = backdrop_readers_in_paint_order
+            .iter()
+            .map(|reader| self.first_run_index_by_effect_index[reader.0 as usize])
+            .collect();
+        let mut summed_read_spread_of_backdrop_readers_from: Vec<Option<i32>> =
+            vec![Some(0); backdrop_readers_in_paint_order.len() + 1];
+        for (position, &reader) in backdrop_readers_in_paint_order.iter().enumerate().rev() {
+            summed_read_spread_of_backdrop_readers_from[position] = summed_read_spread_of_backdrop_readers_from
+                [position + 1]
+                .zip(self.how_far_backdrop_reader_reads_past_each_pixel(runs, reader))
+                .map(|(spread_of_later_readers, spread)| spread_of_later_readers.saturating_add(spread))
+                .filter(|&summed_spread| {
+                    summed_spread <= LARGEST_SUMMED_READ_REACH_OF_COMPOSITED_FILTERS_IN_DEVICE_PIXELS
+                });
+        }
+        let mut widened_reach_by_animation_and_space: BTreeMap<(u32, RasterSpaceIndex), IntRect> = BTreeMap::new();
+        for ((animation_index, raster_space_index), reach) in reach_by_animation_and_space {
+            let first_run_index = first_run_index_by_animation_index[animation_index as usize];
+            let position_of_first_reader_painted_after = first_run_index_of_backdrop_readers
+                .partition_point(|&reader_first_run| reader_first_run <= first_run_index);
+            let (raster_space_index, reach) =
+                match summed_read_spread_of_backdrop_readers_from[position_of_first_reader_painted_after] {
+                    Some(0) => (raster_space_index, reach),
+                    Some(spread) => (
+                        raster_space_index,
+                        rect_at_raster_scale(reach.inflated_edges(spread, spread, spread, spread), 1),
+                    ),
+                    None => (RasterSpaceIndex::VIEWPORT, viewport_extent),
+                };
+            let united_reach = widened_reach_by_animation_and_space
+                .entry((animation_index, raster_space_index))
+                .or_default();
+            *united_reach = united_reach.united(reach);
+        }
+        if widened_reach_by_animation_and_space.len() > MAXIMUM_ANIMATED_CONTENT_REACH_COUNT_OF_RECEIVED_STACK {
+            return None;
+        }
+        Some(
+            widened_reach_by_animation_and_space
+                .into_iter()
+                .filter(|(_, reach)| !reach.is_empty())
+                .map(|((animation_index, raster_space_index), reach)| AnimatedContentReach {
+                    animation_index,
+                    raster_space_index,
+                    reach,
+                })
+                .collect(),
+        )
+    }
+
+    /// Where content of a run can show, in the raster coordinates of a space, or none where it draws nothing: where the
+    /// run reaches within its inline clips in spaces of their own, and where the backdrop filters around it read, or
+    /// for a run of a space whose anchor the compositor animates, wherever the animation takes the space's content.
+    /// Where that is not known, it is the whole viewport.
+    fn where_content_of_run_can_show(
+        &self,
+        runs: &RunGroupsPlaced,
+        run_index: usize,
+        backdrop_read_reach_by_effect_index: &[Reach<IntRect>],
+    ) -> Option<(RasterSpaceIndex, IntRect)> {
+        let spaces = self.tables.spaces();
+        let anywhere_in_viewport = Some((
+            RasterSpaceIndex::VIEWPORT,
+            self.geometries[RasterSpaceIndex::VIEWPORT.0].extent,
+        ));
+        let space = self.space_of_run(runs, run_index);
+        let space_is_animated = is_animated_space(&spaces[space.0]);
+        let mut reach = self.reach_of_run_within_its_inline_clips_in_spaces_of_their_own(runs, run_index);
+        let mut effect = self.list.run(run_index).context.effect;
+        while !effect.is_none() {
+            if self.backdrop_reader_by_effect_index[effect.0 as usize].is_some() {
+                match backdrop_read_reach_by_effect_index[effect.0 as usize] {
+                    Reach::Nothing => {}
+                    Reach::Within(read_reach) if !space_is_animated && self.space_of_effect(runs, effect) == space => {
+                        reach = reach.united(read_reach);
+                    }
+                    _ => return anywhere_in_viewport,
+                }
+            }
+            effect = self.tree.effect_nodes[effect.0 as usize].parent;
+        }
+        if reach.is_empty() {
+            return None;
+        }
+        if !space_is_animated {
+            return Some((space, reach));
+        }
+        match runs.swept_reach_in_parent_space_by_space_index[space.0] {
+            Some(swept_reach) => Some((spaces[space.0].parent_index, swept_reach)),
+            None => anywhere_in_viewport,
+        }
+    }
+
+    // Where the run reaches, as `RunGroupsPlaced::reach_of_run_by_run_index` tells, within what the inline clips of its
+    // records that apply in spaces of their own leave each record to draw, where those clips stand still in the space
+    // of the run, as a replay culls what they clip away.
+    fn reach_of_run_within_its_inline_clips_in_spaces_of_their_own(
+        &self,
+        runs: &RunGroupsPlaced,
+        run_index: usize,
+    ) -> IntRect {
+        let reach_of_run = runs.reach_of_run_by_run_index[run_index];
+        let run_group = &runs.groups[self.run_groups.group_of_run(run_index).0];
+        if reach_of_run.is_empty()
+            || run_group.moves_within_space
+            || self
+                .runs_reaching_outside
+                .inline_clip_spaces_of_run(run_index)
+                .is_empty()
+        {
+            return reach_of_run;
+        }
+        let list = self.list;
+        let context = list.run(run_index).context;
+        let geometry = &self.geometries[run_group.raster_space_index.0];
+        let world = &geometry.raster.world;
+        let Some(command_to_root) = world.draw_matrix_if_known(context.spatial) else {
+            return reach_of_run;
+        };
+        let (chunk_index, run_index_in_chunk) = list.chunk_of_run(run_index);
+        let chunk = list.chunk(chunk_index);
+        let run_in_chunk = &chunk.runs()[run_index_in_chunk];
+        let records_of_run =
+            &chunk.records()[run_in_chunk.offset as usize..(run_in_chunk.offset + run_in_chunk.size) as usize];
+        let mut reach = Reach::Nothing;
+        for_each_command(records_of_run, |header, _, payload| {
+            if header.command_type.is_compositor_metadata() {
+                return;
+            }
+            let Some(bounding_rect) = bounding_rect_computed_from_payload(header, payload) else {
+                return;
+            };
+            let mut drawn_within = bounding_rect.to_float();
+            if header.inline_clip_count != 0
+                && has_inline_clip_in_its_own_space(header, payload)
+                && let Some(OwnSpaceClipExtent::Within(part_left_by_clips)) =
+                    own_space_clip_extent(header, payload, drawn_within, command_to_root, |clip_space| {
+                        world.draw_matrix_if_known(clip_space)
+                    })
+            {
+                drawn_within = part_left_by_clips;
+            }
+            reach = reach.united(geometry.reach_of_content(&self.filters_and_clips, Some(drawn_within), context));
+        });
+        geometry.part_of_extent_reached_by(reach).intersected(reach_of_run)
+    }
+
+    // How far a backdrop reader reads past each pixel it draws, in device pixels, or none where that is not known. One
+    // that only blends reads the pixel it draws.
+    fn how_far_backdrop_reader_reads_past_each_pixel(
+        &self,
+        runs: &RunGroupsPlaced,
+        reader: EffectNodeIndex,
+    ) -> Option<i32> {
+        let Some(BackdropReader {
+            effect_with_backdrop_filter: Some(effect_with_backdrop_filter),
+        }) = &self.backdrop_reader_by_effect_index[reader.0 as usize]
+        else {
+            return Some(0);
+        };
+        let effect_node = &self.tree.effect_nodes[effect_with_backdrop_filter.0 as usize];
+        let EffectNodeData::Effects(effects) = &effect_node.data else {
+            return None;
+        };
+        let backdrop_filter = effects.backdrop_filter.as_ref()?;
+        let space = runs.groups[self.run_group_of_effect(reader).0].raster_space_index;
+        if is_animated_space(&self.tables.spaces()[space.0])
+            || self
+                .tables
+                .animation_samples_move_spatial_within_space(effect_node.spatial, space)
+        {
+            return None;
+        }
+        filter_read_reach_in_device_pixels(
+            &backdrop_filter.filter,
+            &self.geometries[space.0].raster.world.draw_matrix(effect_node.spatial),
+        )
+    }
+
     fn place_effects(
         &self,
         runs: &RunGroupsPlaced,
@@ -100641,11 +100780,15 @@ impl StackBeingBuilt<'_> {
 fn assemble_plan(
     inputs: &LayerStackInputs<'_>,
     placement: &ListPlacement,
-    swept_reach_in_parent_space_by_space_index: Vec<Option<IntRect>>,
-    tiles_hold_content_moving_within_space_by_space_index: Vec<bool>,
+    carried_into_plan: WhatPlacingCarriesIntoPlan,
     spaces: &[RasterSpace],
     layering_obstacles: &LayeringObstacles,
 ) -> Result<LayeredPlan, WhyListIsOneLayer> {
+    let WhatPlacingCarriesIntoPlan {
+        swept_reach_in_parent_space_by_space_index,
+        tiles_hold_content_moving_within_space_by_space_index,
+        reach_of_animated_content,
+    } = carried_into_plan;
     let mut stack_being_built = StackBeingBuilt {
         placement,
         spaces,
@@ -100702,6 +100845,7 @@ fn assemble_plan(
         bands,
         tiles_hold_content_moving_within_space_by_space_index,
         swept_reach_in_parent_space_by_space_index,
+        reach_of_animated_content,
     };
     if plan_holds_more_than_compositor_decodes(&plan) {
         return Err(WhyListIsOneLayer::PlanHoldsMoreThanCompositorDecodes);
@@ -100745,21 +100889,13 @@ fn contexts_sorting_planes_by_depth_hold_effects_that_read_or_are_composited(
 fn build_layer_stack(
     inputs: &LayerStackInputs<'_>,
     placement: ListPlacement,
-    swept_reach_in_parent_space_by_space_index: Vec<Option<IntRect>>,
-    tiles_hold_content_moving_within_space_by_space_index: Vec<bool>,
+    carried_into_plan: WhatPlacingCarriesIntoPlan,
     spaces: Vec<RasterSpace>,
     layering_obstacles: LayeringObstacles,
     nesting_of_live_effects: &NestingOfLiveEffects<'_>,
 ) -> PlannedLayers {
-    let stack_of_plan = assemble_plan(
-        inputs,
-        &placement,
-        swept_reach_in_parent_space_by_space_index,
-        tiles_hold_content_moving_within_space_by_space_index,
-        &spaces,
-        &layering_obstacles,
-    )
-    .and_then(|plan| {
+    let plan = assemble_plan(inputs, &placement, carried_into_plan, &spaces, &layering_obstacles);
+    let stack_of_plan = plan.and_then(|plan| {
         let stack_on_wire = StackOnWire::Layered(plan.clone());
         LayerStack::of_plan_passing_checks(
             plan,
@@ -100867,11 +101003,7 @@ fn plan_layer_stack_at_anchors(
             inputs.viewport_rect,
         );
         let spaces_of_stack = spaces.spaces().to_vec();
-        let (
-            placement,
-            swept_reach_in_parent_space_by_space_index,
-            tiles_hold_content_moving_within_space_by_space_index,
-        ) = place_list(
+        let (placement, carried_into_plan) = place_list(
             inputs,
             spaces,
             &geometries,
@@ -100881,8 +101013,7 @@ fn plan_layer_stack_at_anchors(
         build_layer_stack(
             inputs,
             placement,
-            swept_reach_in_parent_space_by_space_index,
-            tiles_hold_content_moving_within_space_by_space_index,
+            carried_into_plan,
             spaces_of_stack,
             layering_obstacles,
             &nesting_of_live_effects,
@@ -102874,6 +103005,194 @@ mod tests {
         )));
         assert_eq!(inputs.plan().stack, list.stack(&tree, &offsets(700.0, 0.0)));
     }
+
+    fn reach_in_viewport(animation_index: u32, reach: IntRect) -> AnimatedContentReach {
+        AnimatedContentReach {
+            animation_index,
+            raster_space_index: RasterSpaceIndex::VIEWPORT,
+            reach,
+        }
+    }
+
+    // Where the fill of `ELEMENT` can show in the viewport, antialiased.
+    const REACH_OF_ELEMENT: IntRect = IntRect::new(47, 47, 46, 46);
+
+    #[test]
+    fn an_opacity_animation_with_a_layer_reaches_where_its_content_shows() {
+        let (tree, list, _) = page_with_animated_element(Animated::OpacityFromOne, UnderAnimatedNode::Fill);
+        let planned = layers_planned_alike_for_every_sample(&list, &tree);
+        assert!(!planned.stack.composited_effects.is_empty());
+        assert_eq!(
+            planned.stack.reach_of_animated_content,
+            Some(vec![reach_in_viewport(0, REACH_OF_ELEMENT)])
+        );
+    }
+
+    #[test]
+    fn an_opacity_animation_without_a_layer_reaches_where_its_content_shows() {
+        let (tree, list, _) = group_with_animated_element_under_blending_element(IntRect::new(0, 0, 200, 200));
+        let planned = layers_planned_alike_for_every_sample(&list, &tree);
+        assert!(planned.stack.composited_effects.is_empty());
+        // The blending element painted after the animated one reads only the pixels it draws.
+        assert_eq!(
+            planned.stack.reach_of_animated_content,
+            Some(vec![reach_in_viewport(0, REACH_OF_ELEMENT)])
+        );
+    }
+
+    #[test]
+    fn a_translation_with_a_space_reaches_wherever_it_takes_its_content() {
+        let (tree, list, _) = page_with_animated_element(Animated::Translation, UnderAnimatedNode::Fill);
+        let planned = layers_planned_alike_for_every_sample(&list, &tree);
+        let swept_reach = planned.stack.swept_reach_in_parent_space_by_space_index[1]
+            .expect("the translated element has a space of its own");
+        assert!(swept_reach.contains_rect(ELEMENT.translated(100, 0)));
+        assert_eq!(
+            planned.stack.reach_of_animated_content,
+            Some(vec![reach_in_viewport(0, swept_reach)])
+        );
+    }
+
+    #[test]
+    fn a_rotation_refused_a_space_reaches_wherever_its_clips_let_it_show() {
+        let (mut tree, viewport) = tree_with_root_isolation_effect(1.0);
+        let spinner = transformed_context(&mut tree, viewport, FloatRect::new(50.0, 50.0, 40.0, 40.0));
+        tree.set_visual_animations(vec![spinning(spinner.spatial)]);
+        let planned = ListOfOneChunk::default()
+            .with(canvas(IntRect::new(0, 0, 200, 120), 1), viewport)
+            .with(fill(IntRect::new(50, 50, 40, 40), GREEN), spinner)
+            .planned(&tree, &[]);
+        assert_eq!(
+            planned.placement.animations_without_layers,
+            [(
+                AnimatedNode::Transform(spinner.spatial),
+                WhyAnimationHasNoLayer::ItCanShowOverAnEarlierCanvasOrVideo
+            )]
+        );
+        assert_eq!(
+            planned.stack.reach_of_animated_content,
+            Some(vec![reach_in_viewport(0, VIEWPORT)])
+        );
+    }
+
+    #[test]
+    fn animated_content_follows_inline_clips_in_spaces_of_their_own() {
+        let (mut tree, viewport) = tree_with_root_isolation_effect(1.0);
+        let scroll = scroll_node(&mut tree, VISUAL_VIEWPORT_NODE_INDEX);
+        let rotating = transformed_context(&mut tree, viewport, VIEWPORT.to_float());
+        let faded = tree.append_effect_node_under(viewport, effects(1.0, CompositingAndBlendingOperator::Normal));
+        tree.set_visual_animations(vec![
+            opacity_animation_of(faded.effect, 1.0, 0.0),
+            spinning(rotating.spatial),
+        ]);
+        let (opacity_animation, rotation) = (0, 1);
+        let can_show_in_viewport =
+            |animation_index: u32, context: ContextRef, clip_space: SpatialNodeIndex, clip_rect: IntRect| {
+                let mut list = ListOfOneChunk::default();
+                list.builder.append_with_inline_clips(
+                    &fill(VIEWPORT, GREEN),
+                    &[],
+                    context,
+                    &[
+                        crate::display_list::builder::PendingInlineClip::intersecting_float_rect(clip_rect.to_float())
+                            .in_space(clip_space),
+                    ],
+                );
+                let stack = list.stack(&tree, &[]);
+                assert!(stack.why_list_is_one_layer.is_none());
+                stack.running_animations_can_show_within(
+                    |index| index == animation_index,
+                    &stack.composite_offsets(&[]),
+                    VIEWPORT,
+                )
+            };
+
+        // An animated opacity only shows where the clip lets the draw show.
+        let box_on_screen = IntRect::new(0, 10, 10, 10);
+        let box_off_screen = IntRect::new(0, 2000, 10, 10);
+        assert!(can_show_in_viewport(opacity_animation, faded, scroll, box_on_screen));
+        assert!(!can_show_in_viewport(opacity_animation, faded, scroll, box_off_screen));
+
+        // A clip in a rotating space moves the draw it clips, though the draw's own space stands still.
+        assert!(can_show_in_viewport(
+            rotation,
+            viewport,
+            rotating.spatial,
+            box_on_screen
+        ));
+    }
+
+    #[test]
+    fn a_background_color_animation_reaches_the_whole_viewport() {
+        let (mut tree, viewport, document) = tree_with_document_scroll();
+        let animated_background = tree.append_effect(
+            EffectNodeData::BackgroundColorAnimation,
+            viewport.effect,
+            VISUAL_VIEWPORT_NODE_INDEX,
+            ClipNodeIndex::NONE,
+        );
+        let keyframe = |offset: f64, color: Color| crate::visual_animation::VisualAnimationKeyframe {
+            offset,
+            easing: crate::easing::Easing::default(),
+            value: crate::visual_animation::VisualAnimationValue::BackgroundColor(color),
+        };
+        tree.set_visual_animations(vec![animation_of(
+            crate::host::FfiVisualAnimationTargetKind::BackgroundColor,
+            animated_background.0,
+            vec![keyframe(0.0, GREEN), keyframe(1.0, Color::from_rgb(255, 0, 0))],
+        )]);
+        let box_far_below_the_viewport = crate::display_list::commands::FillRect {
+            background_color_animation_effect: animated_background,
+            ..fill(IntRect::new(100, 1500, 50, 50), GREEN)
+        };
+        let stack = ListOfOneChunk::default()
+            .with(fill(IntRect::new(0, 0, 800, 2600), GREEN), document)
+            .with(box_far_below_the_viewport, document)
+            .stack(&tree, &[]);
+        assert!(stack.why_list_is_one_layer.is_none());
+        assert_eq!(
+            stack.reach_of_animated_content,
+            Some(vec![reach_in_viewport(0, VIEWPORT)])
+        );
+    }
+
+    // An element whose opacity is animated, and a backdrop filter away from it, painted before or after it.
+    fn reach_of_fading_element_beside_frosted_glass(glass_is_painted_after_element: bool) -> IntRect {
+        let (mut tree, viewport) = tree_with_root_isolation_effect(1.0);
+        let element = tree.append_effect_node_under(viewport, effects(1.0, CompositingAndBlendingOperator::Normal));
+        tree.set_visual_animations(vec![opacity_animation_of(element.effect, 1.0, 0.0)]);
+        let glass_region = IntRect::new(300, 300, 100, 100);
+        let glass = frosted_glass(&mut tree, viewport, glass_region);
+        let mut list = ListOfOneChunk::default().with(fill(IntRect::new(0, 0, 800, 600), GREEN), viewport);
+        if glass_is_painted_after_element {
+            list = list
+                .with(fill(ELEMENT, GREEN), element)
+                .with(fill(glass_region, GREEN), glass);
+        } else {
+            list = list
+                .with(fill(glass_region, GREEN), glass)
+                .with(fill(ELEMENT, GREEN), element);
+        }
+        let stack = list.stack(&tree, &[]);
+        assert!(stack.why_list_is_one_layer.is_none());
+        let Some([animated_content]) = stack.reach_of_animated_content.as_deref() else {
+            panic!("the animation reaches one space: {:?}", stack.reach_of_animated_content);
+        };
+        assert_eq!(animated_content.raster_space_index, RasterSpaceIndex::VIEWPORT);
+        animated_content.reach
+    }
+
+    #[test]
+    fn a_backdrop_filter_painted_after_an_animation_widens_its_reach_by_how_far_it_reads() {
+        assert_eq!(reach_of_fading_element_beside_frosted_glass(false), REACH_OF_ELEMENT);
+        let widened_reach = reach_of_fading_element_beside_frosted_glass(true);
+        let widening = REACH_OF_ELEMENT.x - widened_reach.x;
+        assert!(widening > 0);
+        assert_eq!(
+            widened_reach,
+            REACH_OF_ELEMENT.inflated_edges(widening, widening, widening, widening)
+        );
+    }
 }
 
 FILE: Libraries/LibCompositing/Rust/src/display_list/layers/planning/lines_of_plan.rs
@@ -103680,6 +103999,14 @@ impl RunsReachingOutsideTheirContext {
         }
     }
 
+    /// The spaces of the inline clips of the run's records that apply in spaces of their own, one per clip, which may
+    /// name nodes the tree does not hold.
+    pub fn inline_clip_spaces_of_run(&self, run_index: usize) -> &[SpatialNodeIndex] {
+        self.inline_clip_spaces_of_runs
+            .get(&run_index)
+            .map_or(&[], |clip_spaces| clip_spaces.as_slice())
+    }
+
     /// The clips rasters of the run in `space` leave to be composited, or none where the run cannot be rastered there.
     pub fn composite_clips_of_run_in(
         &self,
@@ -104129,6 +104456,9 @@ pub(super) const MAXIMUM_NODE_COUNT_OF_RECEIVED_STACK: usize = 1 << 16;
 pub(super) const MAXIMUM_BAND_COUNT_OF_RECEIVED_STACK: usize = 1 << 16;
 pub(super) const MAXIMUM_CUT_COUNT_OF_RECEIVED_BAND: usize = 256;
 pub(super) const MAXIMUM_SPAN_COUNT_OF_RECEIVED_BAND: usize = 1 << 20;
+/// The most reaches of animated content a plan carries, one per animation and space. A plan carries none past it, and
+/// the compositor then makes a frame for every animation.
+pub(super) const MAXIMUM_ANIMATED_CONTENT_REACH_COUNT_OF_RECEIVED_STACK: usize = 1 << 14;
 /// The most canvases, videos and nested contexts that get layers where giving each one a layer cuts a band more times
 /// than the compositor decodes: the cuts a band leaves after the most carets and scroll bars that get layers.
 pub(super) const CANVAS_VIDEO_AND_NESTED_CONTEXT_LAYERS_A_BAND_LEAVES_CUTS_FOR: usize =
@@ -104329,7 +104659,12 @@ fn check_rects_and_coordinates(plan: &LayeredPlan) -> Result<(), &'static str> {
         .iter()
         .flatten()
         .all(|swept_reach| within(*swept_reach));
-    if !nodes_are_within || !layers_are_within || !swept_reaches_are_within {
+    let reaches_of_animated_content_are_within = plan
+        .reach_of_animated_content
+        .iter()
+        .flatten()
+        .all(|animated_content| within(animated_content.reach));
+    if !nodes_are_within || !layers_are_within || !swept_reaches_are_within || !reaches_of_animated_content_are_within {
         return Err("a rect or a coordinate of the stack lies past the limit a plan keeps to");
     }
     Ok(())
@@ -104350,6 +104685,23 @@ fn check_values_per_space(plan: &LayeredPlan, spaces: &[RasterSpace]) -> Result<
             });
     if !only_animated_spaces_are_swept {
         return Err("a space whose anchor the compositor does not animate has a swept reach");
+    }
+    Ok(())
+}
+
+fn check_reach_of_animated_content(
+    plan: &LayeredPlan,
+    spaces: &[RasterSpace],
+    tree: &VisualContextTree,
+) -> Result<(), &'static str> {
+    let animation_count = tree.visual_animations().len();
+    let names_animations_and_spaces_the_stack_holds =
+        plan.reach_of_animated_content.iter().flatten().all(|animated_content| {
+            (animated_content.animation_index as usize) < animation_count
+                && animated_content.raster_space_index.0 < spaces.len()
+        });
+    if !names_animations_and_spaces_the_stack_holds {
+        return Err("animated content is of an animation the tree does not hold or in a space the stack does not hold");
     }
     Ok(())
 }
@@ -104606,9 +104958,9 @@ fn check_stack_of_plan(stack: &LayerStack) -> Result<(), &'static str> {
 /// compositor animates, and no two layers share an identity.
 ///
 /// The checks leave out what can only make pixels wrong: whether reaches and composite clips hold what the records
-/// draw, which effects must be composited, which layers can hold content, whether every record is in a span, which
-/// spaces hold content that moves within them, and where the window server can show media. The list and the tree pass
-/// their own checks first.
+/// draw, whether animated content shows only where the plan says, which effects must be composited, which layers can
+/// hold content, whether every record is in a span, which spaces hold content that moves within them, and where the
+/// window server can show media. The list and the tree pass their own checks first.
 fn validated_stack(
     stack: StackOnWire,
     list: &DisplayListStorage,
@@ -104655,6 +105007,7 @@ impl LayerStack {
         check_viewport_rect(viewport_rect)?;
         check_rects_and_coordinates(&plan)?;
         check_values_per_space(&plan, &spaces)?;
+        check_reach_of_animated_content(&plan, &spaces, tree)?;
         check_nodes(&plan.nodes, &spaces, list, tree)?;
         check_nesting_of_composited_effects(&plan.nodes)?;
         check_composited_effects_nest_as_in_tree(&plan.nodes, nesting_of_live_effects)?;
@@ -104681,10 +105034,11 @@ mod tests {
     };
     use crate::display_list::layers::planning::{LayerStackInputs, PlannedLayers, plan_layer_stack};
     use crate::display_list::layers::{
-        BandIndex, BandOfPlan, CutOfPlan, CutsOfCell, LARGEST_SUMMED_READ_REACH_OF_COMPOSITED_FILTERS_IN_DEVICE_PIXELS,
-        LayerContent, LayerIdentity, LayerIndex, MAXIMUM_NESTING_OF_COMPOSITED_EFFECTS, NodeNamesFromIndices,
-        PlacementNodeBand, PlacementNodeIndex, WhatWindowServerShowsOfFrame, WhyCompositorCannotCompositeEffect,
-        WhyFrameHoldsLayer, WindowServerCompositing, WindowServerPresentationOfMedia,
+        AnimatedContentReach, BandIndex, BandOfPlan, CutOfPlan, CutsOfCell,
+        LARGEST_SUMMED_READ_REACH_OF_COMPOSITED_FILTERS_IN_DEVICE_PIXELS, LayerContent, LayerIdentity, LayerIndex,
+        MAXIMUM_NESTING_OF_COMPOSITED_EFFECTS, NodeNamesFromIndices, PlacementNodeBand, PlacementNodeIndex,
+        WhatWindowServerShowsOfFrame, WhyCompositorCannotCompositeEffect, WhyFrameHoldsLayer, WindowServerCompositing,
+        WindowServerPresentationOfMedia,
     };
     use crate::display_list::placement::{
         CompositeClip, MAXIMUM_RASTER_SPACE_COUNT, RasterSpace, RasterSpaceGeometry, WhatEverySpaceOfTreeShares,
@@ -105196,10 +105550,16 @@ mod tests {
         );
         let composited = stack_of(page_with_nested_composited_effects());
         assert_eq!(composited.composited_effects.len(), 2);
-        assert_eq!(
-            kinds_of_anchors(&stack_of(page_with_spinner())),
-            ["viewport", "animated"]
-        );
+        let spinner = stack_of(page_with_spinner());
+        assert_eq!(kinds_of_anchors(&spinner), ["viewport", "animated"]);
+        assert!(matches!(
+            spinner.reach_of_animated_content.as_deref(),
+            Some([AnimatedContentReach {
+                animation_index: 0,
+                raster_space_index: RasterSpaceIndex::VIEWPORT,
+                ..
+            }])
+        ));
         let root_page = page_with_spinner_holding_the_root_group();
         let root_effect = root_page.tree.root_isolation_effect;
         let composited_effects_of_root_page: Vec<EffectNodeIndex> = stack_of(root_page)
@@ -105592,6 +105952,25 @@ mod tests {
             Decoder::new(&bytes, []).decode::<StackOnWire>(),
             Err(DecodeError::SizeTooLarge(_))
         ));
+        let too_many_reaches_of_animated_content = MAXIMUM_ANIMATED_CONTENT_REACH_COUNT_OF_RECEIVED_STACK + 1;
+        let mut plan_with_too_many_reaches_of_animated_content = page.planned_plan();
+        plan_with_too_many_reaches_of_animated_content.reach_of_animated_content = Some(vec![
+            AnimatedContentReach {
+                animation_index: 0,
+                raster_space_index: RasterSpaceIndex::VIEWPORT,
+                reach: IntRect::new(0, 0, 1, 1),
+            };
+            too_many_reaches_of_animated_content
+        ]);
+        let mut encoder = Encoder::new();
+        encoder
+            .encode(&StackOnWire::Layered(plan_with_too_many_reaches_of_animated_content))
+            .unwrap();
+        let bytes = encoder.finish().0;
+        assert!(matches!(
+            Decoder::new(&bytes, []).decode::<StackOnWire>(),
+            Err(DecodeError::SizeTooLarge(_))
+        ));
         let plan_with_note_lines = |note_lines: Vec<String>| {
             encoded(&LayerPlan {
                 note_lines,
@@ -105888,6 +106267,33 @@ mod tests {
             ("swept reach past the limit", page_with_spinner, |plan| {
                 plan.swept_reach_in_parent_space_by_space_index[1] = Some(IntRect::new(1 << 30, 0, 1, 1));
             }),
+            ("reach of animated content past the limit", page_with_spinner, |plan| {
+                plan.reach_of_animated_content
+                    .as_mut()
+                    .expect("the spinner's plan tells where it shows")[0]
+                    .reach = IntRect::new(1 << 30, 0, 1, 1);
+            }),
+            (
+                "animated content of an animation the tree does not hold",
+                page_with_spinner,
+                |plan| {
+                    plan.reach_of_animated_content
+                        .as_mut()
+                        .expect("the spinner's plan tells where it shows")[0]
+                        .animation_index = 1;
+                },
+            ),
+            (
+                "animated content in a space the stack does not hold",
+                page_with_spinner,
+                |plan| {
+                    let raster_space_index = RasterSpaceIndex(space_count(plan));
+                    plan.reach_of_animated_content
+                        .as_mut()
+                        .expect("the spinner's plan tells where it shows")[0]
+                        .raster_space_index = raster_space_index;
+                },
+            ),
             ("a value per space missing", page_with_two_canvases, |plan| {
                 plan.tiles_hold_content_moving_within_space_by_space_index.pop();
             }),
@@ -106130,6 +106536,7 @@ mod tests {
         for band_index in (0..stack.bands.len()).map(BandIndex) {
             stack.band_has_layer_at_or_above_base_layer(band_index);
         }
+        stack.running_animations_can_show_within(|_| true, &composite_offsets, VIEWPORT);
         let mut presentation = WindowServerPresentationOfMedia::default();
         for shows_tiles_of_painted_layers in [false, true] {
             let window_server_compositing = WindowServerCompositing {
@@ -106410,7 +106817,6 @@ FILE: Libraries/LibCompositing/Rust/src/display_list/mod.rs
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-pub mod animated_content;
 pub mod animated_transform_spaces;
 pub mod builder;
 pub mod canvas_2d;
@@ -108618,12 +109024,71 @@ fn presented_scrollbar_with_colors(
     }
 }
 
-fn tile_raster_cache_key(tile_records: &[u8], tile_size: IntSize) -> u64 {
+fn tile_raster_cache_key(tile_records: &[u8], tile_size: IntSize, raster_scale: i32) -> u64 {
     let mut hasher = crate::fast_hash::fast_hasher();
     hasher.write(tile_records);
     hasher.write_i32(tile_size.width);
     hasher.write_i32(tile_size.height);
+    hasher.write_i32(raster_scale);
     hasher.finish()
+}
+
+/// The largest raster scale of content that is rastered once and shown scaled: that of frames that zoom the page most.
+const LARGEST_RASTER_SCALE: i32 = 8;
+
+/// The power of two, from 1 to `LARGEST_RASTER_SCALE`, at which a raster of content recorded at `recorded_size` and
+/// drawn at `shown_width` x `shown_height` under `canvas_matrix` has a pixel for each pixel of the canvas. Content that
+/// the canvas rotates, skews, mirrors or projects is rastered at 1.
+fn raster_scale_to_show(
+    canvas_matrix: &FloatMatrix4x4,
+    shown_width: f32,
+    shown_height: f32,
+    recorded_size: IntSize,
+) -> i32 {
+    let m = &canvas_matrix.elements;
+    if !canvas_matrix.is_2d_affine()
+        || m[0][1] != 0.0
+        || m[1][0] != 0.0
+        || !(m[0][0] > 0.0 && m[1][1] > 0.0)
+        || recorded_size.is_empty()
+    {
+        return 1;
+    }
+    let device_width = m[0][0] * shown_width;
+    let device_height = m[1][1] * shown_height;
+    // NB: The recorded size is rounded to whole pixels, so a raster one pixel smaller than the canvas shows it is not
+    //     magnified.
+    let raster_covers = |scale: i32| {
+        (recorded_size.width as f32 + 1.0) * scale as f32 >= device_width
+            && (recorded_size.height as f32 + 1.0) * scale as f32 >= device_height
+    };
+    let mut scale = 1;
+    while scale < LARGEST_RASTER_SCALE && !raster_covers(scale) {
+        scale *= 2;
+    }
+    scale
+}
+
+/// The raster scale of a repeated tile, which is rastered whole: that which shows it sharp, lowered until the raster
+/// fits in one surface of at most 16 MiB.
+fn raster_scale_of_repeated_tile(
+    canvas_matrix: &FloatMatrix4x4,
+    shown_width: f32,
+    shown_height: f32,
+    tile_size: IntSize,
+) -> i32 {
+    const LARGEST_DIMENSION: i64 = 16384;
+    const LARGEST_BYTE_SIZE: i64 = 16 * 1024 * 1024;
+    let fits = |scale: i32| {
+        let width = i64::from(tile_size.width) * i64::from(scale);
+        let height = i64::from(tile_size.height) * i64::from(scale);
+        width <= LARGEST_DIMENSION && height <= LARGEST_DIMENSION && width * height * 4 <= LARGEST_BYTE_SIZE
+    };
+    let mut scale = raster_scale_to_show(canvas_matrix, shown_width, shown_height, tile_size);
+    while scale > 1 && !fits(scale) {
+        scale /= 2;
+    }
+    scale
 }
 
 fn rasterize_tile_if_pattern<'t, Painter: ReplayPainter + ?Sized>(
@@ -108645,9 +109110,11 @@ fn rasterize_tile_if_pattern<'t, Painter: ReplayPainter + ?Sized>(
     if tile_size.is_empty() {
         return;
     }
+    // NB: The paint style maps the pattern's raster by its tile size.
     let tile = TileRaster {
         key: 0,
         size: tile_size,
+        raster_scale: 1,
         cacheable: false,
     };
     if painter.begin_tile_raster(&tile) {
@@ -108816,9 +109283,16 @@ fn play_record_resolving_frame_state<'t, Painter: ReplayPainter + ?Sized>(
                 return;
             }
             let tile_records = span_bytes(payload, command.tile);
+            let raster_scale = raster_scale_of_repeated_tile(
+                &painter.canvas_matrix(),
+                command.dst_rect.width,
+                command.dst_rect.height,
+                command.tile_size,
+            );
             let tile = TileRaster {
-                key: tile_raster_cache_key(tile_records, command.tile_size),
+                key: tile_raster_cache_key(tile_records, command.tile_size, raster_scale),
                 size: command.tile_size,
+                raster_scale,
                 cacheable: true,
             };
             if painter.begin_tile_raster(&tile) {
@@ -108852,6 +109326,12 @@ fn play_record_resolving_frame_state<'t, Painter: ReplayPainter + ?Sized>(
                 vector_image_id: command.vector_image_id.0,
                 rect: command.rect,
                 recorded_size: command.recorded_size,
+                raster_scale: raster_scale_to_show(
+                    &painter.canvas_matrix(),
+                    command.rect.width,
+                    command.rect.height,
+                    command.recorded_size,
+                ),
             };
             if painter.begin_vector_image(&placement, command.requires_direct_replay) == VectorImageReplay::Skipped {
                 return;
@@ -109093,7 +109573,7 @@ fn replay_clip_of(clip: &crate::visual_context::ClipData) -> ReplayClip {
 }
 
 // An effect keeps its filters for as long as the tree keeps its structure.
-fn layer_filter_cache_key(tree: &VisualContextTree, effect: EffectNodeIndex) -> u64 {
+pub fn layer_filter_cache_key(tree: &VisualContextTree, effect: EffectNodeIndex) -> u64 {
     let mut hasher = crate::fast_hash::fast_hasher();
     hasher.write_u64(tree.structural_epoch);
     hasher.write_u32(effect.0);
@@ -111901,6 +112381,72 @@ mod tests {
         assert!(!moves_by_whole_pixels_only(&translation_matrix(0.5, 0.0, 0.0)));
         assert!(!moves_by_whole_pixels_only(&scale_matrix(2.0, 2.0, 1.0)));
     }
+
+    fn size(width: i32, height: i32) -> IntSize {
+        IntSize { width, height }
+    }
+
+    #[test]
+    fn a_raster_at_the_scale_of_the_canvas_is_not_magnified() {
+        let at = |scale: f32| translation_matrix(10.0, 20.0, 0.0).multiplied(scale_matrix(scale, scale, 1.0));
+        // A recorded size rounded from the size the image is drawn at stays at 1.
+        assert_eq!(raster_scale_to_show(&at(1.0), 100.4, 50.0, size(100, 50)), 1);
+        assert_eq!(raster_scale_to_show(&at(1.0), 100.0, 50.0, size(100, 50)), 1);
+        assert_eq!(raster_scale_to_show(&at(0.5), 100.0, 50.0, size(100, 50)), 1);
+        assert_eq!(raster_scale_to_show(&at(2.0), 100.4, 50.0, size(100, 50)), 2);
+        assert_eq!(raster_scale_to_show(&at(3.0), 100.0, 50.0, size(100, 50)), 4);
+        assert_eq!(raster_scale_to_show(&at(4.0), 100.0, 50.0, size(100, 50)), 4);
+        assert_eq!(raster_scale_to_show(&at(8.0), 100.4, 50.0, size(100, 50)), 8);
+        assert_eq!(raster_scale_to_show(&at(32.0), 100.0, 50.0, size(100, 50)), 8);
+        // The axis that the canvas magnifies most decides.
+        assert_eq!(
+            raster_scale_to_show(&scale_matrix(1.0, 4.0, 1.0), 100.0, 50.0, size(100, 50)),
+            4
+        );
+        // Content recorded at the scale of a transform above it is drawn at that scale already.
+        assert_eq!(raster_scale_to_show(&at(2.0), 50.0, 25.0, size(100, 50)), 1);
+        assert_eq!(raster_scale_to_show(&at(4.0), 50.0, 25.0, size(100, 50)), 2);
+    }
+
+    #[test]
+    fn a_raster_that_the_canvas_does_not_only_scale_and_move_stays_at_its_recorded_size() {
+        let rotated = scale_matrix(4.0, 4.0, 1.0).multiplied(libgfx_rust::rotation_matrix(
+            [0.0, 0.0, 1.0],
+            std::f32::consts::FRAC_PI_4,
+        ));
+        assert_eq!(raster_scale_to_show(&rotated, 100.0, 50.0, size(100, 50)), 1);
+        assert_eq!(
+            raster_scale_to_show(&scale_matrix(-4.0, 4.0, 1.0), 100.0, 50.0, size(100, 50)),
+            1
+        );
+        assert_eq!(
+            raster_scale_to_show(
+                &perspective_matrix(100.0).multiplied(scale_matrix(4.0, 4.0, 1.0)),
+                100.0,
+                50.0,
+                size(100, 50)
+            ),
+            1
+        );
+        assert_eq!(
+            raster_scale_to_show(&scale_matrix(4.0, 4.0, 1.0), 100.0, 50.0, size(0, 50)),
+            1
+        );
+    }
+
+    #[test]
+    fn a_repeated_tile_is_rastered_at_a_lower_scale_where_it_would_not_fit_in_one_surface() {
+        let at_8 = scale_matrix(8.0, 8.0, 1.0);
+        assert_eq!(raster_scale_of_repeated_tile(&at_8, 16.0, 16.0, size(16, 16)), 8);
+        // 1024 x 512 is 32 MiB at 4 and 8 MiB at 2. 4096 x 1024 is 64 MiB at 2 and 16 MiB at 1.
+        assert_eq!(raster_scale_of_repeated_tile(&at_8, 1024.0, 512.0, size(1024, 512)), 2);
+        assert_eq!(
+            raster_scale_of_repeated_tile(&at_8, 4096.0, 1024.0, size(4096, 1024)),
+            1
+        );
+        // A tile wider than one surface stays at 1.
+        assert_eq!(raster_scale_of_repeated_tile(&at_8, 20000.0, 1.0, size(20000, 1)), 1);
+    }
 }
 
 FILE: Libraries/LibCompositing/Rust/src/display_list/storage.rs
@@ -114631,6 +115177,7 @@ struct ValuesOfFrameThatTilesOfBandRead {
     tree_copy_number: u64,
     raster_settings_hash_of_layers_of_band: ContentHash,
     frame_edge_backdrop_blurs_mirror_at: Option<IntRect>,
+    rect_rasters_of_space_stay_within: Option<IntRect>,
 }
 
 /// What keying the shown tiles of a band did.
@@ -115732,9 +116279,10 @@ impl<'a> TileKeyingOfRasterSpace<'a> {
     /// Keys the tiles of the layers of `band_index` within `shown_rect` that are not keyed yet: each replay item of the
     /// band that reaches a tile goes into the layer of the band its paint position falls in there, and the base layer,
     /// if it is one of the band's, holds every tile. Every tile keyed before is keyed again where the frame state that
-    /// records of the band read, the tree, the raster settings of a layer of the band, or the edge of `frame` that its
-    /// backdrop blurs mirror at changed, and those outside `kept_rect` are forgotten. `frame` is where the frame is in
-    /// the band's space, where that is not the frame's own. The band is bound to the list and the geometry of the frame.
+    /// records of the band read, the tree, the raster settings of a layer of the band, the edge of `frame` that its
+    /// backdrop blurs mirror at, or the rect that rasters of the band's space stay within changed, and those outside
+    /// `kept_rect` are forgotten. `frame` is where the frame is in the band's space, where that is not the frame's own.
+    /// The band is bound to the list and the geometry of the frame.
     ///
     /// Only the cells where the band can hold something are keyed, at most `MAXIMUM_CELLS_ONE_BAND_KEYS_IN_A_FRAME` of
     /// them, so the work and the tiles of a frame have a bound whatever rect of the space the frame shows.
@@ -115773,6 +116321,8 @@ impl<'a> TileKeyingOfRasterSpace<'a> {
         {
             raster_settings_hasher.write_content_hash(raster_settings_hash_by_layer[layer_index.0]);
         }
+        let rect_rasters_of_space_stay_within =
+            stack.rect_rasters_of_space_stay_within(stack.nodes[band.placement_node_index.0].raster_space_index);
         let values_of_frame = ValuesOfFrameThatTilesOfBandRead {
             frame_state_hash: bound_band
                 .replays_records_reading_frame_state_hashed_for_the_list
@@ -115780,6 +116330,7 @@ impl<'a> TileKeyingOfRasterSpace<'a> {
             tree_copy_number: list.tree.copy.number(),
             raster_settings_hash_of_layers_of_band: raster_settings_hasher.finish(),
             frame_edge_backdrop_blurs_mirror_at: bound_band.backdrop_reads.frame_edge_blurs_mirror_at(frame),
+            rect_rasters_of_space_stay_within,
         };
         if band_tile_keys
             .values_of_frame_tiles_were_keyed_with
@@ -115787,8 +116338,14 @@ impl<'a> TileKeyingOfRasterSpace<'a> {
             != Some(values_of_frame)
         {
             for (coord, tiles) in &mut band_tile_keys.cells {
-                counts.tiles_keyed +=
-                    self.key_tiles_of_cell(bound_band, *coord, tiles, raster_settings_hash_by_layer, frame);
+                counts.tiles_keyed += self.key_tiles_of_cell(
+                    bound_band,
+                    *coord,
+                    tiles,
+                    raster_settings_hash_by_layer,
+                    frame,
+                    rect_rasters_of_space_stay_within,
+                );
             }
         }
 
@@ -115796,8 +116353,14 @@ impl<'a> TileKeyingOfRasterSpace<'a> {
             return counts;
         }
         for (coord, mut tiles) in self.bin_new_cells(bound_band, stack, band_index, &new_coords) {
-            counts.tiles_keyed +=
-                self.key_tiles_of_cell(bound_band, coord, &mut tiles, raster_settings_hash_by_layer, frame);
+            counts.tiles_keyed += self.key_tiles_of_cell(
+                bound_band,
+                coord,
+                &mut tiles,
+                raster_settings_hash_by_layer,
+                frame,
+                rect_rasters_of_space_stay_within,
+            );
             let band_holds_something_in_cell = !tiles.is_empty();
             if band_holds_something_in_cell {
                 counts.cells_binned += 1;
@@ -115943,7 +116506,7 @@ impl<'a> TileKeyingOfRasterSpace<'a> {
     }
 
     /// Hashes the tiles of the cell at `coord`, which are keyed together with one raster margin, and returns how many it
-    /// hashed.
+    /// hashed. A raster of tiles that reads past their cell reads only what lies within `rect_rasters_stay_within`.
     fn key_tiles_of_cell(
         &self,
         bound_band: &BandBoundToListAndGeometry,
@@ -115951,13 +116514,25 @@ impl<'a> TileKeyingOfRasterSpace<'a> {
         tiles: &mut [KeyedTile],
         raster_settings_hash_by_layer: &[ContentHash],
         frame: Option<IntRect>,
+        rect_rasters_stay_within: Option<IntRect>,
     ) -> usize {
         let frame_edge_backdrop_blurs_mirror_at = bound_band
             .backdrop_reads
             .frame_edge_blurs_of_cell_mirror_at(coord.cell_rect(), frame);
-        let mut near_area = tiles
-            .first()
-            .and_then(|tile| ContentHashesNearArea::of_cell(coord, tile.raster_margin_in_device_pixels));
+        let raster_margin_of_cell = tiles.first().map(|tile| tile.raster_margin_in_device_pixels);
+        let part_of_rect_rasters_stay_within_that_tiles_of_cell_read =
+            rect_rasters_stay_within.and_then(|within| match raster_margin_of_cell? {
+                Some(0) => None,
+                Some(margin) => {
+                    Some(within.intersected(
+                        with_tile_border(coord.cell_rect()).inflated_edges(margin, margin, margin, margin),
+                    ))
+                }
+                None => Some(within),
+            });
+        let mut near_area = raster_margin_of_cell.and_then(|raster_margin_in_device_pixels| {
+            ContentHashesNearArea::of_cell(coord, raster_margin_in_device_pixels)
+        });
         for tile in tiles.iter_mut() {
             let mut hasher = ContentHasher::new();
             hasher.write_content_hash(raster_settings_hash_by_layer[tile.layer_index.0]);
@@ -115966,6 +116541,10 @@ impl<'a> TileKeyingOfRasterSpace<'a> {
             hasher.write_bool(self.list.replays_every_record_into_every_tile);
             match frame_edge_backdrop_blurs_mirror_at {
                 Some(frame) => hasher.write_int_rect(frame),
+                None => hasher.write_u32(0),
+            }
+            match part_of_rect_rasters_stay_within_that_tiles_of_cell_read {
+                Some(part) => hasher.write_int_rect(part),
                 None => hasher.write_u32(0),
             }
             for &item in &tile.replay_items_in_paint_order {
@@ -116507,6 +117086,60 @@ mod tests {
 
     fn cell_of(rect: IntRect) -> TileCoord {
         TileCoord::of_pixel(rect.x, rect.y)
+    }
+
+    // A raster of several tiles of the viewport's space stays within the viewport, so a tile whose backdrop blur reads
+    // past its cell shows the edge of the viewport where the blur reads past it.
+    #[test]
+    fn a_tile_whose_backdrop_blur_reads_past_its_cell_is_keyed_with_the_part_of_the_viewport_its_raster_reads() {
+        let (mut tree, root) = tree_with_root_isolation_effect(1.0);
+        let region_of_glass = IntRect::new(100, 450, 200, 100);
+        let glass = frosted_glass(&mut tree, root, region_of_glass);
+        let page = IntRect::new(0, 0, 1100, 700);
+        let display_list = DisplayListStorage::of_chunks(vec![
+            chunk_of(fill(page, GREEN), root),
+            chunk_of(fill(region_of_glass, BLUE), glass),
+        ])
+        .unwrap();
+        let cell_above_bottom_edge_of_glass = cell_of(region_of_glass);
+        let cell_below_bottom_edge_of_glass = TileCoord::of_pixel(region_of_glass.x, region_of_glass.bottom());
+        assert_ne!(cell_above_bottom_edge_of_glass, cell_below_bottom_edge_of_glass);
+        let tiles_of_page_within_viewport = |viewport: IntRect| {
+            let stack = LayerStack::one_layer_replaying_whole_list(
+                viewport,
+                display_list.whole_span(),
+                None,
+                LayeringObstacles::default(),
+            );
+            assert_eq!(
+                stack.rect_rasters_of_space_stay_within(RasterSpaceIndex::VIEWPORT),
+                Some(viewport)
+            );
+            let (band_tile_keys, _) = band_tile_keys_after_frames_showing(
+                (&display_list, &tree, &stack),
+                RasterSpaceIndex::VIEWPORT,
+                BandIndex(0),
+                &[page],
+            );
+            for cell_of_glass in [cell_above_bottom_edge_of_glass, cell_below_bottom_edge_of_glass] {
+                assert!(
+                    band_tile_keys
+                        .tile(cell_of_glass, stack.base_layer)
+                        .and_then(|tile| tile.raster_margin_in_device_pixels)
+                        .is_some_and(|margin| margin > 0)
+                );
+            }
+            tiles_within(&band_tile_keys, page)
+        };
+        // Only the bottom edge of the viewport moves, past the cells right of the glass too, whose tiles read nothing
+        // past their cells.
+        let tiles_within_shorter_viewport = tiles_of_page_within_viewport(IntRect::new(0, 0, 1100, 600));
+        let tiles_within_taller_viewport = tiles_of_page_within_viewport(page);
+        assert_eq!(tiles_within_shorter_viewport.len(), 4);
+        assert_eq!(
+            cells_whose_hashes_differ(&tiles_within_shorter_viewport, &tiles_within_taller_viewport),
+            [cell_below_bottom_edge_of_glass]
+        );
     }
 
     // Each sample keys every tile of the band again, and only the tile that draws a value the sample changed gets a new
@@ -123169,6 +123802,9 @@ pub struct IsolatedGroup {
 pub struct TileRaster {
     pub key: u64,
     pub size: IntSize,
+    /// How many raster pixels the tile has for each pixel of `size`: a power of two, at which the raster has a pixel
+    /// for each pixel of the canvas that shows it.
+    pub raster_scale: i32,
     pub cacheable: bool,
 }
 
@@ -123180,6 +123816,9 @@ pub struct VectorImagePlacement {
     pub vector_image_id: u64,
     pub rect: FloatRect,
     pub recorded_size: IntSize,
+    /// How many raster pixels a raster of the records has for each pixel of `recorded_size`: a power of two, at which
+    /// the raster has a pixel for each pixel of the canvas that shows it.
+    pub raster_scale: i32,
 }
 
 /// How the painter takes the records of an SVG image.
@@ -125900,8 +126539,8 @@ pub use display_list::{AsyncScrollingMetadata, DisplayList};
 pub use libgfx_rust::Orientation;
 pub use scroll_state_snapshot::{ScrollStateSnapshot, WorldTransformsCache};
 pub use visual_context_tree::{
-    AccumulatedVisualContextTree, AnimatedContentViewportEffect, ClipBehavior, IncludeVisualViewportTransform,
-    TransformWithOrigin, animated_content_may_affect_viewport, resolve_sticky_offsets,
+    AccumulatedVisualContextTree, ClipBehavior, IncludeVisualViewportTransform, TransformWithOrigin,
+    resolve_sticky_offsets,
 };
 
 pub const USER_SCROLL_SETTLE_DELAY: crate::time::Duration = crate::time::Duration::from_milliseconds(500);
@@ -127671,7 +128310,7 @@ FILE: Libraries/LibCompositing/Rust/src/scrolling/visual_context_tree.rs
 
 use super::{ContextRef, DisplayList, ScrollStateSnapshot, SpatialNodeIndex};
 use crate::visual_context::VisualContextTree;
-use libgfx_rust::{FloatPoint, FloatRect, IntRect};
+use libgfx_rust::{FloatPoint, FloatRect};
 use std::sync::Arc;
 
 pub use crate::visual_context::ffi_types::FfiVisualViewportTransform as TransformWithOrigin;
@@ -127790,43 +128429,6 @@ pub fn resolve_sticky_offsets(tree: &AccumulatedVisualContextTree, scroll_state:
     let resolved_sticky_entries = tree.0.resolve_sticky_offsets(scroll_state.device_offsets());
     for (node_index, offset) in resolved_sticky_entries {
         scroll_state.set_device_offset_for_index(node_index, offset);
-    }
-}
-
-pub struct AnimatedContentViewportEffect {
-    pub may_affect_viewport: bool,
-    // The answer holds until the scene changes: no finite animation is still running, so none can stop
-    // contributing on its own.
-    pub stable_until_scene_changes: bool,
-}
-
-impl Default for AnimatedContentViewportEffect {
-    fn default() -> Self {
-        Self {
-            may_affect_viewport: true,
-            stable_until_scene_changes: false,
-        }
-    }
-}
-
-// Whether the content the tree's animations move at the sample time can reach the viewport.
-pub fn animated_content_may_affect_viewport(
-    display_list: &DisplayList,
-    visual_context_tree: &AccumulatedVisualContextTree,
-    scroll_state: &ScrollStateSnapshot,
-    viewport_rect: IntRect,
-    sample_time_ns: i64,
-) -> AnimatedContentViewportEffect {
-    let effect = crate::display_list::animated_content::animated_content_may_affect_viewport_at(
-        &display_list.storage,
-        visual_context_tree.as_arc(),
-        scroll_state.device_offsets(),
-        viewport_rect,
-        sample_time_ns,
-    );
-    AnimatedContentViewportEffect {
-        may_affect_viewport: effect.may_affect_viewport,
-        stable_until_scene_changes: effect.stable_until_scene_changes,
     }
 }
 
@@ -129411,16 +130013,6 @@ pub struct FfiVisualAnimationSummary {
     pub local_time_at_anchor_ms_of_first: f64,
     pub share_timing_anchor: bool,
     pub targets_are_valid: bool,
-}
-
-/// Whether the content the tree's animations move can reach the viewport, and whether that answer
-/// holds until the scene changes: it does once no finite animation is still running, since none can
-/// then stop contributing on its own.
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(C)]
-pub struct FfiAnimatedContentViewportEffect {
-    pub may_affect_viewport: bool,
-    pub stable_until_scene_changes: bool,
 }
 
 FILE: Libraries/LibCompositing/Rust/src/visual_context/mod.rs
@@ -131808,7 +132400,6 @@ use super::{
     IncludeVisualViewportTransform, SpatialData, SpatialNodeIndex, StickyData, TransformDataRole,
     VISUAL_VIEWPORT_NODE_INDEX, VisualContextTree, WorldTransforms, device_offset_for_index,
 };
-use ak::math;
 use libgfx_rust::{CompositingAndBlendingOperator, FloatMatrix4x4, FloatPoint, FloatRect, IntPoint, IntRect};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132530,43 +133121,6 @@ impl VisualContextTree {
         command_runs: impl IntoIterator<Item = &'a crate::display_list::commands::DisplayListCommandRun>,
     ) -> bool {
         command_runs.into_iter().all(|run| self.context_is_valid(run.context))
-    }
-
-    /// Bounds every possible angle, rather than just the current sample: content outside the viewport now may rotate
-    /// into it later. Repeatedly enclosing rectangles also conservatively handles nested rotations.
-    pub fn rect_with_rotation_bounds_to_viewport(
-        &self,
-        mut index: SpatialNodeIndex,
-        mut rect: FloatRect,
-        rotating_nodes: &[bool],
-        scroll_offsets: &[FloatPoint],
-    ) -> Option<FloatRect> {
-        loop {
-            if rotating_nodes[index.0 as usize] {
-                let SpatialData::Transform(transform) = &self.spatial_nodes[index.0 as usize].data else {
-                    return None;
-                };
-                let origin = transform.origin;
-                let dx = (rect.x - origin.x).abs().max((rect.right() - origin.x).abs());
-                let dy = (rect.y - origin.y).abs().max((rect.bottom() - origin.y).abs());
-                let radius = math::hypot(dx, dy);
-                rect = FloatRect::new(origin.x - radius, origin.y - radius, 2.0 * radius, 2.0 * radius);
-            } else {
-                let matrix = self.local_transform(index, scroll_offsets).matrix;
-                // Projecting a rectangle at each ancestor would discard depth needed by later 3D transforms.
-                if !matrix.is_2d_affine() {
-                    return None;
-                }
-                rect = matrix.extract_2d_affine().map_rect(rect);
-            }
-            if !rect.x.is_finite() || !rect.y.is_finite() || !rect.width.is_finite() || !rect.height.is_finite() {
-                return None;
-            }
-            if index == VISUAL_VIEWPORT_NODE_INDEX {
-                return Some(rect);
-            }
-            index = self.spatial_nodes[index.0 as usize].parent;
-        }
     }
 
     pub fn spatial_nodes_in_subtrees_of(&self, roots: &[SpatialNodeIndex]) -> Vec<bool> {
@@ -135602,7 +136156,7 @@ use super::{
     SpatialNodeIndex, VisualContextTree, WorldTransforms,
 };
 use crate::filter_bytes::filter_functions_graph;
-use crate::host::{FfiVisualAnimationSummary, FfiVisualAnimationTargetKind, FfiVisualAnimationTransformOperationKind};
+use crate::host::{FfiVisualAnimationSummary, FfiVisualAnimationTargetKind};
 use crate::visual_animation::{VisualAnimation, VisualAnimationSample, VisualAnimationValue};
 use libgfx_rust::FloatPoint;
 use libgfx_rust::filter::Filter;
@@ -135668,19 +136222,6 @@ impl VisualAnimationTargets {
     fn effect(&self, effect: EffectNodeIndex) -> AnimatedEffect {
         self.effect_targets.get(effect.0 as usize).copied().unwrap_or_default()
     }
-}
-
-/// What a frame scheduler needs to bound the content the running animations move: the nodes of the
-/// animations whose swept area is bounded, sorted by how the bound is computed, and whether every
-/// running animation is one of them.
-pub struct VisualAnimationExtents {
-    /// Spatial nodes of the running animations that only rotate in the plane.
-    pub rotation_nodes: Vec<SpatialNodeIndex>,
-    /// Effect nodes of the running opacity animations, which never move content.
-    pub opacity_nodes: Vec<EffectNodeIndex>,
-    pub has_finished_animation: bool,
-    pub has_unfinished_finite_animation: bool,
-    pub all_running_animations_are_bounded: bool,
 }
 
 impl VisualContextTree {
@@ -135878,54 +136419,6 @@ impl VisualContextTree {
             .collect();
         self.spatial_nodes_in_subtrees_of(&roots)
     }
-
-    pub fn visual_animation_extents_at(&self, sample_time_ns: i64) -> VisualAnimationExtents {
-        let mut extents = VisualAnimationExtents {
-            rotation_nodes: Vec::new(),
-            opacity_nodes: Vec::new(),
-            has_finished_animation: false,
-            has_unfinished_finite_animation: false,
-            all_running_animations_are_bounded: true,
-        };
-        for animation in self.visual_animations.iter() {
-            if animation.is_finite() {
-                if animation.has_finished_at(sample_time_ns) {
-                    extents.has_finished_animation = true;
-                    continue;
-                }
-                extents.has_unfinished_finite_animation = true;
-            }
-            match animation.target_kind {
-                FfiVisualAnimationTargetKind::Opacity => extents
-                    .opacity_nodes
-                    .extend(animation.node_indices.iter().map(|&index| EffectNodeIndex(index))),
-                FfiVisualAnimationTargetKind::Transform
-                    if animation.keyframes.iter().all(only_rotates_in_the_plane) =>
-                {
-                    extents
-                        .rotation_nodes
-                        .extend(animation.node_indices.iter().map(|&index| SpatialNodeIndex(index)));
-                }
-                _ => {
-                    extents.all_running_animations_are_bounded = false;
-                    return extents;
-                }
-            }
-        }
-        extents
-    }
-}
-
-fn only_rotates_in_the_plane(keyframe: &crate::visual_animation::VisualAnimationKeyframe) -> bool {
-    match &keyframe.value {
-        VisualAnimationValue::Transform(operations) => operations.iter().all(|operation| {
-            matches!(
-                operation.kind,
-                FfiVisualAnimationTransformOperationKind::Rotate | FfiVisualAnimationTransformOperationKind::RotateZ
-            )
-        }),
-        _ => false,
-    }
 }
 
 #[cfg(test)]
@@ -135933,6 +136426,7 @@ mod tests {
     use super::*;
     use crate::animation_timing::{AnimationEffectTiming, TimeValue};
     use crate::easing::Easing;
+    use crate::host::FfiVisualAnimationTransformOperationKind;
     use crate::visual_animation::{VisualAnimationKeyframe, VisualAnimationTransformOperation};
     use crate::visual_context::{
         ClipNodeIndex, EffectsData, TransformData, TransformDataRole, VISUAL_VIEWPORT_NODE_INDEX,
@@ -136149,74 +136643,6 @@ mod tests {
 
         tree.clear_visual_animations();
         assert!(!tree.has_visual_animations());
-    }
-
-    #[test]
-    fn extents_sort_running_animations_by_how_their_content_is_bounded() {
-        let mut tree = VisualContextTree::create(transform_data(FloatMatrix4x4::identity()));
-        let rotated = tree.append_spatial(
-            SpatialData::Transform(transform_data(FloatMatrix4x4::identity())),
-            VISUAL_VIEWPORT_NODE_INDEX,
-        );
-        let effect = tree.append_effect(opacity_effect(), EffectNodeIndex::NONE, rotated, ClipNodeIndex::NONE);
-        let rotate = |angle: f32| {
-            VisualAnimationValue::Transform(vec![
-                VisualAnimationTransformOperation::new(FfiVisualAnimationTransformOperationKind::Rotate, &[angle])
-                    .unwrap(),
-            ])
-        };
-        let rotation = VisualAnimation {
-            target_kind: FfiVisualAnimationTargetKind::Transform,
-            node_indices: vec![rotated.0],
-            timing: AnimationEffectTiming {
-                iteration_duration: TimeValue::milliseconds(1000.0),
-                iteration_count: 1.0,
-                ..VisualAnimation::default().timing
-            },
-            keyframes: vec![keyframe(0.0, rotate(0.0)), keyframe(1.0, rotate(1.0))],
-            ..VisualAnimation::default()
-        };
-        let opacity = VisualAnimation {
-            target_kind: FfiVisualAnimationTargetKind::Opacity,
-            node_indices: vec![effect.0],
-            timing: AnimationEffectTiming {
-                iteration_duration: TimeValue::milliseconds(1000.0),
-                ..VisualAnimation::default().timing
-            },
-            keyframes: vec![
-                keyframe(0.0, VisualAnimationValue::Opacity(0.0)),
-                keyframe(1.0, VisualAnimationValue::Opacity(1.0)),
-            ],
-            ..VisualAnimation::default()
-        };
-        tree.set_visual_animations(vec![rotation.clone(), opacity.clone()]);
-
-        let running = tree.visual_animation_extents_at(milliseconds(500));
-        assert!(running.all_running_animations_are_bounded);
-        assert_eq!(running.rotation_nodes, vec![rotated]);
-        assert_eq!(running.opacity_nodes, vec![effect]);
-        assert!(running.has_unfinished_finite_animation);
-        assert!(!running.has_finished_animation);
-
-        let finished = tree.visual_animation_extents_at(milliseconds(1000));
-        assert!(finished.all_running_animations_are_bounded);
-        assert!(finished.rotation_nodes.is_empty());
-        assert_eq!(finished.opacity_nodes, vec![effect]);
-        assert!(!finished.has_unfinished_finite_animation);
-        assert!(finished.has_finished_animation);
-
-        tree.set_visual_animations(vec![
-            VisualAnimation {
-                keyframes: vec![keyframe(0.0, translate_x(0.0)), keyframe(1.0, translate_x(20.0))],
-                ..rotation
-            },
-            opacity,
-        ]);
-        assert!(
-            !tree
-                .visual_animation_extents_at(milliseconds(500))
-                .all_running_animations_are_bounded
-        );
     }
 }
 
@@ -136692,6 +137118,7 @@ const GL_RGB: u32 = 0x1907;
 const GL_RGBA: u32 = 0x1908;
 const GL_LUMINANCE: u32 = 0x1909;
 const GL_LUMINANCE_ALPHA: u32 = 0x190A;
+const GL_FLOAT: u32 = 0x1406;
 const GL_UNSIGNED_BYTE: u32 = 0x1401;
 const GL_UNSIGNED_SHORT_4_4_4_4: u32 = 0x8033;
 const GL_UNSIGNED_SHORT_5_5_5_1: u32 = 0x8034;
@@ -136709,6 +137136,11 @@ pub enum ExportFormat {
     RGBA4444,
     RGB888,
     RGBA8888,
+    Luminance32F,
+    LuminanceAlpha32F,
+    Alpha32F,
+    RGB32F,
+    RGBA32F,
 }
 
 pub fn texture_export_format(format: u32, r#type: u32) -> Option<ExportFormat> {
@@ -136722,6 +137154,11 @@ pub fn texture_export_format(format: u32, r#type: u32) -> Option<ExportFormat> {
         (GL_ALPHA, GL_UNSIGNED_BYTE) => ExportFormat::Alpha8,
         (GL_LUMINANCE, GL_UNSIGNED_BYTE) => ExportFormat::Luminance8,
         (GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE) => ExportFormat::LuminanceAlpha88,
+        (GL_LUMINANCE, GL_FLOAT) => ExportFormat::Luminance32F,
+        (GL_LUMINANCE_ALPHA, GL_FLOAT) => ExportFormat::LuminanceAlpha32F,
+        (GL_ALPHA, GL_FLOAT) => ExportFormat::Alpha32F,
+        (GL_RGB, GL_FLOAT) => ExportFormat::RGB32F,
+        (GL_RGBA, GL_FLOAT) => ExportFormat::RGBA32F,
         _ => return None,
     })
 }
@@ -155421,15 +155858,17 @@ struct SpawnedChildContext {
     int child_errno { 0 };
 };
 
+[[noreturn]] NO_SANITIZE_ADDRESS static void report_errno_and_exit(SpawnedChildContext& context, int error)
+{
+    context.child_errno = error;
+    _exit(127);
+}
+
 // The child shares our memory but has its own stack until exec(), while the spawning thread waits.
 // Like a vfork() child, it may only make system calls: allocating could corrupt our heap.
 NO_SANITIZE_ADDRESS static int spawned_child_main(void* argument)
 {
     auto& context = *static_cast<SpawnedChildContext*>(argument);
-    auto report_errno_and_exit = [&](int error) {
-        context.child_errno = error;
-        _exit(127);
-    };
 
     // Reset handlers before unblocking signals so they cannot touch our shared state.
     // Use raw syscalls to avoid sanitizer wrappers modifying bookkeeping in our memory.
@@ -155451,29 +155890,28 @@ NO_SANITIZE_ADDRESS static int spawned_child_main(void* argument)
 
     if (context.options.die_with_parent) {
         if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0)
-            report_errno_and_exit(errno);
+            report_errno_and_exit(context, errno);
         if (getppid() != context.parent_pid)
             _exit(127);
     }
 
     if (context.options.new_process_group && setpgid(0, 0) < 0)
-        report_errno_and_exit(errno);
+        report_errno_and_exit(context, errno);
 
     if (auto error = run_file_actions_in_child(context.options.file_actions); error.has_value())
-        report_errno_and_exit(error.value());
+        report_errno_and_exit(context, error.value());
     if (auto error = close_undeclared_descriptors(context.descriptors_to_keep); error.has_value())
-        report_errno_and_exit(error.value());
+        report_errno_and_exit(context, error.value());
 
     if (syscall(SYS_rt_sigprocmask, SIG_SETMASK, &context.child_signal_mask, nullptr, kernel_signal_set_size) < 0)
-        report_errno_and_exit(errno);
+        report_errno_and_exit(context, errno);
 
     if (context.options.search_for_executable_in_path)
         execvpe(context.options.executable.characters(), const_cast<char* const*>(context.arguments.data()), context.environment);
     else
         execve(context.options.executable.characters(), const_cast<char* const*>(context.arguments.data()), context.environment);
 
-    report_errno_and_exit(errno);
-    return 127;
+    report_errno_and_exit(context, errno);
 }
 
 // Share memory until exec(), as posix_spawn() does, to avoid fork()'s page-table copying and copy-on-write setup.
@@ -216453,7 +216891,12 @@ namespace Gfx {
     X(RGBA5551)                     \
     X(RGBA4444)                     \
     X(RGB888)                       \
-    X(RGBA8888)
+    X(RGBA8888)                     \
+    X(Luminance32F)                 \
+    X(LuminanceAlpha32F)            \
+    X(Alpha32F)                     \
+    X(RGB32F)                       \
+    X(RGBA32F)
 
 enum class ExportFormat : u8 {
 #define ENUMERATE_EXPORT_FORMAT(format) format,
@@ -220300,6 +220743,7 @@ private:
     T* m_object { nullptr };
 };
 
+using OwnedFontSet = Owned<FcFontSet, FcFontSetDestroy>;
 using OwnedPattern = Owned<FcPattern, FcPatternDestroy>;
 using OwnedCharSet = Owned<FcCharSet, FcCharSetDestroy>;
 using OwnedLangSet = Owned<FcLangSet, FcLangSetDestroy>;
@@ -220413,42 +220857,29 @@ static OwnedPattern match_font_for_family(StringView family, u16 weight, u16 wid
     return font;
 }
 
-// The font for a code point and a style, if it has the code point.
-static Optional<MatchedFile> match_file_for_code_point(u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji)
+static void prepare_code_point_pattern(FcConfig* config, FcPattern* pattern, u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji)
 {
-    auto* config = GlobalFontConfig::the().get();
-
-    OwnedPattern pattern { FcPatternCreate() };
-    add_style(pattern.get(), weight, width, slope);
+    add_style(pattern, weight, width, slope);
     OwnedCharSet char_set { FcCharSetCreate() };
     FcCharSetAddChar(char_set.get(), code_point);
-    FcPatternAddCharSet(pattern.get(), FC_CHARSET, char_set.get());
+    FcPatternAddCharSet(pattern, FC_CHARSET, char_set.get());
 
     // https://www.unicode.org/reports/tr51/#Emoji_Script
     // The script subtag Zsye asks for emoji presentation, which fontconfig gives to the color emoji fonts.
     if (prefer_color_emoji) {
         OwnedLangSet lang_set { FcLangSetCreate() };
         FcLangSetAdd(lang_set.get(), fontconfig_string("und-zsye"));
-        FcPatternAddLangSet(pattern.get(), FC_LANG, lang_set.get());
+        FcPatternAddLangSet(pattern, FC_LANG, lang_set.get());
     } else if (auto language = Unicode::likely_language_for_script_of(code_point); language.has_value()) {
         // NB: Without a language, fontconfig ranks every font that has the code point alike, and can pick one that
         //     covers every script only crudely (GNU Unifont, e.g.) over one made for the code point's script.
         OwnedLangSet lang_set { FcLangSetCreate() };
         FcLangSetAdd(lang_set.get(), fontconfig_string(language->to_byte_string().characters()));
-        FcPatternAddLangSet(pattern.get(), FC_LANG, lang_set.get());
+        FcPatternAddLangSet(pattern, FC_LANG, lang_set.get());
     }
 
-    FcConfigSubstitute(config, pattern.get(), FcMatchPattern);
-    FcDefaultSubstitute(pattern.get());
-    FcResult result;
-    OwnedPattern font { FcFontMatch(config, pattern.get(), &result) };
-    if (!font.get())
-        return {};
-
-    FcCharSet* font_char_set = nullptr;
-    if (FcPatternGetCharSet(font.get(), FC_CHARSET, 0, &font_char_set) != FcResultMatch || !FcCharSetHasChar(font_char_set, code_point))
-        return {};
-    return matched_file(font.get());
+    FcConfigSubstitute(config, pattern, FcMatchPattern);
+    FcDefaultSubstitute(pattern);
 }
 
 static Optional<SystemFontMatch> loadable_match(Optional<MatchedFile> const& file)
@@ -220474,12 +220905,50 @@ Optional<SystemFontMatch> match_family_style(StringView family, u16 weight, u16 
 
 Optional<SystemFontMatch> match_code_point(u32 code_point, u16 weight, u16 width, u8 slope, bool prefer_color_emoji)
 {
-    Optional<MatchedFile> file;
+    auto covers_code_point = [code_point](FcPattern* font) {
+        FcCharSet* char_set = nullptr;
+        return FcPatternGetCharSet(font, FC_CHARSET, 0, &char_set) == FcResultMatch && FcCharSetHasChar(char_set, code_point);
+    };
+
+    auto* config = GlobalFontConfig::the().get();
+    OwnedPattern pattern { FcPatternCreate() };
+    Optional<MatchedFile> first_file;
+    FcResult result;
+
+    // Trying the preferred face first avoids sorting the full font set when that face is usable.
     {
         MutexLocker locker(fontconfig_mutex());
-        file = match_file_for_code_point(code_point, weight, width, slope, prefer_color_emoji);
+        prepare_code_point_pattern(config, pattern.get(), code_point, weight, width, slope, prefer_color_emoji);
+        OwnedPattern first { FcFontMatch(config, pattern.get(), &result) };
+        if (first.get() && covers_code_point(first.get()))
+            first_file = matched_file(first.get());
     }
-    return loadable_match(file);
+    if (auto match = loadable_match(first_file); match.has_value())
+        return match;
+
+    // Ask Fontconfig for the untrimmed list so we can try later faces with the same coverage.
+    auto fonts = [&] {
+        MutexLocker locker(fontconfig_mutex());
+        return OwnedFontSet { FcFontSort(config, pattern.get(), FcFalse, nullptr, &result) };
+    }();
+    if (!fonts.get())
+        return {};
+    for (int i = 0; i < fonts.get()->nfont; ++i) {
+        Optional<MatchedFile> file;
+        {
+            MutexLocker locker(fontconfig_mutex());
+            auto* candidate = fonts.get()->fonts[i];
+            if (!covers_code_point(candidate))
+                continue;
+            OwnedPattern prepared { FcFontRenderPrepare(config, pattern.get(), candidate) };
+            if (!prepared.get() || !covers_code_point(prepared.get()))
+                continue;
+            file = matched_file(prepared.get());
+        }
+        if (auto match = loadable_match(file); match.has_value())
+            return match;
+    }
+    return {};
 }
 
 Optional<FlyString> resolve_generic_family(StringView family, u16 weight, u8 slope)
@@ -224455,9 +224924,9 @@ namespace Gfx {
 
 class ExifOrientedBitmap {
 public:
-    static ErrorOr<ExifOrientedBitmap> create(TIFF::Orientation orientation, IntSize size, BitmapFormat format)
+    static ErrorOr<ExifOrientedBitmap> create(TIFF::Orientation orientation, IntSize size, BitmapFormat format, AlphaType alpha_type)
     {
-        auto bitmap = TRY(Bitmap::create_shareable_with_gpu_access(format, AlphaType::Premultiplied, oriented_size(size, orientation)));
+        auto bitmap = TRY(Bitmap::create_shareable_with_gpu_access(format, alpha_type, oriented_size(size, orientation)));
         return ExifOrientedBitmap(move(bitmap), size, orientation);
     }
 
@@ -226474,7 +226943,7 @@ ErrorOr<void> PNGLoadingContext::apply_exif_orientation()
 
     for (auto& img_frame_descriptor : frame_descriptors) {
         auto& img = img_frame_descriptor.image;
-        auto oriented_bmp = TRY(ExifOrientedBitmap::create(orientation, img->size(), img->format()));
+        auto oriented_bmp = TRY(ExifOrientedBitmap::create(orientation, img->size(), img->format(), img->alpha_type()));
 
         for (int y = 0; y < img->size().height(); ++y) {
             for (int x = 0; x < img->size().width(); ++x) {
@@ -226579,6 +227048,7 @@ ErrorOr<ByteBuffer> PNGWriter::encode(Gfx::Bitmap const& bitmap, Options options
         ffi_options.cicp_video_full_range_flag = to_underlying(cicp.video_full_range_flag());
     }
     ffi_options.fast = options.compression == PNGCompression::Fast;
+    ffi_options.premultiplied = bitmap.alpha_type() == AlphaType::Premultiplied && (bitmap.format() == BitmapFormat::BGRA8888 || bitmap.format() == BitmapFormat::RGBA8888);
 
     auto is_bgra = bitmap.format() == BitmapFormat::BGRA8888 || bitmap.format() == BitmapFormat::BGRx8888;
 
@@ -239752,6 +240222,8 @@ pub struct PNGEncodeOptions {
     pub cicp_video_full_range_flag: u8,
     /// Encodes much faster, at the cost of a larger file.
     pub fast: bool,
+    /// The color values of the pixels are premultiplied by their alpha, which PNG does not store them as.
+    pub premultiplied: bool,
 }
 
 const STREAM_BUFFER_SIZE: usize = 256 * 1024;
@@ -239775,6 +240247,16 @@ impl Write for CallbackWriter {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+/// Divides the color values of an RGBA pixel by its alpha.
+fn unpremultiplied([red, green, blue, alpha]: [u8; 4]) -> [u8; 4] {
+    if alpha == 0 {
+        return [0, 0, 0, 0];
+    }
+    let alpha_value = u32::from(alpha);
+    let channel = |value: u8| u8::try_from((u32::from(value) * 255 + alpha_value / 2) / alpha_value).unwrap_or(u8::MAX);
+    [channel(red), channel(green), channel(blue), alpha]
 }
 
 /// Encodes 8-bit RGBA pixels, or BGRA pixels when `is_bgra` is set, as an RGBA PNG.
@@ -239845,9 +240327,18 @@ pub unsafe extern "C" fn png_rust_encode(
     let mut row = vec![0; row_bytes];
     for y in 0..height as usize {
         let source = &pixels[y * stride..y * stride + row_bytes];
-        let row = if is_bgra {
+        let row = if is_bgra || options.premultiplied {
             for (source, destination) in source.as_chunks::<4>().0.iter().zip(row.as_chunks_mut::<4>().0) {
-                *destination = [source[2], source[1], source[0], source[3]];
+                let pixel = if is_bgra {
+                    [source[2], source[1], source[0], source[3]]
+                } else {
+                    *source
+                };
+                *destination = if options.premultiplied {
+                    unpremultiplied(pixel)
+                } else {
+                    pixel
+                };
             }
             &row[..]
         } else {
@@ -670893,523 +671384,3 @@ impl PlainDateTimePrototype {
                 name,
                 getter,
                 None,
-                PropertyAttributes::new(Attribute::CONFIGURABLE),
-            );
-        };
-        define_getter(
-            &names.calendarId,
-            raw_native!(PlainDateTimePrototype::calendar_id_getter),
-        );
-        define_getter(&names.era, raw_native!(PlainDateTimePrototype::era_getter));
-        define_getter(&names.eraYear, raw_native!(PlainDateTimePrototype::era_year_getter));
-        define_getter(&names.year, raw_native!(PlainDateTimePrototype::year_getter));
-        define_getter(&names.month, raw_native!(PlainDateTimePrototype::month_getter));
-        define_getter(&names.monthCode, raw_native!(PlainDateTimePrototype::month_code_getter));
-        define_getter(&names.day, raw_native!(PlainDateTimePrototype::day_getter));
-        define_getter(&names.hour, raw_native!(PlainDateTimePrototype::hour_getter));
-        define_getter(&names.minute, raw_native!(PlainDateTimePrototype::minute_getter));
-        define_getter(&names.second, raw_native!(PlainDateTimePrototype::second_getter));
-        define_getter(
-            &names.millisecond,
-            raw_native!(PlainDateTimePrototype::millisecond_getter),
-        );
-        define_getter(
-            &names.microsecond,
-            raw_native!(PlainDateTimePrototype::microsecond_getter),
-        );
-        define_getter(
-            &names.nanosecond,
-            raw_native!(PlainDateTimePrototype::nanosecond_getter),
-        );
-        define_getter(
-            &names.dayOfWeek,
-            raw_native!(PlainDateTimePrototype::day_of_week_getter),
-        );
-        define_getter(
-            &names.dayOfYear,
-            raw_native!(PlainDateTimePrototype::day_of_year_getter),
-        );
-        define_getter(
-            &names.weekOfYear,
-            raw_native!(PlainDateTimePrototype::week_of_year_getter),
-        );
-        define_getter(
-            &names.yearOfWeek,
-            raw_native!(PlainDateTimePrototype::year_of_week_getter),
-        );
-        define_getter(
-            &names.daysInWeek,
-            raw_native!(PlainDateTimePrototype::days_in_week_getter),
-        );
-        define_getter(
-            &names.daysInMonth,
-            raw_native!(PlainDateTimePrototype::days_in_month_getter),
-        );
-        define_getter(
-            &names.daysInYear,
-            raw_native!(PlainDateTimePrototype::days_in_year_getter),
-        );
-        define_getter(
-            &names.monthsInYear,
-            raw_native!(PlainDateTimePrototype::months_in_year_getter),
-        );
-        define_getter(
-            &names.inLeapYear,
-            raw_native!(PlainDateTimePrototype::in_leap_year_getter),
-        );
-
-        let attr = PropertyAttributes::new(Attribute::WRITABLE | Attribute::CONFIGURABLE);
-        let define_native_function = |name: &PropertyKey, function, length| {
-            object.define_native_function(vm, realm, name, function, length, attr, None);
-        };
-        define_native_function(&names.with, raw_native!(PlainDateTimePrototype::with), 1);
-        define_native_function(
-            &names.withPlainTime,
-            raw_native!(PlainDateTimePrototype::with_plain_time),
-            0,
-        );
-        define_native_function(
-            &names.withCalendar,
-            raw_native!(PlainDateTimePrototype::with_calendar),
-            1,
-        );
-        define_native_function(&names.add, raw_native!(PlainDateTimePrototype::add), 1);
-        define_native_function(&names.subtract, raw_native!(PlainDateTimePrototype::subtract), 1);
-        define_native_function(&names.until, raw_native!(PlainDateTimePrototype::until), 1);
-        define_native_function(&names.since, raw_native!(PlainDateTimePrototype::since), 1);
-        define_native_function(&names.round, raw_native!(PlainDateTimePrototype::round), 1);
-        define_native_function(&names.equals, raw_native!(PlainDateTimePrototype::equals), 1);
-        define_native_function(&names.toString, raw_native!(PlainDateTimePrototype::to_string), 0);
-        define_native_function(
-            &names.toLocaleString,
-            raw_native!(PlainDateTimePrototype::to_locale_string),
-            0,
-        );
-        define_native_function(&names.toJSON, raw_native!(PlainDateTimePrototype::to_json), 0);
-        define_native_function(&names.valueOf, raw_native!(PlainDateTimePrototype::value_of), 0);
-        define_native_function(
-            &names.toZonedDateTime,
-            raw_native!(PlainDateTimePrototype::to_zoned_date_time),
-            1,
-        );
-        define_native_function(
-            &names.toPlainDate,
-            raw_native!(PlainDateTimePrototype::to_plain_date),
-            0,
-        );
-        define_native_function(
-            &names.toPlainTime,
-            raw_native!(PlainDateTimePrototype::to_plain_time),
-            0,
-        );
-    }
-
-    // 5.3.3 get Temporal.PlainDateTime.prototype.calendarId, https://tc39.es/proposal-temporal/#sec-get-temporal.plaindatetime.prototype.calendarid
-    fn calendar_id_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Return plainDateTime.[[Calendar]].
-        Ok(Value::from_string(PrimitiveString::create(
-            vm,
-            plain_date_time.calendar(),
-        )))
-    }
-
-    // 5.3.4 get Temporal.PlainDateTime.prototype.era, https://tc39.es/proposal-temporal/#sec-get-temporal.plaindatetime.prototype.era
-    fn era_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Return CalendarISOToDate(plainDateTime.[[Calendar]], plainDateTime.[[ISODateTime]].[[ISODate]]).[[Era]].
-        let result = calendar_date_of(&plain_date_time).era;
-
-        let Some(result) = result else {
-            return Ok(Value::UNDEFINED);
-        };
-
-        Ok(Value::from_string(PrimitiveString::create(vm, result)))
-    }
-
-    // 5.3.5 get Temporal.PlainDateTime.prototype.eraYear, https://tc39.es/proposal-temporal/#sec-get-temporal.plaindatetime.prototype.erayear
-    fn era_year_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Let result be CalendarISOToDate(plainDateTime.[[Calendar]], plainDateTime.[[ISODateTime]].[[ISODate]]).[[EraYear]].
-        let result = calendar_date_of(&plain_date_time).era_year;
-
-        // 4. If result is undefined, return undefined.
-        let Some(result) = result else {
-            return Ok(Value::UNDEFINED);
-        };
-
-        // 5. Return 𝔽(result).
-        Ok(Value::from_i32(result))
-    }
-
-    // 5.3.6 get Temporal.PlainDateTime.prototype.year, https://tc39.es/proposal-temporal/#sec-get-temporal.plaindatetime.prototype.year
-    fn year_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Return 𝔽(CalendarISOToDate(plainDateTime.[[Calendar]], plainDateTime.[[ISODateTime]].[[ISODate]]).[[Year]]).
-        Ok(Value::from_i32(calendar_date_of(&plain_date_time).year))
-    }
-
-    // 5.3.7 get Temporal.PlainDateTime.prototype.month, https://tc39.es/proposal-temporal/#sec-get-temporal.plaindatetime.prototype.month
-    fn month_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Return 𝔽(CalendarISOToDate(plainDateTime.[[Calendar]], plainDateTime.[[ISODateTime]].[[ISODate]]).[[Month]]).
-        Ok(Value::from_i32(i32::from(calendar_date_of(&plain_date_time).month)))
-    }
-
-    // 5.3.8 get Temporal.PlainDateTime.prototype.monthCode, https://tc39.es/proposal-temporal/#sec-get-temporal.plaindatetime.prototype.monthcode
-    fn month_code_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Return CalendarISOToDate(plainDateTime.[[Calendar]], plainDateTime.[[ISODateTime]].[[ISODate]]).[[MonthCode]].
-        Ok(Value::from_string(PrimitiveString::create(
-            vm,
-            calendar_date_of(&plain_date_time).month_code,
-        )))
-    }
-
-    // 5.3.9 get Temporal.PlainDateTime.prototype.day, https://tc39.es/proposal-temporal/#sec-get-temporal.plaindatetime.prototype.monthcode
-    fn day_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Return 𝔽(CalendarISOToDate(plainDateTime.[[Calendar]], plainDateTime.[[ISODateTime]].[[ISODate]]).[[Day]]).
-        Ok(Value::from_i32(i32::from(calendar_date_of(&plain_date_time).day)))
-    }
-
-    // 5.3.10 get Temporal.PlainDateTime.prototype.hour, https://tc39.es/proposal-temporal/#sec-get-temporal.plaindatetime.prototype.hour
-    fn hour_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Return 𝔽(plainDateTime.[[ISODateTime]].[[Time]].[[Hour]]).
-        Ok(Value::from_i32(i32::from(plain_date_time.iso_date_time().time.hour)))
-    }
-
-    // 5.3.11 get Temporal.PlainDateTime.prototype.minute, https://tc39.es/proposal-temporal/#sec-get-temporal.plaindatetime.prototype.minute
-    fn minute_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Return 𝔽(plainDateTime.[[ISODateTime]].[[Time]].[[Minute]]).
-        Ok(Value::from_i32(i32::from(plain_date_time.iso_date_time().time.minute)))
-    }
-
-    // 5.3.12 get Temporal.PlainDateTime.prototype.second, https://tc39.es/proposal-temporal/#sec-get-temporal.plaindatetime.prototype.second
-    fn second_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Return 𝔽(plainDateTime.[[ISODateTime]].[[Time]].[[Second]]).
-        Ok(Value::from_i32(i32::from(plain_date_time.iso_date_time().time.second)))
-    }
-
-    // 5.3.13 get Temporal.PlainDateTime.prototype.millisecond, https://tc39.es/proposal-temporal/#sec-get-temporal.plaindatetime.prototype.millisecond
-    fn millisecond_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Return 𝔽(plainDateTime.[[ISODateTime]].[[Time]].[[Millisecond]]).
-        Ok(Value::from_i32(i32::from(
-            plain_date_time.iso_date_time().time.millisecond,
-        )))
-    }
-
-    // 5.3.14 get Temporal.PlainDateTime.prototype.microsecond, https://tc39.es/proposal-temporal/#sec-get-temporal.plaindatetime.prototype.microsecond
-    fn microsecond_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Return 𝔽(plainDateTime.[[ISODateTime]].[[Time]].[[Microsecond]]).
-        Ok(Value::from_i32(i32::from(
-            plain_date_time.iso_date_time().time.microsecond,
-        )))
-    }
-
-    // 5.3.15 get Temporal.PlainDateTime.prototype.nanosecond, https://tc39.es/proposal-temporal/#sec-get-temporal.plaindatetime.prototype.nanosecond
-    fn nanosecond_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Return 𝔽(plainDateTime.[[ISODateTime]].[[Time]].[[Nanosecond]]).
-        Ok(Value::from_i32(i32::from(
-            plain_date_time.iso_date_time().time.nanosecond,
-        )))
-    }
-
-    // 5.3.16 get Temporal.PlainDateTime.prototype.dayOfWeek, https://tc39.es/proposal-temporal/#sec-get-temporal.plaindatetime.prototype.dayofweek
-    fn day_of_week_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Return 𝔽(CalendarISOToDate(plainDateTime.[[Calendar]], plainDateTime.[[ISODateTime]].[[ISODate]]).[[DayOfWeek]]).
-        Ok(Value::from_i32(i32::from(
-            calendar_date_of(&plain_date_time).day_of_week,
-        )))
-    }
-
-    // 5.3.17 get Temporal.PlainDateTime.prototype.dayOfYear, https://tc39.es/proposal-temporal/#sec-get-temporal.plaindatetime.prototype.dayofyear
-    fn day_of_year_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Return 𝔽(CalendarISOToDate(plainDateTime.[[Calendar]], plainDateTime.[[ISODateTime]].[[ISODate]]).[[DayOfYear]]).
-        Ok(Value::from_i32(i32::from(
-            calendar_date_of(&plain_date_time).day_of_year,
-        )))
-    }
-
-    // 5.3.18 get Temporal.PlainDateTime.prototype.weekOfYear, https://tc39.es/proposal-temporal/#sec-get-temporal.plaindatetime.prototype.weekofyear
-    fn week_of_year_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Let result be CalendarISOToDate(plainDateTime.[[Calendar]], plainDateTime.[[ISODateTime]].[[ISODate]]).[[WeekOfYear]].[[Week]].
-        let result = calendar_date_of(&plain_date_time).week_of_year.week;
-
-        // 4. If result is undefined, return undefined.
-        let Some(result) = result else {
-            return Ok(Value::UNDEFINED);
-        };
-
-        // 5. Return 𝔽(result).
-        Ok(Value::from_i32(i32::from(result)))
-    }
-
-    // 5.3.19 get Temporal.PlainDateTime.prototype.yearOfWeek, https://tc39.es/proposal-temporal/#sec-get-temporal.plaindatetime.prototype.yearofweek
-    fn year_of_week_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Let result be CalendarISOToDate(plainDateTime.[[Calendar]], plainDateTime.[[ISODateTime]].[[ISODate]]).[[WeekOfYear]].[[Year]].
-        let result = calendar_date_of(&plain_date_time).week_of_year.year;
-
-        // 4. If result is undefined, return undefined.
-        let Some(result) = result else {
-            return Ok(Value::UNDEFINED);
-        };
-
-        // 5. Return 𝔽(result).
-        Ok(Value::from_i32(result))
-    }
-
-    // 5.3.20 get Temporal.PlainDateTime.prototype.daysInWeek, https://tc39.es/proposal-temporal/#sec-get-temporal.plaindatetime.prototype.daysinweek
-    fn days_in_week_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Return 𝔽(CalendarISOToDate(plainDateTime.[[Calendar]], plainDateTime.[[ISODateTime]].[[ISODate]]).[[DaysInWeek]]).
-        Ok(Value::from_i32(i32::from(
-            calendar_date_of(&plain_date_time).days_in_week,
-        )))
-    }
-
-    // 5.3.21 get Temporal.PlainDateTime.prototype.daysInMonth, https://tc39.es/proposal-temporal/#sec-get-temporal.plaindatetime.prototype.daysinmonth
-    fn days_in_month_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Return 𝔽(CalendarISOToDate(plainDateTime.[[Calendar]], plainDateTime.[[ISODateTime]].[[ISODate]]).[[DaysInMonth]]).
-        Ok(Value::from_i32(i32::from(
-            calendar_date_of(&plain_date_time).days_in_month,
-        )))
-    }
-
-    // 5.3.22 get Temporal.PlainDateTime.prototype.daysInYear, https://tc39.es/proposal-temporal/#sec-get-temporal.plaindatetime.prototype.daysinyear
-    fn days_in_year_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Return 𝔽(CalendarISOToDate(plainDateTime.[[Calendar]], plainDateTime.[[ISODateTime]].[[ISODate]]).[[DaysInYear]]).
-        Ok(Value::from_i32(i32::from(
-            calendar_date_of(&plain_date_time).days_in_year,
-        )))
-    }
-
-    // 5.3.23 get Temporal.PlainDateTime.prototype.monthsInYear, https://tc39.es/proposal-temporal/#sec-get-temporal.plaindatetime.prototype.monthsinyear
-    fn months_in_year_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Return 𝔽(CalendarISOToDate(plainDateTime.[[Calendar]], plainDateTime.[[ISODateTime]].[[ISODate]]).[[MonthsInYear]]).
-        Ok(Value::from_i32(i32::from(
-            calendar_date_of(&plain_date_time).months_in_year,
-        )))
-    }
-
-    // 5.3.24 get Temporal.PlainDateTime.prototype.inLeapYear, https://tc39.es/proposal-temporal/#sec-get-temporal.plaindatetime.prototype.inleapyear
-    fn in_leap_year_getter(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Return 𝔽(CalendarISOToDate(plainDateTime.[[Calendar]], plainDateTime.[[ISODateTime]].[[ISODate]]).[[InLeapYear]]).
-        Ok(Value::from_bool(calendar_date_of(&plain_date_time).in_leap_year))
-    }
-
-    // 5.3.25 Temporal.PlainDateTime.prototype.with ( temporalDateTimeLike [ , options ] ), https://tc39.es/proposal-temporal/#sec-temporal.plaindatetime.prototype.with
-    fn with(vm: &Vm) -> ThrowCompletionOr<Value> {
-        let temporal_date_time_like = vm.argument(0);
-        let options = vm.argument(1);
-
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. If ? IsPartialTemporalObject(temporalDateTimeLike) is false, throw a TypeError exception.
-        if !is_partial_temporal_object(vm, temporal_date_time_like)? {
-            return vm.throw_completion(
-                ErrorKind::TypeError,
-                ErrorType::TemporalObjectMustBePartialTemporalObject,
-                &[],
-            );
-        }
-
-        // 4. Let calendar be plainDateTime.[[Calendar]].
-        let calendar = plain_date_time.calendar();
-        let iso_date_time = plain_date_time.iso_date_time();
-
-        // 5. Let fields be ISODateToFields(calendar, plainDateTime.[[ISODateTime]].[[ISODate]], DATE).
-        let mut fields = iso_date_to_fields(Utf16View::of_string(&calendar), iso_date_time.iso_date, DateType::Date);
-
-        // 6. Set fields.[[Hour]] to plainDateTime.[[ISODateTime]].[[Time]].[[Hour]].
-        fields.hour = Some(f64::from(iso_date_time.time.hour));
-
-        // 7. Set fields.[[Minute]] to plainDateTime.[[ISODateTime]].[[Time]].[[Minute]].
-        fields.minute = Some(f64::from(iso_date_time.time.minute));
-
-        // 8. Set fields.[[Second]] to plainDateTime.[[ISODateTime]].[[Time]].[[Second]].
-        fields.second = Some(f64::from(iso_date_time.time.second));
-
-        // 9. Set fields.[[Millisecond]] to plainDateTime.[[ISODateTime]].[[Time]].[[Millisecond]].
-        fields.millisecond = Some(f64::from(iso_date_time.time.millisecond));
-
-        // 10. Set fields.[[Microsecond]] to plainDateTime.[[ISODateTime]].[[Time]].[[Microsecond]].
-        fields.microsecond = Some(f64::from(iso_date_time.time.microsecond));
-
-        // 11. Set fields.[[Nanosecond]] to plainDateTime.[[ISODateTime]].[[Time]].[[Nanosecond]].
-        fields.nanosecond = Some(f64::from(iso_date_time.time.nanosecond));
-
-        // 12. Let partialDateTime be ? PrepareCalendarFields(calendar, temporalDateTimeLike, « YEAR, MONTH, MONTH-CODE, DAY », « HOUR, MINUTE, SECOND, MILLISECOND, MICROSECOND, NANOSECOND », PARTIAL).
-        const CALENDAR_FIELD_NAMES: [CalendarField; 4] = [
-            CalendarField::Year,
-            CalendarField::Month,
-            CalendarField::MonthCode,
-            CalendarField::Day,
-        ];
-        const NON_CALENDAR_FIELD_NAMES: [CalendarField; 6] = [
-            CalendarField::Hour,
-            CalendarField::Minute,
-            CalendarField::Second,
-            CalendarField::Millisecond,
-            CalendarField::Microsecond,
-            CalendarField::Nanosecond,
-        ];
-        let partial_date_time = prepare_calendar_fields(
-            vm,
-            Utf16View::of_string(&calendar),
-            &temporal_date_time_like.as_object(),
-            &CALENDAR_FIELD_NAMES,
-            &NON_CALENDAR_FIELD_NAMES,
-            CalendarFieldListOrPartial::Partial,
-        )?;
-
-        // 13. Set fields to CalendarMergeFields(calendar, fields, partialDateTime).
-        let mut fields = calendar_merge_fields(Utf16View::of_string(&calendar), &fields, &partial_date_time);
-
-        // 14. Let resolvedOptions be ? GetOptionsObject(options).
-        let resolved_options = get_options_object(vm, options)?;
-
-        // 15. Let overflow be ? GetTemporalOverflowOption(resolvedOptions).
-        let overflow = get_temporal_overflow_option(vm, &resolved_options)?;
-
-        // 16. Let result be ? InterpretTemporalDateTimeFields(calendar, fields, overflow).
-        let result = interpret_temporal_date_time_fields(vm, Utf16View::of_string(&calendar), &mut fields, overflow)?;
-
-        // 17. Return ? CreateTemporalDateTime(result, calendar).
-        Ok(Value::from_object(create_temporal_date_time(
-            vm, &result, calendar, None,
-        )?))
-    }
-
-    // 5.3.26 Temporal.PlainDateTime.prototype.withPlainTime ( [ plainTimeLike ] ), https://tc39.es/proposal-temporal/#sec-temporal.plaindatetime.prototype.withplaintime
-    fn with_plain_time(vm: &Vm) -> ThrowCompletionOr<Value> {
-        let plain_time_like = vm.argument(0);
-
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Let time be ? ToTimeRecordOrMidnight(plainTimeLike).
-        let time = to_time_record_or_midnight(vm, plain_time_like)?;
-
-        // 4. Let isoDateTime be CombineISODateAndTimeRecord(plainDateTime.[[ISODateTime]].[[ISODate]], time).
-        let iso_date_time = combine_iso_date_and_time_record(plain_date_time.iso_date_time().iso_date, time);
-
-        // 5. Return ? CreateTemporalDateTime(isoDateTime, plainDateTime.[[Calendar]]).
-        Ok(Value::from_object(create_temporal_date_time(
-            vm,
-            &iso_date_time,
-            plain_date_time.calendar(),
-            None,
-        )?))
-    }
-
-    // 5.3.27 Temporal.PlainDateTime.prototype.withCalendar ( calendarLike ), https://tc39.es/proposal-temporal/#sec-temporal.plaindatetime.prototype.withcalendar
-    fn with_calendar(vm: &Vm) -> ThrowCompletionOr<Value> {
-        let calendar_like = vm.argument(0);
-
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
-        let plain_date_time = typed_this_plain_date_time(vm)?;
-
-        // 3. Let calendar be ? ToTemporalCalendarIdentifier(calendarLike).
-        let calendar = to_temporal_calendar_identifier(vm, calendar_like)?;
-
-        // 4. Return ! CreateTemporalDateTime(plainDateTime.[[ISODateTime]], calendar).
-        Ok(Value::from_object(create_temporal_date_time(
-            vm,
-            &plain_date_time.iso_date_time(),
-            calendar,
-            None,
-        )?))
-    }
-
-    // 5.3.28 Temporal.PlainDateTime.prototype.add ( temporalDurationLike [ , options ] ), https://tc39.es/proposal-temporal/#sec-temporal.plaindatetime.prototype.add
-    fn add(vm: &Vm) -> ThrowCompletionOr<Value> {
-        let temporal_duration_like = vm.argument(0);
-        let options = vm.argument(1);
-
-        // 1. Let plainDateTime be the this value.
-        // 2. Perform ? RequireInternalSlot(plainDateTime, [[InitializedTemporalDateTime]]).
