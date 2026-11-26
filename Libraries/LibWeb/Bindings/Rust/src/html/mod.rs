@@ -16,6 +16,8 @@ pub(crate) mod predefined_color_space;
 
 // What follows runs on the JS runtime, which the tests of the crate do not link.
 #[cfg(not(test))]
+pub(crate) mod bar_prop;
+#[cfg(not(test))]
 pub(crate) mod before_unload_event;
 #[cfg(not(test))]
 pub(crate) mod broadcast_channel;
@@ -90,13 +92,23 @@ pub(crate) mod image_bitmap_rendering_context;
 #[cfg(not(test))]
 pub(crate) mod image_data;
 #[cfg(not(test))]
+pub(crate) mod media_error;
+#[cfg(not(test))]
 pub(crate) mod message_channel;
 #[cfg(not(test))]
 pub(crate) mod message_event;
 #[cfg(not(test))]
 pub(crate) mod message_port;
 #[cfg(not(test))]
+pub(crate) mod mime_type;
+#[cfg(not(test))]
+pub(crate) mod mime_type_array;
+#[cfg(not(test))]
 pub(crate) mod navigable;
+#[cfg(not(test))]
+pub(crate) mod navigation_current_entry_change_event;
+#[cfg(not(test))]
+pub(crate) mod navigation_type;
 #[cfg(not(test))]
 pub(crate) mod navigator;
 #[cfg(not(test))]
@@ -111,6 +123,10 @@ pub(crate) mod page_swap_event;
 pub(crate) mod page_transition_event;
 #[cfg(not(test))]
 pub(crate) mod path2d;
+#[cfg(not(test))]
+pub(crate) mod plugin;
+#[cfg(not(test))]
+pub(crate) mod plugin_array;
 #[cfg(not(test))]
 pub(crate) mod pop_state_event;
 #[cfg(not(test))]
@@ -137,6 +153,8 @@ pub(crate) mod text_track_cue;
 pub(crate) mod toggle_event;
 #[cfg(not(test))]
 pub(crate) mod track_event;
+#[cfg(not(test))]
+pub(crate) mod video_playback_quality;
 #[cfg(not(test))]
 pub(crate) mod visibility_state;
 #[cfg(not(test))]

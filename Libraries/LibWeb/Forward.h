@@ -773,7 +773,6 @@ class Location;
 class MediaError;
 class MediaStreamPlayback;
 class MessagePort;
-class MimeType;
 class MimeTypeArray;
 class ModuleMap;
 class Navigable;
@@ -782,7 +781,6 @@ class NavigateEvent;
 class Navigation;
 struct NavigationAPIMethodTracker;
 class NavigationActivation;
-class NavigationCurrentEntryChangeEvent;
 class NavigationDestination;
 class NavigationHistoryEntry;
 class NavigationObserver;
@@ -790,7 +788,6 @@ class NavigationTransition;
 class Navigator;
 class OffscreenCanvas;
 class OffscreenCanvasRenderingContext2D;
-class Plugin;
 class PluginArray;
 class PopoverTargetAttributes;
 class PreloadEntry;
@@ -1141,7 +1138,6 @@ class SVGTitleElement;
 class SVGTransformList;
 class SVGUseElement;
 class SVGViewElement;
-class TimeEvent;
 
 }
 

@@ -414,6 +414,31 @@ static GC::Ptr<DOM::Element const> link_reached_by_click(DOM::Node const& click_
     return nullptr;
 }
 
+static bool press_opens_context_menu(u32 button, [[maybe_unused]] u32 modifiers)
+{
+    if (button == UIEvents::MouseButton::Secondary)
+        return true;
+#if defined(AK_OS_MACOS)
+    if (button == UIEvents::MouseButton::Primary && (modifiers & UIEvents::KeyModifier::Mod_Ctrl) != 0)
+        return true;
+#endif
+    return false;
+}
+
+// NB: Pressing a range input with the primary button starts dragging its thumb, unless the press opens the context
+//     menu.
+static void start_slider_drag_for_press(DOM::Node& pressed_node, CSSPixels client_x, u32 button, u32 modifiers)
+{
+    if (button != UIEvents::MouseButton::Primary || press_opens_context_menu(button, modifiers))
+        return;
+    for (auto* ancestor = &pressed_node; ancestor; ancestor = ancestor->parent_or_shadow_host()) {
+        if (auto* input = as_if<HTML::HTMLInputElement>(*ancestor)) {
+            input->start_slider_drag(client_x.to_double());
+            return;
+        }
+    }
+}
+
 EventResult EventHandler::handle_mousedown(CSSPixelPoint visual_viewport_position, CSSPixelPoint screen_position, u32 button, u32 buttons, u32 modifiers, int click_count, Optional<Web::ScrollbarDraggedByCompositor> const& scrollbar_dragged_by_compositor, Optional<RemoteInputEventTarget>* remote_target)
 {
     if (should_ignore_device_input_event())
@@ -509,12 +534,10 @@ EventResult EventHandler::handle_mousedown(CSSPixelPoint visual_viewport_positio
     m_mousedown_visual_viewport_position = visual_viewport_position;
 
     auto coordinates = compute_mouse_event_coordinates(visual_viewport_position, viewport_position, *layout_node);
-    auto dispatch_result = dispatch_a_pointer_event_for_a_device_that_supports_hover(read, PointerEventType::PointerDown, *node, chrome_widget, coordinates, screen_position, {}, button, buttons, modifiers, click_count).result;
+    auto dispatched_pointer_down = dispatch_a_pointer_event_for_a_device_that_supports_hover(read, PointerEventType::PointerDown, *node, chrome_widget, coordinates, screen_position, {}, button, buttons, modifiers, click_count);
+    auto dispatch_result = dispatched_pointer_down.result;
 
-    bool is_context_menu_trigger = button == UIEvents::MouseButton::Secondary;
-#if defined(AK_OS_MACOS)
-    is_context_menu_trigger |= button == UIEvents::MouseButton::Primary && (modifiers & UIEvents::KeyModifier::Mod_Ctrl) != 0;
-#endif
+    auto is_context_menu_trigger = press_opens_context_menu(button, modifiers);
 
     if (is_context_menu_trigger && dispatch_result == PointerEventDispatchResult::RunDefaultActions && !pressed_on_chrome) {
         // Focus the clicked control before dispatching contextmenu so the menu acts on that control.
@@ -553,6 +576,14 @@ EventResult EventHandler::handle_mousedown(CSSPixelPoint visual_viewport_positio
     // NB: Dispatching an event may have disturbed the world.
     if (m_navigable->active_document() != document)
         return EventResult::Accepted;
+
+    if (!pressed_on_chrome) {
+        auto& pressed_node = dispatched_pointer_down.pointer_capture_target ? *dispatched_pointer_down.pointer_capture_target : *node;
+        start_slider_drag_for_press(pressed_node, coordinates.viewport_position.x(), button, modifiers);
+        if (m_navigable->active_document() != document)
+            return EventResult::Accepted;
+    }
+
     document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseDown);
     if (!has_committed_root_box())
         return EventResult::Accepted;
@@ -2062,6 +2093,7 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
     GC::Root<DOM::Document> native_command_document;
     if (native_editing_binding_resolved)
         native_command_document = m_navigable->active_document();
+    GC::Ptr<DOM::Node> focused_area_before_keydown = m_navigable->active_document()->focused_area();
     auto dispatch_result = fire_keyboard_event(UIEvents::EventNames::keydown, m_navigable, key, modifiers, code_point, repeat);
     if (dispatch_result != EventResult::Accepted) {
         // A page that handles Tab or Escape itself gets the key, and the writing suggestion is dropped.
@@ -2117,6 +2149,10 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
         if (input->handle_date_time_field_key(key, modifiers & ~UIEvents::Mod_Keypad, code_point))
             return EventResult::Handled;
     }
+
+    // AD-HOC: Like in other engines, the arrow and page keys step the value of a range input.
+    if (auto* input = as_if<HTML::HTMLInputElement>(document->focused_area().ptr()); input && input == focused_area_before_keydown.ptr() && input->handle_range_key(key, modifiers & ~UIEvents::Mod_Keypad))
+        return EventResult::Handled;
 
     if (!(modifiers & UIEvents::KeyModifier::Mod_Ctrl)) {
         if (key == UIEvents::KeyCode::Key_Tab)
@@ -2666,7 +2702,6 @@ static bool fire_clipboard_event(DOM::Document& document, Utf16FlyString const& 
     event_init.composed = true;
 
     auto event = Clipboard::create_clipboard_event(HTML::relevant_realm(document), event_name, event_init, data_transfer);
-    event->set_is_trusted(true);
     return target->dispatch_event(event);
 }
 
@@ -3311,6 +3346,7 @@ EventResult EventHandler::fire_text_input_event(HTML::LocalNavigable& navigable,
         auto event = UIEvents::TextEvent::create(Utf16FlyString { UIEvents::EventNames::textInput }, HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(*document)));
         event->init_text_event(UIEvents::EventNames::textInput, true, true, navigable.active_window_proxy(), data);
         event->set_composed(true);
+        // NB: init_text_event() initializes isTrusted to false.
         event->set_is_trusted(true);
         return focused_area->dispatch_event(event) ? EventResult::Accepted : EventResult::Cancelled;
     }
@@ -3708,7 +3744,6 @@ bool EventHandler::dispatch_selectstart_event(DOM::Document& document, DOM::Node
     auto event = DOM::Event::create(HTML::EventNames::selectstart, HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(document)));
     event->set_bubbles(true);
     event->set_cancelable(true);
-    event->set_is_trusted(true);
 
     // If the event is canceled, the user agent must not change the selection.
     if (!target.dispatch_event(event))
@@ -4934,7 +4969,7 @@ GC::Ref<UIEvents::PointerEvent> EventHandler::create_pointer_event(PointerState&
     options.bubbles = true;
     options.cancelable = true;
     options.composed = true;
-    auto event = UIEvents::PointerEvent::create_trusted(name, move(options), coordinates.page_offset.x().to_double(), coordinates.page_offset.y().to_double(), coordinates.offset.x().to_double(), coordinates.offset.y().to_double(), HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(target)));
+    auto event = UIEvents::PointerEvent::create_with_coalesced_events(name, move(options), coordinates.page_offset.x().to_double(), coordinates.page_offset.y().to_double(), coordinates.offset.x().to_double(), coordinates.offset.y().to_double(), HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(target)));
     pointer.last_event = PointerEventSnapshot {
         .position = { coordinates, screen_position },
         .properties = pointer.properties,
@@ -5066,7 +5101,6 @@ bool EventHandler::dispatch_touch_event(PointerState& pointer, DOM::Node& target
         event->set_cancelable(has_non_passive_listener);
     }
 
-    event->set_is_trusted(true);
     return original_target->dispatch_event(event);
 }
 
@@ -5477,6 +5511,9 @@ EventResult EventHandler::handle_pointer_event(Web::MouseEvent const& input, CSS
                 if (m_navigable->active_document() != document)
                     return EventResult::Handled;
                 if (allowed) {
+                    start_slider_drag_for_press(*mouse_target, mouse_coordinates.viewport_position.x(), UIEvents::MouseButton::Primary, pointer.modifiers);
+                    if (m_navigable->active_document() != document)
+                        return EventResult::Handled;
                     document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseDown);
                     if (auto focus_target = focus_candidate_for_position(read, visual_viewport_position))
                         HTML::run_focusing_steps(focus_target, nullptr, HTML::FocusTrigger::Click);
@@ -5493,6 +5530,9 @@ EventResult EventHandler::handle_pointer_event(Web::MouseEvent const& input, CSS
             if (m_navigable->active_document() != document)
                 return EventResult::Handled;
             if (allowed && mouse_name == UIEvents::EventNames::mousedown) {
+                start_slider_drag_for_press(*mouse_target, mouse_coordinates.viewport_position.x(), input.button, pointer.modifiers);
+                if (m_navigable->active_document() != document)
+                    return EventResult::Handled;
                 document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseDown);
                 if (auto focus_target = focus_candidate_for_position(read, visual_viewport_position))
                     HTML::run_focusing_steps(focus_target, nullptr, HTML::FocusTrigger::Click);

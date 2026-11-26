@@ -349,6 +349,16 @@ pub(crate) mod platform;
     clippy::unnecessary_wraps,
     reason = "the bindings call every attribute and operation as one that can throw"
 )]
+pub(crate) mod request_idle_callback;
+#[cfg(not(test))]
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every attribute and operation as one that can throw"
+)]
 pub(crate) mod resource_timing;
 #[cfg_attr(
     not(web_idl_bindings),
@@ -382,6 +392,16 @@ pub(crate) mod storage_api;
     reason = "the bindings call every attribute and operation as one that can throw"
 )]
 pub(crate) mod streams;
+#[cfg(not(test))]
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every attribute and operation as one that can throw"
+)]
+pub(crate) mod svg;
 #[cfg(not(test))]
 #[cfg_attr(
     not(web_idl_bindings),

@@ -210,14 +210,12 @@ Optional<Core::ImmutableBytes> FetchByteChannel::whole_body() const
     return m_whole_body;
 }
 
-bool FetchByteChannel::set_delivery_id_unless_closed(DeliveryId delivery_id)
+void FetchByteChannel::set_delivery_id_unless_closed(DeliveryId delivery_id)
 {
     MutexLocker locker { m_mutex };
     VERIFY(!m_delivery_id.has_value());
-    if (m_state.has<Closed>())
-        return false;
-    m_delivery_id = delivery_id;
-    return true;
+    if (!m_state.has<Closed>())
+        m_delivery_id = delivery_id;
 }
 
 Optional<DeliveryId> FetchByteChannel::delivery_id() const
@@ -248,12 +246,6 @@ FetchByteChannel::TerminateResult FetchByteChannel::cancel()
     }
     dispatch(notifications);
     return result;
-}
-
-bool FetchByteChannel::can_be_read_to_its_end() const
-{
-    MutexLocker locker { m_mutex };
-    return !m_state.has<ConsumerCancelled>() && !m_state.has<Transferred>();
 }
 
 Vector<Core::ImmutableBytes> FetchByteChannel::transfer_out()

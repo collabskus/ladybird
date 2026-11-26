@@ -375,8 +375,6 @@ void Window::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_animation_frame_callback_driver);
     visitor.visit(m_idle_request_callbacks);
     visitor.visit(m_runnable_idle_callbacks);
-    visitor.visit(m_pdf_viewer_plugin_objects);
-    visitor.visit(m_pdf_viewer_mime_type_objects);
     visitor.visit(m_close_watcher_manager);
     visitor.visit(m_cookie_store);
     visitor.visit(m_speech_synthesis);
@@ -1118,51 +1116,6 @@ GC::Ptr<LocalNavigable> Window::navigable() const
     return m_associated_document->navigable();
 }
 
-// https://html.spec.whatwg.org/multipage/system-state.html#pdf-viewer-plugin-objects
-ReadonlySpan<GC::Ref<Plugin>> Window::pdf_viewer_plugin_objects()
-{
-    // Each Window object has a PDF viewer plugin objects list. If the user agent's PDF viewer supported is false, then it is the empty list.
-    // Otherwise, it is a list containing five Plugin objects, whose names are, respectively:
-    // 0.   "PDF Viewer"
-    // 1.   "Chrome PDF Viewer"
-    // 2.   "Chromium PDF Viewer"
-    // 3.   "Microsoft Edge PDF Viewer"
-    // 4.   "WebKit built-in PDF"
-    // The values of the above list form the PDF viewer plugin names list. https://html.spec.whatwg.org/multipage/system-state.html#pdf-viewer-plugin-names
-    if (!page().pdf_viewer_supported())
-        return {};
-
-    if (m_pdf_viewer_plugin_objects.is_empty()) {
-        // FIXME: Propagate errors.
-        m_pdf_viewer_plugin_objects.append(Plugin::create(*this, "PDF Viewer"_string));
-        m_pdf_viewer_plugin_objects.append(Plugin::create(*this, "Chrome PDF Viewer"_string));
-        m_pdf_viewer_plugin_objects.append(Plugin::create(*this, "Chromium PDF Viewer"_string));
-        m_pdf_viewer_plugin_objects.append(Plugin::create(*this, "Microsoft Edge PDF Viewer"_string));
-        m_pdf_viewer_plugin_objects.append(Plugin::create(*this, "WebKit built-in PDF"_string));
-    }
-
-    return m_pdf_viewer_plugin_objects;
-}
-
-// https://html.spec.whatwg.org/multipage/system-state.html#pdf-viewer-mime-type-objects
-ReadonlySpan<GC::Ref<MimeType>> Window::pdf_viewer_mime_type_objects()
-{
-    // Each Window object has a PDF viewer mime type objects list. If the user agent's PDF viewer supported is false, then it is the empty list.
-    // Otherwise, it is a list containing two MimeType objects, whose types are, respectively:
-    // 0.   "application/pdf"
-    // 1.   "text/pdf"
-    // The values of the above list form the PDF viewer mime types list. https://html.spec.whatwg.org/multipage/system-state.html#pdf-viewer-mime-types
-    if (!page().pdf_viewer_supported())
-        return {};
-
-    if (m_pdf_viewer_mime_type_objects.is_empty()) {
-        m_pdf_viewer_mime_type_objects.append(MimeType::create(*this, "application/pdf"_string));
-        m_pdf_viewer_mime_type_objects.append(MimeType::create(*this, "text/pdf"_string));
-    }
-
-    return m_pdf_viewer_mime_type_objects;
-}
-
 static bool s_test_mode = false;
 
 bool Window::in_test_mode()
@@ -1376,7 +1329,7 @@ void Window::blur()
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-locationbar
-GC::Ref<BarProp const> Window::locationbar()
+GC::Ref<BarProp> Window::locationbar()
 {
     if (!m_locationbar)
         m_locationbar = BarProp::create(*this);
@@ -1385,7 +1338,7 @@ GC::Ref<BarProp const> Window::locationbar()
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-menubar
-GC::Ref<BarProp const> Window::menubar()
+GC::Ref<BarProp> Window::menubar()
 {
     if (!m_menubar)
         m_menubar = BarProp::create(*this);
@@ -1394,7 +1347,7 @@ GC::Ref<BarProp const> Window::menubar()
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-personalbar
-GC::Ref<BarProp const> Window::personalbar()
+GC::Ref<BarProp> Window::personalbar()
 {
     if (!m_personalbar)
         m_personalbar = BarProp::create(*this);
@@ -1403,7 +1356,7 @@ GC::Ref<BarProp const> Window::personalbar()
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-scrollbars
-GC::Ref<BarProp const> Window::scrollbars()
+GC::Ref<BarProp> Window::scrollbars()
 {
     if (!m_scrollbars)
         m_scrollbars = BarProp::create(*this);
@@ -1412,7 +1365,7 @@ GC::Ref<BarProp const> Window::scrollbars()
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-statusbar
-GC::Ref<BarProp const> Window::statusbar()
+GC::Ref<BarProp> Window::statusbar()
 {
     if (!m_statusbar)
         m_statusbar = BarProp::create(*this);
@@ -1421,7 +1374,7 @@ GC::Ref<BarProp const> Window::statusbar()
 }
 
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-toolbar
-GC::Ref<BarProp const> Window::toolbar()
+GC::Ref<BarProp> Window::toolbar()
 {
     if (!m_toolbar)
         m_toolbar = BarProp::create(*this);

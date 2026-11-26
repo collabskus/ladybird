@@ -66,7 +66,8 @@ pub(crate) struct AudioContext {
     context: BaseAudioContext,
     base_latency: f64,
     output_latency: f64,
-    allowed_to_start: bool,
+    // FIXME: Reject these promises with InvalidStateError when the document unloads.
+    // https://webaudio.github.io/web-audio-api/#unloading-a-document
     pending_resume_promises: GcRefCell<Vec<WebIdlPromise>>,
     suspended_by_user: Cell<bool>,
     #[gc(untraced)]
@@ -103,6 +104,7 @@ impl GetTheParent for AudioContext {
 }
 
 unsafe extern "C" {
+    fn web_audio_context_is_allowed_to_start(global: *mut c_void) -> bool;
     fn web_audio_output_factory_create(global: *mut c_void) -> FfiSharedCppObject;
     fn web_audio_realtime_context_performance_now(global: *mut c_void) -> f64;
 }
@@ -158,7 +160,6 @@ impl AudioContext {
             context: BaseAudioContext::new(defer_gc, global, 0.),
             base_latency: 0.,
             output_latency: 0.,
-            allowed_to_start: true,
             pending_resume_promises: GcRefCell::new(Vec::new()),
             suspended_by_user: Cell::new(false),
             renderer: RefCell::new(None),
@@ -210,26 +211,14 @@ impl AudioContext {
         }
 
         // 11. If context is allowed to start, send a control message to start processing.
-        // FIXME: The context is currently always allowed to start; this should be gated on sticky activation.
-        if context.allowed_to_start {
+        if context.allowed_to_start() {
+            // AD-HOC: Record startup now so a source started before the statechange task cannot request it again.
+            context.context.set_control_state(AudioContextState::Running);
+
             // FIXME: 1. Let document be the current settings object's relevant global object's associated Document.
             // 2. Attempt to acquire system resources to use a following audio output device based on [[sink ID]] for
             //    rendering.
-            let factory = unsafe { web_audio_output_factory_create(context.context.global_event_target().as_ptr()) };
-            let renderer = RealtimeAudioRenderer::new(
-                Arc::clone(context.context.control_message_queue()),
-                context.context.destination_value().parent().node_id(),
-                context.context.sample_rate_value(),
-                BaseAudioContext::RENDER_QUANTUM_SIZE as usize,
-                SharedCppObject {
-                    pointer: factory.pointer,
-                    retain: factory.retain,
-                    release: factory.release,
-                },
-            );
-            *context.renderer.borrow_mut() = Some(Arc::clone(&renderer));
-            context.set_renderer_client(cx.vm());
-            renderer.start_rendering();
+            context.start_rendering_audio_graph(cx.vm());
 
             // 2. Set this [[rendering thread state]] to running on the AudioContext.
             context.context.set_rendering_state(AudioContextState::Running);
@@ -303,6 +292,13 @@ impl AudioContext {
         })
     }
 
+    // https://webaudio.github.io/web-audio-api/#allowed-to-start
+    pub(crate) fn allowed_to_start(&self) -> bool {
+        // NB: Autoplay permission governs the first start of this context.
+        self.renderer.borrow().is_some()
+            || unsafe { web_audio_context_is_allowed_to_start(self.context.global_event_target().as_ptr()) }
+    }
+
     // https://webaudio.github.io/web-audio-api/#dom-audiocontext-resume
     pub(crate) fn resume(&self, cx: &mut CallContext, promise: WebIdlPromise) -> WebIdlResult<()> {
         // 1. If this’s relevant global object’s associated Document is not fully active then return a promise rejected with "InvalidStateError" DOMException.
@@ -340,7 +336,7 @@ impl AudioContext {
         // FIXME: 5.2. Reject the promise with InvalidStateError, abort these steps, returning promise.
 
         // 6. If the context is not allowed to start, append promise to [[pending promises]] and [[pending resume promises]] and abort these steps, returning promise.
-        if !self.allowed_to_start {
+        if !self.allowed_to_start() {
             self.context.pending_promises.borrow_mut(cx.vm()).push(promise);
             self.pending_resume_promises.borrow_mut(cx.vm()).push(promise);
             return Ok(());
@@ -350,26 +346,41 @@ impl AudioContext {
         self.context.set_control_state(AudioContextState::Running);
 
         // 8. Queue a control message to resume the AudioContext with promise.
-        self.run_control_message_to_resume(cx.vm(), promise);
+        self.run_control_message_to_resume(cx.vm(), Some(promise));
 
         // 9. Return promise.
         Ok(())
     }
 
-    fn run_control_message_to_resume(&self, vm: &Vm, promise: WebIdlPromise) {
+    pub(crate) fn suspended_by_user(&self) -> bool {
+        self.suspended_by_user.get()
+    }
+
+    fn settle_pending_resume_promises(&self, vm: &Vm, mut settle: impl FnMut(WebIdlPromise)) {
+        let mut resumes = self.pending_resume_promises.borrow_mut(vm);
+        if resumes.is_empty() {
+            return;
+        }
+        for &promise in resumes.iter() {
+            settle(promise);
+            let mut pending = self.context.pending_promises.borrow_mut(vm);
+            if let Some(index) = pending.iter().position(|pending| *pending == promise) {
+                pending.remove(index);
+            }
+        }
+        resumes.clear();
+    }
+
+    pub(crate) fn run_control_message_to_resume(&self, vm: &Vm, promise: Option<WebIdlPromise>) {
         // 1. Let promise be the promise passed into this algorithm.
 
         // 2. Attempt to acquire system resources.
         // NB: The renderer acquires resources when starting the graph in step 4.
-        if self.renderer.borrow().is_some() {
-            self.set_renderer_client(vm);
-        }
-
         // 3. Set the [[rendering thread state]] on the AudioContext to running.
         self.context.set_rendering_state(AudioContextState::Running);
 
         // 4. Start rendering the audio graph.
-        let started = self.start_rendering_audio_graph();
+        let started = self.start_rendering_audio_graph(vm);
 
         // 5. In case of failure, queue a media element task to execute the following steps:
         if !started {
@@ -398,19 +409,14 @@ impl AudioContext {
 
                 // 6.2. Resolve all promises from [[pending resume promises]] in order.
                 // 6.3. Clear [[pending resume promises]]. Additionally, remove those promises from [[pending promises]].
-                for pending_resume_promise in &*context.pending_resume_promises.borrow() {
-                    with_temporary_execution_context_and_callbacks(promise_realm(*pending_resume_promise), || {
-                        resolve_promise(vm, *pending_resume_promise, Value::UNDEFINED);
-                    });
-                    let mut pending = context.context.pending_promises.borrow_mut(vm);
-                    if let Some(index) = pending.iter().position(|promise| promise == pending_resume_promise) {
-                        pending.remove(index);
-                    }
-                }
-                context.pending_resume_promises.borrow_mut(vm).clear();
-                with_temporary_execution_context_and_callbacks(promise_realm(promise), || {
+                with_temporary_execution_context_and_callbacks(context.context.realm(), || {
+                    context
+                        .settle_pending_resume_promises(vm, |promise| resolve_promise(vm, promise, Value::UNDEFINED));
+
                     // 6.4. Resolve promise.
-                    resolve_promise(vm, promise, Value::UNDEFINED);
+                    if let Some(promise) = promise {
+                        resolve_promise(vm, promise, Value::UNDEFINED);
+                    }
 
                     // 6.5. If the state attribute of the AudioContext is not already "running":
                     if context.context.state_value() != AudioContextState::Running {
@@ -565,6 +571,19 @@ impl AudioContext {
         self.context
             .queue_a_media_element_task(vm, (self.this(), promise), |vm, (context, promise)| {
                 with_temporary_execution_context_and_callbacks(promise_realm(promise), || {
+                    // AD-HOC: As in Chromium and Firefox, reject resumes still waiting for autoplay permission.
+                    // This context can no longer start once it closes.
+                    context.settle_pending_resume_promises(vm, |promise| {
+                        reject_promise_with_exception(
+                            vm,
+                            promise,
+                            Exception::Dom(
+                                "InvalidStateError",
+                                Utf16String::from_ascii(b"Audio context closed before it could resume."),
+                            ),
+                        );
+                    });
+
                     // 4.1. Resolve promise.
                     resolve_promise(vm, promise, Value::UNDEFINED);
 
@@ -582,25 +601,39 @@ impl AudioContext {
             });
     }
 
-    fn start_rendering_audio_graph(&self) -> bool {
+    fn start_rendering_audio_graph(&self, vm: &Vm) -> bool {
         if let Some(renderer) = &*self.renderer.borrow() {
+            self.set_renderer_client(vm, renderer);
             renderer.resume();
+            return true;
         }
+
+        let factory = unsafe { web_audio_output_factory_create(self.context.global_event_target().as_ptr()) };
+        let renderer = RealtimeAudioRenderer::new(
+            Arc::clone(self.context.control_message_queue()),
+            self.context.destination_value().parent().node_id(),
+            self.context.sample_rate_value(),
+            BaseAudioContext::RENDER_QUANTUM_SIZE as usize,
+            SharedCppObject {
+                pointer: factory.pointer,
+                retain: factory.retain,
+                release: factory.release,
+            },
+        );
+        self.set_renderer_client(vm, &renderer);
+        *self.renderer.borrow_mut() = Some(Arc::clone(&renderer));
+        renderer.start_rendering();
         true
     }
 
     // The renderer's callback captures a GC root on this context, keeping it alive while it renders. That root is released
     // by clearing the callbacks when the context is suspended, closed, or its document becomes inactive, so this is called
     // again to re-establish it whenever rendering resumes.
-    fn set_renderer_client(&self, vm: &Vm) {
-        self.renderer
-            .borrow()
-            .as_ref()
-            .unwrap()
-            .set_client(Some(Rc::new(RendererClient {
-                vm: NonNull::from(vm),
-                context: CellRoot::new(self.this()),
-            })));
+    fn set_renderer_client(&self, vm: &Vm, renderer: &RealtimeAudioRenderer) {
+        renderer.set_client(Some(Rc::new(RendererClient {
+            vm: NonNull::from(vm),
+            context: CellRoot::new(self.this()),
+        })));
     }
 
     // https://webaudio.github.io/web-audio-api/#dom-audiocontext-createmediaelementsource

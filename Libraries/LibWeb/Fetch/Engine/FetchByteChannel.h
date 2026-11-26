@@ -96,9 +96,8 @@ public:
     void keep_whole_body(Core::ImmutableBytes);
     [[nodiscard]] Optional<Core::ImmutableBytes> whole_body() const;
 
-    // The delivery of the handed-over response these bytes are the body of. Set once, unless the channel is Closed, and
-    // returns whether it was set.
-    [[nodiscard]] bool set_delivery_id_unless_closed(DeliveryId);
+    // The delivery of the handed-over response these bytes are the body of. Set once, unless the channel is Closed.
+    void set_delivery_id_unless_closed(DeliveryId);
     [[nodiscard]] Optional<DeliveryId> delivery_id() const;
 
     // Consumer side.
@@ -109,8 +108,6 @@ public:
 
     // Either side may cancel; the producer hears of it unless it has already ended the body.
     TerminateResult cancel();
-    // Whether a read of the channel can still reach its end, which a cancellation or a transfer rules out.
-    [[nodiscard]] bool can_be_read_to_its_end() const;
 
     // Ends an open or closed channel for a body that moves to another process, returning its undrained bytes. The
     // transport hears nothing, and later writes and endings do nothing.

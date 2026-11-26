@@ -7,6 +7,7 @@
 #include <AK/Atomic.h>
 #include <AK/Format.h>
 #include <LibWeb/Fetch/Engine/FetchEngineRecord.h>
+#include <LibWeb/Fetch/Engine/FetchExecutor.h>
 
 namespace Web::Fetch::Engine {
 
@@ -60,7 +61,6 @@ void FetchEngineRecord::stop()
     if (m_redirect_continuation.has_value())
         abandon_redirect();
     stop_body_transport();
-    end_main_fetch_if_its_read_cannot_end();
 }
 
 void FetchEngineRecord::add_network_transport(NetworkTransportHandle& handle, FetchBodyDeliveryGate& delivery_gate)
@@ -70,16 +70,13 @@ void FetchEngineRecord::add_network_transport(NetworkTransportHandle& handle, Fe
         records->add_network_transport(handle, delivery_gate);
 }
 
-Optional<DeliveryId> FetchEngineRecord::deliver_body(FetchByteChannel& channel)
+void FetchEngineRecord::deliver_body(FetchByteChannel& channel)
 {
     ASSERT(is_on_owner_thread());
-    DeliveryId delivery_id { s_next_delivery_id.fetch_add(1) };
-    if (!channel.set_delivery_id_unless_closed(delivery_id))
-        return {};
-    return delivery_id;
+    channel.set_delivery_id_unless_closed(DeliveryId { s_next_delivery_id.fetch_add(1) });
 }
 
-ContinuationId FetchEngineRecord::open_redirect_continuation(NetworkTransportHandle* network_transport)
+void FetchEngineRecord::open_redirect_continuation(NetworkTransportHandle* network_transport)
 {
     ASSERT(is_on_owner_thread());
     VERIFY(!m_redirect_continuation.has_value());
@@ -90,7 +87,6 @@ ContinuationId FetchEngineRecord::open_redirect_continuation(NetworkTransportHan
     m_redirect_continuation = RedirectContinuation { continuation_id, network_transport };
     if (m_stopped)
         abandon_redirect();
-    return continuation_id;
 }
 
 FetchEngineRecord::RedirectAnswerResult FetchEngineRecord::resolve_redirect(ContinuationId continuation_id, Command::ResolveRedirect::Resolution const& resolution)
@@ -103,8 +99,9 @@ FetchEngineRecord::RedirectAnswerResult FetchEngineRecord::resolve_redirect(Cont
 
     resolution.visit(
         [&](Command::ResolveRedirect::Follow) {
-            m_redirect_continuation.clear();
+            // NB: Main fetch runs again before the stop of the body transport can end the redirect's load.
             m_main_fetch = MainFetchRunning {};
+            close_redirect_continuation();
         },
         [&](Command::ResolveRedirect::AcceptAsFinal) {
             m_redirect_continuation.clear();
@@ -114,12 +111,25 @@ FetchEngineRecord::RedirectAnswerResult FetchEngineRecord::resolve_redirect(Cont
     return RedirectAnswerResult::Settled;
 }
 
-void FetchEngineRecord::abandon_redirect()
+Optional<ContinuationId> FetchEngineRecord::open_redirect_continuation_id() const
+{
+    ASSERT(is_on_owner_thread());
+    if (!m_redirect_continuation.has_value())
+        return {};
+    return m_redirect_continuation->id;
+}
+
+void FetchEngineRecord::close_redirect_continuation()
 {
     auto continuation = m_redirect_continuation.release_value();
     if (auto network_transport = continuation.network_transport.strong_ref())
         network_transport->release_transfer_lease();
     stop_body_transport();
+}
+
+void FetchEngineRecord::abandon_redirect()
+{
+    close_redirect_continuation();
     end_fetch_unless_anything_is_left();
 }
 
@@ -131,13 +141,15 @@ NonnullRefPtr<FetchLoad> FetchEngineRecord::start_load()
     return adopt_ref(*new FetchLoad(*this));
 }
 
-void FetchEngineRecord::main_fetch_handed_over()
+void FetchEngineRecord::main_fetch_hands_over(Event::ResponseDelivery delivery)
 {
     ASSERT(is_on_owner_thread());
     if (m_main_fetch.has<MainFetchEnded>())
         return;
-    VERIFY(m_main_fetch.has<MainFetchRunning>() || m_main_fetch.has<MainFetchReadsWholeBody>());
-    end_main_fetch();
+    VERIFY(m_main_fetch.has<MainFetchRunning>());
+    m_main_fetch = MainFetchEnded {};
+    m_event_sink->handle_event(move(delivery));
+    end_fetch_unless_anything_is_left();
 }
 
 void FetchEngineRecord::main_fetch_cannot_hand_over()
@@ -145,20 +157,14 @@ void FetchEngineRecord::main_fetch_cannot_hand_over()
     ASSERT(is_on_owner_thread());
     if (m_main_fetch.has<MainFetchEnded>())
         return;
-    RefPtr<FetchByteChannel> channel_main_fetch_reads;
-    if (auto const* reads_whole_body = m_main_fetch.get_pointer<MainFetchReadsWholeBody>())
-        channel_main_fetch_reads = reads_whole_body->channel;
     end_main_fetch();
-    if (channel_main_fetch_reads)
-        (void)channel_main_fetch_reads->cancel();
 }
 
-void FetchEngineRecord::main_fetch_reads_whole_body(FetchByteChannel& channel)
+void FetchEngineRecord::defer(Function<void()> work)
 {
     ASSERT(is_on_owner_thread());
-    VERIFY(m_main_fetch.has<MainFetchRunning>());
-    m_main_fetch = MainFetchReadsWholeBody { channel };
-    end_main_fetch_if_its_read_cannot_end();
+    if (auto* records = m_records.ptr())
+        records->defer(move(work));
 }
 
 void FetchEngineRecord::main_fetch_waits_for_preload()
@@ -189,15 +195,7 @@ void FetchEngineRecord::did_end_load()
     ASSERT(is_on_owner_thread());
     VERIFY(m_live_load_count > 0);
     --m_live_load_count;
-    end_main_fetch_if_its_read_cannot_end();
     end_fetch_unless_anything_is_left();
-}
-
-void FetchEngineRecord::end_main_fetch_if_its_read_cannot_end()
-{
-    auto const* reads_whole_body = m_main_fetch.get_pointer<MainFetchReadsWholeBody>();
-    if (reads_whole_body && !reads_whole_body->channel->can_be_read_to_its_end())
-        end_main_fetch();
 }
 
 void FetchEngineRecord::end_main_fetch()
@@ -250,6 +248,19 @@ void FetchEngineRecords::Agent::misbehaved(StringView reason)
 FetchEngineRecords::FetchEngineRecords(NonnullOwnPtr<Agent> agent)
     : m_agent(move(agent))
 {
+}
+
+void FetchEngineRecords::attach_to_executor(FetchExecutor& executor)
+{
+    VERIFY(!m_executor);
+    m_executor = &executor;
+}
+
+void FetchEngineRecords::defer(Function<void()> work)
+{
+    ASSERT(is_on_owner_thread());
+    VERIFY(m_executor);
+    m_executor->defer({}, move(work));
 }
 
 RefPtr<FetchEngineRecord> FetchEngineRecords::start(FetchId fetch_id, NonnullOwnPtr<EngineEventSink> event_sink, NonnullRefPtr<NetworkActivityObservers const> network_activity_observers)
