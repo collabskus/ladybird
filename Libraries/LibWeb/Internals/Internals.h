@@ -71,6 +71,7 @@ public:
 
     void gc();
     u32 worker_agent_count() const;
+    u32 network_body_pump_count() const;
     void gc_async(bool move_cells, GC::Ref<WebIDL::Promise>);
     WebIDL::UnsignedLongLong discard_decoded_image_frames();
     WebIDL::ExceptionOr<void> mark_as_garbage(Utf16String const& variable_name);
@@ -311,6 +312,7 @@ public:
     void synchronize_compositor();
     void hold_next_frame(Utf16String const& hold);
     Utf16String last_frame_presented_by(DOM::Document&);
+    String display_list_window_scroll_positions(DOM::Document&);
     void inject_clock_tick(double frame_time_ms, Optional<double> viewport_scroll_y);
     void inject_clock_tick_scrolling_element(double frame_time_ms, DOM::Element& scroller, double x, double y);
     void inject_hover_pointer(double x, double y, Optional<double> frame_time_ms, Optional<u64> input_event_id, u32 buttons);
