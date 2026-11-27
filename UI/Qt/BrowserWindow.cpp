@@ -2080,11 +2080,14 @@ void BrowserWindow::changeEvent(QEvent* event)
 
 void BrowserWindow::appearance_changed()
 {
-    SystemAppearance::the().apply_interface_theme(Application::settings().appearance().interface_theme);
-    SystemAppearance::the().apply_color_theme(Application::settings().appearance().color_theme);
-    update_menu_bar_visibility();
+    auto const& appearance = Application::settings().appearance();
+    SystemAppearance::the().apply_interface_theme(appearance.interface_theme);
+    SystemAppearance::the().apply_color_theme(appearance.color_theme);
 
+    update_menu_bar_visibility();
+    m_tabs_container->update_toolbar_button_visibility();
     m_tabs_container->update_bookmarks_bar_visibility();
+
     for_each_tab([](Tab& tab) {
         tab.view().update_palette();
     });

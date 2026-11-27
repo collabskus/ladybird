@@ -11,11 +11,20 @@
 #include <AK/NonnullRefPtr.h>
 #include <LibURL/Origin.h>
 #include <LibWeb/ContentSecurityPolicy/Directives/Directive.h>
-#include <LibWeb/Forward.h>
+#include <LibWeb/Export.h>
 #include <LibWebCommon/Bindings/SecurityPolicyViolationEvent.h>
 #include <LibWebCommon/ContentSecurityPolicy/PolicySource.h>
+#include <LibWebCommon/Forward.h>
+
+namespace Web::Fetch::Infrastructure {
+
+class Response;
+
+}
 
 namespace Web::ContentSecurityPolicy {
+
+class PolicyList;
 
 #define ENUMERATE_DISPOSITION_TYPES                  \
     __ENUMERATE_DISPOSITION_TYPE(Enforce, "enforce") \
@@ -24,7 +33,7 @@ namespace Web::ContentSecurityPolicy {
 // https://w3c.github.io/webappsec-csp/#content-security-policy-object
 // A policy defines allowed and restricted behaviors, and may be applied to a Document, WorkerGlobalScope,
 // or WorkletGlobalScope.
-class Policy final : public AtomicRefCounted<Policy> {
+class WEB_API Policy final : public AtomicRefCounted<Policy> {
 public:
     using Disposition = Bindings::SecurityPolicyViolationEventDisposition;
 

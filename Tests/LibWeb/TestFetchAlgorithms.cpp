@@ -199,7 +199,7 @@ static NonnullRefPtr<AlgorithmCalls> deliver_to_a_fetch(FetchHarness const& harn
     auto request = harness.create_request_for("https://example.com/delivered"sv);
     auto algorithms = FetchAlgorithms::create(algorithms_recording_their_calls(heap, record));
     auto timing_info = Web::Fetch::Infrastructure::FetchTimingInfo::create();
-    auto fetch_params = FetchParams::create(*controller, move(request), algorithms, move(timing_info), Web::current_loader_config());
+    auto fetch_params = controller->create_fetch_params(move(request), algorithms, move(timing_info), Web::current_loader_config());
     controller->set_realm(*harness.realm);
     controller->set_task_destination(GC::Ref { harness.realm->global_object() });
     Web::Fetch::Engine::FetchId fetch_id { 1 };
@@ -372,7 +372,10 @@ TEST_CASE(each_stop_of_a_started_fetch_reaches_the_engine_for_its_fetch_id)
     FetchHarness harness;
 
     auto reached = make_ref_counted<ReachedSteps>();
-    Web::Fetch::Engine::FetchExecutorServices services { .event_loop = Core::EventLoop::current_weak() };
+    Web::Fetch::Engine::FetchExecutorServices services {
+        .event_loop = Core::EventLoop::current_weak(),
+        .known_hsts_host_provider = Web::HTML::surrounding_agent().fetch_executor->known_hsts_host_provider(),
+    };
     auto fetch_executor = Web::Fetch::Engine::InlineFetchExecutor::create(move(services), make<CommandRecordingEngine>(reached));
 
     auto& registry = Web::HTML::surrounding_agent().fetch_controller_registry;
@@ -897,7 +900,10 @@ public:
         , m_request_server(harness)
     {
         auto& agent = Web::HTML::surrounding_agent();
-        Web::Fetch::Engine::FetchExecutorServices services { .event_loop = Core::EventLoop::current_weak() };
+        Web::Fetch::Engine::FetchExecutorServices services {
+            .event_loop = Core::EventLoop::current_weak(),
+            .known_hsts_host_provider = agent.fetch_executor->known_hsts_host_provider(),
+        };
         auto recording_engine = make<CommandRecordingEngine>(commands, m_posted_commands);
         agent.fetch_executor = Web::Fetch::Engine::InlineFetchExecutor::create(move(services), move(recording_engine));
         m_engine_executor = Web::Fetch::Fetching::create_inline_fetch_executor(agent.network_activity_observers);
@@ -1403,7 +1409,7 @@ struct WaitingFetch : RefCounted<WaitingFetch> {
 }
 
 // A preload of the URL, as HTMLLinkElement::preload makes one: once its body has been read, its entry keeps the
-// response, or gives it to the fetch waiting on the entry.
+// response, or gives it to the fetch waiting on the entry. Stopping it cancels its entry.
 static NEVER_INLINE Web::Fetch::Infrastructure::FetchControllerToken start_preload(FetchHarness const& harness, StringView url, NonnullRefPtr<WaitingFetch> const& waiting_fetch)
 {
     auto entry = Web::HTML::PreloadEntry::create();
@@ -1417,16 +1423,24 @@ static NEVER_INLINE Web::Fetch::Infrastructure::FetchControllerToken start_prelo
             response = Response::network_error("Expected preload response to contain a body"_string);
 
         if (!entry->on_response_available) {
-            entry->response = response;
+            if (!entry->cancelled)
+                entry->response = response;
             return;
         }
-        auto preload_was_stopped = entry->controller->state() == FetchController::State::Stopped;
-        entry->on_response_available->function()(response);
+        auto on_response_available = entry->on_response_available;
+        entry->on_response_available = nullptr;
+        on_response_available->function()(response);
         auto waiting_fetch_is_rooted = waiting_fetch->token.has_value() && is_rooted(*waiting_fetch->token);
-        waiting_fetch->resolutions.append(ByteString::formatted("resolved by a {} preload, rooted: {}", preload_was_stopped ? "stopped"sv : "live"sv, waiting_fetch_is_rooted));
+        waiting_fetch->resolutions.append(ByteString::formatted("resolved by the preload's response, rooted: {}", waiting_fetch_is_rooted));
     });
     auto controller = harness.fetch(request, move(input));
     entry->controller = controller;
+    controller->set_stop_steps(GC::create_function(harness.realm->heap(), GC::captures(entry, waiting_fetch), [](auto& entry, auto& waiting_fetch) {
+        auto has_a_waiting_fetch = entry->on_response_available && !entry->response;
+        entry->cancel();
+        if (has_a_waiting_fetch)
+            waiting_fetch->resolutions.append("resolved by a cancelled preload");
+    }));
     harness.document->map_of_preloaded_resources().set(Web::HTML::create_a_preload_key(*request), entry);
     return controller->token();
 }
@@ -1438,13 +1452,13 @@ static void run_until_handed_over(FetchHarness const& harness, Web::Fetch::Infra
     harness.run_tasks_until(GC::create_function(harness.realm->heap(), GC::captures(GC::Ref { *controller }), [](auto& controller) { return was_handed_over(*controller); }));
 }
 
-static void run_until_waiting_for_preload(FetchHarness const& harness, FetchController& controller)
+// The waiting fetch is the test's second. Its main fetch waits for the preload once the engine has started it.
+static void run_until_waiting_for_preload(FetchHarness const& harness, NonnullRefPtr<ReachedSteps> const& commands)
 {
-    harness.run_tasks_until(GC::create_function(harness.realm->heap(), GC::captures(GC::Ref { controller }), [](auto& controller) { return !!controller->pending_preloaded_response(); }));
-    VERIFY(controller.pending_preloaded_response());
+    harness.run_until_step(commands, "start fetch 2"sv);
 }
 
-TEST_CASE(a_fetch_is_not_rooted_while_it_waits_for_a_preload)
+TEST_CASE(a_fetch_waiting_for_a_preload_is_resumed_by_its_engine)
 {
     Core::EventLoop event_loop;
     install_font_plugin();
@@ -1460,18 +1474,117 @@ TEST_CASE(a_fetch_is_not_rooted_while_it_waits_for_a_preload)
     auto request = harness.create_request_for("http://127.0.0.1:8000/preloaded"sv);
     auto controller = GC::make_root(harness.fetch(request, recording_responses(harness.realm->heap(), record)));
     waiting_fetch->token = controller->token();
+    run_until_waiting_for_preload(harness, commands);
     EXPECT(is_rooted(controller->token()));
-    run_until_waiting_for_preload(harness, *controller);
-    EXPECT(!is_rooted(controller->token()));
 
-    // The preload resolves the wait, and the fetch is rooted again before its main fetch goes on.
+    // The preload's response reaches the engine, which resumes main fetch with it.
     request_server.send_headers(preload_id, 200);
     request_server.send_finished(preload_id);
     harness.run_until_responses(record, 1);
-    EXPECT_EQ(waiting_fetch->resolutions, (Vector<ByteString> { "resolved by a live preload, rooted: true" }));
+    EXPECT_EQ(waiting_fetch->resolutions, (Vector<ByteString> { "resolved by the preload's response, rooted: true" }));
     EXPECT(!record->responses[0]->is_network_error());
     harness.run_until_step(commands, "end of fetch 2"sv);
+    EXPECT(commands->steps.contains_slow("preload response resolved 2"sv));
     EXPECT(!is_rooted(controller->token()));
+}
+
+namespace {
+
+// Gives each fetch it starts a preloaded response candidate that is already a response.
+class PreloadedResponseInjector final : public Web::Fetch::Engine::EngineCommandSink {
+public:
+    PreloadedResponseInjector(NonnullRefPtr<ReachedSteps> misbehaviors, NonnullRefPtr<Response> preloaded_response)
+        : m_engine(Web::HTML::surrounding_agent().network_activity_observers, make<MisbehaviorRecordingAgent>(move(misbehaviors)))
+        , m_preloaded_response(move(preloaded_response))
+    {
+    }
+
+    virtual void attach_to_executor(Web::Fetch::Engine::FetchExecutor& executor) override { m_engine.attach_to_executor(executor); }
+
+    virtual void handle_command(Web::Fetch::Engine::EngineCommand command) override
+    {
+        if (auto* start = command.get_pointer<Web::Fetch::Engine::Command::StartFetch>())
+            start->input.main_fetch.fetch_params->set_preloaded_response_candidate(m_preloaded_response);
+        m_engine.handle_command(move(command));
+    }
+
+private:
+    Web::Fetch::Fetching::FetchEngine m_engine;
+    NonnullRefPtr<Response> m_preloaded_response;
+};
+
+}
+
+// Starts a fetch whose preloaded response has the body, and returns the misbehavior the engine saw.
+static NonnullRefPtr<ReachedSteps> fetch_with_a_preloaded_response(FetchHarness const& harness, Web::Fetch::Infrastructure::ResponseBody body, NonnullRefPtr<AlgorithmCalls> const& record)
+{
+    auto misbehaviors = make_ref_counted<ReachedSteps>();
+    auto preloaded_response = Response::create();
+    preloaded_response->set_body(move(body));
+    harness.run_fetches_on(make<PreloadedResponseInjector>(misbehaviors, preloaded_response));
+    (void)harness.fetch(harness.create_request(), recording_responses(harness.realm->heap(), record));
+    harness.settle();
+    return misbehaviors;
+}
+
+TEST_CASE(a_fetch_started_with_a_preloaded_response_whose_body_is_not_all_its_bytes_is_misbehavior)
+{
+    Core::EventLoop event_loop;
+    install_font_plugin();
+    FetchHarness harness;
+    auto record = make_ref_counted<AlgorithmCalls>();
+
+    auto without_bytes = fetch_with_a_preloaded_response(harness, Web::Fetch::Infrastructure::ResponseBody { Core::ImmutableBytes {}, 0 }, record);
+    auto shorter = fetch_with_a_preloaded_response(harness, Web::Fetch::Infrastructure::ResponseBody { MUST(Core::ImmutableBytes::copy("preloaded"sv.bytes())), 20 }, record);
+
+    Vector<ByteString> expected { "The agent gave main fetch a preloaded response whose body is not all its bytes" };
+    EXPECT_EQ(without_bytes->steps, expected);
+    EXPECT_EQ(shorter->steps, expected);
+    EXPECT(record->responses.is_empty());
+}
+
+TEST_CASE(a_fetch_started_with_a_preloaded_response_with_an_empty_body_hands_it_over)
+{
+    Core::EventLoop event_loop;
+    install_font_plugin();
+    FetchHarness harness;
+    auto record = make_ref_counted<AlgorithmCalls>();
+
+    auto misbehaviors = fetch_with_a_preloaded_response(harness, Web::Fetch::Infrastructure::ResponseBody::from_bytes(MUST(Core::ImmutableBytes::copy({}))), record);
+
+    EXPECT(misbehaviors->steps.is_empty());
+    EXPECT_EQ(record->responses.size(), 1u);
+    EXPECT(!record->responses[0]->is_network_error());
+}
+
+TEST_CASE(a_fetch_aborted_while_it_waits_for_a_preload_ends_there)
+{
+    Core::EventLoop event_loop;
+    install_font_plugin();
+    FetchHarness harness;
+    auto commands = harness.record_commands();
+    StandInRequestServer request_server { harness };
+
+    auto waiting_fetch = make_ref_counted<WaitingFetch>();
+    (void)start_preload(harness, "http://127.0.0.1:8000/preloaded"sv, waiting_fetch);
+    auto preload_id = request_server.wait_for_request("GET"sv);
+
+    auto record = make_ref_counted<AlgorithmCalls>();
+    auto request = harness.create_request_for("http://127.0.0.1:8000/preloaded"sv);
+    auto controller = GC::make_root(harness.fetch(request, recording_responses(harness.realm->heap(), record)));
+    waiting_fetch->token = controller->token();
+    run_until_waiting_for_preload(harness, commands);
+    harness.with_execution_context([&] { controller->abort(*harness.realm, {}); });
+    harness.run_until_step(commands, "end of fetch 2"sv);
+    EXPECT(!is_rooted(controller->token()));
+
+    // The preload completes after the fetch has ended, and gives it nothing.
+    request_server.send_headers(preload_id, 200);
+    request_server.send_finished(preload_id);
+    harness.run_until_step(commands, "end of fetch 1"sv);
+    harness.settle();
+    EXPECT_EQ(waiting_fetch->resolutions, (Vector<ByteString> { "resolved by the preload's response, rooted: false" }));
+    EXPECT(record->responses.is_empty());
 }
 
 struct HeldWaitingFetch {
@@ -1481,11 +1594,11 @@ struct HeldWaitingFetch {
 
 // Starts a fetch of the preload's URL, lets its main fetch wait for the preload, then stops both fetches as a document's
 // abort stops them. It runs away from the test's own stack frame, so a conservative scan of it finds no controller.
-static NEVER_INLINE HeldWaitingFetch wait_for_a_preload_then_stop_both(FetchHarness const& harness, StringView url, Web::Fetch::Infrastructure::FetchControllerToken preload_token, NonnullRefPtr<AlgorithmCalls> const& record)
+static NEVER_INLINE HeldWaitingFetch wait_for_a_preload_then_stop_both(FetchHarness const& harness, NonnullRefPtr<ReachedSteps> const& commands, StringView url, Web::Fetch::Infrastructure::FetchControllerToken preload_token, NonnullRefPtr<AlgorithmCalls> const& record)
 {
     auto request = harness.create_request_for(url);
     auto controller = harness.fetch(request, recording_responses(harness.realm->heap(), record));
-    run_until_waiting_for_preload(harness, *controller);
+    run_until_waiting_for_preload(harness, commands);
     harness.with_execution_context([&] {
         find_controller(preload_token)->stop_fetch();
         controller->stop_fetch();
@@ -1493,8 +1606,9 @@ static NEVER_INLINE HeldWaitingFetch wait_for_a_preload_then_stop_both(FetchHarn
     return { GC::make_root(controller), controller->token() };
 }
 
-// Both fetches are stopped as a document's abort stops them, which leaves the preload's entry unresolved.
-static void leave_a_fetch_waiting_for_a_preload_unresolved(bool preload_body_in_flight)
+// Both fetches are stopped as a document's abort stops them. The preload's stop cancels its entry, and the waiting
+// fetch's own stop ends it before it fetches on its own.
+static void stop_a_fetch_waiting_for_a_preload_and_the_preload(bool preload_body_in_flight)
 {
     Core::EventLoop event_loop;
     install_font_plugin();
@@ -1513,19 +1627,14 @@ static void leave_a_fetch_waiting_for_a_preload_unresolved(bool preload_body_in_
 
     // The test holds the waiting fetch, as its fetch group holds a keepalive fetch.
     auto record = make_ref_counted<AlgorithmCalls>();
-    auto waiting = wait_for_a_preload_then_stop_both(harness, "http://127.0.0.1:8000/preloaded"sv, preload_token, record);
-    harness.run_until_step(commands, "end of fetch 1"sv);
-    harness.settle();
-    EXPECT(!commands->steps.contains_slow("end of fetch 2"sv));
+    auto waiting = wait_for_a_preload_then_stop_both(harness, commands, "http://127.0.0.1:8000/preloaded"sv, preload_token, record);
 
-    // Once the heap collects the preload's entry, the handle in its callback abandons the wait, and the fetch ends
-    // without handing anything over.
-    GC::scrub_stack_for_testing();
-    harness.run_tasks_until(GC::create_function(heap, GC::captures(harness.realm, commands), [](auto& realm, auto& commands) {
-        realm->heap().collect_garbage();
-        return commands->steps.contains_slow("end of fetch 2"sv);
-    }));
-    EXPECT_EQ(commands->steps, (Vector<ByteString> { "start fetch 1", "start fetch 2", "stop 1", "stop 2", "end of fetch 1", "abandon preload wait of 2", "end of fetch 2" }));
+    // The waiting fetch ends at its own stop, without a request or a handover.
+    harness.run_until_step(commands, "end of fetch 2"sv);
+    harness.settle();
+    EXPECT_EQ(commands->steps, (Vector<ByteString> { "start fetch 1", "start fetch 2", "stop 1", "preload response resolved 2", "stop 2", "end of fetch 1", "end of fetch 2" }));
+    EXPECT_EQ(request_server.messages(), (Vector<ByteString> { "start 0 GET /preloaded", "stop 0" }));
+    EXPECT_EQ(waiting_fetch->resolutions, (Vector<ByteString> { "resolved by a cancelled preload" }));
     EXPECT(record->responses.is_empty());
     EXPECT(!is_rooted(waiting.token));
 
@@ -1539,105 +1648,48 @@ static void leave_a_fetch_waiting_for_a_preload_unresolved(bool preload_body_in_
     EXPECT(harness.records_gone->steps.contains_slow("2"sv));
 }
 
-TEST_CASE(a_fetch_waiting_for_a_preload_stopped_before_its_response_ends_once_the_preload_entry_is_collected)
+TEST_CASE(a_fetch_waiting_for_a_preload_stopped_before_its_response_ends_when_it_is_stopped)
 {
-    leave_a_fetch_waiting_for_a_preload_unresolved(false);
+    stop_a_fetch_waiting_for_a_preload_and_the_preload(false);
 }
 
-TEST_CASE(a_fetch_waiting_for_a_preload_stopped_with_its_body_in_flight_ends_once_the_preload_entry_is_collected)
+TEST_CASE(a_fetch_waiting_for_a_preload_stopped_with_its_body_in_flight_ends_when_it_is_stopped)
 {
-    leave_a_fetch_waiting_for_a_preload_unresolved(true);
+    stop_a_fetch_waiting_for_a_preload_and_the_preload(true);
 }
 
-// Starts a fetch of the preload's URL, which consumes the preload's entry, then stops both fetches as a document's abort
-// stops them. Nothing then holds the entry.
-static NEVER_INLINE Web::Fetch::Infrastructure::FetchControllerToken fetch_a_preload_then_stop_both(FetchHarness const& harness, StringView url, Web::Fetch::Infrastructure::FetchControllerToken preload_token, NonnullRefPtr<AlgorithmCalls> const& record)
-{
-    auto request = harness.create_request_for(url);
-    auto controller = harness.fetch(request, recording_responses(harness.realm->heap(), record));
-    harness.with_execution_context([&] {
-        find_controller(preload_token)->stop_fetch();
-        controller->stop_fetch();
-    });
-    return controller->token();
-}
-
-static NEVER_INLINE bool preload_wait_handle_is_gone(Web::Fetch::Infrastructure::FetchControllerToken token)
-{
-    return find_controller(token)->preload_wait_handle().is_null();
-}
-
-// The entry's callback is collected after the waiting fetch consumed the entry, but before its main fetch runs.
-TEST_CASE(a_fetch_whose_preload_entry_is_collected_before_main_fetch_waits_for_it_ends_without_a_handover)
+// A fetch that took the preload's entry, but whose main fetch's earlier steps set a network error, never waits.
+TEST_CASE(a_fetch_whose_main_fetch_never_waits_for_its_preload_ignores_the_preload_s_cancellation)
 {
     Core::EventLoop event_loop;
     install_font_plugin();
     FetchHarness harness;
     auto commands = harness.record_commands();
     StandInRequestServer request_server { harness };
-    auto& heap = harness.realm->heap();
 
     auto waiting_fetch = make_ref_counted<WaitingFetch>();
     auto preload_token = start_preload(harness, "http://127.0.0.1:8000/preloaded"sv, waiting_fetch);
     (void)request_server.wait_for_request("GET"sv);
-    auto record = make_ref_counted<AlgorithmCalls>();
-    auto token = fetch_a_preload_then_stop_both(harness, "http://127.0.0.1:8000/preloaded"sv, preload_token, record);
 
-    GC::scrub_stack_for_testing();
-    heap.collect_garbage_and_return_memory_to_system();
-    EXPECT(preload_wait_handle_is_gone(token));
-
-    // Main fetch does not wait, and the fetch ends without handing anything over.
-    harness.run_until_step(commands, "end of fetch 2"sv);
-    harness.run_until_step(commands, "end of fetch 1"sv);
-    harness.settle();
-    EXPECT_EQ(commands->steps, (Vector<ByteString> { "start fetch 1", "start fetch 2", "stop 1", "stop 2", "end of fetch 2", "end of fetch 1" }));
-    EXPECT(record->responses.is_empty());
-    EXPECT(!is_rooted(token));
-
-    // Nothing else holds the fetch, so its engine record leaves the engine's table.
-    GC::scrub_stack_for_testing();
-    harness.run_tasks_until(GC::create_function(heap, GC::captures(harness.realm, harness.records_gone), [](auto& realm, auto& records_gone) {
-        realm->heap().collect_garbage();
-        return records_gone->steps.contains_slow("2"sv);
-    }));
-    EXPECT(harness.records_gone->steps.contains_slow("2"sv));
-}
-
-// The heap collects the preload entry's callback once it has resolved the wait, before the fetch ends. The handle in
-// the callback abandons nothing then.
-TEST_CASE(a_preload_entry_collected_after_it_resolved_the_wait_abandons_nothing)
-{
-    Core::EventLoop event_loop;
-    install_font_plugin();
-    FetchHarness harness;
-    auto commands = harness.record_commands();
-    StandInRequestServer request_server { harness };
-    auto& heap = harness.realm->heap();
-
-    auto waiting_fetch = make_ref_counted<WaitingFetch>();
-    (void)start_preload(harness, "http://127.0.0.1:8000/preloaded"sv, waiting_fetch);
-    auto preload_id = request_server.wait_for_request("GET"sv);
+    // The fetch's start and the preload's cancellation reach the engine before main fetch hands over its network error.
     auto record = make_ref_counted<AlgorithmCalls>();
     auto request = harness.create_request_for("http://127.0.0.1:8000/preloaded"sv);
-    auto controller = GC::make_root(harness.fetch(request, recording_responses(heap, record)));
-    run_until_waiting_for_preload(harness, *controller);
+    request->set_local_urls_only(true);
+    harness.with_execution_context([&] {
+        auto controller = harness.fetch(request, recording_responses(harness.realm->heap(), record));
+        waiting_fetch->token = controller->token();
+        find_controller(preload_token)->stop_fetch();
+    });
 
-    request_server.send_headers(preload_id, 200);
-    request_server.send_finished(preload_id);
-    harness.run_tasks_until(GC::create_function(heap, GC::captures(waiting_fetch), [](auto& waiting_fetch) { return !waiting_fetch->resolutions.is_empty(); }));
-    EXPECT(!commands->steps.contains_slow("end of fetch 2"sv));
-    GC::scrub_stack_for_testing();
-    heap.collect_garbage_and_return_memory_to_system();
-    EXPECT(preload_wait_handle_is_gone(controller->token()));
-
+    harness.run_until_responses(record, 1);
+    EXPECT(record->responses[0]->is_network_error());
     harness.run_until_step(commands, "end of fetch 2"sv);
     harness.settle();
-    EXPECT_EQ(record->responses.size(), 1u);
-    EXPECT(!commands->steps.contains_slow("abandon preload wait of 2"sv));
+    EXPECT_EQ(waiting_fetch->resolutions, (Vector<ByteString> { "resolved by a cancelled preload" }));
+    EXPECT_EQ(request_server.messages(), (Vector<ByteString> { "start 0 GET /preloaded", "stop 0" }));
 }
 
-TEST_CASE(a_preload_stopped_just_after_its_end_still_resolves_the_fetch_waiting_for_it)
+static void stop_the_preload_a_fetch_waits_for(bool preload_body_in_flight)
 {
     Core::EventLoop event_loop;
     install_font_plugin();
@@ -1648,28 +1700,38 @@ TEST_CASE(a_preload_stopped_just_after_its_end_still_resolves_the_fetch_waiting_
     auto waiting_fetch = make_ref_counted<WaitingFetch>();
     auto preload_token = start_preload(harness, "http://127.0.0.1:8000/preloaded"sv, waiting_fetch);
     auto preload_id = request_server.wait_for_request("GET"sv);
-    request_server.send_headers(preload_id, 200);
-    run_until_handed_over(harness, preload_token);
+    if (preload_body_in_flight) {
+        request_server.send_headers(preload_id, 200);
+        run_until_handed_over(harness, preload_token);
+    }
 
     auto record = make_ref_counted<AlgorithmCalls>();
     auto request = harness.create_request_for("http://127.0.0.1:8000/preloaded"sv);
     auto controller = GC::make_root(harness.fetch(request, recording_responses(harness.realm->heap(), record)));
     waiting_fetch->token = controller->token();
-    run_until_waiting_for_preload(harness, *controller);
+    run_until_waiting_for_preload(harness, commands);
 
-    // The event loop runs the preload's consume body steps only once the preload has ended and been stopped.
-    {
-        auto pause = harness.pause_event_loop();
-        request_server.send_finished(preload_id);
-        harness.run_until_step(commands, "end of fetch 1"sv);
-        harness.with_execution_context([&] { find_controller(preload_token)->stop_fetch(); });
-    }
-
+    // The preload's stop cancels its entry, and the waiting fetch fetches on its own, and reports its own timing.
+    harness.with_execution_context([&] { find_controller(preload_token)->stop_fetch(); });
+    EXPECT(!controller->preload_reports_timing());
+    auto own_id = request_server.wait_for_request("GET"sv);
+    request_server.send_headers(own_id, 200);
+    request_server.send_finished(own_id);
     harness.run_until_responses(record, 1);
-    EXPECT_EQ(waiting_fetch->resolutions, (Vector<ByteString> { "resolved by a stopped preload, rooted: true" }));
+    EXPECT_EQ(waiting_fetch->resolutions, (Vector<ByteString> { "resolved by a cancelled preload" }));
     EXPECT(!record->responses[0]->is_network_error());
     harness.run_until_step(commands, "end of fetch 2"sv);
     EXPECT(!is_rooted(controller->token()));
+}
+
+TEST_CASE(a_fetch_waiting_for_a_preload_stopped_before_its_response_fetches_on_its_own)
+{
+    stop_the_preload_a_fetch_waits_for(false);
+}
+
+TEST_CASE(a_fetch_waiting_for_a_preload_stopped_with_its_body_in_flight_fetches_on_its_own)
+{
+    stop_the_preload_a_fetch_waits_for(true);
 }
 
 namespace {

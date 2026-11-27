@@ -49,7 +49,7 @@ ALLOWED_REALM_MENTIONS = {
     "Clipboard": (4, 6, "the C++ facades create the Rust objects in a given realm"),
     "ContentSecurityPolicy": (
         6,
-        13,
+        15,
         "CSP violation/report objects and callbacks still materialize JS-facing values; "
         "the C++ glue of the Rust SecurityPolicyViolationEvent creates it in a given realm",
     ),
@@ -62,7 +62,7 @@ ALLOWED_REALM_MENTIONS = {
     ),
     "Fetch": (
         22,
-        65,
+        51,
         "Fetch bodies, headers, requests, responses, response views, and controllers still materialize JS values/streams; "
         "a fetch controller keeps the realm that started its fetch, in which its agent runs the rest of a response's "
         "handover; BodyStreamPullSource creates body streams and materializes their pulls and errors on the consumer side, "
@@ -72,11 +72,11 @@ ALLOWED_REALM_MENTIONS = {
     "FileAPI": (2, 9, "Blob glue still creates streams and buffers in selected realms"),
     "HTML": (
         86,
-        210,
+        211,
         "HTML algorithms still contain structured serialization, including canvas, navigation transfer/reconstruction, worker/worklet, and event realm use, and cross-origin Window/Location property functions are created in the current realm; window postMessage glue supplies principal realms and routes remote messages; "
         "the C++ glue of the Rust structured serialization creates platform objects and SharedArrayBuffers in a given realm; "
         "the C++ glue of the Rust Storage and of the Rust events creates them in a given realm, "
-        "and the C++ glue of the Rust DataTransfer wraps its item list in a given realm",
+        "and the C++ glue of the Rust DragDataStore wraps file-system entries in a given realm",
     ),
     "IndexedDB": (
         4,

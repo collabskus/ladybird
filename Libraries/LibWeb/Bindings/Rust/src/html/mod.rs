@@ -72,6 +72,10 @@ pub(crate) mod dom_string_list;
 #[cfg(not(test))]
 pub(crate) mod dom_string_map;
 #[cfg(not(test))]
+pub(crate) mod drag_data_store;
+#[cfg(not(test))]
+pub(crate) mod drag_event;
+#[cfg(not(test))]
 pub(crate) mod error_event;
 #[cfg(not(test))]
 pub(crate) mod event_source;

@@ -27,12 +27,6 @@
 #include <LibWeb/HTML/EventLoop/Task.h>
 #include <LibWeb/HTML/StructuredSerializeTypes.h>
 
-namespace Web::Fetch::Fetching {
-
-class PendingResponse;
-
-}
-
 namespace Web::Fetch::Infrastructure {
 
 // https://fetch.spec.whatwg.org/#fetch-controller
@@ -75,15 +69,15 @@ public:
     Optional<HTML::IPCSerializationRecord> const& serialized_abort_reason() const { return m_serialized_abort_reason; }
     void terminate();
 
-    void set_algorithms(Badge<FetchParams>, GC::Ref<FetchAlgorithms const>);
+    // Creates the controller's fetch params, whose fetch runs the algorithms. Called once.
+    [[nodiscard]] NonnullRefPtr<FetchParams> create_fetch_params(NonnullRefPtr<Request>, GC::Ref<FetchAlgorithms const>, NonnullRefPtr<FetchTimingInfo>, NonnullRefPtr<LoaderConfigSnapshot const>);
+
     [[nodiscard]] GC::Ref<FetchAlgorithms const> algorithms() const;
 
     // The fetch params created with the controller, for which WebDriver BiDi reports errors and intercepts requests.
-    void set_original_fetch_params(Badge<FetchParams>, FetchParams const&);
     [[nodiscard]] RefPtr<FetchParams> original_fetch_params() const;
 
     // The request the controller's fetch params were created with.
-    void set_request(Badge<FetchParams>, NonnullRefPtr<Request>);
     [[nodiscard]] NonnullRefPtr<Request> request() const;
 
     // The realm that started the fetch.
@@ -99,7 +93,6 @@ public:
     void set_preload_reports_timing(bool preload_reports_timing) { m_preload_reports_timing = preload_reports_timing; }
 
     // The network observation of the request the controller's fetch params were created with.
-    void set_network_observation(Badge<FetchParams>, NonnullRefPtr<NetworkObservation>);
     [[nodiscard]] RefPtr<NetworkObservation> const& network_observation() const { return m_network_observation; }
 
     [[nodiscard]] TaskDestination const& task_destination() const { return m_task_destination; }
@@ -116,12 +109,6 @@ public:
     void set_keepalive(bool is_keepalive) { m_is_keepalive = is_keepalive; }
 
     [[nodiscard]] bool response_arrived() const { return m_control_block->response_arrived(); }
-    [[nodiscard]] RefPtr<Fetching::PendingResponse> const& pending_preloaded_response() const { return m_pending_preloaded_response; }
-    void set_pending_preloaded_response(RefPtr<Fetching::PendingResponse>);
-    // The handle in the callback of the preload entry whose response the fetch's preloaded response candidate waits for,
-    // while that callback lives.
-    [[nodiscard]] WeakPtr<Fetching::PreloadWaitHandle> const& preload_wait_handle() const { return m_preload_wait_handle; }
-    void set_preload_wait_handle(WeakPtr<Fetching::PreloadWaitHandle> preload_wait_handle) { m_preload_wait_handle = move(preload_wait_handle); }
 
     bool requires_network() const { return m_control_block->requires_network(); }
     bool has_started_request() const { return m_control_block->has_started_request(); }
@@ -207,11 +194,6 @@ private:
 
     bool m_is_keepalive { false };
     bool m_preload_reports_timing { false };
-
-    // NB: Assumes one waiting consumer for a pending preloaded response.
-    // Widen this if preload handoff ever supports multiple consumers.
-    RefPtr<Fetching::PendingResponse> m_pending_preloaded_response;
-    WeakPtr<Fetching::PreloadWaitHandle> m_preload_wait_handle;
 
     struct StartedFetch {
         Engine::FetchId fetch_id;

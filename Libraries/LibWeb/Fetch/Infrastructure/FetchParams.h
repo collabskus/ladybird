@@ -10,19 +10,28 @@
 #include <AK/RefCounted.h>
 #include <AK/WeakPtr.h>
 #include <AK/Weakable.h>
-#include <LibGC/Ptr.h>
+#include <LibGC/HoldsNoCellEdges.h>
 #include <LibWeb/Export.h>
-#include <LibWeb/Fetch/Engine/FetchEngineRecord.h>
-#include <LibWeb/Fetch/Engine/StartFetchInput.h>
-#include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
-#include <LibWeb/Fetch/Infrastructure/FetchController.h>
+#include <LibWeb/Fetch/Engine/FetchBodyDeliveryGate.h>
+#include <LibWeb/Fetch/Infrastructure/FetchControlBlock.h>
+#include <LibWeb/Fetch/Infrastructure/FetchControllerToken.h>
 #include <LibWeb/Fetch/Infrastructure/FetchTimingInfo.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Requests.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWebCommon/FileAPI/SerializedBlobURLEntry.h>
 #include <LibWebCommon/Loader/LoaderConfigSnapshot.h>
 
+namespace Web::Fetch::Engine {
+
+class EngineEventSink;
+class FetchEngineRecord;
+struct StartFetchInput;
+
+}
+
 namespace Web::Fetch::Infrastructure {
+
+class FetchControllerRegistry;
 
 // https://fetch.spec.whatwg.org/#fetch-params
 class WEB_API FetchParams
@@ -34,13 +43,14 @@ public:
     struct PreloadedResponseCandidatePendingTag { };
     using PreloadedResponseCandidate = Variant<Empty, PreloadedResponseCandidatePendingTag, NonnullRefPtr<Response>>;
 
-    [[nodiscard]] static NonnullRefPtr<FetchParams> create(FetchController&, NonnullRefPtr<Request>, GC::Ref<FetchAlgorithms const>, NonnullRefPtr<FetchTimingInfo>, NonnullRefPtr<LoaderConfigSnapshot const>);
+    [[nodiscard]] static NonnullRefPtr<FetchParams> create(FetchControllerToken, WeakPtr<FetchControllerRegistry>, NonnullRefPtr<FetchControlBlock>, NonnullRefPtr<Request>, NonnullRefPtr<FetchTimingInfo>, NonnullRefPtr<LoaderConfigSnapshot const>);
     [[nodiscard]] static NonnullRefPtr<FetchParams> copy(FetchParams const&);
+    ~FetchParams();
 
     [[nodiscard]] NonnullRefPtr<Request> request() const { return m_request; }
     void set_request(NonnullRefPtr<Request> request) { m_request = move(request); }
-    [[nodiscard]] GC::Ref<FetchController> controller() const;
     [[nodiscard]] FetchControllerToken controller_token() const { return m_controller_token; }
+    [[nodiscard]] WeakPtr<FetchControllerRegistry> const& controller_registry() const { return m_controller_registry; }
     [[nodiscard]] FetchControlBlock& control_block() const { return *m_control_block; }
     [[nodiscard]] NonnullRefPtr<FetchTimingInfo> timing_info() const { return m_timing_info; }
     [[nodiscard]] LoaderConfig const& loader_config() const { return m_loader_config->config; }
@@ -51,7 +61,7 @@ public:
 
     [[nodiscard]] PreloadedResponseCandidate& preloaded_response_candidate() { return m_preloaded_response_candidate; }
     [[nodiscard]] PreloadedResponseCandidate const& preloaded_response_candidate() const { return m_preloaded_response_candidate; }
-    void set_preloaded_response_candidate(PreloadedResponseCandidate preloaded_response_candidate) { m_preloaded_response_candidate = move(preloaded_response_candidate); }
+    void set_preloaded_response_candidate(PreloadedResponseCandidate preloaded_response_candidate) const { m_preloaded_response_candidate = move(preloaded_response_candidate); }
 
     [[nodiscard]] bool is_aborted() const;
     [[nodiscard]] bool is_canceled() const;
@@ -62,12 +72,12 @@ public:
     [[nodiscard]] Optional<FileAPI::SerializedBlobURLEntry> const& blob_url_entry() const { return m_blob_url_entry; }
     void set_blob_url_entry(Optional<FileAPI::SerializedBlobURLEntry> blob_url_entry) { m_blob_url_entry = move(blob_url_entry); }
 
-    [[nodiscard]] Engine::StartFetchInput start_fetch_input(Engine::FetchId, NonnullOwnPtr<Engine::EngineEventSink>) const;
+    [[nodiscard]] Engine::StartFetchInput start_fetch_input(Engine::FetchId, RefPtr<Response>, NonnullOwnPtr<Engine::EngineEventSink>) const;
 
     // Set by the fetch engine when it runs main fetch's in-parallel steps, and shared with copies made after that. A
     // CORS preflight's fetch params share the record of the fetch the preflight is for.
     [[nodiscard]] Engine::FetchEngineRecord* engine_record() const { return m_engine_record; }
-    void set_engine_record(NonnullRefPtr<Engine::FetchEngineRecord> engine_record) const { m_engine_record = move(engine_record); }
+    void set_engine_record(NonnullRefPtr<Engine::FetchEngineRecord>) const;
 
     [[nodiscard]] bool is_cors_preflight() const { return m_is_cors_preflight; }
     void set_is_cors_preflight() { m_is_cors_preflight = true; }
@@ -81,7 +91,7 @@ public:
     void discard_response_body(Response const&) const;
 
 private:
-    FetchParams(NonnullRefPtr<Request>, GC::Ref<FetchAlgorithms const>, FetchController&, NonnullRefPtr<FetchTimingInfo>, NonnullRefPtr<LoaderConfigSnapshot const>);
+    FetchParams(FetchControllerToken, WeakPtr<FetchControllerRegistry>, NonnullRefPtr<FetchControlBlock>, NonnullRefPtr<Request>, NonnullRefPtr<FetchTimingInfo>, NonnullRefPtr<LoaderConfigSnapshot const>);
     FetchParams(FetchParams const&);
 
     // https://fetch.spec.whatwg.org/#fetch-params-request
@@ -109,7 +119,7 @@ private:
     // https://fetch.spec.whatwg.org/#fetch-params-preloaded-response-candidate
     // preloaded response candidate (default null)
     //     Null, "pending", or a response.
-    PreloadedResponseCandidate m_preloaded_response_candidate;
+    mutable PreloadedResponseCandidate m_preloaded_response_candidate;
 
     // Non-spec process integration: a navigation response is retained while the UI process selects its document host.
     bool m_has_response_body_transfer_lease { false };

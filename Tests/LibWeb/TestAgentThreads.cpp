@@ -271,10 +271,17 @@ static constexpr auto AGENT_SCRIPT = R"~~~(
         const matrix = new DOMMatrix([1, 2, 3, 4, 5, 6]).translate(1, 2);
         check("matrix", matrix.e === 12);
 
-        const result = await navigator.locks.request("lock", async lock => lock.name);
+        // NB: The agents have the same storage key, so they share the lock: one agent holds it at a time.
+        let clientId;
+        const result = await navigator.locks.request("lock", async lock => {
+            const holders = (await navigator.locks.query()).held.filter(held => held.name === lock.name);
+            check("lock holders", holders.length === 1);
+            clientId = holders[0].clientId;
+            return lock.name;
+        });
         check("locks", result === "lock");
         const state = await navigator.locks.query();
-        check("lock state", state.held.length === 0);
+        check("lock state", !state.held.some(held => held.clientId === clientId));
 
         check("navigator", navigator.userAgent.length > 0 && navigator.platform.length > 0 && navigator.language.length > 0);
         check("hardware", navigator.hardwareConcurrency > 0);
@@ -667,11 +674,10 @@ TEST_CASE(a_fetch_started_just_before_close_never_runs_its_in_parallel_steps)
         auto request = agent.fetch_and_close("about:blank"sv, Web::Fetch::Infrastructure::FetchAlgorithms::Input { Web::Fetch::Engine::BodyIntent::DrainAndDiscard });
 
         // The worker's event loop has stopped with the command that runs the fetch's in-parallel steps still queued.
-        // Those steps keep the fetch's controller alive.
         EXPECT(has_queued_commands(*Web::HTML::surrounding_agent().fetch_executor, 1));
 
-        // So does the agent's registry, until the fetch ends, which it never does. The registry's roots go with the agent,
-        // before its heap.
+        // The agent's registry keeps the fetch's controller alive until the fetch ends, which it never does. The
+        // registry's roots go with the agent, before its heap.
         {
             auto& registry = Web::HTML::surrounding_agent().fetch_controller_registry;
             auto controllers = registry.controllers();

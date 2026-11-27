@@ -58,6 +58,10 @@ void FetchEngineRecord::stop()
 {
     ASSERT(is_on_owner_thread());
     m_stopped = true;
+    // AD-HOC: A stop, abort or termination ends main fetch's wait for a preloaded response, which Fetch's wait ignores.
+    //         The fetch then ends without a handover.
+    if (m_main_fetch.has<MainFetchWaitsForPreload>())
+        end_main_fetch();
     if (m_redirect_continuation.has_value())
         abandon_redirect();
     stop_body_transport();
@@ -89,7 +93,7 @@ void FetchEngineRecord::open_redirect_continuation(NetworkTransportHandle* netwo
         abandon_redirect();
 }
 
-FetchEngineRecord::RedirectAnswerResult FetchEngineRecord::resolve_redirect(ContinuationId continuation_id, Command::ResolveRedirect::Resolution const& resolution)
+FetchEngineRecord::RedirectAnswerResult FetchEngineRecord::resolve_redirect(ContinuationId continuation_id, RedirectAnswer answer)
 {
     ASSERT(is_on_owner_thread());
     if (!m_redirect_continuation.has_value() || m_redirect_continuation->id != continuation_id)
@@ -97,17 +101,20 @@ FetchEngineRecord::RedirectAnswerResult FetchEngineRecord::resolve_redirect(Cont
     if (!m_main_fetch.has<MainFetchEnded>())
         return RedirectAnswerResult::NotHandedOver;
 
-    resolution.visit(
-        [&](Command::ResolveRedirect::Follow) {
-            // NB: Main fetch runs again before the stop of the body transport can end the redirect's load.
-            m_main_fetch = MainFetchRunning {};
-            close_redirect_continuation();
-        },
-        [&](Command::ResolveRedirect::AcceptAsFinal) {
-            m_redirect_continuation.clear();
-            end_fetch_unless_anything_is_left();
-        },
-        [&](Command::ResolveRedirect::Abandon) { abandon_redirect(); });
+    switch (answer) {
+    case RedirectAnswer::Follow:
+        // NB: Main fetch runs again before the stop of the body transport can end the redirect's load.
+        m_main_fetch = MainFetchRunning {};
+        close_redirect_continuation();
+        break;
+    case RedirectAnswer::AcceptAsFinal:
+        m_redirect_continuation.clear();
+        end_fetch_unless_anything_is_left();
+        break;
+    case RedirectAnswer::Abandon:
+        abandon_redirect();
+        break;
+    }
     return RedirectAnswerResult::Settled;
 }
 
@@ -147,7 +154,7 @@ void FetchEngineRecord::main_fetch_hands_over(Event::ResponseDelivery delivery)
     if (m_main_fetch.has<MainFetchEnded>())
         return;
     VERIFY(m_main_fetch.has<MainFetchRunning>());
-    m_main_fetch = MainFetchEnded {};
+    set_main_fetch_ended();
     m_event_sink->handle_event(move(delivery));
     end_fetch_unless_anything_is_left();
 }
@@ -160,6 +167,14 @@ void FetchEngineRecord::main_fetch_cannot_hand_over()
     end_main_fetch();
 }
 
+KnownHSTSHostProvider& FetchEngineRecord::known_hsts_host_provider()
+{
+    ASSERT(is_on_owner_thread());
+    auto* records = m_records.ptr();
+    VERIFY(records);
+    return records->known_hsts_host_provider();
+}
+
 void FetchEngineRecord::defer(Function<void()> work)
 {
     ASSERT(is_on_owner_thread());
@@ -167,26 +182,42 @@ void FetchEngineRecord::defer(Function<void()> work)
         records->defer(move(work));
 }
 
-void FetchEngineRecord::main_fetch_waits_for_preload()
+void FetchEngineRecord::expect_preload_resolution()
+{
+    ASSERT(is_on_owner_thread());
+    if (m_preload_wait_resolution.has<NoPreloadWait>())
+        m_preload_wait_resolution = PreloadWaitUnresolved {};
+}
+
+void FetchEngineRecord::wait_for_preload(Function<void(RefPtr<Infrastructure::Response>)> resume)
 {
     ASSERT(is_on_owner_thread());
     VERIFY(m_main_fetch.has<MainFetchRunning>());
-    m_main_fetch = MainFetchWaitsForPreload {};
+    expect_preload_resolution();
+    if (auto* resolved_early = m_preload_wait_resolution.get_pointer<PreloadWaitResolvedEarly>()) {
+        auto response = move(resolved_early->response);
+        m_preload_wait_resolution = PreloadWaitResolved {};
+        resume(move(response));
+        return;
+    }
+    m_main_fetch = MainFetchWaitsForPreload { move(resume) };
 }
 
-void FetchEngineRecord::main_fetch_stops_waiting_for_preload()
+bool FetchEngineRecord::resolve_preload_wait(RefPtr<Infrastructure::Response> response)
 {
     ASSERT(is_on_owner_thread());
-    VERIFY(m_main_fetch.has<MainFetchWaitsForPreload>());
-    m_main_fetch = MainFetchRunning {};
-}
-
-bool FetchEngineRecord::abandon_preload_wait()
-{
-    ASSERT(is_on_owner_thread());
-    if (!m_main_fetch.has<MainFetchWaitsForPreload>())
+    if (!m_preload_wait_resolution.has<PreloadWaitUnresolved>())
         return false;
-    end_main_fetch();
+
+    auto* waiting = m_main_fetch.get_pointer<MainFetchWaitsForPreload>();
+    if (!waiting) {
+        m_preload_wait_resolution = PreloadWaitResolvedEarly { move(response) };
+        return true;
+    }
+    m_preload_wait_resolution = PreloadWaitResolved {};
+    auto resume = move(waiting->resume);
+    m_main_fetch = MainFetchRunning {};
+    resume(move(response));
     return true;
 }
 
@@ -198,9 +229,16 @@ void FetchEngineRecord::did_end_load()
     end_fetch_unless_anything_is_left();
 }
 
-void FetchEngineRecord::end_main_fetch()
+void FetchEngineRecord::set_main_fetch_ended()
 {
     m_main_fetch = MainFetchEnded {};
+    if (m_preload_wait_resolution.has<PreloadWaitResolvedEarly>())
+        m_preload_wait_resolution = PreloadWaitResolved {};
+}
+
+void FetchEngineRecord::end_main_fetch()
+{
+    set_main_fetch_ended();
     end_fetch_unless_anything_is_left();
 }
 
@@ -256,6 +294,13 @@ void FetchEngineRecords::attach_to_executor(FetchExecutor& executor)
     m_executor = &executor;
 }
 
+KnownHSTSHostProvider& FetchEngineRecords::known_hsts_host_provider()
+{
+    ASSERT(is_on_owner_thread());
+    VERIFY(m_executor);
+    return m_executor->known_hsts_host_provider();
+}
+
 void FetchEngineRecords::defer(Function<void()> work)
 {
     ASSERT(is_on_owner_thread());
@@ -291,23 +336,23 @@ void FetchEngineRecords::stop(FetchId fetch_id)
     record->stop();
 }
 
-FetchEngineRecords::RedirectAnswerOutcome FetchEngineRecords::resolve_redirect(Command::ResolveRedirect const& resolve)
+FetchEngineRecords::RedirectAnswerOutcome FetchEngineRecords::resolve_redirect(FetchId fetch_id, ContinuationId continuation_id, RedirectAnswer answer)
 {
     ASSERT(is_on_owner_thread());
-    if (resolve.fetch_id > m_last_started_fetch_id) {
+    if (fetch_id > m_last_started_fetch_id) {
         m_agent->misbehaved("The agent resolved a redirect of a fetch it has not started"sv);
         return RedirectAnswerMisbehaved {};
     }
-    if (resolve.continuation_id > m_last_offered_continuation_id) {
+    if (continuation_id > m_last_offered_continuation_id) {
         m_agent->misbehaved("The agent resolved a redirect the engine never offered"sv);
         return RedirectAnswerMisbehaved {};
     }
 
-    auto found_record = m_records.get(resolve.fetch_id);
+    auto found_record = m_records.get(fetch_id);
     if (!found_record.has_value())
         return RedirectAnswerDropped {};
     NonnullRefPtr record = **found_record;
-    switch (record->resolve_redirect(resolve.continuation_id, resolve.resolution)) {
+    switch (record->resolve_redirect(continuation_id, answer)) {
     case FetchEngineRecord::RedirectAnswerResult::Settled:
         return record;
     case FetchEngineRecord::RedirectAnswerResult::NotOpen:
@@ -325,22 +370,34 @@ void FetchEngineRecords::did_offer_redirect_continuation(Badge<FetchEngineRecord
     m_last_offered_continuation_id = continuation_id;
 }
 
-void FetchEngineRecords::abandon_preload_wait(FetchId fetch_id)
+void FetchEngineRecords::resolve_preload_wait(FetchId fetch_id, RefPtr<Infrastructure::Response> response)
 {
     ASSERT(is_on_owner_thread());
     if (fetch_id > m_last_started_fetch_id) {
-        m_agent->misbehaved("The agent abandoned a preload wait of a fetch it has not started"sv);
+        m_agent->misbehaved("The agent resolved a preload wait of a fetch it has not started"sv);
         return;
     }
 
     auto found_record = m_records.get(fetch_id);
     if (!found_record.has_value())
         return;
+    if (response && !response->is_network_error()) {
+        auto body = response->unsafe_response()->body();
+        if (!body.has_value() || !body->holds_all_its_bytes()) {
+            m_agent->misbehaved("The agent resolved a preload wait with a response whose body is not all its bytes"sv);
+            return;
+        }
+    }
+
     NonnullRefPtr record = **found_record;
-    if (record->has_ended())
+    if (record->main_fetch_has_ended())
         return;
-    if (!record->abandon_preload_wait())
-        m_agent->misbehaved("The agent abandoned a preload wait of a fetch that waits for no preload"sv);
+    if (!record->has_preload_candidate()) {
+        m_agent->misbehaved("The agent resolved a preload wait of a fetch whose main fetch waits for no preload"sv);
+        return;
+    }
+    if (!record->resolve_preload_wait(move(response)))
+        m_agent->misbehaved("The agent resolved a preload wait twice"sv);
 }
 
 void FetchEngineRecords::add_network_transport(NetworkTransportHandle& handle, FetchBodyDeliveryGate& delivery_gate)

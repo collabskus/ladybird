@@ -3156,6 +3156,8 @@ bool TabBar::start_window_move()
 
 TabWidget::TabWidget(WebView::IsPrivate is_private, QWidget* parent)
     : QWidget(parent)
+    , m_show_all_tabs_button(Application::settings().appearance().show_all_tabs_button)
+    , m_show_sidebar_button(Application::settings().appearance().show_sidebar_button)
 {
     // NB: The window is marked as private before any chrome inside it is made.
     if (is_private == WebView::IsPrivate::Yes)
@@ -3251,18 +3253,20 @@ TabWidget::TabWidget(WebView::IsPrivate is_private, QWidget* parent)
     // The buttons move together on the left. With the sidebar on the right, only the all-tabs button follows it.
     m_ladybird_buttons = new QWidget(this);
     auto* ladybird_buttons_layout = new QHBoxLayout(m_ladybird_buttons);
+    // Keep the Ladybird button at the start of the group while the layout gives up the all-tabs button's space.
+    ladybird_buttons_layout->setAlignment(Qt::AlignLeft);
     ladybird_buttons_layout->setContentsMargins(0, 0, 0, 0);
     // NB: The Ladybird button's room for its focus ring takes part of the gap after it.
     ladybird_buttons_layout->setSpacing(ALL_TABS_BUTTON_LEADING_GAP - LADYBIRD_BUTTON_FOCUS_RING_ROOM);
     ladybird_buttons_layout->addWidget(m_ladybird_button, 0, Qt::AlignVCenter);
     ladybird_buttons_layout->addWidget(m_all_tabs_button, 0, Qt::AlignVCenter);
     m_ladybird_buttons->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
-    // NB: While pictures stand in for the buttons, they still take up their room, which the toolbar keeps clear of.
-    for (QWidget* button : { static_cast<QWidget*>(m_ladybird_button), static_cast<QWidget*>(m_all_tabs_button) }) {
-        auto size_policy = button->sizePolicy();
-        size_policy.setRetainSizeWhenHidden(true);
-        button->setSizePolicy(size_policy);
-    }
+
+    // The toolbar keeps room for the Ladybird button while a picture stands in for it.
+    auto ladybird_button_size_policy = m_ladybird_button->sizePolicy();
+    ladybird_button_size_policy.setRetainSizeWhenHidden(true);
+    m_ladybird_button->setSizePolicy(ladybird_button_size_policy);
+
     // NB: The room around and between the buttons is empty chrome, which moves the window like the rest of it.
     m_ladybird_buttons->setProperty(WINDOW_DRAG_REGION_PROPERTY, true);
 
@@ -3313,10 +3317,18 @@ TabWidget::TabWidget(WebView::IsPrivate is_private, QWidget* parent)
 
     m_vertical_tabs_toggle_button = new ChromeHeaderButton(m_vertical_tab_bar_column);
     m_vertical_tabs_toggle_button->setObjectName("LadybirdVerticalTabsToggleButton");
-    auto* vertical_tabs_toggle_action = create_application_action(*this, ApplicationActions::the().toggle_vertical_tabs_expanded_action());
-    // NB: The application's sidebar action owns the shortcut, so the window and its View menu share one action for it.
+    auto* vertical_tabs_toggle_action = create_application_action(*this, ApplicationActions::the().toggle_vertical_tabs_expanded_action(), IncludeActionIcon::No);
     vertical_tabs_toggle_action->setShortcuts({});
-    m_vertical_tabs_toggle_button->setDefaultAction(vertical_tabs_toggle_action);
+
+    // The toolbar button has its own visibility setting, separate from the View menu action.
+    connect(m_vertical_tabs_toggle_button, &QToolButton::clicked, vertical_tabs_toggle_action, &QAction::trigger);
+    auto update_sidebar_toggle_text = [this, vertical_tabs_toggle_action] {
+        m_vertical_tabs_toggle_button->setText(vertical_tabs_toggle_action->text());
+        m_vertical_tabs_toggle_button->setToolTip(vertical_tabs_toggle_action->toolTip());
+    };
+    connect(vertical_tabs_toggle_action, &QAction::changed, m_vertical_tabs_toggle_button, update_sidebar_toggle_text);
+    update_sidebar_toggle_text();
+
     m_vertical_tabs_toggle_button->setAutoRaise(true);
     m_vertical_tabs_toggle_button->setFocusPolicy(Qt::NoFocus);
     m_vertical_tabs_toggle_button->setIconSize({ 16, 16 });
@@ -3795,7 +3807,7 @@ void TabWidget::float_sidebar_buttons_while_toggling()
             return;
         m_floating_buttons_strip->hide();
         m_ladybird_button->show();
-        m_all_tabs_button->show();
+        m_all_tabs_button->setVisible(m_show_all_tabs_button);
         return;
     }
 
@@ -3859,18 +3871,21 @@ void TabWidget::float_sidebar_buttons_while_toggling()
 
         m_all_tabs_button->hide();
         m_vertical_tabs_toggle_button->hide();
-        m_floating_all_tabs_button->show();
-        m_floating_sidebar_toggle->show();
+        m_floating_all_tabs_button->setVisible(m_show_all_tabs_button);
+        m_floating_sidebar_toggle->setVisible(m_show_sidebar_button);
         static_cast<QGraphicsOpacityEffect*>(m_floating_all_tabs_button->graphicsEffect())->setOpacity(1);
 
         auto& all_tabs = *m_floating_all_tabs_button;
         auto& toggle = *m_floating_sidebar_toggle;
 
         auto gap = m_toolbar->trailing_sidebar_slot().layout()->spacing();
-        auto buttons_width = all_tabs.width() + gap + toggle.width();
+        auto toggle_x = m_show_all_tabs_button ? all_tabs.width() : 0;
+        if (m_show_all_tabs_button && m_show_sidebar_button)
+            toggle_x += gap;
+        auto buttons_width = toggle_x + (m_show_sidebar_button ? toggle.width() : 0);
         auto strip_left = width() - m_toolbar->trailing_sidebar_slot_right_inset(m_window_controls_visible) - buttons_width;
         all_tabs.move(0, center_y(all_tabs));
-        toggle.move(all_tabs.width() + gap, center_y(toggle));
+        toggle.move(toggle_x, center_y(toggle));
 
         if (controls_float) {
             auto& controls = *m_floating_window_controls;
@@ -3878,7 +3893,7 @@ void TabWidget::float_sidebar_buttons_while_toggling()
         }
 
         m_floating_buttons_strip->setGeometry(strip_left, 0, width() - strip_left, toolbar_height);
-        m_floating_buttons_strip->show();
+        m_floating_buttons_strip->setVisible(buttons_width > 0 || controls_float);
         m_floating_buttons_strip->raise();
         return;
     }
@@ -3890,12 +3905,12 @@ void TabWidget::float_sidebar_buttons_while_toggling()
     // NB: Once the toolbar is in the sidebar, the footer shows the real all-tabs button, which fades with it.
     auto moves_toolbar = toggle_moves_toolbar();
     auto button_is_in_footer = moves_toolbar && m_toggling_toolbar_in_sidebar;
-    auto toggle_floats = !sidebar_toggle_stays_in_corner();
+    auto toggle_floats = m_show_sidebar_button && !sidebar_toggle_stays_in_corner();
     m_ladybird_button->hide();
-    m_all_tabs_button->setVisible(button_is_in_footer);
-    m_vertical_tabs_toggle_button->setVisible(!toggle_floats);
+    m_all_tabs_button->setVisible(m_show_all_tabs_button && button_is_in_footer);
+    m_vertical_tabs_toggle_button->setVisible(m_show_sidebar_button && !toggle_floats);
     m_floating_ladybird_button->show();
-    m_floating_all_tabs_button->setVisible(!button_is_in_footer);
+    m_floating_all_tabs_button->setVisible(m_show_all_tabs_button && !button_is_in_footer);
     m_floating_sidebar_toggle->setVisible(toggle_floats);
 
     auto opacity = moves_toolbar ? clamp(1 - (static_cast<qreal>(sidebar_opening_time()) / TOOLBAR_ROW_FADE_DURATION), 0.0, 1.0) : 1.0;
@@ -3912,13 +3927,13 @@ void TabWidget::float_sidebar_buttons_while_toggling()
 
     auto ladybird_x = sidebar_ladybird_button_inset(vertical_tabs_hold_window_controls()) - LADYBIRD_BUTTON_FOCUS_RING_ROOM;
     auto all_tabs_x = ladybird_x + ladybird.width() + m_ladybird_buttons->layout()->spacing();
-    auto after_all_tabs_x = all_tabs_x + all_tabs.width();
-    auto toggle_x = max(after_all_tabs_x + m_toolbar->sidebar_slot().layout()->spacing(), current_vertical_tabs_width() - vertical_tabs_side_margin(true) - SIDEBAR_TOGGLE_PAGE_SIDE_MARGIN - toggle.width());
+    auto after_leading_buttons_x = m_show_all_tabs_button ? all_tabs_x + all_tabs.width() : ladybird_x + ladybird.width();
+    auto toggle_x = max(after_leading_buttons_x + m_toolbar->sidebar_slot().layout()->spacing(), current_vertical_tabs_width() - vertical_tabs_side_margin(true) - SIDEBAR_TOGGLE_PAGE_SIDE_MARGIN - toggle.width());
     ladybird.move(ladybird_x, center_y(ladybird));
     all_tabs.move(all_tabs_x, center_y(all_tabs));
     toggle.move(toggle_x, center_y(toggle));
     auto strip_width = toggle_floats ? toggle_x + toggle.width() : button_is_in_footer ? ladybird_x + ladybird.width()
-                                                                                       : after_all_tabs_x;
+                                                                                       : after_leading_buttons_x;
     m_floating_buttons_strip->setGeometry(column_origin.x(), column_origin.y(), strip_width, toolbar_height);
     m_floating_buttons_strip->show();
     m_floating_buttons_strip->raise();
@@ -3950,7 +3965,8 @@ void TabWidget::slide_page_with_toggling_sidebar()
         return;
     }
     // NB: The toolbar's contents start where they sit beside the collapsed sidebar, until the sidebar's edge reaches them.
-    m_toolbar->set_leading_room(max(0, m_toolbar->lead_beside_collapsed_sidebar(*m_ladybird_buttons, sidebar_toggle_stays_in_corner() ? QSize(0, 0) : COLLAPSED_VERTICAL_TABS_TOGGLE_BUTTON_SIZE) - current_vertical_tabs_width()));
+    auto toggle_size = m_show_sidebar_button && !sidebar_toggle_stays_in_corner() ? COLLAPSED_VERTICAL_TABS_TOGGLE_BUTTON_SIZE : QSize {};
+    m_toolbar->set_leading_room(max(0, m_toolbar->lead_beside_collapsed_sidebar(*m_ladybird_buttons, toggle_size) - current_vertical_tabs_width()));
     auto page_width = m_vertical_tabs_content->width() - min(m_vertical_tabs_toggle_from_width, m_vertical_tabs_toggle_to_width);
     m_page_column->setGeometry(current_vertical_tabs_width(), 0, page_width, m_vertical_tabs_content->height());
 }
@@ -4003,7 +4019,8 @@ void TabWidget::move_toolbar_with_toggling_sidebar()
         m_toolbar->setGeometry(0, 0, width(), m_toolbar->height_in_row());
         m_toolbar->stackUnder(m_vertical_tab_bar_column);
         // NB: The row's contents stay where they are beside the collapsed sidebar, whose buttons are in the sidebar now.
-        m_toolbar->set_leading_room(m_toolbar->lead_beside_collapsed_sidebar(*m_ladybird_buttons, sidebar_toggle_stays_in_corner() ? QSize(0, 0) : COLLAPSED_VERTICAL_TABS_TOGGLE_BUTTON_SIZE));
+        auto toggle_size = m_show_sidebar_button && !sidebar_toggle_stays_in_corner() ? COLLAPSED_VERTICAL_TABS_TOGGLE_BUTTON_SIZE : QSize {};
+        m_toolbar->set_leading_room(m_toolbar->lead_beside_collapsed_sidebar(*m_ladybird_buttons, toggle_size));
         m_toolbar->set_contents_opacity(clamp(1 - (static_cast<qreal>(opening_time) / TOOLBAR_ROW_FADE_DURATION), 0.0, 1.0));
         // NB: The field's panel is above the page, which slides up over the row.
         m_toolbar->set_field_clip(QRect(mapTo(window(), QPoint()), QSize(width(), row_height)));
@@ -4459,22 +4476,29 @@ int TabWidget::vertical_tabs_header_spacing() const
 int TabWidget::minimum_vertical_tabs_expanded_width() const
 {
     if (m_ladybird_buttons && vertical_tabs_are_on_right()) {
-        auto top_row_width = vertical_tabs_side_margin(true) + SIDEBAR_TOGGLE_PAGE_SIDE_MARGIN
-            + m_all_tabs_button->sizeHint().width() + m_toolbar->trailing_sidebar_slot().layout()->spacing()
-            + COLLAPSED_VERTICAL_TABS_TOGGLE_BUTTON_SIZE.width() + m_toolbar->trailing_sidebar_slot_right_inset(m_window_controls_visible);
+        auto top_row_width = vertical_tabs_side_margin(true) + SIDEBAR_TOGGLE_PAGE_SIDE_MARGIN + m_toolbar->trailing_sidebar_slot_right_inset(m_window_controls_visible);
+        if (m_show_all_tabs_button)
+            top_row_width += m_all_tabs_button->sizeHint().width();
+        if (m_show_sidebar_button)
+            top_row_width += COLLAPSED_VERTICAL_TABS_TOGGLE_BUTTON_SIZE.width();
+        if (m_show_all_tabs_button && m_show_sidebar_button)
+            top_row_width += m_toolbar->trailing_sidebar_slot().layout()->spacing();
         return max(VERTICAL_TABS_MIN_EXPANDED_WIDTH, top_row_width);
     }
 
     auto has_window_controls = use_native_macos_window_controls() || (m_window_controls_visible && window_controls_are_on_left() != vertical_tabs_are_on_right());
     if (!m_ladybird_buttons || (!has_window_controls && !m_everything_in_sidebar))
         return VERTICAL_TABS_MIN_EXPANDED_WIDTH;
-    // NB: With everything in the sidebar, the navigation buttons sit after the Ladybird button instead.
-    auto after_ladybird_button = m_everything_in_sidebar
-        ? WindowToolbar::navigation_buttons_width_in_sidebar()
-        : m_ladybird_buttons->layout()->spacing() + m_all_tabs_button->sizeHint().width() + VERTICAL_TABS_TOGGLE_BUTTON_SIZE;
     auto top_row_width = sidebar_ladybird_button_inset(has_window_controls) - LADYBIRD_BUTTON_FOCUS_RING_ROOM
-        + m_ladybird_button->sizeHint().width() + SIDEBAR_TOGGLE_MINIMUM_GAP + after_ladybird_button
-        + SIDEBAR_TOGGLE_PAGE_SIDE_MARGIN + vertical_tabs_side_margin(true);
+        + m_ladybird_button->sizeHint().width() + SIDEBAR_TOGGLE_PAGE_SIDE_MARGIN + vertical_tabs_side_margin(true);
+    if (m_everything_in_sidebar) {
+        top_row_width += SIDEBAR_TOGGLE_MINIMUM_GAP + WindowToolbar::navigation_buttons_width_in_sidebar();
+    } else {
+        if (m_show_all_tabs_button)
+            top_row_width += m_ladybird_buttons->layout()->spacing() + m_all_tabs_button->sizeHint().width();
+        if (m_show_sidebar_button)
+            top_row_width += SIDEBAR_TOGGLE_MINIMUM_GAP + VERTICAL_TABS_TOGGLE_BUTTON_SIZE;
+    }
     if (use_native_macos_window_controls())
         return top_row_width;
     return max(VERTICAL_TABS_MIN_EXPANDED_WIDTH, top_row_width);
@@ -4534,7 +4558,15 @@ void TabWidget::rebuild_layout()
     m_vertical_tabs_expanded_width = clamp(m_vertical_tabs_expanded_width, minimum_vertical_tabs_expanded_width(), VERTICAL_TABS_MAX_EXPANDED_WIDTH);
     update_toolbar_window_controls_visibility();
     m_toolbar->set_arrangement(toolbar_is_in_sidebar() ? ToolbarArrangement::Sidebar : ToolbarArrangement::Row, window_controls_are_on_left(), SIDEBAR_CONTENT_INSET - vertical_tabs_side_margin(true));
+
+    // Keep room for the All Tabs button while a picture stands in for it during a sidebar animation.
+    auto all_tabs_button_size_policy = m_all_tabs_button->sizePolicy();
+    all_tabs_button_size_policy.setRetainSizeWhenHidden(m_show_all_tabs_button);
+    m_all_tabs_button->setSizePolicy(all_tabs_button_size_policy);
     place_all_tabs_and_sidebar_toggle();
+    m_all_tabs_button->setVisible(m_show_all_tabs_button);
+    if (m_tab_bar->tab_layout() == TabLayout::Horizontal)
+        m_vertical_tabs_toggle_button->hide();
 
     if (m_tab_bar->tab_layout() != TabLayout::Horizontal) {
         rebuild_layout_for_vertical_tabs();
@@ -4686,6 +4718,26 @@ static QString time_since_closed(AK::Duration duration)
     return days == 1 ? QStringLiteral("Yesterday") : qformatted("{} days ago", days);
 }
 
+void TabWidget::update_toolbar_button_visibility()
+{
+    auto const& appearance = Application::settings().appearance();
+
+    if (m_show_all_tabs_button == appearance.show_all_tabs_button
+        && m_show_sidebar_button == appearance.show_sidebar_button) {
+        return;
+    }
+
+    if (m_show_all_tabs_button && !appearance.show_all_tabs_button && m_all_tabs_popover && m_all_tabs_popover->isVisible())
+        m_all_tabs_popover->close();
+
+    m_show_all_tabs_button = appearance.show_all_tabs_button;
+    m_show_sidebar_button = appearance.show_sidebar_button;
+    rebuild_layout();
+
+    if (m_vertical_tabs_toggling)
+        float_sidebar_buttons_while_toggling();
+}
+
 void TabWidget::show_all_tabs()
 {
     if (!m_all_tabs_popover) {
@@ -4706,15 +4758,19 @@ void TabWidget::show_all_tabs()
 
     update_all_tabs_entries();
 
-    // The list hangs from the button that opens it, toward the middle of the window. In the sidebar's footer, it rises
-    // from the button instead.
-    auto button_center = m_all_tabs_button->mapTo(window(), m_all_tabs_button->rect().center());
-    auto is_in_right_half = button_center.x() > window()->width() / 2;
-    auto alignment = is_in_right_half ? PopoverAlignment::Trailing : PopoverAlignment::Leading;
-    if (toolbar_is_in_sidebar())
-        move_popover_above(*m_all_tabs_popover, *m_all_tabs_button, alignment);
-    else
-        move_popover_below(*m_all_tabs_popover, *m_all_tabs_button, alignment);
+    if (m_all_tabs_button->isVisible()) {
+        auto button_center = m_all_tabs_button->mapTo(window(), m_all_tabs_button->rect().center());
+        auto alignment = button_center.x() > window()->width() / 2 ? PopoverAlignment::Trailing : PopoverAlignment::Leading;
+        if (toolbar_is_in_sidebar())
+            move_popover_above(*m_all_tabs_popover, *m_all_tabs_button, alignment);
+        else
+            move_popover_below(*m_all_tabs_popover, *m_all_tabs_button, alignment);
+    } else if (m_ladybird_button->isVisible()) {
+        move_popover_below(*m_all_tabs_popover, *m_ladybird_button, PopoverAlignment::Leading);
+    } else {
+        move_popover_below(*m_all_tabs_popover, *this, PopoverAlignment::Leading, QRect(TOOLBAR_HORIZONTAL_MARGIN, 0, 1, 1));
+    }
+
     m_all_tabs_popover->show();
 }
 
@@ -4799,15 +4855,19 @@ bool TabWidget::bookmarks_are_in_sidebar() const
     return sidebar_toggle_stays_in_corner();
 }
 
+int TabWidget::sidebar_footer_reserved_height() const
+{
+    return WindowToolbar::sidebar_footer_height() * (m_show_sidebar_button && !vertical_tabs_effectively_expanded() ? 2 : 1);
+}
+
 void TabWidget::place_sidebar_toggle_in_corner()
 {
     m_bookmarks_menu_button->setVisible(m_tab_bar_visible && bookmarks_are_in_sidebar());
     if (!sidebar_toggle_stays_in_corner())
         return;
 
-    auto size = COLLAPSED_VERTICAL_TABS_TOGGLE_BUTTON_SIZE;
     auto footer_height = WindowToolbar::sidebar_footer_height();
-    auto reserved_height = footer_height * (vertical_tabs_effectively_expanded() ? 1 : 2);
+    auto reserved_height = sidebar_footer_reserved_height();
 
     if (m_vertical_tabs_footer_spacer && m_vertical_tabs_footer_spacer->sizeHint().height() != reserved_height) {
         m_vertical_tabs_footer_spacer->changeSize(0, reserved_height, QSizePolicy::Fixed, QSizePolicy::Fixed);
@@ -4815,20 +4875,25 @@ void TabWidget::place_sidebar_toggle_in_corner()
     }
 
     auto footer_top = m_vertical_tab_bar_column->height() - m_vertical_tab_bar_column_layout->contentsMargins().bottom() - footer_height;
-    m_vertical_tabs_toggle_button->move((VERTICAL_TABS_COLLAPSED_WIDTH - size.width()) / 2, footer_top + ((footer_height - size.height()) / 2));
-    m_vertical_tabs_toggle_button->raise();
-
-    auto center_y = m_vertical_tabs_toggle_button->y() + m_vertical_tabs_toggle_button->height() / 2;
-
-    if (!vertical_tabs_effectively_expanded()) {
-        // The collapsed rail stacks bookmarks above the sidebar toggle.
-        m_bookmarks_menu_button->move((VERTICAL_TABS_COLLAPSED_WIDTH - m_bookmarks_menu_button->width()) / 2, center_y - footer_height - m_bookmarks_menu_button->height() / 2);
-        m_bookmarks_menu_button->raise();
-    } else if (m_bookmarks_menu_button->parentWidget() == m_vertical_tab_bar_column) {
-        // Hover expansion keeps the toolbar in its row, so the sidebar places its bookmarks button itself.
-        m_bookmarks_menu_button->move(m_vertical_tabs_toggle_button->geometry().right() + 1, center_y - m_bookmarks_menu_button->height() / 2);
-        m_bookmarks_menu_button->raise();
+    auto center_y = footer_top + footer_height / 2;
+    if (m_show_sidebar_button) {
+        auto size = COLLAPSED_VERTICAL_TABS_TOGGLE_BUTTON_SIZE;
+        m_vertical_tabs_toggle_button->move((VERTICAL_TABS_COLLAPSED_WIDTH - size.width()) / 2, center_y - size.height() / 2);
+        m_vertical_tabs_toggle_button->raise();
     }
+
+    // Hover expansion keeps the toolbar in its row, so the sidebar places its bookmarks button itself.
+    if (m_bookmarks_menu_button->parentWidget() != m_vertical_tab_bar_column)
+        return;
+    auto bookmarks_x = (VERTICAL_TABS_COLLAPSED_WIDTH - m_bookmarks_menu_button->width()) / 2;
+    if (m_show_sidebar_button) {
+        if (vertical_tabs_effectively_expanded())
+            bookmarks_x = m_vertical_tabs_toggle_button->geometry().right() + 1;
+        else
+            center_y -= footer_height;
+    }
+    m_bookmarks_menu_button->move(bookmarks_x, center_y - m_bookmarks_menu_button->height() / 2);
+    m_bookmarks_menu_button->raise();
 }
 
 // With everything in the open sidebar, the all-tabs and bookmarks buttons start its footer. On the right the all-tabs
@@ -4853,8 +4918,7 @@ void TabWidget::place_all_tabs_and_sidebar_toggle()
         }
 
         m_vertical_tabs_toggle_button->set_size(COLLAPSED_VERTICAL_TABS_TOGGLE_BUTTON_SIZE);
-        m_vertical_tabs_toggle_button->show();
-        m_all_tabs_button->show();
+        m_vertical_tabs_toggle_button->setVisible(m_show_sidebar_button);
         return;
     }
 
@@ -4862,10 +4926,13 @@ void TabWidget::place_all_tabs_and_sidebar_toggle()
         if (m_vertical_tabs_toggle_button->parentWidget() != m_vertical_tab_bar_column)
             m_vertical_tabs_toggle_button->setParent(m_vertical_tab_bar_column);
         m_vertical_tabs_toggle_button->set_size(COLLAPSED_VERTICAL_TABS_TOGGLE_BUTTON_SIZE);
-        m_vertical_tabs_toggle_button->show();
+        m_vertical_tabs_toggle_button->setVisible(m_show_sidebar_button);
         place_sidebar_toggle_in_corner();
-        auto toggle_right = m_vertical_tabs_toggle_button->geometry().right() + 1;
-        m_toolbar->set_sidebar_footer_leading_room(toggle_right - vertical_tabs_side_margin(true));
+        // With the toggle hidden, center the first footer button where the toggle would be.
+        auto first_footer_button_x = m_show_sidebar_button
+            ? m_vertical_tabs_toggle_button->geometry().right() + 1
+            : (VERTICAL_TABS_COLLAPSED_WIDTH - ALL_TABS_BUTTON_SIZE.width()) / 2;
+        m_toolbar->set_sidebar_footer_leading_room(first_footer_button_x - vertical_tabs_side_margin(true));
     }
 
     if (!toolbar_is_in_sidebar()) {
@@ -4873,7 +4940,6 @@ void TabWidget::place_all_tabs_and_sidebar_toggle()
             m_all_tabs_button->setParent(m_ladybird_buttons);
             m_ladybird_buttons->layout()->addWidget(m_all_tabs_button);
             static_cast<QBoxLayout*>(m_ladybird_buttons->layout())->setAlignment(m_all_tabs_button, Qt::AlignVCenter);
-            m_all_tabs_button->show();
         }
         return;
     }
@@ -4891,7 +4957,6 @@ void TabWidget::place_all_tabs_and_sidebar_toggle()
         footer_layout->insertWidget(1, m_bookmarks_menu_button, 0, Qt::AlignVCenter);
     }
 
-    m_all_tabs_button->show();
     m_bookmarks_menu_button->setVisible(m_tab_bar_visible && bookmarks_are_in_sidebar());
 }
 
@@ -4905,7 +4970,7 @@ void TabWidget::place_toolbar_sidebar_buttons()
     if (!on_right || !m_vertical_tabs_expanded)
         m_toolbar->restore_trailing_sidebar_slot();
 
-    trailing_slot.setVisible(m_tab_bar_visible && on_right);
+    trailing_slot.setVisible(m_tab_bar_visible && on_right && (m_show_all_tabs_button || m_show_sidebar_button));
 
     if (!m_tab_bar_visible || !is_vertical || (m_vertical_tabs_expanded && !on_right)) {
         slot.hide();
@@ -4926,7 +4991,7 @@ void TabWidget::place_toolbar_sidebar_buttons()
             slot_layout->insertWidget(1, m_vertical_tabs_toggle_button, 0, Qt::AlignVCenter);
         }
 
-        m_vertical_tabs_toggle_button->show();
+        m_vertical_tabs_toggle_button->setVisible(m_show_sidebar_button);
     }
 
     m_ladybird_buttons->show();
@@ -4967,7 +5032,7 @@ void TabWidget::rebuild_layout_for_vertical_tabs()
             m_vertical_tabs_toggle_button->setParent(m_vertical_tab_bar_column);
             // NB: The button was smaller while it sat in the collapsed sidebar's slot.
             m_vertical_tabs_toggle_button->set_size({ VERTICAL_TABS_TOGGLE_BUTTON_SIZE, VERTICAL_TABS_TOGGLE_BUTTON_SIZE });
-            m_vertical_tabs_toggle_button->show();
+            m_vertical_tabs_toggle_button->setVisible(m_show_sidebar_button);
         }
         if (vertical_tabs_are_on_right()) {
             top_row_layout->addStretch(1);
@@ -4994,8 +5059,8 @@ void TabWidget::rebuild_layout_for_vertical_tabs()
             top_row_layout->addSpacing(ladybird_leading_room);
             top_row_layout->addWidget(m_ladybird_buttons, 0, Qt::AlignVCenter);
             top_row_layout->addStretch(1);
-            top_row_layout->addSpacing(SIDEBAR_TOGGLE_MINIMUM_GAP);
             if (toolbar_is_in_sidebar()) {
+                top_row_layout->addSpacing(SIDEBAR_TOGGLE_MINIMUM_GAP);
                 // NB: While the sidebar toggles, the buttons are placed by move_toolbar_with_toggling_sidebar().
                 auto& navigation_buttons = m_toolbar->navigation_buttons();
                 if (toggle_moves_toolbar())
@@ -5003,7 +5068,8 @@ void TabWidget::rebuild_layout_for_vertical_tabs()
                 else
                     top_row_layout->addWidget(&navigation_buttons, 0, Qt::AlignVCenter);
                 navigation_buttons.show();
-            } else if (!sidebar_toggle_stays_in_corner()) {
+            } else if (m_show_sidebar_button && !sidebar_toggle_stays_in_corner()) {
+                top_row_layout->addSpacing(SIDEBAR_TOGGLE_MINIMUM_GAP);
                 top_row_layout->addWidget(m_vertical_tabs_toggle_button, 0, Qt::AlignVCenter);
             }
         }
@@ -5052,8 +5118,7 @@ void TabWidget::rebuild_layout_for_vertical_tabs()
     if (m_vertical_tabs_expanded && toolbar_is_in_sidebar() && !toggle_moves_toolbar()) {
         m_vertical_tab_bar_column_layout->addWidget(&m_toolbar->sidebar_footer());
     } else if (sidebar_toggle_stays_in_corner()) {
-        auto footer_height = WindowToolbar::sidebar_footer_height() * (vertical_tabs_effectively_expanded() ? 1 : 2);
-        m_vertical_tabs_footer_spacer = new QSpacerItem(0, footer_height, QSizePolicy::Fixed, QSizePolicy::Fixed);
+        m_vertical_tabs_footer_spacer = new QSpacerItem(0, sidebar_footer_reserved_height(), QSizePolicy::Fixed, QSizePolicy::Fixed);
         m_vertical_tab_bar_column_layout->addItem(m_vertical_tabs_footer_spacer);
     }
 }
@@ -5453,7 +5518,7 @@ void TabWidget::update_vertical_tabs_toggle_icon()
     if (!m_vertical_tabs_toggle_button)
         return;
     auto icon = vertical_tabs_are_on_right() ? ChromeIcon::SidebarRight : ChromeIcon::Sidebar;
-    m_vertical_tabs_toggle_button->defaultAction()->setIcon(create_chrome_icon(icon, Theme::chrome_palette(*this), ChromeStyle::window_activity(*this)));
+    m_vertical_tabs_toggle_button->setIcon(create_chrome_icon(icon, Theme::chrome_palette(*this), ChromeStyle::window_activity(*this)));
 }
 
 void TabWidget::update_chrome_style()

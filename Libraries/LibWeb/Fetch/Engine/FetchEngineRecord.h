@@ -34,7 +34,15 @@ namespace Web::Fetch::Engine {
 
 class FetchEngineRecords;
 class FetchExecutor;
+class KnownHSTSHostProvider;
 class FetchLoad;
+
+// How the agent answers a manual redirect that main fetch handed over.
+enum class RedirectAnswer : u8 {
+    Follow,
+    AcceptAsFinal,
+    Abandon,
+};
 
 // What the fetch engine keeps of a fetch it has started. Every method runs on the engine's loop, and so does the
 // record's destruction.
@@ -42,12 +50,19 @@ class WEB_API FetchEngineRecord final : public RefCounted<FetchEngineRecord> {
 public:
     ~FetchEngineRecord();
 
+    [[nodiscard]] FetchId fetch_id() const { return m_fetch_id; }
     [[nodiscard]] EngineEventSink& event_sink() { return *m_event_sink; }
 
     // Reports what happened to one of the fetch's RequestServer requests to the agent that started the fetch.
     void report_network_activity(RequestId request_id, Event::NetworkActivity::Activity activity)
     {
         m_event_sink->handle_event(Event::NetworkActivity { .request_id = request_id, .activity = move(activity) });
+    }
+
+    void report_violation(ContentSecurityPolicy::RequestViolation violation)
+    {
+        ASSERT(is_on_owner_thread());
+        m_event_sink->handle_event(Event::ViolationReport { .violation = move(violation) });
     }
 
     // Those of the agent that started the fetch.
@@ -62,8 +77,8 @@ public:
     void set_cors_preflight_body_transport(FetchBodyDeliveryGate::Transport&);
     void stop_cors_preflight_body_transport();
 
-    // For a stop, abort or termination of the fetch: abandons the redirect continuation that is open, and any opened
-    // later, and stops the fetch's body transport.
+    // For a stop, abort or termination of the fetch: ends main fetch's wait for a preload, abandons the redirect
+    // continuation that is open, and any opened later, and stops the fetch's body transport.
     void stop();
 
     void add_network_transport(NetworkTransportHandle&, FetchBodyDeliveryGate&);
@@ -86,7 +101,7 @@ public:
     };
     // Settles the open continuation with the agent's answer once main fetch has handed the redirect over. Following also
     // lets main fetch run again.
-    [[nodiscard]] RedirectAnswerResult resolve_redirect(ContinuationId, Command::ResolveRedirect::Resolution const&);
+    [[nodiscard]] RedirectAnswerResult resolve_redirect(ContinuationId, RedirectAnswer);
 
     // Starts a load of the fetch's request, which main fetch runs.
     [[nodiscard]] NonnullRefPtr<FetchLoad> start_load();
@@ -98,15 +113,25 @@ public:
     // Main fetch can no longer hand a response over. Does nothing once main fetch has ended.
     void main_fetch_cannot_hand_over();
 
+    // The provider of the executor the fetch runs on.
+    [[nodiscard]] KnownHSTSHostProvider& known_hsts_host_provider();
+
     // Defers main fetch's work through the engine's executor; work deferred once the engine is gone never runs.
     void defer(Function<void()>);
 
-    // Main fetch waits for a preload's response, until the agent resolves the wait or abandons it.
-    void main_fetch_waits_for_preload();
-    void main_fetch_stops_waiting_for_preload();
-    // Ends main fetch's wait for a preload's response, after which main fetch can no longer hand a response over. Returns
-    // whether main fetch was waiting.
-    [[nodiscard]] bool abandon_preload_wait();
+    // Whether a stop, abort or termination of the fetch has reached the engine.
+    [[nodiscard]] bool is_stopped() const { return m_stopped; }
+
+    // Main fetch may wait for a preload's response, as the fetch's preloaded response candidate was pending when main
+    // fetch's in-parallel steps started.
+    void expect_preload_resolution();
+    [[nodiscard]] bool has_preload_candidate() const { return !m_preload_wait_resolution.has<NoPreloadWait>(); }
+    // Main fetch waits for a preload's response, until the agent resolves the wait or the fetch is stopped, aborted
+    // or terminated. A resolution that came before main fetch waited resumes it at once.
+    void wait_for_preload(Function<void(RefPtr<Infrastructure::Response>)> resume);
+    // Resumes main fetch with the preload's response, or null for a cancelled preload, or keeps it for main fetch's
+    // wait. Returns false for a second resolution.
+    [[nodiscard]] bool resolve_preload_wait(RefPtr<Infrastructure::Response>);
 
     // Whether the fetch has ended: main fetch has ended, no load is live and no redirect continuation is open.
     [[nodiscard]] bool has_ended() const { return m_ended; }
@@ -124,6 +149,8 @@ private:
     void close_redirect_continuation();
     void abandon_redirect();
     void did_end_load();
+    // Main fetch's end drops a preload's response that came before main fetch waited for it.
+    void set_main_fetch_ended();
     void end_main_fetch();
     // Sends the fetch's end as its last event once nothing keeps the fetch from ending.
     void end_fetch_unless_anything_is_left();
@@ -142,13 +169,22 @@ private:
     };
     Optional<RedirectContinuation> m_redirect_continuation;
 
-    // Whether a stop, abort or termination of the fetch has reached the engine.
     bool m_stopped { false };
 
     struct MainFetchRunning { };
-    struct MainFetchWaitsForPreload { };
+    struct MainFetchWaitsForPreload {
+        Function<void(RefPtr<Infrastructure::Response>)> resume;
+    };
     struct MainFetchEnded { };
     Variant<MainFetchRunning, MainFetchWaitsForPreload, MainFetchEnded> m_main_fetch { MainFetchRunning {} };
+
+    struct NoPreloadWait { };
+    struct PreloadWaitUnresolved { };
+    struct PreloadWaitResolvedEarly {
+        RefPtr<Infrastructure::Response> response;
+    };
+    struct PreloadWaitResolved { };
+    Variant<NoPreloadWait, PreloadWaitUnresolved, PreloadWaitResolvedEarly, PreloadWaitResolved> m_preload_wait_resolution { NoPreloadWait {} };
     size_t m_live_load_count { 0 };
     bool m_ended { false };
 };
@@ -196,8 +232,12 @@ public:
 
     explicit FetchEngineRecords(NonnullOwnPtr<Agent>);
 
+    // Reports to the agent a command no honest agent could have posted.
+    void agent_misbehaved(StringView reason) { m_agent->misbehaved(reason); }
+
     // The executor that runs the engine, which outlives the records.
     void attach_to_executor(FetchExecutor&);
+    [[nodiscard]] KnownHSTSHostProvider& known_hsts_host_provider();
     void defer(Function<void()>);
 
     // Reports to the agent a fetch id no higher than that of an earlier start, and returns null for it.
@@ -214,12 +254,13 @@ public:
 
     // Settles the open continuation the answer names, returning the fetch's record. Reports to the agent a fetch id
     // above every start, a continuation id above every offer, or an answer before the redirect's handover.
-    [[nodiscard]] RedirectAnswerOutcome resolve_redirect(Command::ResolveRedirect const&);
+    [[nodiscard]] RedirectAnswerOutcome resolve_redirect(FetchId, ContinuationId, RedirectAnswer);
     void did_offer_redirect_continuation(Badge<FetchEngineRecord>, ContinuationId);
 
-    // Does nothing once the fetch has ended or its record is gone. Reports to the agent a fetch id above that of every
-    // started fetch, or a fetch whose main fetch does not wait for a preload.
-    void abandon_preload_wait(FetchId);
+    // Resolves the preload wait of a started fetch's main fetch. Reports to the agent a fetch id above every start, then,
+    // unless the record is gone, a response that is neither a network error nor one whose body is all its bytes, then,
+    // unless main fetch has ended, a fetch with no preload candidate or a second resolution.
+    void resolve_preload_wait(FetchId, RefPtr<Infrastructure::Response>);
 
     // Records a network transport, which the agent's transport controls name by the id and transport epoch of its
     // request.

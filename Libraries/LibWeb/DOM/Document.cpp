@@ -287,6 +287,7 @@
 #include <LibWeb/WebIDL/ExceptionOr.h>
 #include <LibWeb/WebIDL/ObservableArray.h>
 #include <LibWeb/WebIDL/Promise.h>
+#include <LibWeb/WebLocks/AbstractOperations.h>
 #include <LibWeb/WebRTC/WebRTCAgent.h>
 #include <LibWeb/XPath/XPath.h>
 #include <LibWebCommon/CSS/SystemColor.h>
@@ -3937,7 +3938,7 @@ WebIDL::ExceptionOr<GC::Ref<Event>> Document::create_event(Utf16FlyString const&
     } else if (interface.equals_ignoring_ascii_case("deviceorientationevent"sv)) {
         event = Event::create(FlyString {}, time_stamp); // FIXME: Create DeviceOrientationEvent
     } else if (interface.equals_ignoring_ascii_case("dragevent"sv)) {
-        event = HTML::DragEvent::create(Utf16FlyString {}, {}, 0, 0, 0, 0, time_stamp);
+        event = HTML::create_drag_event_for_create_event(time_stamp);
     } else if (interface.equals_ignoring_ascii_case("event"sv)
         || interface.equals_ignoring_ascii_case("events"sv)) {
         event = Event::create(FlyString {}, time_stamp);
@@ -6375,6 +6376,7 @@ void Document::run_unloading_cleanup_steps()
     FileAPI::run_unloading_cleanup_steps(*this);
     fully_exit_fullscreen();
     PictureInPicture::run_unloading_cleanup_steps(*this);
+    WebLocks::run_unloading_cleanup_steps(*this);
 
     // https://w3c.github.io/mediacapture-main/#dfn-stop-all-sources
     // The User Agent MUST stop all sources of a globalObject in the following conditions:

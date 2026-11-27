@@ -308,9 +308,20 @@ TEST_CASE(a_stop_of_a_fetch_the_engine_has_not_started_dies)
     EXPECT_DEATH("Stopping a fetch with an id above that of the last fetch started", records.stop(FetchId { 2 }));
 }
 
-static Command::ResolveRedirect answer(u64 fetch_id, ContinuationId continuation_id, Command::ResolveRedirect::Resolution resolution)
+struct Answer {
+    FetchId fetch_id;
+    ContinuationId continuation_id;
+    RedirectAnswer answer;
+};
+
+static Answer answer(u64 fetch_id, ContinuationId continuation_id, RedirectAnswer redirect_answer)
 {
-    return { .fetch_id = FetchId { fetch_id }, .continuation_id = continuation_id, .resolution = move(resolution) };
+    return { FetchId { fetch_id }, continuation_id, redirect_answer };
+}
+
+static FetchEngineRecords::RedirectAnswerOutcome resolve_redirect(FetchEngineRecords& records, Answer const& answer)
+{
+    return records.resolve_redirect(answer.fetch_id, answer.continuation_id, answer.answer);
 }
 
 // The record of the fetch whose continuation the answer settled, or null for any other outcome.
@@ -357,7 +368,7 @@ TEST_CASE(an_abandoned_redirect_has_its_lease_released_and_its_request_stopped)
     auto continuation_id = hand_over_redirect(*record, redirect);
     EXPECT(has_lease(redirect));
 
-    EXPECT_EQ(settled(records.resolve_redirect(answer(1, continuation_id, Command::ResolveRedirect::Abandon {}))).ptr(), record.ptr());
+    EXPECT_EQ(settled(resolve_redirect(records, answer(1, continuation_id, RedirectAnswer::Abandon))).ptr(), record.ptr());
     EXPECT(!has_lease(redirect));
     EXPECT(redirect.teardowns->reasons == (Vector<Requests::Request::TeardownReason> { Requests::Request::TeardownReason::Stopped }));
 }
@@ -372,7 +383,7 @@ TEST_CASE(a_followed_redirect_has_its_lease_released_and_its_request_stopped)
     auto continuation_id = hand_over_redirect(*record, redirect);
     EXPECT(has_lease(redirect));
 
-    EXPECT_EQ(settled(records.resolve_redirect(answer(1, continuation_id, Command::ResolveRedirect::Follow {}))).ptr(), record.ptr());
+    EXPECT_EQ(settled(resolve_redirect(records, answer(1, continuation_id, RedirectAnswer::Follow))).ptr(), record.ptr());
     EXPECT(!has_lease(redirect));
     EXPECT(redirect.teardowns->reasons == (Vector<Requests::Request::TeardownReason> { Requests::Request::TeardownReason::Stopped }));
 }
@@ -390,7 +401,7 @@ TEST_CASE(a_followed_redirect_keeps_its_fetch_through_the_end_of_its_load)
     auto continuation_id = open_continuation(*record);
     record->main_fetch_hands_over(delivery());
 
-    EXPECT_EQ(settled(records.resolve_redirect(answer(1, continuation_id, Command::ResolveRedirect::Follow {}))).ptr(), record.ptr());
+    EXPECT_EQ(settled(resolve_redirect(records, answer(1, continuation_id, RedirectAnswer::Follow))).ptr(), record.ptr());
     EXPECT(load->has_ended());
     EXPECT_EQ(ends->count, 0u);
 }
@@ -404,7 +415,7 @@ TEST_CASE(a_redirect_accepted_as_final_keeps_its_request)
     auto redirect = start_network_transport(*connected.client, Requests::RequestClient::TransferLease::Yes);
     auto continuation_id = hand_over_redirect(*record, redirect);
 
-    EXPECT_EQ(settled(records.resolve_redirect(answer(1, continuation_id, Command::ResolveRedirect::AcceptAsFinal {}))).ptr(), record.ptr());
+    EXPECT_EQ(settled(resolve_redirect(records, answer(1, continuation_id, RedirectAnswer::AcceptAsFinal))).ptr(), record.ptr());
     EXPECT(has_lease(redirect));
     EXPECT(redirect.teardowns->reasons.is_empty());
 
@@ -423,13 +434,13 @@ TEST_CASE(a_followed_redirect_gives_its_record_to_the_next_hop)
     auto redirect = start_network_transport(*connected.client, Requests::RequestClient::TransferLease::Yes);
     auto continuation_id = hand_over_redirect(*record, redirect);
 
-    EXPECT_EQ(settled(records.resolve_redirect(answer(1, continuation_id, Command::ResolveRedirect::Follow {}))).ptr(), record.ptr());
+    EXPECT_EQ(settled(resolve_redirect(records, answer(1, continuation_id, RedirectAnswer::Follow))).ptr(), record.ptr());
 
     // The next hop hands over a redirect of its own.
     auto next_redirect = start_network_transport(*connected.client, Requests::RequestClient::TransferLease::Yes);
     auto next_continuation_id = hand_over_redirect(*record, next_redirect);
     EXPECT_NE(next_continuation_id, continuation_id);
-    EXPECT_EQ(settled(records.resolve_redirect(answer(1, next_continuation_id, Command::ResolveRedirect::Follow {}))).ptr(), record.ptr());
+    EXPECT_EQ(settled(resolve_redirect(records, answer(1, next_continuation_id, RedirectAnswer::Follow))).ptr(), record.ptr());
 }
 
 TEST_CASE(a_stop_of_a_fetch_abandons_the_redirect_it_waits_on)
@@ -446,7 +457,7 @@ TEST_CASE(a_stop_of_a_fetch_abandons_the_redirect_it_waits_on)
     EXPECT(redirect.teardowns->reasons == (Vector<Requests::Request::TeardownReason> { Requests::Request::TeardownReason::Stopped }));
 
     // The agent's task that follows the redirect before it heard of the stop gets no next hop.
-    EXPECT(was_dropped(records.resolve_redirect(answer(1, continuation_id, Command::ResolveRedirect::Follow {}))));
+    EXPECT(was_dropped(resolve_redirect(records, answer(1, continuation_id, RedirectAnswer::Follow))));
 }
 
 TEST_CASE(a_redirect_handed_over_after_a_stop_of_its_fetch_is_abandoned_at_once)
@@ -470,7 +481,7 @@ TEST_CASE(an_answer_for_a_settled_redirect_or_an_ended_fetch_does_nothing)
 {
     FetchEngineRecords records { make<FetchEngineRecords::Agent>() };
     auto ended_continuation_id = open_continuation(*start_fetch(records, 1));
-    EXPECT(was_dropped(records.resolve_redirect(answer(1, ended_continuation_id, Command::ResolveRedirect::Follow {}))));
+    EXPECT(was_dropped(resolve_redirect(records, answer(1, ended_continuation_id, RedirectAnswer::Follow))));
 
     auto record = start_fetch(records, 2);
     auto transport = WholeBodyTransport::create();
@@ -479,10 +490,10 @@ TEST_CASE(an_answer_for_a_settled_redirect_or_an_ended_fetch_does_nothing)
     record->set_body_transport(transport);
     auto continuation_id = open_continuation(*record);
     record->main_fetch_hands_over(delivery());
-    EXPECT_EQ(settled(records.resolve_redirect(answer(2, continuation_id, Command::ResolveRedirect::AcceptAsFinal {}))).ptr(), record.ptr());
+    EXPECT_EQ(settled(resolve_redirect(records, answer(2, continuation_id, RedirectAnswer::AcceptAsFinal))).ptr(), record.ptr());
 
-    EXPECT(was_dropped(records.resolve_redirect(answer(2, continuation_id, Command::ResolveRedirect::Abandon {}))));
-    EXPECT(was_dropped(records.resolve_redirect(answer(2, continuation_id, Command::ResolveRedirect::Follow {}))));
+    EXPECT(was_dropped(resolve_redirect(records, answer(2, continuation_id, RedirectAnswer::Abandon))));
+    EXPECT(was_dropped(resolve_redirect(records, answer(2, continuation_id, RedirectAnswer::Follow))));
     EXPECT(!stopped);
 }
 
@@ -492,11 +503,11 @@ TEST_CASE(an_answer_for_a_redirect_the_engine_never_offered_dies)
     auto record = start_fetch(records, 1);
     auto continuation_id = open_continuation(*record);
 
-    auto above_every_offered = answer(1, ContinuationId { continuation_id.value() + 1 }, Command::ResolveRedirect::Follow {});
-    EXPECT_DEATH("Answering a redirect with a continuation id above every one the engine offered", (void)records.resolve_redirect(above_every_offered));
+    auto above_every_offered = answer(1, ContinuationId { continuation_id.value() + 1 }, RedirectAnswer::Follow);
+    EXPECT_DEATH("Answering a redirect with a continuation id above every one the engine offered", (void)resolve_redirect(records, above_every_offered));
 
-    auto of_a_fetch_not_started = answer(2, continuation_id, Command::ResolveRedirect::Follow {});
-    EXPECT_DEATH("Answering a redirect of a fetch with an id above that of the last fetch started", (void)records.resolve_redirect(of_a_fetch_not_started));
+    auto of_a_fetch_not_started = answer(2, continuation_id, RedirectAnswer::Follow);
+    EXPECT_DEATH("Answering a redirect of a fetch with an id above that of the last fetch started", (void)resolve_redirect(records, of_a_fetch_not_started));
 }
 
 TEST_CASE(an_answer_to_a_redirect_main_fetch_has_not_handed_over_is_misbehavior)
@@ -506,8 +517,8 @@ TEST_CASE(an_answer_to_a_redirect_main_fetch_has_not_handed_over_is_misbehavior)
     auto record = start_fetch(records, 1);
     auto continuation_id = open_continuation(*record);
 
-    EXPECT(records.resolve_redirect(answer(1, continuation_id, Command::ResolveRedirect::Follow {})).has<FetchEngineRecords::RedirectAnswerMisbehaved>());
-    EXPECT(records.resolve_redirect(answer(1, continuation_id, Command::ResolveRedirect::Abandon {})).has<FetchEngineRecords::RedirectAnswerMisbehaved>());
+    EXPECT(resolve_redirect(records, answer(1, continuation_id, RedirectAnswer::Follow)).has<FetchEngineRecords::RedirectAnswerMisbehaved>());
+    EXPECT(resolve_redirect(records, answer(1, continuation_id, RedirectAnswer::Abandon)).has<FetchEngineRecords::RedirectAnswerMisbehaved>());
     EXPECT_EQ(misbehaviors, (Vector<ByteString> { "The agent answered a redirect before it was handed over", "The agent answered a redirect before it was handed over" }));
 }
 
@@ -571,8 +582,8 @@ TEST_CASE(a_fetch_ends_once_the_redirect_it_handed_over_is_settled)
     }
     EXPECT_EQ(accepted_ends->count + abandoned_ends->count + stopped_ends->count, 0u);
 
-    (void)records.resolve_redirect(answer(1, continuation_ids[0], Command::ResolveRedirect::AcceptAsFinal {}));
-    (void)records.resolve_redirect(answer(2, continuation_ids[1], Command::ResolveRedirect::Abandon {}));
+    (void)resolve_redirect(records, answer(1, continuation_ids[0], RedirectAnswer::AcceptAsFinal));
+    (void)resolve_redirect(records, answer(2, continuation_ids[1], RedirectAnswer::Abandon));
     records.stop(FetchId { 3 });
     EXPECT_EQ(accepted_ends->count, 1u);
     EXPECT_EQ(abandoned_ends->count, 1u);
@@ -587,7 +598,7 @@ TEST_CASE(a_followed_redirect_keeps_its_fetch_until_the_next_hop_ends)
     auto continuation_id = open_continuation(*record);
     record->main_fetch_hands_over(delivery());
 
-    EXPECT_EQ(settled(records.resolve_redirect(answer(1, continuation_id, Command::ResolveRedirect::Follow {}))).ptr(), record.ptr());
+    EXPECT_EQ(settled(resolve_redirect(records, answer(1, continuation_id, RedirectAnswer::Follow))).ptr(), record.ptr());
     auto next_hop_load = record->start_load();
     record->main_fetch_hands_over(delivery());
     EXPECT_EQ(ends->count, 0u);
@@ -717,56 +728,184 @@ TEST_CASE(a_handover_after_main_fetch_has_ended_delivers_nothing)
     EXPECT_EQ(received->events, (Vector<StringView> { "end of fetch"sv }));
 }
 
-TEST_CASE(an_abandoned_preload_wait_ends_the_fetch_whose_main_fetch_waits)
+// A preload's response, whose body is all its bytes.
+static NonnullRefPtr<Web::Fetch::Infrastructure::Response> preloaded_response()
 {
-    FetchEngineRecords records { make<FetchEngineRecords::Agent>() };
-    auto waiting_ends = make_ref_counted<FetchEnds>();
-    auto waiting = start_fetch(records, 1, waiting_ends);
-    waiting->main_fetch_waits_for_preload();
-    records.abandon_preload_wait(FetchId { 1 });
-    EXPECT_EQ(waiting_ends->count, 1u);
-
-    // The fetch has ended, and a later abandonment changes nothing.
-    records.abandon_preload_wait(FetchId { 1 });
-    EXPECT_EQ(waiting_ends->count, 1u);
-
-    // A wait the agent resolved ends as any other main fetch does.
-    auto resolved_ends = make_ref_counted<FetchEnds>();
-    auto resolved = start_fetch(records, 2, resolved_ends);
-    resolved->main_fetch_waits_for_preload();
-    resolved->main_fetch_stops_waiting_for_preload();
-    EXPECT_EQ(resolved_ends->count, 0u);
-    resolved->main_fetch_hands_over(delivery());
-    EXPECT_EQ(resolved_ends->count, 1u);
-    records.abandon_preload_wait(FetchId { 2 });
-    EXPECT_EQ(resolved_ends->count, 1u);
+    auto response = Web::Fetch::Infrastructure::Response::create();
+    response->set_body(Web::Fetch::Infrastructure::ResponseBody::from_bytes(Core::ImmutableBytes::adopt(MUST(ByteBuffer::copy("preloaded"sv.bytes())))));
+    return response;
 }
 
-TEST_CASE(an_abandoned_preload_wait_of_a_fetch_that_waits_for_none_is_misbehavior)
+static void ignore_preload_response(RefPtr<Web::Fetch::Infrastructure::Response>)
+{
+}
+
+TEST_CASE(a_resolved_preload_wait_ends_as_any_main_fetch_does)
+{
+    FetchEngineRecords records { make<FetchEngineRecords::Agent>() };
+    auto ends = make_ref_counted<FetchEnds>();
+    auto record = start_fetch(records, 1, ends);
+    record->wait_for_preload(ignore_preload_response);
+    records.resolve_preload_wait(FetchId { 1 }, preloaded_response());
+    EXPECT_EQ(ends->count, 0u);
+    record->main_fetch_hands_over(delivery());
+    EXPECT_EQ(ends->count, 1u);
+}
+
+TEST_CASE(a_resolved_preload_wait_resumes_main_fetch_with_the_response)
+{
+    FetchEngineRecords records { make<FetchEngineRecords::Agent>() };
+    auto record = start_fetch(records, 1);
+    RefPtr<Web::Fetch::Infrastructure::Response> resumed_with;
+    record->wait_for_preload([&](RefPtr<Web::Fetch::Infrastructure::Response> response) { resumed_with = move(response); });
+
+    auto response = preloaded_response();
+    records.resolve_preload_wait(FetchId { 1 }, response);
+    EXPECT_EQ(resumed_with.ptr(), response.ptr());
+    EXPECT(!record->main_fetch_has_ended());
+}
+
+TEST_CASE(a_preload_wait_resolved_for_a_cancelled_preload_resumes_main_fetch_with_null)
+{
+    FetchEngineRecords records { make<FetchEngineRecords::Agent>() };
+    auto record = start_fetch(records, 1);
+    bool resumed_with_null = false;
+    record->wait_for_preload([&](RefPtr<Web::Fetch::Infrastructure::Response> response) { resumed_with_null = !response; });
+
+    records.resolve_preload_wait(FetchId { 1 }, nullptr);
+    EXPECT(resumed_with_null);
+    EXPECT(!record->main_fetch_has_ended());
+}
+
+TEST_CASE(a_fetch_stopped_while_main_fetch_waits_for_a_preload_ends_and_takes_no_response)
+{
+    FetchEngineRecords records { make<FetchEngineRecords::Agent>() };
+    auto ends = make_ref_counted<FetchEnds>();
+    auto record = start_fetch(records, 1, ends);
+    bool resumed = false;
+    record->wait_for_preload([&](auto) { resumed = true; });
+
+    records.stop(FetchId { 1 });
+    EXPECT_EQ(ends->count, 1u);
+    records.resolve_preload_wait(FetchId { 1 }, preloaded_response());
+    EXPECT(!resumed);
+}
+
+TEST_CASE(a_preload_wait_resolved_before_main_fetch_waits_resumes_main_fetch_when_it_waits)
+{
+    FetchEngineRecords records { make<FetchEngineRecords::Agent>() };
+    auto record = start_fetch(records, 1);
+    record->expect_preload_resolution();
+    auto response = preloaded_response();
+    records.resolve_preload_wait(FetchId { 1 }, response);
+
+    RefPtr<Web::Fetch::Infrastructure::Response> resumed_with;
+    record->wait_for_preload([&](RefPtr<Web::Fetch::Infrastructure::Response> response) { resumed_with = move(response); });
+    EXPECT_EQ(resumed_with.ptr(), response.ptr());
+}
+
+TEST_CASE(a_preload_response_that_came_before_main_fetch_waited_goes_when_main_fetch_ends)
+{
+    FetchEngineRecords records { make<FetchEngineRecords::Agent>() };
+    auto record = start_fetch(records, 1);
+    auto load = record->start_load();
+    record->expect_preload_resolution();
+    auto response = preloaded_response();
+    records.resolve_preload_wait(FetchId { 1 }, response);
+
+    record->main_fetch_hands_over(delivery());
+    EXPECT(!record->has_ended());
+    EXPECT_EQ(response->ref_count(), 1u);
+}
+
+TEST_CASE(a_preload_wait_of_a_main_fetch_that_never_waits_is_kept_until_the_fetch_ends)
+{
+    FetchEngineRecords records { make<FetchEngineRecords::Agent>() };
+    auto ends = make_ref_counted<FetchEnds>();
+    auto record = start_fetch(records, 1, ends);
+    record->expect_preload_resolution();
+    records.resolve_preload_wait(FetchId { 1 }, nullptr);
+
+    record->main_fetch_hands_over(delivery());
+    EXPECT_EQ(ends->count, 1u);
+    records.resolve_preload_wait(FetchId { 1 }, nullptr);
+}
+
+TEST_CASE(a_preload_wait_resolved_twice_or_for_a_fetch_not_started_is_misbehavior)
 {
     Vector<ByteString> misbehaviors;
     FetchEngineRecords records { make<MisbehaviorRecordingAgent>(misbehaviors) };
     auto record = start_fetch(records, 1);
-    records.abandon_preload_wait(FetchId { 1 });
-
-    record->main_fetch_waits_for_preload();
-    record->main_fetch_stops_waiting_for_preload();
-    records.abandon_preload_wait(FetchId { 1 });
-    records.abandon_preload_wait(FetchId { 2 });
+    record->wait_for_preload(ignore_preload_response);
+    records.resolve_preload_wait(FetchId { 1 }, preloaded_response());
+    records.resolve_preload_wait(FetchId { 1 }, preloaded_response());
+    records.resolve_preload_wait(FetchId { 2 }, preloaded_response());
 
     EXPECT(!record->has_ended());
     EXPECT_EQ(misbehaviors, (Vector<ByteString> {
-                                "The agent abandoned a preload wait of a fetch that waits for no preload",
-                                "The agent abandoned a preload wait of a fetch that waits for no preload",
-                                "The agent abandoned a preload wait of a fetch it has not started",
+                                "The agent resolved a preload wait twice",
+                                "The agent resolved a preload wait of a fetch it has not started",
                             }));
+}
+
+TEST_CASE(a_preload_wait_resolved_for_a_fetch_whose_main_fetch_waits_for_no_preload_is_misbehavior)
+{
+    Vector<ByteString> misbehaviors;
+    FetchEngineRecords records { make<MisbehaviorRecordingAgent>(misbehaviors) };
+    auto record = start_fetch(records, 1);
+    records.resolve_preload_wait(FetchId { 1 }, preloaded_response());
+
+    EXPECT(!record->has_ended());
+    EXPECT_EQ(misbehaviors, (Vector<ByteString> { "The agent resolved a preload wait of a fetch whose main fetch waits for no preload" }));
+}
+
+TEST_CASE(a_preload_wait_resolved_with_a_body_that_is_not_all_its_bytes_is_misbehavior)
+{
+    Vector<ByteString> misbehaviors;
+    FetchEngineRecords records { make<MisbehaviorRecordingAgent>(misbehaviors) };
+    auto record = start_fetch(records, 1);
+    bool resumed = false;
+    record->wait_for_preload([&](auto) { resumed = true; });
+
+    auto streamed = Web::Fetch::Infrastructure::Response::create();
+    streamed->set_body(Web::Fetch::Infrastructure::ResponseBody { Web::Fetch::Infrastructure::ResponseBody::ReadThroughStream {}, {} });
+    records.resolve_preload_wait(FetchId { 1 }, streamed);
+    records.resolve_preload_wait(FetchId { 1 }, Web::Fetch::Infrastructure::Response::create());
+    auto without_bytes = Web::Fetch::Infrastructure::Response::create();
+    without_bytes->set_body(Web::Fetch::Infrastructure::ResponseBody { Core::ImmutableBytes {}, 0 });
+    records.resolve_preload_wait(FetchId { 1 }, without_bytes);
+    auto shorter = Web::Fetch::Infrastructure::Response::create();
+    shorter->set_body(Web::Fetch::Infrastructure::ResponseBody { MUST(Core::ImmutableBytes::copy("preloaded"sv.bytes())), 20 });
+    records.resolve_preload_wait(FetchId { 1 }, shorter);
+
+    EXPECT(!resumed);
+    EXPECT_EQ(misbehaviors, (Vector<ByteString> {
+                                "The agent resolved a preload wait with a response whose body is not all its bytes",
+                                "The agent resolved a preload wait with a response whose body is not all its bytes",
+                                "The agent resolved a preload wait with a response whose body is not all its bytes",
+                                "The agent resolved a preload wait with a response whose body is not all its bytes",
+                            }));
+}
+
+TEST_CASE(a_preload_wait_resolved_with_an_empty_body_resumes_main_fetch_with_it)
+{
+    FetchEngineRecords records { make<FetchEngineRecords::Agent>() };
+    auto record = start_fetch(records, 1);
+    RefPtr<Web::Fetch::Infrastructure::Response> resumed_with;
+    record->wait_for_preload([&](auto response) { resumed_with = move(response); });
+
+    auto empty = Web::Fetch::Infrastructure::Response::create();
+    empty->set_body(Web::Fetch::Infrastructure::ResponseBody::from_bytes(MUST(Core::ImmutableBytes::copy({}))));
+    records.resolve_preload_wait(FetchId { 1 }, empty);
+
+    EXPECT_EQ(resumed_with.ptr(), empty.ptr());
 }
 
 TEST_CASE(a_handover_while_main_fetch_waits_for_a_preload_dies)
 {
     FetchEngineRecords records { make<FetchEngineRecords::Agent>() };
     auto record = start_fetch(records, 1);
-    record->main_fetch_waits_for_preload();
+    record->wait_for_preload(ignore_preload_response);
 
     EXPECT_DEATH("Handing a response over while main fetch waits for a preload", record->main_fetch_hands_over(delivery()));
 }
