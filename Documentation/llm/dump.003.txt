@@ -1,4 +1,1701 @@
-﻿    let mut parser = ScriptCreatedParser::open();
+﻿                // 2. If node is not the current node, then this is a parse error.
+                if self.current_node_handle() != node_handle {
+                    self.parse_error("matching node is not current node for any other end tag");
+                }
+                // 3. Pop all the nodes from the current node up to node, including node.
+                while self
+                    .stack_of_open_elements
+                    .last()
+                    .is_some_and(|current_node| current_node.handle != node_handle)
+                {
+                    self.pop_stack_node();
+                }
+                if self
+                    .stack_of_open_elements
+                    .last()
+                    .is_some_and(|current_node| current_node.handle == node_handle)
+                {
+                    self.pop_stack_node();
+                }
+                return;
+            }
+
+            // 3. Otherwise, if node is in the special category, then this is a parse error; return.
+            if is_special_tag(node) {
+                self.parse_error("special element reached while processing any other end tag");
+                return;
+            }
+            // 4. Set node to the previous entry in the stack of open elements.
+        }
+    }
+
+    fn remove_active_formatting_element(&mut self, handle: usize) {
+        self.list_of_active_formatting_elements
+            .retain(|entry| entry.handle != handle);
+    }
+}
+
+/// The text of the character tokens that haven't been inserted yet.
+#[derive(Default)]
+struct PendingText {
+    /// The run of tokenizer input that is all of the text, for as long as the text is exactly that. The run doesn't
+    /// outlive a parser run, so the input can't change under it.
+    input_run: Option<InputRun>,
+    /// The text, once it is anything other than a single run of input.
+    code_units: Vec<u16>,
+}
+
+impl PendingText {
+    fn is_empty(&self) -> bool {
+        self.input_run.is_none() && self.code_units.is_empty()
+    }
+
+    fn push_code_point(&mut self, code_point: u32, input: &CodeUnits) {
+        let Some(character) = char::from_u32(code_point) else {
+            return;
+        };
+        self.copy_input_run(input);
+        self.code_units.extend_from_slice(character.encode_utf16(&mut [0; 2]));
+    }
+
+    fn push_input_run(&mut self, run: InputRun, input: &CodeUnits) {
+        if self.is_empty() {
+            self.input_run = Some(run);
+            return;
+        }
+        if let Some(input_run) = &mut self.input_run
+            && input_run.range.end == run.range.start
+        {
+            input_run.range.end = run.range.end;
+            input_run.is_ascii &= run.is_ascii;
+            return;
+        }
+        self.copy_input_run(input);
+        input.slice(run.range).append_to(&mut self.code_units);
+    }
+
+    fn copy_input_run(&mut self, input: &CodeUnits) {
+        if let Some(input_run) = self.input_run.take() {
+            input.slice(input_run.range).append_to(&mut self.code_units);
+        }
+    }
+}
+
+#[derive(Default)]
+struct AttributeBuffers {
+    attributes: Vec<RustFfiHtmlParserAttribute>,
+    local_names: Vec<HtmlName>,
+}
+
+struct AdjustedAttributeName {
+    local_name: HtmlName,
+    prefix: Option<&'static str>,
+    namespace_: RustFfiHtmlAttributeNamespace,
+}
+
+fn owned_attributes_from_token(token: &Token, namespace_: RustFfiHtmlNamespace) -> OwnedAttributes {
+    let TokenPayload::Tag {
+        attributes: token_attributes,
+        ..
+    } = &token.payload
+    else {
+        return OwnedAttributes::default();
+    };
+
+    let mut attributes = Vec::with_capacity(token_attributes.len());
+    for attribute in token_attributes {
+        let adjusted_name = adjusted_foreign_attribute_name(&attribute.local_name, namespace_);
+        attributes.push(OwnedAttribute {
+            local_name: adjusted_name.local_name,
+            prefix: adjusted_name
+                .prefix
+                .map(|prefix| CodeUnits::from(prefix.as_bytes().to_vec())),
+            namespace_: adjusted_name.namespace_,
+            value: attribute.value.clone(),
+        });
+    }
+    attributes.into()
+}
+
+unsafe fn utf16_string_from_ffi(ptr: *const u16, len: usize) -> Vec<u16> {
+    if ptr.is_null() || len == 0 {
+        return Vec::new();
+    }
+
+    unsafe { ak::slice_from_raw_parts(ptr, len) }.to_vec()
+}
+
+unsafe fn utf16_namespace_uri_from_ffi(
+    namespace_: RustFfiHtmlNamespace,
+    ptr: *const u16,
+    len: usize,
+) -> Option<Vec<u16>> {
+    if namespace_ != RustFfiHtmlNamespace::Other || ptr.is_null() || len == 0 {
+        return None;
+    }
+    Some(unsafe { utf16_string_from_ffi(ptr, len) })
+}
+
+unsafe fn owned_context_attributes_from_ffi(
+    attributes: *const RustFfiHtmlParserContextAttribute,
+    attribute_count: usize,
+) -> Vec<OwnedAttribute> {
+    if attributes.is_null() || attribute_count == 0 {
+        return Vec::new();
+    }
+
+    let attributes = unsafe { ak::slice_from_raw_parts(attributes, attribute_count) };
+    attributes
+        .iter()
+        .map(|attribute| OwnedAttribute {
+            local_name: unsafe { HtmlName::from_borrowed_raw(attribute.local_name) },
+            prefix: if attribute.prefix_len == 0 {
+                None
+            } else {
+                Some(unsafe { utf16_string_from_ffi(attribute.prefix_ptr, attribute.prefix_len) }.into())
+            },
+            namespace_: attribute.namespace_,
+            value: unsafe { utf16_string_from_ffi(attribute.value_ptr, attribute.value_len) }.into(),
+        })
+        .collect()
+}
+
+fn active_formatting_element_has_same_attributes(
+    active_formatting_element: &ActiveFormattingElement,
+    attributes: &[OwnedAttribute],
+) -> bool {
+    active_formatting_element.attributes.len() == attributes.len()
+        && active_formatting_element.attributes.iter().all(|attribute| {
+            attributes.iter().any(|other_attribute| {
+                attribute.local_name == other_attribute.local_name
+                    && attribute.namespace_ == other_attribute.namespace_
+                    && attribute.value == other_attribute.value
+            })
+        })
+}
+
+impl AttributeBuffers {
+    // The caller keeps the source attributes alive until the synchronous host callback returns.
+    fn fill_from_owned_attributes(&mut self, attributes: &[OwnedAttribute]) {
+        self.attributes.extend(attributes.iter().map(|attribute| {
+            let prefix = attribute
+                .prefix
+                .as_ref()
+                .map_or(Utf16View::Latin1(&[]), CodeUnits::as_slice);
+            RustFfiHtmlParserAttribute {
+                local_name: attribute.local_name.raw_identity(),
+                prefix: prefix.into(),
+                namespace_: attribute.namespace_,
+                value: attribute.value.as_slice().into(),
+            }
+        }));
+    }
+
+    fn fill_from_token(&mut self, token: &Token, namespace_: RustFfiHtmlNamespace) {
+        let TokenPayload::Tag { attributes, .. } = &token.payload else {
+            return;
+        };
+        self.attributes.reserve(attributes.len());
+        self.local_names.reserve(attributes.len());
+        for attribute in attributes {
+            let adjusted_name = adjusted_foreign_attribute_name(&attribute.local_name, namespace_);
+            let prefix = adjusted_name.prefix.unwrap_or("");
+            self.local_names.push(adjusted_name.local_name);
+            self.attributes.push(RustFfiHtmlParserAttribute {
+                local_name: self.local_names.last().unwrap().raw_identity(),
+                prefix: Utf16View::Latin1(prefix.as_bytes()).into(),
+                namespace_: adjusted_name.namespace_,
+                value: attribute.value.as_slice().into(),
+            });
+        }
+    }
+}
+
+fn adjusted_foreign_tag_name(tag_name: &HtmlName, namespace_: RustFfiHtmlNamespace) -> HtmlName {
+    if namespace_ != RustFfiHtmlNamespace::Svg {
+        return tag_name.clone();
+    }
+    // https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-inforeign
+    // If the adjusted current node is an element in the SVG namespace, and the token's tag name is one of the ones in
+    // the first column of the following table, change the tag name to the name given in the corresponding cell in the
+    // second column.
+    let adjustments = [
+        ("altglyph", "altGlyph"),
+        ("altglyphdef", "altGlyphDef"),
+        ("altglyphitem", "altGlyphItem"),
+        ("animatecolor", "animateColor"),
+        ("animatemotion", "animateMotion"),
+        ("animatetransform", "animateTransform"),
+        ("clippath", "clipPath"),
+        ("feblend", "feBlend"),
+        ("fecolormatrix", "feColorMatrix"),
+        ("fecomponenttransfer", "feComponentTransfer"),
+        ("fecomposite", "feComposite"),
+        ("feconvolvematrix", "feConvolveMatrix"),
+        ("fediffuselighting", "feDiffuseLighting"),
+        ("fedisplacementmap", "feDisplacementMap"),
+        ("fedistantlight", "feDistantLight"),
+        ("fedropshadow", "feDropShadow"),
+        ("feflood", "feFlood"),
+        ("fefunca", "feFuncA"),
+        ("fefuncb", "feFuncB"),
+        ("fefuncg", "feFuncG"),
+        ("fefuncr", "feFuncR"),
+        ("fegaussianblur", "feGaussianBlur"),
+        ("feimage", "feImage"),
+        ("femerge", "feMerge"),
+        ("femergenode", "feMergeNode"),
+        ("femorphology", "feMorphology"),
+        ("feoffset", "feOffset"),
+        ("fepointlight", "fePointLight"),
+        ("fespecularlighting", "feSpecularLighting"),
+        ("fespotlight", "feSpotLight"),
+        ("fetile", "feTile"),
+        ("feturbulence", "feTurbulence"),
+        ("foreignobject", "foreignObject"),
+        ("glyphref", "glyphRef"),
+        ("lineargradient", "linearGradient"),
+        ("radialgradient", "radialGradient"),
+        ("textpath", "textPath"),
+    ];
+    adjustments
+        .iter()
+        .find_map(|(name, adjusted_name)| tag_name.equals(name).then(|| HtmlName::from_utf8(adjusted_name)))
+        .unwrap_or_else(|| tag_name.clone())
+}
+
+fn adjusted_foreign_attribute_name(
+    attribute_name: &HtmlName,
+    namespace_: RustFfiHtmlNamespace,
+) -> AdjustedAttributeName {
+    if namespace_ == RustFfiHtmlNamespace::Html {
+        return AdjustedAttributeName {
+            local_name: attribute_name.clone(),
+            prefix: None,
+            namespace_: RustFfiHtmlAttributeNamespace::None,
+        };
+    }
+
+    let adjusted_name = if namespace_ == RustFfiHtmlNamespace::MathMl && attribute_name.equals("definitionurl") {
+        HtmlName::from_utf8("definitionURL")
+    } else if namespace_ == RustFfiHtmlNamespace::Svg {
+        let adjustments = [
+            ("attributename", "attributeName"),
+            ("attributetype", "attributeType"),
+            ("basefrequency", "baseFrequency"),
+            ("baseprofile", "baseProfile"),
+            ("calcmode", "calcMode"),
+            ("clippathunits", "clipPathUnits"),
+            ("diffuseconstant", "diffuseConstant"),
+            ("edgemode", "edgeMode"),
+            ("filterunits", "filterUnits"),
+            ("glyphref", "glyphRef"),
+            ("gradienttransform", "gradientTransform"),
+            ("gradientunits", "gradientUnits"),
+            ("kernelmatrix", "kernelMatrix"),
+            ("kernelunitlength", "kernelUnitLength"),
+            ("keypoints", "keyPoints"),
+            ("keysplines", "keySplines"),
+            ("keytimes", "keyTimes"),
+            ("lengthadjust", "lengthAdjust"),
+            ("limitingconeangle", "limitingConeAngle"),
+            ("markerheight", "markerHeight"),
+            ("markerunits", "markerUnits"),
+            ("markerwidth", "markerWidth"),
+            ("maskcontentunits", "maskContentUnits"),
+            ("maskunits", "maskUnits"),
+            ("numoctaves", "numOctaves"),
+            ("pathlength", "pathLength"),
+            ("patterncontentunits", "patternContentUnits"),
+            ("patterntransform", "patternTransform"),
+            ("patternunits", "patternUnits"),
+            ("pointsatx", "pointsAtX"),
+            ("pointsaty", "pointsAtY"),
+            ("pointsatz", "pointsAtZ"),
+            ("preservealpha", "preserveAlpha"),
+            ("preserveaspectratio", "preserveAspectRatio"),
+            ("primitiveunits", "primitiveUnits"),
+            ("refx", "refX"),
+            ("refy", "refY"),
+            ("repeatcount", "repeatCount"),
+            ("repeatdur", "repeatDur"),
+            ("requiredextensions", "requiredExtensions"),
+            ("requiredfeatures", "requiredFeatures"),
+            ("specularconstant", "specularConstant"),
+            ("specularexponent", "specularExponent"),
+            ("spreadmethod", "spreadMethod"),
+            ("startoffset", "startOffset"),
+            ("stddeviation", "stdDeviation"),
+            ("stitchtiles", "stitchTiles"),
+            ("surfacescale", "surfaceScale"),
+            ("systemlanguage", "systemLanguage"),
+            ("tablevalues", "tableValues"),
+            ("targetx", "targetX"),
+            ("targety", "targetY"),
+            ("textlength", "textLength"),
+            ("viewbox", "viewBox"),
+            ("viewtarget", "viewTarget"),
+            ("xchannelselector", "xChannelSelector"),
+            ("ychannelselector", "yChannelSelector"),
+            ("zoomandpan", "zoomAndPan"),
+        ];
+        adjustments
+            .iter()
+            .find_map(|(name, adjusted_name)| attribute_name.equals(name).then(|| HtmlName::from_utf8(adjusted_name)))
+            .unwrap_or_else(|| attribute_name.clone())
+    } else {
+        attribute_name.clone()
+    };
+
+    // https://html.spec.whatwg.org/multipage/parsing.html#adjust-foreign-attributes
+    // When the steps below require the user agent to adjust foreign attributes for a token, then, if any of the
+    // attributes on the token match the strings given in the first column of the following table, let the attribute be
+    // a namespaced attribute, with the prefix being the string given in the corresponding cell in the second column,
+    // the local name being the string given in the corresponding cell in the third column, and the namespace being the
+    // namespace given in the corresponding cell in the fourth column.
+    let namespaced_adjustments = [
+        (
+            "xlink:actuate",
+            "actuate",
+            Some("xlink"),
+            RustFfiHtmlAttributeNamespace::XLink,
+        ),
+        (
+            "xlink:arcrole",
+            "arcrole",
+            Some("xlink"),
+            RustFfiHtmlAttributeNamespace::XLink,
+        ),
+        (
+            "xlink:href",
+            "href",
+            Some("xlink"),
+            RustFfiHtmlAttributeNamespace::XLink,
+        ),
+        (
+            "xlink:role",
+            "role",
+            Some("xlink"),
+            RustFfiHtmlAttributeNamespace::XLink,
+        ),
+        (
+            "xlink:show",
+            "show",
+            Some("xlink"),
+            RustFfiHtmlAttributeNamespace::XLink,
+        ),
+        (
+            "xlink:title",
+            "title",
+            Some("xlink"),
+            RustFfiHtmlAttributeNamespace::XLink,
+        ),
+        (
+            "xlink:type",
+            "type",
+            Some("xlink"),
+            RustFfiHtmlAttributeNamespace::XLink,
+        ),
+        ("xml:lang", "lang", Some("xml"), RustFfiHtmlAttributeNamespace::Xml),
+        ("xml:space", "space", Some("xml"), RustFfiHtmlAttributeNamespace::Xml),
+        ("xmlns", "xmlns", None, RustFfiHtmlAttributeNamespace::Xmlns),
+        (
+            "xmlns:xlink",
+            "xlink",
+            Some("xmlns"),
+            RustFfiHtmlAttributeNamespace::Xmlns,
+        ),
+    ];
+    let adjusted_namespace = namespaced_adjustments
+        .iter()
+        .find(|(name, ..)| adjusted_name.equals(name));
+    let (local_name, prefix, namespace_) = adjusted_namespace.map_or_else(
+        || (adjusted_name, None, RustFfiHtmlAttributeNamespace::None),
+        |(_, local_name, prefix, namespace_)| (HtmlName::from_utf8(local_name), *prefix, *namespace_),
+    );
+
+    AdjustedAttributeName {
+        local_name,
+        prefix,
+        namespace_,
+    }
+}
+
+// https://html.spec.whatwg.org/multipage/parsing.html#mathml-text-integration-point
+fn is_mathml_text_integration_point(node: &StackNode) -> bool {
+    if node.namespace_ != RustFfiHtmlNamespace::MathMl {
+        return false;
+    }
+
+    // A node is a MathML text integration point if it is one of the following elements:
+    // - A MathML mi element
+    // - A MathML mo element
+    // - A MathML mn element
+    // - A MathML ms element
+    // - A MathML mtext element
+    node.local_name.is_one_of(&[
+        tag_name!("mi"),
+        tag_name!("mo"),
+        tag_name!("mn"),
+        tag_name!("ms"),
+        tag_name!("mtext"),
+    ])
+}
+
+// https://html.spec.whatwg.org/multipage/parsing.html#html-integration-point
+fn is_html_integration_point(node: &StackNode) -> bool {
+    // A node is an HTML integration point if it is one of the following elements:
+    // - A MathML annotation-xml element whose start tag token had an attribute with the name "encoding" whose value was an ASCII case-insensitive match for the string "text/html"
+    // - A MathML annotation-xml element whose start tag token had an attribute with the name "encoding" whose value was an ASCII case-insensitive match for the string "application/xhtml+xml"
+    if node.namespace_ == RustFfiHtmlNamespace::MathMl
+        && node.local_name == tag_name!("annotation-xml")
+        && node
+            .attributes
+            .iter()
+            .find(|attribute| {
+                attribute.namespace_ == RustFfiHtmlAttributeNamespace::None
+                    && attribute.prefix.is_none()
+                    && attribute.local_name == "encoding"
+            })
+            .is_some_and(|attribute| {
+                attribute.value.as_slice().eq_ignore_ascii_case("text/html")
+                    || attribute.value.as_slice().eq_ignore_ascii_case("application/xhtml+xml")
+            })
+    {
+        return true;
+    }
+
+    // - An SVG foreignObject element
+    // - An SVG desc element
+    // - An SVG title element
+    if node.namespace_ == RustFfiHtmlNamespace::Svg {
+        return node
+            .local_name
+            .is_one_of(&[tag_name!("foreignObject"), tag_name!("desc"), tag_name!("title")]);
+    }
+
+    false
+}
+
+// https://html.spec.whatwg.org/multipage/parsing.html#has-an-element-in-the-specific-scope
+fn is_scope_boundary(node: &StackNode) -> bool {
+    if node.namespace_ == RustFfiHtmlNamespace::Html {
+        return node.local_name.is_one_of(&[
+            tag_name!("applet"),
+            tag_name!("caption"),
+            tag_name!("html"),
+            tag_name!("table"),
+            tag_name!("td"),
+            tag_name!("th"),
+            tag_name!("marquee"),
+            tag_name!("object"),
+            tag_name!("select"),
+            tag_name!("template"),
+        ]);
+    }
+
+    is_html_integration_point(node)
+        || is_mathml_text_integration_point(node)
+        || (node.namespace_ == RustFfiHtmlNamespace::MathMl && node.local_name == tag_name!("annotation-xml"))
+}
+
+fn is_foreign_content_breakout_token(token: &Token) -> bool {
+    // -> A start tag whose tag name is one of: "b", "big", "blockquote", "body", "br", "center", "code", "dd", "div", "dl", "dt", "em", "embed", "h1", "h2", "h3", "h4", "h5", "h6", "head", "hr", "i", "img", "li", "listing", "menu", "meta", "nobr", "ol", "p", "pre", "ruby", "s", "small", "span", "strong", "strike", "sub", "sup", "table", "tt", "u", "ul", "var"
+    if token.is_start_tag_one_of(tag_set![
+        "b",
+        "big",
+        "blockquote",
+        "body",
+        "br",
+        "center",
+        "code",
+        "dd",
+        "div",
+        "dl",
+        "dt",
+        "em",
+        "embed",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "head",
+        "hr",
+        "i",
+        "img",
+        "li",
+        "listing",
+        "menu",
+        "meta",
+        "nobr",
+        "ol",
+        "p",
+        "pre",
+        "ruby",
+        "s",
+        "small",
+        "span",
+        "strong",
+        "strike",
+        "sub",
+        "sup",
+        "table",
+        "tt",
+        "u",
+        "ul",
+        "var"
+    ]) {
+        return true;
+    }
+
+    // -> A start tag whose tag name is "font", if the token has any attributes named "color", "face", or "size"
+    if token.is_start_tag_named(tag_id!("font"))
+        && (token.has_attribute(attribute_name!("color"))
+            || token.has_attribute(attribute_name!("face"))
+            || token.has_attribute(attribute_name!("size")))
+    {
+        return true;
+    }
+
+    // -> An end tag whose tag name is "br", "p"
+    token.is_end_tag_one_of(tag_set!["br", "p"])
+}
+
+fn is_formatting_element(tag_name: &HtmlName) -> bool {
+    tag_name.is_one_of(&[
+        tag_name!("a"),
+        tag_name!("b"),
+        tag_name!("big"),
+        tag_name!("code"),
+        tag_name!("em"),
+        tag_name!("font"),
+        tag_name!("i"),
+        tag_name!("nobr"),
+        tag_name!("s"),
+        tag_name!("small"),
+        tag_name!("strike"),
+        tag_name!("strong"),
+        tag_name!("tt"),
+        tag_name!("u"),
+    ])
+}
+
+fn is_implied_end_tag(tag_name: &HtmlName) -> bool {
+    tag_name.is_one_of(&[
+        tag_name!("dd"),
+        tag_name!("dt"),
+        tag_name!("li"),
+        tag_name!("optgroup"),
+        tag_name!("option"),
+        tag_name!("p"),
+        tag_name!("rb"),
+        tag_name!("rp"),
+        tag_name!("rt"),
+        tag_name!("rtc"),
+    ])
+}
+
+fn is_thoroughly_implied_end_tag(tag_name: &HtmlName) -> bool {
+    tag_name.is_one_of(&[
+        tag_name!("caption"),
+        tag_name!("colgroup"),
+        tag_name!("dd"),
+        tag_name!("dt"),
+        tag_name!("li"),
+        tag_name!("optgroup"),
+        tag_name!("option"),
+        tag_name!("p"),
+        tag_name!("rb"),
+        tag_name!("rp"),
+        tag_name!("rt"),
+        tag_name!("rtc"),
+        tag_name!("tbody"),
+        tag_name!("td"),
+        tag_name!("tfoot"),
+        tag_name!("th"),
+        tag_name!("thead"),
+        tag_name!("tr"),
+    ])
+}
+
+// https://html.spec.whatwg.org/multipage/parsing.html#special
+fn is_special_tag(node: &StackNode) -> bool {
+    match node.namespace_ {
+        RustFfiHtmlNamespace::Html => node.local_name.is_one_of(&[
+            tag_name!("address"),
+            tag_name!("applet"),
+            tag_name!("area"),
+            tag_name!("article"),
+            tag_name!("aside"),
+            tag_name!("base"),
+            tag_name!("basefont"),
+            tag_name!("bgsound"),
+            tag_name!("blockquote"),
+            tag_name!("body"),
+            tag_name!("br"),
+            tag_name!("button"),
+            tag_name!("caption"),
+            tag_name!("center"),
+            tag_name!("col"),
+            tag_name!("colgroup"),
+            tag_name!("dd"),
+            tag_name!("details"),
+            tag_name!("dir"),
+            tag_name!("div"),
+            tag_name!("dl"),
+            tag_name!("dt"),
+            tag_name!("embed"),
+            tag_name!("fieldset"),
+            tag_name!("figcaption"),
+            tag_name!("figure"),
+            tag_name!("footer"),
+            tag_name!("form"),
+            tag_name!("frame"),
+            tag_name!("frameset"),
+            tag_name!("h1"),
+            tag_name!("h2"),
+            tag_name!("h3"),
+            tag_name!("h4"),
+            tag_name!("h5"),
+            tag_name!("h6"),
+            tag_name!("head"),
+            tag_name!("header"),
+            tag_name!("hgroup"),
+            tag_name!("hr"),
+            tag_name!("html"),
+            tag_name!("iframe"),
+            tag_name!("img"),
+            tag_name!("input"),
+            tag_name!("keygen"),
+            tag_name!("li"),
+            tag_name!("link"),
+            tag_name!("listing"),
+            tag_name!("main"),
+            tag_name!("marquee"),
+            tag_name!("menu"),
+            tag_name!("meta"),
+            tag_name!("nav"),
+            tag_name!("noembed"),
+            tag_name!("noframes"),
+            tag_name!("noscript"),
+            tag_name!("object"),
+            tag_name!("ol"),
+            tag_name!("p"),
+            tag_name!("param"),
+            tag_name!("plaintext"),
+            tag_name!("pre"),
+            tag_name!("script"),
+            tag_name!("search"),
+            tag_name!("section"),
+            tag_name!("select"),
+            tag_name!("source"),
+            tag_name!("style"),
+            tag_name!("summary"),
+            tag_name!("table"),
+            tag_name!("tbody"),
+            tag_name!("td"),
+            tag_name!("template"),
+            tag_name!("textarea"),
+            tag_name!("tfoot"),
+            tag_name!("th"),
+            tag_name!("thead"),
+            tag_name!("title"),
+            tag_name!("tr"),
+            tag_name!("track"),
+            tag_name!("ul"),
+            tag_name!("wbr"),
+            tag_name!("xmp"),
+        ]),
+        RustFfiHtmlNamespace::Svg => {
+            node.local_name
+                .is_one_of(&[tag_name!("desc"), tag_name!("foreignObject"), tag_name!("title")])
+        }
+        RustFfiHtmlNamespace::MathMl => node.local_name.is_one_of(&[
+            tag_name!("mi"),
+            tag_name!("mo"),
+            tag_name!("mn"),
+            tag_name!("ms"),
+            tag_name!("mtext"),
+            tag_name!("annotation-xml"),
+        ]),
+        RustFfiHtmlNamespace::Other => false,
+    }
+}
+
+fn is_void_html_element(tag_name: &HtmlName) -> bool {
+    tag_name.is_one_of(&[
+        tag_name!("area"),
+        tag_name!("base"),
+        tag_name!("br"),
+        tag_name!("col"),
+        tag_name!("embed"),
+        tag_name!("hr"),
+        tag_name!("img"),
+        tag_name!("input"),
+        tag_name!("keygen"),
+        tag_name!("link"),
+        tag_name!("meta"),
+        tag_name!("param"),
+        tag_name!("source"),
+        tag_name!("track"),
+        tag_name!("wbr"),
+    ])
+}
+
+trait TokenExt {
+    fn is_start_tag(&self) -> bool;
+    fn is_end_tag(&self) -> bool;
+    fn is_start_tag_named(&self, id: TagId) -> bool;
+    fn is_end_tag_named(&self, id: TagId) -> bool;
+    fn is_start_tag_one_of(&self, names: &TagSet) -> bool;
+    fn is_end_tag_one_of(&self, names: &TagSet) -> bool;
+    fn is_parser_whitespace(&self) -> bool;
+    fn comment_data(&self) -> Utf16View<'_>;
+    fn doctype_data(&self) -> &crate::token::DoctypeData;
+    fn attribute(&self, name: KnownName) -> Option<Utf16View<'_>>;
+    fn has_attribute(&self, name: KnownName) -> bool;
+}
+
+impl TokenExt for Token {
+    fn is_start_tag(&self) -> bool {
+        self.token_type == TokenType::StartTag
+    }
+
+    fn is_end_tag(&self) -> bool {
+        self.token_type == TokenType::EndTag
+    }
+
+    #[inline(always)]
+    fn is_start_tag_named(&self, id: TagId) -> bool {
+        self.is_start_tag() && self.tag_id() == id
+    }
+
+    #[inline(always)]
+    fn is_end_tag_named(&self, id: TagId) -> bool {
+        self.is_end_tag() && self.tag_id() == id
+    }
+
+    #[inline(always)]
+    fn is_start_tag_one_of(&self, names: &TagSet) -> bool {
+        self.is_start_tag() && names.contains(self.tag_id())
+    }
+
+    #[inline(always)]
+    fn is_end_tag_one_of(&self, names: &TagSet) -> bool {
+        self.is_end_tag() && names.contains(self.tag_id())
+    }
+
+    fn is_parser_whitespace(&self) -> bool {
+        if self.token_type != TokenType::Character {
+            return false;
+        }
+        matches!(self.code_point, 0x09 | 0x0a | 0x0c | 0x0d | 0x20)
+    }
+
+    fn comment_data(&self) -> Utf16View<'_> {
+        let TokenPayload::Comment(data) = &self.payload else {
+            return Utf16View::Latin1(&[]);
+        };
+        data.as_slice()
+    }
+
+    fn doctype_data(&self) -> &crate::token::DoctypeData {
+        let TokenPayload::Doctype(data) = &self.payload else {
+            panic!("doctype_data called on non-doctype token");
+        };
+        data
+    }
+
+    fn attribute(&self, name: KnownName) -> Option<Utf16View<'_>> {
+        let TokenPayload::Tag { attributes, .. } = &self.payload else {
+            return None;
+        };
+        attributes.iter().find_map(|attribute| {
+            if attribute.local_name == name {
+                Some(attribute.value.as_slice())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn has_attribute(&self, name: KnownName) -> bool {
+        self.attribute(name).is_some()
+    }
+}
+
+impl Token {
+    fn synthetic_character(code_point: u32) -> Self {
+        Self {
+            token_type: TokenType::Character,
+            code_point,
+            ..Default::default()
+        }
+    }
+
+    fn synthetic_end_tag(tag_name: &str) -> Self {
+        Self {
+            token_type: TokenType::EndTag,
+            payload: TokenPayload::Tag {
+                tag_name: HtmlName::from_utf8(tag_name),
+                tag_id: TagId::for_name(tag_name),
+                self_closing: false,
+                had_duplicate_attribute: false,
+                attributes: AttributeList::new(),
+            },
+            ..Default::default()
+        }
+    }
+
+    fn synthetic_start_tag(tag_name: &str) -> Self {
+        Self {
+            token_type: TokenType::StartTag,
+            payload: TokenPayload::Tag {
+                tag_name: HtmlName::from_utf8(tag_name),
+                tag_id: TagId::for_name(tag_name),
+                self_closing: false,
+                had_duplicate_attribute: false,
+                attributes: AttributeList::new(),
+            },
+            ..Default::default()
+        }
+    }
+}
+
+/// Create a new Rust HTML parser.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_html_parser_create() -> *mut RustFfiHtmlParserHandle {
+    Box::into_raw(Box::new(RustFfiHtmlParserHandle {
+        state: ParserState::new(),
+    }))
+}
+
+/// Initialize the Rust HTML parser for the HTML fragment parsing algorithm.
+///
+/// # Safety
+/// `handle` must be a valid pointer from `rust_html_parser_create`.
+/// `context_local_name` must be the borrowed identity of a live C++ `Utf16FlyString`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_html_parser_begin_fragment(
+    handle: Option<&mut RustFfiHtmlParserHandle>,
+    root: usize,
+    root_insertion_target: usize,
+    context_element: usize,
+    context_namespace: RustFfiHtmlNamespace,
+    context_namespace_uri_ptr: *const u16,
+    context_namespace_uri_len: usize,
+    context_local_name: usize,
+    context_attributes: *const RustFfiHtmlParserContextAttribute,
+    context_attribute_count: usize,
+    document_quirks_mode: RustFfiHtmlQuirksMode,
+    allow_declarative_shadow_roots: bool,
+    form_element: usize,
+) {
+    let Some(handle) = handle else {
+        return;
+    };
+    if root == 0 {
+        return;
+    }
+
+    let context_local_name = unsafe { HtmlName::from_borrowed_raw(context_local_name) };
+    let context_namespace_uri = unsafe {
+        utf16_namespace_uri_from_ffi(context_namespace, context_namespace_uri_ptr, context_namespace_uri_len)
+    };
+    let context_attributes = unsafe { owned_context_attributes_from_ffi(context_attributes, context_attribute_count) };
+
+    handle.state.begin_fragment(FragmentParsingContext {
+        root,
+        root_insertion_target,
+        context_element: StackNode {
+            handle: context_element,
+            local_name: context_local_name,
+            namespace_: context_namespace,
+            namespace_uri: context_namespace_uri,
+            attributes: context_attributes.into(),
+            template_content: None,
+        },
+        document_quirks_mode,
+        allow_declarative_shadow_roots,
+        form_element,
+    });
+}
+
+/// Record that the parser's parser sanitizer configuration is non-null, and whether it allows comments.
+///
+/// This must be called after `rust_html_parser_begin_fragment`, which resets the parser state.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_html_parser_set_sanitizer(
+    handle: Option<&mut RustFfiHtmlParserHandle>,
+    sanitizing: bool,
+    allows_comments: bool,
+) {
+    let Some(handle) = handle else {
+        return;
+    };
+    handle.state.sanitizing = sanitizing;
+    handle.state.sanitizer_allows_comments = allows_comments;
+}
+
+/// Run the Rust HTML parser.
+///
+/// Returns `ExecuteScript` when tree construction reaches a parser-blocking script
+/// and the C++ host needs to run the script before tokenization can continue.
+///
+/// # Safety
+/// `handle` must be a valid pointer from `rust_html_parser_create`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_html_parser_run_document(
+    handle: *mut RustFfiHtmlParserHandle,
+    tokenizer: *mut RustFfiTokenizerHandle,
+    host: *mut c_void,
+    scripting_enabled: bool,
+    allow_declarative_shadow_roots: bool,
+    stop_at_insertion_point: bool,
+) -> RustFfiHtmlParserRunResult {
+    if handle.is_null() || tokenizer.is_null() || host.is_null() {
+        return RustFfiHtmlParserRunResult::Unsupported;
+    }
+    // Do not materialize long-lived `&mut` references to the parser state or tokenizer here. C++ host callbacks can
+    // synchronously execute script, and script can re-enter this function through document.write() or document.close().
+    // TreeBuilder uses raw pointers internally so those nested parser runs do not alias an outer Rust `&mut` borrow.
+    unsafe {
+        (*handle).state.scripting_enabled = scripting_enabled;
+        (*handle).state.allow_declarative_shadow_roots = allow_declarative_shadow_roots;
+        (*handle).state.parser_pause_requested = false;
+    }
+    let tokenizer = NonNull::new(unsafe { addr_of_mut!((*tokenizer).tokenizer) }).unwrap();
+    let state = NonNull::new(unsafe { addr_of_mut!((*handle).state) }).unwrap();
+    let mut tree_builder = TreeBuilder::new(tokenizer, host, state);
+    tree_builder.run(stop_at_insertion_point);
+    if unsafe { (*handle).state.pending_script.is_some() } {
+        return RustFfiHtmlParserRunResult::ExecuteScript;
+    }
+    if unsafe { (*handle).state.pending_svg_script.is_some() } {
+        return RustFfiHtmlParserRunResult::ExecuteSvgScript;
+    }
+    RustFfiHtmlParserRunResult::Ok
+}
+
+/// Pop all open elements at the end of parsing.
+///
+/// # Safety
+/// `handle` must be a valid pointer from `rust_html_parser_create`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_html_parser_pop_all_open_elements(handle: *mut RustFfiHtmlParserHandle) {
+    if handle.is_null() {
+        return;
+    }
+    while let Some(node) = unsafe { (*handle).state.stack_of_open_elements.pop() } {
+        if requires_element_popped_callback(&node) {
+            unsafe { ladybird_html_parser_handle_element_popped(node.handle) };
+        }
+    }
+}
+
+/// Visit all DOM nodes that are kept alive by the Rust HTML parser state.
+///
+/// # Safety
+/// `handle` must be a valid pointer from `rust_html_parser_create`.
+/// `visitor` must be a valid `GC::Cell::Visitor`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_html_parser_visit_edges(handle: Option<&RustFfiHtmlParserHandle>, visitor: *mut c_void) {
+    let Some(handle) = handle else {
+        return;
+    };
+    if visitor.is_null() {
+        return;
+    }
+    handle.state.visit_edges(visitor);
+}
+
+/// Take the script element that caused the last Rust HTML parser run to stop.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_html_parser_take_pending_script(handle: Option<&mut RustFfiHtmlParserHandle>) -> usize {
+    let Some(handle) = handle else {
+        return 0;
+    };
+    handle.state.pending_script.take().unwrap_or(0)
+}
+
+/// Take the SVG script element that caused the last Rust HTML parser run to stop.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_html_parser_take_pending_svg_script(handle: Option<&mut RustFfiHtmlParserHandle>) -> usize {
+    let Some(handle) = handle else {
+        return 0;
+    };
+    handle.state.pending_svg_script.take().unwrap_or(0)
+}
+
+/// Destroy a Rust HTML parser.
+///
+/// # Safety
+/// `handle` must be a valid pointer from `rust_html_parser_create`,
+/// and must not be used after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_html_parser_destroy(handle: *mut RustFfiHtmlParserHandle) {
+    if !handle.is_null() {
+        drop(unsafe { Box::from_raw(handle) });
+    }
+}
+
+#[cfg(test)]
+mod test_host;
+
+#[cfg(test)]
+mod tests;
+
+FILE: Libraries/LibWeb/HTML/Parser/Rust/src/parser/test_host.rs
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+//! A fake DOM host that defines the `ladybird_html_parser_*` callbacks so the tree builder can run in Rust tests.
+
+use super::APPEND_CHILD_OFFSET;
+use super::RustFfiHtmlNamespace;
+use super::RustFfiHtmlParserAttribute;
+use super::RustFfiHtmlQuirksMode;
+use super::RustFfiHtmlShadowRootMode;
+use super::RustFfiHtmlSlotAssignmentMode;
+use crate::code_units::RustFfiHtmlUtf16View;
+use std::cell::RefCell;
+use std::ffi::c_void;
+use std::ptr::NonNull;
+
+pub(super) const DOCUMENT: usize = 1;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum FakeNodeKind {
+    Document,
+    DocumentType,
+    DocumentFragment,
+    ShadowRoot,
+    Element(RustFfiHtmlNamespace),
+    Text(String),
+    Comment,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FakeInsertionCall {
+    InsertNode,
+    InsertText,
+    ReinsertLastNode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct FakeInsertion {
+    pub(super) call: FakeInsertionCall,
+    pub(super) parent: usize,
+    pub(super) explicit_offset: Option<usize>,
+}
+
+struct FakeNode {
+    kind: FakeNodeKind,
+    parent: usize,
+    children: Vec<usize>,
+    fragment_host: usize,
+    template_content: usize,
+    shadow_root: usize,
+}
+
+struct FakeDom {
+    nodes: Vec<FakeNode>,
+    insertions: Vec<FakeInsertion>,
+}
+
+impl FakeDom {
+    fn new() -> Self {
+        let mut dom = Self {
+            nodes: Vec::new(),
+            insertions: Vec::new(),
+        };
+        let document = dom.create_node(FakeNodeKind::Document);
+        assert_eq!(document, DOCUMENT);
+        dom
+    }
+
+    fn create_node(&mut self, kind: FakeNodeKind) -> usize {
+        self.nodes.push(FakeNode {
+            kind,
+            parent: 0,
+            children: Vec::new(),
+            fragment_host: 0,
+            template_content: 0,
+            shadow_root: 0,
+        });
+        self.nodes.len()
+    }
+
+    fn node(&self, handle: usize) -> &FakeNode {
+        &self.nodes[handle - 1]
+    }
+
+    fn node_mut(&mut self, handle: usize) -> &mut FakeNode {
+        &mut self.nodes[handle - 1]
+    }
+
+    fn index_in_parent(&self, node: usize) -> usize {
+        let parent = self.node(node).parent;
+        self.node(parent)
+            .children
+            .iter()
+            .position(|&child| child == node)
+            .unwrap()
+    }
+
+    fn has_element_child(&self, node: usize) -> bool {
+        self.node(node)
+            .children
+            .iter()
+            .any(|&child| matches!(self.node(child).kind, FakeNodeKind::Element(_)))
+    }
+
+    fn is_host_including_inclusive_ancestor(&self, ancestor: usize, node: usize) -> bool {
+        let mut current = node;
+        while current != 0 {
+            if current == ancestor {
+                return true;
+            }
+            let current_node = self.node(current);
+            current = if current_node.parent != 0 {
+                current_node.parent
+            } else {
+                current_node.fragment_host
+            };
+        }
+        false
+    }
+
+    fn record_insertion(&mut self, call: FakeInsertionCall, parent: usize, offset: usize) {
+        let explicit_offset = (offset != APPEND_CHILD_OFFSET).then_some(offset);
+        if let Some(offset) = explicit_offset {
+            assert!(offset <= self.node(parent).children.len());
+        }
+        self.insertions.push(FakeInsertion {
+            call,
+            parent,
+            explicit_offset,
+        });
+    }
+
+    fn child_at_offset(&self, parent: usize, offset: usize) -> Option<usize> {
+        if offset == APPEND_CHILD_OFFSET {
+            return None;
+        }
+        self.node(parent).children.get(offset).copied()
+    }
+
+    fn child_before_offset(&self, parent: usize, offset: usize) -> Option<usize> {
+        let children = &self.node(parent).children;
+        match offset {
+            APPEND_CHILD_OFFSET => children.last().copied(),
+            0 => None,
+            _ => Some(children[offset - 1]),
+        }
+    }
+
+    fn remove(&mut self, node: usize) {
+        let parent = self.node(node).parent;
+        if parent == 0 {
+            return;
+        }
+        let index = self.index_in_parent(node);
+        self.node_mut(parent).children.remove(index);
+        self.node_mut(node).parent = 0;
+    }
+
+    fn insert_before(&mut self, parent: usize, node: usize, reference_child: Option<usize>) {
+        self.remove(node);
+        let index = match reference_child {
+            Some(reference_child) => self.index_in_parent(reference_child),
+            None => self.node(parent).children.len(),
+        };
+        self.node_mut(parent).children.insert(index, node);
+        self.node_mut(node).parent = parent;
+    }
+}
+
+thread_local! {
+    static FAKE_DOM: RefCell<FakeDom> = RefCell::new(FakeDom::new());
+}
+
+fn with_fake_dom<R>(callback: impl FnOnce(&mut FakeDom) -> R) -> R {
+    FAKE_DOM.with_borrow_mut(callback)
+}
+
+pub(super) fn fake_parser_host() -> *mut c_void {
+    NonNull::<c_void>::dangling().as_ptr()
+}
+
+pub(super) fn reset() {
+    with_fake_dom(|dom| *dom = FakeDom::new());
+}
+
+pub(super) fn insertions() -> Vec<FakeInsertion> {
+    with_fake_dom(|dom| dom.insertions.clone())
+}
+
+pub(super) fn children(node: usize) -> Vec<usize> {
+    with_fake_dom(|dom| dom.node(node).children.clone())
+}
+
+pub(super) fn kind(node: usize) -> FakeNodeKind {
+    with_fake_dom(|dom| dom.node(node).kind.clone())
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_document_node(_parser: *mut c_void) -> usize {
+    DOCUMENT
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_document_html_element(_parser: *mut c_void) -> usize {
+    with_fake_dom(|dom| {
+        let document_element = dom
+            .node(DOCUMENT)
+            .children
+            .iter()
+            .copied()
+            .find(|&child| matches!(dom.node(child).kind, FakeNodeKind::Element(_)));
+        match document_element {
+            Some(element) if dom.node(element).kind == FakeNodeKind::Element(RustFfiHtmlNamespace::Html) => element,
+            _ => 0,
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_set_document_quirks_mode(_parser: *mut c_void, _mode: RustFfiHtmlQuirksMode) {}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_document_is_iframe_srcdoc_document(_parser: *mut c_void) -> bool {
+    false
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_log_parse_error(_parser: *mut c_void, _message_ptr: *const u8, _message_len: usize) {
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_stop_parsing(_parser: *mut c_void) {}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_parse_errors_enabled() -> bool {
+    false
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_visit_node(_visitor: *mut c_void, _node: usize) {}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_create_document_type(
+    _parser: *mut c_void,
+    _name: RustFfiHtmlUtf16View,
+    _public_id: RustFfiHtmlUtf16View,
+    _system_id: RustFfiHtmlUtf16View,
+) -> usize {
+    with_fake_dom(|dom| dom.create_node(FakeNodeKind::DocumentType))
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_create_comment(_parser: *mut c_void, _data: RustFfiHtmlUtf16View) -> usize {
+    with_fake_dom(|dom| dom.create_node(FakeNodeKind::Comment))
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_insert_text(
+    parent: usize,
+    offset: usize,
+    text: RustFfiHtmlUtf16View,
+    is_ascii: bool,
+) {
+    let text = text.to_test_string();
+    assert!(!is_ascii || text.is_ascii());
+    insert_text(parent, offset, &text);
+}
+
+fn insert_text(parent: usize, offset: usize, data: &str) {
+    with_fake_dom(|dom| {
+        dom.record_insertion(FakeInsertionCall::InsertText, parent, offset);
+        if dom.node(parent).kind == FakeNodeKind::Document {
+            return;
+        }
+        if let Some(previous_child) = dom.child_before_offset(parent, offset)
+            && let FakeNodeKind::Text(previous_text) = &mut dom.node_mut(previous_child).kind
+        {
+            previous_text.push_str(data);
+            return;
+        }
+        let reference_child = dom.child_at_offset(parent, offset);
+        let text = dom.create_node(FakeNodeKind::Text(data.to_string()));
+        dom.insert_before(parent, text, reference_child);
+    })
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_add_missing_attribute(
+    _parser: *mut c_void,
+    _element: usize,
+    _local_name: usize,
+    _value: RustFfiHtmlUtf16View,
+) {
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_remove_node(node: usize) {
+    with_fake_dom(|dom| dom.remove(node))
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_handle_element_popped(_element: usize) {}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_set_script_source_line(
+    _parser: *mut c_void,
+    _element: usize,
+    _source_line_number: usize,
+) {
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_mark_script_already_started(_parser: *mut c_void, _element: usize) {}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_process_meta_element(_parser: *mut c_void, _element: usize) {}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_parent_node(node: usize) -> usize {
+    with_fake_dom(|dom| dom.node(node).parent)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_element_cannot_be_inserted(target_parent: usize, element: usize) -> bool {
+    with_fake_dom(|dom| {
+        dom.node(element).parent != 0
+            || dom.is_host_including_inclusive_ancestor(element, target_parent)
+            || (dom.node(target_parent).kind == FakeNodeKind::Document && dom.has_element_child(target_parent))
+    })
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_node_index(node: usize) -> usize {
+    with_fake_dom(|dom| dom.index_in_parent(node))
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_create_element(
+    _parser: *mut c_void,
+    _intended_parent: usize,
+    namespace_: RustFfiHtmlNamespace,
+    _namespace_uri_ptr: *const u16,
+    _namespace_uri_len: usize,
+    _local_name: usize,
+    _attributes: *const RustFfiHtmlParserAttribute,
+    _attribute_count: usize,
+    _had_duplicate_attribute: bool,
+    _form_element: usize,
+    _has_template_element_on_stack: bool,
+) -> usize {
+    with_fake_dom(|dom| dom.create_node(FakeNodeKind::Element(namespace_)))
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_append_child(parent: usize, child: usize) {
+    with_fake_dom(|dom| dom.insert_before(parent, child, None))
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_insert_node(
+    parent: usize,
+    offset: usize,
+    child: usize,
+    _queue_custom_element_reactions: bool,
+) {
+    with_fake_dom(|dom| {
+        dom.record_insertion(FakeInsertionCall::InsertNode, parent, offset);
+        let reference_child = dom.child_at_offset(parent, offset);
+        dom.insert_before(parent, child, reference_child);
+    })
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_reinsert_last_node(parent: usize, offset: usize, last_node: usize) {
+    with_fake_dom(|dom| {
+        dom.record_insertion(FakeInsertionCall::ReinsertLastNode, parent, offset);
+        let reference_child = dom.child_at_offset(parent, offset);
+        dom.remove(last_node);
+        let can_be_inserted = !dom.is_host_including_inclusive_ancestor(last_node, parent)
+            && (dom.node(parent).kind != FakeNodeKind::Document || !dom.has_element_child(parent))
+            && reference_child.is_none_or(|reference_child| dom.node(reference_child).parent == parent);
+        if can_be_inserted {
+            dom.insert_before(parent, last_node, reference_child);
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_move_all_children(from: usize, to: usize) {
+    with_fake_dom(|dom| {
+        for child in dom.node(from).children.clone() {
+            dom.insert_before(to, child, None);
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_template_content(element: usize) -> usize {
+    with_fake_dom(|dom| {
+        if dom.node(element).template_content == 0 {
+            let content = dom.create_node(FakeNodeKind::DocumentFragment);
+            dom.node_mut(content).fragment_host = element;
+            dom.node_mut(element).template_content = content;
+        }
+        dom.node(element).template_content
+    })
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_attach_declarative_shadow_root(
+    host: usize,
+    _mode: RustFfiHtmlShadowRootMode,
+    _slot_assignment: RustFfiHtmlSlotAssignmentMode,
+    _clonable: bool,
+    _serializable: bool,
+    _delegates_focus: bool,
+    _keep_custom_element_registry_null: bool,
+) -> usize {
+    with_fake_dom(|dom| {
+        if dom.node(host).shadow_root != 0 {
+            return 0;
+        }
+        let shadow_root = dom.create_node(FakeNodeKind::ShadowRoot);
+        dom.node_mut(shadow_root).fragment_host = host;
+        dom.node_mut(host).shadow_root = shadow_root;
+        shadow_root
+    })
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_set_template_content(element: usize, content: usize) {
+    with_fake_dom(|dom| dom.node_mut(element).template_content = content)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_is_shadow_host(node: usize) -> bool {
+    with_fake_dom(|dom| dom.node(node).shadow_root != 0)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_sanitizer_action(_parser: *mut c_void, _element: usize) -> u8 {
+    0
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_child_at_index(parent: usize, index: usize) -> usize {
+    with_fake_dom(|dom| dom.node(parent).children.get(index).copied().unwrap_or(0))
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_declarative_shadow_root_attributes(_element: usize) -> u32 {
+    0
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn ladybird_html_parser_set_script_text_from_parser(_element: usize) {}
+
+FILE: Libraries/LibWeb/HTML/Parser/Rust/src/parser/tests.rs
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+use super::RustFfiHtmlNamespace;
+use super::RustFfiHtmlParserHandle;
+use super::RustFfiHtmlParserRunResult;
+use super::rust_html_parser_create;
+use super::rust_html_parser_destroy;
+use super::rust_html_parser_pop_all_open_elements;
+use super::rust_html_parser_run_document;
+use super::test_host;
+use super::test_host::FakeInsertion;
+use super::test_host::FakeInsertionCall;
+use super::test_host::FakeNodeKind;
+use crate::RustFfiTokenizerHandle;
+use crate::make_handle;
+use crate::rust_html_tokenizer_destroy;
+use crate::tokenizer::HtmlTokenizer;
+use ak::Utf16View;
+
+const HTML_ELEMENT: FakeNodeKind = FakeNodeKind::Element(RustFfiHtmlNamespace::Html);
+
+struct ScriptCreatedParser {
+    parser: *mut RustFfiHtmlParserHandle,
+    tokenizer: *mut RustFfiTokenizerHandle,
+}
+
+impl ScriptCreatedParser {
+    fn open() -> Self {
+        test_host::reset();
+        let mut parser = Self {
+            parser: rust_html_parser_create(),
+            tokenizer: make_handle(HtmlTokenizer::new(Vec::<u8>::new())),
+        };
+        parser.tokenizer().set_input_stream_closed(false);
+        parser.tokenizer().update_insertion_point();
+        parser
+    }
+
+    fn tokenizer(&mut self) -> &mut HtmlTokenizer {
+        unsafe { &mut (*self.tokenizer).tokenizer }
+    }
+
+    fn run(&mut self, stop_at_insertion_point: bool) {
+        let result = unsafe {
+            rust_html_parser_run_document(
+                self.parser,
+                self.tokenizer,
+                test_host::fake_parser_host(),
+                true,
+                false,
+                stop_at_insertion_point,
+            )
+        };
+        assert_eq!(result, RustFfiHtmlParserRunResult::Ok);
+    }
+
+    fn write(&mut self, markup: &str) {
+        let code_units: Vec<u16> = markup.encode_utf16().collect();
+        self.tokenizer()
+            .insert_input_at_insertion_point(Utf16View::Utf16(&code_units));
+        self.run(true);
+    }
+
+    /// Gives the parser the rest of its input from the network rather than from a script.
+    fn append_and_close(&mut self, markup: &str) {
+        let code_units: Vec<u16> = markup.encode_utf16().collect();
+        if code_units.iter().all(|code_unit| *code_unit <= 0xff) {
+            let bytes: Vec<u8> = code_units.iter().map(|code_unit| *code_unit as u8).collect();
+            self.tokenizer().append_input(Utf16View::Latin1(&bytes));
+        } else {
+            self.tokenizer().append_input(Utf16View::Utf16(&code_units));
+        }
+        self.close();
+    }
+
+    fn close(&mut self) {
+        self.tokenizer().insert_eof();
+        self.run(false);
+        unsafe { rust_html_parser_pop_all_open_elements(self.parser) };
+    }
+}
+
+impl Drop for ScriptCreatedParser {
+    fn drop(&mut self) {
+        unsafe {
+            rust_html_parser_destroy(self.parser);
+            rust_html_tokenizer_destroy(self.tokenizer);
+        }
+    }
+}
+
+fn body_element() -> usize {
+    let html_element = *test_host::children(test_host::DOCUMENT).last().unwrap();
+    test_host::children(html_element)[1]
+}
+
+fn kinds_of(nodes: &[usize]) -> Vec<FakeNodeKind> {
+    nodes.iter().map(|&node| test_host::kind(node)).collect()
+}
+
+fn insertions_with_explicit_offset() -> Vec<FakeInsertion> {
+    test_host::insertions()
+        .into_iter()
+        .filter(|insertion| insertion.explicit_offset.is_some())
+        .collect()
+}
+
+#[test]
+fn script_created_parser_appends_every_flat_sibling() {
+    const SIBLING_COUNT: usize = 5000;
+    let mut parser = ScriptCreatedParser::open();
+    parser.write(&format!("{}<span>PASS</span>", "<span></span>".repeat(SIBLING_COUNT)));
+    parser.close();
+
+    let body = body_element();
+    let insertions_into_body = test_host::insertions()
+        .into_iter()
+        .filter(|insertion| insertion.parent == body)
+        .count();
+    assert_eq!(insertions_into_body, SIBLING_COUNT + 1);
+    let explicit_offset_insertions = insertions_with_explicit_offset();
+    assert!(explicit_offset_insertions.is_empty(), "{explicit_offset_insertions:?}");
+
+    let body_children = test_host::children(body);
+    assert_eq!(kinds_of(&body_children), vec![HTML_ELEMENT; SIBLING_COUNT + 1]);
+    assert_eq!(
+        kinds_of(&test_host::children(body_children[SIBLING_COUNT])),
+        [FakeNodeKind::Text("PASS".to_string())]
+    );
+}
+
+#[test]
+fn foster_parented_element_is_inserted_before_the_table_at_an_explicit_offset() {
+    let mut parser = ScriptCreatedParser::open();
+    parser.write("<table><b>fostered</b></table>");
+    parser.close();
+
+    let body = body_element();
+    assert_eq!(
+        insertions_with_explicit_offset(),
+        [FakeInsertion {
+            call: FakeInsertionCall::InsertNode,
+            parent: body,
+            explicit_offset: Some(0),
+        }]
+    );
+
+    let [fostered_element, table] = test_host::children(body)[..] else {
+        panic!("expected the fostered element and the table in body");
+    };
+    assert_eq!(kinds_of(&[fostered_element, table]), [HTML_ELEMENT, HTML_ELEMENT]);
+    assert_eq!(
+        kinds_of(&test_host::children(fostered_element)),
+        [FakeNodeKind::Text("fostered".to_string())]
+    );
+    assert!(test_host::children(table).is_empty());
+}
+
+#[test]
+fn foster_parented_text_is_inserted_before_the_table_at_an_explicit_offset() {
+    let mut parser = ScriptCreatedParser::open();
+    parser.write("<table>fostered</table>");
+    parser.close();
+
+    let body = body_element();
+    let fostered_insertions = insertions_with_explicit_offset();
+    assert!(!fostered_insertions.is_empty());
+    assert!(
+        fostered_insertions
+            .iter()
+            .all(|insertion| insertion.call == FakeInsertionCall::InsertText && insertion.parent == body)
+    );
+
+    let body_children = test_host::children(body);
+    assert_eq!(
+        kinds_of(&body_children),
+        [FakeNodeKind::Text("fostered".to_string()), HTML_ELEMENT]
+    );
+    assert!(test_host::children(body_children[1]).is_empty());
+}
+
+fn text_of_each_paragraph(markup: &str) -> Vec<String> {
+    let mut parser = ScriptCreatedParser::open();
     parser.append_and_close(markup);
     test_host::children(body_element())
         .into_iter()
@@ -7183,6 +8880,17 @@ void PreloadEntry::visit_edges(Cell::Visitor& visitor)
     visitor.visit(controller);
 }
 
+void PreloadEntry::cancel()
+{
+    if (response || cancelled)
+        return;
+    cancelled = true;
+    if (auto callback = on_response_available) {
+        on_response_available = nullptr;
+        callback->function()(nullptr);
+    }
+}
+
 // https://html.spec.whatwg.org/multipage/links.html#create-a-preload-key
 PreloadKey create_a_preload_key(Fetch::Infrastructure::Request const& request)
 {
@@ -7215,7 +8923,7 @@ bool consume_a_preloaded_resource(
     Fetch::Infrastructure::Request::Mode mode,
     Fetch::Infrastructure::Request::CredentialsMode credentials_mode,
     Utf16View integrity_metadata,
-    GC::Ref<GC::Function<void(NonnullRefPtr<Fetch::Infrastructure::Response>)>> on_response_available,
+    GC::Ref<GC::Function<void(RefPtr<Fetch::Infrastructure::Response>)>> on_response_available,
     Fetch::Engine::BodyIntent consumer_body_intent,
     bool& preload_reports_timing)
 {
@@ -7260,10 +8968,8 @@ bool consume_a_preloaded_resource(
     // 8. Remove preloads[key].
     preloads.remove(it);
 
-    // AD-HOC: A preload whose fetch was stopped before its response arrived, such as by stopping the document, will
-    //         never have a response: Stopping a fetch drops its algorithms. Return false, so the consumer fetches on
-    //         its own instead of waiting forever.
-    if (!entry->response && entry->controller && entry->controller->state() == Fetch::Infrastructure::FetchController::State::Stopped)
+    // AD-HOC: A cancelled entry has no response to give. Return false, so the consumer fetches on its own.
+    if (entry->cancelled)
         return false;
 
     // AD-HOC: A preload reports its own timing to Resource Timing, but a speculative fetch does not. Let the consumer
@@ -7371,9 +9077,13 @@ public:
 
     // on response available
     //     Null, or an algorithm accepting a response or null
-    // The callback is always invoked with a non-null response — either entry's resolved response,
-    // or the response delivered by the preload's fetch.
-    GC::Ptr<GC::Function<void(NonnullRefPtr<Fetch::Infrastructure::Response>)>> on_response_available;
+    // AD-HOC: It is called with null only for a cancelled entry.
+    GC::Ptr<GC::Function<void(RefPtr<Fetch::Infrastructure::Response>)>> on_response_available;
+
+    // AD-HOC: Whether the preload's fetch was stopped before the entry had a response. A cancelled entry takes no
+    //         response, and a consumer fetches on its own instead.
+    bool cancelled { false };
+    void cancel();
 
     // AD-HOC: The controller of the fetch loading this entry. A sync XHR consumer, whose event loop is paused while it's
     //         blocked, re-targets that fetch thru this, so it delivers its response without the event loop as well; see
@@ -7392,7 +9102,7 @@ bool consume_a_preloaded_resource(
     Fetch::Infrastructure::Request::Mode mode,
     Fetch::Infrastructure::Request::CredentialsMode credentials_mode,
     Utf16View integrity_metadata,
-    GC::Ref<GC::Function<void(NonnullRefPtr<Fetch::Infrastructure::Response>)>> on_response_available,
+    GC::Ref<GC::Function<void(RefPtr<Fetch::Infrastructure::Response>)>> on_response_available,
     Fetch::Engine::BodyIntent consumer_body_intent,
     bool& preload_reports_timing);
 
@@ -15022,6 +16732,28 @@ private:
 template<>
 inline bool Web::HTML::Script::fast_is<Web::HTML::ModuleScript>() const { return is_module_script(); }
 
+FILE: Libraries/LibWeb/HTML/Scripting/RemoteClientNavigation.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Utf16String.h>
+#include <LibWebCommon/HTML/CrossProcessId.h>
+
+namespace Web::HTML {
+
+// A navigation whose request has a client another process hosts, by which the UI process finds that client again.
+struct RemoteClientNavigation {
+    CrossProcessId navigable_id;
+    Utf16String navigation_id;
+};
+
+}
+
 FILE: Libraries/LibWeb/HTML/Scripting/RemoteEnvironmentSettings.h
 /*
  * Copyright (c) 2026-present, the Ladybird developers.
@@ -15032,17 +16764,10 @@ FILE: Libraries/LibWeb/HTML/Scripting/RemoteEnvironmentSettings.h
 #pragma once
 
 #include <AK/AtomicRefCounted.h>
-#include <AK/Utf16String.h>
-#include <LibWebCommon/HTML/CrossProcessId.h>
+#include <LibWeb/HTML/Scripting/RemoteClientNavigation.h>
 #include <LibWebCommon/HTML/Scripting/SerializedEnvironmentSettingsObject.h>
 
 namespace Web::HTML {
-
-// A navigation whose request has a client another process hosts, by which the UI process finds that client again.
-struct RemoteClientNavigation {
-    CrossProcessId navigable_id;
-    Utf16String navigation_id;
-};
 
 // The settings of an environment another process hosts, as that process serialized them.
 struct RemoteEnvironmentSettings final : public AtomicRefCounted<RemoteEnvironmentSettings> {
@@ -57228,13 +58953,7 @@ EventResult DragAndDropEventHandler::handle_drag_start(
         auto contents = file.take_contents();
         auto mime_type = MimeSniff::Resource::sniff(contents);
 
-        m_drag_data_store->add_item({
-            .kind = HTML::DragDataStoreItem::Kind::File,
-            .type_string = Utf16String::from_utf8(mime_type.essence()),
-            .data = {},
-            .file_data = move(contents),
-            .file_name = file.name(),
-        });
+        m_drag_data_store->add_file(Utf16FlyString::from_utf8(mime_type.essence()), move(contents), file.name());
     }
 
     // FIXME: 6. If the list of dragged nodes is not empty, then extract the microdata from those nodes into a JSON form, and
@@ -57292,13 +59011,7 @@ EventResult DragAndDropEventHandler::handle_drag_start(
         //        Text
         //    The actual data
         //        url string
-        m_drag_data_store->add_item({
-            .kind = HTML::DragDataStoreItem::Kind::Text,
-            .type_string = "text/uri-list"_utf16,
-            .data = move(url),
-            .file_data = {},
-            .file_name = {},
-        });
+        m_drag_data_store->add_text("text/uri-list"_utf16_fly_string, url);
     }();
 
     // FIXME: 8. Update the drag data store default feedback as appropriate for the user agent (if the user is dragging the
@@ -57356,7 +59069,7 @@ EventResult DragAndDropEventHandler::handle_drag_move(
     //    drag operation to "none" (no drag operation).
     auto drag_event = fire_a_drag_and_drop_event(m_source_node, HTML::EventNames::drag);
     if (drag_event->cancelled())
-        m_current_drag_operation = HTML::DataTransferEffect::none;
+        m_current_drag_operation = "none"_utf16_fly_string;
 
     // 3. If the drag event was not canceled and the user has not ended the drag-and-drop operation, check the state of
     //    the drag-and-drop operation, as follows:
@@ -57426,37 +59139,19 @@ EventResult DragAndDropEventHandler::handle_drag_move(
                 if (allow_text_drop(*m_current_target_element)) {
                     // Set the current drag operation to either "copy" or "move", as appropriate given the platform
                     // conventions.
-                    m_current_drag_operation = HTML::DataTransferEffect::copy;
+                    m_current_drag_operation = "copy"_utf16_fly_string;
                 }
                 // -> Otherwise
                 else {
                     // Reset the current drag operation to "none".
-                    m_current_drag_operation = HTML::DataTransferEffect::none;
+                    m_current_drag_operation = "none"_utf16_fly_string;
                 }
             }
             // Otherwise (if the dragover event is canceled), set the current drag operation based on the values of the
             // effectAllowed and dropEffect attributes of the DragEvent object's dataTransfer object as they stood after
-            // the event dispatch finished, as per the following table:
+            // the event dispatch finished.
             else {
-                auto const& effect_allowed = drag_event->data_transfer()->effect_allowed();
-                auto const& drop_effect = drag_event->data_transfer()->drop_effect();
-
-                // effectAllowed                                             | dropEffect | Drag operation
-                // ---------------------------------------------------------------------------------------
-                // "uninitialized", "copy", "copyLink", "copyMove", or "all" | "copy"     | "copy"
-                // "uninitialized", "link", "copyLink", "linkMove", or "all" | "link"     | "link"
-                // "uninitialized", "move", "copyMove", "linkMove", or "all" | "move"     | "move"
-                // Any other case                                            |            | "none"
-                using namespace HTML::DataTransferEffect;
-
-                if (effect_allowed.is_one_of(uninitialized, copy, copyLink, copyMove, all) && drop_effect == copy)
-                    m_current_drag_operation = copy;
-                else if (effect_allowed.is_one_of(uninitialized, link, copyLink, linkMove, all) && drop_effect == link)
-                    m_current_drag_operation = link;
-                else if (effect_allowed.is_one_of(uninitialized, move, copyMove, linkMove, all) && drop_effect == move)
-                    m_current_drag_operation = move;
-                else
-                    m_current_drag_operation = none;
+                m_current_drag_operation = HTML::drag_event_operation(*drag_event);
             }
         }
     }
@@ -57537,7 +59232,7 @@ EventResult DragAndDropEventHandler::handle_drag_end(
         // 1. If the current drag operation is "none" (no drag operation), or if the user ended the drag-and-drop
         //    operation by canceling it (e.g. by hitting the Escape key), or if the current target element is null, then
         //    the drag operation failed. Run these substeps:
-        if (m_current_drag_operation == HTML::DataTransferEffect::none || cancelled == Cancelled::Yes || !m_current_target_element) {
+        if (m_current_drag_operation == "none"_utf16_fly_string || cancelled == Cancelled::Yes || !m_current_target_element) {
             // 1. Let dropped be false.
             dropped = false;
 
@@ -57550,11 +59245,11 @@ EventResult DragAndDropEventHandler::handle_drag_end(
             }
 
             // 3. Set the current drag operation to "none".
-            m_current_drag_operation = HTML::DataTransferEffect::none;
+            m_current_drag_operation = "none"_utf16_fly_string;
         }
         // Otherwise, the drag operation might be a success; run these substeps:
         else {
-            GC::Ptr<HTML::DragEvent> drag_event;
+            GC::Ptr<DOM::Event> drag_event;
 
             // 1. Let dropped be true.
             dropped = true;
@@ -57570,7 +59265,7 @@ EventResult DragAndDropEventHandler::handle_drag_end(
             // 3. If the event is canceled, set the current drag operation to the value of the dropEffect attribute of
             //    the DragEvent object's dataTransfer object as it stood after the event dispatch finished.
             if (drag_event && drag_event->cancelled()) {
-                m_current_drag_operation = drag_event->data_transfer()->drop_effect();
+                m_current_drag_operation = HTML::drag_event_drop_effect(*drag_event);
             }
 
             // Otherwise, the event is not canceled; perform the event's default action, which depends on the exact
@@ -57589,7 +59284,7 @@ EventResult DragAndDropEventHandler::handle_drag_end(
                 // -> Otherwise
                 else {
                     // Reset the current drag operation to "none".
-                    m_current_drag_operation = HTML::DataTransferEffect::none;
+                    m_current_drag_operation = "none"_utf16_fly_string;
                 }
             }
         }
@@ -57611,7 +59306,7 @@ EventResult DragAndDropEventHandler::handle_drag_end(
             // FIXME: The user agent should delete the dragged selection from the relevant text control.
         }
         // -> If dropped is false or if the current drag operation is "none"
-        else if (!dropped || m_current_drag_operation == HTML::DataTransferEffect::none) {
+        else if (!dropped || m_current_drag_operation == "none"_utf16_fly_string) {
             // The drag was canceled. If the platform conventions dictate that this be represented to the user (e.g. by
             // animating the dragged selection going back to the source of the drag-and-drop operation), then do so.
             return EventResult::Cancelled;
@@ -57626,7 +59321,8 @@ EventResult DragAndDropEventHandler::handle_drag_end(
 }
 
 // https://html.spec.whatwg.org/multipage/dnd.html#fire-a-dnd-event
-GC::Ref<HTML::DragEvent> DragAndDropEventHandler::fire_a_drag_and_drop_event(
+// drag_event.rs handles the steps that initialize and detach the drag data store.
+GC::Ref<DOM::Event> DragAndDropEventHandler::fire_a_drag_and_drop_event(
     JS::Object const& relevant_global_object,
     GC::Ptr<DOM::EventTarget> target,
     Utf16FlyString const& name,
@@ -57644,78 +59340,19 @@ GC::Ref<HTML::DragEvent> DragAndDropEventHandler::fire_a_drag_and_drop_event(
     //       handle this by allowing callers to pass a null `target` node. This allows us to execute all state-change
     //       operations in the fire-a-DND-event AO, and simply skip event dispatching for now if the target is null.
 
-    // 1. Let dataDragStoreWasChanged be false.
-    bool drag_data_store_was_changed = false;
-
     // 2. If no specific related target was provided, set related target to null.
 
     // 3. Let window be the relevant global object of the Document object of the specified target element.
     // NOTE: We defer this until it's needed later, to more easily handle when the target is not an element.
 
-    // 4. If e is dragstart, then set the drag data store mode to the read/write mode and set dataDragStoreWasChanged to true.
-    if (name == HTML::EventNames::dragstart) {
-        m_drag_data_store->set_mode(HTML::DragDataStore::Mode::ReadWrite);
-        drag_data_store_was_changed = true;
-    }
-
-    // 5. If e is drop, set the drag data store mode to the read-only mode.
-    else if (name == HTML::EventNames::drop) {
-        m_drag_data_store->set_mode(HTML::DragDataStore::Mode::ReadOnly);
-    }
-
-    // 6. Let dataTransfer be a newly created DataTransfer object associated with the given drag data store.
-    auto data_transfer = HTML::DataTransfer::create(*m_drag_data_store);
-
-    // 7. Set the effectAllowed attribute to the drag data store's drag data store allowed effects state.
-    data_transfer->set_effect_allowed_internal(m_drag_data_store->allowed_effects_state());
-
-    // 8. Set the dropEffect attribute to "none" if e is dragstart, drag, or dragleave; to the value corresponding to the
-    //    current drag operation if e is drop or dragend; and to a value based on the effectAllowed attribute's value and
-    //    the drag-and-drop source, as given by the following table, otherwise (i.e. if e is dragenter or dragover):
-    if (name.is_one_of(HTML::EventNames::dragstart, HTML::EventNames::drag, HTML::EventNames::dragleave)) {
-        data_transfer->set_drop_effect(HTML::DataTransferEffect::none);
-    } else if (name.is_one_of(HTML::EventNames::drop, HTML::EventNames::dragend)) {
-        data_transfer->set_drop_effect(m_current_drag_operation);
-    } else {
-        // effectAllowed                                                                     | dropEffect
-        // ---------------------------------------------------------------------------------------------------------------------------------------
-        // "none"                                                                            | "none"
-        // "copy"                                                                            | "copy"
-        // "copyLink"                                                                        | "copy", or, if appropriate, "link"
-        // "copyMove"                                                                        | "copy", or, if appropriate, "move"
-        // "all"                                                                             | "copy", or, if appropriate, either "link" or "move"
-        // "link"                                                                            | "link"
-        // "linkMove"                                                                        | "link", or, if appropriate, "move"
-        // "move"                                                                            | "move"
-        // "uninitialized" when what is being dragged is a selection from a text control     | "move", or, if appropriate, either "copy" or "link"
-        // "uninitialized" when what is being dragged is a selection                         | "copy", or, if appropriate, either "link" or "move"
-        // "uninitialized" when what is being dragged is an a element with an href attribute | "link", or, if appropriate, either "copy" or "move"
-        // Any other case                                                                    | "copy", or, if appropriate, either "link" or "move"
-        using namespace HTML::DataTransferEffect;
-
-        // clang-format off
-        if (data_transfer->effect_allowed() == none)          data_transfer->set_drop_effect(none);
-        else if (data_transfer->effect_allowed() == copy)     data_transfer->set_drop_effect(copy);
-        else if (data_transfer->effect_allowed() == copyLink) data_transfer->set_drop_effect(copy);
-        else if (data_transfer->effect_allowed() == copyMove) data_transfer->set_drop_effect(copy);
-        else if (data_transfer->effect_allowed() == all)      data_transfer->set_drop_effect(copy);
-        else if (data_transfer->effect_allowed() == link)     data_transfer->set_drop_effect(link);
-        else if (data_transfer->effect_allowed() == linkMove) data_transfer->set_drop_effect(link);
-        else if (data_transfer->effect_allowed() == move)     data_transfer->set_drop_effect(move);
-        // FIXME: Handle "uninitialized" when element drag operations are supported.
-        else data_transfer->set_drop_effect(copy);
-        // clang-format on
-    }
-
     // 9. Let event be the result of creating an event using DragEvent.
     // FIXME: Implement https://dom.spec.whatwg.org/#concept-event-create
-    HTML::DragEventInit event_init {};
+    UIEvents::MouseEventOptions event_init {};
 
     // 10. Initialize event's type attribute to e, its bubbles attribute to true, its view attribute to window, its
     //     relatedTarget attribute to related target, and its dataTransfer attribute to dataTransfer.
     event_init.bubbles = true;
     event_init.related_target = related_target;
-    event_init.data_transfer = data_transfer;
 
     if (target) {
         auto* target_node = as_if<DOM::Node>(target.ptr());
@@ -57741,7 +59378,7 @@ GC::Ref<HTML::DragEvent> DragAndDropEventHandler::fire_a_drag_and_drop_event(
     event_init.button = button;
     event_init.buttons = buttons;
 
-    auto event = HTML::DragEvent::create(name, event_init, page_offset.x().to_double(), page_offset.y().to_double(), offset.x().to_double(), offset.y().to_double(), HighResolutionTime::current_high_resolution_time(relevant_global_object));
+    auto event = HTML::create_drag_event(name, event_init, page_offset.x().to_double(), page_offset.y().to_double(), offset.x().to_double(), offset.y().to_double(), HighResolutionTime::current_high_resolution_time(relevant_global_object), *m_drag_data_store, m_current_drag_operation);
 
     // The "create an event" AO in step 9 should set these.
     event->set_initialized(true);
@@ -57751,16 +59388,7 @@ GC::Ref<HTML::DragEvent> DragAndDropEventHandler::fire_a_drag_and_drop_event(
     if (target)
         target->dispatch_event(event);
 
-    // 13. Set the drag data store allowed effects state to the current value of dataTransfer's effectAllowed attribute.
-    //     (It can only have changed value if e is dragstart.)
-    m_drag_data_store->set_allowed_effects_state(data_transfer->effect_allowed());
-
-    // 14. If dataDragStoreWasChanged is true, then set the drag data store mode back to the protected mode.
-    if (drag_data_store_was_changed)
-        m_drag_data_store->set_mode(HTML::DragDataStore::Mode::Protected);
-
-    // 15. Break the association between dataTransfer and the drag data store.
-    data_transfer->disassociate_with_drag_data_store();
+    HTML::finish_drag_event(*event);
 
     return event;
 }
@@ -57792,7 +59420,7 @@ void DragAndDropEventHandler::reset()
     m_source_node = nullptr;
     m_immediate_user_selection = nullptr;
     m_current_target_element = nullptr;
-    m_current_drag_operation = HTML::DataTransferEffect::none;
+    m_current_drag_operation = "none"_utf16_fly_string;
 }
 
 }
@@ -57842,7 +59470,7 @@ private:
     };
     EventResult handle_drag_end(JS::Object const& relevant_global_object, Cancelled, CSSPixelPoint screen_position, CSSPixelPoint page_offset, CSSPixelPoint client_offset, CSSPixelPoint offset, unsigned button, unsigned buttons, unsigned modifiers);
 
-    GC::Ref<HTML::DragEvent> fire_a_drag_and_drop_event(
+    GC::Ref<DOM::Event> fire_a_drag_and_drop_event(
         JS::Object const& relevant_global_object,
         GC::Ptr<DOM::EventTarget> target,
         Utf16FlyString const& name,
@@ -58024,7 +59652,6 @@ FILE: Libraries/LibWeb/Page/EventHandler.cpp
  */
 
 #include <AK/AnyOf.h>
-#include <AK/Base64.h>
 #include <AK/Debug.h>
 #include <AK/Math.h>
 #include <AK/TemporaryChange.h>
@@ -58050,7 +59677,6 @@ FILE: Libraries/LibWeb/Page/EventHandler.cpp
 #include <LibWeb/Editing/Internal/Algorithms.h>
 #include <LibWeb/Editing/WritingSuggestionController.h>
 #include <LibWeb/HTML/CloseWatcherManager.h>
-#include <LibWeb/HTML/DataTransfer.h>
 #include <LibWeb/HTML/DragDataStore.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/EventNames.h>
@@ -60706,7 +62332,7 @@ static GC::Ptr<DOM::EventTarget> clipboard_event_target(DOM::Document& document)
 }
 
 // https://w3c.github.io/clipboard-apis/#fire-a-clipboard-event
-static bool fire_clipboard_event(DOM::Document& document, Utf16FlyString const& event_name, GC::Ref<HTML::DataTransfer> data_transfer)
+static bool fire_clipboard_event(DOM::Document& document, Utf16FlyString const& event_name, HTML::DragDataStore const& store)
 {
     auto target = clipboard_event_target(document);
     if (!target)
@@ -60717,7 +62343,7 @@ static bool fire_clipboard_event(DOM::Document& document, Utf16FlyString const& 
     event_init.cancelable = true;
     event_init.composed = true;
 
-    auto event = Clipboard::create_clipboard_event(HTML::relevant_realm(document), event_name, event_init, data_transfer);
+    auto event = Clipboard::create_clipboard_event(HTML::relevant_realm(document), event_name, event_init, store);
     return target->dispatch_event(event);
 }
 
@@ -60725,8 +62351,9 @@ static bool fire_clipboard_event(DOM::Document& document, Utf16FlyString const& 
 static void write_data_transfer_to_clipboard(DOM::Document& document, HTML::DragDataStore const& data_store)
 {
     Vector<Clipboard::SystemClipboardRepresentation> representations;
-    for (auto const& item : data_store.item_list()) {
-        if (item.kind != HTML::DragDataStoreItem::Kind::Text)
+    for (size_t index = 0; index < data_store.size(); ++index) {
+        auto item = data_store.item_at(index);
+        if (item.is_file)
             continue;
         if (item.type_string != u"text/plain"sv && item.type_string != u"text/html"sv)
             continue;
@@ -60781,10 +62408,9 @@ bool EventHandler::perform_copy_action(ClipboardActionTrigger trigger)
 
     auto data_store = HTML::DragDataStore::create();
     data_store->set_mode(HTML::DragDataStore::Mode::ReadWrite);
-    auto data_transfer = HTML::DataTransfer::create(data_store);
 
     // 2. Fire a clipboard event named copy.
-    bool event_was_not_canceled = fire_clipboard_event(*document, HTML::EventNames::copy, data_transfer);
+    bool event_was_not_canceled = fire_clipboard_event(*document, HTML::EventNames::copy, *data_store);
     data_store->set_mode(HTML::DragDataStore::Mode::Protected);
 
     // NB: The event listeners can make the document inactive, for example by removing its iframe.
@@ -60852,10 +62478,9 @@ bool EventHandler::perform_cut_action(ClipboardActionTrigger trigger)
 
     auto data_store = HTML::DragDataStore::create();
     data_store->set_mode(HTML::DragDataStore::Mode::ReadWrite);
-    auto data_transfer = HTML::DataTransfer::create(data_store);
 
     // 2. Fire a clipboard event named cut.
-    bool event_was_not_canceled = fire_clipboard_event(*document, HTML::EventNames::cut, data_transfer);
+    bool event_was_not_canceled = fire_clipboard_event(*document, HTML::EventNames::cut, *data_store);
     data_store->set_mode(HTML::DragDataStore::Mode::Protected);
 
     // NB: The event listeners can make the document inactive, for example by removing its iframe.
@@ -60954,26 +62579,6 @@ EventResult EventHandler::perform_paste_action(Vector<Clipboard::SystemClipboard
 {
     auto data_store = HTML::DragDataStore::create();
 
-    auto add_text_item = [&](Utf16FlyString type, Utf16String data) {
-        data_store->add_item({
-            .kind = HTML::DragDataStoreItem::Kind::Text,
-            .type_string = move(type),
-            .data = move(data),
-            .file_data = {},
-            .file_name = {},
-        });
-    };
-
-    auto add_file_item = [&](Utf16FlyString type, Utf16String name, ByteBuffer data) {
-        data_store->add_item({
-            .kind = HTML::DragDataStoreItem::Kind::File,
-            .type_string = move(type),
-            .data = {},
-            .file_data = move(data),
-            .file_name = move(name),
-        });
-    };
-
     if (!system_clipboard_data.is_empty()) {
         for (auto const& representation : system_clipboard_data.first().system_clipboard_representations) {
             auto mime_type = MimeSniff::MimeType::parse(representation.name);
@@ -60987,17 +62592,16 @@ EventResult EventHandler::perform_paste_action(Vector<Clipboard::SystemClipboard
                     auto data = String::from_utf8_with_replacement_character(text);
 
                     if (essence.is_one_of("text/plain"sv, "text/html"sv)) {
-                        add_text_item(move(essence), Utf16String::from_utf8_with_replacement_character(text));
+                        data_store->add_text(essence, Utf16String::from_utf8_with_replacement_character(text));
                     } else if (essence == "image/png"sv) {
                         // AD-HOC: The spec doesn't say what to do here, but other engines add a file named
                         //         image.png for any PNG inserted via navigator.clipboard. Note that only PNG
                         //         images are supported via that API.
-                        add_file_item(move(essence), "image.png"_utf16, text.to_byte_buffer());
+                        data_store->add_file(essence, text.to_byte_buffer(), "image.png"_utf16);
                     }
                 },
                 [&](HTML::SelectedFile const& file) {
-                    auto contents = file;
-                    add_file_item(move(essence), file.name(), contents.take_contents());
+                    data_store->add_file(essence, file.file_or_contents().get<ByteBuffer>(), file.name());
                 });
         }
     }
@@ -61018,7 +62622,6 @@ EventResult EventHandler::perform_paste_action(NonnullRefPtr<HTML::DragDataStore
     TemporaryChange handling_user_paste { s_is_handling_user_key_press_or_paste, true };
 
     data_store->set_mode(HTML::DragDataStore::Mode::ReadOnly);
-    auto data_transfer = HTML::DataTransfer::create(data_store);
 
     // NB: Pasting the system clipboard is the user's interaction with the user agent's "Paste" control, so script
     //     running as a result of the paste event may read the data being pasted. A paste of handed-over content lets
@@ -61028,7 +62631,7 @@ EventResult EventHandler::perform_paste_action(NonnullRefPtr<HTML::DragDataStore
     window->set_system_clipboard_data_being_pasted(system_clipboard_data);
 
     // 2. Fire a clipboard event named paste.
-    bool event_was_not_canceled = fire_clipboard_event(*document, HTML::EventNames::paste, data_transfer);
+    bool event_was_not_canceled = fire_clipboard_event(*document, HTML::EventNames::paste, *data_store);
     window->set_system_clipboard_data_being_pasted(data_being_pasted);
     data_store->set_mode(HTML::DragDataStore::Mode::Protected);
 
@@ -61037,15 +62640,16 @@ EventResult EventHandler::perform_paste_action(NonnullRefPtr<HTML::DragDataStore
     auto result = EventResult::Handled;
     if (event_was_not_canceled) {
         Optional<Utf16String> html;
-        Utf16View plain_text;
+        Utf16String plain_text;
 
-        for (auto const& item : data_store->item_list()) {
+        for (size_t index = 0; index < data_store->size(); ++index) {
+            auto item = data_store->item_at(index);
             if (item.type_string == "text/html"sv) {
                 html = item.data;
             } else if (item.type_string == "text/plain"sv) {
                 plain_text = item.data;
             } else if (item.type_string.starts_with("image/"sv)) {
-                if (auto base64 = AK::encode_base64(item.file_data); !base64.is_error())
+                if (auto base64 = data_store->file_data_as_base64(index); !base64.is_error())
                     html = Utf16String::formatted("<img src=\"data:{};base64,{}\" />", item.type_string, base64.value());
             }
         }
@@ -551345,6 +552949,7 @@ FILE: Libraries/LibWeb/TrustedTypes/RequireTrustedTypesForDirective.h
 
 #include <LibJS/Runtime/Object.h>
 #include <LibWeb/ContentSecurityPolicy/Directives/Directive.h>
+#include <LibWeb/Forward.h>
 #include <LibWeb/TrustedTypes/InjectionSink.h>
 
 namespace Web::TrustedTypes {
@@ -563590,6 +565195,7 @@ FILE: Libraries/LibWeb/WebDriver/BiDi/Network.cpp
 #include <AK/Time.h>
 #include <LibRequests/Request.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/Fetch/Fetching/Fetching.h>
 #include <LibWeb/Fetch/Infrastructure/ClientContextSnapshot.h>
 #include <LibWeb/Fetch/Infrastructure/FetchParams.h>
 #include <LibWeb/Fetch/Infrastructure/HTTP/Bodies.h>
@@ -563660,7 +565266,7 @@ static RefPtr<NetworkRequest> network_request_of(RefPtr<NetworkObservation> cons
 // The state of the request the fetch was started with.
 static RefPtr<NetworkRequest> network_request_of(FetchParams const& fetch_params)
 {
-    return network_request_of(fetch_params.controller()->network_observation());
+    return network_request_of(Fetch::Fetching::fetch_controller_of(fetch_params)->network_observation());
 }
 
 static RefPtr<NetworkContinuation> blocked_request(NetworkRequest const& state)
@@ -563696,7 +565302,7 @@ static void resume_blocked_request(String id, NetworkContinuationAction action, 
 
 static void cancel_network_interception_impl(FetchParams const& fetch_params, StringView error_text)
 {
-    auto blocked = blocked_request(*fetch_params.controller());
+    auto blocked = blocked_request(*Fetch::Fetching::fetch_controller_of(fetch_params));
     if (!blocked)
         return;
     resume_blocked_request(blocked->request_id, NetworkContinuationAction::Fail, Response::network_error(String::from_utf8_with_replacement_character(error_text)));
@@ -563878,7 +565484,7 @@ void initialize_network_request(Request& request, GC::Ptr<HTML::Navigable> navig
 
 void initialize_network_request(FetchParams const& fetch_params, GC::Ptr<HTML::Navigable> navigable)
 {
-    auto observation = fetch_params.controller()->network_observation();
+    auto observation = Fetch::Fetching::fetch_controller_of(fetch_params)->network_observation();
     VERIFY(observation);
     initialize_network_request(*observation, *fetch_params.request(), navigable, {});
 }
@@ -576042,25 +577648,33 @@ FILE: Libraries/LibWeb/WebLocks/AbstractOperations.cpp
 #include <LibGC/Function.h>
 #include <LibJS/HostClassBuilder.h>
 #include <LibJS/Runtime/Realm.h>
+#include <LibWeb/DOM/Document.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/Scripting/Agent.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
+#include <LibWeb/HTML/Window.h>
 #include <LibWeb/WebIDL/CallbackType.h>
+#include <LibWeb/WebLocks/AbstractOperations.h>
 
 namespace Web::WebLocks {
 
 extern "C" {
 void web_locks_queue_task(JS::Realm*, GC::Cell*, void (*steps)(JSVM*, void*));
 void web_locks_queue_callback_task(WebIDL::CallbackType*, GC::Cell*, void (*steps)(JSVM*, void*));
+void web_locks_queue_notices_task(void (*steps)(JSVM*));
+
+u64 web_rust_web_locks_agent_id();
+void web_rust_web_locks_terminate_remaining_locks_and_requests_of_agent(u64 agent_id);
+void web_rust_web_locks_terminate_remaining_locks_and_requests_of_client(JSVM*, HTML::EnvironmentSettingsObject*);
 }
 
 // https://w3c.github.io/web-locks/#lock-task-queue
 static HTML::ParallelQueue& lock_task_queue()
 {
     // A user agent has a lock task queue which is the result of starting a new parallel queue.
-    // NB: Lock managers are per environment, and a parallel queue queues tasks on the agent that uses it. So this is one
-    //     queue per agent.
+    // NB: A parallel queue queues tasks on the agent that uses it, so this is one queue per agent. The lock managers that
+    //     agents share are in a table behind a lock, and each agent acts on its own requests and locks from its own queue.
     auto& agent = HTML::surrounding_agent();
     if (!agent.lock_task_queue)
         agent.lock_task_queue = HTML::ParallelQueue::create();
@@ -576083,6 +577697,65 @@ void web_locks_queue_callback_task(WebIDL::CallbackType* callback, GC::Cell* cel
         steps(JS::HostABI::vm_to_abi(callback->callback_context->realm().vm()), cell.ptr());
     }));
 }
+
+// NB: The steps act on objects of more than one realm, and enter the realm of each themselves.
+void web_locks_queue_notices_task(void (*steps)(JSVM*))
+{
+    auto& vm = JS::VM::the();
+    lock_task_queue().enqueue(GC::create_function(vm.heap(), GC::captures(steps), [](auto& steps) {
+        steps(JS::HostABI::vm_to_abi(JS::VM::the()));
+    }));
+}
+
+u64 lock_agent_id()
+{
+    return web_rust_web_locks_agent_id();
+}
+
+void terminate_remaining_locks_and_requests(u64 lock_agent_id)
+{
+    web_rust_web_locks_terminate_remaining_locks_and_requests_of_agent(lock_agent_id);
+}
+
+void run_unloading_cleanup_steps(DOM::Document& document)
+{
+    // Whenever the unloading document cleanup steps run with a document, terminate remaining locks and requests with its
+    // agent.
+    // NB: The documents of this process share one agent, so this terminates the locks and requests of the document's
+    //     environment only. A window that another document takes over keeps its environment, and so its locks.
+    auto window = document.window();
+    if (!window || &window->associated_document() != &document || document.window_is_taken_over_after_unload())
+        return;
+    auto& environment = HTML::relevant_settings_object(*window);
+    web_rust_web_locks_terminate_remaining_locks_and_requests_of_client(JS::HostABI::vm_to_abi(JS::VM::the()), &environment);
+}
+
+}
+
+FILE: Libraries/LibWeb/WebLocks/AbstractOperations.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Types.h>
+#include <LibWeb/Export.h>
+#include <LibWeb/Forward.h>
+
+namespace Web::WebLocks {
+
+// The id under which the lock managers of this process know the agent of the current thread.
+WEB_API u64 lock_agent_id();
+
+// https://w3c.github.io/web-locks/#termination-of-locks
+// Any thread can do this for an agent, so that an agent that is stuck in script still lets go of its locks.
+WEB_API void terminate_remaining_locks_and_requests(u64 lock_agent_id);
+
+// https://w3c.github.io/web-locks/#termination-of-locks
+void run_unloading_cleanup_steps(DOM::Document&);
 
 }
 
@@ -576130,17 +577803,11 @@ namespace Web::WebLocks {
 
 extern "C" {
 void* web_rust_web_locks_create_lock_manager(JSVM*, void* realm);
-LockManager* web_locks_environment_lock_manager(HTML::EnvironmentSettingsObject*);
 }
 
 GC::Ref<LockManager> LockManager::create(HTML::EnvironmentSettingsObject& environment)
 {
     return *static_cast<LockManager*>(web_rust_web_locks_create_lock_manager(JS::HostABI::vm_to_abi(environment.realm().vm()), &environment.realm()));
-}
-
-LockManager* web_locks_environment_lock_manager(HTML::EnvironmentSettingsObject* environment)
-{
-    return environment->lock_manager().ptr();
 }
 
 }
@@ -582804,7 +584471,9 @@ ErrorOr<void> WebSocket::establish_web_socket_connection(URL::URL const& url_rec
         return Error::from_string_literal("WebSocket connection was blocked");
     }
 
-    Fetch::Fetching::upgrade_request_to_https_for_known_hsts_host_if_appropriate(Bindings::principal_host_defined_page(client.realm()), *request);
+    Fetch::Fetching::upgrade_request_to_https_for_known_hsts_host_if_appropriate(*request, [&](String const& host) {
+        return ResourceLoader::is_known_hsts_host(Bindings::principal_host_defined_page(client.realm()), host);
+    });
 
     if (m_ready_state != Requests::WebSocket::ReadyState::Connecting)
         return Error::from_string_literal("The WebSocket was closed before it connected");
@@ -590097,7 +591766,7 @@ FILE: Libraries/LibWebCommon/HTML/CrossProcessId.h
 #include <AK/HashFunctions.h>
 #include <AK/Traits.h>
 #include <AK/Types.h>
-#include <LibGC/Forward.h>
+#include <LibGC/HoldsNoCellEdges.h>
 #include <LibIPC/Forward.h>
 #include <LibWebCommon/Export.h>
 
@@ -590686,6 +592355,7 @@ template<>
 ErrorOr<void> IPC::encode(Encoder& encoder, Web::FinalizeSameDocumentNavigationHistoryOperationParameters const& parameters)
 {
     TRY(encoder.encode(parameters.navigable_id));
+    TRY(encoder.encode(parameters.document_id));
     TRY(encoder.encode(parameters.target_entry));
     TRY(encoder.encode(parameters.entry_to_replace));
     TRY(encoder.encode(parameters.previous_entry_persisted_state));
@@ -590699,6 +592369,7 @@ ErrorOr<Web::FinalizeSameDocumentNavigationHistoryOperationParameters> IPC::deco
 {
     return Web::FinalizeSameDocumentNavigationHistoryOperationParameters {
         .navigable_id = TRY(decoder.decode<Web::HTML::CrossProcessId>()),
+        .document_id = TRY(decoder.decode<Web::HTML::CrossProcessId>()),
         .target_entry = TRY(decoder.decode<Web::HTML::SameDocumentNavigationEntry>()),
         .entry_to_replace = TRY(decoder.decode<Optional<Web::HTML::SessionHistoryEntryIdentity>>()),
         .previous_entry_persisted_state = TRY(decoder.decode<Optional<Web::HTML::SessionHistoryEntryPersistedState>>()),
@@ -590810,6 +592481,7 @@ struct NavigableDestructionHistoryOperationParameters {
 
 struct FinalizeSameDocumentNavigationHistoryOperationParameters {
     HTML::CrossProcessId navigable_id;
+    HTML::CrossProcessId document_id;
     HTML::SameDocumentNavigationEntry target_entry;
     Optional<HTML::SessionHistoryEntryIdentity> entry_to_replace;
     Optional<HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state;
@@ -593040,7 +594712,7 @@ FILE: Libraries/LibWebCommon/HTML/Scripting/EnvironmentId.h
 
 #include <AK/Format.h>
 #include <AK/String.h>
-#include <LibGC/Forward.h>
+#include <LibGC/HoldsNoCellEdges.h>
 #include <LibIPC/Forward.h>
 #include <LibWebCommon/Export.h>
 
@@ -593385,7 +595057,7 @@ FILE: Libraries/LibWebCommon/HTML/Scripting/SerializedEnvironmentSettingsObject.
 #pragma once
 
 #include <AK/Utf16String.h>
-#include <LibGC/Forward.h>
+#include <LibGC/HoldsNoCellEdges.h>
 #include <LibIPC/Forward.h>
 #include <LibURL/Origin.h>
 #include <LibURL/URL.h>
@@ -602746,1460 +604418,3 @@ impl Resource<'_> {
         if length >= 2
             && (self.resource_header.starts_with(b"\xFE\xFF") || self.resource_header.starts_with(b"\xFF\xFE"))
         {
-            self.computed_mime_type = mime_type("text/plain");
-            return;
-        }
-
-        // 3. If length is greater than or equal to 3 and the first 3 bytes of the resource header are equal to 0xEF 0xBB 0xBF (UTF-8 BOM),
-        //    the computed MIME type is "text/plain".
-        //    Abort these steps.
-        if length >= 3 && self.resource_header.starts_with(b"\xEF\xBB\xBF") {
-            self.computed_mime_type = mime_type("text/plain");
-            return;
-        }
-
-        // 4. If the resource header contains no binary data bytes, the computed MIME type is "text/plain".
-        //    Abort these steps.
-        if !self.resource_header.iter().copied().any(is_binary_data_byte) {
-            self.computed_mime_type = mime_type("text/plain");
-        }
-
-        // 5. The computed MIME type is "application/octet-stream".
-        // NB: This is the default MIME type of the computed MIME type.
-    }
-
-    // https://mimesniff.spec.whatwg.org/#context-specific-sniffing-algorithm
-    fn context_specific_sniffing_algorithm(&mut self, sniffing_context: SniffingContext) {
-        // A context-specific sniffing algorithm determines the computed MIME type of a resource only if
-        // the resource is a MIME type relevant to a particular context.
-        if matches!(sniffing_context, SniffingContext::None | SniffingContext::Browsing) {
-            // https://mimesniff.spec.whatwg.org/#sniffing-in-a-browsing-context
-            // Use the MIME type sniffing algorithm.
-            self.mime_type_sniffing_algorithm();
-            return;
-        }
-
-        // NB: Non-standard but if the client expects us to not sniff, we shouldn't be doing any
-        //     context-specific sniffing if we don't have to.
-        if self.no_sniff
-            && let Some(supplied_mime_type) = &self.supplied_mime_type
-        {
-            self.computed_mime_type = supplied_mime_type.clone();
-            return;
-        }
-
-        match sniffing_context {
-            SniffingContext::Image => self.rules_for_sniffing_images_specifically(),
-            SniffingContext::AudioOrVideo => self.rules_for_sniffing_audio_or_video_specifically(),
-            SniffingContext::Font => self.rules_for_sniffing_fonts_specifically(),
-            SniffingContext::TextOrBinary => self.rules_for_distinguishing_if_a_resource_is_text_or_binary(),
-            SniffingContext::None | SniffingContext::Browsing => unreachable!(),
-        }
-    }
-
-    // https://mimesniff.spec.whatwg.org/#sniffing-in-an-image-context
-    fn rules_for_sniffing_images_specifically(&mut self) {
-        // 1. If the supplied MIME type is an XML MIME type, the computed MIME type is the supplied MIME type.
-        //    Abort these steps.
-        // NB: Non-standard but due to the mime type detection algorithm we need this sanity check.
-        if let Some(supplied_mime_type) = &self.supplied_mime_type
-            && supplied_mime_type.essence().is_xml()
-        {
-            self.computed_mime_type = supplied_mime_type.clone();
-            return;
-        }
-
-        // 2. Let image-type-matched be the result of executing the image type pattern matching algorithm with
-        //    the resource header as the byte sequence to be matched.
-        // 3. If image-type-matched is not undefined, the computed MIME type is image-type-matched.
-        //    Abort these steps.
-        if let Some(matched_type) = match_an_image_type_pattern(self.resource_header) {
-            self.computed_mime_type = matched_type;
-            return;
-        }
-
-        // 4. The computed MIME type is the supplied MIME type.
-        // NB: Non-standard but due to the mime type detection algorithm we need this sanity check.
-        //     If the supplied mime type is undefined, we use computed mime type's default value.
-        if let Some(supplied_mime_type) = &self.supplied_mime_type {
-            self.computed_mime_type = supplied_mime_type.clone();
-        }
-    }
-
-    // https://mimesniff.spec.whatwg.org/#sniffing-in-an-audio-or-video-context
-    fn rules_for_sniffing_audio_or_video_specifically(&mut self) {
-        // 1. If the supplied MIME type is an XML MIME type, the computed MIME type is the supplied MIME type.
-        //    Abort these steps.
-        // NB: Non-standard but due to the mime type detection algorithm we need this sanity check.
-        if let Some(supplied_mime_type) = &self.supplied_mime_type
-            && supplied_mime_type.essence().is_xml()
-        {
-            self.computed_mime_type = supplied_mime_type.clone();
-            return;
-        }
-
-        // 2. Let audio-or-video-type-matched be the result of executing the audio or video type pattern matching
-        //    algorithm with the resource header as the byte sequence to be matched.
-        // 3. If audio-or-video-type-matched is not undefined, the computed MIME type is audio-or-video-type-matched.
-        //    Abort these steps.
-        if let Some(matched_type) = match_an_audio_or_video_type_pattern(self.resource_header) {
-            self.computed_mime_type = matched_type;
-            return;
-        }
-
-        // 4. The computed MIME type is the supplied MIME type.
-        // NB: Non-standard but due to the mime type detection algorithm we need this sanity check.
-        //     If the supplied mime type is undefined, we use computed mime type's default value.
-        if let Some(supplied_mime_type) = &self.supplied_mime_type {
-            self.computed_mime_type = supplied_mime_type.clone();
-        }
-    }
-
-    // https://mimesniff.spec.whatwg.org/#sniffing-in-a-font-context
-    fn rules_for_sniffing_fonts_specifically(&mut self) {
-        // 1. If the supplied MIME type is an XML MIME type, the computed MIME type is the supplied MIME type.
-        //    Abort these steps.
-        // NB: Non-standard but due to the mime type detection algorithm we need this sanity check.
-        if let Some(supplied_mime_type) = &self.supplied_mime_type
-            && supplied_mime_type.essence().is_xml()
-        {
-            self.computed_mime_type = supplied_mime_type.clone();
-            return;
-        }
-
-        // 2. Let font-type-matched be the result of executing the font type pattern matching algorithm with the
-        //    resource header as the byte sequence to be matched.
-        // 3. If font-type-matched is not undefined, the computed MIME type is font-type-matched.
-        //    Abort these steps.
-        if let Some(matched_type) = match_a_font_type_pattern(self.resource_header) {
-            self.computed_mime_type = matched_type;
-            return;
-        }
-
-        // 4. The computed MIME type is the supplied MIME type.
-        // NB: Non-standard but due to the mime type detection algorithm we need this sanity check.
-        //     If the supplied mime type is undefined, we use computed mime type's default value.
-        if let Some(supplied_mime_type) = &self.supplied_mime_type {
-            self.computed_mime_type = supplied_mime_type.clone();
-        }
-    }
-}
-
-FILE: Libraries/LibWebCommon/SecureContexts/AbstractOperations.cpp
-/*
- * Copyright (c) 2022, Linus Groh <linusg@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibURL/InternalURLs.h>
-#include <LibURL/Origin.h>
-#include <LibURL/URL.h>
-#include <LibWebCommon/SecureContexts/AbstractOperations.h>
-
-namespace Web::SecureContexts {
-
-// https://w3c.github.io/webappsec-secure-contexts/#is-origin-trustworthy
-Trustworthiness is_origin_potentially_trustworthy(URL::Origin const& origin)
-{
-    // 1. If origin is an opaque origin, return "Not Trustworthy".
-    if (origin.is_opaque()) {
-        // AD-HOC: The secure context spec assumes file scheme origins are tuple origins.
-        //         Therefore, we need to special case file scheme origins here. See spec issue:
-        //         https://github.com/w3c/webappsec-secure-contexts/issues/66
-        return origin.is_opaque_file_origin() ? Trustworthiness::PotentiallyTrustworthy : Trustworthiness::NotTrustworthy;
-    }
-
-    // 2. Assert: origin is a tuple origin.
-
-    // 3. If origin’s scheme is either "https" or "wss", return "Potentially Trustworthy".
-    // Note: This is meant to be analog to the a priori authenticated URL concept in [MIX].
-    if (auto& scheme = origin.scheme(); scheme.has_value() && scheme->is_one_of("https"sv, "wss"sv))
-        return Trustworthiness::PotentiallyTrustworthy;
-
-    // 4. If origin’s host matches one of the CIDR notations 127.0.0.0/8 or ::1/128 [RFC4632], return "Potentially Trustworthy".
-    // 5. If the user agent conforms to the name resolution rules in [let-localhost-be-localhost] and one of the following is true:
-    // - origin’s host is "localhost" or "localhost."
-    // - origin’s host ends with ".localhost" or ".localhost."
-    // then return "Potentially Trustworthy".
-    // Note: See § 5.2 localhost for details on the requirements here.
-    if (origin.host().is_loopback_or_localhost())
-        return Trustworthiness::PotentiallyTrustworthy;
-
-    // 6. If origin’s scheme is "file", return "Potentially Trustworthy".
-    // AD-HOC: Our resource:// is basically an alias to file://
-    if (origin.scheme() == "file"sv || origin.scheme() == "resource"sv)
-        return Trustworthiness::PotentiallyTrustworthy;
-
-    // 7. If origin’s scheme component is one which the user agent considers to be authenticated, return "Potentially Trustworthy".
-    // Note: See § 7.1 Packaged Applications for detail here.
-
-    // 8. If origin has been configured as a trustworthy origin, return "Potentially Trustworthy".
-    // Note: See § 7.2 Development Environments for detail here.
-
-    // 9. Return "Not Trustworthy".
-    return Trustworthiness::NotTrustworthy;
-}
-
-// https://w3c.github.io/webappsec-secure-contexts/#is-url-trustworthy
-Trustworthiness is_url_potentially_trustworthy(URL::URL const& url)
-{
-    // 1. If url is "about:blank" or "about:srcdoc", return "Potentially Trustworthy".
-    if (url == URL::about_blank() || url == URL::about_srcdoc())
-        return Trustworthiness::PotentiallyTrustworthy;
-
-    // AD-HOC: Browser-internal about: pages (WebUI) are served directly by the user agent.
-    if (URL::is_webui_url(url))
-        return Trustworthiness::PotentiallyTrustworthy;
-
-    // 2. If url's scheme is "data", return "Potentially Trustworthy".
-    if (url.scheme() == "data"sv)
-        return Trustworthiness::PotentiallyTrustworthy;
-
-    // 3. Return the result of executing § 3.1 Is origin potentially trustworthy? on url’s origin.
-    return is_origin_potentially_trustworthy(url.origin());
-}
-
-}
-
-FILE: Libraries/LibWebCommon/SecureContexts/AbstractOperations.h
-/*
- * Copyright (c) 2022, Linus Groh <linusg@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/Forward.h>
-#include <LibURL/Forward.h>
-#include <LibWebCommon/Export.h>
-
-namespace Web::SecureContexts {
-
-enum class Trustworthiness {
-    PotentiallyTrustworthy,
-    NotTrustworthy,
-};
-
-[[nodiscard]] WEBCOMMON_API Trustworthiness is_origin_potentially_trustworthy(URL::Origin const&);
-[[nodiscard]] WEBCOMMON_API Trustworthiness is_url_potentially_trustworthy(URL::URL const&);
-
-}
-
-FILE: Libraries/LibWebCommon/StorageAPI/StorageAreaId.h
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/Concepts.h>
-#include <AK/DistinctNumeric.h>
-#include <LibIPC/SenderClaim.h>
-
-namespace Web::StorageAPI {
-
-// Identifies one storage area: the map a storage bottle for one storage key keeps, in the process that owns it. The
-// UI process hands out area IDs when a WebContent process connects to an area and tracks which connection each one
-// went to, so an area ID in a message from a helper process is a claim about the sender. The distinct type keeps that
-// claim from being mistaken for an ordinary number.
-AK_TYPEDEF_DISTINCT_ORDERED_ID(u64, StorageAreaId);
-
-// An area ID in a message is checked against the receiver's own record of which areas the sender was connected to.
-template<typename Stub>
-bool verify_sender_claim(Stub& stub, StorageAreaId const& area_id)
-{
-    if constexpr (requires {
-                      { stub.may_act_for_storage_area(area_id) } -> SameAs<bool>;
-                  })
-        return stub.may_act_for_storage_area(area_id);
-    else
-        return true;
-}
-
-}
-
-namespace IPC {
-
-template<>
-class SenderClaimReceiver<Web::StorageAPI::StorageAreaId> {
-public:
-    // True when the connection a message came from was given the storage area the message names. A receiver that
-    // hands out no area IDs is not the party the claim is made to, so it accepts every area ID.
-    virtual bool may_act_for_storage_area(Web::StorageAPI::StorageAreaId) const { return true; }
-
-protected:
-    ~SenderClaimReceiver() = default;
-};
-
-}
-
-FILE: Libraries/LibWebCommon/StorageAPI/StorageEndpoint.cpp
-/*
- * Copyright (c) 2024-2025, Shannon Booth <shannon@serenityos.org>
- * Copyright (c) 2025, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibWebCommon/StorageAPI/StorageEndpoint.h>
-
-namespace Web::StorageAPI {
-
-ReadonlySpan<StorageEndpoint> StorageEndpoint::registered_endpoints()
-{
-    // https://storage.spec.whatwg.org/#registered-storage-endpoints
-    static auto const endpoints = to_array<StorageEndpoint>({
-        { StorageEndpointType::Caches, StorageType::Local, {} },
-        { StorageEndpointType::IndexedDB, StorageType::Local, {} },
-        { StorageEndpointType::LocalStorage, StorageType::Local, LOCAL_STORAGE_QUOTA },
-        { StorageEndpointType::ServiceWorkerRegistrations, StorageType::Local, {} },
-        { StorageEndpointType::SessionStorage, StorageType::Session, SESSION_STORAGE_QUOTA },
-    });
-    return endpoints;
-}
-
-Optional<u64> quota_for(StorageEndpointType identifier)
-{
-    for (auto const& endpoint : StorageEndpoint::registered_endpoints()) {
-        if (endpoint.identifier == identifier)
-            return endpoint.quota;
-    }
-    return {};
-}
-
-u64 storage_quota_size(Utf16View const& string)
-{
-    // Counted without encoding: the bytes UTF-8 would take, with a lone surrogate counted as the three bytes it is
-    // written as. Every write measures its key and value this way, so building the UTF-8 string would cost a copy of
-    // each on the path meant to be fast.
-    if (string.has_ascii_storage())
-        return string.length_in_code_units();
-
-    u64 size = 0;
-    for (auto code_point : string) {
-        if (code_point < 0x80)
-            size += 1;
-        else if (code_point < 0x800)
-            size += 2;
-        else if (code_point < 0x10000)
-            size += 3;
-        else
-            size += 4;
-    }
-    return size;
-}
-
-}
-
-FILE: Libraries/LibWebCommon/StorageAPI/StorageEndpoint.h
-/*
- * Copyright (c) 2024-2025, Shannon Booth <shannon@serenityos.org>
- * Copyright (c) 2025, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/Optional.h>
-#include <AK/String.h>
-#include <AK/Types.h>
-#include <AK/Utf16String.h>
-#include <LibWebCommon/Export.h>
-#include <LibWebCommon/StorageAPI/StorageType.h>
-
-namespace Web::StorageAPI {
-
-enum class StorageEndpointType : u8 {
-    Caches = 0,
-    IndexedDB = 1,
-    LocalStorage = 2,
-    ServiceWorkerRegistrations = 3,
-    SessionStorage = 4,
-
-    Count = 5 // This should always be the last value in the enum.
-};
-
-// https://storage.spec.whatwg.org/#storage-endpoint
-//
-// A storage endpoint is a local or session storage API that uses the infrastructure defined by this
-// standard, most notably storage bottles, to keep track of its storage needs.
-struct WEBCOMMON_API StorageEndpoint {
-    static constexpr u64 LOCAL_STORAGE_QUOTA = 5 * MiB;
-    static constexpr u64 SESSION_STORAGE_QUOTA = 5 * MiB;
-
-    // https://storage.spec.whatwg.org/#storage-endpoint-identifier
-    // A storage endpoint has an identifier, which is a storage identifier.
-    StorageEndpointType identifier;
-
-    // https://storage.spec.whatwg.org/#storage-endpoint-types
-    // A storage endpoint also has types, which is a set of storage types.
-    // NOTE: We do not implement this as a set as it is not necessary in the current implementation.
-    StorageType type;
-
-    // https://storage.spec.whatwg.org/#storage-endpoint-quota
-    // A storage endpoint also has a quota, which is null or a number representing a recommended quota (in bytes) for each storage bottle corresponding to this storage endpoint.
-    Optional<u64> quota;
-
-    static ReadonlySpan<StorageEndpoint> registered_endpoints();
-};
-
-// The quota of the registered storage endpoint with this identifier, or null when it has none.
-WEBCOMMON_API Optional<u64> quota_for(StorageEndpointType);
-
-// Bytes a string contributes toward a storage bottle's quota: its UTF-8 length. The process that keeps a bottle and
-// the processes that mirror it measure the same way, so a write one accepts is a write the other accepts.
-WEBCOMMON_API u64 storage_quota_size(Utf16View const&);
-inline u64 storage_quota_size(Utf16String const& string) { return storage_quota_size(string.utf16_view()); }
-
-}
-
-FILE: Libraries/LibWebCommon/StorageAPI/StorageKey.cpp
-/*
- * Copyright (c) 2024, Andrew Kaster <andrew@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibIPC/Decoder.h>
-#include <LibIPC/Encoder.h>
-#include <LibWebCommon/StorageAPI/StorageKey.h>
-
-namespace Web::StorageAPI {
-
-StorageKey obtain_a_storage_key_for_non_storage_purposes(URL::Origin const& origin)
-{
-    // NOTE: This function exists as there are cases where we don't have the full environment object, but we still need to obtain a storage key.
-    return { origin };
-}
-
-// https://storage.spec.whatwg.org/#obtain-a-storage-key
-Optional<StorageKey> obtain_a_storage_key(URL::Origin const& origin)
-{
-    // 1. Let key be the result of running obtain a storage key for non-storage purposes with environment.
-    // NB: The caller ran step 1; this is its key's origin.
-    auto key = obtain_a_storage_key_for_non_storage_purposes(origin);
-
-    // AD-HOC: "file://" URLs are opaque, but other browsers support storage on "file://" URLs.
-    if (key.origin.is_opaque_file_origin())
-        key.origin = URL::Origin { "file"_string, String {}, {} };
-
-    // 2. If key's origin is an opaque origin, then return failure.
-    if (key.origin.is_opaque())
-        return {};
-
-    // FIXME: 3. If the user has disabled storage, then return failure.
-
-    // 4. Return key.
-    return key;
-}
-
-}
-
-namespace IPC {
-
-template<>
-ErrorOr<void> encode(Encoder& encoder, Web::StorageAPI::StorageKey const& key)
-{
-    TRY(encoder.encode(key.origin));
-    return {};
-}
-
-template<>
-ErrorOr<Web::StorageAPI::StorageKey> decode(Decoder& decoder)
-{
-    auto origin = TRY(decoder.decode<URL::Origin>());
-    return Web::StorageAPI::StorageKey { move(origin) };
-}
-
-}
-
-FILE: Libraries/LibWebCommon/StorageAPI/StorageKey.h
-/*
- * Copyright (c) 2024, Andrew Kaster <andrew@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/Optional.h>
-#include <AK/String.h>
-#include <AK/Traits.h>
-#include <LibGC/Forward.h>
-#include <LibIPC/Forward.h>
-#include <LibURL/Origin.h>
-#include <LibWebCommon/Export.h>
-
-namespace Web::StorageAPI {
-
-// https://storage.spec.whatwg.org/#storage-keys
-struct StorageKey {
-
-    // A storage key is a tuple consisting of an origin (an origin). [HTML]
-    // NOTE: This is expected to change; see Client-Side Storage Partitioning https://privacycg.github.io/storage-partitioning/.
-    URL::Origin origin;
-
-    String to_string() const
-    {
-        return origin.serialize();
-    }
-
-    friend bool operator==(StorageKey const& a, StorageKey const& b)
-    {
-        // To determine whether a storage key A equals storage key B, run these steps:
-        // 1. If A’s origin is not same origin with B’s origin, then return false.
-        // 2. Return true.
-        return a.origin.is_same_origin(b.origin);
-    }
-};
-
-WEBCOMMON_API StorageKey obtain_a_storage_key_for_non_storage_purposes(URL::Origin const&);
-
-// Steps 2 to 4 of "obtain a storage key", for a caller that has the environment's origin in hand. Every process
-// that names a bottle goes through this, so they all name it the same way.
-WEBCOMMON_API Optional<StorageKey> obtain_a_storage_key(URL::Origin const&);
-
-}
-
-namespace AK {
-
-template<>
-struct Traits<Web::StorageAPI::StorageKey> : public DefaultTraits<Web::StorageAPI::StorageKey> {
-    static unsigned hash(Web::StorageAPI::StorageKey const& key)
-    {
-        return Traits<URL::Origin>::hash(key.origin);
-    }
-};
-
-}
-
-namespace IPC {
-
-template<>
-WEBCOMMON_API ErrorOr<void> encode(Encoder&, Web::StorageAPI::StorageKey const&);
-
-template<>
-WEBCOMMON_API ErrorOr<Web::StorageAPI::StorageKey> decode(Decoder&);
-
-}
-
-GC_UNTRACED_CAPTURE(Web::StorageAPI::StorageKey);
-
-FILE: Libraries/LibWebCommon/StorageAPI/StorageType.h
-/*
- * Copyright (c) 2024-2025, Shannon Booth <shannon@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-namespace Web::StorageAPI {
-
-// https://storage.spec.whatwg.org/#storage-type
-// A storage type is "local" or "session".
-enum class StorageType {
-    Local,
-    Session,
-};
-
-}
-
-FILE: Libraries/LibWebCommon/UIEvents/KeyCode.h
-/*
- * Copyright (c) 2018-2020, Andreas Kling <andreas@ladybird.org>
- * Copyright (c) 2024, Andrew Kaster <akaster@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/EnumBits.h>
-#include <AK/Platform.h>
-#include <AK/Types.h>
-#include <AK/Utf16View.h>
-
-namespace Web::UIEvents {
-
-#define ENUMERATE_KEY_CODES                                          \
-    __ENUMERATE_KEY_CODE(Invalid, "Invalid", 0x00)                   \
-    __ENUMERATE_KEY_CODE(Backspace, "Backspace", 0x08)               \
-    __ENUMERATE_KEY_CODE(Tab, "Tab", 0x09)                           \
-    __ENUMERATE_KEY_CODE(Return, "Return", 0x0D)                     \
-    __ENUMERATE_KEY_CODE(LeftShift, "LeftShift", 0x10)               \
-    __ENUMERATE_KEY_CODE(RightShift, "RightShift", 0xB0)             \
-    __ENUMERATE_KEY_CODE(LeftControl, "LeftControl", 0x11)           \
-    __ENUMERATE_KEY_CODE(RightControl, "RightControl", 0xB1)         \
-    __ENUMERATE_KEY_CODE(LeftAlt, "LeftAlt", 0x12)                   \
-    __ENUMERATE_KEY_CODE(RightAlt, "RightAlt", 0xB2)                 \
-    __ENUMERATE_KEY_CODE(AltGr, "AltGr", 0xE1)                       \
-    __ENUMERATE_KEY_CODE(PauseBreak, "PauseBreak", 0x13)             \
-    __ENUMERATE_KEY_CODE(CapsLock, "CapsLock", 0x14)                 \
-    __ENUMERATE_KEY_CODE(Escape, "Escape", 0x1B)                     \
-    __ENUMERATE_KEY_CODE(Space, "Space", 0x20)                       \
-    __ENUMERATE_KEY_CODE(PageUp, "PageUp", 0x21)                     \
-    __ENUMERATE_KEY_CODE(PageDown, "PageDown", 0x22)                 \
-    __ENUMERATE_KEY_CODE(End, "End", 0x23)                           \
-    __ENUMERATE_KEY_CODE(Home, "Home", 0x24)                         \
-    __ENUMERATE_KEY_CODE(Left, "Left", 0x25)                         \
-    __ENUMERATE_KEY_CODE(Up, "Up", 0x26)                             \
-    __ENUMERATE_KEY_CODE(Right, "Right", 0x27)                       \
-    __ENUMERATE_KEY_CODE(Down, "Down", 0x28)                         \
-    __ENUMERATE_KEY_CODE(PrintScreen, "PrintScreen", 0x2A)           \
-    __ENUMERATE_KEY_CODE(SysRq, "SysRq", 0x2C)                       \
-    __ENUMERATE_KEY_CODE(Delete, "Delete", 0x2E)                     \
-    __ENUMERATE_KEY_CODE(0, "0", 0x30)                               \
-    __ENUMERATE_KEY_CODE(1, "1", 0x31)                               \
-    __ENUMERATE_KEY_CODE(2, "2", 0x32)                               \
-    __ENUMERATE_KEY_CODE(3, "3", 0x33)                               \
-    __ENUMERATE_KEY_CODE(4, "4", 0x34)                               \
-    __ENUMERATE_KEY_CODE(5, "5", 0x35)                               \
-    __ENUMERATE_KEY_CODE(6, "6", 0x36)                               \
-    __ENUMERATE_KEY_CODE(7, "7", 0x37)                               \
-    __ENUMERATE_KEY_CODE(8, "8", 0x38)                               \
-    __ENUMERATE_KEY_CODE(9, "9", 0x39)                               \
-    __ENUMERATE_KEY_CODE(A, "A", 0x41)                               \
-    __ENUMERATE_KEY_CODE(B, "B", 0x42)                               \
-    __ENUMERATE_KEY_CODE(C, "C", 0x43)                               \
-    __ENUMERATE_KEY_CODE(D, "D", 0x44)                               \
-    __ENUMERATE_KEY_CODE(E, "E", 0x45)                               \
-    __ENUMERATE_KEY_CODE(F, "F", 0x46)                               \
-    __ENUMERATE_KEY_CODE(G, "G", 0x47)                               \
-    __ENUMERATE_KEY_CODE(H, "H", 0x48)                               \
-    __ENUMERATE_KEY_CODE(I, "I", 0x49)                               \
-    __ENUMERATE_KEY_CODE(J, "J", 0x4A)                               \
-    __ENUMERATE_KEY_CODE(K, "K", 0x4B)                               \
-    __ENUMERATE_KEY_CODE(L, "L", 0x4C)                               \
-    __ENUMERATE_KEY_CODE(M, "M", 0x4D)                               \
-    __ENUMERATE_KEY_CODE(N, "N", 0x4E)                               \
-    __ENUMERATE_KEY_CODE(O, "O", 0x4F)                               \
-    __ENUMERATE_KEY_CODE(P, "P", 0x50)                               \
-    __ENUMERATE_KEY_CODE(Q, "Q", 0x51)                               \
-    __ENUMERATE_KEY_CODE(R, "R", 0x52)                               \
-    __ENUMERATE_KEY_CODE(S, "S", 0x53)                               \
-    __ENUMERATE_KEY_CODE(T, "T", 0x54)                               \
-    __ENUMERATE_KEY_CODE(U, "U", 0x55)                               \
-    __ENUMERATE_KEY_CODE(V, "V", 0x56)                               \
-    __ENUMERATE_KEY_CODE(W, "W", 0x57)                               \
-    __ENUMERATE_KEY_CODE(X, "X", 0x58)                               \
-    __ENUMERATE_KEY_CODE(Y, "Y", 0x59)                               \
-    __ENUMERATE_KEY_CODE(Z, "Z", 0x5A)                               \
-    __ENUMERATE_KEY_CODE(RightParen, ")", 0x60)                      \
-    __ENUMERATE_KEY_CODE(ExclamationPoint, "!", 0x61)                \
-    __ENUMERATE_KEY_CODE(AtSign, "@", 0x62)                          \
-    __ENUMERATE_KEY_CODE(Hashtag, "#", 0x63)                         \
-    __ENUMERATE_KEY_CODE(Dollar, "$", 0x64)                          \
-    __ENUMERATE_KEY_CODE(Percent, "%", 0x65)                         \
-    __ENUMERATE_KEY_CODE(Circumflex, "^", 0x66)                      \
-    __ENUMERATE_KEY_CODE(Ampersand, "&", 0x67)                       \
-    __ENUMERATE_KEY_CODE(Asterisk, "*", 0x68)                        \
-    __ENUMERATE_KEY_CODE(LeftParen, "(", 0x69)                       \
-    __ENUMERATE_KEY_CODE(Plus, "+", 0x6A)                            \
-    __ENUMERATE_KEY_CODE(Minus, "-", 0x6B)                           \
-    __ENUMERATE_KEY_CODE(Slash, "/", 0x6C)                           \
-    __ENUMERATE_KEY_CODE(Comma, ",", 0x6D)                           \
-    __ENUMERATE_KEY_CODE(Period, ".", 0x6E)                          \
-    __ENUMERATE_KEY_CODE(Colon, ":", 0x6F)                           \
-    __ENUMERATE_KEY_CODE(F1, "F1", 0x70)                             \
-    __ENUMERATE_KEY_CODE(F2, "F2", 0x71)                             \
-    __ENUMERATE_KEY_CODE(F3, "F3", 0x72)                             \
-    __ENUMERATE_KEY_CODE(F4, "F4", 0x73)                             \
-    __ENUMERATE_KEY_CODE(F5, "F5", 0x74)                             \
-    __ENUMERATE_KEY_CODE(F6, "F6", 0x75)                             \
-    __ENUMERATE_KEY_CODE(F7, "F7", 0x76)                             \
-    __ENUMERATE_KEY_CODE(F8, "F8", 0x77)                             \
-    __ENUMERATE_KEY_CODE(F9, "F9", 0x78)                             \
-    __ENUMERATE_KEY_CODE(F10, "F10", 0x79)                           \
-    __ENUMERATE_KEY_CODE(F11, "F11", 0x7A)                           \
-    __ENUMERATE_KEY_CODE(F12, "F12", 0x7B)                           \
-    __ENUMERATE_KEY_CODE(DoubleQuote, "\"", 0x7C)                    \
-    __ENUMERATE_KEY_CODE(Apostrophe, "'", 0x7D)                      \
-    __ENUMERATE_KEY_CODE(Insert, "Insert", 0x7E)                     \
-    __ENUMERATE_KEY_CODE(Semicolon, ";", 0x7F)                       \
-    __ENUMERATE_KEY_CODE(LessThan, "<", 0x80)                        \
-    __ENUMERATE_KEY_CODE(Equal, "=", 0x81)                           \
-    __ENUMERATE_KEY_CODE(GreaterThan, ">", 0x82)                     \
-    __ENUMERATE_KEY_CODE(QuestionMark, "?", 0x83)                    \
-    __ENUMERATE_KEY_CODE(LeftBracket, "[", 0x84)                     \
-    __ENUMERATE_KEY_CODE(RightBracket, "]", 0x85)                    \
-    __ENUMERATE_KEY_CODE(Backslash, "\\", 0x86)                      \
-    __ENUMERATE_KEY_CODE(Underscore, "_", 0x87)                      \
-    __ENUMERATE_KEY_CODE(LeftBrace, "{", 0x88)                       \
-    __ENUMERATE_KEY_CODE(RightBrace, "}", 0x89)                      \
-    __ENUMERATE_KEY_CODE(Pipe, "|", 0x8A)                            \
-    __ENUMERATE_KEY_CODE(Tilde, "~", 0x8B)                           \
-    __ENUMERATE_KEY_CODE(Backtick, "`", 0x8C)                        \
-    __ENUMERATE_KEY_CODE(NumLock, "NumLock", 0x90)                   \
-    __ENUMERATE_KEY_CODE(ScrollLock, "ScrollLock", 0x91)             \
-    __ENUMERATE_KEY_CODE(LeftSuper, "LeftSuper", 0x92)               \
-    __ENUMERATE_KEY_CODE(RightSuper, "RightSuper", 0xAC)             \
-    __ENUMERATE_KEY_CODE(BrowserSearch, "BrowserSearch", 0x93)       \
-    __ENUMERATE_KEY_CODE(BrowserFavorites, "BrowserFavorites", 0x94) \
-    __ENUMERATE_KEY_CODE(BrowserHome, "BrowserHome", 0x95)           \
-    __ENUMERATE_KEY_CODE(PreviousTrack, "PreviousTrack", 0x96)       \
-    __ENUMERATE_KEY_CODE(BrowserBack, "BrowserBack", 0x97)           \
-    __ENUMERATE_KEY_CODE(BrowserForward, "BrowserForward", 0x98)     \
-    __ENUMERATE_KEY_CODE(BrowserRefresh, "BrowserRefresh", 0x99)     \
-    __ENUMERATE_KEY_CODE(BrowserStop, "BrowserStop", 0x9A)           \
-    __ENUMERATE_KEY_CODE(VolumeDown, "VolumeDown", 0x9B)             \
-    __ENUMERATE_KEY_CODE(VolumeUp, "VolumeUp", 0x9C)                 \
-    __ENUMERATE_KEY_CODE(Wake, "Wake", 0x9D)                         \
-    __ENUMERATE_KEY_CODE(Sleep, "Sleep", 0x9E)                       \
-    __ENUMERATE_KEY_CODE(NextTrack, "NextTrack", 0x9F)               \
-    __ENUMERATE_KEY_CODE(MediaSelect, "MediaSelect", 0xA0)           \
-    __ENUMERATE_KEY_CODE(Email, "Email", 0xA1)                       \
-    __ENUMERATE_KEY_CODE(MyComputer, "MyComputer", 0xA2)             \
-    __ENUMERATE_KEY_CODE(Power, "Power", 0xA3)                       \
-    __ENUMERATE_KEY_CODE(Stop, "Stop", 0xA4)                         \
-    __ENUMERATE_KEY_CODE(LeftGUI, "LeftGUI", 0xA5)                   \
-    __ENUMERATE_KEY_CODE(Mute, "Mute", 0xA6)                         \
-    __ENUMERATE_KEY_CODE(RightGUI, "RightGUI", 0xA7)                 \
-    __ENUMERATE_KEY_CODE(Calculator, "Calculator", 0xA8)             \
-    __ENUMERATE_KEY_CODE(Apps, "Apps", 0xA9)                         \
-    __ENUMERATE_KEY_CODE(PlayPause, "PlayPause", 0xAA)               \
-    __ENUMERATE_KEY_CODE(Menu, "Menu", 0xAB)
-
-enum KeyCode : u8 {
-#define __ENUMERATE_KEY_CODE(name, ui_name, code) Key_##name = code,
-    ENUMERATE_KEY_CODES
-#undef __ENUMERATE_KEY_CODE
-};
-
-constexpr KeyCode key_code_from_string(Utf16View key_name)
-{
-#define __ENUMERATE_KEY_CODE(name, ui_name, code) \
-    if (key_name == u##ui_name##sv)               \
-        return KeyCode::Key_##name;
-    ENUMERATE_KEY_CODES
-#undef __ENUMERATE_KEY_CODE
-
-    VERIFY_NOT_REACHED();
-}
-
-enum KeyModifier {
-    Mod_None = 0x00,
-    Mod_Alt = (1 << 0),
-    Mod_Ctrl = (1 << 1),
-    Mod_Shift = (1 << 2),
-    Mod_Super = (1 << 3),
-    Mod_Keypad = (1 << 4),
-    Mod_Mask = Mod_Alt | Mod_Ctrl | Mod_Shift | Mod_Super | Mod_Keypad,
-
-    Is_Press = 0x80,
-
-#if defined(AK_OS_MACOS)
-    Mod_PlatformCtrl = Mod_Super,
-    Mod_PlatformWordJump = Mod_Alt,
-#else
-    Mod_PlatformCtrl = Mod_Ctrl,
-    Mod_PlatformWordJump = Mod_Ctrl,
-#endif
-};
-
-AK_ENUM_BITWISE_OPERATORS(KeyModifier);
-
-inline KeyCode code_point_to_key_code(u32 code_point)
-{
-    switch (code_point) {
-#define MATCH_ALPHA(letter) \
-    case #letter[0]:        \
-    case #letter[0] + 32:   \
-        return KeyCode::Key_##letter;
-        MATCH_ALPHA(A)
-        MATCH_ALPHA(B)
-        MATCH_ALPHA(C)
-        MATCH_ALPHA(D)
-        MATCH_ALPHA(E)
-        MATCH_ALPHA(F)
-        MATCH_ALPHA(G)
-        MATCH_ALPHA(H)
-        MATCH_ALPHA(I)
-        MATCH_ALPHA(J)
-        MATCH_ALPHA(K)
-        MATCH_ALPHA(L)
-        MATCH_ALPHA(M)
-        MATCH_ALPHA(N)
-        MATCH_ALPHA(O)
-        MATCH_ALPHA(P)
-        MATCH_ALPHA(Q)
-        MATCH_ALPHA(R)
-        MATCH_ALPHA(S)
-        MATCH_ALPHA(T)
-        MATCH_ALPHA(U)
-        MATCH_ALPHA(V)
-        MATCH_ALPHA(W)
-        MATCH_ALPHA(X)
-        MATCH_ALPHA(Y)
-        MATCH_ALPHA(Z)
-#undef MATCH_ALPHA
-
-#define MATCH_KEY(name, character) \
-    case character:                \
-        return KeyCode::Key_##name;
-        MATCH_KEY(Backspace, '\b')
-        MATCH_KEY(Tab, '\t')
-        MATCH_KEY(Return, '\n')
-        MATCH_KEY(Space, ' ')
-        MATCH_KEY(ExclamationPoint, '!')
-        MATCH_KEY(DoubleQuote, '"')
-        MATCH_KEY(Hashtag, '#')
-        MATCH_KEY(Dollar, '$')
-        MATCH_KEY(Percent, '%')
-        MATCH_KEY(Ampersand, '&')
-        MATCH_KEY(Apostrophe, '\'')
-        MATCH_KEY(LeftParen, '(')
-        MATCH_KEY(RightParen, ')')
-        MATCH_KEY(Asterisk, '*')
-        MATCH_KEY(Plus, '+')
-        MATCH_KEY(Comma, ',')
-        MATCH_KEY(Minus, '-')
-        MATCH_KEY(Period, '.')
-        MATCH_KEY(Slash, '/')
-        MATCH_KEY(0, '0')
-        MATCH_KEY(1, '1')
-        MATCH_KEY(2, '2')
-        MATCH_KEY(3, '3')
-        MATCH_KEY(4, '4')
-        MATCH_KEY(5, '5')
-        MATCH_KEY(6, '6')
-        MATCH_KEY(7, '7')
-        MATCH_KEY(8, '8')
-        MATCH_KEY(9, '9')
-        MATCH_KEY(Colon, ':')
-        MATCH_KEY(Semicolon, ';')
-        MATCH_KEY(LessThan, '<')
-        MATCH_KEY(Equal, '=')
-        MATCH_KEY(GreaterThan, '>')
-        MATCH_KEY(QuestionMark, '?')
-        MATCH_KEY(AtSign, '@')
-        MATCH_KEY(LeftBracket, '[')
-        MATCH_KEY(RightBracket, ']')
-        MATCH_KEY(Backslash, '\\')
-        MATCH_KEY(Circumflex, '^')
-        MATCH_KEY(Underscore, '_')
-        MATCH_KEY(LeftBrace, '{')
-        MATCH_KEY(RightBrace, '}')
-        MATCH_KEY(Pipe, '|')
-        MATCH_KEY(Tilde, '~')
-        MATCH_KEY(Backtick, '`')
-#undef MATCH_KEY
-
-    default:
-        return KeyCode::Key_Invalid;
-    }
-}
-
-}
-
-#include <LibWebCommon/UIEvents/KeyCodeCodecs.h>
-
-FILE: Libraries/LibWebCommon/UIEvents/KeyCode.ipc
-// Copyright (c) 2026-present, the Ladybird developers.
-//
-// SPDX-License-Identifier: BSD-2-Clause
-
-#include <LibWebCommon/UIEvents/KeyCode.h>
-
-[ExistingCpp]
-enum Web::UIEvents::KeyCode : u8 {
-    Key_Invalid = 0x00,
-    Key_Backspace = 0x08,
-    Key_Tab = 0x09,
-    Key_Return = 0x0D,
-    Key_LeftShift = 0x10,
-    Key_RightShift = 0xB0,
-    Key_LeftControl = 0x11,
-    Key_RightControl = 0xB1,
-    Key_LeftAlt = 0x12,
-    Key_RightAlt = 0xB2,
-    Key_AltGr = 0xE1,
-    Key_PauseBreak = 0x13,
-    Key_CapsLock = 0x14,
-    Key_Escape = 0x1B,
-    Key_Space = 0x20,
-    Key_PageUp = 0x21,
-    Key_PageDown = 0x22,
-    Key_End = 0x23,
-    Key_Home = 0x24,
-    Key_Left = 0x25,
-    Key_Up = 0x26,
-    Key_Right = 0x27,
-    Key_Down = 0x28,
-    Key_PrintScreen = 0x2A,
-    Key_SysRq = 0x2C,
-    Key_Delete = 0x2E,
-    Key_0 = 0x30,
-    Key_1 = 0x31,
-    Key_2 = 0x32,
-    Key_3 = 0x33,
-    Key_4 = 0x34,
-    Key_5 = 0x35,
-    Key_6 = 0x36,
-    Key_7 = 0x37,
-    Key_8 = 0x38,
-    Key_9 = 0x39,
-    Key_A = 0x41,
-    Key_B = 0x42,
-    Key_C = 0x43,
-    Key_D = 0x44,
-    Key_E = 0x45,
-    Key_F = 0x46,
-    Key_G = 0x47,
-    Key_H = 0x48,
-    Key_I = 0x49,
-    Key_J = 0x4A,
-    Key_K = 0x4B,
-    Key_L = 0x4C,
-    Key_M = 0x4D,
-    Key_N = 0x4E,
-    Key_O = 0x4F,
-    Key_P = 0x50,
-    Key_Q = 0x51,
-    Key_R = 0x52,
-    Key_S = 0x53,
-    Key_T = 0x54,
-    Key_U = 0x55,
-    Key_V = 0x56,
-    Key_W = 0x57,
-    Key_X = 0x58,
-    Key_Y = 0x59,
-    Key_Z = 0x5A,
-    Key_RightParen = 0x60,
-    Key_ExclamationPoint = 0x61,
-    Key_AtSign = 0x62,
-    Key_Hashtag = 0x63,
-    Key_Dollar = 0x64,
-    Key_Percent = 0x65,
-    Key_Circumflex = 0x66,
-    Key_Ampersand = 0x67,
-    Key_Asterisk = 0x68,
-    Key_LeftParen = 0x69,
-    Key_Plus = 0x6A,
-    Key_Minus = 0x6B,
-    Key_Slash = 0x6C,
-    Key_Comma = 0x6D,
-    Key_Period = 0x6E,
-    Key_Colon = 0x6F,
-    Key_F1 = 0x70,
-    Key_F2 = 0x71,
-    Key_F3 = 0x72,
-    Key_F4 = 0x73,
-    Key_F5 = 0x74,
-    Key_F6 = 0x75,
-    Key_F7 = 0x76,
-    Key_F8 = 0x77,
-    Key_F9 = 0x78,
-    Key_F10 = 0x79,
-    Key_F11 = 0x7A,
-    Key_F12 = 0x7B,
-    Key_DoubleQuote = 0x7C,
-    Key_Apostrophe = 0x7D,
-    Key_Insert = 0x7E,
-    Key_Semicolon = 0x7F,
-    Key_LessThan = 0x80,
-    Key_Equal = 0x81,
-    Key_GreaterThan = 0x82,
-    Key_QuestionMark = 0x83,
-    Key_LeftBracket = 0x84,
-    Key_RightBracket = 0x85,
-    Key_Backslash = 0x86,
-    Key_Underscore = 0x87,
-    Key_LeftBrace = 0x88,
-    Key_RightBrace = 0x89,
-    Key_Pipe = 0x8A,
-    Key_Tilde = 0x8B,
-    Key_Backtick = 0x8C,
-    Key_NumLock = 0x90,
-    Key_ScrollLock = 0x91,
-    Key_LeftSuper = 0x92,
-    Key_RightSuper = 0xAC,
-    Key_BrowserSearch = 0x93,
-    Key_BrowserFavorites = 0x94,
-    Key_BrowserHome = 0x95,
-    Key_PreviousTrack = 0x96,
-    Key_BrowserBack = 0x97,
-    Key_BrowserForward = 0x98,
-    Key_BrowserRefresh = 0x99,
-    Key_BrowserStop = 0x9A,
-    Key_VolumeDown = 0x9B,
-    Key_VolumeUp = 0x9C,
-    Key_Wake = 0x9D,
-    Key_Sleep = 0x9E,
-    Key_NextTrack = 0x9F,
-    Key_MediaSelect = 0xA0,
-    Key_Email = 0xA1,
-    Key_MyComputer = 0xA2,
-    Key_Power = 0xA3,
-    Key_Stop = 0xA4,
-    Key_LeftGUI = 0xA5,
-    Key_Mute = 0xA6,
-    Key_RightGUI = 0xA7,
-    Key_Calculator = 0xA8,
-    Key_Apps = 0xA9,
-    Key_PlayPause = 0xAA,
-    Key_Menu = 0xAB,
-}
-
-// NB: Mod_PlatformCtrl and Mod_PlatformWordJump each name one of these, which one depends on the platform.
-[ExistingCpp, Flags, RustDerive=Default+Hash]
-enum Web::UIEvents::KeyModifier : u32 {
-    Mod_None = 0x00,
-    Mod_Alt = 0x01,
-    Mod_Ctrl = 0x02,
-    Mod_Shift = 0x04,
-    Mod_Super = 0x08,
-    Mod_Keypad = 0x10,
-    Mod_Mask = 0x1F,
-    Is_Press = 0x80,
-}
-
-FILE: Libraries/LibWebCommon/UIEvents/MouseButton.h
-/*
- * Copyright (c) 2024, Andreas Kling <andreas@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/Assertions.h>
-#include <AK/EnumBits.h>
-#include <AK/Types.h>
-
-namespace Web::UIEvents {
-
-enum MouseButton : u8 {
-    None = 0,
-    Primary = 1,
-    Secondary = 2,
-    Middle = 4,
-    Backward = 8,
-    Forward = 16,
-};
-
-AK_ENUM_BITWISE_OPERATORS(MouseButton);
-
-// https://w3c.github.io/pointerevents/#the-button-property
-constexpr i16 mouse_button_to_button_code(MouseButton button)
-{
-    switch (button) {
-    case MouseButton::None:
-        return -1;
-    case MouseButton::Primary:
-        return 0;
-    case MouseButton::Middle:
-        return 1;
-    case MouseButton::Secondary:
-        return 2;
-    case MouseButton::Backward:
-        return 3;
-    case MouseButton::Forward:
-        return 4;
-    default:
-        VERIFY_NOT_REACHED();
-    }
-}
-
-// https://w3c.github.io/pointerevents/#the-button-property
-constexpr MouseButton button_code_to_mouse_button(i16 button)
-{
-    if (button == 0)
-        return MouseButton::Primary;
-    if (button == 1)
-        return MouseButton::Middle;
-    if (button == 2)
-        return MouseButton::Secondary;
-    if (button == 3)
-        return MouseButton::Backward;
-    if (button == 4)
-        return MouseButton::Forward;
-    return MouseButton::None;
-}
-
-}
-
-#include <LibWebCommon/UIEvents/MouseButtonCodecs.h>
-
-FILE: Libraries/LibWebCommon/UIEvents/MouseButton.ipc
-// Copyright (c) 2026-present, the Ladybird developers.
-//
-// SPDX-License-Identifier: BSD-2-Clause
-
-#include <LibWebCommon/UIEvents/MouseButton.h>
-
-[ExistingCpp, Flags, RustDerive=Default+Hash]
-enum Web::UIEvents::MouseButton : u8 {
-    None = 0,
-    Primary = 1,
-    Secondary = 2,
-    Middle = 4,
-    Backward = 8,
-    Forward = 16,
-}
-
-FILE: Libraries/LibWebCommon/UpgradeInsecureRequests/InsecureRequestsPolicy.cpp
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibIPC/Decoder.h>
-#include <LibIPC/Encoder.h>
-#include <LibWebCommon/UpgradeInsecureRequests/InsecureRequestsPolicy.h>
-
-namespace Web::UpgradeInsecureRequests {
-
-void UpgradeInsecureNavigationsSet::insert(HostAndPort tuple)
-{
-    if (!contains(tuple))
-        m_tuples.append(move(tuple));
-}
-
-}
-
-namespace IPC {
-
-template<>
-ErrorOr<void> encode(Encoder& encoder, Web::UpgradeInsecureRequests::UpgradeInsecureNavigationsSet const& set)
-{
-    TRY(encoder.encode_size(set.tuples().size()));
-    for (auto const& tuple : set.tuples()) {
-        TRY(encoder.encode(tuple.host));
-        TRY(encoder.encode(tuple.port));
-    }
-    return {};
-}
-
-template<>
-ErrorOr<Web::UpgradeInsecureRequests::UpgradeInsecureNavigationsSet> decode(Decoder& decoder)
-{
-    Web::UpgradeInsecureRequests::UpgradeInsecureNavigationsSet set;
-    auto size = TRY(decoder.decode_size());
-    for (size_t i = 0; i < size; ++i) {
-        auto host = TRY(decoder.decode<URL::Host>());
-        auto port = TRY(decoder.decode<Optional<u16>>());
-        set.insert({ move(host), port });
-    }
-    return set;
-}
-
-}
-
-FILE: Libraries/LibWebCommon/UpgradeInsecureRequests/InsecureRequestsPolicy.h
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/Optional.h>
-#include <AK/Vector.h>
-#include <LibIPC/Forward.h>
-#include <LibURL/Host.h>
-#include <LibWebCommon/Export.h>
-
-namespace Web::UpgradeInsecureRequests {
-
-// https://w3c.github.io/webappsec-upgrade-insecure-requests/#insecure-requests-policy
-enum class InsecureRequestsPolicy : u8 {
-    DoNotUpgrade,
-    Upgrade,
-};
-
-// https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-insecure-navigations-set
-// A (host, port) tuple, which the upgrade insecure navigations set contains.
-struct HostAndPort {
-    URL::Host host;
-    Optional<u16> port;
-
-    bool operator==(HostAndPort const&) const = default;
-};
-
-// https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-insecure-navigations-set
-class WEBCOMMON_API UpgradeInsecureNavigationsSet {
-public:
-    bool contains(HostAndPort const& tuple) const { return m_tuples.contains_slow(tuple); }
-    void insert(HostAndPort);
-
-    Vector<HostAndPort> const& tuples() const { return m_tuples; }
-
-private:
-    Vector<HostAndPort> m_tuples;
-};
-
-}
-
-namespace IPC {
-
-template<>
-WEBCOMMON_API ErrorOr<void> encode(Encoder&, Web::UpgradeInsecureRequests::UpgradeInsecureNavigationsSet const&);
-
-template<>
-WEBCOMMON_API ErrorOr<Web::UpgradeInsecureRequests::UpgradeInsecureNavigationsSet> decode(Decoder&);
-
-}
-
-#include <LibWebCommon/UpgradeInsecureRequests/InsecureRequestsPolicyCodecs.h>
-
-FILE: Libraries/LibWebCommon/UpgradeInsecureRequests/InsecureRequestsPolicy.ipc
-// Copyright (c) 2026-present, the Ladybird developers.
-
-#include <LibWebCommon/UpgradeInsecureRequests/InsecureRequestsPolicy.h>
-
-[ExistingCpp]
-enum Web::UpgradeInsecureRequests::InsecureRequestsPolicy : u8 {
-    DoNotUpgrade,
-    Upgrade,
-}
-
-FILE: Libraries/LibWebCommon/WebDriver/BiDi.cpp
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <AK/JsonObject.h>
-#include <LibWebCommon/WebDriver/BiDi.h>
-
-namespace Web::WebDriver {
-
-// js-uint = 0..9007199254740991
-Optional<u64> as_js_uint(JsonValue const& value)
-{
-    static constexpr u64 MAXIMUM_SAFE_INTEGER = 9007199254740991;
-
-    if (!value.is_number())
-        return {};
-
-    return value.as_number().visit(
-        [](u64 number) -> Optional<u64> {
-            if (number > MAXIMUM_SAFE_INTEGER)
-                return {};
-            return number;
-        },
-        [](i64 number) -> Optional<u64> {
-            if (number < 0 || static_cast<u64>(number) > MAXIMUM_SAFE_INTEGER)
-                return {};
-            return static_cast<u64>(number);
-        },
-        [](double number) -> Optional<u64> {
-            if (!(number >= 0) || number > static_cast<double>(MAXIMUM_SAFE_INTEGER))
-                return {};
-            auto integer = static_cast<u64>(number);
-            if (static_cast<double>(integer) != number)
-                return {};
-            return integer;
-        });
-}
-
-// https://w3c.github.io/webdriver-bidi/#type-script-SerializationOptions
-ErrorOr<SerializationOptions, Error> parse_serialization_options(JsonValue const& value)
-{
-    // script.SerializationOptions = {
-    //   ? maxDomDepth: (js-uint / null) .default 0,
-    //   ? maxObjectDepth: (js-uint / null) .default null,
-    //   ? includeShadowTree: ("none" / "open" / "all") .default "none",
-    // }
-    if (!value.is_object())
-        return Error::from_code(ErrorCode::InvalidArgument, "Serialization options must be an object"sv);
-
-    auto const& object = value.as_object();
-    SerializationOptions options;
-
-    if (auto max_dom_depth = object.get("maxDomDepth"sv); max_dom_depth.has_value()) {
-        if (max_dom_depth->is_null()) {
-            options.max_dom_depth = {};
-        } else {
-            options.max_dom_depth = as_js_uint(*max_dom_depth);
-            if (!options.max_dom_depth.has_value())
-                return Error::from_code(ErrorCode::InvalidArgument, "maxDomDepth must be an unsigned integer or null"sv);
-        }
-    }
-
-    if (auto max_object_depth = object.get("maxObjectDepth"sv); max_object_depth.has_value()) {
-        if (!max_object_depth->is_null()) {
-            options.max_object_depth = as_js_uint(*max_object_depth);
-            if (!options.max_object_depth.has_value())
-                return Error::from_code(ErrorCode::InvalidArgument, "maxObjectDepth must be an unsigned integer or null"sv);
-        }
-    }
-
-    if (auto include_shadow_tree = object.get("includeShadowTree"sv); include_shadow_tree.has_value()) {
-        auto string = include_shadow_tree->is_string() ? include_shadow_tree->as_string() : String {};
-        if (string == "none"sv)
-            options.include_shadow_tree = SerializationOptions::IncludeShadowTree::None;
-        else if (string == "open"sv)
-            options.include_shadow_tree = SerializationOptions::IncludeShadowTree::Open;
-        else if (string == "all"sv)
-            options.include_shadow_tree = SerializationOptions::IncludeShadowTree::All;
-        else
-            return Error::from_code(ErrorCode::InvalidArgument, "includeShadowTree must be \"none\", \"open\" or \"all\""sv);
-    }
-
-    return options;
-}
-
-}
-
-FILE: Libraries/LibWebCommon/WebDriver/BiDi.h
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/HashMap.h>
-#include <AK/JsonValue.h>
-#include <AK/Optional.h>
-#include <AK/String.h>
-#include <AK/Vector.h>
-#include <AK/kmalloc.h>
-#include <LibWebCommon/Export.h>
-#include <LibWebCommon/WebDriver/Error.h>
-#include <LibWebCommon/WebDriver/Network.h>
-
-namespace Web::WebDriver {
-
-// js-uint = 0..9007199254740991
-// https://w3c.github.io/webdriver-bidi/#protocol-definition
-WEBCOMMON_API Optional<u64> as_js_uint(JsonValue const&);
-
-// https://w3c.github.io/webdriver-bidi/#type-script-SerializationOptions
-struct WEBCOMMON_API SerializationOptions {
-    enum class IncludeShadowTree : u8 {
-        None,
-        Open,
-        All,
-    };
-
-    // NB: An empty depth is null, which does not limit the depth.
-    Optional<u64> max_dom_depth { 0 };
-    Optional<u64> max_object_depth {};
-    IncludeShadowTree include_shadow_tree { IncludeShadowTree::None };
-};
-
-WEBCOMMON_API ErrorOr<SerializationOptions, Error> parse_serialization_options(JsonValue const&);
-
-// https://w3c.github.io/webdriver-bidi/#preload-script
-struct WEBCOMMON_API BiDiPreloadScript {
-    String id;
-    String function_declaration;
-    JsonValue arguments;
-    Optional<Vector<String>> contexts;
-    Optional<String> sandbox;
-    Vector<String> user_contexts;
-};
-
-// The state of the BiDi session that processes hosting web content need: which events some subscription enables, and
-// the preload scripts to run in new windows.
-struct WEBCOMMON_API BiDiSessionState {
-    AK_ALLOC_WITH_KMALLOC;
-
-    bool is_active { false };
-    Vector<String> enabled_events;
-    // NB: A null scope enables the event globally; otherwise it names top-level traversables.
-    HashMap<String, Optional<Vector<String>>> enabled_event_contexts;
-    Vector<BiDiPreloadScript> preload_scripts;
-    Vector<Network::Intercept> network_intercepts;
-    Vector<Network::Header> network_default_headers;
-    HashMap<String, Vector<Network::Header>> network_user_context_headers;
-    HashMap<String, Vector<Network::Header>> network_navigable_headers;
-    String network_default_cache_behavior { "default"_string };
-    HashMap<String, String> network_navigable_cache_behavior;
-};
-
-}
-
-#include <LibWebCommon/WebDriver/BiDiCodecs.h>
-
-FILE: Libraries/LibWebCommon/WebDriver/BiDi.ipc
-// Copyright (c) 2026-present, the Ladybird developers.
-
-// NB: The IPC compiler cannot check that each struct here lists every field of its C++ type. A field left out
-//     here does not cross IPC.
-
-#include <LibWebCommon/WebDriver/BiDi.h>
-
-[ExistingCpp]
-struct Web::WebDriver::Network::UrlPattern {
-    Optional<String> protocol;
-    Optional<String> hostname;
-    Optional<String> port;
-    Optional<String> pathname;
-    Optional<String> search;
-}
-
-[ExistingCpp]
-struct Web::WebDriver::Network::Intercept {
-    String id;
-    Vector<Web::WebDriver::Network::UrlPattern> url_patterns;
-    Vector<String> phases;
-    Optional<Vector<String>> browsing_contexts;
-}
-
-[ExistingCpp]
-struct Web::WebDriver::BiDiPreloadScript {
-    String id;
-    String function_declaration;
-    JsonValue arguments;
-    Optional<Vector<String>> contexts;
-    Optional<String> sandbox;
-    Vector<String> user_contexts;
-}
-
-[ExistingCpp]
-struct Web::WebDriver::BiDiSessionState {
-    bool is_active;
-    Vector<String> enabled_events;
-    HashMap<String, Optional<Vector<String>>> enabled_event_contexts;
-    Vector<Web::WebDriver::BiDiPreloadScript> preload_scripts;
-    Vector<Web::WebDriver::Network::Intercept> network_intercepts;
-    Vector<HTTP::Header> network_default_headers;
-    HashMap<String, Vector<HTTP::Header>> network_user_context_headers;
-    HashMap<String, Vector<HTTP::Header>> network_navigable_headers;
-    String network_default_cache_behavior;
-    HashMap<String, String> network_navigable_cache_behavior;
-}
-
-FILE: Libraries/LibWebCommon/WebDriver/Capabilities.cpp
-/*
- * Copyright (c) 2022-2025, Tim Flynn <trflynn89@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <AK/Debug.h>
-#include <AK/JsonArray.h>
-#include <AK/JsonObject.h>
-#include <AK/JsonValue.h>
-#include <AK/Optional.h>
-#include <LibCore/BrowserVersion.h>
-#include <LibWebCommon/Loader/UserAgent.h>
-#include <LibWebCommon/WebDriver/Capabilities.h>
-#include <LibWebCommon/WebDriver/Proxy.h>
-#include <LibWebCommon/WebDriver/TimeoutsConfiguration.h>
-#include <LibWebCommon/WebDriver/UserPrompt.h>
-
-namespace Web::WebDriver {
-
-// https://w3c.github.io/webdriver/#dfn-deserialize-as-a-page-load-strategy
-static Response deserialize_as_a_page_load_strategy(JsonValue value)
-{
-    // 1. If value is not a string return an error with error code invalid argument.
-    if (!value.is_string())
-        return Error::from_code(ErrorCode::InvalidArgument, "Capability pageLoadStrategy must be a string"sv);
-
-    // 2. If there is no entry in the table of page load strategies with keyword value return an error with error code invalid argument.
-    if (!value.as_string().is_one_of("none"sv, "eager"sv, "normal"sv))
