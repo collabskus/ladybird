@@ -1,4 +1,169 @@
-﻿    m_socket->close();
+﻿    ROUTE(GET, "/session/:session_id/element/:element_id/name"sv, get_element_tag_name),
+    ROUTE(GET, "/session/:session_id/element/:element_id/rect"sv, get_element_rect),
+    ROUTE(GET, "/session/:session_id/element/:element_id/enabled"sv, is_element_enabled),
+    ROUTE(GET, "/session/:session_id/element/:element_id/computedrole"sv, get_computed_role),
+    ROUTE(GET, "/session/:session_id/element/:element_id/computedlabel"sv, get_computed_label),
+    ROUTE(POST, "/session/:session_id/element/:element_id/click"sv, element_click),
+    ROUTE(POST, "/session/:session_id/element/:element_id/clear"sv, element_clear),
+    ROUTE(POST, "/session/:session_id/element/:element_id/value"sv, element_send_keys),
+    ROUTE(GET, "/session/:session_id/source"sv, get_source),
+    ROUTE(POST, "/session/:session_id/execute/sync"sv, execute_script),
+    ROUTE(POST, "/session/:session_id/execute/async"sv, execute_async_script),
+    ROUTE(GET, "/session/:session_id/cookie"sv, get_all_cookies),
+    ROUTE(GET, "/session/:session_id/cookie/:name"sv, get_named_cookie),
+    ROUTE(POST, "/session/:session_id/cookie"sv, add_cookie),
+    ROUTE(DELETE, "/session/:session_id/cookie/:name"sv, delete_cookie),
+    ROUTE(DELETE, "/session/:session_id/cookie"sv, delete_all_cookies),
+    ROUTE(POST, "/session/:session_id/actions"sv, perform_actions),
+    ROUTE(DELETE, "/session/:session_id/actions"sv, release_actions),
+    ROUTE(POST, "/session/:session_id/alert/dismiss"sv, dismiss_alert),
+    ROUTE(POST, "/session/:session_id/alert/accept"sv, accept_alert),
+    ROUTE(GET, "/session/:session_id/alert/text"sv, get_alert_text),
+    ROUTE(POST, "/session/:session_id/alert/text"sv, send_alert_text),
+    ROUTE(GET, "/session/:session_id/screenshot"sv, take_screenshot),
+    ROUTE(GET, "/session/:session_id/element/:element_id/screenshot"sv, take_element_screenshot),
+    ROUTE(POST, "/session/:session_id/print"sv, print_page),
+    ROUTE(POST, "/session/:session_id/permissions"sv, set_permission),
+};
+
+// https://w3c.github.io/webdriver/#dfn-match-a-request
+static ErrorOr<MatchedRoute, Error> match_route(HTTP::HttpRequest const& request)
+{
+    dbgln_if(WEBDRIVER_ROUTE_DEBUG, "match_route({}, {})", HTTP::to_string_view(request.method()), request.resource());
+
+    auto request_path = request.resource().view();
+    Vector<String> parameters;
+
+    auto next_segment = [](auto& path) -> Optional<StringView> {
+        if (auto index = path.find('/'); index.has_value() && (*index + 1) < path.length()) {
+            path = path.substring_view(*index + 1);
+
+            if (index = path.find('/'); index.has_value())
+                return path.substring_view(0, *index);
+            return path;
+        }
+
+        path = {};
+        return {};
+    };
+
+    for (auto const& route : s_webdriver_endpoints) {
+        dbgln_if(WEBDRIVER_ROUTE_DEBUG, "- Checking {} {}", HTTP::to_string_view(route.method), route.path);
+        if (route.method != request.method())
+            continue;
+
+        auto route_path = route.path;
+        Optional<bool> match;
+
+        auto on_failed_match = [&]() {
+            request_path = request.resource();
+            parameters.clear();
+            match = false;
+        };
+
+        while (!match.has_value()) {
+            auto request_segment = next_segment(request_path);
+            auto route_segment = next_segment(route_path);
+
+            if (!request_segment.has_value() && !route_segment.has_value())
+                match = true;
+            else if (request_segment.has_value() != route_segment.has_value())
+                on_failed_match();
+            else if (route_segment->starts_with(':'))
+                TRY(parameters.try_append(TRY(String::from_utf8(*request_segment))));
+            else if (request_segment != route_segment)
+                on_failed_match();
+        }
+
+        if (*match) {
+            dbgln_if(WEBDRIVER_ROUTE_DEBUG, "- Found match with parameters={}", parameters);
+            return MatchedRoute {
+                route.handler,
+                move(parameters),
+                route.path.starts_with("/session/:session_id"sv),
+            };
+        }
+    }
+
+    return Error::from_code(ErrorCode::UnknownCommand, "The command was not recognized."sv);
+}
+
+static JsonValue make_success_response(JsonValue value)
+{
+    JsonObject result;
+    result.set("value"sv, move(value));
+    return result;
+}
+
+// NB: A page using DNS rebinding sends a Host header with its own domain name, which resolves to the local machine. A
+//     WebDriver client names the listener by IP address, or as localhost.
+static bool is_allowed_host(StringView host)
+{
+    if (host.starts_with('[')) {
+        auto closing_bracket = host.find(']');
+        if (!closing_bracket.has_value())
+            return false;
+        auto rest = host.substring_view(*closing_bracket + 1);
+        if (!rest.is_empty() && !rest.starts_with(':'))
+            return false;
+        return IPv6Address::from_string(host.substring_view(1, *closing_bracket - 1)).has_value();
+    }
+
+    if (auto colon = host.find_last(':'); colon.has_value())
+        host = host.substring_view(0, *colon);
+    return host.equals_ignoring_ascii_case("localhost"sv) || IPv4Address::from_string(host).has_value();
+}
+
+static Optional<StringView> find_header(HTTP::HttpRequest const& request, StringView name)
+{
+    if (auto it = request.headers().headers().find_if([&](auto& header) { return header.name.equals_ignoring_ascii_case(name); }); !it.is_end())
+        return it->value.view();
+    return {};
+}
+
+// NB: The WebDriver endpoint controls the browser without authentication, so web pages must not reach it.
+static ErrorOr<void, Error> reject_requests_from_web_pages(HTTP::HttpRequest const& request)
+{
+    auto host = find_header(request, "Host"sv);
+    if (!host.has_value() || !is_allowed_host(host->trim_whitespace()))
+        return Error { 403, "unknown error"_string, "The Host header does not name the local machine"_string, {} };
+
+    // A browser sends Origin with every request a page makes, except for a same-origin GET or HEAD, which a page can
+    // only make to WebDriver through DNS rebinding.
+    if (find_header(request, "Origin"sv).has_value())
+        return Error { 403, "unknown error"_string, "Requests from web pages are not allowed"_string, {} };
+
+    // A page can send a request with a CORS-safelisted Content-Type without a CORS preflight.
+    if (auto content_type = find_header(request, "Content-Type"sv); content_type.has_value()) {
+        auto essence = content_type->find_first_split_view(';').trim_whitespace();
+        if (essence.equals_ignoring_ascii_case("application/x-www-form-urlencoded"sv)
+            || essence.equals_ignoring_ascii_case("multipart/form-data"sv)
+            || essence.equals_ignoring_ascii_case("text/plain"sv))
+            return Error { 415, "unknown error"_string, "The Content-Type of the request is not allowed"_string, {} };
+    }
+
+    return {};
+}
+
+static bool is_keep_alive_request(HTTP::HttpRequest const& request)
+{
+    if (auto it = request.headers().headers().find_if([](auto& header) { return header.name.equals_ignoring_ascii_case("Connection"sv); }); !it.is_end())
+        return it->value.trim_whitespace().equals_ignoring_ascii_case("keep-alive"sv);
+    return false;
+}
+
+Client::Client(NonnullOwnPtr<Core::BufferedTCPSocket> socket)
+    : m_socket(move(socket))
+{
+    m_socket->on_ready_to_read = [this] {
+        if (auto result = on_ready_to_read(); result.is_error())
+            handle_error(HTTP::HttpRequest { HTTP::HeaderList::create() }, result.release_error());
+    };
+}
+
+Client::~Client()
+{
+    m_socket->close();
 }
 
 void Client::die()
@@ -19316,6 +19481,7 @@ FILE: Libraries/LibWebView/BrowsingSession.h
 #include <AK/Types.h>
 #include <AK/Vector.h>
 #include <AK/Weakable.h>
+#include <LibRequests/CertificateError.h>
 #include <LibWebView/Export.h>
 #include <LibWebView/Forward.h>
 
@@ -19351,6 +19517,10 @@ public:
         ByteString host;
         u16 port { 0 };
         ByteString fingerprint;
+        // Trust covers only the errors the user reviewed.
+        Requests::CertificateError errors { Requests::CertificateError::None };
+        // RequestServer's description of unnamed errors.
+        ByteString error_details;
 
         bool operator==(CertificateException const&) const = default;
     };
@@ -19360,7 +19530,7 @@ public:
         CertificateException certificate;
         MonotonicTime rejected_at;
     };
-    HashMap<ByteString, Vector<RejectedCertificate>> rejected_self_signed_certificates;
+    HashMap<ByteString, Vector<RejectedCertificate>> rejected_certificates;
 
     // Every RequestServer of the session accepts these, including those launched after the user trusted them.
     Vector<CertificateException> trusted_certificates;
@@ -49002,14 +49172,14 @@ ErrorOr<void> RequestServerManager::launch_process(RequestServerInstance& instan
         if (auto instance = weak_instance.strong_ref())
             the().disk_cache_size_changed(*instance, size);
     };
-    control_client->on_rejected_self_signed_certificate = [weak_instance](ByteString const& host, u16 port, ByteString const& fingerprint) {
+    control_client->on_rejected_certificate = [weak_instance](ByteString const& host, u16 port, ByteString const& fingerprint, Requests::CertificateError errors, ByteString const& details) {
         if (auto instance = weak_instance.strong_ref())
-            the().did_reject_self_signed_certificate(instance->session(), { .host = host, .port = port, .fingerprint = fingerprint });
+            the().did_reject_certificate(instance->session(), { .host = host, .port = port, .fingerprint = fingerprint, .errors = errors, .error_details = details });
     };
     Application::the().configure_request_server_control_client(*control_client);
 
     for (auto const& exception : instance.session().trusted_certificates)
-        control_client->async_trust_certificate(exception.host, exception.port, exception.fingerprint);
+        control_client->async_trust_certificate(exception.host, exception.port, exception.fingerprint, exception.errors, exception.error_details);
 
     instance.m_control_client = move(control_client);
     instance.m_ui_client = nullptr;
@@ -49136,45 +49306,51 @@ static void remove_stale_rejections(Vector<BrowsingSession::RejectedCertificate>
     rejections.remove_all_matching([&](auto const& rejection) { return now - rejection.rejected_at > rejected_certificate_lifetime; });
 }
 
-void RequestServerManager::did_reject_self_signed_certificate(BrowsingSession& session, BrowsingSession::CertificateException certificate)
+void RequestServerManager::did_reject_certificate(BrowsingSession& session, BrowsingSession::CertificateException certificate)
 {
-    auto& rejections = session.rejected_self_signed_certificates.ensure(certificate_exception_key(certificate.host, certificate.port));
+    auto& rejections = session.rejected_certificates.ensure(certificate_exception_key(certificate.host, certificate.port));
     remove_stale_rejections(rejections);
-    rejections.remove_all_matching([&](auto const& rejection) { return rejection.certificate == certificate; });
+    // The latest rejection of a certificate has the errors it fails for now.
+    rejections.remove_all_matching([&](auto const& rejection) { return rejection.certificate.fingerprint == certificate.fingerprint; });
     rejections.append({ .certificate = move(certificate), .rejected_at = MonotonicTime::now_coarse() });
 }
 
 // Warnings identify only the host and port. If recent rejections disagree, offering any certificate risks trusting
 // one other than the certificate that triggered the warning.
-Optional<BrowsingSession::CertificateException> RequestServerManager::rejected_self_signed_certificate(BrowsingSession& session, URL::URL const& url) const
+Optional<BrowsingSession::RejectedCertificate> RequestServerManager::rejected_certificate(BrowsingSession& session, URL::URL const& url) const
 {
     auto key = certificate_exception_key(url.serialized_host().to_byte_string(), url.port_or_default());
-    auto rejections = session.rejected_self_signed_certificates.get(key);
+    auto rejections = session.rejected_certificates.get(key);
     if (!rejections.has_value())
         return {};
 
     remove_stale_rejections(*rejections);
     if (rejections->is_empty()) {
-        session.rejected_self_signed_certificates.remove(key);
+        session.rejected_certificates.remove(key);
         return {};
     }
     if (rejections->size() != 1)
         return {};
-    return rejections->first().certificate;
+    return rejections->first();
 }
 
 void RequestServerManager::trust_certificate(BrowsingSession& session, BrowsingSession::CertificateException const& certificate)
 {
     // A trusted certificate is no longer a candidate for a later warning about the same host and port.
-    if (auto rejections = session.rejected_self_signed_certificates.get(certificate_exception_key(certificate.host, certificate.port)); rejections.has_value())
+    if (auto rejections = session.rejected_certificates.get(certificate_exception_key(certificate.host, certificate.port)); rejections.has_value())
         rejections->remove_all_matching([&](auto const& rejection) { return rejection.certificate == certificate; });
 
     if (session.trusted_certificates.contains_slow(certificate))
         return;
 
+    // Match RequestServer's latest trusted errors for this certificate.
+    session.trusted_certificates.remove_all_matching([&](auto const& trusted) {
+        return trusted.host == certificate.host && trusted.port == certificate.port && trusted.fingerprint == certificate.fingerprint;
+    });
+
     for (auto& instance : m_instances) {
         if (&instance->session() == &session)
-            (void)send_sync_to_helper<Messages::RequestServerControl::TrustCertificate>(instance->control_client(), certificate.host, certificate.port, certificate.fingerprint);
+            (void)send_sync_to_helper<Messages::RequestServerControl::TrustCertificate>(instance->control_client(), certificate.host, certificate.port, certificate.fingerprint, certificate.errors, certificate.error_details);
     }
 
     session.trusted_certificates.append(certificate);
@@ -49554,8 +49730,8 @@ public:
     ErrorOr<RequestServerClientConnection> connect_new_client(RequestServerInstance&, BrowsingSession&, RequestServer::SiteBinding);
 
     // The recently rejected certificate for this session, host and port, if unambiguous.
-    Optional<BrowsingSession::CertificateException> rejected_self_signed_certificate(BrowsingSession&, URL::URL const&) const;
-    void did_reject_self_signed_certificate(BrowsingSession&, BrowsingSession::CertificateException);
+    Optional<BrowsingSession::RejectedCertificate> rejected_certificate(BrowsingSession&, URL::URL const&) const;
+    void did_reject_certificate(BrowsingSession&, BrowsingSession::CertificateException);
 
     // Makes every RequestServer of the session accept the certificate, including those launched later.
     void trust_certificate(BrowsingSession&, BrowsingSession::CertificateException const&);
@@ -51374,6 +51550,15 @@ static auto const& CONFIG_VARIABLE_DEFINITIONS = *new Array<ConfigVariableDefini
         .default_value = false,
         .array_element_type = {},
     },
+    {
+        .id = ConfigVariableID::OfferToTrustInvalidCertificates,
+        .name = "security.certificates.offer_to_trust_invalid"sv,
+        .title = "Offer to trust any certificate that fails verification"sv,
+        .description = "Also ask for certificates that fail verification for any other reason, such as one that has expired, was issued for another site, or comes from an issuer Ladybird doesn't trust. Any of these may mean someone is intercepting the connection."sv,
+        .default_value = false,
+        .array_element_type = {},
+        .depends_on = ConfigVariableID::OfferToTrustSelfSignedCertificates,
+    },
 #if defined(LADYBIRD_HAS_UPDATE_CHECK)
     {
         .id = ConfigVariableID::UpdateCheckInterval,
@@ -53119,6 +53304,7 @@ enum class ConfigVariableID : u8 {
     RestartStalledConnections,
     DisableHighDynamicRangeSurfaces,
     OfferToTrustSelfSignedCertificates,
+    OfferToTrustInvalidCertificates,
 #if defined(LADYBIRD_HAS_UPDATE_CHECK)
     UpdateCheckInterval,
 #endif
@@ -53133,6 +53319,8 @@ struct ConfigVariableDefinition {
     StringView description;
     JsonValue default_value;
     Optional<JsonValue::Type> array_element_type;
+    // This variable has no effect and cannot be changed in Settings while its dependency is off.
+    Optional<ConfigVariableID> depends_on {};
 };
 
 WEBVIEW_API ReadonlySpan<ConfigVariableDefinition> config_variable_definitions();
@@ -60008,15 +60196,19 @@ void ViewImplementation::did_request_certificate_warning(Badge<WebContentPage>, 
         return;
 
     // Snapshot the rejected certificate so trusting it cannot trust a later rejection for the same host.
-    auto certificate = RequestServerManager::the().rejected_self_signed_certificate(session(), url);
-    if (!certificate.has_value())
+    auto rejection = RequestServerManager::the().rejected_certificate(session(), url);
+    if (!rejection.has_value())
+        return;
+
+    // Use RequestServer's errors so a page cannot bypass the certificate trust settings.
+    if (!Requests::is_only_self_signed(rejection->certificate.errors) && !Application::settings().config_variable_as_bool(ConfigVariableID::OfferToTrustInvalidCertificates))
         return;
 
     // Declining reloads the error page; suppress its repeated warning request.
-    if (auto declined = exchange(m_declined_certificate, {}); declined == certificate)
+    if (auto declined = exchange(m_declined_certificate, {}); declined == rejection->certificate)
         return;
 
-    CertificateWarning warning { .url = url, .certificate = certificate.release_value(), .form_submission = {}, .form_initiator_origin = URL::Origin::create_opaque(), .form_is_not_resent = false };
+    CertificateWarning warning { .url = url, .certificate = move(rejection->certificate), .form_submission = {}, .form_initiator_origin = URL::Origin::create_opaque(), .form_is_not_resent = false };
 
     // Preserve the form for resubmission before replacing the error page's history entry.
     auto const& document_state = *traversable().session_history().current_entry().document_state;
@@ -61011,9 +61203,12 @@ static void send_global_privacy_control(WebContentPage const& page)
     page.async_set_enable_global_privacy_control(Application::settings().global_privacy_control() == GlobalPrivacyControl::Yes);
 }
 
-static void send_offer_to_trust_self_signed_certificates(WebContentPage const& page)
+static void send_offers_to_trust_certificates(WebContentPage const& page)
 {
-    page.async_set_offers_to_trust_self_signed_certificates(Application::settings().config_variable_as_bool(ConfigVariableID::OfferToTrustSelfSignedCertificates));
+    auto const& settings = Application::settings();
+    auto self_signed = settings.config_variable_as_bool(ConfigVariableID::OfferToTrustSelfSignedCertificates);
+    auto invalid = self_signed && settings.config_variable_as_bool(ConfigVariableID::OfferToTrustInvalidCertificates);
+    page.async_set_offers_to_trust_certificates(self_signed, invalid);
 }
 
 // Only a page hosting the tab's traversable takes this request: It applies to the page's local traversable, which a page
@@ -61035,7 +61230,7 @@ void ViewImplementation::send_preferences_to_page(WebContentPage& page)
     send_browsing_behavior(page);
     send_autoplay_settings(page);
     send_global_privacy_control(page);
-    send_offer_to_trust_self_signed_certificates(page);
+    send_offers_to_trust_certificates(page);
     auto* spell_checker = Application::the().spell_checker();
     page.async_set_spell_checking_available(spell_checker != nullptr);
     page.async_set_writing_suggestions_available(spell_checker && spell_checker->can_suggest());
@@ -64278,8 +64473,8 @@ void ViewImplementation::global_privacy_control_changed()
 
 void ViewImplementation::config_variable_changed(ConfigVariableID id)
 {
-    if (id == ConfigVariableID::OfferToTrustSelfSignedCertificates)
-        traversable().for_each_hosting_page(send_offer_to_trust_self_signed_certificates);
+    if (id == ConfigVariableID::OfferToTrustSelfSignedCertificates || id == ConfigVariableID::OfferToTrustInvalidCertificates)
+        traversable().for_each_hosting_page(send_offers_to_trust_certificates);
 }
 
 Vector<SitePermissionRow> ViewImplementation::site_permission_rows() const
@@ -77383,6 +77578,30 @@ ViewImplementation* CertificateUI::view() const
     return &page->view();
 }
 
+static JsonArray certificate_error_reasons(BrowsingSession::CertificateException const& certificate)
+{
+    using enum Requests::CertificateError;
+
+    JsonArray reasons;
+    if (has_flag(certificate.errors, SelfSigned))
+        reasons.must_append("It is self-signed, or its chain ends at a self-signed root that Ladybird doesn't trust."sv);
+    if (has_flag(certificate.errors, UnknownIssuer))
+        reasons.must_append("It comes from an issuer that Ladybird doesn't know or doesn't trust."sv);
+    if (has_flag(certificate.errors, Expired))
+        reasons.must_append("It has expired. If the date and time of this computer are wrong, correct them instead."sv);
+    if (has_flag(certificate.errors, NotYetValid))
+        reasons.must_append("It isn't valid yet. If the date and time of this computer are wrong, correct them instead."sv);
+    if (has_flag(certificate.errors, NameMismatch))
+        reasons.must_append(MUST(String::formatted("It was issued for another site, not for {}.", certificate.host)));
+    if (has_flag(certificate.errors, Other)) {
+        if (certificate.error_details.is_empty())
+            reasons.must_append("It failed verification."sv);
+        else
+            reasons.must_append(MUST(String::formatted("It failed verification: {}.", certificate.error_details)));
+    }
+    return reasons;
+}
+
 void CertificateUI::load_certificate_warning()
 {
     auto* view = this->view();
@@ -77401,6 +77620,7 @@ void CertificateUI::load_certificate_warning()
     object.set("formIsNotResent"sv, warning.form_is_not_resent);
     object.set("host"sv, MUST(String::from_byte_string(warning.certificate.host)));
     object.set("fingerprint"sv, MUST(String::from_byte_string(warning.certificate.fingerprint)));
+    object.set("reasons"sv, certificate_error_reasons(warning.certificate));
     async_send_message("loadCertificateWarning"sv, move(object));
 }
 
@@ -78068,6 +78288,8 @@ JsonObject SettingsUI::serialize_settings() const
         variable_object.set("type"sv, config_variable_type_to_string(variable.default_value.type()));
         if (variable.array_element_type.has_value())
             variable_object.set("elementType"sv, config_variable_type_to_string(*variable.array_element_type));
+        if (variable.depends_on.has_value())
+            variable_object.set("dependsOn"sv, config_variable_definition(*variable.depends_on).name);
         variable_object.set("defaultValue"sv, variable.default_value);
         variable_object.set("value"sv, Application::settings().config_variable(variable.id));
 
@@ -204732,6 +204954,13 @@ impl Layer {
         set!(self, "setAllowsEdgeAntialiasing:", yes_or_no(allows));
     }
 
+    /// Has the window server cut every edge of the layer at whole pixels. An edge of a new layer that falls between
+    /// pixels covers them only in part, so two layers that meet there let what is below them show through.
+    pub fn stop_antialiasing_edges(&self) {
+        const NO_EDGES_OF_CA_EDGE_ANTIALIASING_MASK: u32 = 0;
+        set!(self, "setEdgeAntialiasingMask:", NO_EDGES_OF_CA_EDGE_ANTIALIASING_MASK);
+    }
+
     pub fn set_opacity(&self, opacity: f32) {
         set!(self, "setOpacity:", opacity);
     }
@@ -205394,6 +205623,10 @@ impl NativeSublayers for Natives {
         // A group fades what its sublayers show together, not each of them over the ones below it.
         if kind == SublayerKind::Group {
             outermost_layer.set_allows_group_opacity(true);
+        }
+        let meets_other_sublayers_edge_to_edge = matches!(kind, SublayerKind::Tile | SublayerKind::Color);
+        if meets_other_sublayers_edge_to_edge {
+            outermost_layer.stop_antialiasing_edges();
         }
         let mut content_layer = None;
         if kind == SublayerKind::PlacedContent {
@@ -219464,6 +219697,9 @@ FILE: Services/RequestServer/AIA.cpp
 
 #include <LibCrypto/OpenSSL.h>
 #include <RequestServer/AIA.h>
+#ifdef AK_OS_MACOS
+#    include <RequestServer/SystemTrustMacOS.h>
+#endif
 #include <RequestServer/CertificateExceptions.h>
 
 #include <AK/AnyOf.h>
@@ -219656,14 +219892,6 @@ static void promote_fetched_intermediates(X509_STORE_CTX* context, AIACollector&
     }
 }
 
-static bool is_self_signed_certificate_error(int verify_error)
-{
-    if (verify_error == X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT)
-        return true;
-    // On macOS, OpenSSL's empty trust store rejects any chain containing its root, even if SecTrust trusts it.
-    return openssl_trust_store_is_authoritative && verify_error == X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN;
-}
-
 static bool certificate_matches_host(X509* certificate, ByteString const& host)
 {
     auto address = host.view();
@@ -219683,56 +219911,182 @@ static bool certificate_matches_host(X509* certificate, ByteString const& host)
     return X509_check_host(certificate, name.characters_without_null_termination(), name.length(), X509_CHECK_FLAG_NEVER_CHECK_SUBJECT | X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS, nullptr) == 1;
 }
 
-// OpenSSL stops at a self-signed certificate before it checks validity periods, so check them here.
-static int validity_period_error(X509_STORE_CTX* context, X509* leaf)
-{
-    auto* chain = X509_STORE_CTX_get0_chain(context);
-    auto chain_length = chain ? sk_X509_num(chain) : 0;
-    for (int i = 0; i < max(chain_length, 1); ++i) {
-        auto* certificate = chain_length > 0 ? sk_X509_value(chain, i) : leaf;
-        auto not_before = X509_cmp_current_time(X509_get0_notBefore(certificate));
-        if (not_before == 0)
-            return X509_V_ERR_ERROR_IN_CERT_NOT_BEFORE_FIELD;
-        if (not_before > 0)
-            return X509_V_ERR_CERT_NOT_YET_VALID;
-        auto not_after = X509_cmp_current_time(X509_get0_notAfter(certificate));
-        if (not_after == 0)
-            return X509_V_ERR_ERROR_IN_CERT_NOT_AFTER_FIELD;
-        if (not_after < 0)
-            return X509_V_ERR_CERT_HAS_EXPIRED;
+struct VerificationFailure {
+    Requests::CertificateError errors { Requests::CertificateError::None };
+    // Descriptions of errors without a dedicated CertificateError flag.
+    ByteString details;
+    // macOS decides issuer trust; curl doesn't report its reasons for rejection.
+    bool is_decided_by_system_verifier { false };
+
+    void add(int verify_error)
+    {
+        switch (verify_error) {
+        case X509_V_OK:
+            return;
+        case X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT:
+            errors |= Requests::CertificateError::SelfSigned;
+            return;
+        case X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN:
+        case X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT:
+        case X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY:
+        case X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE:
+        case X509_V_ERR_CERT_UNTRUSTED:
+            if (!openssl_trust_store_is_authoritative)
+                is_decided_by_system_verifier = true;
+            else
+                errors |= verify_error == X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN ? Requests::CertificateError::SelfSigned : Requests::CertificateError::UnknownIssuer;
+            return;
+        case X509_V_ERR_CERT_HAS_EXPIRED:
+            errors |= Requests::CertificateError::Expired;
+            return;
+        case X509_V_ERR_CERT_NOT_YET_VALID:
+            errors |= Requests::CertificateError::NotYetValid;
+            return;
+        case X509_V_ERR_HOSTNAME_MISMATCH:
+            errors |= Requests::CertificateError::NameMismatch;
+            return;
+        default:
+            break;
+        }
+
+        add_unnamed_error(X509_verify_cert_error_string(verify_error));
     }
-    return X509_V_OK;
+
+    void add_unnamed_error(ByteString description)
+    {
+        errors |= Requests::CertificateError::Other;
+        if (description.is_empty() || details.view().split_view("; "sv).contains_slow(description.view()))
+            return;
+        details = details.is_empty() ? move(description) : ByteString::formatted("{}; {}", details, description);
+    }
+
+#ifdef AK_OS_MACOS
+    void add_system_verdict(X509* leaf, ReadonlySpan<X509*> intermediates)
+    {
+        auto verdict = system_trust_verdict(leaf, intermediates);
+        errors |= verdict.errors & ~Requests::CertificateError::Other;
+        if (has_flag(verdict.errors, Requests::CertificateError::Other))
+            add_unnamed_error(move(verdict.details));
+        is_decided_by_system_verifier = false;
+    }
+#endif
+};
+
+static int record_verification_error(int, X509_STORE_CTX* context)
+{
+    static_cast<VerificationFailure*>(X509_STORE_CTX_get_app_data(context))->add(X509_STORE_CTX_get_error(context));
+    // Continue verification to collect later errors.
+    return 1;
 }
 
-static int apply_self_signed_certificate_exception(X509_STORE_CTX* context, AIACollector& collector)
+// Verify past OpenSSL's first error so the user can review all failures, including checks an untrusted chain
+// would skip, such as certificate purpose.
+static VerificationFailure verification_failure(X509_STORE_CTX* context, int result, X509* leaf, ByteString const& host)
 {
-    if (!is_self_signed_certificate_error(X509_STORE_CTX_get_error(context)))
-        return 0;
+    VerificationFailure failure;
 
-    // NB: The certificate may be issued to another name. Devices on a local network often come with one for localhost,
-    //     and the exception is for this certificate on this host and port only.
+    if (result <= 0) {
+        auto* full_verification = X509_STORE_CTX_new();
+        if (full_verification && X509_STORE_CTX_init(full_verification, X509_STORE_CTX_get0_store(context), leaf, X509_STORE_CTX_get0_untrusted(context)) == 1
+            && X509_VERIFY_PARAM_set1(X509_STORE_CTX_get0_param(full_verification), X509_STORE_CTX_get0_param(context)) == 1) {
+            X509_STORE_CTX_set_verify_cb(full_verification, record_verification_error);
+            X509_STORE_CTX_set_app_data(full_verification, &failure);
+            (void)X509_verify_cert(full_verification);
+        }
+        X509_STORE_CTX_free(full_verification);
+        ERR_clear_error();
+
+        // Preserve the original failure if the second pass recorded none.
+        if (failure.errors == Requests::CertificateError::None && !failure.is_decided_by_system_verifier)
+            failure.add(X509_STORE_CTX_get_error(context) == X509_V_OK ? X509_V_ERR_UNSPECIFIED : X509_STORE_CTX_get_error(context));
+    }
+
+    // curl only checks the name once the handshake is done, and doesn't say that it was the name that failed.
+    if (!host.is_empty() && !certificate_matches_host(leaf, host))
+        failure.errors |= Requests::CertificateError::NameMismatch;
+
+    return failure;
+}
+
+#ifdef AK_OS_MACOS
+static Vector<X509*> intermediates_of(X509_STORE_CTX* context)
+{
+    Vector<X509*> intermediates;
+    auto* untrusted = X509_STORE_CTX_get0_untrusted(context);
+    for (int i = 0; untrusted && i < sk_X509_num(untrusted); ++i)
+        intermediates.append(sk_X509_value(untrusted, i));
+    return intermediates;
+}
+#endif
+
+// Return whether an exception covers all failures; otherwise record the rejected certificate and errors for review.
+static bool apply_certificate_exception(X509_STORE_CTX* context, int result, AIACollector& collector)
+{
+    collector.rejected_certificate.clear();
+    collector.chain_for_system_verifier.clear();
+
     auto* leaf = X509_STORE_CTX_get0_cert(context);
     if (!leaf)
-        return 0;
+        return false;
 
-    // Neither trusted nor offered to the user: no exception could make an out-of-date certificate valid.
-    if (auto error = validity_period_error(context, leaf); error != X509_V_OK) {
-        X509_STORE_CTX_set_error(context, error);
-        return 0;
-    }
+    auto failure = verification_failure(context, result, leaf, collector.host);
+    if (result > 0 && failure.errors == Requests::CertificateError::None)
+        return false;
 
     auto fingerprint = certificate_fingerprint(leaf);
     if (fingerprint.is_empty())
-        return 0;
+        return false;
 
-    if (has_certificate_exception(collector.host, collector.port, fingerprint)) {
-        // curl checks SSL_get_verify_result() after the handshake, which reports the error left on the context.
-        X509_STORE_CTX_set_error(context, X509_V_OK);
-        return 1;
+    if (failure.is_decided_by_system_verifier) {
+#ifdef AK_OS_MACOS
+        // An exception bypasses curl's system verification, so ask here first. Otherwise, curl asks after the
+        // handshake and we collect the reasons only if it fails.
+        if (collector.checks_host_name) {
+            failure.add_system_verdict(leaf, intermediates_of(context));
+            if (failure.errors == Requests::CertificateError::None)
+                return false;
+        } else {
+            AIACollector::ChainForSystemVerifier chain { { move(fingerprint), failure.errors, move(failure.details) }, {} };
+            add_certificate(chain.certificates, leaf);
+            for (auto* intermediate : intermediates_of(context))
+                add_certificate(chain.certificates, intermediate);
+            collector.chain_for_system_verifier = move(chain);
+            return false;
+        }
+#else
+        return false;
+#endif
     }
 
-    collector.rejected_self_signed_certificate_fingerprint = move(fingerprint);
-    return 0;
+    // NB: curl still checks the name itself unless an exception existed when the connection was set up.
+    auto may_have_another_name = collector.checks_host_name || !has_flag(failure.errors, Requests::CertificateError::NameMismatch);
+    if (may_have_another_name && has_certificate_exception(collector.host, collector.port, fingerprint, failure.errors, failure.details)) {
+        // curl checks SSL_get_verify_result() after the handshake, which reports the error left on the context.
+        X509_STORE_CTX_set_error(context, X509_V_OK);
+        return true;
+    }
+
+    collector.rejected_certificate = AIACollector::RejectedCertificate { move(fingerprint), failure.errors, move(failure.details) };
+    return false;
+}
+
+void explain_system_verifier_refusal([[maybe_unused]] AIACollector& collector)
+{
+#ifdef AK_OS_MACOS
+    auto chain = exchange(collector.chain_for_system_verifier, {});
+    if (!chain.has_value() || chain->certificates.is_empty())
+        return;
+
+    VerificationFailure failure { chain->rejection.errors, move(chain->rejection.details), true };
+    Vector<X509*> intermediates;
+    for (size_t i = 1; i < chain->certificates.size(); ++i)
+        intermediates.append(chain->certificates[i].ptr());
+    failure.add_system_verdict(chain->certificates.first().ptr(), intermediates);
+    if (failure.errors == Requests::CertificateError::None)
+        return;
+
+    collector.rejected_certificate = AIACollector::RejectedCertificate { move(chain->rejection.fingerprint), failure.errors, move(failure.details) };
+#endif
 }
 
 // Installed via SSL_CTX_set_cert_verify_callback. On failure, we record the failing cert's caIssuers URLs for the
@@ -219757,16 +220111,15 @@ static int verify_callback(X509_STORE_CTX* context, void* collector_data)
 
     auto result = X509_verify_cert(context);
 
+    // Reverification needs the fetched intermediates before they are removed from the context.
+    auto accepted_by_exception = collector && apply_certificate_exception(context, result, *collector);
+
     if (untrusted) {
         X509_STORE_CTX_set0_untrusted(context, server_untrusted);
         sk_X509_free(untrusted);
     }
-
-    auto accepted_by_exception = false;
-    if (result <= 0 && collector) {
-        result = apply_self_signed_certificate_exception(context, *collector);
-        accepted_by_exception = result > 0;
-    }
+    if (accepted_by_exception)
+        result = 1;
 
     // Only the certificate the user trusted may name another host. Fail the handshake for any other, as on macOS curl
     // would otherwise go on to verify the chain with SecTrust, which then doesn't check the name either.
@@ -219863,6 +220216,7 @@ FILE: Services/RequestServer/AIA.h
 #include <AK/Vector.h>
 #include <LibCrypto/OpenSSL.h>
 #include <LibCrypto/OpenSSLForward.h>
+#include <LibRequests/CertificateError.h>
 #include <RequestServer/IsPrivate.h>
 
 extern "C" {
@@ -219894,14 +220248,31 @@ public:
     // Verification checks the host name instead of curl when an exception may allow a certificate for another name.
     bool checks_host_name { false };
 
-    Optional<ByteString> rejected_self_signed_certificate_fingerprint;
+    // The server's certificate, if the last verification refused it, and why.
+    struct RejectedCertificate {
+        ByteString fingerprint;
+        Requests::CertificateError errors { Requests::CertificateError::None };
+        // Descriptions of errors without a dedicated CertificateError flag.
+        ByteString details;
+    };
+    Optional<RejectedCertificate> rejected_certificate;
+
+    // Retain the chain to explain a macOS system verification failure after the handshake.
+    struct ChainForSystemVerifier {
+        RejectedCertificate rejection;
+        Vector<Crypto::OpenSSL_X509> certificates; // The leaf first.
+    };
+    Optional<ChainForSystemVerifier> chain_for_system_verifier;
 };
 
-// Accept self-signed certificates with user exceptions; otherwise record the rejected fingerprint in the collector.
+// Accept certificates with user exceptions; otherwise record the rejected certificate and its errors in the collector.
 //
 // During verification, any cert whose issuer we can't find locally or in the fetched-intermediate cache has its
 // caIssuers URLs appended to collector.pending_urls (skipping ones already attempted or recently known dead).
 void apply_aia_verification(SSL_CTX* ssl_context, AIACollector& collector);
+
+// Call after curl rejects the certificate to record any deferred system verification errors.
+void explain_system_verifier_refusal(AIACollector&);
 
 // Returns true if the body yielded a certificate.
 bool add_fetched_aia_intermediates(ReadonlyBytes body, ReadonlySpan<NonnullRefPtr<AIACollector>> collectors);
@@ -220288,7 +220659,6 @@ FILE: Services/RequestServer/CertificateExceptions.cpp
  */
 
 #include <AK/HashMap.h>
-#include <AK/HashTable.h>
 #include <AK/StringBuilder.h>
 #include <RequestServer/CertificateExceptions.h>
 
@@ -220302,9 +220672,16 @@ FILE: Services/RequestServer/CertificateExceptions.cpp
 
 namespace RequestServer {
 
-static HashMap<ByteString, HashTable<ByteString>>& certificate_exceptions()
+// The errors each certificate is trusted in spite of, by fingerprint.
+struct TrustedCertificate {
+    Requests::CertificateError errors { Requests::CertificateError::None };
+    ByteString error_details;
+};
+using TrustedCertificates = HashMap<ByteString, TrustedCertificate>;
+
+static HashMap<ByteString, TrustedCertificates>& certificate_exceptions()
 {
-    static HashMap<ByteString, HashTable<ByteString>> exceptions;
+    static HashMap<ByteString, TrustedCertificates> exceptions;
     return exceptions;
 }
 
@@ -220326,19 +220703,27 @@ ByteString certificate_fingerprint(X509* certificate)
     return builder.to_byte_string();
 }
 
-void add_certificate_exception(ByteString const& host, u16 port, ByteString fingerprint)
+void add_certificate_exception(ByteString const& host, u16 port, ByteString fingerprint, Requests::CertificateError errors, ByteString error_details)
 {
     if (fingerprint.is_empty())
         return;
-    certificate_exceptions().ensure(exception_key(host, port)).set(move(fingerprint));
+    // The latest review covers all current errors and replaces earlier approvals.
+    certificate_exceptions().ensure(exception_key(host, port)).set(move(fingerprint), { errors, move(error_details) });
 }
 
-bool has_certificate_exception(ByteString const& host, u16 port, ByteString const& fingerprint)
+bool has_certificate_exception(ByteString const& host, u16 port, ByteString const& fingerprint, Requests::CertificateError errors, StringView error_details)
 {
     if (fingerprint.is_empty())
         return false;
     auto exceptions = certificate_exceptions().get(exception_key(host, port));
-    return exceptions.has_value() && exceptions->contains(fingerprint);
+    if (!exceptions.has_value())
+        return false;
+    // A certificate that has since begun to fail for another reason goes back to the user.
+    auto trusted = exceptions->get(fingerprint);
+    if (!trusted.has_value() || has_any_flag(errors, ~trusted->errors))
+        return false;
+    // Descriptions distinguish errors sharing the Other flag.
+    return !has_flag(errors, Requests::CertificateError::Other) || error_details == trusted->error_details;
 }
 
 bool has_any_certificate_exception(ByteString const& host, u16 port)
@@ -220360,6 +220745,7 @@ FILE: Services/RequestServer/CertificateExceptions.h
 #include <AK/ByteString.h>
 #include <AK/Types.h>
 #include <LibCrypto/OpenSSLForward.h>
+#include <LibRequests/CertificateError.h>
 
 namespace RequestServer {
 
@@ -220367,9 +220753,9 @@ namespace RequestServer {
 ByteString certificate_fingerprint(X509* certificate);
 
 // The UI process grants exceptions for user-trusted certificates that fail verification.
-// Each is limited to one host and port and lasts for this process's lifetime.
-void add_certificate_exception(ByteString const& host, u16 port, ByteString fingerprint);
-bool has_certificate_exception(ByteString const& host, u16 port, ByteString const& fingerprint);
+// Each is limited to one host and port and to the errors the user reviewed, and lasts for this process's lifetime.
+void add_certificate_exception(ByteString const& host, u16 port, ByteString fingerprint, Requests::CertificateError, ByteString error_details = {});
+bool has_certificate_exception(ByteString const& host, u16 port, ByteString const& fingerprint, Requests::CertificateError, StringView error_details = {});
 bool has_any_certificate_exception(ByteString const& host, u16 port);
 
 }
@@ -220393,7 +220779,7 @@ set(SOURCES
 if (LINUX)
     list(APPEND SOURCES SandboxLinux.cpp)
 elseif (APPLE)
-    list(APPEND SOURCES SandboxMacOS.cpp)
+    list(APPEND SOURCES SandboxMacOS.cpp SystemTrustMacOS.cpp)
 else()
     list(APPEND SOURCES SandboxUnimplemented.cpp)
 endif()
@@ -220415,6 +220801,9 @@ target_include_directories(requestserverservice PRIVATE ${LADYBIRD_SOURCE_DIR}/S
 
 target_link_libraries(RequestServer PRIVATE requestserverservice LibFileSystem)
 target_link_libraries(requestserverservice PUBLIC LibCore LibDNS LibHTTP LibIPC LibMain LibPlatformFeatures LibRequests LibSandbox LibWebSocket LibURL LibTextCodec CURL::libcurl)
+if (APPLE)
+    target_link_libraries(requestserverservice PRIVATE "-framework CoreFoundation" "-framework Security")
+endif()
 target_link_libraries(requestserverservice PRIVATE OpenSSL::Crypto OpenSSL::SSL)
 
 if (WIN32)
@@ -221987,9 +222376,9 @@ void ControlConnectionFromClient::set_proxy_configuration(HTTP::ProxyConfigurati
     RequestServer::set_proxy_configuration(move(proxy_configuration));
 }
 
-void ControlConnectionFromClient::trust_certificate(ByteString host, u16 port, ByteString fingerprint)
+void ControlConnectionFromClient::trust_certificate(ByteString host, u16 port, ByteString fingerprint, Requests::CertificateError errors, ByteString error_details)
 {
-    add_certificate_exception(host, port, move(fingerprint));
+    add_certificate_exception(host, port, move(fingerprint), errors, move(error_details));
 }
 
 void ControlConnectionFromClient::set_performance_monitor_enabled(bool enabled)
@@ -222204,7 +222593,7 @@ private:
 
     virtual void set_proxy_configuration(HTTP::ProxyConfiguration) override;
 
-    virtual void trust_certificate(ByteString host, u16 port, ByteString fingerprint) override;
+    virtual void trust_certificate(ByteString host, u16 port, ByteString fingerprint, Requests::CertificateError, ByteString error_details) override;
 
     virtual void set_performance_monitor_enabled(bool) override;
 
@@ -223873,8 +224262,10 @@ void Request::handle_fetch_complete(int result_code)
         m_alternative_service.clear();
         m_dns_result = nullptr;
         // The origin may present another certificate than the alternative service did.
-        if (m_aia_collector)
-            m_aia_collector->rejected_self_signed_certificate_fingerprint.clear();
+        if (m_aia_collector) {
+            m_aia_collector->rejected_certificate.clear();
+            m_aia_collector->chain_for_system_verifier.clear();
+        }
 
         MUST(free_curl_structs());
         reset_for_retry();
@@ -224067,7 +224458,8 @@ void Request::retry_after_aia(Badge<ConnectionFromClient>)
     m_curl_result_code = {};
     if (m_aia_collector) {
         m_aia_collector->pending_urls.clear();
-        m_aia_collector->rejected_self_signed_certificate_fingerprint.clear();
+        m_aia_collector->rejected_certificate.clear();
+        m_aia_collector->chain_for_system_verifier.clear();
     }
     transition_to_state(State::Fetch);
 }
@@ -224802,11 +225194,15 @@ void Request::handle_complete_state()
         if (m_curl_result_code != CURLE_OK) {
             m_network_error = curl_code_to_network_error(*m_curl_result_code);
 
-            if (m_network_error == Requests::NetworkError::SSLVerificationFailed && m_aia_collector && m_aia_collector->rejected_self_signed_certificate_fingerprint.has_value()) {
-                m_network_error = Requests::NetworkError::SSLSelfSignedCertificate;
+            if (m_network_error == Requests::NetworkError::SSLVerificationFailed && m_aia_collector)
+                explain_system_verifier_refusal(*m_aia_collector);
+
+            if (m_network_error == Requests::NetworkError::SSLVerificationFailed && m_aia_collector && m_aia_collector->rejected_certificate.has_value()) {
+                auto const& rejected = *m_aia_collector->rejected_certificate;
+                m_network_error = Requests::network_error_for_certificate_errors(rejected.errors);
 
                 if (auto control_connection = ControlConnectionFromClient::the(); control_connection.has_value())
-                    control_connection->async_rejected_self_signed_certificate(m_aia_collector->host, m_aia_collector->port, *m_aia_collector->rejected_self_signed_certificate_fingerprint);
+                    control_connection->async_rejected_certificate(m_aia_collector->host, m_aia_collector->port, rejected.fingerprint, rejected.errors, rejected.details);
             }
 
             if (m_network_error == Requests::NetworkError::Unknown) {
@@ -226382,6 +226778,7 @@ FILE: Services/RequestServer/RequestServerControl.ipc
 #include <LibHTTP/Cache/DiskCacheSettings.h>
 #include <LibHTTP/Proxy.h>
 #include <LibIPC/TransportHandle.h>
+#include <LibRequests/CertificateError.h>
 #include <RequestServer/IsPrivate.h>
 #include <RequestServer/RequestType.h>
 #include <RequestServer/SiteBinding.h>
@@ -226409,7 +226806,7 @@ endpoint RequestServerControl
     set_proxy_configuration(HTTP::ProxyConfiguration proxy_configuration) =|
 
     // Synchronous so the exception applies before the UI process reloads.
-    trust_certificate(ByteString host, u16 port, ByteString fingerprint) => ()
+    trust_certificate(ByteString host, u16 port, ByteString fingerprint, Requests::CertificateError errors, ByteString error_details) => ()
 
     set_performance_monitor_enabled(bool enabled) =|
 
@@ -226431,6 +226828,7 @@ FILE: Services/RequestServer/RequestServerControlClient.ipc
 #include <LibHTTP/Cookie/ParsedCookie.h>
 #include <LibHTTP/HSTS/ParsedHSTSPolicy.h>
 #include <LibRequests/CacheSizes.h>
+#include <LibRequests/CertificateError.h>
 #include <LibRequests/NetworkUsage.h>
 #include <LibURL/URL.h>
 #include <RequestServer/IsPrivate.h>
@@ -226445,7 +226843,8 @@ endpoint RequestServerControlClient
     retrieve_http_cookie(int client_id, u64 request_id, ::RequestServer::RequestType request_type, u64 cookie_request_id, URL::URL url, Optional<HTTP::Cookie::PartitionContext> partition_context, HTTP::Cookie::SameSiteContext same_site_context) =|
     store_response_cookies_and_hsts_policy(int client_id, u64 request_id, u64 store_request_id, URL::URL url, Optional<HTTP::Cookie::PartitionContext> partition_context, HTTP::Cookie::SameSiteContext same_site_context, Vector<HTTP::Cookie::ParsedCookie> cookies, Optional<HTTP::HSTS::ParsedHSTSPolicy> hsts_policy) =|
 
-    rejected_self_signed_certificate(ByteString host, u16 port, ByteString fingerprint) =|
+    // Details describe unnamed errors.
+    rejected_certificate(ByteString host, u16 port, ByteString fingerprint, Requests::CertificateError errors, ByteString details) =|
 
     network_usage(Vector<Requests::NetworkUsage> usage, u64 interval_microseconds) =|
 
@@ -227202,6 +227601,208 @@ enum class SiteBinding : u8 {
     Unrestricted,
     Bound,
 };
+
+}
+
+FILE: Services/RequestServer/SystemTrustMacOS.cpp
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/QuickSort.h>
+#include <AK/ScopeGuard.h>
+#include <AK/Vector.h>
+#include <RequestServer/SystemTrustMacOS.h>
+
+#include <CoreFoundation/CoreFoundation.h>
+#include <Security/Security.h>
+#include <openssl/x509.h>
+
+namespace RequestServer {
+
+static SecCertificateRef create_certificate(X509* certificate)
+{
+    unsigned char* der = nullptr;
+    auto length = i2d_X509(certificate, &der);
+    if (length <= 0)
+        return nullptr;
+    ScopeGuard free_der = [&] { OPENSSL_free(der); };
+
+    auto* data = CFDataCreate(nullptr, der, length);
+    if (!data)
+        return nullptr;
+    ScopeGuard release_data = [&] { CFRelease(data); };
+    return SecCertificateCreateWithData(nullptr, data);
+}
+
+static ByteString byte_string_from(CFStringRef string)
+{
+    if (!string)
+        return {};
+    auto length = CFStringGetMaximumSizeForEncoding(CFStringGetLength(string), kCFStringEncodingUTF8) + 1;
+    Vector<char> buffer;
+    buffer.resize(length);
+    if (!CFStringGetCString(string, buffer.data(), length, kCFStringEncodingUTF8))
+        return {};
+    return ByteString { buffer.data() };
+}
+
+// Recheck dates: the system may add certificates OpenSSL never saw, such as keychain intermediates.
+static void add_validity_period_error(SecCertificateRef certificate, SystemTrustVerdict& verdict, Vector<ByteString>& unnamed_reasons)
+{
+    X509* parsed = nullptr;
+    if (auto* data = SecCertificateCopyData(certificate)) {
+        auto const* bytes = CFDataGetBytePtr(data);
+        parsed = d2i_X509(nullptr, &bytes, CFDataGetLength(data));
+        CFRelease(data);
+    }
+    ScopeGuard free_parsed = [&] { X509_free(parsed); };
+
+    if (parsed && X509_cmp_current_time(X509_get0_notAfter(parsed)) < 0)
+        verdict.errors |= Requests::CertificateError::Expired;
+    else if (parsed && X509_cmp_current_time(X509_get0_notBefore(parsed)) > 0)
+        verdict.errors |= Requests::CertificateError::NotYetValid;
+    else
+        unnamed_reasons.append("TemporalValidity"sv);
+}
+
+static void add_reasons(CFDictionaryRef certificate_details, SecCertificateRef certificate, SystemTrustVerdict& verdict, Vector<ByteString>& unnamed_reasons)
+{
+    auto count = CFDictionaryGetCount(certificate_details);
+    Vector<void const*> keys;
+    keys.resize(count);
+    CFDictionaryGetKeysAndValues(certificate_details, keys.data(), nullptr);
+
+    for (auto const* key : keys) {
+        if (CFGetTypeID(key) != CFStringGetTypeID())
+            continue;
+        auto name = byte_string_from(static_cast<CFStringRef>(key));
+        // The chain ends at a root that isn't trusted.
+        if (name == "AnchorTrusted"sv)
+            verdict.errors |= Requests::CertificateError::SelfSigned;
+        else if (name == "MissingIntermediate"sv)
+            verdict.errors |= Requests::CertificateError::UnknownIssuer;
+        else if (name == "TemporalValidity"sv && certificate)
+            add_validity_period_error(certificate, verdict, unnamed_reasons);
+        // The caller checks host names; StatusCodes lists codes for the other errors.
+        else if (!name.is_one_of("SSLHostname"sv, "StatusCodes"sv) && !unnamed_reasons.contains_slow(name))
+            unnamed_reasons.append(move(name));
+    }
+}
+
+SystemTrustVerdict system_trust_verdict(X509* leaf, ReadonlySpan<X509*> intermediates)
+{
+    SystemTrustVerdict verdict;
+
+    auto* certificates = CFArrayCreateMutable(nullptr, 0, &kCFTypeArrayCallBacks);
+    ScopeGuard release_certificates = [&] { CFRelease(certificates); };
+    Vector<X509*> chain { leaf };
+    for (auto* intermediate : intermediates) {
+        if (X509_cmp(intermediate, leaf) != 0)
+            chain.append(intermediate);
+    }
+    for (auto* certificate : chain) {
+        auto* system_certificate = create_certificate(certificate);
+        if (!system_certificate)
+            continue;
+        CFArrayAppendValue(certificates, system_certificate);
+        CFRelease(system_certificate);
+    }
+
+    // The caller checks host names using curl's matching rules.
+    auto* policy = SecPolicyCreateSSL(true, nullptr);
+    ScopeGuard release_policy = [&] { CFRelease(policy); };
+
+    SecTrustRef trust = nullptr;
+    if (CFArrayGetCount(certificates) == 0 || SecTrustCreateWithCertificates(certificates, policy, &trust) != errSecSuccess) {
+        verdict.errors |= Requests::CertificateError::Other;
+        return verdict;
+    }
+    ScopeGuard release_trust = [&] { CFRelease(trust); };
+
+    CFErrorRef error = nullptr;
+    if (SecTrustEvaluateWithError(trust, &error))
+        return verdict;
+    ScopeGuard release_error = [&] {
+        if (error)
+            CFRelease(error);
+    };
+
+    // Undocumented per-certificate details distinguish rejection reasons. Without them, use the system's description.
+    Vector<ByteString> unnamed_reasons;
+    if (auto* result = SecTrustCopyResult(trust)) {
+        ScopeGuard release_result = [&] { CFRelease(result); };
+        // Details follow the system's certificate chain order.
+        auto* chain = SecTrustCopyCertificateChain(trust);
+        ScopeGuard release_chain = [&] {
+            if (chain)
+                CFRelease(chain);
+        };
+        auto const* details = CFDictionaryGetValue(result, CFSTR("TrustResultDetails"));
+        if (details && CFGetTypeID(details) == CFArrayGetTypeID()) {
+            auto* array = static_cast<CFArrayRef>(details);
+            for (CFIndex i = 0; i < CFArrayGetCount(array); ++i) {
+                auto const* certificate_details = CFArrayGetValueAtIndex(array, i);
+                if (CFGetTypeID(certificate_details) != CFDictionaryGetTypeID())
+                    continue;
+                auto certificate = chain && i < CFArrayGetCount(chain) ? static_cast<SecCertificateRef>(const_cast<void*>(CFArrayGetValueAtIndex(chain, i))) : nullptr;
+                add_reasons(static_cast<CFDictionaryRef>(certificate_details), certificate, verdict, unnamed_reasons);
+            }
+        }
+    }
+
+    if (unnamed_reasons.is_empty() && verdict.errors != Requests::CertificateError::None)
+        return verdict;
+
+    // The description names only the most serious reason. Include all unnamed reasons so exceptions cannot
+    // cover reasons the user didn't review.
+    verdict.errors |= Requests::CertificateError::Other;
+    ByteString description;
+    if (error) {
+        auto* error_description = CFErrorCopyDescription(error);
+        description = byte_string_from(error_description);
+        if (error_description)
+            CFRelease(error_description);
+    }
+    quick_sort(unnamed_reasons);
+    if (unnamed_reasons.is_empty())
+        verdict.details = move(description);
+    else if (description.is_empty())
+        verdict.details = ByteString::join(", "sv, unnamed_reasons);
+    else
+        verdict.details = ByteString::formatted("{} ({})", description, ByteString::join(", "sv, unnamed_reasons));
+    return verdict;
+}
+
+}
+
+FILE: Services/RequestServer/SystemTrustMacOS.h
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/ByteString.h>
+#include <AK/Span.h>
+#include <LibCrypto/OpenSSLForward.h>
+#include <LibRequests/CertificateError.h>
+
+namespace RequestServer {
+
+struct SystemTrustVerdict {
+    Requests::CertificateError errors { Requests::CertificateError::None };
+    // System descriptions of errors without a dedicated CertificateError flag.
+    ByteString details;
+};
+
+// Query the system's issuer trust and rejection reasons without changing trust settings.
+// The caller checks host names.
+SystemTrustVerdict system_trust_verdict(X509* leaf, ReadonlySpan<X509*> intermediates);
 
 }
 
@@ -232606,10 +233207,12 @@ void ConnectionFromClient::set_has_picture_in_picture_support(Web::PageId page_i
         page->page().picture_in_picture_controller().set_has_picture_in_picture_support(has_support);
 }
 
-void ConnectionFromClient::set_offers_to_trust_self_signed_certificates(Web::PageId page_id, bool offers)
+void ConnectionFromClient::set_offers_to_trust_certificates(Web::PageId page_id, bool self_signed, bool invalid)
 {
-    if (auto page = this->page(page_id); page.has_value())
-        page->page().set_offers_to_trust_self_signed_certificates(offers);
+    if (auto page = this->page(page_id); page.has_value()) {
+        page->page().set_offers_to_trust_self_signed_certificates(self_signed);
+        page->page().set_offers_to_trust_invalid_certificates(invalid);
+    }
 }
 
 void ConnectionFromClient::did_open_picture_in_picture_window(Web::PageId page_id, Gfx::IntSize window_size)
@@ -233019,7 +233622,7 @@ private:
     virtual void exit_fullscreen(Web::PageId page_id) override;
 
     virtual void set_has_picture_in_picture_support(Web::PageId page_id, bool has_support) override;
-    virtual void set_offers_to_trust_self_signed_certificates(Web::PageId page_id, bool offers) override;
+    virtual void set_offers_to_trust_certificates(Web::PageId page_id, bool self_signed, bool invalid) override;
     virtual void did_open_picture_in_picture_window(Web::PageId page_id, Gfx::IntSize window_size) override;
     virtual void picture_in_picture_window_did_resize(Web::PageId page_id, Gfx::IntSize window_size) override;
     virtual void picture_in_picture_window_did_close(Web::PageId page_id, bool pause_video) override;
@@ -239771,7 +240374,7 @@ endpoint WebContentServer routed by Web::PageId page_id
     exit_fullscreen(Web::PageId page_id) =|
 
     set_has_picture_in_picture_support(Web::PageId page_id, bool has_support) =|
-    set_offers_to_trust_self_signed_certificates(Web::PageId page_id, bool offers) =|
+    set_offers_to_trust_certificates(Web::PageId page_id, bool self_signed, bool invalid) =|
     did_open_picture_in_picture_window(Web::PageId page_id, Gfx::IntSize window_size) =|
     picture_in_picture_window_did_resize(Web::PageId page_id, Gfx::IntSize window_size) =|
     picture_in_picture_window_did_close(Web::PageId page_id, bool pause_video) =|
@@ -612743,9 +613346,31 @@ FILE: Tests/LibWeb/Ref/expected/clip-offscreen-ref.html
 <!DOCTYPE html>
 (This space intentionally left blank)
 
+FILE: Tests/LibWeb/Ref/expected/clip-path-clips-escaping-absolute-descendants-after-scroll-ref.html
+<!DOCTYPE html>
+<style>
+  body { margin: 0; }
+  div { position: absolute; top: 50px; left: 0; width: 100px; height: 100px; background: green; }
+</style>
+<div></div>
+
 FILE: Tests/LibWeb/Ref/expected/clip-path-clips-filter-output-ref.html
 <!DOCTYPE html>
 <style>body { margin: 0; }</style>
+
+FILE: Tests/LibWeb/Ref/expected/clip-path-clips-fixed-descendants-after-scroll-ref.html
+<!DOCTYPE html>
+<style>
+  body { margin: 0; }
+  main { height: 1500px; background: lightblue; }
+  footer { height: 300px; position: relative; background: orange; }
+  .inner { position: absolute; bottom: 0; left: 0; width: 200px; height: 100px; background: green; }
+</style>
+<main></main>
+<footer><div class="inner"></div></footer>
+<script>
+  window.scrollTo(0, 99999);
+</script>
 
 FILE: Tests/LibWeb/Ref/expected/clip-path-geometry-box-creates-stacking-context-ref.html
 <!DOCTYPE html>
@@ -639353,1215 +639978,3 @@ FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-grid/grid-lanes/alignment/row
 
 <div class="grid" style="align-items: center;">
   <item class="auto short">A1</item>
-  <item class="start short">S1</item>
-  <item class="end short">E1</item>
-  <item class="stretch">ST1</item>
-  <item class="auto medium">A2</item>
-  <item class="start medium">S2</item>
-  <item class="end medium">E2</item>
-  <item class="stretch">ST2</item>
-  <item class="auto tall">A3</item>
-  <item class="start tall">S3</item>
-  <item class="end tall">E3</item>
-  <item class="stretch">ST3</item>
-</div>
-
-<div class="grid" style="align-items: end;">
-  <item class="auto short">A1</item>
-  <item class="start short">S1</item>
-  <item class="center short">C1</item>
-  <item class="stretch">ST1</item>
-  <item class="auto medium">A2</item>
-  <item class="start medium">S2</item>
-  <item class="center medium">C2</item>
-  <item class="stretch">ST2</item>
-  <item class="auto tall">A3</item>
-  <item class="start tall">S3</item>
-  <item class="center tall">C3</item>
-  <item class="stretch">ST3</item>
-</div>
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-grid/grid-lanes/alignment/row-grid-lanes-align-self-002-ref.html
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <style>
-    html,body {
-      color:black; background-color:white; font:15px/1 monospace; padding:0; margin:0;
-    }
-
-    .grid {
-      display: grid;
-      gap: 2px;
-      grid-template-rows: repeat(3, 40px);
-      grid-template-columns: repeat(2, min-content);
-      color: #444;
-      border: 1px solid;
-      padding: 2px;
-      width: 180px;
-      margin: 5px;
-    }
-
-    item {
-      background-color: #444;
-      color: #fff;
-      padding: 2px;
-      width: 45px;
-    }
-
-    .safe-end {
-      align-self: safe end;
-      background-color: purple;
-      height: 50px;
-    }
-
-    .safe-center {
-      align-self: safe center;
-      background-color: teal;
-      height: 45px;
-    }
-
-    .unsafe-end {
-      align-self: end;
-      background-color: darkmagenta;
-      height: 50px;
-    }
-
-    .unsafe-center {
-      align-self: center;
-      background-color: darkcyan;
-      height: 45px;
-    }
-
-    .normal {
-      align-self: normal;
-      background-color: brown;
-    }
-
-    .self-start {
-      align-self: self-start;
-      background-color: darkred;
-    }
-
-    .self-end {
-      align-self: self-end;
-      background-color: darkblue;
-    }
-
-    .short {
-      height: 15px;
-    }
-  </style>
-</head>
-<body>
-<div class="grid">
-  <item class="normal">N1</item>
-  <item class="normal">N3</item>
-  <item class="safe-end">SE1</item>
-  <item class="unsafe-end">UE1</item>
-  <item class="normal">N2</item>
-  <item class="normal">N4</item>
-</div>
-
-<div class="grid">
-  <item class="normal">N1</item>
-  <item class="normal">N3</item>
-  <item class="safe-center">SC1</item>
-  <item class="unsafe-center">UC1</item>
-  <item class="normal">N2</item>
-  <item class="normal">N4</item>
-</div>
-
-<div class="grid">
-  <item class="self-start short">SS1</item>
-  <item class="self-end short">SE4</item>
-  <item class="self-end short">SE2</item>
-  <item class="self-start short">SS5</item>
-  <item class="self-start short">SS3</item>
-  <item class="self-end short">SE6</item>
-</div>
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-grid/grid-lanes/alignment/row-grid-lanes-align-self-003-ref.html
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <style>
-    .grid {
-      display: grid;
-      width: 100px;
-      height: 250px;
-      grid-template-rows: repeat(4, 1fr);
-      gap: 5px;
-      border: 1px solid black;
-      margin-bottom: 20px;
-    }
-
-    .item {
-      background-color: #444;
-      color: #fff;
-      padding: 2px;
-      width: 50px;
-    }
-
-    .img-placeholder {
-      width: 48px;
-      height: 30px;
-      background: linear-gradient(45deg, #666, #999);
-      display: inline-block;
-    }
-
-    input[type="text"] {
-      background-color: #f0f0f0;
-      border: 1px solid #999;
-      padding: 2px;
-      height: 20px;
-      width: auto;
-    }
-
-    button {
-      background-color: #ddd;
-      border: 1px solid #999;
-      padding: 2px 4px;
-      cursor: pointer;
-      width: auto;
-    }
-
-    .start {
-      align-self: start;
-      background-color: red;
-      grid-row: 1/2;
-    }
-
-    .center {
-      align-self: center;
-      background-color: green;
-      grid-row: 2/3;
-    }
-
-    .end {
-      align-self: end;
-      background-color: blue;
-      grid-row: 3/4;
-    }
-
-    .stretch {
-      align-self: stretch;
-      background-color: orange;
-      grid-row: 4/5;
-    }
-  </style>
-</head>
-<body>
-<div class="grid">
-  <div class="item start">
-    <div class="img-placeholder"></div>
-  </div>
-  <div class="item center">
-    <div class="img-placeholder"></div>
-  </div>
-  <div class="item end">
-    <div class="img-placeholder"></div>
-  </div>
-  <div class="item stretch">
-    <div class="img-placeholder" style="height: 100%;"></div>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="item start">
-    <input type="text" value="start" style="width: 43px;">
-  </div>
-  <div class="item center">
-    <button>center</button>
-  </div>
-  <div class="item end">
-    <input type="text" value="end" style="width: 43px;">
-  </div>
-  <div class="item stretch">
-    <button style="height: 100%;">stretch</button>
-  </div>
-</div>
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-grid/grid-lanes/alignment/row-grid-lanes-alignment-positioned-items-001-ref.html
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <style>
-    html,body {
-        color:black; background-color:white; font:10px/1 monospace; padding:0; margin:0;
-    }
-
-    .grid {
-        position: relative;
-        display: grid;
-        grid-template-columns: 200px;
-        grid-template-rows: 100px 150px;
-        width: 200px;
-        height: 300px;
-        background: grey;
-        gap: 10px;
-        padding: 10px;
-    }
-
-    .grid > div {
-        position: absolute;
-    }
-
-    .grid > :nth-child(1) {
-        grid-row: 1/2;
-        justify-self: start;
-        background: green;
-    }
-
-    .grid > :nth-child(2) {
-        grid-row: 2/3;
-        justify-self: start;
-        background: blue;
-    }
-
-    .grid > :nth-child(3) {
-        grid-row: 1/2;
-        justify-self: end;
-        background: yellow;
-    }
-
-    .grid > :nth-child(4) {
-        grid-row: 2/3;
-        justify-self: end;
-        background: red;
-    }
-  </style>
-</head>
-<body>
-<div class="grid">
-  <div>X XX X</div>
-  <div>XX X<br>X XXX X<br>XX XXX</div>
-  <div>X XX X</div>
-  <div>XX X<br>X XXX<br>X<br>XX XXX</div>
-</div>
-
-<div class="grid" style="direction: rtl;">
-  <div>X XX X</div>
-  <div>XX X<br>X XXX X<br>XX XXX</div>
-  <div>X XX X</div>
-  <div>XX X<br>X XXX<br>X<br>XX XXX</div>
-</div>
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-grid/grid-lanes/alignment/row-grid-lanes-alignment-positioned-items-002-ref.html
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <style>
-    html,body {
-      color:black; background-color:white; font:8px/1 monospace; padding:0; margin:0;
-    }
-
-    .grid {
-      position: relative;
-      display: grid;
-      grid-template-columns: 150px;
-      grid-template-rows: 80px 80px 80px;
-      width: 150px;
-      height: 290px;
-      gap: 10px;
-      padding: 10px;
-      border: 2px solid black;
-      margin: 10px;
-    }
-
-    .grid > div {
-      position: absolute;
-      border: 1px solid #333;
-      width: 30px;
-      height: 120px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-
-    .safe-start {
-      grid-row: 1 / 2;
-      justify-self: safe start;
-      background: lightcoral;
-    }
-
-    .unsafe-start {
-      grid-row: 2 / 3;
-      justify-self: unsafe start;
-      background: lightblue;
-    }
-
-    .safe-end {
-      grid-row: 3 / 4;
-      justify-self: safe end;
-      background: lightgreen;
-    }
-
-    .unsafe-end {
-      grid-row: 1 / 2;
-      justify-self: unsafe end;
-      background: lightyellow;
-    }
-
-    .safe-center {
-      grid-row: 2 / 3;
-      justify-self: safe center;
-      background: plum;
-    }
-
-    .unsafe-center {
-      grid-row: 3 / 4;
-      justify-self: unsafe center;
-      background: orange;
-    }
-  </style>
-</head>
-<body>
-  <div class="grid">
-    <div class="safe-start">safe-start</div>
-    <div class="unsafe-start">unsafe-start</div>
-    <div class="safe-end">safe-end</div>
-    <div class="unsafe-end">unsafe-end</div>
-    <div class="safe-center">safe-center</div>
-    <div class="unsafe-center">unsafe-center</div>
-  </div>
-
-  <div class="grid" style="direction: rtl;">
-    <div class="safe-start">safe-start</div>
-    <div class="unsafe-start">unsafe-start</div>
-    <div class="safe-end">safe-end</div>
-    <div class="unsafe-end">unsafe-end</div>
-    <div class="safe-center">safe-center</div>
-    <div class="unsafe-center">unsafe-center</div>
-  </div>
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-grid/grid-lanes/alignment/row-grid-lanes-alignment-positioned-items-003-ref.html
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <style>
-    html,body {
-        color:black; background-color:white; font:8px/1 monospace; padding:0; margin:0;
-    }
-
-    .grid {
-        position: relative;
-        display: grid;
-        grid-template-columns: 150px;
-        grid-template-rows: 90px 90px 90px;
-        width: 150px;
-        height: 320px;
-        gap: 10px;
-        padding: 15px;
-        border: 2px solid black;
-        margin: 10px;
-    }
-
-    .grid > div {
-        position: absolute;
-        border: 1px solid #333;
-        width: 30px;
-        height: 70px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-    }
-
-    .flex-start-item {
-        grid-row: 1 / 2;
-        justify-self: flex-start;
-        align-self: flex-start;
-        background: lightcoral;
-    }
-
-    .flex-end-item {
-        grid-row: 2 / 3;
-        justify-self: flex-end;
-        align-self: flex-end;
-        background: lightblue;
-    }
-
-    .mixed-legacy {
-        grid-row: 3 / 4;
-        justify-self: flex-start;
-        align-self: end;
-        background: lightgreen;
-    }
-
-    .normal-item {
-        grid-row: 1 / 2;
-        justify-self: normal;
-        align-self: normal;
-        background: lightyellow;
-    }
-
-    .auto-item {
-        grid-row: 2 / 3;
-        justify-self: auto;
-        align-self: auto;
-        background: plum;
-    }
-
-    .legacy-center {
-        grid-row: 3 / 4;
-        justify-self: flex-start;
-        align-self: center;
-        background: orange;
-    }
-  </style>
-</head>
-<body>
-  <div class="grid">
-    <div class="flex-start-item">flex-start</div>
-    <div class="flex-end-item">flex-end</div>
-    <div class="mixed-legacy">mixed</div>
-    <div class="normal-item">normal</div>
-    <div class="auto-item">auto</div>
-    <div class="legacy-center">legacy-center</div>
-  </div>
-
-  <div class="grid" style="direction: rtl;">
-    <div class="flex-start-item">flex-start</div>
-    <div class="flex-end-item">flex-end</div>
-    <div class="mixed-legacy">mixed</div>
-    <div class="normal-item">normal</div>
-    <div class="auto-item">auto</div>
-    <div class="legacy-center">legacy-center</div>
-  </div>
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-grid/grid-lanes/alignment/row-grid-lanes-alignment-positioned-items-004-ref.html
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <style>
-    html,body {
-      color:black; background-color:white; font:8px/1 monospace; padding:0; margin:0;
-    }
-
-    .grid {
-      position: relative;
-      display: grid;
-      grid-template-columns: 200px;
-      grid-template-rows: 80px 80px 80px;
-      width: 200px;
-      height: 290px;
-      gap: 10px;
-      padding: 10px;
-      border: 2px solid black;
-      margin: 10px;
-    }
-
-    .grid > div {
-      position: absolute;
-      border: 1px solid #333;
-      width: 25px;
-      height: 50px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-
-    .start-start {
-      grid-row: 1 / 2;
-      justify-self: start;
-      align-self: start;
-      background: red;
-    }
-
-    .start-center {
-      grid-row: 2 / 3;
-      justify-self: start;
-      align-self: center;
-      background: orange;
-    }
-
-    .start-end {
-      grid-row: 3 / 4;
-      justify-self: start;
-      align-self: end;
-      background: yellow;
-    }
-
-    .center-start {
-      grid-row: 1 / 2;
-      justify-self: center;
-      align-self: start;
-      background: green;
-    }
-
-    .center-center {
-      grid-row: 2 / 3;
-      justify-self: center;
-      align-self: center;
-      background: blue;
-    }
-
-    .center-end {
-      grid-row: 3 / 4;
-      justify-self: center;
-      align-self: end;
-      background: indigo;
-    }
-
-    .end-start {
-      grid-row: 1 / 2;
-      justify-self: end;
-      align-self: start;
-      background: violet;
-    }
-
-    .end-center {
-      grid-row: 2 / 3;
-      justify-self: end;
-      align-self: center;
-      background: pink;
-    }
-
-    .end-end {
-      grid-row: 3 / 4;
-      justify-self: end;
-      align-self: end;
-      background: brown;
-    }
-  </style>
-</head>
-<body>
-  <div class="grid">
-    <div class="start-start">SS</div>
-    <div class="start-center">SC</div>
-    <div class="start-end">SE</div>
-    <div class="center-start">CS</div>
-    <div class="center-center">CC</div>
-    <div class="center-end">CE</div>
-    <div class="end-start">ES</div>
-    <div class="end-center">EC</div>
-    <div class="end-end">EE</div>
-  </div>
-
-  <div class="grid" style="direction: rtl;">
-    <div class="start-start">SS</div>
-    <div class="start-center">SC</div>
-    <div class="start-end">SE</div>
-    <div class="center-start">CS</div>
-    <div class="center-center">CC</div>
-    <div class="center-end">CE</div>
-    <div class="end-start">ES</div>
-    <div class="end-center">EC</div>
-    <div class="end-end">EE</div>
-  </div>
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-grid/grid-lanes/alignment/row-overflow-alignment-001-ref.html
-<!DOCTYPE html>
-<html>
-<link rel="help" href="https://drafts.csswg.org/css-grid-3">
-<style>
-.grid {
-    display: grid;
-    background: gray;
-    grid-template-rows: 70px;
-    grid-template-columns: 75px 50px 75px 100px;
-    align-items: unsafe center;
-    width: 300px;
-    height: 70px;
-}
-.overflow-safe {
-    align-self: safe end;
-    width: 75px;
-    height: 75px;
-    background-color: lightgreen;
-}
-.overflow-unsafe {
-    align-self: unsafe end;
-    width: 75px;
-    height: 75px;
-    background-color: lightblue;
-}
-.small-item {
-    width: 50px;
-    background-color: lightyellow;
-}
-</style>
-<body>
-  <p>Test that overflow safe and unsafe are working as expected.
-  <div class="grid">
-    <div class="overflow-safe">
-      Overflow safe
-    </div>
-    <div style="width: 50px; background-color: lightpink;">
-      Regular item
-    </div>
-    <div class="overflow-unsafe">
-      Overflow unsafe
-    </div>
-    <div style="height: 150px; width: 100px; background-color: brown">
-      Overflow center
-    </div>
-  </div>
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-grid/grid-lanes/animation/grid-template-columns-001-ref.html
-<!DOCTYPE html>
-<html>
-<head>
-  <style>
-    .grid-lanes {
-      display: grid-lanes;
-      width: 400px;
-      gap: 10px;
-      grid-template-columns: 60px 1fr;
-    }
-    span { border: 1px solid; }
-  </style>
-</head>
-<body>
-  <div class="grid-lanes">
-    <span>column1</span>
-    <span>column2</span>
-  </div>
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-grid/grid-lanes/animation/grid-template-rows-001-ref.html
-<!DOCTYPE html>
-<html>
-<head>
-  <style>
-    .grid-lanes {
-      display: grid-lanes;
-      width: 400px;
-      height: 400px;
-      gap: 10px;
-      grid-template-rows: 60px 1fr;
-    }
-    span { border: 1px solid; }
-  </style>
-</head>
-<body>
-  <div class="grid-lanes">
-    <span>row1</span>
-    <span>row2</span>
-  </div>
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-grid/grid-lanes/baseline/column-grid-lanes-container-baseline-001b-ref.html
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <style>
-    .container {
-      display: flex;
-      gap: 20px;
-      border: 2px solid blue;
-      padding: 10px;
-      font: 16px/1 monospace;
-      width: 800px;
-      text-decoration: underline;
-    }
-
-    .first-baseline {
-      align-items: first baseline;
-    }
-
-    .last-baseline {
-      align-items: last baseline;
-    }
-
-    .text-reference {
-      background: yellow;
-      padding: 8px;
-    }
-
-    .bottom {
-      display: flex;
-      align-items: end;
-    }
-
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(3, 100px);
-      grid-template-rows: auto;
-      gap: 10px;
-      border: 1px solid red;
-      background: #f0f0f0;
-    }
-
-    .grid-item {
-      padding: 8px;
-      border: 1px solid navy;
-    }
-
-    .grid-item:nth-child(1) {
-      grid-column: 1 / span 2;
-      height: 45px;
-      background: lightcoral;
-    }
-
-    .grid-item:nth-child(2) {
-      height: 75px;
-      background: lightgreen;
-    }
-
-    .grid-item:nth-child(3) {
-      grid-column: 1 / span 3;
-      height: 55px;
-      background: lightpink;
-    }
-
-    .grid-item:nth-child(4) {
-      height: 90px;
-      background: lightyellow;
-    }
-
-    .grid-item:nth-child(5) {
-      grid-column: 2 / span 2;
-      height: 65px;
-      background: lightcyan;
-    }
-  </style>
-</head>
-<body>
-<div class="container first-baseline">
-  <div class="text-reference">Reference text</div>
-  <div class="grid">
-    <div class="grid-item">Item 1</div>
-    <div class="grid-item bottom">Item 2</div>
-    <div class="grid-item">Item 3</div>
-    <div class="grid-item">Item 4</div>
-    <div class="grid-item">Item 5</div>
-  </div>
-  <div class="text-reference">Reference text</div>
-</div>
-<div class="container last-baseline">
-  <div class="text-reference">Reference text</div>
-  <div class="grid">
-    <div class="grid-item">Item 1</div>
-    <div class="grid-item">Item 2</div>
-    <div class="grid-item">Item 3</div>
-    <div class="grid-item">Item 4</div>
-    <div class="grid-item bottom">Item 5</div>
-  </div>
-  <div class="text-reference">Reference text</div>
-</div>
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-grid/grid-lanes/baseline/column-grid-lanes-container-baseline-004a-ref.html
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <style>
-    .test-section {
-      margin: 10px 0;
-      border: 1px solid #666;
-      padding: 8px;
-      font: 16px/1 monospace;
-    }
-
-    .side-by-side {
-      display: flex;
-      gap: 20px;
-      align-items: flex-start;
-    }
-
-    .four-column {
-      display: flex;
-      gap: 15px;
-      align-items: flex-start;
-    }
-
-    .test-variant {
-      flex: 1;
-      border: 1px solid #ccc;
-      padding: 8px;
-      background: #fafafa;
-    }
-
-    .container {
-      display: flex;
-      align-items: baseline;
-      gap: 10px;
-      border: 1px solid blue;
-      padding: 5px;
-      margin: 5px 0;
-      background: #f9f9f9;
-      text-decoration: underline;
-    }
-
-    .multicolumn {
-      column-count: 2;
-      column-width: 40px;
-      column-gap: 0px;
-      border: 1px solid red;
-      background: white;
-      display: inline-block;
-    }
-
-    .multicolumn-item {
-      background: lightblue;
-      padding: 4px;
-      border: 1px solid navy;
-      font-size: 12px;
-      text-align: center;
-      break-inside: avoid;
-    }
-
-    .multicolumn-item:last-child {
-      margin-bottom: 0;
-    }
-
-    .text-reference {
-      font-size: 14px;
-      background: yellow;
-      padding: 6px;
-      font-weight: bold;
-    }
-
-    .multicolumn-item:nth-child(1) {
-      height: 25px;
-      background: lightcoral;
-      font-size: 10px;
-      display: flex;
-      align-items: flex-start;
-    }
-
-    .multicolumn-item:nth-child(3) {
-      height: 35px;
-      background: lightgreen;
-      font-size: 16px;
-      display: flex;
-      align-items: center;
-    }
-
-    .multicolumn-item:nth-child(2) {
-      height: 30px;
-      background: lightpink;
-      font-size: 12px;
-      display: flex;
-      align-items: flex-end;
-    }
-
-    .multicolumn-item:nth-child(4) {
-      height: 40px;
-      background: lightyellow;
-      font-size: 14px;
-      display: flex;
-      align-items: flex-start;
-    }
-
-    .horizontal-tb { writing-mode: horizontal-tb; }
-    .vertical-rl { writing-mode: vertical-rl; }
-    .vertical-lr { writing-mode: vertical-lr; }
-
-    .ltr { direction: ltr; }
-    .rtl { direction: rtl; }
-
-    .vertical-rl .multicolumn,
-    .vertical-lr .multicolumn {
-      column-count: 2;
-      column-width: 50px;
-      column-gap: 0px;
-      height: 120px;
-    }
-
-    .vertical-rl .multicolumn-item,
-    .vertical-lr .multicolumn-item {
-      width: 40px;
-      height: auto;
-      min-height: 20px;
-    }
-
-    .vertical-rl .text-reference,
-    .vertical-lr .text-reference {
-      writing-mode: inherit;
-      height: 60px;
-      width: 25px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 12px;
-    }
-  </style>
-</head>
-<body>
-<div class="test-section">
-  <div class="side-by-side">
-    <div class="test-variant">
-      <h3>Horizontal-LTR</h3>
-      <div class="container horizontal-tb ltr">
-        <div class="text-reference">Ref</div>
-        <div class="multicolumn">
-          <div class="multicolumn-item">A</div>
-          <div class="multicolumn-item">C</div>
-          <div class="multicolumn-item">B</div>
-          <div class="multicolumn-item">D</div>
-        </div>
-        <div class="text-reference">Ref</div>
-      </div>
-    </div>
-
-    <div class="test-variant">
-      <h3>horizontal-RTL</h3>
-      <div class="container horizontal-tb rtl">
-        <div class="text-reference">Ref</div>
-        <div class="multicolumn">
-          <div class="multicolumn-item">A</div>
-          <div class="multicolumn-item">C</div>
-          <div class="multicolumn-item">B</div>
-          <div class="multicolumn-item">D</div>
-        </div>
-        <div class="text-reference">Ref</div>
-      </div>
-    </div>
-  </div>
-</div>
-
-<div class="test-section">
-  <div class="four-column">
-    <div class="test-variant">
-      <h3>Vertical RL - LTR</h3>
-      <div class="container vertical-rl ltr">
-        <div class="text-reference">Ref</div>
-        <div class="multicolumn">
-          <div class="multicolumn-item">A</div>
-          <div class="multicolumn-item">C</div>
-          <div class="multicolumn-item">B</div>
-          <div class="multicolumn-item">D</div>
-        </div>
-        <div class="text-reference">Ref</div>
-      </div>
-    </div>
-
-    <div class="test-variant">
-      <h3>Vertical RL - RTL</h3>
-      <div class="container vertical-rl rtl">
-        <div class="text-reference">Ref</div>
-        <div class="multicolumn">
-          <div class="multicolumn-item">A</div>
-          <div class="multicolumn-item">C</div>
-          <div class="multicolumn-item">B</div>
-          <div class="multicolumn-item">D</div>
-        </div>
-        <div class="text-reference">Ref</div>
-      </div>
-    </div>
-
-    <div class="test-variant">
-      <h3>Vertical LR - LTR</h3>
-      <div class="container vertical-lr ltr">
-        <div class="text-reference">Ref</div>
-        <div class="multicolumn">
-          <div class="multicolumn-item">A</div>
-          <div class="multicolumn-item">C</div>
-          <div class="multicolumn-item">B</div>
-          <div class="multicolumn-item">D</div>
-        </div>
-        <div class="text-reference">Ref</div>
-      </div>
-    </div>
-
-    <div class="test-variant">
-      <h3>Vertical LR - RTL</h3>
-      <div class="container vertical-lr rtl">
-        <div class="text-reference">Ref</div>
-        <div class="multicolumn">
-          <div class="multicolumn-item">A</div>
-          <div class="multicolumn-item">C</div>
-          <div class="multicolumn-item">B</div>
-          <div class="multicolumn-item">D</div>
-        </div>
-        <div class="text-reference">Ref</div>
-      </div>
-    </div>
-  </div>
-</div>
-</body>
-</html>
-
-FILE: Tests/LibWeb/Ref/expected/wpt-import/css/css-grid/grid-lanes/baseline/column-grid-lanes-container-baseline-004b-ref.html
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <style>
-    .test-section {
-      margin: 10px 0;
-      border: 1px solid #666;
-      padding: 8px;
-      font: 16px/1 monospace;
-    }
-
-    .four-column {
-      display: flex;
-      gap: 15px;
-      align-items: flex-start;
-    }
-
-    .test-variant {
-      flex: 1;
-      border: 1px solid #ccc;
-      padding: 8px;
-      background: #fafafa;
-    }
-
-    .container {
-      display: flex;
-      align-items: baseline;
-      gap: 10px;
-      border: 1px solid blue;
-      padding: 5px;
-      margin: 5px 0;
-      background: #f9f9f9;
-      text-decoration: underline;
-    }
-
-    .multicolumn {
-      column-count: 2;
-      column-width: 50px;
-      column-gap: 0px;
-      height: 120px;
-      border: 1px solid red;
-      background: white;
-      display: inline-block;
-    }
-
-    .multicolumn-item {
-      background: lightblue;
-      padding: 4px;
-      border: 1px solid navy;
-      font-size: 12px;
-      text-align: center;
-      break-inside: avoid;
-      width: 40px;
-      height: auto;
-      min-height: 20px;
-    }
-
-    .multicolumn-item:last-child {
-      margin-bottom: 0;
-    }
-
-    .text-reference {
-      writing-mode: inherit;
-      height: 60px;
-      width: 25px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 12px;
-      background: yellow;
-      padding: 6px;
-      font-weight: bold;
-    }
-
-    .multicolumn-item:nth-child(1) {
-      height: 25px;
-      background: lightcoral;
-      font-size: 10px;
-      display: flex;
-      align-items: flex-start;
-    }
-
-    .multicolumn-item:nth-child(3) {
-      height: 35px;
-      background: lightgreen;
-      font-size: 16px;
-      display: flex;
-      align-items: center;
-    }
-
-    .multicolumn-item:nth-child(2) {
-      height: 30px;
-      background: lightpink;
-      font-size: 12px;
-      display: flex;
-      align-items: flex-end;
-    }
-
-    .multicolumn-item:nth-child(4) {
-      height: 40px;
-      background: lightyellow;
-      font-size: 14px;
-      display: flex;
-      align-items: flex-start;
-    }
-
-    .sideways-rl { writing-mode: sideways-rl; }
-    .sideways-lr { writing-mode: sideways-lr; }
-
-    .ltr { direction: ltr; }
-    .rtl { direction: rtl; }
-  </style>
-</head>
-<body>
-<div class="test-section">
-  <div class="four-column">
-    <div class="test-variant">
-      <h3>Sideways RL - LTR</h3>
-      <div class="container sideways-rl ltr">
-        <div class="text-reference">Ref</div>
-        <div class="multicolumn">
-          <div class="multicolumn-item">A</div>
-          <div class="multicolumn-item">C</div>
-          <div class="multicolumn-item">B</div>
-          <div class="multicolumn-item">D</div>
-        </div>
-        <div class="text-reference">Ref</div>
-      </div>
-    </div>
-
-    <div class="test-variant">
-      <h3>Sideways RL - RTL</h3>
-      <div class="container sideways-rl rtl">
-        <div class="text-reference">Ref</div>
-        <div class="multicolumn">
-          <div class="multicolumn-item">A</div>
-          <div class="multicolumn-item">C</div>
-          <div class="multicolumn-item">B</div>
-          <div class="multicolumn-item">D</div>
-        </div>
-        <div class="text-reference">Ref</div>
-      </div>
-    </div>
-
-    <div class="test-variant">
-      <h3>Sideways LR - LTR</h3>
-      <div class="container sideways-lr ltr">
-        <div class="text-reference">Ref</div>
-        <div class="multicolumn">
-          <div class="multicolumn-item">A</div>
-          <div class="multicolumn-item">C</div>
-          <div class="multicolumn-item">B</div>
-          <div class="multicolumn-item">D</div>
-        </div>
-        <div class="text-reference">Ref</div>
-      </div>
-    </div>
-
-    <div class="test-variant">
-      <h3>Sideways LR - RTL</h3>
-      <div class="container sideways-lr rtl">
-        <div class="text-reference">Ref</div>
