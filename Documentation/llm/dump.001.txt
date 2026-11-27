@@ -2409,8 +2409,8 @@ jobs:
           Meta/WPT.sh run --test-list Tests/LibWeb/WPT/ci-smoke-tests.txt
         env:
           BUILD_LADYBIRD: 'false'
-          LADYBIRD_BINARY: ${{ github.workspace }}/Build/bin/Ladybird
-          WEBDRIVER_BINARY: ${{ github.workspace }}/Build/bin/WebDriver
+          LADYBIRD_BINARY: ${{ github.workspace }}/Build/bin/ladybird
+          WEBDRIVER_BINARY: ${{ github.workspace }}/Build/bin/ladybird-driver
           WPT_PROCESSES: '4'
 
       - name: Test
@@ -4368,7 +4368,7 @@ jobs:
         working-directory: ${{ runner.temp }}/ladybird-app-bundle
         run: |
           tar -xzf ladybird-app-bundle.tar.gz
-          echo "LADYBIRD_BINARY=${PWD}/Ladybird.app/Contents/MacOS/Ladybird" >> "$GITHUB_ENV"
+          echo "LADYBIRD_BINARY=${PWD}/Ladybird.app/Contents/MacOS/ladybird" >> "$GITHUB_ENV"
 
       # Try to wake a display and clear the lock UI. And print the session state before and after — so a remedy that
       # doesn't work is visible, rather than inferred. (A few of Blacksmith's macOS runners still boot with the session
@@ -5005,9 +5005,9 @@ jobs:
           python3 -m pip install -r requirements.txt
 
           if [ "${{ matrix.os_name }}" = "macOS" ]; then
-            executable="${GITHUB_WORKSPACE}/Build/bin/Ladybird.app/Contents/MacOS/Ladybird"
+            executable="${GITHUB_WORKSPACE}/Build/bin/Ladybird.app/Contents/MacOS/ladybird"
           else
-            executable="${GITHUB_WORKSPACE}/Build/bin/Ladybird"
+            executable="${GITHUB_WORKSPACE}/Build/bin/ladybird"
           fi
 
           ./run.py --iterations=3 --executable="${executable}"
@@ -33251,13 +33251,26 @@ FILE: AK/Rust/src/stack.rs
 
 //! The bounds of the native stack of the calling thread.
 
+use std::cell::Cell;
+
 /// The lowest address of the stack of this thread, or `None` if that cannot be told.
 pub fn lowest_address_of_this_thread() -> Option<usize> {
     // NB: Asking for the stack of the main thread reads /proc/self/maps on Linux.
     thread_local! {
-        static LOWEST_ADDRESS: Option<usize> = thread_stack_lowest_address();
+        static LOWEST_ADDRESS: Cell<Option<usize>> = const { Cell::new(None) };
     }
-    LOWEST_ADDRESS.with(|lowest_address| *lowest_address)
+    LOWEST_ADDRESS.with(|lowest_address| found_once(lowest_address, thread_stack_lowest_address))
+}
+
+/// What `cache` holds, or else what `find` finds, which `cache` keeps only if it was found: A stack's bounds never
+/// change, but a lookup that failed can succeed when it's asked again.
+fn found_once(cache: &Cell<Option<usize>>, find: impl FnOnce() -> Option<usize>) -> Option<usize> {
+    if let Some(found) = cache.get() {
+        return Some(found);
+    }
+    let found = find();
+    cache.set(found);
+    found
 }
 
 /// The address that the stack can only go `bytes` below where it is now.
@@ -33278,7 +33291,65 @@ fn thread_stack_lowest_address() -> Option<usize> {
         let mut size = 0;
         let result = libc::pthread_attr_getstack(&raw const attributes, &raw mut address, &raw mut size);
         libc::pthread_attr_destroy(&raw mut attributes);
-        (result == 0).then_some(address as usize)
+        if result != 0 {
+            return None;
+        }
+        #[cfg(target_env = "musl")]
+        if let Some(lowest_address) = main_thread_stack_lowest_address(address as usize) {
+            return Some(lowest_address);
+        }
+        Some(address as usize)
+    }
+}
+
+/// For the main thread, the lowest address its stack can grow down to, or `None` on any other thread.
+///
+/// musl reports only the part of the main thread's stack that is mapped so far, and from below the argument and
+/// environment strings at its top. But the kernel grows the stack on demand until it spans the stack size limit, from
+/// the top of its mapping. The kernel puts the executable's file name at that top, under one pointer, so the top
+/// follows from where the file name ends. A guard page is left below. The stack reaches at least as far as
+/// `mapped_lowest_address`, the lowest address musl reports, even where an unlimited size limit is taken as less.
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+fn main_thread_stack_lowest_address(mapped_lowest_address: usize) -> Option<usize> {
+    // SAFETY: These only read the process's and the thread's IDs, the auxiliary vector and the file name it points to,
+    //         the stack size limit, and the page size.
+    unsafe {
+        if libc::getpid() != libc::gettid() {
+            return None;
+        }
+        let file_name = libc::getauxval(libc::AT_EXECFN) as *const libc::c_char;
+        if file_name.is_null() {
+            return None;
+        }
+        let mut limit: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_STACK, &raw mut limit) != 0 {
+            return None;
+        }
+        // The same size AK::StackInfo assumes for an unlimited stack.
+        let size = if limit.rlim_cur == libc::RLIM_INFINITY {
+            8 * 0x10000
+        } else {
+            usize::try_from(limit.rlim_cur).unwrap_or(usize::MAX)
+        };
+        let page_size = usize::try_from(libc::sysconf(libc::_SC_PAGESIZE)).ok()?;
+        let top = (file_name as usize + libc::strlen(file_name) + 1 + size_of::<usize>()).next_multiple_of(page_size);
+        Some(lowest_address_within_size_limit(
+            top,
+            size,
+            page_size,
+            mapped_lowest_address,
+        ))
+    }
+}
+
+/// The lowest address a stack from `top` can grow down to under the size limit `size`, a guard page above it, but never
+/// above `mapped_lowest_address`. A limit that reaches past address 0 leaves the stack at `mapped_lowest_address`, as it
+/// does in AK::StackInfo, since an address of 0 would keep the stack checks from ever stopping a recursion.
+#[cfg(any(test, all(target_os = "linux", target_env = "musl")))]
+fn lowest_address_within_size_limit(top: usize, size: usize, page_size: usize, mapped_lowest_address: usize) -> usize {
+    match top.checked_sub(size.saturating_sub(page_size)) {
+        Some(lowest_address) => lowest_address.min(mapped_lowest_address),
+        None => mapped_lowest_address,
     }
 }
 
@@ -33315,6 +33386,45 @@ fn thread_stack_lowest_address() -> Option<usize> {
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn thread_stack_lowest_address() -> Option<usize> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_lookup_that_failed_is_tried_again_and_one_that_succeeded_is_kept() {
+        let cache = Cell::new(None);
+        assert_eq!(found_once(&cache, || None), None);
+        assert_eq!(found_once(&cache, || Some(4096)), Some(4096));
+        assert_eq!(
+            found_once(&cache, || unreachable!("a found address is kept")),
+            Some(4096)
+        );
+    }
+
+    #[test]
+    fn a_size_limit_that_reaches_past_address_zero_keeps_the_mapped_bound() {
+        let page_size = 4096;
+        let top = 0x7fff_0000_0000;
+        let mapped_lowest_address = top - 33 * page_size;
+        assert_eq!(
+            lowest_address_within_size_limit(top, 8 * 1024 * 1024, page_size, mapped_lowest_address),
+            top - 8 * 1024 * 1024 + page_size
+        );
+        assert_eq!(
+            lowest_address_within_size_limit(top, 16 * page_size, page_size, mapped_lowest_address),
+            mapped_lowest_address
+        );
+        assert_eq!(
+            lowest_address_within_size_limit(top, top, page_size, mapped_lowest_address),
+            page_size
+        );
+        assert_eq!(
+            lowest_address_within_size_limit(top, usize::MAX, page_size, mapped_lowest_address),
+            mapped_lowest_address
+        );
+    }
 }
 
 FILE: AK/Rust/src/string_conversions.rs
@@ -38040,6 +38150,7 @@ FILE: AK/StackInfo.cpp
 #include <AK/Assertions.h>
 #include <AK/Platform.h>
 #include <AK/StackInfo.h>
+#include <AK/StdLibExtras.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -38048,6 +38159,9 @@ FILE: AK/StackInfo.cpp
 #elif defined(AK_OS_LINUX) || defined(AK_LIBC_GLIBC) || defined(AK_OS_MACOS) || defined(AK_OS_IOS) || defined(AK_OS_NETBSD) || defined(AK_OS_SOLARIS) || defined(AK_OS_HAIKU)
 #    include <pthread.h>
 #    include <sys/resource.h>
+#    if defined(AK_OS_LINUX)
+#        include <sys/auxv.h>
+#    endif
 #elif defined(AK_OS_FREEBSD) || defined(AK_OS_OPENBSD)
 #    include <pthread.h>
 #    include <pthread_np.h>
@@ -38154,17 +38268,24 @@ StackInfo::StackInfo()
     m_top = m_base + m_size;
 
 #if defined(AK_OS_LINUX) && !defined(AK_OS_ANDROID) && !defined(AK_LIBC_GLIBC)
-    // Note: musl libc always gives the initial size of the main thread's stack
-    if (getpid() == static_cast<pid_t>(gettid())) {
+    // musl reports only the part of the main thread's stack that is mapped so far, and from below the argument and
+    // environment strings at its top. But the kernel grows the stack on demand until it spans the stack size limit, from
+    // the top of its mapping. The kernel puts the executable's file name at that top, under one pointer, so the top
+    // follows from where the file name ends.
+    if (auto const* file_name = reinterpret_cast<char const*>(getauxval(AT_EXECFN)); file_name && getpid() == static_cast<pid_t>(gettid())) {
+        auto page_size = static_cast<FlatPtr>(sysconf(_SC_PAGESIZE));
+        auto file_name_end = reinterpret_cast<FlatPtr>(file_name) + strlen(file_name) + 1 + sizeof(void*);
+        m_top = (file_name_end + page_size - 1) & ~(page_size - 1);
         rlimit limit;
         getrlimit(RLIMIT_STACK, &limit);
         rlim_t size = limit.rlim_cur;
         if (size == RLIM_INFINITY)
             size = 8 * 0x10000;
         // account for a guard page
-        size -= static_cast<rlim_t>(sysconf(_SC_PAGESIZE));
-        m_size = static_cast<size_t>(size);
-        m_base = m_top - m_size;
+        size -= static_cast<rlim_t>(page_size);
+        // The stack reaches at least as far as musl reports, even where an unlimited size limit is taken as less.
+        m_base = min(m_top - static_cast<FlatPtr>(size), m_base);
+        m_size = m_top - m_base;
     }
 #endif
 
@@ -70172,7 +70293,7 @@ ninja -C Build/release debug-ladybird
 
 To run without ninja rule on non-macOS systems:
 ```
-./Build/release/bin/Ladybird
+./Build/release/bin/ladybird
 ```
 
 To run without ninja rule on macOS:
@@ -70188,7 +70309,7 @@ open -W --stdout $(tty) --stderr $(tty) ./Build/release/bin/Ladybird.app --args 
 Ladybird should be built with debug symbols first. This can be done by adding `-DCMAKE_BUILD_TYPE=Debug` to the cmake command line,
 or selecting the Build Type Debug in the CLion CMake profile.
 
-After running Ladybird as suggested above with `./Meta/ladybird.py run ladybird`, you can now in CLion use Run -> Attach to Process to connect. If debugging layout or rendering issues, filter the listing that opens for `WebContent` and attach to that.
+After running Ladybird as suggested above with `./Meta/ladybird.py run ladybird`, you can now in CLion use Run -> Attach to Process to connect. If debugging layout or rendering issues, filter the listing that opens for `ladybird-render` and attach to that.
 
 Now breakpoints, stepping and variable inspection will work.
 
@@ -71304,7 +71425,7 @@ with mode `0400`.
 Reports awaiting review are always kept; of the reports that have already been
 offered, the newest 20 are kept. Filenames start with a UTC date and time,
 for example
-`2026-09-06T12-34-56Z-WebContent-a1B2c3.txt`, so they sort chronologically.
+`2026-09-06T12-34-56Z-ladybird-render-a1B2c3.txt`, so they sort chronologically.
 Hyphens in the time keep filenames compatible with Windows; the random suffix
 avoids collisions. Retention includes reports saved with the older filenames.
 Nothing is uploaded automatically.
@@ -73264,16 +73385,16 @@ If you want to run the debugger, first place the content below in `.vscode/launc
             "name": "Attach to WebContent",
             "type": "lldb",
             "request": "attach",
-            "program": "${workspaceFolder}/Build/debug/bin/Ladybird.app/Contents/MacOS/WebContent",
+            "program": "${workspaceFolder}/Build/debug/bin/Ladybird.app/Contents/MacOS/ladybird-render",
         }
     ],
 }
 ```
 
-then run Ladybird with the debug preset and with the `--debug-process WebContent` flag:
+then run Ladybird with the debug preset and with the `--debug-process ladybird-render` flag:
 
 ```bash
-CC=$(brew --prefix llvm)/bin/clang CXX=$(brew --prefix llvm)/bin/clang++ BUILD_PRESET=Debug ./Meta/ladybird.py run ladybird --debug-process WebContent
+CC=$(brew --prefix llvm)/bin/clang CXX=$(brew --prefix llvm)/bin/clang++ BUILD_PRESET=Debug ./Meta/ladybird.py run ladybird --debug-process ladybird-render
 ```
 
 Running Ladybird in this way will pause execution until a debugger is attached. You can then run the debugger by going to the **Run and Debug** menu and selecting the **Attach to WebContent** configuration.
@@ -73289,7 +73410,7 @@ For Linux, the `launch.json` will instead be the file below.
       "name": "Attach and debug",
       "type": "cppdbg",
       "request": "attach",
-      "program": "${workspaceRoot}/Build/debug/libexec/WebContent",
+      "program": "${workspaceRoot}/Build/debug/libexec/ladybird-render",
       "MIMode": "gdb",
     },
   ]
@@ -73299,7 +73420,7 @@ For Linux, the `launch.json` will instead be the file below.
 Running Ladybird as follows:
 
 ```bash
-BUILD_PRESET=Debug Meta/ladybird.py run ladybird --debug-process WebContent
+BUILD_PRESET=Debug Meta/ladybird.py run ladybird --debug-process ladybird-render
 ```
 
 Then follow the same steps found in the Mac section. Notice also that you need to have `gdb` (the GNU Debugger) installed.
@@ -74891,20 +75012,22 @@ Ladybird uses a multi-process architecture to improve stability and security in 
 
 **RequestServer** and **ImageDecoder** are shared by the renderers of a site, while the processes below the renderers each work for a single renderer. **Hub** launches all of them, because the sandboxes keep the others from spawning anything. It then connects them directly to each other, so that a renderer talks to its **RequestServer** or **ImageDecoder** without going through **Hub**.
 
-| Process | How many | Launched |
-| --- | --- | --- |
-| **UI** | One | By the user |
-| **Hub** | One | By **UI**, as it starts |
-| **Compositor** | One | At startup, and again if it crashes |
-| **WebContent** | One per set of documents that must share a process, see [site isolation](#site-isolation) | When a document needs one, with a spare kept ready for the next tab |
-| **RequestServer** | One per browsing session and top-level site, plus one per session with no site | The default session's one with no site at startup, the others on first use |
-| **ImageDecoder** | One per browsing session and site, or one for a single process | When a renderer first has an image to decode |
-| **MediaServer** | One per renderer | When the renderer first needs one |
-| **AudioServer** | One per renderer | When the renderer first needs one |
-| **VideoDecoderServer** | One per MediaServer | When its **MediaServer** asks for one |
-| **WebRTCClient** | One per **WebContent** process | When the renderer first needs one |
+| Process | Executable | How many | Launched |
+| --- | --- | --- | --- |
+| **UI** | `ladybird` | One | By the user |
+| **Hub** | `ladybird-hub` | One | By **UI**, as it starts |
+| **Compositor** | `ladybird-gpu` | One | At startup, and again if it crashes |
+| **WebContent** | `ladybird-render` | One per set of documents that must share a process, see [site isolation](#site-isolation) | When a document needs one, with a spare kept ready for the next tab |
+| **RequestServer** | `ladybird-net` | One per browsing session and top-level site, plus one per session with no site | The default session's one with no site at startup, the others on first use |
+| **ImageDecoder** | `ladybird-image` | One per browsing session and site, or one for a single process | When a renderer first has an image to decode |
+| **MediaServer** | `ladybird-media` | One per renderer | When the renderer first needs one |
+| **AudioServer** | `ladybird-audio` | One per renderer | When the renderer first needs one |
+| **VideoDecoderServer** | `ladybird-video` | One per MediaServer | When its **MediaServer** asks for one |
+| **WebRTCClient** | `ladybird-webrtc` | One per **WebContent** process | When the renderer first needs one |
 
-On macOS, the kernel does not end a process when its parent dies, so a small **ProcessReaper** helper ends the others when **Hub** is gone.
+On macOS, the kernel does not end a process when its parent dies, so a small **ProcessReaper** helper ends the others when **Hub** is gone; its executable is `ladybird-reaper`.
+
+The executables share the `ladybird` prefix, so that `pgrep -l ladybird` lists all of them. Each name fits in the 15 characters that Linux keeps of a process name.
 
 ### Process: UI
 
@@ -74960,7 +75083,7 @@ This process runs the WebRTC connections of a **WebContent** process, outside of
 
 ## Site isolation
 
-A renderer may be taken over by a page it hosts, so documents of different sites, cross-site frames included, are kept in different processes. The Memory section of `about:settings` chooses whether tabs of one origin or one site share a process. `--debug-process WebContent` turns isolation off, so that every document of a tab stays in the process a debugger is attached to.
+A renderer may be taken over by a page it hosts, so documents of different sites, cross-site frames included, are kept in different processes. The Memory section of `about:settings` chooses whether tabs of one origin or one site share a process. `--debug-process ladybird-render` turns isolation off, so that every document of a tab stays in the process a debugger is attached to.
 
 Documents that can script each other synchronously belong to one agent, and an agent runs in one process. A document with an opaque origin goes with the document that created it. Local file content and WebUI documents are kept in processes of their own, because those processes hold privileges that a website must not get.
 
@@ -76439,7 +76562,7 @@ Here is a full sequence of instructions creating a Ladybird build linked against
 5. **Verify the link.** Confirm Ladybird picked up the patched Qt rather than the system one:
 
    ```sh
-   ldd Build/release/bin/Ladybird | grep libQt6Gui
+   ldd Build/release/bin/ladybird | grep libQt6Gui
    ```
 
    The output should reference `libQt6Gui.so.6` under your install prefix (`/opt/qt-6.11.0-patched/lib/...` in the example above) — not a system path such as `/usr/lib/...`.
@@ -77019,14 +77142,14 @@ Every record has these fields:
 | --- | --- |
 | `type` | `sample` or `event` |
 | `time_ns` | Integer nanoseconds from `CLOCK_MONOTONIC`, shared across processes on a host |
-| `process` | `Ladybird`, `WebDriver`, `WebContent`, `RequestServer`, `Compositor`, `ImageDecoder`, `AudioServer`, `MediaServer`, or `VideoDecoderServer` |
+| `process` | `ladybird`, `ladybird-driver`, `ladybird-render`, `ladybird-net`, `ladybird-gpu`, `ladybird-image`, `ladybird-audio`, `ladybird-media`, or `ladybird-video` |
 | `pid` | Integer operating system process ID |
 
 For example:
 
 ```json
-{"type":"sample","time_ns":1234567890,"process":"WebContent","pid":123,"values":{"gc.heap_blocks":42}}
-{"type":"event","time_ns":1234567891,"process":"WebContent","pid":123,"name":"load","data":{"page_id":1,"navigable_id":"1:1","document_id":"1:1","url":"https://example.com/"}}
+{"type":"sample","time_ns":1234567890,"process":"ladybird-render","pid":123,"values":{"gc.heap_blocks":42}}
+{"type":"event","time_ns":1234567891,"process":"ladybird-render","pid":123,"name":"load","data":{"page_id":1,"navigable_id":"1:1","document_id":"1:1","url":"https://example.com/"}}
 ```
 
 Samples have a `values` object containing only numbers with dotted keys. Each process takes an
@@ -77107,12 +77230,12 @@ form `namespace:local`, preserving their exact values in floating-point JSON con
 
 | Name | Process | Data |
 | --- | --- | --- |
-| `navigation_start` | Ladybird | `navigable_id` (cross-process ID string), `navigation_id` (string), `url` (string) |
-| `DOMContentLoaded` | WebContent | `page_id` (integer), `navigable_id` (cross-process ID string), `document_id` (cross-process ID string), `url` (string) |
-| `load` | WebContent | Same fields as `DOMContentLoaded` |
-| `frame` | Compositor | `page_id` (integer), `changed` (boolean), `damage_x`, `damage_y`, `damage_width`, `damage_height` (integer device pixels) |
-| `rendering_pending` | WebContent | `page_id` (integer), `navigable_id` (cross-process ID string), `pending` (boolean), `reasons` (object of integer counts) |
-| `gc` | WebContent | `collection`, `duration_ns`, `pause_duration_ns`, `sweep_duration_ns`, `bytes_before`, `bytes_after`, `live_cell_bytes`, `live_external_bytes` (integers) |
+| `navigation_start` | `ladybird` | `navigable_id` (cross-process ID string), `navigation_id` (string), `url` (string) |
+| `DOMContentLoaded` | `ladybird-render` | `page_id` (integer), `navigable_id` (cross-process ID string), `document_id` (cross-process ID string), `url` (string) |
+| `load` | `ladybird-render` | Same fields as `DOMContentLoaded` |
+| `frame` | `ladybird-gpu` | `page_id` (integer), `changed` (boolean), `damage_x`, `damage_y`, `damage_width`, `damage_height` (integer device pixels) |
+| `rendering_pending` | `ladybird-render` | `page_id` (integer), `navigable_id` (cross-process ID string), `pending` (boolean), `reasons` (object of integer counts) |
+| `gc` | `ladybird-render` | `collection`, `duration_ns`, `pause_duration_ns`, `sweep_duration_ns`, `bytes_before`, `bytes_after`, `live_cell_bytes`, `live_external_bytes` (integers) |
 
 Navigation starts are recorded when the browser admits a navigation. Lifecycle markers are recorded
 immediately before DOM event dispatch, excluding event handlers. Match them by `navigable_id`.
@@ -78936,9 +79059,9 @@ import time
 from pathlib import Path
 
 build = Path.cwd()
-webdriver = build / "bin/WebDriver"
+webdriver = build / "bin/ladybird-driver"
 if not webdriver.is_file():
-    webdriver = build / "bin/Ladybird.app/Contents/MacOS/WebDriver"
+    webdriver = build / "bin/Ladybird.app/Contents/MacOS/ladybird-driver"
 
 with socket.socket() as listener:
     listener.bind(("127.0.0.1", 0))
@@ -79070,12 +79193,12 @@ startup polling interval only waits for the WebDriver listening socket.
 
 To inspect a visible browser, remove `--headless` and set `ladybird:headless` to
 `false`. For a browser process waiting for a debugger, add, for example,
-`--debug-process WebContent` and allow enough request time to attach. Use
+`--debug-process ladybird-render` and allow enough request time to attach. Use
 `--force-cpu-painting` when investigating differences involving GPU painting.
 
 For authenticated investigations, `--profile-path /absolute/path/to/profile`
 selects a persistent profile. WebDriver otherwise uses its own temporary profile.
-See `./bin/WebDriver --help` (or the bundle path above on macOS) for other options.
+See `./bin/ladybird-driver --help` (or the bundle path above on macOS) for other options.
 
 FILE: Documentation/WrapperArchitecture.md
 # LibWeb wrapper architecture
@@ -91044,6 +91167,7 @@ pub enum Paint<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct Compositing<'a> {
     pub filter: Option<&'a [u8]>,
+    pub filter_in_bitmap_space: bool,
     pub global_alpha: f32,
     pub compositing_and_blending_operator: CompositingAndBlendingOperator,
     pub shadow: Option<Canvas2DShadow>,
@@ -91053,6 +91177,7 @@ impl Default for Compositing<'_> {
     fn default() -> Self {
         Self {
             filter: None,
+            filter_in_bitmap_space: false,
             global_alpha: 1.0,
             compositing_and_blending_operator: CompositingAndBlendingOperator::SourceOver,
             shadow: None,
@@ -91177,6 +91302,7 @@ impl InlineData {
                 .filter
                 .map_or_else(DisplayListDataSpan::default, |filter| self.append(filter, 1)),
             has_filter: compositing.filter.is_some(),
+            filter_in_bitmap_space: compositing.filter_in_bitmap_space,
             global_alpha: compositing.global_alpha,
             compositing_and_blending_operator: compositing.compositing_and_blending_operator,
             has_shadow: compositing.shadow.is_some(),
@@ -91408,6 +91534,7 @@ mod tests {
             WindingRule::EvenOdd,
             &Compositing {
                 filter: Some(&filter),
+                filter_in_bitmap_space: true,
                 global_alpha: 0.5,
                 compositing_and_blending_operator: CompositingAndBlendingOperator::Multiply,
                 shadow: None,
@@ -91435,6 +91562,7 @@ mod tests {
         assert_eq!(command.paint.color_stops.positions.offset % 4, 0);
         assert_eq!(command.winding_rule, WindingRule::EvenOdd);
         assert!(command.compositing.has_filter);
+        assert!(command.compositing.filter_in_bitmap_space);
         assert_eq!(span_bytes(payload, command.compositing.filter), filter);
         assert_eq!(command.compositing.global_alpha, 0.5);
         assert_eq!(
@@ -91520,9 +91648,10 @@ mod tests {
             dest_rect: IntRect::new(0, 0, 1, 1).to_float(),
             scaling_mode: libgfx_rust::ScalingMode::NearestNeighbor,
         };
+        // The images of an SVG filter's feImage primitives come with the draw that applies it.
         assert_eq!(
             validate(&Filter::compose(Filter::blur(2.0, 2.0, None), image).serialize()),
-            Err("Canvas 2D stream command has a filter that draws an image")
+            Ok(())
         );
     }
 
@@ -93862,6 +93991,7 @@ display_list_record_fields!(Canvas2DShadow {
 pub struct Canvas2DCompositing {
     pub filter: DisplayListDataSpan,
     pub has_filter: bool,
+    pub filter_in_bitmap_space: bool,
     pub global_alpha: f32,
     pub compositing_and_blending_operator: CompositingAndBlendingOperator,
     pub has_shadow: bool,
@@ -93870,6 +94000,7 @@ pub struct Canvas2DCompositing {
 display_list_record_fields!(Canvas2DCompositing {
     filter,
     has_filter,
+    filter_in_bitmap_space,
     global_alpha = 1.0,
     compositing_and_blending_operator,
     has_shadow,
@@ -119461,14 +119592,11 @@ fn validate_canvas_2d_compositing(payload: Payload, offset: usize) -> Result<(),
     payload.span_at(offset + offset_of!(Canvas2DCompositing, filter))?;
     payload.bool_at(offset + offset_of!(Canvas2DCompositing, has_filter))?;
     if payload.u8_at(offset + offset_of!(Canvas2DCompositing, has_filter)) != 0 {
-        // A canvas filter comes from CSS filter functions, which draw no images, so the player has none to give it.
-        let filter = payload.filter_span_at(offset + offset_of!(Canvas2DCompositing, filter))?;
-        let mut draws_an_image = false;
-        filter.for_each_image_frame_id(&mut |_| draws_an_image = true);
-        if draws_an_image {
-            return Err("Canvas 2D stream command has a filter that draws an image");
-        }
+        // Decoding refuses a malformed filter, or one nested too deeply. A filter may draw the images of its feImage
+        // primitives: The player takes them from the frames that came with the commands, and draws any other as nothing.
+        payload.filter_span_at(offset + offset_of!(Canvas2DCompositing, filter))?;
     }
+    payload.bool_at(offset + offset_of!(Canvas2DCompositing, filter_in_bitmap_space))?;
     // The player turns the global alpha into a byte, which only a value from 0 to 1 converts to.
     let global_alpha = payload.f32_at(offset + offset_of!(Canvas2DCompositing, global_alpha));
     if !(0.0..=1.0).contains(&global_alpha) {
@@ -147645,6 +147773,11 @@ ErrorOr<void> CrashHandler::initialize(int fd)
     struct sigaction action {};
     action.sa_sigaction = CrashHandler::handle_fatal_signal;
     sigfillset(&action.sa_mask);
+#if defined(AK_OS_LINUX)
+    // A system call that the sandbox traps raises SIGSYS, and the kernel kills a process for a trap that arrives while
+    // SIGSYS is blocked. musl's sigaction() for SIGABRT, which the handler makes, blocks signals with one.
+    sigdelset(&action.sa_mask, SIGSYS);
+#endif
     action.sa_flags = SA_SIGINFO | SA_ONSTACK;
     for (int signal : { SIGSEGV, SIGBUS, SIGFPE, SIGABRT, SIGILL, SIGTRAP }) {
         if (sigaction(signal, &action, nullptr) < 0)
@@ -553834,7 +553967,9 @@ fn align_up(value: usize, alignment: usize) -> usize {
     value.div_ceil(alignment) * alignment
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+// The key goes through glibc's wrappers of the protection key system calls, which musl lacks, so a musl build writes
+// JIT code with mprotect() instead.
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
 mod protection_key {
     use std::sync::OnceLock;
 
@@ -553976,7 +554111,7 @@ impl Chunk {
             let mut has_protection_key = false;
             // NB: With a protection key, the pages can be writable without any thread being able to write them, which
             //     makes writing code a per-thread register change instead of a page protection change.
-            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
             if let Some(key) = protection_key::key() {
                 // SAFETY: The chunk was just mapped with this size.
                 has_protection_key = unsafe {
@@ -554034,7 +554169,7 @@ fn write_codes_in_chunk(chunk: &Chunk, writes: &[CodeWrite<'_>]) {
         }
     };
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
     if chunk.has_protection_key {
         let key = protection_key::key().expect("a chunk with a protection key has one");
         protection_key::set_writable(key, true);
@@ -671305,157 +671440,3 @@ impl PlainDateConstructor {
         Ok(create_temporal_date(vm, iso_date, calendar, Some(new_target))?.upcast())
     }
 
-    // 3.2.2 3.2.2 Temporal.PlainDate.from ( item [ , options ] ), https://tc39.es/proposal-temporal/#sec-temporal.plaindate.from
-    fn from(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Return ? ToTemporalDate(item, options).
-        Ok(Value::from_object(to_temporal_date(
-            vm,
-            vm.argument(0),
-            vm.argument(1),
-        )?))
-    }
-
-    // 3.2.3 Temporal.PlainDate.compare ( one, two ), https://tc39.es/proposal-temporal/#sec-temporal.plaindate.compare
-    fn compare(vm: &Vm) -> ThrowCompletionOr<Value> {
-        // 1. Set one to ? ToTemporalDate(one).
-        let one = to_temporal_date(vm, vm.argument(0), Value::UNDEFINED)?;
-
-        // 2. Set two to ? ToTemporalDate(two).
-        let two = to_temporal_date(vm, vm.argument(1), Value::UNDEFINED)?;
-
-        // 3. Return 𝔽(CompareISODate(one.[[ISODate]], two.[[ISODate]])).
-        Ok(Value::from_i32(i32::from(compare_iso_date(
-            one.iso_date(),
-            two.iso_date(),
-        ))))
-    }
-}
-
-FILE: Libraries/LibJS/Rust/src/runtime/temporal/plain_date_prototype.rs
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-//! %Temporal.PlainDate.prototype%.
-
-use ak::Utf16String;
-use libjs_runtime_macros::Trace;
-
-use crate::gc::class::{GcCell, define_cell};
-use crate::interpreter::vm::Vm;
-use crate::layout::cell::Gc;
-use crate::layout::object::Object;
-use crate::layout::value::Value;
-use crate::runtime::abstract_operations::get_options_object;
-use crate::runtime::big_int::BigInt;
-use crate::runtime::completion::{Must, ThrowCompletionOr};
-use crate::runtime::error::ErrorKind;
-use crate::runtime::error_types::ErrorType;
-use crate::runtime::intl::date_time_format::{FormattableDateTime, format_date_time};
-use crate::runtime::intl::date_time_format_constructor::{OptionDefaults, OptionRequired, create_date_time_format};
-use crate::runtime::native_function::raw_native;
-use crate::runtime::object::{MayInterfereWithIndexedPropertyAccess, ORDINARY_OBJECT_METHODS, define_object_class};
-use crate::runtime::primitive_string::PrimitiveString;
-use crate::runtime::property_attributes::{Attribute, PropertyAttributes};
-use crate::runtime::property_key::PropertyKey;
-use crate::runtime::prototype_object::typed_this_object;
-use crate::runtime::realm::Realm;
-use crate::runtime::temporal::abstract_operations::{
-    ArithmeticOperation, DateType, Disambiguation, DurationOperation, Overflow, ShowCalendar,
-    get_temporal_overflow_option, get_temporal_show_calendar_name_option, is_partial_temporal_object,
-    iso_date_to_fields,
-};
-use crate::runtime::temporal::calendar::{
-    CalendarDate, CalendarField, CalendarFieldListOrPartial, calendar_date_from_fields, calendar_equals,
-    calendar_iso_to_date, calendar_merge_fields, calendar_month_day_from_fields, calendar_year_month_from_fields,
-    prepare_calendar_fields, to_temporal_calendar_identifier,
-};
-use crate::runtime::temporal::plain_date::{
-    PlainDate, add_duration_to_date, compare_iso_date, create_temporal_date, difference_temporal_plain_date,
-    temporal_date_to_string, to_temporal_date,
-};
-use crate::runtime::temporal::plain_date_time::{
-    combine_iso_date_and_time_record, create_temporal_date_time, iso_date_time_within_limits,
-};
-use crate::runtime::temporal::plain_month_day::create_temporal_month_day;
-use crate::runtime::temporal::plain_time::{to_temporal_time, to_time_record_or_midnight};
-use crate::runtime::temporal::plain_year_month::create_temporal_year_month;
-use crate::runtime::temporal::time_zone::{
-    get_epoch_nanoseconds_for, get_start_of_day, to_temporal_time_zone_identifier,
-};
-use crate::runtime::temporal::zoned_date_time::create_temporal_zoned_date_time;
-use crate::utf16::Utf16View;
-
-// 3.3 Properties of the Temporal.PlainDate Prototype Object, https://tc39.es/proposal-temporal/#sec-properties-of-the-temporal-plaindate-prototype-object
-#[repr(C)]
-#[derive(Trace)]
-pub struct PlainDatePrototype {
-    base: Object,
-}
-
-define_object_class!(PlainDatePrototype, extends: [Object], methods: {
-    initialize: PlainDatePrototype::initialize,
-    ..ORDINARY_OBJECT_METHODS
-});
-
-fn typed_this_plain_date(vm: &Vm) -> ThrowCompletionOr<Gc<PlainDate>> {
-    typed_this_object::<PlainDate>(vm, "Temporal.PlainDate")
-}
-
-fn string_value(vm: &Vm, string: &str) -> Value {
-    Value::from_string(PrimitiveString::create(vm, Utf16String::from_utf8(string)))
-}
-
-/// CalendarISOToDate(plainDate.[[Calendar]], plainDate.[[ISODate]]).
-fn calendar_date_of(plain_date: &PlainDate) -> CalendarDate {
-    let calendar = plain_date.calendar();
-    calendar_iso_to_date(Utf16View::of_string(&calendar), plain_date.iso_date())
-}
-
-impl PlainDatePrototype {
-    pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<PlainDatePrototype> {
-        realm.create_object(vm, |_| PlainDatePrototype {
-            base: Object::new_with_prototype(
-                vm,
-                Self::CLASS,
-                realm,
-                Some(realm.object_prototype()),
-                MayInterfereWithIndexedPropertyAccess::No,
-            ),
-        })
-    }
-
-    fn initialize(object: &Object, vm: &Vm, realm: Gc<Realm>) {
-        let names = &vm.names;
-
-        // 3.3.2 Temporal.PlainDate.prototype[ %Symbol.toStringTag% ], https://tc39.es/proposal-temporal/#sec-temporal.plaindate.prototype-%symbol.tostringtag%
-        object.define_direct_property(
-            vm,
-            &PropertyKey::from(vm.well_known_symbols().to_string_tag),
-            Value::from_string(PrimitiveString::create_from_utf8(vm, "Temporal.PlainDate")),
-            PropertyAttributes::new(Attribute::CONFIGURABLE),
-        );
-
-        let define_getter = |name: &PropertyKey, getter| {
-            object.define_native_accessor(
-                vm,
-                realm,
-                name,
-                getter,
-                None,
-                PropertyAttributes::new(Attribute::CONFIGURABLE),
-            );
-        };
-        define_getter(&names.calendarId, raw_native!(PlainDatePrototype::calendar_id_getter));
-        define_getter(&names.era, raw_native!(PlainDatePrototype::era_getter));
-        define_getter(&names.eraYear, raw_native!(PlainDatePrototype::era_year_getter));
-        define_getter(&names.year, raw_native!(PlainDatePrototype::year_getter));
-        define_getter(&names.month, raw_native!(PlainDatePrototype::month_getter));
-        define_getter(&names.monthCode, raw_native!(PlainDatePrototype::month_code_getter));
-        define_getter(&names.day, raw_native!(PlainDatePrototype::day_getter));
-        define_getter(&names.dayOfWeek, raw_native!(PlainDatePrototype::day_of_week_getter));
-        define_getter(&names.dayOfYear, raw_native!(PlainDatePrototype::day_of_year_getter));
-        define_getter(&names.weekOfYear, raw_native!(PlainDatePrototype::week_of_year_getter));
-        define_getter(&names.yearOfWeek, raw_native!(PlainDatePrototype::year_of_week_getter));

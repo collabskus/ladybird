@@ -1,4 +1,536 @@
-﻿        nonce: attribute_or_empty(attribute_name!("nonce")),
+﻿            [text] => match test_host::kind(*text) {
+                FakeNodeKind::Text(text) => text,
+                kind => panic!("expected text in the paragraph, not {kind:?}"),
+            },
+            children => panic!("expected one text node in the paragraph, not {} nodes", children.len()),
+        })
+        .collect()
+}
+
+#[test]
+fn text_is_inserted_as_one_node_however_the_tokenizer_emits_it() {
+    // Text that is taken straight from the input, in both forms the input is stored in.
+    assert_eq!(
+        text_of_each_paragraph("<p>plain<p>caf\u{e9}\nau lait"),
+        ["plain", "caf\u{e9}\nau lait"]
+    );
+    assert_eq!(
+        text_of_each_paragraph("<p>plain<p>wide \u{2014} \u{1f600}!"),
+        ["plain", "wide \u{2014} \u{1f600}!"]
+    );
+    // Text that is put together from runs of input and the characters between them that the tokenizer changes.
+    assert_eq!(
+        text_of_each_paragraph("<p>a &amp; b &lt;<p>x\r\ny\rz<p>&amp;<p>\u{1f600} first"),
+        ["a & b <", "x\ny\nz", "&", "\u{1f600} first"]
+    );
+    // A surrogate without its other half becomes U+FFFD.
+    let mut parser = ScriptCreatedParser::open();
+    parser
+        .tokenizer()
+        .append_input(Utf16View::Utf16(&[0x3C, 0x70, 0x3E, 0x61, 0xD83D, 0x62]));
+    parser.close();
+    let paragraph = test_host::children(body_element())[0];
+    assert_eq!(
+        kinds_of(&test_host::children(paragraph)),
+        [FakeNodeKind::Text("a\u{fffd}b".to_string())]
+    );
+}
+
+FILE: Libraries/LibWeb/HTML/Parser/Rust/src/preload_scanner.rs
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+use crate::RustFfiTokenizerHandle;
+use crate::code_units::RustFfiHtmlUtf16View;
+use crate::known_names::attribute_name;
+use crate::known_names::tag_name;
+use crate::token::Attribute;
+use crate::token::HtmlName;
+use crate::token::KnownName;
+use crate::token::Token;
+use crate::token::TokenPayload;
+use crate::token::TokenType;
+use crate::tokenizer::HtmlTokenizer;
+use crate::tokenizer::State;
+use ak::Utf16View;
+use std::borrow::Cow;
+use std::ffi::c_void;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RustFfiPreloadScannerAction {
+    Base = 0,
+    Fetch = 1,
+    ModulePreload = 2,
+    ModuleScript = 3,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RustFfiPreloadScannerDestination {
+    None = 0,
+    Font = 1,
+    Image = 2,
+    Script = 3,
+    Style = 4,
+    Track = 5,
+    AudioWorklet = 6,
+    JSON = 7,
+    PaintWorklet = 8,
+    ServiceWorker = 9,
+    SharedWorker = 10,
+    Worker = 11,
+    Text = 12,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RustFfiPreloadScannerCorsSetting {
+    NoCors = 0,
+    Anonymous = 1,
+    UseCredentials = 2,
+}
+
+#[repr(C)]
+pub struct RustFfiPreloadScannerEntry {
+    pub action: RustFfiPreloadScannerAction,
+    pub url: RustFfiHtmlUtf16View,
+    pub destination: RustFfiPreloadScannerDestination,
+    pub cors_setting: RustFfiPreloadScannerCorsSetting,
+    pub nonce: RustFfiHtmlUtf16View,
+    pub integrity: RustFfiHtmlUtf16View,
+    pub integrity_present: bool,
+    pub referrer_policy: RustFfiHtmlUtf16View,
+    pub fetch_priority: RustFfiHtmlUtf16View,
+    pub media: RustFfiHtmlUtf16View,
+}
+
+/// A preload scanner that keeps its place in the parser's input from one run to the next, so that a speculative HTML
+/// parser started while another script blocks the parser goes on from where the last one stopped, rather than scanning
+/// the same input again.
+pub struct RustFfiPreloadScanner {
+    tokenizer: HtmlTokenizer,
+    template_depth: u64,
+    foreign_depth: u64,
+    scripting_enabled: bool,
+}
+
+impl RustFfiPreloadScanner {
+    fn new(scripting_enabled: bool) -> Self {
+        let mut tokenizer = HtmlTokenizer::new(Vec::<u8>::new());
+        // More input can arrive, so the scanner waits at the end of what it has for the rest of a token.
+        tokenizer.set_input_stream_closed(false);
+        RustFfiPreloadScanner {
+            tokenizer,
+            template_depth: 0,
+            foreign_depth: 0,
+            scripting_enabled,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new(self.scripting_enabled);
+    }
+
+    fn append_input(&mut self, code_units: Utf16View<'_>) {
+        self.tokenizer.append_input(code_units);
+    }
+
+    fn scan(&mut self, callback: &mut impl FnMut(&RustFfiPreloadScannerEntry) -> bool) {
+        while let Some(token) = self.tokenizer.next_token(false, false) {
+            let should_continue = match token.token_type {
+                TokenType::StartTag => {
+                    let should_continue =
+                        process_start_tag(&token, &mut self.template_depth, &mut self.foreign_depth, callback);
+
+                    // The tree builder switches the tokenizer out of the data state for these elements, so their
+                    // contents are text rather than markup. It never does so for foreign content.
+                    if self.foreign_depth == 0
+                        && let Some(state) = tokenizer_state_after_start_tag(token.tag_name(), self.scripting_enabled)
+                    {
+                        self.tokenizer.switch_to(state);
+                    }
+                    should_continue
+                }
+                TokenType::EndTag => {
+                    process_end_tag(&token, &mut self.template_depth, &mut self.foreign_depth);
+                    true
+                }
+                TokenType::EndOfFile => false,
+                _ => true,
+            };
+            if !should_continue {
+                break;
+            }
+        }
+
+        // Drop the input scanned so far, unless a token that isn't finished yet still needs it.
+        self.tokenizer.parser_did_run();
+    }
+}
+
+/// Create a preload scanner for a speculative HTML parser.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_html_preload_scanner_create(scripting_enabled: bool) -> *mut RustFfiPreloadScanner {
+    Box::into_raw(Box::new(RustFfiPreloadScanner::new(scripting_enabled)))
+}
+
+/// Destroy a preload scanner.
+///
+/// # Safety
+/// `scanner` must come from `rust_html_preload_scanner_create`, and must not be used afterwards.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_html_preload_scanner_destroy(scanner: *mut RustFfiPreloadScanner) {
+    if !scanner.is_null() {
+        // SAFETY: The caller passes a scanner from rust_html_preload_scanner_create.
+        drop(unsafe { Box::from_raw(scanner) });
+    }
+}
+
+/// Hand the scanner the input of the parser that it hasn't seen yet. Returns false if the scanner had to start over at
+/// the parser's current position, because the parser got past where it stopped, input was inserted before there, or
+/// the caller asked for it with `start_over`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_html_preload_scanner_append_parser_input(
+    scanner: Option<&mut RustFfiPreloadScanner>,
+    tokenizer: Option<&mut RustFfiTokenizerHandle>,
+    start_over: bool,
+) -> bool {
+    let (Some(scanner), Some(tokenizer)) = (scanner, tokenizer) else {
+        return false;
+    };
+    if start_over {
+        tokenizer.tokenizer.forget_speculative_scan_end();
+    }
+    let (input, continues) = tokenizer.tokenizer.input_for_speculative_scan();
+    if !continues {
+        scanner.reset();
+    }
+    scanner.append_input(input);
+    continues
+}
+
+/// Scan the input the scanner has for resources the speculative HTML parser can fetch, stopping at the end of it or
+/// once `callback` returns false.
+///
+/// # Safety
+/// `callback` must not retain pointers from the provided entry beyond the callback invocation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_html_preload_scanner_scan(
+    scanner: Option<&mut RustFfiPreloadScanner>,
+    ctx: *mut c_void,
+    callback: unsafe extern "C" fn(ctx: *mut c_void, entry: *const RustFfiPreloadScannerEntry) -> bool,
+) {
+    let Some(scanner) = scanner else {
+        return;
+    };
+    scanner.scan(&mut |entry| unsafe { callback(ctx, &raw const *entry) });
+}
+
+#[cfg(test)]
+pub(crate) fn scan(input: &[u8], scripting_enabled: bool, callback: impl FnMut(&RustFfiPreloadScannerEntry) -> bool) {
+    // SAFETY: The tests pass valid UTF-8.
+    let code_units: Vec<u16> = unsafe { std::str::from_utf8_unchecked(input) }.encode_utf16().collect();
+    scan_utf16(&code_units, scripting_enabled, callback);
+}
+
+#[cfg(test)]
+pub(crate) fn scan_utf16(
+    input: &[u16],
+    scripting_enabled: bool,
+    mut callback: impl FnMut(&RustFfiPreloadScannerEntry) -> bool,
+) {
+    let mut scanner = RustFfiPreloadScanner::new(scripting_enabled);
+    scanner.append_input(Utf16View::Utf16(input));
+    scanner.tokenizer.set_input_stream_closed(true);
+    scanner.scan(&mut callback);
+}
+
+fn process_start_tag(
+    token: &Token,
+    template_depth: &mut u64,
+    foreign_depth: &mut u64,
+    callback: &mut impl FnMut(&RustFfiPreloadScannerEntry) -> bool,
+) -> bool {
+    let tag_name = token.tag_name();
+
+    if *tag_name == tag_name!("template") {
+        *template_depth = template_depth.saturating_add(1);
+        return true;
+    }
+
+    if *tag_name == tag_name!("svg") || *tag_name == tag_name!("math") {
+        // A self-closing svg or math element leaves no element open.
+        if !token.is_self_closing() {
+            *foreign_depth = foreign_depth.saturating_add(1);
+        }
+        return true;
+    }
+
+    if *template_depth > 0 || *foreign_depth > 0 {
+        return true;
+    }
+
+    let TokenPayload::Tag { attributes, .. } = &token.payload else {
+        return true;
+    };
+
+    if *tag_name == tag_name!("base") {
+        process_base(attributes, callback)
+    } else if *tag_name == tag_name!("script") {
+        process_script(attributes, callback)
+    } else if *tag_name == tag_name!("link") {
+        process_link(attributes, callback)
+    } else if *tag_name == tag_name!("img") {
+        process_img(attributes, callback)
+    } else {
+        true
+    }
+}
+
+fn process_end_tag(token: &Token, template_depth: &mut u64, foreign_depth: &mut u64) {
+    let tag_name = token.tag_name();
+    if *tag_name == tag_name!("template") && *template_depth > 0 {
+        *template_depth -= 1;
+    } else if (*tag_name == tag_name!("svg") || *tag_name == tag_name!("math")) && *foreign_depth > 0 {
+        *foreign_depth -= 1;
+    }
+}
+
+pub(crate) fn tokenizer_state_after_start_tag(tag_name: &HtmlName, scripting_enabled: bool) -> Option<State> {
+    if *tag_name == tag_name!("script") {
+        Some(State::ScriptData)
+    } else if *tag_name == tag_name!("title") || *tag_name == tag_name!("textarea") {
+        Some(State::RCDATA)
+    } else if *tag_name == tag_name!("style")
+        || *tag_name == tag_name!("xmp")
+        || *tag_name == tag_name!("iframe")
+        || *tag_name == tag_name!("noembed")
+        || *tag_name == tag_name!("noframes")
+        || (*tag_name == tag_name!("noscript") && scripting_enabled)
+    {
+        Some(State::RAWTEXT)
+    } else if *tag_name == tag_name!("plaintext") {
+        Some(State::PLAINTEXT)
+    } else {
+        None
+    }
+}
+
+fn process_base(attributes: &[Attribute], callback: &mut impl FnMut(&RustFfiPreloadScannerEntry) -> bool) -> bool {
+    let Some(href) = attribute_value(attributes, attribute_name!("href")) else {
+        return true;
+    };
+    if href.is_empty() {
+        return true;
+    }
+
+    emit_entry(
+        callback,
+        RustFfiPreloadScannerAction::Base,
+        href,
+        RustFfiPreloadScannerDestination::None,
+        RustFfiPreloadScannerCorsSetting::NoCors,
+        None,
+    )
+}
+
+fn process_script(attributes: &[Attribute], callback: &mut impl FnMut(&RustFfiPreloadScannerEntry) -> bool) -> bool {
+    let Some(src) = attribute_value(attributes, attribute_name!("src")) else {
+        return true;
+    };
+    if src.is_empty() {
+        return true;
+    }
+    let action = match script_type_from_attributes(attributes) {
+        // 'If el has a nomodule content attribute and its type is "classic", then return.' — so the script never runs,
+        // and preparing it doesn't fetch src.
+        Some(ScriptType::Classic) if attribute_value(attributes, attribute_name!("nomodule")).is_some() => return true,
+        Some(ScriptType::Classic) => RustFfiPreloadScannerAction::Fetch,
+        Some(ScriptType::Module) => RustFfiPreloadScannerAction::ModuleScript,
+        // An import map or speculation-rules script with a src attribute only fires an error event, and a script whose
+        // type is null never runs — none of them fetch src.
+        Some(ScriptType::ImportMap) | Some(ScriptType::SpeculationRules) | None => return true,
+    };
+    emit_entry(
+        callback,
+        action,
+        src,
+        RustFfiPreloadScannerDestination::Script,
+        cors_setting_from_attribute(attributes),
+        Some(attributes),
+    )
+}
+
+/// The type "prepare the script element" gives a script element from its type and language attributes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScriptType {
+    Classic,
+    Module,
+    ImportMap,
+    SpeculationRules,
+}
+
+// https://mimesniff.spec.whatwg.org/#javascript-mime-type
+// A JavaScript MIME type is any MIME type whose essence is one of the following:
+const JAVASCRIPT_MIME_TYPE_ESSENCES: [&[u8]; 16] = [
+    b"application/ecmascript",
+    b"application/javascript",
+    b"application/x-ecmascript",
+    b"application/x-javascript",
+    b"text/ecmascript",
+    b"text/javascript",
+    b"text/javascript1.0",
+    b"text/javascript1.1",
+    b"text/javascript1.2",
+    b"text/javascript1.3",
+    b"text/javascript1.4",
+    b"text/javascript1.5",
+    b"text/jscript",
+    b"text/livescript",
+    b"text/x-ecmascript",
+    b"text/x-javascript",
+];
+
+// https://html.spec.whatwg.org/multipage/scripting.html#prepare-the-script-element
+// Steps 8 to 13 of "prepare the script element": the type the element gets from its type and language attributes, or
+// None when "no script is executed, and el's type is left as null".
+fn script_type_from_attributes(attributes: &[Attribute]) -> Option<ScriptType> {
+    let type_attribute = attribute_value(attributes, attribute_name!("type"));
+    let language_attribute = attribute_value(attributes, attribute_name!("language"));
+
+    // 8. If any of the following are true:
+    //    - el has a type attribute whose value is the empty string;
+    //    - el has no type attribute but it has a language attribute and that attribute's value is the empty string; or
+    //    - el has neither a type attribute nor a language attribute,
+    //    then let the script block's type string for this script element be "text/javascript".
+    //    Otherwise, if el has a type attribute, then let the script block's type string be the value of that attribute.
+    //    Otherwise, el has a non-empty language attribute; let the script block's type string be the concatenation of
+    //    "text/" and the value of el's language attribute.
+    // FIXME: Preserve whitespace in the type string; only the classic JavaScript MIME comparison strips it.
+    let type_attribute = type_attribute.map(keyword_bytes);
+    let language_attribute = language_attribute.map(keyword_bytes);
+    let type_string: Cow<'_, [u8]> = match (&type_attribute, &language_attribute) {
+        (Some(type_attribute), _) if type_attribute.is_empty() => Cow::Borrowed(b"text/javascript"),
+        (None, Some(language)) if language.is_empty() => Cow::Borrowed(b"text/javascript"),
+        (None, None) => Cow::Borrowed(b"text/javascript"),
+        (Some(type_attribute), _) => Cow::Borrowed(type_attribute.trim_ascii()),
+        (None, Some(language)) => Cow::Owned([b"text/".as_slice(), language].concat()),
+    };
+
+    // 9. If the script block's type string is a JavaScript MIME type essence match, or el has a type attribute whose
+    //    value with leading and trailing ASCII whitespace stripped is a JavaScript MIME type essence match, then set
+    //    el's type to "classic".
+    if JAVASCRIPT_MIME_TYPE_ESSENCES
+        .iter()
+        .any(|essence| type_string.eq_ignore_ascii_case(essence))
+    {
+        return Some(ScriptType::Classic);
+    }
+
+    // 10. Otherwise, if the script block's type string is an ASCII case-insensitive match for the string "module", then
+    //     set el's type to "module".
+    if type_string.eq_ignore_ascii_case(b"module") {
+        return Some(ScriptType::Module);
+    }
+
+    // 11. Otherwise, if the script block's type string is an ASCII case-insensitive match for the string "importmap",
+    //     then set el's type to "importmap".
+    if type_string.eq_ignore_ascii_case(b"importmap") {
+        return Some(ScriptType::ImportMap);
+    }
+
+    // 12. Otherwise, if the script block's type string is an ASCII case-insensitive match for the string
+    //     "speculationrules", then set el's type to "speculationrules".
+    if type_string.eq_ignore_ascii_case(b"speculationrules") {
+        return Some(ScriptType::SpeculationRules);
+    }
+
+    // 13. Otherwise, return. (No script is executed, and el's type is left as null.)
+    None
+}
+
+fn process_link(attributes: &[Attribute], callback: &mut impl FnMut(&RustFfiPreloadScannerEntry) -> bool) -> bool {
+    let Some(href) = attribute_value(attributes, attribute_name!("href")) else {
+        return true;
+    };
+    if href.is_empty() {
+        return true;
+    }
+
+    let Some(rel) = attribute_value(attributes, attribute_name!("rel")) else {
+        return true;
+    };
+    let rel = keyword_bytes(rel);
+
+    let (action, destination) = if rel_contains_keyword(&rel, b"stylesheet") {
+        (
+            RustFfiPreloadScannerAction::Fetch,
+            RustFfiPreloadScannerDestination::Style,
+        )
+    } else if rel_contains_keyword(&rel, b"modulepreload") {
+        let Some(destination) = translate_modulepreload_destination(attribute_value(attributes, attribute_name!("as")))
+        else {
+            return true;
+        };
+        (RustFfiPreloadScannerAction::ModulePreload, destination)
+    } else if rel_contains_keyword(&rel, b"preload") {
+        let Some(destination) = translate_preload_destination(attribute_value(attributes, attribute_name!("as")))
+        else {
+            return true;
+        };
+        (RustFfiPreloadScannerAction::Fetch, destination)
+    } else {
+        return true;
+    };
+
+    emit_entry(
+        callback,
+        action,
+        href,
+        destination,
+        cors_setting_from_attribute(attributes),
+        Some(attributes),
+    )
+}
+
+fn process_img(attributes: &[Attribute], callback: &mut impl FnMut(&RustFfiPreloadScannerEntry) -> bool) -> bool {
+    let Some(src) = attribute_value(attributes, attribute_name!("src")) else {
+        return true;
+    };
+    if src.is_empty() {
+        return true;
+    }
+
+    emit_entry(
+        callback,
+        RustFfiPreloadScannerAction::Fetch,
+        src,
+        RustFfiPreloadScannerDestination::Image,
+        cors_setting_from_attribute(attributes),
+        Some(attributes),
+    )
+}
+
+fn emit_entry(
+    callback: &mut impl FnMut(&RustFfiPreloadScannerEntry) -> bool,
+    action: RustFfiPreloadScannerAction,
+    url: Utf16View<'_>,
+    destination: RustFfiPreloadScannerDestination,
+    cors_setting: RustFfiPreloadScannerCorsSetting,
+    attributes: Option<&[Attribute]>,
+) -> bool {
+    let attribute = |name| attribute_value(attributes.unwrap_or_default(), name);
+    let attribute_or_empty = |name| attribute(name).unwrap_or(Utf16View::Latin1(&[])).into();
+    let entry = RustFfiPreloadScannerEntry {
+        action,
+        url: url.into(),
+        destination,
+        cors_setting,
+        nonce: attribute_or_empty(attribute_name!("nonce")),
         integrity: attribute_or_empty(attribute_name!("integrity")),
         integrity_present: attribute(attribute_name!("integrity")).is_some(),
         referrer_policy: attribute_or_empty(attribute_name!("referrerpolicy")),
@@ -73451,21 +73983,26 @@ FILE: Libraries/LibWeb/Painting/SvgPaintResources.cpp
 
 namespace Web::Painting {
 
+bool svg_filter_fits_primitive_budget(SVG::SVGFilterElement const& filter_element, size_t& primitives_used)
+{
+    // INTEROP: Other engines treat a filter with more than a few hundred primitives as an error, which also keeps a
+    //          chain of thousands of primitives from overflowing the stack of the painter that applies them one by one,
+    //          and from taking seconds to apply.
+    static constexpr size_t max_primitives = 256;
+    for (auto const* child = filter_element.first_child(); child; child = child->next_sibling()) {
+        if (is<DOM::Element>(*child) && ++primitives_used > max_primitives)
+            return false;
+    }
+    return true;
+}
+
 bool push_svg_filter_reference(Layout::BegunRead const& read, DOM::Document& document, Compositing::RustFFI::NodeSlotId slot, void const* url_value, void* sink)
 {
     auto const& layout_node = as<Layout::NodeWithStyle>(*document.layout_node_arena().node_if_live(read, slot));
     auto filter_element = resolve_svg_filter_reference({ .pointer = url_value }, layout_node);
-    if (!filter_element)
+    size_t primitives_used = 0;
+    if (!filter_element || !svg_filter_fits_primitive_budget(*filter_element, primitives_used))
         return false;
-
-    // INTEROP: Other engines treat a filter with more than a few hundred primitives as an error, which also keeps a
-    //          chain of thousands of primitives from overflowing the stack of the painter that applies them one by one.
-    static constexpr size_t max_primitives_per_filter = 256;
-    size_t primitive_count = 0;
-    for (auto const* child = filter_element->first_child(); child; child = child->next_sibling()) {
-        if (is<DOM::Element>(*child) && ++primitive_count > max_primitives_per_filter)
-            return false;
-    }
 
     auto dest_size = Gfx::enclosing_int_rect(absolute_rect(layout_node).to_type<float>()).size();
     filter_element->push_primitives(sink, dest_size);
@@ -73505,6 +74042,9 @@ FILE: Libraries/LibWeb/Painting/SvgPaintResources.h
 
 namespace Web::Painting {
 
+// Adds a filter's primitives to those used so far by the filters applied together, unless that makes more than they
+// may have between them, and so fails to apply.
+bool svg_filter_fits_primitive_budget(SVG::SVGFilterElement const&, size_t& primitives_used);
 bool push_svg_filter_reference(Layout::BegunRead const&, DOM::Document&, Compositing::RustFFI::NodeSlotId, void const* url_value, void* sink);
 void push_svg_paint_server_description(Layout::BegunRead const&, DOM::Document&, Compositing::RustFFI::NodeSlotId, bool is_stroke, void* sink);
 
@@ -126469,6 +127009,14 @@ impl<'a> ComputedValuesView<'a> {
         matches!(
             self.content().content.data(),
             Some(StyleValueData::Keyword { keyword }) if *keyword == crate::css::css_enums::keyword::NONE
+        )
+    }
+
+    /// Whether `content` computes to `normal`.
+    pub(crate) fn content_keyword_is_normal(self) -> bool {
+        matches!(
+            self.content().content.data(),
+            Some(StyleValueData::Keyword { keyword }) if *keyword == crate::css::css_enums::keyword::NORMAL
         )
     }
 
@@ -323977,13 +324525,23 @@ impl<'pass> BlockFormattingContext<'pass> {
         // box".
         // NB: So the marker ends at the start of the list item's border box, rather than of its content box: Padding
         //     and borders at the start of the list item move its contents, but not its marker.
+        // A disc, circle or square marker is its symbol followed by a space, which leaves it closer to the list item's
+        // text than markers usually sit. So it ends a little further from the list item's border box.
+        const PREDEFINED_SYMBOL_MARKER_END_SPACING: i64 = 5;
+        let end_spacing = if super::generated_content::marker_shows_predefined_symbol(*marker_style, *list_item_style) {
+            CssPixels::from_integer(PREDEFINED_SYMBOL_MARKER_END_SPACING)
+                .scaled(f64::from(marker_style.effective_zoom()))
+        } else {
+            CssPixels::default()
+        };
         let collapsed = list_item.cells.uses_collapsing_borders_model();
         let marker_inline_offset = if list_item_style.direction() == direction::LTR {
             inline_space_used_before_list_item_elements_formatted.left
                 - list_item.cells.border_box_left(collapsed)
                 - marker_inline_size
+                - end_spacing
         } else {
-            list_item.cells.content_inline_size + list_item.cells.border_box_right(collapsed)
+            list_item.cells.content_inline_size + list_item.cells.border_box_right(collapsed) + end_spacing
                 - inline_space_used_before_list_item_elements_formatted.right
         };
         let marker_block_offset = if let Some(list_item_first_baseline) = list_item_first_baseline
@@ -347980,6 +348538,29 @@ fn value_list(value: Option<&StyleValueData>) -> &[crate::css::style_value::Reta
         Some(StyleValueData::ValueList { values, .. }) => values.as_slice(),
         _ => &[],
     }
+}
+
+/// Whether a list marker shows the symbol of the predefined disc, circle or square counter style, which authors can't
+/// redefine: Its `content` is `normal`, it has no `list-style-image`, and its list item's `list-style-type` names one
+/// of those styles.
+pub(crate) fn marker_shows_predefined_symbol(
+    marker_style: ComputedValuesView<'_>,
+    list_item_style: ComputedValuesView<'_>,
+) -> bool {
+    if !marker_style.content_keyword_is_normal() || marker_style.list_style_image_is_set() {
+        return false;
+    }
+    let Some(StyleValueData::CounterStyle(counter_style)) = list_item_style.inherited_list().list_style_type.data()
+    else {
+        return false;
+    };
+    if counter_style.is_symbols {
+        return false;
+    }
+    let name = counter_style.name.units();
+    ["disc", "circle", "square"]
+        .iter()
+        .any(|predefined| predefined.encode_utf16().eq(name.iter().copied()))
 }
 
 pub(crate) fn content_is_normal(content: Option<&StyleValueData>) -> bool {
@@ -434019,6 +434600,7 @@ pub fn css_property_names() -> impl Iterator<Item = &'static str> {
 }
 pub use css::serialize::TextSink;
 pub use css::typed_om;
+pub use painting::svg_filter::build_canvas_filter;
 pub use svg::gfx_path_from_path_data;
 
 /// The red, green, blue and alpha of a CSS <color> in ASCII that needs nothing to be resolved against, or None for any
@@ -484142,8 +484724,10 @@ FILE: Libraries/LibWeb/Rust/src/painting/svg_filter.rs
 //! device pixels.
 
 use std::collections::HashMap;
+use std::ffi::c_void;
 
 use libgfx_rust::filter::{ChannelSelector, ChannelTable, Filter, TurbulenceType};
+use libgfx_rust::image_frame::ImageFrameHandle;
 use libgfx_rust::{CompositingAndBlendingOperator, FloatRect, IntSize, InterpolationColorSpace};
 
 use crate::layout::svg_formatting_context::FfiSvgNumberPercentage;
@@ -484151,6 +484735,38 @@ use crate::painting::host::visual_context::{
     FfiSvgFilterPrimitiveKind, FfiSvgFilterRegion, SUBREGION_SPECIFIES_HEIGHT, SUBREGION_SPECIFIES_WIDTH,
     SUBREGION_SPECIFIES_X, SUBREGION_SPECIFIES_Y, SvgFilterPrimitiveValues,
 };
+
+/// Builds a canvas filter from primitives published synchronously through the SVG painting sink.
+/// The callback must use the sink only during the call, through the SVG filter publication functions.
+pub fn build_canvas_filter(
+    size: IntSize,
+    publish: impl FnOnce(*mut c_void) -> bool,
+) -> Option<(Option<Filter>, Vec<ImageFrameHandle>)> {
+    let mut published = crate::painting::svg_paint_resources::PublishedSvgFilter::default();
+    if !publish((&raw mut published).cast()) {
+        return None;
+    }
+    let mut builder = SvgFilterGraphBuilder::new(1.0);
+    // https://html.spec.whatwg.org/multipage/canvas.html#filters
+    // Filters are applied in the output bitmap's coordinate space.
+    builder.set_target(
+        SvgFilterTarget {
+            region: published.region,
+            object_bounding_box: FloatRect::new(0.0, 0.0, size.width as f32, size.height as f32),
+            user_space_origin: (0.0, 0.0),
+            user_space_viewport: (size.width as f32, size.height as f32),
+        },
+        0,
+    );
+    let mut frames = Vec::new();
+    for primitive in published.primitives {
+        if let Some(frame) = &primitive.image_frame {
+            frames.push(frame.clone());
+        }
+        builder.push(primitive);
+    }
+    Some((builder.finish(), frames))
+}
 
 // https://drafts.fxtf.org/filter-effects-1/#InterfaceSVGFEColorMatrixElement
 const COLOR_MATRIX_TYPE_MATRIX: u16 = 1;
@@ -603592,478 +604208,3 @@ static ErrorOr<JsonObject, Error> validate_capabilities(JsonValue const& capabil
 
         // -> name equals "timeouts"
         else if (name == "timeouts"sv) {
-            // Let deserialized be the result of trying to JSON deserialize as a timeouts configuration the value.
-            auto timeouts = TRY(json_deserialize_as_a_timeouts_configuration(value));
-            deserialized = JsonValue { timeouts_object(timeouts) };
-        }
-
-        // -> name equals "unhandledPromptBehavior"
-        else if (name == "unhandledPromptBehavior"sv) {
-            // Let deserialized be the result of trying to deserialize as an unhandled prompt behavior with argument value.
-            deserialized = TRY(deserialize_as_an_unhandled_prompt_behavior(value));
-        }
-
-        // FIXME: -> name is the name of an additional WebDriver capability
-        // FIXME:     Let deserialized be the result of trying to run the additional capability deserialization algorithm for the extension capability corresponding to name, with argument value.
-
-        // https://w3c.github.io/webdriver-bidi/#type-session-CapabilityRequest
-        else if (name == "webSocketUrl"sv) {
-            // 1. If value is not a boolean, return error with code invalid argument.
-            if (!value.is_bool())
-                return Error::from_code(ErrorCode::InvalidArgument, "Capability webSocketUrl must be a boolean"sv);
-
-            // 2. Return success with data value.
-            deserialized = value;
-        }
-
-        // -> name is the key of an extension capability
-        else if (name.contains(':')) {
-            // If name is known to the implementation, let deserialized be the result of trying to deserialize value in
-            // an implementation-specific way. Otherwise, let deserialized be set to value.
-            if (name.starts_with_bytes("ladybird:"sv))
-                deserialized = TRY(deserialize_as_ladybird_capability(name, value));
-        }
-
-        // -> The remote end is an endpoint node
-        else {
-            // Return an error with error code invalid argument.
-            return Error::from_code(ErrorCode::InvalidArgument, MUST(String::formatted("Unrecognized capability: {}", name)));
-        }
-
-        // d. If deserialized is not null, set a property on result with name name and value deserialized.
-        if (!deserialized.is_null())
-            result.set(name, move(deserialized));
-
-        return {};
-    }));
-
-    // 4. Return success with data result.
-    return result;
-}
-
-// https://w3c.github.io/webdriver/#dfn-merging-capabilities
-static ErrorOr<JsonObject, Error> merge_capabilities(JsonObject const& primary, Optional<JsonObject const&> const& secondary)
-{
-    // 1. Let result be a new JSON Object.
-    JsonObject result;
-
-    // 2. For each enumerable own property in primary, run the following substeps:
-    primary.for_each_member([&](auto const& name, auto const& value) {
-        // a. Let name be the name of the property.
-        // b. Let value be the result of getting a property named name from primary.
-
-        // c. Set a property on result with name name and value value.
-        result.set(name, value);
-    });
-
-    // 3. If secondary is undefined, return result.
-    if (!secondary.has_value())
-        return result;
-
-    // 4. For each enumerable own property in secondary, run the following substeps:
-    TRY(secondary->try_for_each_member([&](auto const& name, auto const& value) -> ErrorOr<void, Error> {
-        // a. Let name be the name of the property.
-        // b. Let value be the result of getting a property named name from secondary.
-
-        // c. Let primary value be the result of getting the property name from primary.
-        auto primary_value = primary.get(name);
-
-        // d. If primary value is not undefined, return an error with error code invalid argument.
-        if (primary_value.has_value())
-            return Error::from_code(ErrorCode::InvalidArgument, MUST(String::formatted("Unable to merge capability {}", name)));
-
-        // e. Set a property on result with name name and value value.
-        result.set(name, value);
-        return {};
-    }));
-
-    // 5. Return result.
-    return result;
-}
-
-static bool matches_browser_version(StringView requested_version, StringView required_version)
-{
-    // FIXME: Handle relative (>, >=, <. <=) comparisons. For now, require an exact match.
-    return requested_version == required_version;
-}
-
-static bool matches_platform_name(StringView requested_platform_name, StringView required_platform_name)
-{
-    if (requested_platform_name == required_platform_name)
-        return true;
-
-    // The following platform names are in common usage with well-understood semantics and, when matching capabilities, greatest interoperability can be achieved by honoring them as valid synonyms for well-known Operating Systems:
-    //     "linux"   Any server or desktop system based upon the Linux kernel.
-    //     "mac"     Any version of Apple’s macOS.
-    //     "windows" Any version of Microsoft Windows, including desktop and mobile versions.
-    // This list is not exhaustive.
-
-    // NOTE: Of the synonyms listed in the spec, the only one that differs for us is macOS.
-    //       Further, we are allowed to handle synonyms for SerenityOS.
-    if (requested_platform_name == "mac"sv && required_platform_name == "macos"sv)
-        return true;
-    if (requested_platform_name == "serenity"sv && required_platform_name == "serenityos"sv)
-        return true;
-    return false;
-}
-
-// https://w3c.github.io/webdriver/#dfn-matching-capabilities
-static JsonValue match_capabilities(JsonObject const& capabilities, SessionFlags flags)
-{
-    static auto& browser_name = *new String(String::from_utf8_without_validation({ BROWSER_NAME, __builtin_strlen(BROWSER_NAME) }).to_ascii_lowercase());
-    static auto& browser_version = *new String(String::from_utf8_without_validation({ BROWSER_VERSION, __builtin_strlen(BROWSER_VERSION) }));
-    static auto& platform_name = *new String(String::from_utf8_without_validation({ OS_STRING, __builtin_strlen(OS_STRING) }).to_ascii_lowercase());
-
-    // 1. Let matched capabilities be a JSON Object with the following entries:
-    JsonObject matched_capabilities;
-    // "browserName"
-    //     ASCII Lowercase name of the user agent as a string.
-    matched_capabilities.set("browserName"sv, browser_name);
-    // "browserVersion"
-    //     The user agent version, as a string.
-    matched_capabilities.set("browserVersion"sv, browser_version);
-    // "platformName"
-    //     ASCII Lowercase name of the current platform as a string.
-    matched_capabilities.set("platformName"sv, platform_name);
-    // "acceptInsecureCerts"
-    //     Boolean initially set to false, indicating the session will not implicitly trust untrusted or self-signed TLS certificates on navigation.
-    matched_capabilities.set("acceptInsecureCerts"sv, false);
-    // "strictFileInteractability"
-    //     Boolean initially set to false, indicating that interactability checks will be applied to <input type=file>.
-    // FIXME: Spec issue: This item likely should have been removed in lieu of step 2.
-    //        https://github.com/w3c/webdriver/issues/1879
-    // "setWindowRect"
-    //     Boolean indicating whether the remote end supports all of the resizing and positioning commands.
-    matched_capabilities.set("setWindowRect"sv, true);
-    // "userAgent"
-    //     String containing the default User-Agent value.
-    matched_capabilities.set("userAgent"sv, Web::default_user_agent);
-
-    // 2. If flags contains "http", add the following entries to matched capabilities:
-    if (has_flag(flags, SessionFlags::Http)) {
-        // "strictFileInteractability"
-        //     Boolean initially set to false, indicating that interactabilty checks will be applied to <input type=file>.
-        matched_capabilities.set("strictFileInteractability"sv, false);
-    }
-
-    // 3. Optionally add extension capabilities as entries to matched capabilities. The values of these may be elided,
-    //    and there is no requirement that all extension capabilities be added.
-    set_default_ladybird_capabilities(matched_capabilities);
-
-    // 3. For each name and value corresponding to capabilities's own properties:
-    auto result = capabilities.try_for_each_member([&](auto const& name, auto const& value) -> ErrorOr<void> {
-        // a. Let match value equal value.
-
-        // b. Run the substeps of the first matching name:
-        // -> "browserName"
-        if (name == "browserName"sv) {
-            // If value is not a string equal to the "browserName" entry in matched capabilities, return success with data null.
-            if (value.as_string() != matched_capabilities.get_string(name).value())
-                return AK::Error::from_string_literal("browserName");
-        }
-        // -> "browserVersion"
-        else if (name == "browserVersion"sv) {
-            // Compare value to the "browserVersion" entry in matched capabilities using an implementation-defined comparison algorithm. The comparison is to accept a value that places constraints on the version using the "<", "<=", ">", and ">=" operators.
-            // If the two values do not match, return success with data null.
-            if (!matches_browser_version(value.as_string(), matched_capabilities.get_string(name).value()))
-                return AK::Error::from_string_literal("browserVersion");
-        }
-        // -> "platformName"
-        else if (name == "platformName"sv) {
-            // If value is not a string equal to the "platformName" entry in matched capabilities, return success with data null.
-            if (!matches_platform_name(value.as_string(), matched_capabilities.get_string(name).value()))
-                return AK::Error::from_string_literal("platformName");
-        }
-        // -> "acceptInsecureCerts"
-        else if (name == "acceptInsecureCerts"sv) {
-            // If accept insecure TLS flag is set and not equal to value, return success with data null.
-            if (value.as_bool())
-                return AK::Error::from_string_literal("acceptInsecureCerts");
-        }
-        // -> "proxy"
-        else if (name == "proxy"sv) {
-            // If the has proxy configuration flag is set, or if the proxy configuration defined in value is not one that
-            // passes the endpoint node's implementation-specific validity checks, return success with data null.
-            if (has_proxy_configuration() || !is_supported_proxy_configuration(value))
-                return AK::Error::from_string_literal("proxy");
-        }
-        // -> "unhandledPromptBehavior"
-        else if (name == "unhandledPromptBehavior"sv) {
-            // If check user prompt handler matches with value is false, return success with data null.
-            if (!check_user_prompt_handler_matches(value.as_object()))
-                return AK::Error::from_string_literal("unhandledPromptBehavior");
-        }
-        // -> Otherwise
-        else {
-            // FIXME: If name is the name of an additional WebDriver capability which defines a matched capability serialization algorithm, let match value be the result of running the matched capability serialization algorithm for capability name with arguments value, and flags.
-            // FIXME: Otherwise, if name is the key of an extension capability, let match value be the result of trying implementation-specific steps to match on name with value. If the match is not successful, return success with data null.
-
-            // https://w3c.github.io/webdriver-bidi/#type-session-CapabilityRequest
-            if (name == "webSocketUrl"sv) {
-                // 1. If value is false, return success with data null.
-                // NB: This is the match value, which is then not set on matched capabilities.
-                if (!value.as_bool())
-                    return {};
-
-                // 2. Return success with data value.
-            }
-        }
-
-        // c. If match value is not null, set a property on matched capabilities with name name and value match value.
-        if (!value.is_null())
-            matched_capabilities.set(name, value);
-
-        return {};
-    });
-
-    if (result.is_error()) {
-        dbgln_if(WEBDRIVER_DEBUG, "Failed to match capability: {}", result.error());
-        return JsonValue {};
-    }
-
-    // 4. Return success with data matched capabilities.
-    return matched_capabilities;
-}
-
-// https://w3c.github.io/webdriver/#dfn-capabilities-processing
-Response process_capabilities(JsonValue const& parameters, SessionFlags flags)
-{
-    if (!parameters.is_object())
-        return Error::from_code(ErrorCode::InvalidArgument, "Session parameters is not an object"sv);
-
-    // 1. Let capabilities request be the result of getting the property "capabilities" from parameters.
-    //     a. If capabilities request is not a JSON Object, return error with error code invalid argument.
-    auto maybe_capabilities_request = parameters.as_object().get_object("capabilities"sv);
-    if (!maybe_capabilities_request.has_value())
-        return Error::from_code(ErrorCode::InvalidArgument, "Capabilities is not an object"sv);
-
-    auto const& capabilities_request = maybe_capabilities_request.value();
-
-    // 2. Let required capabilities be the result of getting the property "alwaysMatch" from capabilities request.
-    //     a. If required capabilities is undefined, set the value to an empty JSON Object.
-    JsonObject required_capabilities;
-
-    if (auto capability = capabilities_request.get("alwaysMatch"sv); capability.has_value()) {
-        // b. Let required capabilities be the result of trying to validate capabilities with arguments required capabilities and flag.
-        // FIXME: Spec issue: The "flags" parameter should not be provided to validate_capabilities.
-        // https://github.com/w3c/webdriver/issues/1879
-        required_capabilities = TRY(validate_capabilities(*capability));
-    }
-
-    // 3. Let all first match capabilities be the result of getting the property "firstMatch" from capabilities request.
-    JsonArray all_first_match_capabilities;
-
-    if (auto capabilities = capabilities_request.get("firstMatch"sv); capabilities.has_value()) {
-        // b. If all first match capabilities is not a List with one or more entries, return error with error code invalid argument.
-        if (!capabilities->is_array() || capabilities->as_array().is_empty())
-            return Error::from_code(ErrorCode::InvalidArgument, "Capability firstMatch must be an array with at least one entry"sv);
-
-        all_first_match_capabilities = capabilities->as_array();
-    } else {
-        // a. If all first match capabilities is undefined, set the value to a List with a single entry of an empty JSON Object.
-        all_first_match_capabilities.must_append(JsonObject {});
-    }
-
-    // 4. Let validated first match capabilities be an empty List.
-    JsonArray validated_first_match_capabilities;
-    validated_first_match_capabilities.ensure_capacity(all_first_match_capabilities.size());
-
-    // 5. For each first match capabilities corresponding to an indexed property in all first match capabilities:
-    TRY(all_first_match_capabilities.try_for_each([&](auto const& first_match_capabilities) -> ErrorOr<void, Error> {
-        // a. Let validated capabilities be the result of trying to validate capabilities with arguments first match capabilities and flags.
-        // FIXME: Spec issue: The "flags" parameter should not be provided to validate_capabilities.
-        // https://github.com/w3c/webdriver/issues/1879
-        auto validated_capabilities = TRY(validate_capabilities(first_match_capabilities));
-
-        // b. Append validated capabilities to validated first match capabilities.
-        validated_first_match_capabilities.must_append(move(validated_capabilities));
-        return {};
-    }));
-
-    // 6. Let merged capabilities be an empty List.
-    JsonArray merged_capabilities;
-    merged_capabilities.ensure_capacity(validated_first_match_capabilities.size());
-
-    // 7. For each first match capabilities corresponding to an indexed property in validated first match capabilities:
-    TRY(validated_first_match_capabilities.try_for_each([&](auto const& first_match_capabilities) -> ErrorOr<void, Error> {
-        // a. Let merged be the result of trying to merge capabilities with required capabilities and first match capabilities as arguments.
-        auto merged = TRY(merge_capabilities(required_capabilities, first_match_capabilities.as_object()));
-
-        // b. Append merged to merged capabilities.
-        merged_capabilities.must_append(move(merged));
-        return {};
-    }));
-
-    // 8. For each capabilities corresponding to an indexed property in merged capabilities:
-    for (auto const& capabilities : merged_capabilities.values()) {
-        // a. Let matched capabilities be the result of trying to match capabilities with capabilities as an argument.
-        // FIXME: Spec issue: The "flags" parameter *should* be provided to match_capabilities.
-        // https://github.com/w3c/webdriver/issues/1879
-        auto matched_capabilities = match_capabilities(capabilities.as_object(), flags);
-
-        // b. If matched capabilities is not null, return success with data matched capabilities.
-        if (!matched_capabilities.is_null())
-            return matched_capabilities;
-    }
-
-    // 9. Return success with data null.
-    return JsonValue {};
-}
-
-LadybirdOptions::LadybirdOptions(JsonObject const& capabilities)
-{
-    if (auto headless = capabilities.get_bool("ladybird:headless"sv); headless.has_value())
-        this->headless = *headless;
-    if (auto enable_test_hooks = capabilities.get_bool("ladybird:enableTestHooks"sv); enable_test_hooks.has_value())
-        this->enable_test_hooks = *enable_test_hooks;
-}
-
-}
-
-FILE: Libraries/LibWebCommon/WebDriver/Capabilities.h
-/*
- * Copyright (c) 2022-2025, Tim Flynn <trflynn89@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/EnumBits.h>
-#include <AK/Forward.h>
-#include <AK/StringView.h>
-#include <LibWebCommon/Export.h>
-#include <LibWebCommon/WebDriver/Response.h>
-
-namespace Web::WebDriver {
-
-enum class SessionFlags {
-    Default = 0x0,
-    Http = 0x1,
-};
-AK_ENUM_BITWISE_OPERATORS(SessionFlags);
-
-// https://w3c.github.io/webdriver/#dfn-page-load-strategy
-enum class PageLoadStrategy {
-    None,
-    Eager,
-    Normal,
-};
-
-constexpr PageLoadStrategy page_load_strategy_from_string(StringView strategy)
-{
-    if (strategy == "none"sv)
-        return PageLoadStrategy::None;
-    if (strategy == "eager"sv)
-        return PageLoadStrategy::Eager;
-    if (strategy == "normal"sv)
-        return PageLoadStrategy::Normal;
-    VERIFY_NOT_REACHED();
-}
-
-enum class InterfaceMode {
-    Graphical,
-    Headless,
-};
-WEBCOMMON_API void set_default_interface_mode(InterfaceMode);
-
-struct WEBCOMMON_API LadybirdOptions {
-    explicit LadybirdOptions(JsonObject const& capabilities);
-
-    bool headless { false };
-    bool enable_test_hooks { false };
-};
-
-WEBCOMMON_API Response process_capabilities(JsonValue const& parameters, SessionFlags flags);
-
-}
-
-FILE: Libraries/LibWebCommon/WebDriver/Client.cpp
-/*
- * Copyright (c) 2022, Florent Castelli <florent.castelli@gmail.com>
- * Copyright (c) 2022, Sam Atkins <atkinssj@serenityos.org>
- * Copyright (c) 2022, Tobias Christiansen <tobyase@serenityos.org>
- * Copyright (c) 2022, Linus Groh <linusg@serenityos.org>
- * Copyright (c) 2022-2024, Tim Flynn <trflynn89@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <AK/ByteBuffer.h>
-#include <AK/Debug.h>
-#include <AK/Format.h>
-#include <AK/IPv4Address.h>
-#include <AK/IPv6Address.h>
-#include <AK/JsonObject.h>
-#include <AK/JsonValue.h>
-#include <AK/Span.h>
-#include <AK/StringBuilder.h>
-#include <AK/StringView.h>
-#include <AK/Time.h>
-#include <LibCore/Promise.h>
-#include <LibHTTP/Status.h>
-#include <LibWebCommon/WebDriver/Client.h>
-
-namespace Web::WebDriver {
-
-using RouteHandler = Client::ResponsePromise (*)(Client&, Parameters, JsonValue);
-
-struct Route {
-    HTTP::HttpRequest::Method method {};
-    StringView path;
-    RouteHandler handler { nullptr };
-};
-
-struct MatchedRoute {
-    RouteHandler handler;
-    Vector<String> parameters;
-    bool is_session_command { false };
-};
-
-#define ROUTE(method, path, handler)                              \
-    Route                                                         \
-    {                                                             \
-        HTTP::HttpRequest::method,                                \
-            path,                                                 \
-            [](auto& client, auto parameters, auto payload) {     \
-                return client.handler(parameters, move(payload)); \
-            }                                                     \
-    }
-
-// https://w3c.github.io/webdriver/#dfn-endpoints
-static constexpr auto s_webdriver_endpoints = Array {
-    ROUTE(POST, "/session"sv, new_session),
-    ROUTE(DELETE, "/session/:session_id"sv, delete_session),
-    ROUTE(GET, "/status"sv, get_status),
-    ROUTE(GET, "/session/:session_id/timeouts"sv, get_timeouts),
-    ROUTE(POST, "/session/:session_id/timeouts"sv, set_timeouts),
-    ROUTE(POST, "/session/:session_id/url"sv, navigate_to),
-    ROUTE(GET, "/session/:session_id/url"sv, get_current_url),
-    ROUTE(POST, "/session/:session_id/back"sv, back),
-    ROUTE(POST, "/session/:session_id/forward"sv, forward),
-    ROUTE(POST, "/session/:session_id/refresh"sv, refresh),
-    ROUTE(GET, "/session/:session_id/title"sv, get_title),
-    ROUTE(GET, "/session/:session_id/window"sv, get_window_handle),
-    ROUTE(DELETE, "/session/:session_id/window"sv, close_window),
-    ROUTE(POST, "/session/:session_id/window"sv, switch_to_window),
-    ROUTE(GET, "/session/:session_id/window/handles"sv, get_window_handles),
-    ROUTE(POST, "/session/:session_id/window/new"sv, new_window),
-    ROUTE(POST, "/session/:session_id/frame"sv, switch_to_frame),
-    ROUTE(POST, "/session/:session_id/frame/parent"sv, switch_to_parent_frame),
-    ROUTE(GET, "/session/:session_id/window/rect"sv, get_window_rect),
-    ROUTE(POST, "/session/:session_id/window/rect"sv, set_window_rect),
-    ROUTE(POST, "/session/:session_id/window/maximize"sv, maximize_window),
-    ROUTE(POST, "/session/:session_id/window/minimize"sv, minimize_window),
-    ROUTE(POST, "/session/:session_id/window/fullscreen"sv, fullscreen_window),
-    ROUTE(POST, "/session/:session_id/window/consume-user-activation"sv, consume_user_activation),
-    ROUTE(POST, "/session/:session_id/ladybird/crash-current-page"sv, crash_current_page),
-    ROUTE(POST, "/session/:session_id/ladybird/load-url-from-ui"sv, load_url_from_ui),
-    ROUTE(POST, "/session/:session_id/ladybird/traverse-history-from-ui"sv, traverse_history_from_ui),
-    ROUTE(GET, "/session/:session_id/ladybird/session-history"sv, get_session_history),
-    ROUTE(POST, "/session/:session_id/element"sv, find_element),
-    ROUTE(POST, "/session/:session_id/elements"sv, find_elements),
-    ROUTE(POST, "/session/:session_id/element/:element_id/element"sv, find_element_from_element),
-    ROUTE(POST, "/session/:session_id/element/:element_id/elements"sv, find_elements_from_element),
-    ROUTE(POST, "/session/:session_id/shadow/:shadow_id/element"sv, find_element_from_shadow_root),
-    ROUTE(POST, "/session/:session_id/shadow/:shadow_id/elements"sv, find_elements_from_shadow_root),
-    ROUTE(GET, "/session/:session_id/element/active"sv, get_active_element),
