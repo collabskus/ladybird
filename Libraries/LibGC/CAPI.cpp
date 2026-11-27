@@ -333,6 +333,11 @@ void gc_heap_enqueue_post_gc_task(GCHeap* heap, GCCallback callback, void* conte
     as_heap(heap).enqueue_post_gc_task([callback, context] { callback(context); });
 }
 
+void gc_heap_enqueue_post_move_task(GCHeap* heap, GCCallback callback, void* context)
+{
+    as_heap(heap).enqueue_post_move_task([callback, context] { callback(context); });
+}
+
 void gc_heap_register_sweep_callback(GCHeap* heap, GCCallback callback, void* context)
 {
     as_heap(heap).register_sweep_callback([callback, context] { callback(context); });
@@ -518,6 +523,16 @@ void gc_marker_visit_ephemeron_without_pinning(GCMarker* marker, GCCell* key, GC
 void gc_marker_visit_member(GCMarker* marker, uint32_t const* slot)
 {
     FFI::rust_gc_marker_visit_member(reinterpret_cast<FFI::Marker*>(marker), slot);
+}
+
+void gc_marker_visit_owned_member(GCMarker* marker, uint32_t const* slot)
+{
+    FFI::rust_gc_marker_visit_owned_member(reinterpret_cast<FFI::Marker*>(marker), slot);
+}
+
+void gc_marker_visit_owned_cell_pointer(GCMarker* marker, uintptr_t const* slot)
+{
+    FFI::rust_gc_marker_visit_owned_cell_pointer(reinterpret_cast<FFI::Marker*>(marker), slot);
 }
 
 void gc_marker_visit_interior_pointer(GCMarker* marker, uintptr_t const* slot, GCCell* cell)

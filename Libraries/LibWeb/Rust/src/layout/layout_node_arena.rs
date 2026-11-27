@@ -283,6 +283,17 @@ pub(crate) struct IntrinsicSizeCaches {
 }
 
 impl IntrinsicSizeCaches {
+    /// The bytes of the slots and of the maps they hold.
+    pub(crate) fn heap_size(&self) -> usize {
+        self.slots.heap_size(|slot| {
+            slot.sizes.as_ref().map_or(0, |maps| {
+                size_of::<IntrinsicSizeMaps>()
+                    + crate::heap_size::small_vec_bytes(&maps.content_inline_sizes.entries)
+                    + crate::heap_size::small_vec_bytes(&maps.max_content_block_size.entries)
+            })
+        })
+    }
+
     pub(super) fn cover_slots(&mut self, slot_count: usize) {
         self.slots.cover_slots(slot_count);
     }
@@ -1255,6 +1266,9 @@ pub(crate) struct LayoutNodeArena {
     free_list: ForkVec<u32>,
     /// A row a tree build made already, which the next allocation hands out: see [`Self::allocate_preallocated_row`].
     preallocated_row: Option<NodeSlotId>,
+    /// The chunks of rows freed whole since the last publication, whose published rows that publication stops
+    /// storing. See [`Self::stop_storing_rows_of_free_chunks`].
+    chunks_freed_since_publication: Vec<u32>,
     live_count: u32,
     default_scroll_shift_anchors: Vec<DefaultScrollShiftAnchorSlot>,
     text_slots: TextSlots,
@@ -1358,6 +1372,55 @@ pub(crate) struct LayoutNodeArena {
 }
 
 impl LayoutNodeArena {
+    /// Counts what the arena holds for its rows.
+    pub(crate) fn report_memory(&self, report: &mut super::memory_report::LayoutMemoryReport) {
+        use super::memory_report::LayoutMemoryOwner;
+        report.slots = self.slot_metadata.len();
+        report.live_rows = self.live_count as usize;
+        let bytes = self.chunks.row_bytes()
+            + self.chunks.len() * size_of::<Chunk>()
+            + self.tree_shape.heap_size(&mut report.sizer)
+            + self.slot_metadata.row_bytes();
+        report.add(LayoutMemoryOwner::NodeRows, bytes);
+        let bytes = self.style_column_heap_size()
+            + self.style_nodes.row_bytes()
+            + self.next_rows_with_same_style_node.row_bytes()
+            + self.first_rows_by_style_node.elements.row_bytes()
+            + self.first_rows_by_style_node.texts.row_bytes()
+            + self.bound_rows.elements.heap_size(&mut report.sizer, |_, _| 0)
+            + self.bound_rows.texts.heap_size(&mut report.sizer, |_, _| 0)
+            + self.committed_link_holders.row_bytes()
+            + self.pre_order_labels.row_bytes()
+            + self.free_list.row_bytes()
+            + self.next_rows_built_for_same_node.row_bytes()
+            + self.replaced_content_facts.heap_size(&mut report.sizer, |_, _| 0);
+        report.add(LayoutMemoryOwner::ArenaColumns, bytes);
+        let rendered_text = |rendered: &Arc<super::rendered_text::RenderedText>,
+                             sizer: &mut crate::heap_size::HeapSizer| {
+            let shallow = sizer.arc_shallow(rendered);
+            if shallow == 0 {
+                return 0;
+            }
+            shallow + rendered.heap_bytes()
+        };
+        let bytes = self.text_slots.slots.row_bytes()
+            + self.text_slots.vacant_states.row_bytes()
+            + self.text_slots.released_states.row_bytes()
+            + self.text_slots.states.heap_size(&mut report.sizer, |state, sizer| {
+                state
+                    .content
+                    .as_ref()
+                    .map_or(0, |content| rendered_text(content.rendered(), sizer))
+            })
+            + self.text_slots.published.heap_size(&mut report.sizer, |slot, sizer| {
+                slot.rendered
+                    .as_ref()
+                    .map_or(0, |rendered| rendered_text(rendered, sizer))
+            });
+        report.add(LayoutMemoryOwner::TextRows, bytes);
+        self.paintable_rows.report_memory(report);
+    }
+
     /// The bytes of the columns that name the style record each row is built from.
     pub(crate) fn style_column_heap_size(&self) -> usize {
         self.style_records.row_bytes()
@@ -1403,6 +1466,7 @@ impl LayoutNodeArena {
             pre_order_labels: ForkVec::default(),
             free_list: ForkVec::default(),
             preallocated_row: None,
+            chunks_freed_since_publication: Vec::new(),
             live_count: 0,
             default_scroll_shift_anchors: Vec::new(),
             text_slots: TextSlots::default(),
@@ -1771,12 +1835,47 @@ impl LayoutNodeArena {
                 paintable_row_resets.push(reset);
             }
         }
+        self.stop_storing_rows_of_free_chunks(&rows);
         FreedSubtree {
             rows,
             paintable_row_resets,
             arena_pinned_style_records,
             style_engine: self.style_engine.0,
         }
+    }
+
+    /// Lets the columns stop storing the rows of each chunk of slots that freeing `freed` left without a live row.
+    ///
+    /// OPTIMIZATION: A build that replaces a tree makes the new rows before the old ones are freed, so the old rows'
+    ///               slots are free from then on, and no later build fills more than a few of them. The columns never
+    ///               shrink, but a freed row is the default in each, and a column stores nothing for a chunk of those.
+    fn stop_storing_rows_of_free_chunks(&mut self, freed: &[NodeSlotId]) {
+        if freed.len() < SLOTS_PER_CHUNK / 4 {
+            // NB: Too few rows to have emptied a chunk that was mostly live. A chunk they did empty is let go of the
+            //     next time a larger subtree in it is freed, if ever.
+            return;
+        }
+        let mut chunks: Vec<u32> = freed
+            .iter()
+            .map(|slot| slot.slot_index() / SLOTS_PER_CHUNK as u32)
+            .collect();
+        chunks.sort_unstable();
+        chunks.dedup();
+        for chunk in chunks {
+            let first_slot = chunk as usize * SLOTS_PER_CHUNK;
+            let holds_live_row = (first_slot..first_slot + SLOTS_PER_CHUNK)
+                .any(|index| self.slot_metadata.get(index).is_some_and(SlotMetadata::occupied));
+            if holds_live_row {
+                continue;
+            }
+            self.paintable_rows
+                .stop_storing_default_rows(first_slot, SLOTS_PER_CHUNK);
+            self.text_slots.published.release_chunk_if_default(chunk as usize);
+            self.chunks_freed_since_publication.push(chunk);
+        }
+        // NB: A chunk can be filled and emptied again before the paint tree is next published, and is noted once.
+        self.chunks_freed_since_publication.sort_unstable();
+        self.chunks_freed_since_publication.dedup();
     }
 
     fn assert_node_is_unlinked_from_parent(&self, id: NodeSlotId) {
@@ -1941,7 +2040,9 @@ impl LayoutNodeArena {
     pub(crate) fn publish_paint_tree(
         &mut self,
     ) -> crate::cow_column::ColumnSnapshot<super::node_data::PaintNode, PUBLISHED_ROWS_PER_CHUNK> {
+        let chunks_freed = std::mem::take(&mut self.chunks_freed_since_publication);
         self.tree_shape.publish(
+            &chunks_freed,
             &mut self.chunks,
             &self.style_records,
             &self.style_nodes,
@@ -3205,17 +3306,7 @@ impl LayoutNodeArena {
     /// paint facts also follow their element's own state, such as a form control's or a media element's, are owed
     /// them on every visit.
     pub(crate) fn owe_style_image_resources_once(&mut self, id: NodeSlotId) -> bool {
-        // NB: These are the kinds whose paint facts push_paint_facts_after_style_attach() in Painting/PaintFacts.cpp
-        //     takes from their element, and the two must stay in sync.
-        if matches!(
-            self.data(id).kind.get(),
-            NodeKind::CheckBox
-                | NodeKind::RadioButton
-                | NodeKind::CanvasBox
-                | NodeKind::ImageBox
-                | NodeKind::SVGImageBox
-                | NodeKind::VideoBox
-        ) {
+        if super::node_facts::kind_takes_paint_facts_from_element(self.data(id).kind.get()) {
             return true;
         }
         let index = id.slot_index() as usize;
@@ -5486,7 +5577,7 @@ impl LayoutNodeArena {
         );
         self.paintable_rows
             .with_committed_fragment_link(node.slot_index(), node.generation(), |link| {
-                link.and_then(|link| link.placement.abspos_layout_inputs.as_deref().copied())
+                link.and_then(|link| link.placement.abspos_layout_inputs().map(|inputs| **inputs))
             })
             .or_else(|| self.confined_abspos_layout_inputs.get(&node).copied())
     }
@@ -8170,7 +8261,8 @@ mod tests {
         let allocation = arena.allocate_for_test();
         let inputs = test_abspos_layout_inputs();
         let mut link = fragment_tree::FragmentLink::for_test(allocation.slot);
-        link.placement.abspos_layout_inputs = Some(std::sync::Arc::new(inputs));
+        link.placement
+            .set_abspos_layout_inputs(Some(std::sync::Arc::new(inputs)));
         arena.set_committed_fragment_link(allocation.slot, link, None);
         assert!(arena.committed_fragment_link(allocation.slot).is_some());
         assert_eq!(arena.saved_abspos_layout_inputs(allocation.slot), Some(inputs));
@@ -8196,7 +8288,8 @@ mod tests {
         let new = arena.allocate_for_test();
         let inputs = test_abspos_layout_inputs();
         let mut link = fragment_tree::FragmentLink::for_test(old.slot);
-        link.placement.abspos_layout_inputs = Some(std::sync::Arc::new(inputs));
+        link.placement
+            .set_abspos_layout_inputs(Some(std::sync::Arc::new(inputs)));
         let retained_fragment = link.fragment.clone();
         arena.set_committed_fragment_link(old.slot, link, None);
 

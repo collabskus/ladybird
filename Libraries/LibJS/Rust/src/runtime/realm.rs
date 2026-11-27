@@ -56,7 +56,7 @@ define_cell!(Realm, Other);
 
 // SAFETY: Visits every cell a realm holds.
 unsafe impl Trace for Realm {
-    fn trace(&self, visitor: &mut Visitor) {
+    fn trace<'c>(&'c self, visitor: &mut Visitor<'c>) {
         self.intrinsics.trace(visitor);
         self.global_object.trace(visitor);
         self.global_environment.trace(visitor);
@@ -70,6 +70,8 @@ unsafe impl Trace for Realm {
             .array_prototypes_without_is_concat_spreadable
             .trace(visitor);
         self.storage.string_objects_convert_to_their_string_data.trace(visitor);
+        // NB: JIT code reads the sets through these fields, so they are visited in place, where a collection that
+        //     moves the sets rewrites them.
         self.array_iterator_next_watchpoint_set.trace(visitor);
         self.array_iterator_return_watchpoint_set.trace(visitor);
     }

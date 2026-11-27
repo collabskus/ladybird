@@ -144,6 +144,9 @@ GC_API void gc_heap_uproot_cell(GCHeap*, GCCell*);
 // The bounds of the stack of the thread that created the heap; base is the lowest address.
 GC_API void gc_heap_stack_bounds(GCHeap const*, uintptr_t* base, uintptr_t* top);
 GC_API void gc_heap_enqueue_post_gc_task(GCHeap*, GCCallback, void* context);
+// Like gc_heap_enqueue_post_gc_task(), for a task that updates what still holds the old addresses of cells that the
+// collection moved: it runs before every other post-GC task.
+GC_API void gc_heap_enqueue_post_move_task(GCHeap*, GCCallback, void* context);
 // Runs during every collection after marking and finalization and before dead cells are swept, when weak holders can
 // drop the cells that did not survive. There is no way to unregister a sweep callback, and it also runs when the heap
 // is destroyed.
@@ -165,8 +168,9 @@ GC_API void gc_allocator_destroy(GCAllocator*);
 GC_API void gc_allocator_set_traced_on_owner_thread_only(GCAllocator*);
 // Lets collections move the cells of the allocator to other blocks of it, in collections that do not scan the stack. A
 // cell moves as a bytewise copy, its old slot is freed without destroying it, and every slot that marking visited
-// through gc_marker_visit_member(), gc_marker_visit_values(), gc_marker_visit_owned_values(),
-// gc_marker_visit_interior_pointer() or gc_marker_visit_self_pointer() is rewritten. A cell that something visits by
+// through gc_marker_visit_member(), gc_marker_visit_owned_member(), gc_marker_visit_values(),
+// gc_marker_visit_owned_values(), gc_marker_visit_owned_cell_pointer(), gc_marker_visit_interior_pointer() or
+// gc_marker_visit_self_pointer() is rewritten. A cell that something visits by
 // value, through gc_marker_visit_cell() or as a root, or that gc_marker_pin_cell() pins, stays where it is. So a type
 // may only be movable if everything that keeps its address without visiting it as a slot either pins it or forgets it
 // (see gc_cell_will_move()). It must be called before the allocator allocates a cell.
@@ -262,6 +266,13 @@ GC_API void gc_marker_visit_owned_values(GCMarker*, uint64_t const*, size_t coun
 // Visits the cell that the compressed pointer in the slot points to, if it is not null. A collection that moves cells
 // rewrites the slot if it is in a cell, and keeps the cell where it is otherwise.
 GC_API void gc_marker_visit_member(GCMarker*, uint32_t const* slot);
+// Like gc_marker_visit_member(), for a slot in memory that the cell being visited owns outside the heap, which a
+// collection that moves cells rewrites where it is, as with gc_marker_visit_owned_values().
+GC_API void gc_marker_visit_owned_member(GCMarker*, uint32_t const* slot);
+// Visits the cell that the pointer in the slot points to, if it is not null, for a slot in memory that the cell being
+// visited owns outside the heap, which a collection that moves cells rewrites where it is, as with
+// gc_marker_visit_owned_values().
+GC_API void gc_marker_visit_owned_cell_pointer(GCMarker*, uintptr_t const* slot);
 // Visits a cell that the pointer in the slot points into, past its start, like the values of storage a cell keeps.
 GC_API void gc_marker_visit_interior_pointer(GCMarker*, uintptr_t const* slot, GCCell* cell);
 // Notes a pointer in the slot to somewhere in the cell that holds it, up to one past its end, which a collection that

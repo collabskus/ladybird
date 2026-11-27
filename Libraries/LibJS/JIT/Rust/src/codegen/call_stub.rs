@@ -33,6 +33,7 @@ use super::Codegen;
 use super::Locals;
 use super::STUB_CODE_LIMIT;
 use super::STUB_ZONE_LIMIT;
+use super::call::Field;
 use super::target_registers;
 use crate::CompileFailure;
 use crate::asm::Address;
@@ -51,6 +52,7 @@ use crate::ir::Graph;
 use crate::ir::value;
 use crate::regalloc::Allocation;
 use crate::snapshot::COMPRESSED_POINTER_SHIFT;
+use crate::snapshot::CellId;
 use crate::snapshot::RuntimeInfo;
 use crate::snapshot::Snapshot;
 use ak::ZoneMap;
@@ -134,6 +136,13 @@ fn generate_stub<M: PortableMacroAssembler>(
             work: &zone,
             decoded_instructions: ZoneMap::new_in(&zone),
             runtime,
+            // NB: Stubs are shared by all code, and embed no cells.
+            cell_encoding: super::cell_encoding(runtime),
+            embedded: zone.alloc(crate::relocation::EmbeddedCells::new_in(
+                &[],
+                super::cell_encoding(runtime),
+                &zone,
+            )),
             stress: crate::snapshot::StressOptions::default(),
             pinned,
             frame: M::frame(GprSet::EMPTY, FprSet::EMPTY, local::SIZE),
@@ -180,7 +189,11 @@ fn generate_stub<M: PortableMacroAssembler>(
             undeclared_saves_area_uses: core::cell::RefCell::new(ZoneVec::new_in(&zone)),
         };
         codegen.emit_call_stub(construct)?;
-        codegen.masm.finish().map_err(super::assembly_failure)?;
+        let mut cells = crate::asm::NoCells::default();
+        codegen.masm.finish(&mut cells).map_err(super::assembly_failure)?;
+        if cells.held {
+            return Err(CompileFailure::CodeGeneration);
+        }
     }
     Ok(code)
 }
@@ -661,7 +674,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         constants.clear();
         constants.extend(self.emit_stub_call_site_fields(callee_frame, scratch, true));
         for register in (0..RESERVED_REGISTER_COUNT).filter(|register| *register != THIS_VALUE_REGISTER) {
-            constants.push((slot(register), 8, value::EMPTY));
+            constants.push((slot(register), 8, Field::Value(value::EMPTY)));
         }
         self.emit_constant_fields_with_vector(callee_frame, scratch, &mut constants, Some(M::ARGUMENT_FPRS[0]), &[])?;
         self.spare_fields = constants;
@@ -1083,7 +1096,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         let mut constants = self.spare_fields.take();
         constants.clear();
         constants.extend(self.emit_stub_call_site_fields(native_frame, temp, false));
-        constants.extend([(offsets.execution_context_executable, 8, 0)]);
+        constants.extend([(offsets.execution_context_executable, 8, Field::Cell(CellId::NULL))]);
         self.emit_constant_fields_with_vector(native_frame, temp, &mut constants, Some(M::ARGUMENT_FPRS[0]), &[])?;
         self.spare_fields = constants;
         self.masm.load_effective_address(

@@ -10,7 +10,6 @@ use core::cell::Cell;
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
-use super::capi::gc_visitor_visit_cell;
 use super::visitor::{Trace, Visitor};
 
 /// A reference to a C++ GC cell, such as the implementation object a host object wraps, which keeps that cell alive
@@ -43,10 +42,10 @@ impl ForeignCellSlot {
 
 // SAFETY: Visits the one cell the slot holds.
 unsafe impl Trace for ForeignCellSlot {
-    fn trace(&self, visitor: &mut Visitor) {
+    fn trace<'c>(&'c self, visitor: &mut Visitor<'c>) {
         if let Some(cell) = self.get() {
-            // SAFETY: The visitor is live, and set() only stores cells of its heap, which the slot has kept alive.
-            unsafe { gc_visitor_visit_cell(visitor.as_raw(), cell.as_ptr()) };
+            // SAFETY: set() only stores cells of the heap, which the slot has kept alive.
+            unsafe { visitor.visit_foreign_cell(cell) };
         }
     }
 }

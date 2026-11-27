@@ -134,9 +134,19 @@ impl<T> Copy for EntityRef<T> {}
 
 // SAFETY: The handle is the address of the entity's cell, which this visits.
 unsafe impl<T: Entity + 'static> Trace for EntityRef<T> {
-    fn trace(&self, visitor: &mut Visitor) {
+    fn trace<'c>(&'c self, visitor: &mut Visitor<'c>) {
+        self.visit(visitor);
+    }
+}
+
+impl<T: Entity + 'static> EntityRef<T> {
+    /// Visits the cell by value: the handle is not a slot the collector could rewrite.
+    pub(crate) fn visit(&self, visitor: &mut Visitor<'_>) {
+        let Some(raw) = visitor.as_raw() else {
+            return;
+        };
         // SAFETY: The visitor is live while it traces, and the cell is a cell of its heap.
-        unsafe { gc_visitor_visit_cell(visitor.as_raw().cast(), self.0.cell().cast()) };
+        unsafe { gc_visitor_visit_cell(raw.as_ptr().cast(), self.0.cell().cast()) };
     }
 }
 
@@ -147,9 +157,12 @@ pub(crate) struct CellReference(pub(crate) u64);
 
 // SAFETY: The reference is the address of its cell, which this visits.
 unsafe impl Trace for CellReference {
-    fn trace(&self, visitor: &mut Visitor) {
+    fn trace<'c>(&'c self, visitor: &mut Visitor<'c>) {
+        let Some(raw) = visitor.as_raw() else {
+            return;
+        };
         // SAFETY: The visitor is live while it traces, and the reference is the address of a cell of its heap.
-        unsafe { gc_visitor_visit_cell(visitor.as_raw().cast(), self.0 as *mut c_void) };
+        unsafe { gc_visitor_visit_cell(raw.as_ptr().cast(), self.0 as *mut c_void) };
     }
 }
 
@@ -215,8 +228,11 @@ impl WasmValues {
 
 // SAFETY: Every reference among the values is traced as the type it was made for says.
 unsafe impl Trace for WasmValues {
-    fn trace(&self, visitor: &mut Visitor) {
-        let wasm_visitor = libwasm_engine::runtime::heap::Visitor::new(visitor.as_raw().cast());
+    fn trace<'c>(&'c self, visitor: &mut Visitor<'c>) {
+        let Some(raw) = visitor.as_raw() else {
+            return;
+        };
+        let wasm_visitor = libwasm_engine::runtime::heap::Visitor::new(raw.as_ptr().cast());
         let (values, traces) = (self.values.borrow(), self.traces.borrow());
         debug_assert_eq!(values.len(), traces.len());
         for (value, &trace) in values.iter().zip(traces.iter()) {

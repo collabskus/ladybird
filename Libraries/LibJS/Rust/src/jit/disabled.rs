@@ -107,6 +107,8 @@ pub mod code {
 
         pub fn free_jit_entry_slot(&self, _vm: &Vm, _sweep: &Sweep<'_>) {}
 
+        pub fn record_jit_entry_slot_owner(&self, _vm: &Vm, _sweep: &Sweep<'_>) {}
+
         pub fn trace_jit_code(&self, _visitor: &mut Visitor) {}
 
         pub fn trace_embedded_cells_of_jit_code(&self, _vm: &Vm, _visitor: &mut Visitor) {}
@@ -242,8 +244,15 @@ pub mod dependencies {
     use super::Vm;
     use crate::layout::object::Object;
 
+    /// A cell that JIT code depends on, which nothing reads without the JIT.
     #[derive(Clone, Copy)]
-    pub struct CellId(pub u64);
+    pub struct CellId;
+
+    impl CellId {
+        pub const fn from_address(_address: u64) -> CellId {
+            CellId
+        }
+    }
 
     /// What JIT code may depend on, which the runtime notes when it stops holding.
     pub enum Dependency {

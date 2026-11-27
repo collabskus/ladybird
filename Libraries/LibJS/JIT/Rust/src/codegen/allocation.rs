@@ -15,6 +15,7 @@ use ak::ZoneVec;
 use super::Codegen;
 use super::RegisterList;
 use super::call::ConstantField;
+use super::call::Field;
 use super::slow_path_calls::slow_path_saved_registers;
 use crate::CompileFailure;
 use crate::asm::Address;
@@ -27,7 +28,11 @@ use crate::ir::Graph;
 use crate::ir::NodeId;
 use crate::ir::Op;
 use crate::ir::value;
+use crate::relocation::CompressedCell;
 use crate::snapshot::CellId;
+use crate::snapshot::CellSlot;
+use crate::snapshot::CellSlotHolds;
+use crate::snapshot::SampleSlot;
 
 /// The runtime call that allocates what an allocation node allocates.
 #[derive(Clone, Copy)]
@@ -39,7 +44,7 @@ pub(super) enum AllocationCall {
     Array(u32),
     /// `FunctionAllocationInfo::slow_path` with the sample slot and
     /// the environments in the node's inputs.
-    Function(CellId),
+    Function(SampleSlot),
     /// `RuntimeInfo::create_lexical_environment` with the parent in the
     /// node's input, the environment shape cache and the capacity.
     Environment(u32, u32),
@@ -151,15 +156,12 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         fields.extend(
             (0u32..)
                 .zip(&self.snapshot[info.template][..words])
-                .map(|(index, word)| (8 * index, 8, *word)),
-        );
-        set_field_bytes(
-            &mut fields,
-            info.shape_offset as usize,
-            &shape.compressed().to_le_bytes(),
+                .map(|(index, word)| (8 * index, 8, Field::Bits(*word))),
         );
         set_field_bytes(&mut fields, info.inline_capacity_offset as usize, &[inline_capacity]);
         fields.retain(|(offset, _, _)| *offset != info.named_properties_offset);
+        hold_image_slots(&mut fields, &self.snapshot[info.template_slots])?;
+        set_compressed_cell(&mut fields, info.shape_offset, shape.compressed())?;
         // NB: Of several initializations of a property, the last one wins.
         //     If it is a constant, the allocation stores it, and none of
         //     them runs; otherwise they all run.
@@ -175,7 +177,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
                 Some((_, _, Some(bits))) => bits,
                 None => value::UNDEFINED,
             };
-            fields.push((info.plain_inline_storage_offset + 8 * index, 8, value));
+            fields.push((info.plain_inline_storage_offset + 8 * index, 8, Field::Value(value)));
         }
         let is_absorbed = |offset: u32| matches!(last_initialization(offset), Some((_, _, Some(_))));
         self.absorbed_initializations.extend(
@@ -220,7 +222,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
             match allocation.call {
                 AllocationCall::Object(shape, reserve) => {
                     self.masm.move64(arguments[0], self.pinned.vm);
-                    self.masm.move_imm64(arguments[1], shape.0);
+                    self.move_cell(arguments[1], shape);
                     self.masm.move_imm32(arguments[2], reserve);
                     self.masm.call_absolute(self.runtime.object_allocation.slow_path);
                 }
@@ -237,6 +239,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
                     self.masm.move64(arguments[2], self.input(allocation.node, 0));
                     self.masm.move64(arguments[3], scratch);
                     self.masm.move64(arguments[0], self.pinned.vm);
+                    // NB: The slot is not a cell, and stays where it is.
                     self.masm.move_imm64(arguments[1], sample_slot.0);
                     self.masm.call_absolute(self.runtime.function_allocation.slow_path);
                 }
@@ -246,7 +249,10 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
                     self.emit_unbox_cell(scratch, parent);
                     self.masm.move64(arguments[1], scratch);
                     self.masm.move64(arguments[0], self.pinned.vm);
-                    self.masm.move_imm64(arguments[2], self.snapshot.executables[0].cell.0);
+                    // NB: The executable is the running frame's, as the code does not embed it, and collections
+                    //     move it.
+                    let running = self.frame_field(self.runtime.offsets.execution_context_executable);
+                    self.masm.load64(arguments[2], &running);
                     self.masm.move_imm32(arguments[3], shape_cache);
                     self.masm.move_imm32(arguments[4], capacity);
                     self.masm.call_absolute(self.runtime.create_lexical_environment);
@@ -263,9 +269,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
                 }
             }
             for (offset, bits) in allocation.constant_fields {
-                self.masm.move_imm64(self.pinned.scratch, *bits);
-                self.masm
-                    .store64(&Address::new(M::RETURN_GPRS[0], *offset as i32), self.pinned.scratch);
+                self.store_value(&Address::new(M::RETURN_GPRS[0], *offset as i32), *bits);
             }
             self.masm.move64(output, M::RETURN_GPRS[0]);
             match allocation.call {
@@ -471,7 +475,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         fields.extend(
             (0u32..)
                 .zip(&self.snapshot[info.template])
-                .map(|(index, word)| (8 * index, 8, *word)),
+                .map(|(index, word)| (8 * index, 8, Field::Bits(*word))),
         );
         if count != 0 {
             set_field_bytes(
@@ -488,6 +492,7 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         fields.retain(|(offset, _, _)| {
             *offset != objects.named_properties_offset && (count == 0 || *offset != layout.object_indexed_elements)
         });
+        hold_image_slots(&mut fields, &self.snapshot[info.template_slots])?;
         self.emit_constant_fields(array, temp, &mut fields)?;
         self.masm
             .load_effective_address(temp, &at(array, objects.inline_storage_offset));
@@ -495,14 +500,15 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
 
         if let Some(size_class) = storage_size_class {
             fields.clear();
+            // NB: The header of value storage holds no cells.
             fields.extend(
                 (0u32..)
                     .zip(&self.snapshot[info.storage_template])
-                    .map(|(index, word)| (8 * index, 8, *word)),
+                    .map(|(index, word)| (8 * index, 8, Field::Bits(*word))),
             );
             for index in 0..size_class.capacity {
                 let element = if index < count { value::UNDEFINED } else { value::EMPTY };
-                fields.push((info.storage_values_offset + 8 * index, 8, element));
+                fields.push((info.storage_values_offset + 8 * index, 8, Field::Value(element)));
             }
             self.emit_constant_fields(storage, temp, &mut fields)?;
             self.masm.move_imm32(temp, size_class.capacity);
@@ -567,7 +573,12 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         self.emit_count_allocation(template.cell_size, template.cell_size, temp, false);
 
         let mut fields = self.spare_fields.take();
-        template_fields(&self.snapshot[template.words], &stored, &mut fields);
+        template_fields(
+            &self.snapshot[template.words],
+            &self.snapshot[template.slots],
+            &stored,
+            &mut fields,
+        )?;
         self.emit_constant_fields(environment, temp, &mut fields)?;
         self.spare_fields = fields;
         if template.inline_binding_values {
@@ -640,7 +651,12 @@ impl<M: PortableMacroAssembler> Codegen<'_, '_, M> {
         self.emit_count_allocation(info.cell_size, info.cell_size, temp, false);
 
         let mut fields = self.spare_fields.take();
-        template_fields(&self.snapshot[closure.words], &stored, &mut fields);
+        template_fields(
+            &self.snapshot[closure.words],
+            &self.snapshot[closure.slots],
+            &stored,
+            &mut fields,
+        )?;
         self.emit_constant_fields(function, temp, &mut fields)?;
         self.spare_fields = fields;
         self.masm
@@ -696,13 +712,27 @@ fn initializations_without_gc<'g>(
 }
 
 /// Writes `bytes` at byte `offset` of the cell whose words `fields` hold, one
-/// field of 8 bytes for each word from the first on.
+/// field of 8 bytes of plain bits for each word from the first on.
 fn set_field_bytes(fields: &mut [ConstantField], offset: usize, bytes: &[u8]) {
     for (index, byte) in bytes.iter().enumerate() {
         let at = offset + index;
         let shift = 8 * (at % 8);
-        let word = &mut fields[at / 8].2;
+        let Field::Bits(word) = &mut fields[at / 8].2 else {
+            unreachable!("the fields are plain bits until hold_image_slots() says what they hold");
+        };
         *word = (*word & !(0xff << shift)) | (u64::from(*byte) << shift);
+    }
+}
+
+/// Makes `cell` the value of the field at `offset`, which must be one the slots of the image say holds a compressed
+/// cell (see `hold_image_slots()`).
+fn set_compressed_cell(fields: &mut [ConstantField], offset: u32, cell: CompressedCell) -> Result<(), CompileFailure> {
+    match fields.iter_mut().find(|(field_offset, _, _)| *field_offset == offset) {
+        Some((_, 4, field @ Field::CompressedCell(_))) => {
+            *field = Field::CompressedCell(cell);
+            Ok(())
+        }
+        _ => Err(CompileFailure::CodeGeneration),
     }
 }
 
@@ -715,10 +745,16 @@ pub(super) fn stored_fields_fit(stored: &[(u32, u32)], template_bytes: u64) -> b
     })
 }
 
-/// Makes `fields` the constant fields of a cell image `words` without the
-/// fields at `stored` (see `stored_fields_fit()`): whole words, and the
-/// halves of the words that share theirs with a 4-byte stored field.
-pub(super) fn template_fields(words: &[u64], stored: &[(u32, u32)], fields: &mut ZoneVec<'_, ConstantField>) {
+/// Makes `fields` the constant fields of a cell image `words` with the slots
+/// `slots` without the fields at `stored` (see `stored_fields_fit()`): whole
+/// words, and the halves of the words that share theirs with a 4-byte stored
+/// field, which say what they hold (see `hold_image_slots()`).
+pub(super) fn template_fields(
+    words: &[u64],
+    slots: &[CellSlot],
+    stored: &[(u32, u32)],
+    fields: &mut ZoneVec<'_, ConstantField>,
+) -> Result<(), CompileFailure> {
     let is_stored = |offset: u32, size: u32| {
         stored
             .iter()
@@ -727,13 +763,63 @@ pub(super) fn template_fields(words: &[u64], stored: &[(u32, u32)], fields: &mut
     fields.clear();
     for (offset, word) in (0u32..).step_by(8).zip(words) {
         if !is_stored(offset, 8) {
-            fields.push((offset, 8, *word));
+            fields.push((offset, 8, Field::Bits(*word)));
             continue;
         }
         for (half_offset, half) in [(offset, *word & 0xffff_ffff), (offset + 4, *word >> 32)] {
             if !is_stored(half_offset, 4) {
-                fields.push((half_offset, 4, half));
+                fields.push((half_offset, 4, Field::Bits(half)));
             }
         }
     }
+    hold_image_slots(fields, slots)
+}
+
+/// Has the fields of a cell image, words or halves of words of plain bits,
+/// say what the slots of the image `slots` hold, splitting the words that a
+/// 4-byte slot is half of. Fails if a field keeps a pointer into the cell
+/// the image comes from. Slots that no field covers are stored otherwise.
+pub(super) fn hold_image_slots(
+    fields: &mut ZoneVec<'_, ConstantField>,
+    slots: &[CellSlot],
+) -> Result<(), CompileFailure> {
+    for slot in slots {
+        let size = match slot.holds {
+            CellSlotHolds::CompressedCell => 4,
+            CellSlotHolds::Value | CellSlotHolds::Cell | CellSlotHolds::SelfPointer => 8,
+        };
+        let Some(index) = fields
+            .iter()
+            .position(|&(offset, field_size, _)| offset < slot.offset + size && slot.offset < offset + field_size)
+        else {
+            continue;
+        };
+        let typed = |bits: u64| match slot.holds {
+            CellSlotHolds::Value => Ok(Field::Value(bits)),
+            CellSlotHolds::Cell => Ok(Field::Cell(CellId::from_address(bits))),
+            CellSlotHolds::CompressedCell => Ok(Field::CompressedCell(CompressedCell::from_bits(bits as u32))),
+            CellSlotHolds::SelfPointer => Err(CompileFailure::CodeGeneration),
+        };
+        let (offset, field_size, Field::Bits(bits)) = fields[index] else {
+            return Err(CompileFailure::CodeGeneration);
+        };
+        if offset > slot.offset || slot.offset + size > offset + field_size {
+            return Err(CompileFailure::CodeGeneration);
+        }
+        match (field_size, size) {
+            (8, 8) | (4, 4) => fields[index].2 = typed(bits)?,
+            (8, 4) => {
+                let (low, high) = (bits & 0xffff_ffff, bits >> 32);
+                let (low, high) = if slot.offset == offset {
+                    (typed(low)?, Field::Bits(high))
+                } else {
+                    (Field::Bits(low), typed(high)?)
+                };
+                fields[index] = (offset, 4, low);
+                fields.push((offset + 4, 4, high));
+            }
+            _ => return Err(CompileFailure::CodeGeneration),
+        }
+    }
+    Ok(())
 }

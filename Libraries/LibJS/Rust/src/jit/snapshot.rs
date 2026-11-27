@@ -400,16 +400,16 @@ fn function_frame_fields(function: Gc<EcmascriptFunctionObject>) -> FunctionFram
     let shared_data = function.shared_data();
     FunctionFrameFields {
         script_or_module: shared_data.script_or_module.word(),
-        environment: function
-            .environment()
-            .map_or(0, |environment| environment.as_ptr() as u64),
+        environment: function.environment().map_or(CellId::NULL, |environment| {
+            CellId::from_address(environment.as_ptr() as u64)
+        }),
     }
 }
 
 /// Adds `cell` to `cells`, the cells a snapshot refers to, and returns what the snapshot knows it as.
 fn note_cell<T: Extends<CellHeader>>(cells: &mut Vec<Gc<CellHeader>>, cell: Gc<T>) -> CellId {
     cells.push(cell.upcast::<CellHeader>());
-    CellId(cell.as_ptr() as u64)
+    CellId::from_address(cell.as_ptr() as u64)
 }
 
 /// Adds the environment of `function`, whose address its FunctionFrameFields hold, to `cells`.
@@ -1364,12 +1364,8 @@ impl SnapshotBuilder<'_> {
             })),
             exit_sites: self.snapshot.add(&executable.jit_exit_sites_for_recompile()),
             builtin_exit_sites: if entry.function.is_none() {
-                self.list(
-                    executable
-                        .jit_builtin_exit_sites()
-                        .into_iter()
-                        .map(|(builtin, pc, kind)| (CellId(builtin), pc, kind)),
-                )
+                let sites = executable.map_jit_builtin_exit_sites(|builtin, pc, kind| (self.cell(builtin), pc, kind));
+                self.list(sites)
             } else {
                 List::empty()
             },

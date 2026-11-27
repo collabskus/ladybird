@@ -18,15 +18,15 @@ pub(crate) use demand::{PendingDemandInput, RecordDemand, RecordDemandAnswer};
 /// What a subtree does to the generated-content state that the boxes after it read.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct SubtreeGeneratedContentEffects {
-    /// A `counter-reset` names a counter. The counter it creates reaches only the following siblings of the element
-    /// that resets it, and their descendants.
+    /// A `counter-reset` of the root names a counter, which can reach the siblings after the root.
     pub(crate) resets_counters: bool,
-    /// A `counter-increment` or `counter-set` names a counter, or a list item below the root increments `list-item`.
-    /// The counter can be one that an ancestor or an earlier box created, and that boxes outside the subtree read. An
-    /// inserted `<li>` itself has the DOM renumber the list it joins.
+    /// A `counter-increment` or `counter-set` names a counter, or a list item below the root increments `list-item`,
+    /// and no ancestor below the root resets the counter. The counter can then be one that an ancestor of the root or
+    /// an earlier box created, and that boxes outside the subtree read. An inserted `<li>` itself has the DOM
+    /// renumber the list it joins.
     pub(crate) increments_or_sets_counters: bool,
     /// An element's own quotes leave the quote depth after it other than they found it: its `::before` and `::after`
-    /// together do, or its `::marker` or its own `content` names a quote. The walk stops once it finds one.
+    /// together do, or its `::marker` or its own `content` names a quote.
     pub(crate) has_element_with_unbalanced_quotes: bool,
 }
 
@@ -356,9 +356,9 @@ impl RetainedState {
         self.computed_group_sets.holds_no_records_affecting_generated_content()
     }
 
-    /// What the node and its DOM descendants do to the two pieces of generated-content state that run
-    /// along the whole tree rather than staying inside one box, themselves or through a `::before`,
-    /// `::after` or `::marker`. Inserting such a subtree can change what the boxes after it show.
+    /// What the node and its descendants, those in the shadow trees below it among them, do to the two pieces of
+    /// generated-content state that run along the whole tree rather than staying inside one box, themselves or through
+    /// a `::before`, `::after` or `::marker`. Inserting such a subtree can change what the boxes after it show.
     #[must_use]
     pub(crate) fn subtree_generated_content_effects(&self, root: StyleNodeID) -> SubtreeGeneratedContentEffects {
         let mut effects = SubtreeGeneratedContentEffects::default();
@@ -366,8 +366,27 @@ impl RetainedState {
         if self.computed_group_sets.holds_no_records_affecting_generated_content() {
             return effects;
         }
-        let mut pending = vec![root];
-        while let Some(node) = pending.pop() {
+        // OPTIMIZATION: A subtree that increments counters its own elements reset, as one with a list in it does,
+        //               moves no counter that a box after it reads, and the boxes after it are not built again for it.
+        // The names of the counters that the ancestors of the node the walk is at reset, below the root, and the node
+        // itself. An element always inherits the counters of its parent. It inherits one a sibling before it reset
+        // only where its parent has none of that name, which the subtree alone does not tell, so those are left out.
+        let mut counters_in_reach: Vec<&[u16]> = Vec::new();
+        enum Step {
+            Enter(StyleNodeID),
+            /// Leaves an element, with how many counters were in reach before it.
+            Leave(usize),
+        }
+        let mut pending = vec![Step::Enter(root)];
+        while let Some(step) = pending.pop() {
+            let node = match step {
+                Step::Enter(node) => node,
+                Step::Leave(counters) => {
+                    counters_in_reach.truncate(counters);
+                    continue;
+                }
+            };
+            let counters_in_reach_before = counters_in_reach.len();
             if node.element_index().is_some() {
                 // OPTIMIZATION: Most elements hold no pseudo-element record at all.
                 let has_pseudo_records = !self.computed_group_sets.has_no_pseudo_rows(node);
@@ -387,10 +406,21 @@ impl RetainedState {
                         continue;
                     };
                     let is_root_element = index == 0 && node == root;
-                    effects.resets_counters |= !view.counter_reset().is_empty();
-                    effects.increments_or_sets_counters |= !view.counter_increment().is_empty()
-                        || !view.counter_set().is_empty()
-                        || (view.display().is_list_item() && !is_root_element);
+                    if is_root_element {
+                        effects.resets_counters |= !view.counter_reset().is_empty();
+                    } else if index == 0 {
+                        // NB: A pseudo-element's counters are left out, which errs towards an effect.
+                        counters_in_reach.extend(view.counter_reset().iter().map(|counter| counter.name().units()));
+                    }
+                    let is_in_reach = |name: &[u16]| counters_in_reach.contains(&name);
+                    effects.increments_or_sets_counters |= view
+                        .counter_increment()
+                        .iter()
+                        .chain(view.counter_set())
+                        .any(|counter| !is_in_reach(counter.name().units()))
+                        || (!is_root_element
+                            && crate::layout::counters::style_has_implicit_list_item_increment(view)
+                            && !is_in_reach(&crate::layout::counters::LIST_ITEM_COUNTER_NAME));
                 }
                 let [element_record, before_record, after_record, marker_record] = records;
                 let names_quotes = |record| {
@@ -408,11 +438,23 @@ impl RetainedState {
                         .then(generated_quote_transfer(after_record))
                         .is_identity()
                 {
+                    // NB: The walk goes on, as the caller asks of the whole subtree whether it moves a counter.
                     effects.has_element_with_unbalanced_quotes = true;
-                    return effects;
                 }
             }
-            pending.extend(self.tree.dom_children(node));
+            pending.push(Step::Leave(counters_in_reach_before));
+            // NB: The boxes of a shadow tree go in the box of its host, so the tree is walked beside the host's own
+            //     children.
+            pending.extend(self.projection.shadow_root_of(node).map(Step::Enter));
+            // NB: A slot's box holds the boxes of the nodes it shows, which may stand outside the subtree.
+            pending.extend(self.projection.assigned_nodes_of(node).iter().copied().map(Step::Enter));
+            // NB: A child that a slot shows is reached through the slot alone, so no node is walked twice.
+            pending.extend(
+                self.tree
+                    .dom_children(node)
+                    .filter(|child| self.projection.assigned_slot_of(*child).is_none())
+                    .map(Step::Enter),
+            );
         }
         effects
     }

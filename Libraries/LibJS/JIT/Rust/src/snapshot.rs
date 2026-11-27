@@ -29,23 +29,32 @@ use crate::bytecode::ExceptionHandler;
 use crate::bytecode::FrameLayout;
 use crate::code::ExitKind;
 
-/// The address of a GC cell on the main thread, used as an opaque identity.
-/// It is never dereferenced by the compiler.
+/// The address of the slot that holds the sample of a closure template (see `ClosureTemplateSnapshot::sample_slot`).
+/// It is not a cell: the runtime keeps the slot where it is, and plain bits may hold it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct CellId(pub u64);
+pub struct SampleSlot(pub u64);
 
-/// How far a cell's address is shifted right to compress it: cells store
-/// pointers to other cells as the low 32 bits of the shifted address (their
-/// offset into the 32 GiB heap region, which is aligned to its size, in units
-/// of the 8-byte cell alignment), and 0 for null.
-pub const COMPRESSED_POINTER_SHIFT: u8 = 3;
+pub use crate::asm::relocation::{COMPRESSED_POINTER_SHIFT, CellId, CompressedCell};
 
-impl CellId {
-    /// The cell's compressed pointer, which a field that holds the cell
-    /// compares equal to without decoding.
-    pub fn compressed(self) -> u32 {
-        (self.0 >> COMPRESSED_POINTER_SHIFT) as u32
-    }
+/// What a slot of a cell image holds, as tracing the cell found it. Bytes of the image outside its slots are plain
+/// bits, whatever their value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellSlotHolds {
+    /// A value, which is a cell if its tag says so.
+    Value,
+    /// The address of a cell, or 0.
+    Cell,
+    /// The compressed pointer of a cell, or 0.
+    CompressedCell,
+    /// A pointer into the cell itself, which a copy of the image must not keep.
+    SelfPointer,
+}
+
+/// A slot of a cell image, `offset` bytes into the cell (see `CellSlotHolds`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellSlot {
+    pub offset: u32,
+    pub holds: CellSlotHolds,
 }
 
 /// One bytecode executable: the function being compiled (index 0) or an
@@ -289,13 +298,14 @@ pub struct ClosureTemplateSnapshot {
     /// The address of the slot that holds the sample, a function object
     /// the closures are copies of, which is no cell: the code that copies
     /// the sample keeps the slot, and the sample may move.
-    pub sample_slot: CellId,
+    pub sample_slot: SampleSlot,
     /// The cells the words refer to, the shape and the shared function
     /// data of the sample, which code that copies the words embeds.
     pub shape: CellId,
     pub shared_data: CellId,
-    /// Its bytes (see `FunctionAllocationInfo`).
+    /// Its bytes (see `FunctionAllocationInfo`), and the slots in them.
     pub words: List<u64>,
+    pub slots: List<CellSlot>,
     /// The index in `Snapshot::executables` of the closures' executable, if
     /// calls of them can be inlined.
     pub inline_executable: Option<u32>,
@@ -598,9 +608,9 @@ impl ForwardedCallSnapshot {
 /// one JIT code can allocate itself. Its executable and realm stay the same
 /// for as long as the function lives. Code that calls it embeds
 /// `function.function` (`function.shared_data` for `closures`), `executable`,
-/// `function.realm` (and
-/// `function.global_this` if it binds `this` to it, and the cells of its
-/// environment template) and must list them in
+/// `function.realm`, the environment in `function_fields` unless it calls
+/// `closures` (and `function.global_this` if it binds `this` to it, and the
+/// cells of its environment template) and must list them in
 /// `CompiledCode::embedded_cells`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DirectCallTarget {
@@ -638,6 +648,7 @@ pub struct LexicalEnvironmentTemplateSnapshot {
     pub allocator: u64,
     pub cell_size: u32,
     pub words: List<u64>,
+    pub slots: List<CellSlot>,
     pub binding_count: u32,
     pub inline_binding_values: bool,
     pub binding_values_offset: u32,
@@ -659,6 +670,7 @@ pub struct EnvironmentTemplateSnapshot {
     pub allocator: u64,
     pub cell_size: u32,
     pub words: List<u64>,
+    pub slots: List<CellSlot>,
     /// Whether the environment has room for binding values in its cell.
     pub inline_binding_values: bool,
     pub binding_values_offset: u32,
@@ -676,8 +688,9 @@ pub struct EnvironmentTemplateSnapshot {
 /// as long as the function.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FunctionFrameFields {
+    /// The `ScriptOrModuleSlot` word, plain bits: scripts and modules never move.
     pub script_or_module: u64,
-    pub environment: u64,
+    pub environment: CellId,
 }
 
 impl FunctionFrameFields {
@@ -1461,8 +1474,9 @@ pub struct ObjectAllocationInfo {
     pub local_cursor_offset: u32,
     pub local_end_offset: u32,
     pub local_cell_size_offset: u32,
-    /// The bytes every new plain object starts with, as u64 words.
+    /// The bytes every new plain object starts with, as u64 words, and the slots in them.
     pub template: List<u64>,
+    pub template_slots: List<CellSlot>,
     pub shape_offset: u32,
     pub named_properties_offset: u32,
     /// Where the inline named storage of the objects of other classes starts.
@@ -1511,8 +1525,9 @@ pub struct RopeAllocationInfo {
     /// The `GC::CellAllocator` of rope strings.
     pub allocator: u64,
     pub cell_size: u32,
-    /// The bytes every new rope string starts with, as u64 words.
+    /// The bytes every new rope string starts with, as u64 words, and the slots in them.
     pub template: List<u64>,
+    pub template_slots: List<CellSlot>,
     pub lhs_offset: u32,
     pub rhs_offset: u32,
     pub length_offset: u32,
@@ -1551,6 +1566,7 @@ pub struct ArrayAllocationInfo {
     pub allocator: u64,
     pub cell_size: u32,
     pub template: List<u64>,
+    pub template_slots: List<CellSlot>,
     pub shape: CellId,
     /// By ascending capacity.
     pub storage_size_classes: List<StorageSizeClass>,
@@ -1869,6 +1885,7 @@ rows! {
     offsets: u32,
     words: u64,
     cells: CellId,
+    cell_slots: CellSlot,
     exception_handlers: ExceptionHandler,
     exit_sites: (u32, ExitKind),
     builtin_exit_sites: (CellId, u32, ExitKind),
@@ -2074,6 +2091,21 @@ pub struct TypeofStrings {
     pub boolean: u64,
     pub bigint: u64,
     pub function: u64,
+}
+
+impl TypeofStrings {
+    pub fn all(&self) -> [u64; 8] {
+        [
+            self.number,
+            self.undefined,
+            self.object,
+            self.string,
+            self.symbol,
+            self.boolean,
+            self.bigint,
+            self.function,
+        ]
+    }
 }
 
 /// What the inline code of compiled nodes needs to know about the runtime's

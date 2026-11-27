@@ -35,6 +35,7 @@ use crate::gc::capi::{self, GCVisitor};
 use crate::gc::class::{GcCell, define_cell};
 use crate::gc::foreign::ForeignCellSlot;
 use crate::gc::gc_ref_cell::GcRefCell;
+use crate::gc::gc_ref_cell::ref_cell_for_trace;
 use crate::gc::heap::Heap;
 use crate::gc::heap_function::HeapFunction;
 use crate::gc::root::{MarkedVec, Root, RootSet};
@@ -81,7 +82,7 @@ use crate::runtime::module::{Module, finish_loading_imported_module};
 use crate::runtime::module_loading::{ImportedModulePayload, ImportedModuleReferrer};
 use crate::runtime::module_request::ModuleRequest;
 use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFunction;
-use crate::runtime::object::{IndexedDictionary, IntrinsicAccessor};
+use crate::runtime::object::{FunctionIndexedDictionary, IntrinsicAccessor};
 use crate::runtime::primitive_string::PrimitiveString;
 use crate::runtime::promise::{Promise, PromiseState, RejectionOperation};
 use crate::runtime::property_key::PropertyKey;
@@ -118,14 +119,14 @@ pub enum CompilationType {
 
 /// The intrinsic accessors of each object that still has any, by the object's address.
 pub type IntrinsicAccessorMap = HashMap<
-    usize,
+    Gc<Object>,
     HashMap<Utf16FlyString, IntrinsicAccessor, foldhash::fast::RandomState>,
     foldhash::fast::RandomState,
 >;
 
 /// The properties defined with Object::define_unimplemented_property, by the address of their object.
 pub type UnimplementedPropertyMap =
-    HashMap<usize, HashSet<Utf16FlyString, foldhash::fast::RandomState>, foldhash::fast::RandomState>;
+    HashMap<Gc<Object>, HashSet<Utf16FlyString, foldhash::fast::RandomState>, foldhash::fast::RandomState>;
 
 /// HostEnsureCanAddPrivateElement, which hosts that are web browsers may override.
 pub type HostEnsureCanAddPrivateElement = fn(&Vm, &Object) -> ThrowCompletionOr<()>;
@@ -510,7 +511,6 @@ fn key_concatenation_cache_index(lhs: u64, rhs: u64) -> usize {
     (((lhs >> 4) ^ (rhs >> 4).wrapping_mul(33)) as usize) & (KEY_CONCATENATION_CACHE_SIZE - 1)
 }
 
-#[derive(Trace)]
 pub struct NumericStringCacheEntry {
     pub number: Cell<u64>,
     pub string: Cell<Option<Gc<PrimitiveString>>>,
@@ -585,11 +585,11 @@ pub struct Vm {
     native_function_count: Cell<u32>,
     /// The index of each function in the native function table, by its address and type.
     native_function_indices: RefCell<HashMap<(usize, u32), u32>>,
-    /// The indexed property dictionaries of the ECMAScript function objects that have one, by address. Those objects
-    /// have no pointer to their indexed elements (see `EcmascriptFunctionFields`), and hardly any of them has indexed
-    /// properties. The objects trace and free their dictionaries.
+    /// The indexed property dictionaries of the ECMAScript function objects that have one. Those objects have no
+    /// pointer to their indexed elements (see `EcmascriptFunctionFields`), and hardly any of them has indexed
+    /// properties. The objects trace their dictionaries, which go away with their entries.
     pub(crate) function_indexed_dictionaries:
-        RefCell<HashMap<usize, *mut IndexedDictionary, foldhash::fast::RandomState>>,
+        RefCell<HashMap<Gc<Object>, FunctionIndexedDictionary, foldhash::fast::RandomState>>,
     roots: RootSet,
 
     pub names: CommonPropertyNames,
@@ -1335,15 +1335,25 @@ impl Vm {
         &self.roots
     }
 
-    fn gather_roots(&self, visitor: &mut Visitor) {
+    fn gather_roots<'c>(&'c self, visitor: &mut Visitor<'c>) {
         self.code_flushing.begin_pass(self);
         self.jit.trace(visitor);
         self.trace_embedded_cells_of_running_jit_code(visitor);
+        // SAFETY: The execution contexts stay where they are until the collection is over: no code runs during it.
+        let outlives_the_collection = |context: &ExecutionContext| unsafe { &*core::ptr::from_ref(context) };
         self.for_each_execution_context_top_to_bottom(|context| {
-            context.trace(visitor);
+            outlives_the_collection(context).trace(visitor);
             ControlFlow::Continue(())
         });
-        for saved_stack in self.saved_execution_context_stacks.borrow().iter() {
+        // SAFETY: Nothing writes the saved stacks, the debugger or the last throw while a collection traces them.
+        let (saved_execution_context_stacks, debugger, last_throw) = unsafe {
+            (
+                ref_cell_for_trace(&self.saved_execution_context_stacks),
+                ref_cell_for_trace(&self.debugger),
+                ref_cell_for_trace(&self.last_throw),
+            )
+        };
+        for saved_stack in saved_execution_context_stacks {
             for_each_execution_context_top_to_bottom_of(
                 saved_stack.length,
                 |index| {
@@ -1355,7 +1365,7 @@ impl Vm {
                 },
                 saved_stack.running_execution_context,
                 |context| {
-                    context.trace(visitor);
+                    outlives_the_collection(context).trace(visitor);
                     ControlFlow::Continue(())
                 },
             );
@@ -1365,8 +1375,6 @@ impl Vm {
         self.empty_string.trace(visitor);
         self.empty_realm.trace(visitor);
         self.single_ascii_character_strings.trace(visitor);
-        self.numeric_string_cache.trace(visitor);
-        self.large_numeric_string_cache.trace(visitor);
         self.json_parse_cache.trace(visitor);
         self.json_stringify_cache.trace(visitor);
         self.cached_strings.trace(visitor);
@@ -1377,10 +1385,10 @@ impl Vm {
         self.job_queues.trace(visitor);
         self.loaded_modules.trace(visitor);
         self.finalization_registries_with_dead_cells.trace(visitor);
-        if let Some(debugger) = self.debugger.borrow().as_ref() {
+        if let Some(debugger) = debugger {
             debugger.trace(visitor);
         }
-        if let Some(throw_site) = self.last_throw.borrow().as_ref() {
+        if let Some(throw_site) = last_throw {
             throw_site.value.trace(visitor);
         }
     }
@@ -1476,20 +1484,34 @@ impl Vm {
         }
     }
 
-    /// Forgets the intrinsic accessors and unimplemented properties of objects that died in this collection.
+    /// Forgets the intrinsic accessors and unimplemented properties of objects that died in this collection. The maps
+    /// are keyed by the identity of the objects, which moves do not change, and a collection that moves an object
+    /// rewrites its key.
     fn remove_dead_objects_from_intrinsic_accessors_and_unimplemented_properties(&self, sweep: &Sweep<'_>) {
-        let is_live = |object: usize| {
-            // SAFETY: The maps only hold objects that were live when their entries were added, and a dead object is
-            //         intact until the sweep that follows this callback.
-            let object = unsafe { Gc::from_non_null(NonNull::new_unchecked(object as *mut Object)) };
-            !sweep.is_dead(object)
-        };
-        self.intrinsic_accessors
-            .borrow_mut()
-            .retain(|&object, _| is_live(object));
-        self.unimplemented_properties
-            .borrow_mut()
-            .retain(|&object, _| is_live(object));
+        let mut intrinsic_accessors = self.intrinsic_accessors.borrow_mut();
+        let mut unimplemented_properties = self.unimplemented_properties.borrow_mut();
+        intrinsic_accessors.retain(|object, _| !sweep.is_dead(*object));
+        unimplemented_properties.retain(|object, _| !sweep.is_dead(*object));
+        if sweep.moves_cells() {
+            for object in intrinsic_accessors.keys().chain(unimplemented_properties.keys()) {
+                // SAFETY: Only defining and reading the properties of objects changes the maps, which nothing does
+                //         until the collection is over.
+                unsafe { sweep.record_slot(object) };
+            }
+        }
+    }
+
+    /// Frees the indexed dictionaries of functions that died in this collection. The map is keyed by the identity of
+    /// the functions, which moves do not change, and a collection that moves a function rewrites its key.
+    fn remove_dead_functions_from_indexed_dictionaries(&self, sweep: &Sweep<'_>) {
+        let mut dictionaries = self.function_indexed_dictionaries.borrow_mut();
+        dictionaries.retain(|function, _| !sweep.is_dead(*function));
+        if sweep.moves_cells() {
+            for function in dictionaries.keys() {
+                // SAFETY: Only the functions change the map, which nothing runs until the collection is over.
+                unsafe { sweep.record_slot(function) };
+            }
+        }
     }
 
     pub fn intrinsic_accessors(&self) -> &RefCell<IntrinsicAccessorMap> {
@@ -1745,6 +1767,22 @@ impl Vm {
             }
         }
         drop(interned_strings);
+        // NB: The numeric string caches hold their strings weakly, rather than as roots, which would keep every string
+        //     they ever made where it is.
+        let moves_cells = sweep.moves_cells();
+        let slots = self
+            .numeric_string_cache
+            .iter()
+            .chain(self.large_numeric_string_cache.iter().map(|entry| &entry.string));
+        for slot in slots {
+            if slot.get().is_some_and(|string| sweep.is_dead(string)) {
+                slot.set(None);
+            } else if moves_cells {
+                // SAFETY: Only making a numeric string changes the caches, which nothing does until the collection is
+                //         over.
+                unsafe { sweep.record_optional_slot(slot) };
+            }
+        }
         self.characters_to_atom_cache
             .borrow_mut()
             .fill_with(CharactersToAtomCacheEntry::default);
@@ -1768,12 +1806,30 @@ impl Vm {
             idle_collection_count.set(idle_collection_count.get().saturating_add(1));
             true
         });
+        // NB: The list and the JIT entry table keep the executables by address, without visiting them, so a collection
+        //     that moves executables rewrites the addresses of those that survived.
+        if sweep.moves_cells() {
+            for executable in self.executables.borrow().iter() {
+                // SAFETY: Only creating an executable changes the list, which nothing does until the collection is
+                //         over, and the executable survived.
+                unsafe { sweep.record_slot(executable) };
+                executable.record_jit_entry_slot_owner(self, sweep);
+            }
+        }
         self.static_property_lookup_caches.remove_dead_entries(sweep);
         self.keyed_property_lookup_cache.remove_dead_entries(sweep);
         self.prototype_transition_cache.remove_dead_entries(sweep);
         self.construct_shape_cache.remove_dead_entries(sweep);
         self.keyed_property_store_cache.remove_dead_entries(sweep);
         self.jit.dependents.remove_dead_entries(self, sweep);
+    }
+
+    /// Calls `f` with every executable of the VM, which must not make or drop any meanwhile.
+    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
+    pub(crate) fn for_each_executable(&self, mut f: impl FnMut(Gc<Executable>)) {
+        for executable in self.executables.borrow().iter() {
+            f(*executable);
+        }
     }
 
     /// Has the JIT code that idled long enough in this collection flushed once the collection is over.
@@ -2543,7 +2599,7 @@ impl Drop for Vm {
 // SAFETY: gather_roots() visits the VM's roots. The caches it skips are weak, and the VM clears them of dead cells after
 // each collection.
 unsafe impl Trace for Vm {
-    fn trace(&self, visitor: &mut Visitor) {
+    fn trace<'c>(&'c self, visitor: &mut Visitor<'c>) {
         self.gather_roots(visitor);
     }
 }
@@ -2576,6 +2632,7 @@ unsafe extern "C" fn sweep(context: *mut c_void) {
     vm.remove_dead_cells_from_property_lookup_caches(&sweep);
     vm.clear_idle_collection_counts_of_running_executables();
     vm.remove_dead_objects_from_intrinsic_accessors_and_unimplemented_properties(&sweep);
+    vm.remove_dead_functions_from_indexed_dictionaries(&sweep);
     if let Some(debugger) = vm.debugger() {
         debugger.remove_dead_executables(&sweep);
     }

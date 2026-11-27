@@ -39,6 +39,7 @@ use libjs_runtime_macros::Trace;
 
 use crate::bytecode::executable::Executable;
 use crate::gc::defer_gc::{DeferGc, Deferred};
+use crate::gc::gc_ref_cell::ref_cell_for_trace;
 use crate::gc::visitor::{Trace, Visitor};
 use crate::interpreter::dispatch_tables::DispatchTable;
 use crate::interpreter::vm::Vm;
@@ -173,6 +174,9 @@ pub struct JitState {
     codes_detached_in_collection: RefCell<DetachedJitCode>,
     /// Whether code that is detached now goes into `codes_detached_in_collection`.
     defers_code_drops: Cell<bool>,
+    /// Whether the collection in progress patches the code once it is over (see
+    /// `relocate_code_once_collection_is_over()`).
+    relocates_code: Cell<bool>,
     /// With the "stress-invalidate" option, how many more tier-up checks happen before the next invalidation.
     stress_invalidation_countdown: Cell<u32>,
     /// With the "coverage" option, how often each coverage key was counted.
@@ -242,6 +246,7 @@ impl JitState {
             held_compile_results: RefCell::default(),
             codes_detached_in_collection: RefCell::default(),
             defers_code_drops: Cell::new(false),
+            relocates_code: Cell::new(false),
             stress_invalidation_countdown,
             coverage: RefCell::default(),
             warming_up_dispatch_table,
@@ -343,6 +348,20 @@ impl JitState {
         self.defers_code_drops
             .get()
             .then_some(&self.codes_detached_in_collection)
+    }
+
+    /// Has the code of every executable patched where it holds cells that the collection in progress moves (see
+    /// `JitCode::relocate()`), and the dependents keyed by where their cells are now (see `Dependents::rekey()`), once
+    /// it is over and before any other post-GC task can run JS or invalidate dependents.
+    pub(crate) fn relocate_code_once_collection_is_over(&self, vm: &Vm) {
+        if self.relocates_code.replace(true) {
+            return;
+        }
+        // SAFETY: The VM outlives its heap, whose collections run the task.
+        unsafe {
+            vm.heap()
+                .enqueue_post_move_task(relocate_code, core::ptr::from_ref(vm).cast_mut().cast());
+        }
     }
 
     /// Has the code detached until the returned guard goes away kept until the collection in progress is over, for
@@ -535,8 +554,9 @@ impl Drop for JitState {
 }
 
 unsafe impl Trace for JitState {
-    fn trace(&self, visitor: &mut Visitor) {
-        for job in self.jobs.borrow().values() {
+    fn trace<'c>(&'c self, visitor: &mut Visitor<'c>) {
+        // SAFETY: Nothing writes the jobs while a collection traces them.
+        for job in unsafe { ref_cell_for_trace(&self.jobs) }.values() {
             job.trace(visitor);
         }
     }
@@ -570,6 +590,28 @@ impl Drop for CodeDropDeferral<'_> {
     fn drop(&mut self) {
         self.0.defers_code_drops.set(false);
     }
+}
+
+/// How JIT code of `vm` encodes cells (see `libjs_jit::relocation`).
+fn cell_encoding(vm: &Vm) -> libjs_jit::relocation::CellEncoding {
+    libjs_jit::relocation::CellEncoding {
+        heap_region_base: vm.head.heap_region_base.get() as u64,
+        value_offset_mask: crate::build_configuration::HEAP_REGION_OFFSET_MASK,
+        value_is_cell_pattern: libjs_abi::value::SHIFTED_IS_CELL_PATTERN,
+    }
+}
+
+unsafe extern "C" fn relocate_code(context: *mut c_void) {
+    // SAFETY: The task was enqueued with the VM as its context.
+    let vm = unsafe { &*context.cast::<Vm>() };
+    vm.jit.relocates_code.set(false);
+    vm.jit.dependents.rekey();
+    let encoding = cell_encoding(vm);
+    vm.for_each_executable(|executable| {
+        if let Some(code) = executable.jit_code(vm) {
+            code.relocate(encoding);
+        }
+    });
 }
 
 unsafe extern "C" fn drop_codes_detached_in_collection(context: *mut c_void) {

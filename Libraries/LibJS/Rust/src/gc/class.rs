@@ -47,6 +47,9 @@ pub struct Class {
     /// Whether LibGC may only trace the cells of this class on the thread that owns their heap, see
     /// traced_on_owner_thread_only().
     owner_thread_only: bool,
+    /// The trace of the cells of this class, which type_info.visit_edges calls with the visitor LibGC passes, for
+    /// tracing them with a visitor that is not one of LibGC's (see record_cell_slots()).
+    pub trace: unsafe fn(cell: *const c_void, visitor: &mut Visitor<'_>),
 }
 
 // The layout module's mirror of the class, through which Layout.h tells an embedder where a class keeps its id and
@@ -67,7 +70,7 @@ pub(crate) const MIN_CELL_SIZE: usize = 24;
 const MAX_CELL_ALIGNMENT: usize = 16;
 
 impl Class {
-    pub const fn new<T: Trace>(
+    pub const fn new<T: Trace + 'static>(
         name: &'static str,
         id: ClassId,
         kind: CellKind,
@@ -103,6 +106,7 @@ impl Class {
             object_methods,
             kind,
             owner_thread_only: false,
+            trace: trace::<T>,
         }
     }
 
@@ -159,6 +163,35 @@ impl Class {
                 | ClassId::Set
                 | ClassId::SetIterator
                 | ClassId::Promise
+                | ClassId::PromiseResolvingFunction
+                | ClassId::PromiseCapability
+                | ClassId::PromiseReaction
+                | ClassId::JobCallback
+                | ClassId::CapturingNativeFunction
+                | ClassId::WatchpointSet
+                | ClassId::DeclarativeEnvironmentRareData
+                | ClassId::SharedFunctionInstanceData
+                | ClassId::Executable
+                | ClassId::CallEnvironmentTemplate
+                | ClassId::EnvironmentShape
+                | ClassId::ObjectPropertyIteratorCacheData
+                | ClassId::RawNativeFunction
+                | ClassId::DirectGetterFunction
+                | ClassId::ArrayBuffer
+                | ClassId::TypedArrayBase
+                | ClassId::Uint8Array
+                | ClassId::Uint8ClampedArray
+                | ClassId::Uint16Array
+                | ClassId::Uint32Array
+                | ClassId::BigUint64Array
+                | ClassId::Int8Array
+                | ClassId::Int16Array
+                | ClassId::Int32Array
+                | ClassId::BigInt64Array
+                | ClassId::Float16Array
+                | ClassId::Float32Array
+                | ClassId::Float64Array
+                | ClassId::DataView
         )
     }
 
@@ -177,10 +210,17 @@ impl Class {
     }
 }
 
-unsafe extern "C" fn visit_edges<T: Trace>(cell: *mut c_void, visitor: *mut GCVisitor) {
+unsafe extern "C" fn visit_edges<T: Trace + 'static>(cell: *mut c_void, visitor: *mut GCVisitor) {
     // SAFETY: LibGC passes a live cell of this class and a visitor that outlives the call.
-    let (cell, mut visitor) = unsafe { (&*cell.cast::<T>(), Visitor::from_raw(visitor)) };
-    cell.trace(&mut visitor);
+    unsafe { trace::<T>(cell, &mut Visitor::from_raw(visitor)) };
+}
+
+/// # Safety
+///
+/// `cell` must be a live cell of the class of `T`, which stays where it is while the visitor visits it.
+unsafe fn trace<T: Trace + 'static>(cell: *const c_void, visitor: &mut Visitor<'_>) {
+    // SAFETY: The caller vouches for the cell.
+    unsafe { &*cell.cast::<T>() }.trace(visitor);
 }
 
 /// Cells that need to act before they are destroyed. Finalizers run during a collection, while every cell that dies
@@ -264,6 +304,7 @@ impl Class {
             object_methods,
             kind: parent.kind,
             owner_thread_only: parent.owner_thread_only,
+            trace: parent.trace,
         }));
         #[cfg(feature = "address-sanitizer")]
         // SAFETY: The class is a live allocation, which the process keeps for as long as it runs.

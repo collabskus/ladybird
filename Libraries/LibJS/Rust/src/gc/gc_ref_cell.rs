@@ -59,7 +59,21 @@ impl<T: Default> Default for GcRefCell<T> {
 
 // SAFETY: Traces the current value.
 unsafe impl<T: Trace> Trace for GcRefCell<T> {
-    fn trace(&self, visitor: &mut Visitor) {
+    fn trace<'c>(&'c self, visitor: &mut Visitor<'c>) {
+        // SAFETY: Nothing writes the value while a collection traces it.
+        unsafe { self.borrow_for_trace() }.trace(visitor);
+    }
+}
+
+impl<T> GcRefCell<T> {
+    /// The value, for a trace() that visits it in a way of its own. It is not borrowed, so the borrow state does not
+    /// keep code from writing it.
+    ///
+    /// # Safety
+    ///
+    /// Nothing may borrow the value mutably, replace it or write it while the reference lives. This holds during a
+    /// trace, as no code runs while a collection marks.
+    pub(crate) unsafe fn borrow_for_trace(&self) -> &T {
         // NB: Marking may trace the cell on a thread other than the one that owns the heap, so this only reads the
         //     borrow state, rather than borrow the value.
         // SAFETY: The thread that owns the heap is stopped while its collection marks, and it holds no mutable borrow,
@@ -68,8 +82,23 @@ unsafe impl<T: Trace> Trace for GcRefCell<T> {
             eprintln!("libjs_rust: garbage collection while a GcRefCell is mutably borrowed");
             std::process::abort();
         };
-        value.trace(visitor);
+        value
     }
+}
+
+/// The value of `cell`, for a trace() that visits the slots in it: like GcRefCell::borrow_for_trace(), for a RefCell
+/// that only the thread that owns the heap uses, which is stopped while its collection marks.
+///
+/// # Safety
+///
+/// As for GcRefCell::borrow_for_trace().
+pub unsafe fn ref_cell_for_trace<T>(cell: &core::cell::RefCell<T>) -> &T {
+    // SAFETY: See GcRefCell::borrow_for_trace().
+    let Ok(value) = (unsafe { cell.try_borrow_unguarded() }) else {
+        eprintln!("libjs_rust: garbage collection while a RefCell it traces is mutably borrowed");
+        std::process::abort();
+    };
+    value
 }
 
 /// A mutable borrow of the state in a GcRefCell, with the deferral of collections that it holds until it ends.

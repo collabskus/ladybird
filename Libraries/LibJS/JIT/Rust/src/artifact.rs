@@ -31,13 +31,17 @@ use crate::CompileFailure;
 use crate::asm::JumpPatch;
 use crate::code::CALLEE_SLOT;
 use crate::code::Dependency;
+use crate::code::EmbeddedCell;
 use crate::code::ExitKind;
 use crate::code::Repr;
 use crate::code::ResumeMode;
 use crate::code::SiteKind;
 use crate::code::ValueLocation;
 use crate::code::VirtualObjectDescriptorKind;
+use crate::relocation::Relocation;
+use crate::relocation::RelocationKind;
 use crate::snapshot::CellId;
+use crate::snapshot::SampleSlot;
 
 /// A table of compiled code. Their order here is their order in the array.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +74,8 @@ enum Section {
     UncaughtHandlers,
     /// A record per invalidation patch.
     Patches,
+    /// A record per relocation, by code offset.
+    Relocations,
     /// The cells the code embeds, as two words each. Only the install reads this section and the next.
     EmbeddedCells,
     /// A record per dependency.
@@ -79,7 +85,7 @@ enum Section {
 const SECTION_COUNT: usize = Section::Dependencies as usize + 1;
 
 /// The sections the runtime reads after it installed the code are the first ones.
-const LAST_KEPT_SECTION: Section = Section::Patches;
+const LAST_KEPT_SECTION: Section = Section::Relocations;
 
 /// In place of an index, a slot or a count: there is none.
 const NONE: u32 = u32::MAX;
@@ -143,6 +149,7 @@ const OBJECT_PROPERTY_COUNT: usize = 5;
 const OBJECT_KIND_OBJECT: u32 = 0;
 const OBJECT_KIND_CLOSURE: u32 = 1;
 
+/// A 64-bit value, low half first, or for a cell location, the index of the cell and the high half of its tag bits.
 const WIDE_WORDS: usize = 2;
 
 const PATCH_WORDS: usize = 4;
@@ -154,6 +161,8 @@ const PATCH_BYTES: usize = 2;
 pub const MAX_PATCH_LENGTH: usize = 8;
 
 const CELL_WORDS: usize = 2;
+
+const RELOCATION_WORDS: usize = 3;
 
 const DEPENDENCY_WORDS: usize = 5;
 
@@ -177,6 +186,8 @@ const LOCATION_CONSTANT: u32 = 3;
 const LOCATION_ARGUMENTS_OBJECT: u32 = 4;
 /// The payload is the index of the object among those of the site.
 const LOCATION_VIRTUAL_OBJECT: u32 = 5;
+/// The payload is the index of the cell's record among the 64-bit values.
+const LOCATION_CELL: u32 = 6;
 
 /// Where each table of compiled code is in its array of words.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -251,6 +262,8 @@ pub struct Tail<'a> {
     /// See `Artifact::invalidation_patches()`.
     pub invalidation_patches: &'a [(u32, JumpPatch)],
     pub embedded_cells: &'a [CellId],
+    /// See `Artifact::relocations()`.
+    pub relocations: &'a [Relocation],
     pub dependencies: &'a [Dependency],
 }
 
@@ -473,14 +486,14 @@ impl<'a> ArtifactWriter<'a> {
         }
         let start = self.objects.len() / OBJECT_WORDS;
         for (kind, allocation, property_count) in objects {
-            let (kind, cell) = match kind {
-                VirtualObjectDescriptorKind::Object { shape } => (OBJECT_KIND_OBJECT, shape),
-                VirtualObjectDescriptorKind::Closure { sample_slot } => (OBJECT_KIND_CLOSURE, sample_slot),
+            let (kind, bits) = match kind {
+                VirtualObjectDescriptorKind::Object { shape } => (OBJECT_KIND_OBJECT, u64::from(shape.0)),
+                VirtualObjectDescriptorKind::Closure { sample_slot } => (OBJECT_KIND_CLOSURE, sample_slot.0),
             };
             let mut words = [0; OBJECT_WORDS];
             words[OBJECT_KIND] = kind;
             words[OBJECT_ALLOCATION] = allocation;
-            words[OBJECT_CELL..][..2].copy_from_slice(&halves(cell.0));
+            words[OBJECT_CELL..][..2].copy_from_slice(&halves(bits));
             words[OBJECT_PROPERTIES] = properties;
             words[OBJECT_PROPERTY_COUNT] = property_count;
             self.objects.try_extend_from_slice(&words)?;
@@ -520,6 +533,17 @@ impl<'a> ArtifactWriter<'a> {
             }
             ValueLocation::Frame(slot) => (LOCATION_FRAME, Repr::Tagged, slot),
             ValueLocation::Constant(bits) => (LOCATION_CONSTANT, Repr::Tagged, self.wide_value(bits)?),
+            ValueLocation::Cell { cell, tag } => {
+                let [low, high] = halves(tag);
+                if low != 0 {
+                    return Err(CompileFailure::CodeGeneration);
+                }
+                (
+                    LOCATION_CELL,
+                    Repr::Tagged,
+                    self.wide_value(u64::from(cell.0) | u64::from(high) << 32)?,
+                )
+            }
             ValueLocation::ArgumentsObject { mapped } => (LOCATION_ARGUMENTS_OBJECT, Repr::Tagged, u32::from(mapped)),
             ValueLocation::VirtualObject(index) => (LOCATION_VIRTUAL_OBJECT, Repr::Tagged, index),
         };
@@ -647,8 +671,19 @@ impl<'a> ArtifactWriter<'a> {
         }
         end(Section::Patches, words);
 
+        let start = words.len();
+        for relocation in tail.relocations {
+            words.try_extend_from_slice(&[relocation.offset, relocation.kind as u32, relocation.cell])?;
+        }
+        words[start..]
+            .as_chunks_mut::<RELOCATION_WORDS>()
+            .0
+            .sort_unstable_by_key(|record| record[0]);
+        end(Section::Relocations, words);
+
         for cell in tail.embedded_cells {
-            words.try_extend_from_slice(&halves(cell.0))?;
+            // SAFETY: The runtime reads the section once, as it installs the code, before a collection can move a cell.
+            words.try_extend_from_slice(&halves(unsafe { cell.address() }))?;
         }
         end(Section::EmbeddedCells, words);
         for dependency in tail.dependencies {
@@ -657,11 +692,12 @@ impl<'a> ArtifactWriter<'a> {
                 Dependency::GlobalDeclarations { environment, serial } => (1, environment, serial),
                 Dependency::GlobalBindingUnassigned { environment, index } => (2, environment, u64::from(index)),
                 Dependency::GlobalPropertyUnassigned { object, offset } => (3, object, u64::from(offset)),
-                Dependency::NoHtmlDdaObjects => (4, CellId(0), 0),
+                Dependency::NoHtmlDdaObjects => (4, CellId::NULL, 0),
                 Dependency::StableShape(cell) => (5, cell, 0),
             };
             let mut record = [kind; DEPENDENCY_WORDS];
-            record[1..3].copy_from_slice(&halves(cell.0));
+            // SAFETY: The runtime reads the section once, as it installs the code, before a collection can move a cell.
+            record[1..3].copy_from_slice(&halves(unsafe { cell.address() }));
             record[3..5].copy_from_slice(&halves(value));
             words.try_extend_from_slice(&record)?;
         }
@@ -725,6 +761,13 @@ impl<'a, W: Word> Artifact<'a, W> {
             ),
             LOCATION_FRAME => ValueLocation::Frame(payload),
             LOCATION_CONSTANT => ValueLocation::Constant(from_halves(self.record(Section::Wide, payload, WIDE_WORDS))),
+            LOCATION_CELL => {
+                let record = self.record(Section::Wide, payload, WIDE_WORDS);
+                ValueLocation::Cell {
+                    cell: EmbeddedCell(record[0].word()),
+                    tag: u64::from(record[1].word()) << 32,
+                }
+            }
             LOCATION_ARGUMENTS_OBJECT => ValueLocation::ArgumentsObject { mapped: payload != 0 },
             LOCATION_VIRTUAL_OBJECT => ValueLocation::VirtualObject(payload),
             kind => unreachable!("{kind} is no kind of location"),
@@ -792,18 +835,29 @@ impl<'a, W: Word> Artifact<'a, W> {
         })
     }
 
+    /// Where the code holds the cells it embeds, by code offset. A relocation names a cell by its index in
+    /// `embedded_cells()`.
+    pub fn relocations(self) -> impl ExactSizeIterator<Item = Relocation> {
+        self.records(Section::Relocations, RELOCATION_WORDS)
+            .map(|record| Relocation {
+                offset: record[0].word(),
+                kind: RelocationKind::from_word(record[1].word()),
+                cell: record[2].word(),
+            })
+    }
+
     /// Cells the code depends on (compares against or uses). The runtime keeps them alive for as long as the code
     /// may run. Only tables that have every section have them.
     pub fn embedded_cells(self) -> impl ExactSizeIterator<Item = CellId> {
         self.records(Section::EmbeddedCells, CELL_WORDS)
-            .map(|record| CellId(from_halves(record)))
+            .map(|record| CellId::from_address(from_halves(record)))
     }
 
     /// What the code assumes keeps holding. The runtime installs the code only if all of them still hold, and
     /// invalidates it when one stops holding. Only tables that have every section have them.
     pub fn dependencies(self) -> impl ExactSizeIterator<Item = Dependency> {
         self.records(Section::Dependencies, DEPENDENCY_WORDS).map(|record| {
-            let cell = CellId(from_halves(&record[1..3]));
+            let cell = CellId::from_address(from_halves(&record[1..3]));
             let value = from_halves(&record[3..5]);
             match record[0].word() {
                 0 => Dependency::WatchpointSetValid(cell),
@@ -837,6 +891,17 @@ pub struct Patch {
 }
 
 impl Patch {
+    /// The patch that writes `bytes`, at most `MAX_PATCH_LENGTH` of them, at `offset`.
+    pub fn new(offset: u32, bytes: &[u8]) -> Patch {
+        let mut padded = [0; MAX_PATCH_LENGTH];
+        padded[..bytes.len()].copy_from_slice(bytes);
+        Patch {
+            offset,
+            length: bytes.len(),
+            bytes: padded,
+        }
+    }
+
     pub fn bytes(&self) -> &[u8] {
         &self.bytes[..self.length]
     }
@@ -1111,10 +1176,14 @@ impl<W> Copy for ObjectView<'_, W> {}
 
 impl<'a, W: Word> ObjectView<'a, W> {
     pub fn kind(self) -> VirtualObjectDescriptorKind {
-        let cell = CellId(from_halves(&self.record[OBJECT_CELL..]));
+        let bits = from_halves(&self.record[OBJECT_CELL..]);
         match self.record[OBJECT_KIND].word() {
-            OBJECT_KIND_OBJECT => VirtualObjectDescriptorKind::Object { shape: cell },
-            OBJECT_KIND_CLOSURE => VirtualObjectDescriptorKind::Closure { sample_slot: cell },
+            OBJECT_KIND_OBJECT => VirtualObjectDescriptorKind::Object {
+                shape: EmbeddedCell(bits as u32),
+            },
+            OBJECT_KIND_CLOSURE => VirtualObjectDescriptorKind::Closure {
+                sample_slot: SampleSlot(bits),
+            },
             kind => unreachable!("{kind} is no kind of object"),
         }
     }

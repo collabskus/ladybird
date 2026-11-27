@@ -313,11 +313,17 @@ pub(crate) struct TreeShape {
 }
 
 impl TreeShape {
+    /// The bytes of the published rows that `sizer` reaches for the first time.
+    pub(crate) fn heap_size(&self, sizer: &mut crate::heap_size::HeapSizer) -> usize {
+        self.nodes.heap_size(sizer, |_, _| 0)
+    }
+
     /// Brings the rows of every node written since the last publication up to date and publishes
     /// the column. A row whose node did not change is not written, so a chunk an earlier
     /// publication shares is copied only for a change.
     pub(crate) fn publish(
         &mut self,
+        chunks_freed: &[u32],
         chunks: &mut ForkVec<Box<Chunk>>,
         style_records: &ForkVec<u64>,
         style_nodes: &ForkVec<Option<StyleNodeID>>,
@@ -341,6 +347,14 @@ impl TreeShape {
                     );
                     self.nodes.set(index, row).expect("the column holds every chunk");
                 }
+            }
+        }
+        // OPTIMIZATION: The rows of a chunk whose nodes were all freed are the default once written above, and the
+        //               column stores nothing for those.
+        for &chunk in chunks_freed {
+            let first = chunk as usize * (SLOTS_PER_CHUNK / PUBLISHED_ROWS_PER_CHUNK);
+            for published_chunk in first..first + SLOTS_PER_CHUNK / PUBLISHED_ROWS_PER_CHUNK {
+                self.nodes.release_chunk_if_default(published_chunk);
             }
         }
         self.nodes.publish()

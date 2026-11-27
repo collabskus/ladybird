@@ -315,15 +315,9 @@ impl ExternalMemorySize for Object {
 // SAFETY: Visits the shape, the named properties the shape describes and the indexed properties, which are all the
 // cells an object reaches.
 unsafe impl Trace for Object {
-    fn trace(&self, visitor: &mut Visitor) {
-        // NB: The VM keeps the intrinsic accessors and unimplemented properties of objects by their address, and
-        //     compiled code depends on the slots of global objects by theirs, so such objects stay where they are.
-        if self.flags.get()
-            & (object_flag::HAS_INTRINSIC_ACCESSORS
-                | object_flag::HAS_UNIMPLEMENTED_PROPERTIES
-                | object_flag::IS_GLOBAL_OBJECT)
-            != 0
-        {
+    fn trace<'c>(&'c self, visitor: &mut Visitor<'c>) {
+        // NB: Compiled code depends on the slots of global objects by their address, so they stay where they are.
+        if self.has_flag(object_flag::IS_GLOBAL_OBJECT) {
             visitor.pin(self.as_gc());
         }
         self.shape.trace(visitor);
@@ -363,11 +357,6 @@ unsafe impl Trace for Object {
                 visitor,
             ),
             IndexedStorageKind::Dictionary => {
-                // NB: The VM keeps the indexed dictionaries of ECMAScript function objects by the address of the
-                //     function, so such a function stays where it is.
-                if self.is_ecmascript_function_object() {
-                    visitor.pin(self.as_gc());
-                }
                 self.indexed_dictionary().trace(visitor);
             }
         }
@@ -385,6 +374,29 @@ unsafe impl Trace for Object {
 }
 
 pub(crate) type IndexedDictionary = GcRefCell<GenericIndexedPropertyStorage>;
+
+/// The indexed dictionary of an ECMAScript function object, which the VM keeps for it (see
+/// `Vm::function_indexed_dictionaries`), and frees when it drops the entry: when the function leaves dictionary mode,
+/// when a collection finds the function dead, or with the VM.
+pub(crate) struct FunctionIndexedDictionary(*mut IndexedDictionary);
+
+impl FunctionIndexedDictionary {
+    /// Takes `dictionary`, which came from Box::into_raw().
+    fn new(dictionary: *mut IndexedDictionary) -> Self {
+        Self(dictionary)
+    }
+
+    fn pointer(&self) -> *mut IndexedDictionary {
+        self.0
+    }
+}
+
+impl Drop for FunctionIndexedDictionary {
+    fn drop(&mut self) {
+        // SAFETY: The pointer came from Box::into_raw(), and only this owns it.
+        drop(unsafe { Box::from_raw(self.0) });
+    }
+}
 
 /// Object::~Object(), which LibGC runs as it sweeps the object, rather than in a finalizer every dead object would
 /// have to visit while the world is stopped. Property storage in ValueStorage cells is collected with the object, and
@@ -414,6 +426,9 @@ impl Object {
             unsafe { value_storage::deallocate(self.named_properties.get()) };
         }
         match self.indexed_storage_kind() {
+            // NB: The collection that found the function dead freed its dictionary, and the VM frees the ones left when
+            //     the heap is torn down (see `FunctionIndexedDictionary`).
+            IndexedStorageKind::Dictionary if self.is_ecmascript_function_object() => {}
             IndexedStorageKind::Dictionary => self.free_indexed_elements_dictionary(),
             IndexedStorageKind::Packed | IndexedStorageKind::Holey
                 if flags & object_flag::HAS_MALLOC_INDEXED_STORAGE != 0 =>
@@ -483,7 +498,7 @@ fn find_intrinsic_accessor(vm: &Vm, object: &Object, property_key: &PropertyKey)
     }
 
     let mut intrinsic_accessors = vm.intrinsic_accessors().borrow_mut();
-    let intrinsics = intrinsic_accessors.get_mut(&(core::ptr::from_ref(object) as usize))?;
+    let intrinsics = intrinsic_accessors.get_mut(&Gc::from_ref(object))?;
     intrinsics.remove(property_key.as_string())
 }
 
@@ -497,11 +512,7 @@ fn attributes_for(value: Value, mut attributes: PropertyAttributes) -> PropertyA
 }
 
 fn remove_intrinsic_accessor(vm: &Vm, object: &Object, property_key: &PropertyKey) {
-    if let Some(intrinsics) = vm
-        .intrinsic_accessors()
-        .borrow_mut()
-        .get_mut(&(core::ptr::from_ref(object) as usize))
-    {
+    if let Some(intrinsics) = vm.intrinsic_accessors().borrow_mut().get_mut(&Gc::from_ref(object)) {
         intrinsics.remove(property_key.as_string());
     }
 }
@@ -3275,7 +3286,7 @@ impl Object {
         self.set_has_intrinsic_accessors();
         vm.intrinsic_accessors()
             .borrow_mut()
-            .entry(core::ptr::from_ref(self) as usize)
+            .entry(Gc::from_ref(self))
             .or_default()
             .insert(property_key.as_string().clone(), accessor);
     }
@@ -3393,7 +3404,7 @@ impl Object {
         self.set_flag(object_flag::HAS_UNIMPLEMENTED_PROPERTIES);
         vm.unimplemented_properties()
             .borrow_mut()
-            .entry(core::ptr::from_ref(self) as usize)
+            .entry(Gc::from_ref(self))
             .or_default()
             .insert(property_name);
     }
@@ -3404,7 +3415,7 @@ impl Object {
         }
         vm.unimplemented_properties()
             .borrow()
-            .get(&(core::ptr::from_ref(self) as usize))
+            .get(&Gc::from_ref(self))
             .is_some_and(|properties| properties.contains(property_key.as_string()))
     }
 
@@ -3975,9 +3986,10 @@ impl Object {
             //         while its collections mark, nor while the map is borrowed mutably, which this checks.
             let dictionaries = unsafe { self.vm().function_indexed_dictionaries.try_borrow_unguarded() }
                 .expect("the indexed dictionaries of functions are not being changed");
-            return *dictionaries
-                .get(&core::ptr::from_ref(self).addr())
-                .expect("a function in dictionary mode has a dictionary");
+            return dictionaries
+                .get(&Gc::from_ref(self))
+                .expect("a function in dictionary mode has a dictionary")
+                .pointer();
         }
         self.indexed_elements.get().cast()
     }
@@ -3987,7 +3999,7 @@ impl Object {
             self.vm()
                 .function_indexed_dictionaries
                 .borrow_mut()
-                .insert(core::ptr::from_ref(self).addr(), dictionary);
+                .insert(Gc::from_ref(self), FunctionIndexedDictionary::new(dictionary));
         } else {
             self.make_room_for_indexed_storage();
             self.indexed_elements.set(dictionary.cast());
@@ -4177,15 +4189,16 @@ impl Object {
     }
 
     fn free_indexed_elements_dictionary(&self) {
-        let dictionary = if self.is_ecmascript_function_object() {
-            self.vm()
-                .function_indexed_dictionaries
-                .borrow_mut()
-                .remove(&core::ptr::from_ref(self).addr())
-                .unwrap_or(core::ptr::null_mut())
-        } else {
-            self.indexed_elements.replace(core::ptr::null_mut()).cast()
-        };
+        if self.is_ecmascript_function_object() {
+            drop(
+                self.vm()
+                    .function_indexed_dictionaries
+                    .borrow_mut()
+                    .remove(&Gc::from_ref(self)),
+            );
+            return;
+        }
+        let dictionary: *mut IndexedDictionary = self.indexed_elements.replace(core::ptr::null_mut()).cast();
         if !dictionary.is_null() {
             // SAFETY: The pointer came from Box::into_raw in transition_to_dictionary(), and is gone from the object.
             drop(unsafe { Box::from_raw(dictionary) });

@@ -51,9 +51,6 @@ mod shape_flag {
     pub const HAS_WATCHED_SLOTS: u8 = 1 << 2;
     /// See `Shape::is_non_extensible()`.
     pub const NON_EXTENSIBLE: u8 = 1 << 3;
-    /// JIT code allocates objects of the shape from a template that holds its address (see
-    /// `Shape::note_in_allocation_template()`).
-    pub const IN_ALLOCATION_TEMPLATE: u8 = 1 << 4;
     /// The flags a shape gets from the shape it comes from.
     pub const INHERITED: u8 = HAS_PARAMETER_MAP | NON_EXTENSIBLE;
     /// An object may have left the shape (see `Shape::is_stable()`).
@@ -84,8 +81,9 @@ define_cell!(DictionaryPropertyTable, Other);
 
 // SAFETY: The keys are the only cells a table reaches.
 unsafe impl Trace for DictionaryPropertyTable {
-    fn trace(&self, visitor: &mut Visitor) {
-        for property_key in self.table.borrow().keys() {
+    fn trace<'c>(&'c self, visitor: &mut Visitor<'c>) {
+        // SAFETY: Nothing writes the table while a collection traces it.
+        for property_key in unsafe { self.table.borrow_for_trace() }.keys() {
             property_key.trace(visitor);
         }
     }
@@ -103,9 +101,10 @@ struct ShapeExtra {
 
 // SAFETY: Visits the keys of the forward transitions, the caches and the rare data. The shapes of transitions are weak.
 unsafe impl Trace for ShapeExtra {
-    fn trace(&self, visitor: &mut Visitor) {
+    fn trace<'c>(&'c self, visitor: &mut Visitor<'c>) {
         // FIXME: The forward transition keys should be weak, but we have to mark them for now in case they go stale.
-        for transition_key in self.forward_transitions.borrow().keys() {
+        // SAFETY: Nothing writes the transitions while a collection traces them.
+        for transition_key in unsafe { self.forward_transitions.borrow_for_trace() }.keys() {
             transition_key.property_key.trace(visitor);
         }
         self.property_iterator_cache.trace(visitor);
@@ -281,7 +280,7 @@ impl Drop for ShapeStorage {
 
 // SAFETY: Visits what the extra reaches. The shape of a transition in the word is weak.
 unsafe impl Trace for ShapeStorage {
-    fn trace(&self, visitor: &mut Visitor) {
+    fn trace<'c>(&'c self, visitor: &mut Visitor<'c>) {
         if let ShapeStorageState::Extra(extra) = self.state() {
             extra.trace(visitor);
         }
@@ -290,7 +289,7 @@ unsafe impl Trace for ShapeStorage {
 
 // SAFETY: Visits the keys.
 unsafe impl Trace for OwnStringKeys {
-    fn trace(&self, visitor: &mut Visitor) {
+    fn trace<'c>(&'c self, visitor: &mut Visitor<'c>) {
         // SAFETY: The keys are the shape's own, which only with_own_string_keys() replaces, and nothing writes them.
         unsafe { visitor.visit_owned_values(&self.keys) };
     }
@@ -300,22 +299,31 @@ unsafe impl Trace for OwnStringKeys {
 // the watchpoint sets of slots. The shapes of transitions and child prototype shapes are weak, and so are the keys of
 // prototype transitions, which are only compared.
 unsafe impl Trace for RareData {
-    fn trace(&self, visitor: &mut Visitor) {
+    fn trace<'c>(&'c self, visitor: &mut Visitor<'c>) {
         // FIXME: The delete transition keys should be weak, but we have to mark them for now in case they go stale.
         for property_key in self.delete_transitions.keys() {
             property_key.trace(visitor);
         }
         self.own_string_keys.trace(visitor);
+        // NB: The shapes and watchpoint sets are visited as owned slots, so that a collection that moves them rewrites
+        //     them here rather than keeping them where they are.
+        // SAFETY: The rare data is the shape's own, which only the shape's own methods change, and only its destructor
+        //         frees.
         if let Some(assign_copy) = &self.assign_copy {
-            visitor.visit(assign_copy.prototype_validity);
-            visitor.visit(assign_copy.copy_shape);
+            // SAFETY: See above.
+            unsafe {
+                visitor.visit_owned(&assign_copy.prototype_validity);
+                visitor.visit_owned(&assign_copy.copy_shape);
+            }
         }
-        for shape in self.integrity_level_shapes.iter().flatten() {
-            visitor.visit(*shape);
+        for shape in &self.integrity_level_shapes {
+            // SAFETY: See above.
+            unsafe { visitor.visit_owned_option(shape) };
         }
         for watched_slot in self.watched_slots.values() {
             if let WatchedSlot::Watched(watchpoint_set) = watched_slot {
-                visitor.visit(*watchpoint_set);
+                // SAFETY: See above.
+                unsafe { visitor.visit_owned(watchpoint_set) };
             }
         }
     }
@@ -326,12 +334,7 @@ define_cell!(Shape, Other);
 // SAFETY: Visits the realm, the prototype, the validity, the previous shape, the descriptors or property table and what
 // the storage owns.
 unsafe impl Trace for Shape {
-    fn trace(&self, visitor: &mut Visitor) {
-        // NB: The VM keeps the compiled code that depends on a shape by the address of the shape, and JIT code copies
-        //     the address from allocation templates, so such shapes stay where they are.
-        if self.flags.get() & (shape_flag::HAS_DEPENDENT_CODE | shape_flag::IN_ALLOCATION_TEMPLATE) != 0 {
-            visitor.pin(Gc::from_ref(self));
-        }
+    fn trace<'c>(&'c self, visitor: &mut Visitor<'c>) {
         self.realm.trace(visitor);
         self.prototype.trace(visitor);
         self.prototype_chain_validity.trace(visitor);
@@ -1314,7 +1317,7 @@ impl Shape {
         if flags & shape_flag::HAS_DEPENDENT_CODE != 0 {
             crate::jit::dependencies::invalidate_dependents(
                 vm,
-                Dependency::StableShape(CellId(core::ptr::from_ref(self) as u64)),
+                Dependency::StableShape(CellId::from_address(core::ptr::from_ref(self) as u64)),
             );
         }
     }
@@ -1322,12 +1325,6 @@ impl Shape {
     /// Notes that JIT code depends on the shape staying stable.
     pub fn set_has_dependent_code(&self) {
         self.flags.set(self.flags.get() | shape_flag::HAS_DEPENDENT_CODE);
-    }
-
-    /// Notes that the words of a template JIT code allocates cells from hold the address of the shape, which keeps the
-    /// shape from moving from now on.
-    pub fn note_in_allocation_template(&self) {
-        self.flags.set(self.flags.get() | shape_flag::IN_ALLOCATION_TEMPLATE);
     }
 
     /// Whether the objects of this shape are not extensible. Preventing extensions moves an object to such a shape, so

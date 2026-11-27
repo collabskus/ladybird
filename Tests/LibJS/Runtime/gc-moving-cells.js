@@ -55,6 +55,13 @@ const huge = new Function(
     `let ${Array.from({ length: hugeBindingCount }, (_, i) => `h${i} = { v: ${i} }`).join(", ")};` +
         `return () => h${hugeBindingCount - 1};`
 )();
+// Arrays this sparse keep their elements in a map that the array owns, whose values are slots the collector can
+// rewrite too.
+const sparseArray = [];
+sparseArray[100000] = { sparse: "element" };
+// Functions keep their indexed properties in such a map too, which the VM holds for them.
+holder.functionWithElements = function () {};
+holder.functionWithElements[0] = { indexed: "element" };
 const bound = function (a, b) {
     return [this.t, a.x, b];
 }.bind({ t: "this" }, { x: "argument" });
@@ -65,6 +72,8 @@ const movedBefore = {
     smallSetValue: addressOf(smallSet.values().next().value),
     hugeElement: addressOf(hugeArray[1999]),
     hugeBinding: addressOf(huge()),
+    sparseElement: addressOf(sparseArray[100000]),
+    functionWithElements: addressOf(holder.functionWithElements),
 };
 const weakMap = new WeakMap([[holder.weakMapKey, "weak map value"]]);
 
@@ -104,7 +113,17 @@ const internedConstant = () => "an interned constant";
 jit.neverCompile(constantString);
 jit.neverCompile(constantBigInt);
 jit.neverCompile(internedConstant);
+// The VM's caches of the strings of integers hold them weakly, and hand the slots of those that survive to the
+// collector.
+holder.smallNumeric = String(123);
+holder.largeNumeric = String(123456);
+// The legacy static properties of RegExp hold the last input string in a field of the constructor.
+/x(y)/.exec("a" + "bxyz".repeat(3));
+const regExpInputBefore = addressOf(RegExp.input);
+
 const constantsBefore = {
+    smallNumeric: addressOf(holder.smallNumeric),
+    largeNumeric: addressOf(holder.largeNumeric),
     string: addressOf(constantString()),
     bigint: addressOf(constantBigInt()),
     interned: addressOf(internedConstant()),
@@ -209,6 +228,19 @@ runAfterMovingCollection(() => {
         expect(huge().v).toBe(hugeBindingCount - 1);
     });
 
+    test("elements of sparse arrays move", () => {
+        expect(addressOf(sparseArray[100000])).not.toBe(movedBefore.sparseElement);
+        expect(sparseArray[100000].sparse).toBe("element");
+        expect(sparseArray.length).toBe(100001);
+    });
+
+    test("functions with indexed properties move, and keep them", () => {
+        expect(addressOf(holder.functionWithElements)).not.toBe(movedBefore.functionWithElements);
+        expect(holder.functionWithElements[0].indexed).toBe("element");
+        holder.functionWithElements[1] = "added";
+        expect(Object.keys(holder.functionWithElements)).toEqual(["0", "1"]);
+    });
+
     test("bound functions keep their target, this and arguments", () => {
         expect(bound(2)).toEqual(["this", "argument", 2]);
     });
@@ -239,6 +271,21 @@ runAfterMovingCollection(() => {
         expect(constantString().length).toBeGreaterThan(256);
         expect(addressOf(constantBigInt())).not.toBe(constantsBefore.bigint);
         expect(constantBigInt()).toBe(123456789012345678901234567890n);
+    });
+
+    test("strings of integers move, and stay in the caches of the VM", () => {
+        expect(addressOf(holder.smallNumeric)).not.toBe(constantsBefore.smallNumeric);
+        expect(addressOf(String(123))).toBe(addressOf(holder.smallNumeric));
+        expect(holder.smallNumeric).toBe("123");
+        expect(addressOf(holder.largeNumeric)).not.toBe(constantsBefore.largeNumeric);
+        expect(addressOf(String(123456))).toBe(addressOf(holder.largeNumeric));
+        expect(holder.largeNumeric).toBe("123456");
+    });
+
+    test("strings that a cell holds in a field move", () => {
+        expect(addressOf(RegExp.input)).not.toBe(regExpInputBefore);
+        expect(RegExp.input).toBe("abxyzbxyzbxyz");
+        expect(RegExp.$1).toBe("y");
     });
 
     test("interned strings move, and stay the interned strings of their contents", () => {
