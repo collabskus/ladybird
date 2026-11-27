@@ -11,6 +11,7 @@
 #include <AK/ScopeGuard.h>
 #include <AK/StringBuilder.h>
 #include <AK/Vector.h>
+#include <LibSandbox/ControlMessages.h>
 #include <LibSandbox/FileBroker.h>
 #include <LibSandbox/Seccomp.h>
 #include <dirent.h>
@@ -560,15 +561,9 @@ static void send_response(int reply_fd, FileBrokerResponse const& response, int 
         char space[CMSG_SPACE(sizeof(int))];
     } control {};
 
-    msghdr message {
-        .msg_name = nullptr,
-        .msg_namelen = 0,
-        .msg_iov = &io,
-        .msg_iovlen = 1,
-        .msg_control = nullptr,
-        .msg_controllen = 0,
-        .msg_flags = 0,
-    };
+    msghdr message {};
+    message.msg_iov = &io;
+    message.msg_iovlen = 1;
 
     if (fd >= 0) {
         message.msg_control = &control;
@@ -678,15 +673,11 @@ void FileBrokerServer::serve(int socket)
             char space[CMSG_SPACE(4 * sizeof(int))];
         } control {};
 
-        msghdr message {
-            .msg_name = nullptr,
-            .msg_namelen = 0,
-            .msg_iov = &io,
-            .msg_iovlen = 1,
-            .msg_control = &control,
-            .msg_controllen = sizeof(control),
-            .msg_flags = 0,
-        };
+        msghdr message {};
+        message.msg_iov = &io;
+        message.msg_iovlen = 1;
+        message.msg_control = &control;
+        message.msg_controllen = sizeof(control);
 
         ssize_t received = 0;
         do {
@@ -697,7 +688,7 @@ void FileBrokerServer::serve(int socket)
 
         int fds[8];
         size_t fd_count = 0;
-        for (auto* header = CMSG_FIRSTHDR(&message); header; header = CMSG_NXTHDR(&message, header)) {
+        for (auto* header = CMSG_FIRSTHDR(&message); header; header = next_control_message_header(message, header)) {
             if (header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS || header->cmsg_len < CMSG_LEN(0))
                 continue;
             auto count = (header->cmsg_len - CMSG_LEN(0)) / sizeof(int);

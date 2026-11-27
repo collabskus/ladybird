@@ -11,6 +11,7 @@
 #include <AK/Time.h>
 #include <LibCore/DirIterator.h>
 #include <LibSandbox/ConnectBroker.h>
+#include <LibSandbox/ControlMessages.h>
 #include <LibSandbox/LinuxFcntl.h>
 #include <LibSandbox/Sandbox.h>
 #include <LibSandbox/Seccomp.h>
@@ -39,8 +40,10 @@
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <unistd.h>
 
 #if defined(__NR_newfstatat) && defined(__NR_fstat)
@@ -146,6 +149,100 @@ TEST_CASE(file_descriptor_policy_allows_open_file_description_queries)
         EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
+TEST_CASE(file_descriptor_policy_answers_both_terminal_queries_isatty_makes)
+{
+    auto body = [] {
+        int descriptors[2];
+        VERIFY(pipe(descriptors) == 0);
+        termios attributes {};
+        VERIFY(ioctl(descriptors[0], TCGETS, &attributes) == -1);
+        VERIFY(errno == ENOTTY);
+        winsize size {};
+        VERIFY(ioctl(descriptors[0], TIOCGWINSZ, &size) == -1);
+        VERIFY(errno == ENOTTY);
+        VERIFY(!isatty(descriptors[0]));
+    };
+    auto status = run_with_policy([](auto&) { }, body);
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+#ifdef __NR_pwritev2
+#    ifndef RWF_NOAPPEND
+#        define RWF_NOAPPEND 0x00000020
+#    endif
+
+TEST_CASE(file_descriptor_policy_sends_pwritev2_to_the_pwrite64_fallback)
+{
+    char path[] = "/tmp/ladybird-pwritev2-XXXXXX";
+    int fd = mkstemp(path);
+    VERIFY(fd >= 0);
+    VERIFY(unlink(path) == 0);
+
+    auto body = [&] {
+        char byte = 'x';
+        iovec io { .iov_base = &byte, .iov_len = 1 };
+        VERIFY(syscall(__NR_pwritev2, fd, &io, 1, 4, 0, RWF_NOAPPEND) == -1);
+        VERIFY(errno == ENOSYS);
+        VERIFY(pwrite(fd, &byte, 1, 4) == 1);
+    };
+    auto status = run_with_policy([](auto&) { }, body);
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+
+    struct stat metadata {};
+    VERIFY(fstat(fd, &metadata) == 0);
+    EXPECT_EQ(metadata.st_size, 5);
+    VERIFY(close(fd) == 0);
+}
+#endif
+
+#ifdef __NR_lstat
+TEST_CASE(filesystem_metadata_policy_answers_the_lstat_musl_makes)
+{
+    char directory[] = "/tmp/ladybird-lstat-XXXXXX";
+    VERIFY(mkdtemp(directory));
+    auto link = ByteString::formatted("{}/link", directory);
+    VERIFY(symlink("missing", link.characters()) == 0);
+    auto missing = ByteString::formatted("{}/missing", directory);
+
+    auto status = run_with_policy(
+        [](auto& policy) { policy.allow_filesystem_metadata_queries(); },
+        [&] {
+            struct stat metadata {};
+            VERIFY(syscall(__NR_lstat, link.characters(), &metadata) == 0);
+            VERIFY(S_ISLNK(metadata.st_mode));
+            VERIFY(syscall(__NR_lstat, missing.characters(), &metadata) == -1);
+            VERIFY(errno == ENOENT);
+        });
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+
+    VERIFY(unlink(link.characters()) == 0);
+    VERIFY(rmdir(directory) == 0);
+}
+#endif
+
+#ifdef __NR_pipe
+TEST_CASE(file_descriptor_policy_answers_the_pipe_musl_makes)
+{
+    auto body = [] {
+        int descriptors[2];
+        VERIFY(syscall(__NR_pipe, descriptors) == 0);
+        VERIFY(write(descriptors[1], "x", 1) == 1);
+        char byte = 0;
+        VERIFY(read(descriptors[0], &byte, 1) == 1 && byte == 'x');
+    };
+    auto status = run_with_policy([](auto&) { }, body);
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+#endif
+
 TEST_CASE(runtime_policy_refuses_other_processes_and_resource_limit_changes)
 {
     auto parent = getpid();
@@ -188,6 +285,88 @@ TEST_CASE(runtime_policy_allows_thread_self_signals)
     if (WIFEXITED(status))
         EXPECT_EQ(WEXITSTATUS(status), 0);
 }
+
+#ifdef __NR_tkill
+static Atomic<int> s_signals_received;
+
+TEST_CASE(runtime_policy_sends_tkill_only_within_the_process)
+{
+    // A process outside the sandbox, whose ID is also its main thread's ID.
+    auto outsider = fork();
+    VERIFY(outsider >= 0);
+    if (outsider == 0) {
+        pause();
+        _exit(0);
+    }
+
+    auto body = [&] {
+        VERIFY(signal(SIGUSR1, [](int) { s_signals_received++; }) != SIG_ERR);
+        pthread_t thread;
+        VERIFY(pthread_create(&thread, nullptr, [](void*) -> void* {
+            VERIFY(syscall(__NR_tkill, gettid(), SIGUSR1) == 0);
+            return nullptr; }, nullptr) == 0);
+        VERIFY(pthread_join(thread, nullptr) == 0);
+        VERIFY(s_signals_received == 1);
+
+#    if !defined(AK_LIBC_GLIBC)
+        // musl's raise() makes its tkill() with every signal blocked, SIGSYS included.
+        sigset_t all_signals;
+        sigfillset(&all_signals);
+        VERIFY(pthread_sigmask(SIG_BLOCK, &all_signals, nullptr) == 0);
+        VERIFY(syscall(__NR_tkill, gettid(), SIGUSR1) == 0);
+        VERIFY(pthread_sigmask(SIG_UNBLOCK, &all_signals, nullptr) == 0);
+        VERIFY(s_signals_received == 2);
+#    endif
+
+        VERIFY(syscall(__NR_tkill, outsider, SIGKILL) == -1);
+        VERIFY(errno == ESRCH);
+    };
+    auto status = run_with_policy([](auto&) { }, body);
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+
+    int outsider_status = 0;
+    EXPECT_EQ(waitpid(outsider, &outsider_status, WNOHANG), 0);
+    VERIFY(kill(outsider, SIGKILL) == 0);
+    VERIFY(waitpid(outsider, &outsider_status, 0) == outsider);
+}
+#endif
+
+#ifdef __NR_tkill
+static Atomic<int> s_signals_received_with_the_signal_policy_alone;
+
+TEST_CASE(signal_policy_alone_sends_tkill_within_the_process)
+{
+    auto child = fork();
+    VERIFY(child >= 0);
+    if (child == 0) {
+        rlimit limit { 0, 0 };
+        setrlimit(RLIMIT_CORE, &limit);
+        // A forked child's only thread has the process's ID as its thread ID.
+        auto tid = getpid();
+        MUST(Sandbox::install_no_new_privileges());
+        Sandbox::SeccompPolicy policy;
+        policy.allow_signals();
+        policy.allow_exit();
+        MUST(policy.install());
+
+        VERIFY(signal(SIGUSR1, [](int) { s_signals_received_with_the_signal_policy_alone++; }) != SIG_ERR);
+        VERIFY(syscall(__NR_tkill, tid, SIGUSR1) == 0);
+        VERIFY(s_signals_received_with_the_signal_policy_alone == 1);
+
+        // The crash handler re-raises a fatal signal at the thread it found with gettid().
+        VERIFY(syscall(__NR_gettid) == tid);
+        _exit(0);
+    }
+
+    int status = 0;
+    VERIFY(waitpid(child, &status, 0) == child);
+    EXPECT(WIFEXITED(status));
+    if (WIFEXITED(status))
+        EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+#endif
 
 TEST_CASE(runtime_policy_limits_prctl_operations)
 {
@@ -1333,15 +1512,11 @@ static int submit_broker_request(int helper_fd, ByteString const& path, int sock
         char space[CMSG_SPACE(2 * sizeof(int))];
     } control {};
 
-    msghdr message {
-        .msg_name = nullptr,
-        .msg_namelen = 0,
-        .msg_iov = &io,
-        .msg_iovlen = 1,
-        .msg_control = &control,
-        .msg_controllen = sizeof(control),
-        .msg_flags = 0,
-    };
+    msghdr message {};
+    message.msg_iov = &io;
+    message.msg_iovlen = 1;
+    message.msg_control = &control;
+    message.msg_controllen = sizeof(control);
 
     auto* header = CMSG_FIRSTHDR(&message);
     header->cmsg_level = SOL_SOCKET;
@@ -1366,15 +1541,11 @@ static i32 await_broker_error(int reply_fd)
         char space[CMSG_SPACE(sizeof(int))];
     } control {};
 
-    msghdr message {
-        .msg_name = nullptr,
-        .msg_namelen = 0,
-        .msg_iov = &io,
-        .msg_iovlen = 1,
-        .msg_control = &control,
-        .msg_controllen = sizeof(control),
-        .msg_flags = 0,
-    };
+    msghdr message {};
+    message.msg_iov = &io;
+    message.msg_iovlen = 1;
+    message.msg_control = &control;
+    message.msg_controllen = sizeof(control);
 
     ssize_t received = 0;
     do {
@@ -1386,7 +1557,7 @@ static i32 await_broker_error(int reply_fd)
 
     // A successful answer carries the connected socket. Close it here rather than leaving it to the
     // kernel, so that a test counting descriptors is counting something it fully accounts for.
-    for (auto* header = CMSG_FIRSTHDR(&message); header; header = CMSG_NXTHDR(&message, header)) {
+    for (auto* header = CMSG_FIRSTHDR(&message); header; header = Sandbox::next_control_message_header(message, header)) {
         if (header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS)
             continue;
         auto count = (header->cmsg_len - CMSG_LEN(0)) / sizeof(int);
@@ -1584,15 +1755,11 @@ static void submit_request_with_an_unwanted_descriptor(int helper_fd)
         char space[CMSG_SPACE(2 * sizeof(int))];
     } control {};
 
-    msghdr message {
-        .msg_name = nullptr,
-        .msg_namelen = 0,
-        .msg_iov = &io,
-        .msg_iovlen = 1,
-        .msg_control = &control,
-        .msg_controllen = sizeof(control),
-        .msg_flags = 0,
-    };
+    msghdr message {};
+    message.msg_iov = &io;
+    message.msg_iovlen = 1;
+    message.msg_control = &control;
+    message.msg_controllen = sizeof(control);
 
     auto* header = CMSG_FIRSTHDR(&message);
     header->cmsg_level = SOL_SOCKET;

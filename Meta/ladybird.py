@@ -162,10 +162,13 @@ def main():
         sys.exit(1)
 
     if "target" in args:
-        if platform.host_system != HostSystem.Windows and args.target == "ladybird":
-            args.target = "Ladybird"
+        if args.target == "Ladybird":
+            args.target = "ladybird"
+        # Accept a helper's executable name in place of its target name.
+        targets_by_executable_name = {name: target for target, name in HELPER_EXECUTABLE_NAMES.items()}
+        args.target = targets_by_executable_name.get(args.target, args.target)
         if not args.target and args.command not in ("build", "rebuild"):
-            args.target = "ladybird" if platform.host_system == HostSystem.Windows else "Ladybird"
+            args.target = "ladybird"
 
     if args.command == "build":
         build_dir = configure_main(platform, args.preset, args.cc, args.cxx, args.jobs)
@@ -456,19 +459,35 @@ def test_main(build_dir: Path, preset: str, jobs: Optional[str], pattern: Option
     run_command(test_args, exit_on_failure=True)
 
 
-def run_main(host_system: HostSystem, build_dir: Path, target: str, args: list[str]):
-    run_args = []
+# The executables of these targets have other names, which share a prefix so that tools like pgrep find all of them.
+HELPER_EXECUTABLE_NAMES = {
+    "AudioServer": "ladybird-audio",
+    "Compositor": "ladybird-gpu",
+    "Hub": "ladybird-hub",
+    "ImageDecoder": "ladybird-image",
+    "MediaServer": "ladybird-media",
+    "ProcessReaper": "ladybird-reaper",
+    "RequestServer": "ladybird-net",
+    "SystemProbe": "ladybird-probe",
+    "VideoDecoderServer": "ladybird-video",
+    "WebContent": "ladybird-render",
+    "WebDriver": "ladybird-driver",
+    "WebRTCClient": "ladybird-webrtc",
+}
 
-    if host_system == HostSystem.macOS and target in (
-        "ImageDecoder",
-        "Ladybird",
-        "RequestServer",
-        "WebContent",
-        "WebDriver",
-    ):
-        run_args.append(str(build_dir.joinpath("bin", "Ladybird.app", "Contents", "MacOS", target)))
-    else:
-        run_args.append(str(build_dir.joinpath("bin", target)))
+
+def executable_path(host_system: HostSystem, build_dir: Path, target: str) -> Path:
+    name = HELPER_EXECUTABLE_NAMES.get(target, target)
+    if host_system == HostSystem.macOS and (target == "ladybird" or target in HELPER_EXECUTABLE_NAMES):
+        return build_dir.joinpath("bin", "Ladybird.app", "Contents", "MacOS", name)
+    # Elsewhere, the helpers are built into libexec, except on Windows, where everything is next to the browser.
+    if host_system != HostSystem.Windows and target in HELPER_EXECUTABLE_NAMES and target != "WebDriver":
+        return build_dir.joinpath("libexec", name)
+    return build_dir.joinpath("bin", name)
+
+
+def run_main(host_system: HostSystem, build_dir: Path, target: str, args: list[str]):
+    run_args = [str(executable_path(host_system, build_dir, target))]
 
     run_args.extend(args)
 
@@ -489,12 +508,12 @@ def debug_main(host_system: HostSystem, build_dir: Path, target: str, debugger: 
     for cmd in debugger_commands:
         gdb_args.extend(["-ex" if debugger == "gdb" else "-o", cmd])
 
-    if target == "Ladybird" and host_system == HostSystem.macOS:
+    if target == "ladybird" and host_system == HostSystem.macOS:
         gdb_args.append(str(build_dir.joinpath("bin", "Ladybird.app")))
     elif host_system == HostSystem.Windows:
-        gdb_args.append(str(build_dir.joinpath("bin", target + ".exe")))
+        gdb_args.append(str(build_dir.joinpath("bin", HELPER_EXECUTABLE_NAMES.get(target, target) + ".exe")))
     else:
-        gdb_args.append(str(build_dir.joinpath("bin", target)))
+        gdb_args.append(str(executable_path(host_system, build_dir, target)))
 
     run_command(gdb_args, exit_on_failure=True)
 
@@ -506,10 +525,10 @@ def profile_main(host_system: HostSystem, build_dir: Path, target: str, args: li
 
     valgrind_args = ["valgrind", "--tool=callgrind", "--instr-atstart=yes"]
 
-    if target == "Ladybird" and host_system == HostSystem.macOS:
+    if target == "ladybird" and host_system == HostSystem.macOS:
         valgrind_args.append(str(build_dir.joinpath("bin", "Ladybird.app")))
     else:
-        valgrind_args.append(str(build_dir.joinpath("bin", target)))
+        valgrind_args.append(str(executable_path(host_system, build_dir, target)))
 
     valgrind_args.extend(args)
 
@@ -529,11 +548,13 @@ def addr2line_main(build_dir, target: str, program: str, addresses: list[str]):
         print(f"Please install {program}!", file=sys.stderr)
         sys.exit(1)
 
+    executable_name = HELPER_EXECUTABLE_NAMES.get(target, target)
     binary_file_path = None
     for root, _, files in os.walk(build_dir):
-        if target in files:
-            candidate = Path(root) / target
-            if os.access(candidate, os.X_OK):
+        if executable_name in files:
+            candidate = Path(root) / executable_name
+            # Links may point at an installed build, whose addresses differ from this build's.
+            if not candidate.is_symlink() and os.access(candidate, os.X_OK):
                 binary_file_path = str(candidate)
 
     if not binary_file_path:

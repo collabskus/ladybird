@@ -282,16 +282,16 @@ If you want to run the debugger, first place the content below in `.vscode/launc
             "name": "Attach to WebContent",
             "type": "lldb",
             "request": "attach",
-            "program": "${workspaceFolder}/Build/debug/bin/Ladybird.app/Contents/MacOS/WebContent",
+            "program": "${workspaceFolder}/Build/debug/bin/Ladybird.app/Contents/MacOS/ladybird-render",
         }
     ],
 }
 ```
 
-then run Ladybird with the debug preset and with the `--debug-process WebContent` flag:
+then run Ladybird with the debug preset and with the `--debug-process ladybird-render` flag:
 
 ```bash
-CC=$(brew --prefix llvm)/bin/clang CXX=$(brew --prefix llvm)/bin/clang++ BUILD_PRESET=Debug ./Meta/ladybird.py run ladybird --debug-process WebContent
+CC=$(brew --prefix llvm)/bin/clang CXX=$(brew --prefix llvm)/bin/clang++ BUILD_PRESET=Debug ./Meta/ladybird.py run ladybird --debug-process ladybird-render
 ```
 
 Running Ladybird in this way will pause execution until a debugger is attached. You can then run the debugger by going to the **Run and Debug** menu and selecting the **Attach to WebContent** configuration.
@@ -307,7 +307,7 @@ For Linux, the `launch.json` will instead be the file below.
       "name": "Attach and debug",
       "type": "cppdbg",
       "request": "attach",
-      "program": "${workspaceRoot}/Build/debug/libexec/WebContent",
+      "program": "${workspaceRoot}/Build/debug/libexec/ladybird-render",
       "MIMode": "gdb",
     },
   ]
@@ -317,7 +317,7 @@ For Linux, the `launch.json` will instead be the file below.
 Running Ladybird as follows:
 
 ```bash
-BUILD_PRESET=Debug Meta/ladybird.py run ladybird --debug-process WebContent
+BUILD_PRESET=Debug Meta/ladybird.py run ladybird --debug-process ladybird-render
 ```
 
 Then follow the same steps found in the Mac section. Notice also that you need to have `gdb` (the GNU Debugger) installed.

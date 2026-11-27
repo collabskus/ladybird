@@ -8,8 +8,8 @@
 Uses only Python's standard library and a built headless WebDriver, on Linux
 and macOS alike. Examples:
   Meta/style-update-capture.py capture connected.json --runs 3 --scenario connected
-  Meta/style-update-capture.py capture paired.json --config A=Build/a/bin/WebDriver \
-      --config B=Build/b/bin/WebDriver --runs 3
+  Meta/style-update-capture.py capture paired.json --config A=Build/a/bin/ladybird-driver \
+      --config B=Build/b/bin/ladybird-driver --runs 3
   Meta/style-update-capture.py compare paired.json paired.json --a A --b B
   Meta/style-update-capture.py capture bench.json --stylebench-url http://localhost:8000/
 
@@ -66,7 +66,18 @@ PHASES = {
 }
 
 
-WATCHED_PROCESSES = ("js", "test-web", "test262-runner", "WebContent", "Ladybird", "WebDriver")
+# Builds from before the processes were renamed are watched and measured too, so that they can be compared with newer ones.
+RENDERER_PROCESSES = ("ladybird-render", "WebContent")
+WATCHED_PROCESSES = (
+    "js",
+    "test-web",
+    "test262-runner",
+    *RENDERER_PROCESSES,
+    "ladybird",
+    "ladybird-driver",
+    "Ladybird",
+    "WebDriver",
+)
 PS_FORMAT = "pid=,pgid=,rss=,time=,lstart=,comm="
 PS_START_FIELDS = 5
 PS_UNAVAILABLE = False
@@ -231,7 +242,7 @@ class Browser:
             (
                 {key: row[key] for key in ["pid", "startedAt", "rssBytes", "cpuMicroseconds"]}
                 for row in process_table()
-                if row["name"] == "WebContent" and row["group"] == self.process.pid
+                if row["name"] in RENDERER_PROCESSES and row["group"] == self.process.pid
             ),
             key=lambda row: row["pid"],
         )
@@ -389,17 +400,28 @@ def cpu_governors():
 
 
 def configuration(executable):
-    build = executable.parent.parent
+    # On macOS the executables are in bin/Ladybird.app/Contents/MacOS rather than in bin.
+    if executable.parent.name == "MacOS" and executable.parents[2].suffix == ".app":
+        build = executable.parents[4]
+    else:
+        build = executable.parent.parent
     paths = [
         executable,
+        executable.parent / "ladybird",
         executable.parent / "Ladybird",
-        executable.parent / "WebContent",
-        build / "libexec/WebContent",
+        *(executable.parent / name for name in RENDERER_PROCESSES),
+        *(build / "libexec" / name for name in RENDERER_PROCESSES),
         *web_libraries(build),
     ]
     hashes = {}
+    hashed_files = set()
     for path in paths:
         if path.is_file():
+            # On a case-insensitive file system, ladybird and Ladybird are the same file.
+            file_id = (path.stat().st_dev, path.stat().st_ino)
+            if file_id in hashed_files:
+                continue
+            hashed_files.add(file_id)
             with path.open("rb") as stream:
                 digest = hashlib.sha256()
                 while chunk := stream.read(1024 * 1024):
@@ -428,7 +450,11 @@ def capture(args):
     if stray:
         raise RuntimeError("Other browser/test processes are running:\n" + "\n".join(stray))
     configs = {}
-    for config in args.config or ["release=Build/release/bin/WebDriver"]:
+    if platform.system() == "Darwin":
+        default_webdriver = "Build/release/bin/Ladybird.app/Contents/MacOS/ladybird-driver"
+    else:
+        default_webdriver = "Build/release/bin/ladybird-driver"
+    for config in args.config or [f"release={default_webdriver}"]:
         name, path = config.split("=", 1)
         if not name or name in configs or not all(c.isalnum() or c in "-_" for c in name):
             raise RuntimeError(f"Invalid or duplicate config name: {name}")

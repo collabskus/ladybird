@@ -5,8 +5,10 @@
  */
 
 #include <AK/Array.h>
+#include <AK/Platform.h>
 #include <LibCore/CrashHandler.h>
 #include <LibSandbox/ConnectBroker.h>
+#include <LibSandbox/ControlMessages.h>
 #include <LibSandbox/FileBroker.h>
 #include <LibSandbox/LinuxFcntl.h>
 #include <LibSandbox/Sandbox.h>
@@ -55,6 +57,7 @@ static constexpr u16 broker_socket_trap = 2;
 static constexpr u16 broker_connect_trap = 3;
 static constexpr u16 file_broker_trap = 4;
 static constexpr u16 signal_mask_trap = 5;
+static constexpr u16 emulate_tkill_trap = 6;
 // A refusal for a system call that the file system filter sends to the broker. The policy can't refuse it with an errno,
 // because the kernel takes the filter's trap over that, so it traps too, with the errno added to this.
 static constexpr u16 refused_path_syscall_trap = 0x1000;
@@ -165,6 +168,7 @@ static constexpr unsigned read_only_open_flags = [] {
 #define IF_DEFINED_link(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_linkat(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_lseek(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_lstat(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_madvise(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_membarrier(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_memfd_create(if_defined, if_not_defined) if_defined
@@ -179,6 +183,7 @@ static constexpr unsigned read_only_open_flags = [] {
 #define IF_DEFINED_newfstatat(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_open(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_openat(if_defined, if_not_defined) if_defined
+#define IF_DEFINED_pipe(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_pipe2(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_poll(if_defined, if_not_defined) if_defined
 #define IF_DEFINED_pread64(if_defined, if_not_defined) if_defined
@@ -360,6 +365,10 @@ static constexpr unsigned read_only_open_flags = [] {
 #    undef IF_DEFINED_getresuid
 #    define IF_DEFINED_getresuid(if_defined, if_not_defined) if_not_defined
 #endif
+#ifndef __NR_lstat
+#    undef IF_DEFINED_lstat
+#    define IF_DEFINED_lstat(if_defined, if_not_defined) if_not_defined
+#endif
 #ifndef __NR_membarrier
 #    undef IF_DEFINED_membarrier
 #    define IF_DEFINED_membarrier(if_defined, if_not_defined) if_not_defined
@@ -379,6 +388,10 @@ static constexpr unsigned read_only_open_flags = [] {
 #ifndef __NR_mmap2
 #    undef IF_DEFINED_mmap2
 #    define IF_DEFINED_mmap2(if_defined, if_not_defined) if_not_defined
+#endif
+#ifndef __NR_pipe
+#    undef IF_DEFINED_pipe
+#    define IF_DEFINED_pipe(if_defined, if_not_defined) if_not_defined
 #endif
 #ifndef __NR_pipe2
 #    undef IF_DEFINED_pipe2
@@ -1243,6 +1256,20 @@ static void set_syscall_result(SyscallRegisters const& registers, i64 result)
     *registers.result = static_cast<FlatPtr>(result);
 }
 
+#ifdef __NR_tkill
+// musl's raise(), abort(), and pthread_kill() signal a thread with tkill(), which names just a thread ID, where glibc's
+// name the thread group too, with tgkill(). A thread ID alone could be another process's, so the filter can't allow
+// tkill() outright. Instead, it's sent as a tgkill() within this process, which the filter allows.
+static void emulate_tkill(void* context)
+{
+    auto registers = syscall_registers(context);
+    auto saved_errno = errno;
+    auto result = syscall(__NR_tgkill, getpid(), registers.arguments[0], registers.arguments[1]);
+    set_syscall_result(registers, result < 0 ? -errno : result);
+    errno = saved_errno;
+}
+#endif
+
 #if defined(__NR_newfstatat) && defined(__NR_fstat)
 static void emulate_fstatat(void* context)
 {
@@ -1297,15 +1324,11 @@ static i64 exchange_with_broker(int broker_fd, void const* request, size_t reque
         char space[CMSG_SPACE(3 * sizeof(int))];
     } request_control {};
 
-    msghdr request_message {
-        .msg_name = nullptr,
-        .msg_namelen = 0,
-        .msg_iov = &request_io,
-        .msg_iovlen = 1,
-        .msg_control = &request_control,
-        .msg_controllen = CMSG_SPACE(passed_fd_count * sizeof(int)),
-        .msg_flags = 0,
-    };
+    msghdr request_message {};
+    request_message.msg_iov = &request_io;
+    request_message.msg_iovlen = 1;
+    request_message.msg_control = &request_control;
+    request_message.msg_controllen = CMSG_SPACE(passed_fd_count * sizeof(int));
 
     auto* request_header = CMSG_FIRSTHDR(&request_message);
     request_header->cmsg_level = SOL_SOCKET;
@@ -1336,15 +1359,11 @@ static i64 exchange_with_broker(int broker_fd, void const* request, size_t reque
         char space[CMSG_SPACE(sizeof(int))];
     } response_control {};
 
-    msghdr response_message {
-        .msg_name = nullptr,
-        .msg_namelen = 0,
-        .msg_iov = &response_io,
-        .msg_iovlen = 1,
-        .msg_control = &response_control,
-        .msg_controllen = sizeof(response_control),
-        .msg_flags = 0,
-    };
+    msghdr response_message {};
+    response_message.msg_iov = &response_io;
+    response_message.msg_iovlen = 1;
+    response_message.msg_control = &response_control;
+    response_message.msg_controllen = sizeof(response_control);
 
     ssize_t received = 0;
     do {
@@ -1357,7 +1376,7 @@ static i64 exchange_with_broker(int broker_fd, void const* request, size_t reque
     if (received < 0)
         return -saved_errno;
 
-    for (auto* header = CMSG_FIRSTHDR(&response_message); header; header = CMSG_NXTHDR(&response_message, header)) {
+    for (auto* header = CMSG_FIRSTHDR(&response_message); header; header = next_control_message_header(response_message, header)) {
         if (header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS)
             continue;
         if (header->cmsg_len < CMSG_LEN(0))
@@ -1711,6 +1730,10 @@ static i64 perform_file_syscall(int syscall_number, SyscallRegisters const& regi
     case __NR_stat:
         return stat_through_broker(AT_FDCWD, path(0), reinterpret_cast<void*>(registers.arguments[1]), true);
 #endif
+#ifdef __NR_lstat
+    case __NR_lstat:
+        return stat_through_broker(AT_FDCWD, path(0), reinterpret_cast<void*>(registers.arguments[1]), false);
+#endif
 #ifdef __NR_newfstatat
     case __NR_newfstatat: {
         auto flags = number(3);
@@ -1866,6 +1889,12 @@ NO_SANITIZE_ADDRESS static void handle_sigsys(int, siginfo_t* info, void* contex
 #if defined(__NR_newfstatat) && defined(__NR_fstat)
         if (info->si_syscall == __NR_newfstatat && info->si_errno == emulate_fstatat_trap) {
             emulate_fstatat(context);
+            return;
+        }
+#endif
+#ifdef __NR_tkill
+        if (info->si_syscall == __NR_tkill && info->si_errno == emulate_tkill_trap) {
+            emulate_tkill(context);
             return;
         }
 #endif
@@ -2041,6 +2070,8 @@ void SeccompPolicy::allow_filesystem_metadata_queries()
     SECCOMP_APPEND_PATH_SYSCALL_IF_DEFINED(*this, faccessat2);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, fstatfs);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getdents64);
+    // glibc's lstat() makes newfstatat() with AT_SYMLINK_NOFOLLOW, but musl's makes lstat() itself.
+    SECCOMP_APPEND_PATH_SYSCALL_IF_DEFINED(*this, lstat);
     SECCOMP_APPEND_PATH_SYSCALL_IF_DEFINED(*this, newfstatat);
     SECCOMP_APPEND_PATH_SYSCALL_IF_DEFINED(*this, readlink);
     SECCOMP_APPEND_PATH_SYSCALL_IF_DEFINED(*this, readlinkat);
@@ -2116,11 +2147,19 @@ void SeccompPolicy::allow_file_descriptor_operations()
     SECCOMP_APPEND_ALLOW_SYSCALL(*this, dup2);
 #endif
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, dup3);
+    // glibc's pipe() makes pipe2(), but musl's makes pipe() itself, where the architecture has it.
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, pipe);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, pipe2);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, ftruncate);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, lseek);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, pread64);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, pwrite64);
+    // musl's pwrite() first tries pwritev2() with RWF_NOAPPEND, so that a descriptor opened for appending still writes
+    // at the offset. Where pwritev2() doesn't exist, it falls back to pwrite64() for any other descriptor.
+#ifdef __NR_pwritev2
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_pwritev2, 0, 1));
+    append(SECCOMP_ERRNO(ENOSYS));
+#endif
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, sendfile);
     SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, memfd_create);
 
@@ -2198,9 +2237,18 @@ void SeccompPolicy::allow_file_descriptor_operations()
     append(SECCOMP_LOAD_SYSCALL_NR);
     append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
 
+    // isatty() asks for a descriptor's terminal attributes with TCGETS in glibc, and for its window size with
+    // TIOCGWINSZ in musl. Both only read.
     append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_ioctl, 0, 5));
     append(SECCOMP_LOAD_ARGUMENT(1));
     append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, TCGETS, 0, 1));
+    append(SECCOMP_ALLOW);
+    append(SECCOMP_LOAD_SYSCALL_NR);
+    append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
+
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_ioctl, 0, 5));
+    append(SECCOMP_LOAD_ARGUMENT(1));
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, TIOCGWINSZ, 0, 1));
     append(SECCOMP_ALLOW);
     append(SECCOMP_LOAD_SYSCALL_NR);
     append(BPF_STMT(BPF_ALU | BPF_ADD | BPF_K, 0));
@@ -2758,6 +2806,15 @@ void SeccompPolicy::allow_signals()
     append(SECCOMP_ALLOW);
     append(SECCOMP_LOAD_SYSCALL_NR);
 #endif
+#ifdef __NR_tkill
+    append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_tkill, 0, 1));
+    append(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP | emulate_tkill_trap));
+    m_emulates_tkill = true;
+#endif
+    // The tkill() emulation names this process with getpid(), and the crash handler re-raises a fatal signal at this
+    // thread with getpid() and gettid().
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, getpid);
+    SECCOMP_APPEND_ALLOW_SYSCALL_IF_DEFINED(*this, gettid);
 }
 
 void SeccompPolicy::allow_clocks()
@@ -2815,9 +2872,12 @@ void SeccompPolicy::allow_gpu_device_operations()
     };
     append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_ioctl, 0, 2 * types.size() + 3));
     append(SECCOMP_LOAD_ARGUMENT(1));
-    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, _IOC_TYPEMASK << _IOC_TYPESHIFT));
+    // _IO() puts its type in a request's type field and leaves every other field clear, so _IO(0xff, 0) masks the type
+    // field. The kernel's own names for the field, _IOC_TYPEMASK and _IOC_TYPESHIFT, come in through glibc's
+    // <sys/ioctl.h> but not musl's.
+    append(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, static_cast<u32>(_IO(0xff, 0))));
     for (auto type : types) {
-        append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<u32>(type) << _IOC_TYPESHIFT, 0, 1));
+        append(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<u32>(_IO(static_cast<u8>(type), 0)), 0, 1));
         append(SECCOMP_ALLOW);
     }
     append(SECCOMP_LOAD_SYSCALL_NR);
@@ -2960,9 +3020,15 @@ ErrorOr<void> SeccompPolicy::install()
 
     // A logged refusal traps, and the kernel kills a process for a trap that arrives while SIGSYS is blocked, as it is
     // in glibc's pthread_create(). The file broker's filter keeps SIGSYS out of every mask, so without the broker this
-    // policy has to, ahead of any group that allows rt_sigprocmask.
+    // policy has to, ahead of any group that allows rt_sigprocmask. Outside glibc, the tkill() that the signal policy
+    // traps arrives with every signal blocked, from musl's raise(), abort(), and pthread_kill().
+#if defined(AK_LIBC_GLIBC)
+    bool const keeps_sigsys_unblocked = sandbox_debugging_is_enabled();
+#else
+    bool const keeps_sigsys_unblocked = sandbox_debugging_is_enabled() || m_emulates_tkill;
+#endif
 #ifdef __NR_rt_sigprocmask
-    if (sandbox_debugging_is_enabled() && !file_broker_is_active()) {
+    if (keeps_sigsys_unblocked && !file_broker_is_active()) {
         static constexpr size_t after_the_syscall_number_load = 4;
         VERIFY(m_filter[after_the_syscall_number_load - 1].k == offsetof(seccomp_data, nr));
         sock_filter const keep_sigsys_unblocked[] = {
@@ -3109,6 +3175,9 @@ ErrorOr<void> install_file_system_filter()
 #ifdef __NR_stat
         { __NR_stat, brokered },
 #endif
+#ifdef __NR_lstat
+        { __NR_lstat, brokered },
+#endif
 #ifdef __NR_newfstatat
         { __NR_newfstatat, brokered },
 #endif
@@ -3144,9 +3213,6 @@ ErrorOr<void> install_file_system_filter()
 #endif
 #ifdef __NR_bind
         { __NR_bind, brokered },
-#endif
-#ifdef __NR_lstat
-        { __NR_lstat, refused(ENOSYS) },
 #endif
 #ifdef __NR_statx
         { __NR_statx, refused(ENOSYS) },

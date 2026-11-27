@@ -256,7 +256,7 @@ def resign(app: Path, build_directory: Path) -> list[str]:
     already has and reseals the bundle over everything copied in. Code in nested bundles keeps the signatures the build
     gave it, since signing its files one by one would break the seals of those bundles; verify() checks them."""
     executables_directory = app / "Contents" / "MacOS"
-    main_executable = executables_directory / "Ladybird"
+    main_executable = executables_directory / "ladybird"
     resigned = []
     for library in bundle_binaries(app):
         if library.parent != executables_directory and not is_in_nested_bundle(app, library):
@@ -265,8 +265,8 @@ def resign(app: Path, build_directory: Path) -> list[str]:
         if executable == main_executable:
             continue
         command = ["codesign", "--sign", "-", "--force"]
-        entitlements = build_directory / "Services" / executable.name / f"{executable.name}.entitlements"
-        if entitlements.is_file():
+        entitlements = next((build_directory / "Services").glob(f"*/{executable.name}.entitlements"), None)
+        if entitlements is not None:
             command += ["--options", "runtime", "--entitlements", str(entitlements)]
         subprocess.run([*command, str(executable)], check=True, capture_output=True)
         resigned.append(executable.name)
@@ -309,8 +309,8 @@ def main() -> int:
     args = parser.parse_args()
 
     app = args.install_dir / "bundle" / "Ladybird.app"
-    built_app_binary = args.build_dir / "bin" / "Ladybird.app" / "Contents" / "MacOS" / "Ladybird"
-    if not (app / "Contents" / "MacOS" / "Ladybird").is_file():
+    built_app_binary = args.build_dir / "bin" / "Ladybird.app" / "Contents" / "MacOS" / "ladybird"
+    if not (app / "Contents" / "MacOS" / "ladybird").is_file():
         sys.exit(f"error: no installed app bundle at {app}")
     if not built_app_binary.is_file():
         sys.exit(f"error: no built app binary at {built_app_binary}")
