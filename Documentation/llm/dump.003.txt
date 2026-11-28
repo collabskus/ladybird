@@ -1,4 +1,493 @@
-﻿            // Pop the current node (which will be the head element) off the stack of open elements.
+﻿        // SAFETY: TreeBuilder is only constructed with a ParserState pointer owned by the
+        // C++ HTMLParser handle, and the handle outlives each parser run.
+        unsafe { self.state.as_ref() }
+    }
+}
+
+impl DerefMut for TreeBuilder {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: TreeBuilder is only constructed with a ParserState pointer owned by the
+        // C++ HTMLParser handle, and the handle outlives each parser run.
+        unsafe { self.state.as_mut() }
+    }
+}
+
+impl TreeBuilder {
+    fn new(tokenizer: NonNull<HtmlTokenizer>, host: *mut c_void, state: NonNull<ParserState>) -> Self {
+        let log_parse_errors = unsafe { ladybird_html_parser_parse_errors_enabled() };
+        Self {
+            tokenizer,
+            host,
+            state,
+            log_parse_errors,
+        }
+    }
+
+    fn next_token(&mut self, token: &mut Token, stop_at_insertion_point: bool, cdata_allowed: bool) -> bool {
+        // SAFETY: TreeBuilder is only constructed with a tokenizer pointer owned by the C++
+        // HTMLParser's Rust tokenizer handle, and the handle outlives each parser run.
+        unsafe {
+            let tokenizer = self.tokenizer.as_mut();
+            if !stop_at_insertion_point && let Some(code_point) = tokenizer.try_fast_data_char() {
+                *token = Token::new_character(code_point);
+                return true;
+            }
+            tokenizer.next_token_into(token, stop_at_insertion_point, cdata_allowed)
+        }
+    }
+
+    fn source_line_number_for_script_token(&mut self, token: &Token) -> usize {
+        // SAFETY: TreeBuilder is only constructed with a tokenizer pointer owned by the C++
+        // HTMLParser's Rust tokenizer handle, and the handle outlives each parser run.
+        let end_position = unsafe { self.tokenizer.as_mut().position_at(token.end_offset) };
+        end_position.line.saturating_add(1).min(usize::MAX as u64) as usize
+    }
+
+    fn switch_tokenizer_to(&mut self, state: State) {
+        // SAFETY: TreeBuilder is only constructed with a tokenizer pointer owned by the C++
+        // HTMLParser's Rust tokenizer handle, and the handle outlives each parser run.
+        unsafe { self.tokenizer.as_mut().switch_to(state) };
+    }
+
+    fn run(&mut self, stop_at_insertion_point: bool) {
+        // NB: The tokenizer puts every token here, and the rules below read it where it is.
+        let mut token = Token::default();
+        loop {
+            if !stop_at_insertion_point
+                && !self.next_line_feed_can_be_ignored
+                && self.insertion_mode == InsertionMode::InBody
+                && self
+                    .adjusted_current_node()
+                    .is_some_and(|node| node.namespace_ == RustFfiHtmlNamespace::Html)
+            {
+                // SAFETY: TreeBuilder is only constructed with a tokenizer pointer owned by the
+                // C++ HTMLParser's Rust tokenizer handle, and the handle outlives each parser run.
+                let has_fast_data_run = unsafe { self.tokenizer.as_ref().has_fast_data_run() };
+                if has_fast_data_run {
+                    self.reconstruct_the_active_formatting_elements();
+                    // SAFETY: See above.
+                    // FIXME: Recheck the tokenizer state after reconstruction; custom element reactions can abort
+                    //        the parser, invalidating the previously available Data-state run.
+                    let run = unsafe { self.tokenizer.as_mut().try_fast_data_run().unwrap() };
+                    // SAFETY: See above.
+                    let input = unsafe { &self.tokenizer.as_ref().input };
+                    if self.frameset_ok && contains_non_whitespace(input.slice(run.range.clone())) {
+                        self.frameset_ok = false;
+                    }
+                    self.pending_text.push_input_run(run, input);
+                    continue;
+                }
+            }
+
+            // https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-incdata
+            // OPTIMIZATION: Text of a script, a style element and the like is inserted a run of input at a time, which
+            //               is what "insert the token's character" does for each character of it.
+            if !stop_at_insertion_point
+                && !self.next_line_feed_can_be_ignored
+                && self.insertion_mode == InsertionMode::Text
+                && self
+                    .adjusted_current_node()
+                    .is_some_and(|node| node.namespace_ == RustFfiHtmlNamespace::Html)
+            {
+                // SAFETY: See above.
+                if let Some(run) = unsafe { self.tokenizer.as_mut().try_fast_element_text_run() } {
+                    // SAFETY: See above.
+                    let input = unsafe { &self.tokenizer.as_ref().input };
+                    self.pending_text.push_input_run(run, input);
+                    continue;
+                }
+            }
+
+            let cdata_allowed = self
+                .adjusted_current_node()
+                .is_some_and(|node| node.namespace_ != RustFfiHtmlNamespace::Html);
+            if !self.next_token(&mut token, stop_at_insertion_point, cdata_allowed) {
+                break;
+            }
+            if self.next_line_feed_can_be_ignored {
+                self.next_line_feed_can_be_ignored = false;
+                if token.token_type == TokenType::Character && token.code_point == '\n' as u32 {
+                    continue;
+                }
+            }
+            let is_character = token.token_type == TokenType::Character;
+            if !is_character {
+                self.flush_character_insertions();
+            }
+            let is_eof = token.token_type == TokenType::EndOfFile;
+            if self.should_process_token_using_html_rules(&token) {
+                self.process_using_the_rules_for(self.insertion_mode, &mut token);
+            } else {
+                self.process_using_the_rules_for_foreign_content(&mut token);
+            }
+            if self.pending_script.is_some() || self.pending_svg_script.is_some() || self.parser_pause_requested {
+                break;
+            }
+            if is_eof {
+                break;
+            }
+        }
+        self.flush_character_insertions();
+    }
+
+    fn process_using_the_rules_for(&mut self, mode: InsertionMode, token: &mut Token) {
+        match mode {
+            InsertionMode::Initial => self.handle_initial(token),
+            InsertionMode::BeforeHtml => self.handle_before_html(token),
+            InsertionMode::BeforeHead => self.handle_before_head(token),
+            InsertionMode::InHead => self.handle_in_head(token),
+            InsertionMode::InHeadNoscript => self.handle_in_head_noscript(token),
+            InsertionMode::AfterHead => self.handle_after_head(token),
+            InsertionMode::InBody => self.handle_in_body(token),
+            InsertionMode::Text => self.handle_text(token),
+            InsertionMode::InTemplate => self.handle_in_template(token),
+            InsertionMode::InTableText => self.handle_in_table_text(token),
+            InsertionMode::InTable => self.handle_in_table(token),
+            InsertionMode::InCaption => self.handle_in_caption(token),
+            InsertionMode::InColumnGroup => self.handle_in_column_group(token),
+            InsertionMode::InTableBody => self.handle_in_table_body(token),
+            InsertionMode::InRow => self.handle_in_row(token),
+            InsertionMode::InCell => self.handle_in_cell(token),
+            InsertionMode::InFrameset => self.handle_in_frameset(token),
+            InsertionMode::AfterFrameset => self.handle_after_frameset(token),
+            InsertionMode::AfterBody => self.handle_after_body(token),
+            InsertionMode::AfterAfterBody => self.handle_after_after_body(token),
+            InsertionMode::AfterAfterFrameset => self.handle_after_after_frameset(token),
+        }
+    }
+
+    // https://html.spec.whatwg.org/multipage/parsing.html#tree-construction-dispatcher
+    fn should_process_token_using_html_rules(&self, token: &Token) -> bool {
+        if self.stack_of_open_elements.is_empty() || token.token_type == TokenType::EndOfFile {
+            return true;
+        }
+
+        let Some(adjusted_current_node) = self.adjusted_current_node() else {
+            return true;
+        };
+
+        if adjusted_current_node.namespace_ == RustFfiHtmlNamespace::Html {
+            return true;
+        }
+
+        if is_mathml_text_integration_point(adjusted_current_node) {
+            if token.is_start_tag() && !token.is_start_tag_one_of(tag_set!["mglyph", "malignmark"]) {
+                return true;
+            }
+            if token.token_type == TokenType::Character {
+                return true;
+            }
+        }
+
+        if adjusted_current_node.namespace_ == RustFfiHtmlNamespace::MathMl
+            && adjusted_current_node.local_name == tag_name!("annotation-xml")
+            && token.is_start_tag_named(tag_id!("svg"))
+        {
+            return true;
+        }
+
+        if is_html_integration_point(adjusted_current_node)
+            && (token.is_start_tag() || token.token_type == TokenType::Character)
+        {
+            return true;
+        }
+
+        false
+    }
+
+    // https://html.spec.whatwg.org/multipage/parsing.html#the-initial-insertion-mode
+    fn handle_initial(&mut self, token: &mut Token) {
+        // -> A character token that is one of U+0009 CHARACTER TABULATION, U+000A LINE FEED (LF),
+        //    U+000C FORM FEED (FF), U+000D CARRIAGE RETURN (CR), or U+0020 SPACE
+        if token.is_parser_whitespace() {
+            return;
+        }
+
+        // -> A comment token
+        if token.token_type == TokenType::Comment {
+            let document = self.document_node();
+            self.append_comment_to_node(document, token.comment_data());
+            return;
+        }
+
+        // -> A DOCTYPE token
+        if token.token_type == TokenType::Doctype {
+            // If the DOCTYPE token's name is not "html", or the token's public identifier is not missing,
+            // or the token's system identifier is neither missing nor "about:legacy-compat", then there is a parse error.
+            let doctype = token.doctype_data();
+            if doctype.name != "html"
+                || !doctype.missing_public_identifier
+                || (!doctype.missing_system_identifier && doctype.system_identifier != "about:legacy-compat")
+            {
+                self.parse_error("unexpected DOCTYPE token");
+            }
+
+            // Let doctype be the result of creating a doctype given the Document node, the name given in the DOCTYPE
+            // token (or the empty string if the name was missing), the public identifier given in the DOCTYPE token
+            // (or the empty string if the public identifier was missing), and the system identifier given in the DOCTYPE
+            // token (or the empty string if the system identifier was missing). Then, if the Document node has neither
+            // a DocumentType child nor an element child, append doctype to the Document node.
+            // FIXME: Check for an existing DocumentType or element child before appending the new doctype.
+            fn present(missing: bool, string: &CodeUnits) -> Utf16View<'_> {
+                if missing {
+                    Utf16View::Latin1(&[])
+                } else {
+                    string.as_slice()
+                }
+            }
+            let name = present(doctype.missing_name, &doctype.name);
+            let public_id = present(doctype.missing_public_identifier, &doctype.public_identifier);
+            let system_id = present(doctype.missing_system_identifier, &doctype.system_identifier);
+            let document_type = self.create_document_type(name, public_id, system_id);
+            let document = self.document_node();
+            self.append_child(document, document_type);
+
+            // Then, if the document is not an iframe srcdoc document, and the parser cannot change the mode flag is
+            // false, set the Document to quirks or limited-quirks mode where the DOCTYPE token calls for it.
+            if !self.document_is_iframe_srcdoc_document() {
+                self.set_document_quirks_mode(self.which_quirks_mode(token));
+            }
+            self.insertion_mode = InsertionMode::BeforeHtml;
+            return;
+        }
+
+        // -> Anything else
+        // If the document is not an iframe srcdoc document, then this is a parse error; if the parser cannot change the
+        // mode flag is false, set the Document to quirks mode.
+        if !self.document_is_iframe_srcdoc_document() {
+            self.parse_error("anything else in initial insertion mode");
+            self.set_document_quirks_mode(RustFfiHtmlQuirksMode::Yes);
+        }
+
+        // In any case, switch the insertion mode to "before html", then reprocess the token.
+        self.insertion_mode = InsertionMode::BeforeHtml;
+        self.process_using_the_rules_for(InsertionMode::BeforeHtml, token);
+    }
+
+    // https://html.spec.whatwg.org/multipage/parsing.html#the-before-html-insertion-mode
+    fn handle_before_html(&mut self, token: &mut Token) {
+        // -> A DOCTYPE token
+        if token.token_type == TokenType::Doctype {
+            // Parse error. Ignore the token.
+            self.parse_error("DOCTYPE token in before html insertion mode");
+            return;
+        }
+
+        // -> A character token that is one of U+0009 CHARACTER TABULATION, U+000A LINE FEED (LF),
+        //    U+000C FORM FEED (FF), U+000D CARRIAGE RETURN (CR), or U+0020 SPACE
+        if token.is_parser_whitespace() {
+            return;
+        }
+
+        if token.token_type == TokenType::Comment {
+            let document = self.document_node();
+            self.append_comment_to_node(document, token.comment_data());
+            return;
+        }
+
+        if token.is_start_tag_named(tag_id!("html")) {
+            let document = self.document_node();
+            self.insert_html_element_for_document(token, document);
+            self.insertion_mode = InsertionMode::BeforeHead;
+            return;
+        }
+
+        if token.is_end_tag_one_of(tag_set!["head", "body", "html", "br"]) || !token.is_end_tag() {
+            let document = self.document_node();
+            if let Some(html_element) = self.document_html_element() {
+                self.stack_of_open_elements.push(StackNode {
+                    handle: html_element,
+                    local_name: HtmlName::from_utf8("html"),
+                    namespace_: RustFfiHtmlNamespace::Html,
+                    namespace_uri: None,
+                    attributes: OwnedAttributes::default(),
+                    template_content: None,
+                });
+            } else {
+                self.insert_html_element_for_document(&Token::synthetic_start_tag("html"), document);
+            }
+            self.insertion_mode = InsertionMode::BeforeHead;
+            self.process_using_the_rules_for(InsertionMode::BeforeHead, token);
+            return;
+        }
+
+        // -> Any other end tag
+        if token.is_end_tag() {
+            // Parse error. Ignore the token.
+            self.parse_error("unexpected end tag in before html insertion mode");
+        }
+    }
+
+    // https://html.spec.whatwg.org/multipage/parsing.html#the-before-head-insertion-mode
+    fn handle_before_head(&mut self, token: &mut Token) {
+        // -> A character token that is one of U+0009 CHARACTER TABULATION, U+000A LINE FEED (LF),
+        //    U+000C FORM FEED (FF), U+000D CARRIAGE RETURN (CR), or U+0020 SPACE
+        if token.is_parser_whitespace() {
+            return;
+        }
+
+        // -> A DOCTYPE token
+        if token.token_type == TokenType::Doctype {
+            // Parse error. Ignore the token.
+            self.parse_error("DOCTYPE token in before head insertion mode");
+            return;
+        }
+
+        if token.token_type == TokenType::Comment {
+            self.insert_comment(token.comment_data(), None);
+            return;
+        }
+
+        if token.is_start_tag_named(tag_id!("html")) {
+            self.process_using_the_rules_for(InsertionMode::InBody, token);
+            return;
+        }
+
+        if token.is_start_tag_named(tag_id!("head")) {
+            let head = self.insert_html_element_for(token);
+            self.head_element = Some(head);
+            self.insertion_mode = InsertionMode::InHead;
+            return;
+        }
+
+        if token.is_end_tag_one_of(tag_set!["head", "body", "html", "br"]) || !token.is_end_tag() {
+            let head = self.insert_html_element_named("head");
+            self.head_element = Some(head);
+            self.insertion_mode = InsertionMode::InHead;
+            self.process_using_the_rules_for(InsertionMode::InHead, token);
+            return;
+        }
+
+        // -> Any other end tag
+        if token.is_end_tag() {
+            // Parse error. Ignore the token.
+            self.parse_error("unexpected end tag in before head insertion mode");
+        }
+    }
+
+    // https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-inhead
+    fn handle_in_head(&mut self, token: &mut Token) {
+        // -> A character token that is one of U+0009 CHARACTER TABULATION, U+000A LINE FEED (LF), U+000C FORM FEED (FF),
+        //    U+000D CARRIAGE RETURN (CR), or U+0020 SPACE
+        if token.is_parser_whitespace() {
+            // Insert the character.
+            self.insert_character(token.code_point);
+            return;
+        }
+
+        // -> A comment token
+        if token.token_type == TokenType::Comment {
+            // Insert a comment.
+            self.insert_comment(token.comment_data(), None);
+            return;
+        }
+
+        // FIXME: -> A processing instruction token
+        //     Insert a processing instruction.
+
+        // -> A DOCTYPE token
+        if token.token_type == TokenType::Doctype {
+            // Parse error. Ignore the token.
+            self.parse_error("DOCTYPE token in in head insertion mode");
+            return;
+        }
+
+        // -> A start tag whose tag name is "html"
+        if token.is_start_tag_named(tag_id!("html")) {
+            // Process the token using the rules for the "in body" insertion mode.
+            self.process_using_the_rules_for(InsertionMode::InBody, token);
+            return;
+        }
+
+        // -> A start tag whose tag name is one of: "base", "basefont", "bgsound", "link"
+        if token.is_start_tag_one_of(tag_set!["base", "basefont", "bgsound", "link"]) {
+            // Insert an HTML element for the token. Immediately pop the current node off the stack of open elements.
+            self.insert_html_element_for(token);
+            self.pop_current_node();
+
+            // FIXME: Acknowledge the token's self-closing flag, if it is set.
+            return;
+        }
+
+        // -> A start tag whose tag name is "meta"
+        if token.is_start_tag_named(tag_id!("meta")) {
+            // Insert an HTML element for the token. Immediately pop the current node off the stack of open elements.
+            let element = self.insert_html_element_for(token);
+            self.pop_current_node();
+
+            // FIXME: Acknowledge the token's self-closing flag, if it is set.
+
+            unsafe { ladybird_html_parser_process_meta_element(self.host, element) };
+            return;
+        }
+
+        // -> A start tag whose tag name is "title"
+        if token.is_start_tag_named(tag_id!("title")) {
+            // Follow the generic RCDATA element parsing algorithm.
+            self.parse_generic_rcdata_element(token);
+            return;
+        }
+
+        // -> A start tag whose tag name is "noscript", if scripting mode is not Disabled
+        // -> A start tag whose tag name is one of: "noframes", "style"
+        if token.is_start_tag_one_of(tag_set!["style", "noframes"])
+            || (token.is_start_tag_named(tag_id!("noscript")) && self.scripting_enabled)
+        {
+            // Follow the generic raw text element parsing algorithm.
+            self.parse_generic_raw_text_element(token);
+            return;
+        }
+
+        // -> A start tag whose tag name is "noscript", if scripting mode is Disabled
+        if token.is_start_tag_named(tag_id!("noscript")) && !self.scripting_enabled {
+            // Insert an HTML element for the token.
+            self.insert_html_element_for(token);
+
+            // Switch the insertion mode to "in head noscript".
+            self.insertion_mode = InsertionMode::InHeadNoscript;
+            return;
+        }
+
+        // -> A start tag whose tag name is "script"
+        if token.is_start_tag_named(tag_id!("script")) {
+            // Run these steps:
+            //
+            // 1. Create an element for the token in the HTML namespace, with the intended parent being the target parent
+            //    of the appropriate place for inserting a node.
+            // 2. If the scripting mode is not Fragment, then set the element's parser document to the Document and set
+            //    its force async to false.
+            // NOTE: The Fragment scripting mode treats parser-inserted scripts as if they were not parser-inserted
+            //       (so external scripts execute asynchronously), allowing, for example, executing scripts when applying
+            //       a fragment created by createContextualFragment().
+            // FIXME: Keep force async true in Fragment mode; the C++ element configuration currently clears it.
+            // NOTE: Setting force async to false ensures that, if the script is external, any document.write() calls
+            //       in the script will execute in-line, instead of blowing the document away, as would happen in most
+            //       other cases. It also prevents the script from executing until the end tag is seen.
+            // 3. If the parser's scripting mode is Inert, then set the script element's already started to true.
+            //    (fragment case)
+            // 4. If the parser was invoked via the document.write() or document.writeln() methods, then optionally set
+            //    the script element's already started to true. (For example, the user agent might use this clause to
+            //    prevent execution of cross-origin scripts inserted via document.write() under slow network conditions,
+            //    or when the page has already taken a long time to load.)
+            // 5. Insert an element at the adjusted insertion location with the newly created element.
+            // 6. Push the newly created element onto the stack of open elements so that it is the new current node.
+            // NB: Creation, configuration, insertion, and the stack push are performed by the insertion helper.
+            self.insert_html_element_for(token);
+
+            // 7. Switch the tokenizer to the script data state.
+            self.switch_tokenizer_to(State::ScriptData);
+
+            // 8. Set the original insertion mode to the current insertion mode.
+            self.original_insertion_mode = self.insertion_mode;
+
+            // 9. Switch the insertion mode to "text".
+            self.insertion_mode = InsertionMode::Text;
+            return;
+        }
+
+        // -> An end tag whose tag name is "head"
+        if token.is_end_tag_named(tag_id!("head")) {
+            // Pop the current node (which will be the head element) off the stack of open elements.
             self.pop_current_node();
 
             // Switch the insertion mode to "after head".
@@ -65919,12 +66408,24 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
             return EventResult::Handled;
         }
 
-        if ((key == UIEvents::KeyCode::Key_PageUp || key == UIEvents::KeyCode::Key_PageDown) && (modifiers & UIEvents::Mod_Shift)) {
-            if (key == UIEvents::KeyCode::Key_PageUp)
-                target->move_cursor_to_previous_page(InputEventsTarget::CollapseSelection::No);
-            else
-                target->move_cursor_to_next_page(InputEventsTarget::CollapseSelection::No);
-            return EventResult::Handled;
+        if (key == UIEvents::KeyCode::Key_PageUp || key == UIEvents::KeyCode::Key_PageDown) {
+            // Shift+Page Up/Down extends the selection by a page. A plain Page Up/Down moves the cursor by a page too in
+            // multi-line text, except on macOS, where it only scrolls, as it does in the platform's own text views. In a
+            // single-line input, it scrolls the page as if the input weren't focused.
+            Optional<InputEventsTarget::CollapseSelection> collapse;
+            if (modifiers & UIEvents::Mod_Shift)
+                collapse = InputEventsTarget::CollapseSelection::No;
+#if !defined(AK_OS_MACOS)
+            else if ((modifiers & ~UIEvents::Mod_Keypad) == UIEvents::Mod_None && !is<HTML::HTMLInputElement>(document->focused_area().ptr()))
+                collapse = InputEventsTarget::CollapseSelection::Yes;
+#endif
+            if (collapse.has_value()) {
+                if (key == UIEvents::KeyCode::Key_PageUp)
+                    target->move_cursor_to_previous_page(*collapse);
+                else
+                    target->move_cursor_to_next_page(*collapse);
+                return EventResult::Handled;
+            }
         }
 
         if (key == UIEvents::KeyCode::Key_Home) {
@@ -70477,6 +70978,7 @@ FILE: Libraries/LibWeb/Page/Page.cpp
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/Focus.h>
+#include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/HTML/HTMLIFrameElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLMediaElement.h>
@@ -72725,21 +73227,23 @@ void Page::set_content_blocking_policy(bool enabled, ReadonlySpan<String> disabl
     invalidate_user_style();
 }
 
-Vector<GC::Root<DOM::Document>> Page::documents_in_active_window() const
+// The documents find-in-page searches: the active document, and then those of the navigables nested in it that this
+// process hosts, in tree order.
+Vector<GC::Root<DOM::Document>> Page::documents_to_search() const
 {
     if (!has_local_traversable())
         return {};
-
-    auto documents = HTML::main_thread_event_loop().documents_in_this_event_loop_matching([&](auto& document) {
-        return document.window() == local_traversable()->active_window();
-    });
-
+    Vector<GC::Root<DOM::Document>> documents;
+    for (auto const& navigable : local_traversable()->hosted_inclusive_descendant_navigables()) {
+        if (auto document = navigable->active_document(); document && document->window())
+            documents.append(*document);
+    }
     return documents;
 }
 
 void Page::clear_selection()
 {
-    for (auto const& document : documents_in_active_window()) {
+    for (auto const& document : documents_to_search()) {
         auto selection = document->get_selection();
         if (!selection)
             continue;
@@ -72755,9 +73259,12 @@ Page::FindInPageResult Page::perform_find_in_page_query(FindInPageQuery const& q
     Vector<GC::Root<DOM::Range>> all_matches;
 
     auto active_match = find_in_page_active_match();
+    // Find carries on from the selection in the document the user is in, which can be a nested one.
     auto search_start_range = [&]() -> GC::Ptr<DOM::Range> {
-        auto active_document = local_traversable()->active_document();
-        if (auto selection = active_document ? active_document->get_selection() : nullptr; selection && selection->range())
+        GC::Ptr<DOM::Document> document = local_traversable()->active_document();
+        if (auto focused_navigable = hosted_focused_navigable(); focused_navigable && focused_navigable->active_document())
+            document = focused_navigable->active_document();
+        if (auto selection = document ? document->get_selection() : nullptr; selection && selection->range())
             return selection->range();
         return active_match;
     }();
@@ -72777,7 +73284,7 @@ Page::FindInPageResult Page::perform_find_in_page_query(FindInPageQuery const& q
 
     auto should_update_match_index = false;
     auto active_match_is_still_a_match = false;
-    for (auto const& document : documents_in_active_window()) {
+    for (auto const& document : documents_to_search()) {
         auto matches = document->find_matching_text(query.string, query.case_sensitivity);
         if (search_start_range) {
             if (&search_start_range->start_container()->document() == document.ptr()) {
@@ -72793,7 +73300,9 @@ Page::FindInPageResult Page::perform_find_in_page_query(FindInPageQuery const& q
                         && match.end_offset() == active_match->end_offset();
                 }
                 should_update_match_index = true;
-                m_find_in_page_match_index = new_match_index.value_or(0) + all_matches.size();
+                // With no match after the boundary point in this document, the next one is the first match in the
+                // documents that follow it.
+                m_find_in_page_match_index = new_match_index.value_or(matches.size()) + all_matches.size();
             }
         } else if (GC::Ptr { document.ptr() } == local_traversable()->active_document()) {
             m_find_in_page_match_index = all_matches.size();
@@ -72886,6 +73395,19 @@ void Page::find_in_page_end()
     set_find_in_page_active_match(nullptr);
     if (!active_match || active_match->collapsed())
         return;
+
+    // A match in the value of a text control that has a selection becomes the control's selection, which its caret
+    // follows, rather than the document's.
+    if (auto shadow_root = active_match->start_container()->containing_shadow_root()) {
+        if (auto* control = as_if<HTML::FormAssociatedTextControlElement>(shadow_root->host())) {
+            auto const* input = as_if<HTML::HTMLInputElement>(shadow_root->host());
+            auto value_text = control->form_associated_element_to_text_node();
+            if ((!input || input->selection_or_range_applies()) && value_text && active_match->start_container() == value_text && active_match->end_container() == value_text) {
+                control->set_the_selection_range(active_match->start_offset(), active_match->end_offset());
+                return;
+            }
+        }
+    }
 
     auto selection = active_match->start_container()->document().get_selection();
     if (!selection || selection->range())
@@ -73958,7 +74480,7 @@ private:
     template<typename Callback>
     void for_each_canvas_element(Callback&& callback);
 
-    Vector<GC::Root<DOM::Document>> documents_in_active_window() const;
+    Vector<GC::Root<DOM::Document>> documents_to_search() const;
     void discard_provisional_navigable_of(HTML::RemoteNavigable&);
 
     enum class SearchDirection {
@@ -420722,9 +421244,14 @@ fn search_node(arena: &LayoutNodeArena, node: NodeSlotId) -> SearchNode {
     if data.kind.get() == NodeKind::BreakNode {
         return SearchNode::LineBreak;
     }
-    let pseudo = data.generated_for.get();
-    if kind_is_box(data.kind.get()) || (pseudo != 0 && pseudo != GENERATED_FOR_FIRST_LETTER) {
+    if kind_is_box(data.kind.get()) {
         return SearchNode::Break;
+    }
+    // Generated content isn't the document's text, so find-in-page leaves it out, and the text on either side of an
+    // inline pseudo-element reads on as one run, just as it does in the DOM.
+    let pseudo = data.generated_for.get();
+    if pseudo != 0 && pseudo != GENERATED_FOR_FIRST_LETTER {
+        return SearchNode::Skip;
     }
     if kind_is_text(data.kind.get()) {
         let style = node_style_view(arena.data(data.parent.get())).expect("text parent has style");
@@ -491729,6 +492256,12 @@ const LUMINANCE_TO_ALPHA_MATRIX: [f32; 20] = [
     0.2126, 0.7152, 0.0722, 0.0, 0.0,
 ];
 
+/// How many nodes a filter's graph may have once each input it reads is spelled out where it's read. A primitive whose
+/// inputs both default to the result before it doubles the graph, so a chain of such primitives grows it
+/// exponentially. The cap leaves room for any graph that reads each result about once, as the primitive budget
+/// allows, and stops a doubling chain long before it takes noticeable time or memory to build.
+const MAXIMUM_FILTER_GRAPH_NODES: usize = 8192;
+
 fn boxed(filter: Option<Filter>) -> Option<Box<Filter>> {
     filter.map(Box::new)
 }
@@ -491751,6 +492284,12 @@ pub(crate) struct SvgFilterGraphBuilder {
     /// The output of the last primitive, which is what an unnamed `in` refers to and what the
     /// filter as a whole produces.
     last_result: FilterResult,
+    /// The number of nodes of each result, by name and for the last one.
+    nodes_by_name: HashMap<Vec<u16>, usize>,
+    last_result_nodes: usize,
+    /// Set once a primitive would take the graph past `MAXIMUM_FILTER_GRAPH_NODES`, after which the filter applies
+    /// as if it had no primitives.
+    too_large: bool,
 }
 
 impl SvgFilterGraphBuilder {
@@ -491763,6 +492302,9 @@ impl SvgFilterGraphBuilder {
             target: None,
             results_by_name: HashMap::new(),
             last_result: FilterResult::default(),
+            nodes_by_name: HashMap::new(),
+            last_result_nodes: 1,
+            too_large: false,
         }
     }
 
@@ -491814,6 +492356,9 @@ impl SvgFilterGraphBuilder {
     }
 
     pub(crate) fn push(&mut self, mut primitive: SvgFilterPrimitive) {
+        if self.too_large {
+            return;
+        }
         let result_name = std::mem::take(&mut primitive.result);
         let subregion = self.subregion_of(&primitive);
         let result = match subregion {
@@ -491830,6 +492375,18 @@ impl SvgFilterGraphBuilder {
                 subregion: Some(subregion),
             },
             _ => {
+                // Each input is a copy of the result it names, which a color space conversion may wrap, and the
+                // primitive adds itself and the crop to its subregion. This bounds what the primitive is about to build
+                // from its inputs, before it builds it.
+                let estimated_nodes = Self::input_names(&primitive)
+                    .iter()
+                    .map(|name| self.nodes_of_input(name) + 1)
+                    .sum::<usize>()
+                    + 2;
+                if estimated_nodes > MAXIMUM_FILTER_GRAPH_NODES {
+                    self.too_large = true;
+                    return;
+                }
                 let Some(mut result) = self.primitive_result(primitive, subregion) else {
                     return;
                 };
@@ -491848,15 +492405,38 @@ impl SvgFilterGraphBuilder {
                 result
             }
         };
+        // A primitive may also copy an input within its own graph, as feDropShadow does for its shadow, so count what
+        // it built.
+        let nodes = result
+            .filter
+            .as_ref()
+            .map_or(1, |filter| filter.node_count_up_to(MAXIMUM_FILTER_GRAPH_NODES));
+        if nodes > MAXIMUM_FILTER_GRAPH_NODES {
+            self.too_large = true;
+            return;
+        }
         if !result_name.is_empty() {
+            self.nodes_by_name.insert(result_name.clone(), nodes);
             self.results_by_name.insert(result_name, result.clone());
         }
         self.last_result = result;
+        self.last_result_nodes = nodes;
+    }
+
+    /// The number of nodes of the result an input named `name` reads, as `resolve_input` finds it.
+    fn nodes_of_input(&self, name: &[u16]) -> usize {
+        if Self::is_standard_input(name) {
+            return 2;
+        }
+        self.nodes_by_name.get(name).copied().unwrap_or(self.last_result_nodes)
     }
 
     /// The graph, with its output in sRGB for compositing onto the canvas, or `None` when no
-    /// primitive produced anything.
+    /// primitive produced anything, or when the graph would have grown too large.
     pub(crate) fn finish(self) -> Option<Filter> {
+        if self.too_large {
+            return None;
+        }
         self.last_result.converted_to(InterpolationColorSpace::SRGB)
     }
 
@@ -602085,814 +602665,3 @@ constexpr inline auto ASCII_WHITESPACE = "\t\n\f\r "sv;
 constexpr inline auto ASCII_WHITESPACE_CODE_POINTS = to_array<u32>({ '\t', '\n', '\f', '\r', ' ' });
 
 // https://infra.spec.whatwg.org/#ascii-whitespace
-constexpr bool is_ascii_whitespace(u32 code_point)
-{
-    // ASCII whitespace is U+0009 TAB, U+000A LF, U+000C FF, U+000D CR, or U+0020 SPACE.
-    return code_point == '\t' || code_point == '\n' || code_point == '\f' || code_point == '\r' || code_point == ' ';
-}
-
-}
-
-FILE: Libraries/LibWebCommon/Infra/Strings.cpp
-/*
- * Copyright (c) 2022-2023, Linus Groh <linusg@serenityos.org>
- * Copyright (c) 2022, networkException <networkexception@serenityos.org>
- * Copyright (c) 2023, Kenneth Myhra <kennethmyhra@serenityos.org>
- * Copyright (c) 2023, Sam Atkins <atkinssj@serenityos.org>
- * Copyright (c) 2024, Andreas Kling <andreas@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <AK/CharacterTypes.h>
-#include <AK/GenericLexer.h>
-#include <AK/String.h>
-#include <AK/Utf16String.h>
-#include <AK/Utf16StringBuilder.h>
-#include <AK/Utf16View.h>
-#include <AK/Utf8View.h>
-#include <LibWebCommon/Infra/CharacterTypes.h>
-#include <LibWebCommon/Infra/Strings.h>
-
-namespace Web::Infra {
-
-// https://infra.spec.whatwg.org/#normalize-newlines
-Utf16String normalize_newlines(Utf16String const& string)
-{
-    // To normalize newlines in a string, replace every U+000D CR U+000A LF code point pair with a single U+000A LF
-    // code point, and then replace every remaining U+000D CR code point with a U+000A LF code point.
-    if (!string.contains('\r'))
-        return string;
-
-    return normalize_newlines(string.utf16_view());
-}
-
-// https://infra.spec.whatwg.org/#normalize-newlines
-Utf16String normalize_newlines(Utf16View string)
-{
-    // To normalize newlines in a string, replace every U+000D CR U+000A LF code point pair with a single U+000A LF
-    // code point, and then replace every remaining U+000D CR code point with a U+000A LF code point.
-    if (!string.contains('\r'))
-        return Utf16String::from_utf16(string);
-
-    Utf16StringBuilder builder(string.length_in_code_units());
-    Utf16GenericLexer lexer { string };
-
-    while (!lexer.is_eof()) {
-        builder.append(lexer.consume_until('\r'));
-
-        if (lexer.peek() == '\r') {
-            lexer.ignore(1 + static_cast<size_t>(lexer.peek(1) == '\n'));
-            builder.append_ascii('\n');
-        }
-    }
-
-    return builder.to_string();
-}
-
-// https://infra.spec.whatwg.org/#strip-and-collapse-ascii-whitespace
-ErrorOr<String> strip_and_collapse_whitespace(StringView string)
-{
-    // Replace any sequence of one or more consecutive code points that are ASCII whitespace in the string with a single U+0020 SPACE code point.
-    StringBuilder builder;
-    for (auto code_point : Utf8View { string }) {
-        if (Infra::is_ascii_whitespace(code_point)) {
-            if (!builder.string_view().ends_with(' '))
-                builder.append(' ');
-            continue;
-        }
-        TRY(builder.try_append_code_point(code_point));
-    }
-
-    // ...and then remove any leading and trailing ASCII whitespace from that string.
-    return String::from_utf8(builder.string_view().trim(Infra::ASCII_WHITESPACE));
-}
-
-// https://infra.spec.whatwg.org/#strip-and-collapse-ascii-whitespace
-Utf16String strip_and_collapse_whitespace(Utf16String const& string)
-{
-    // Replace any sequence of one or more consecutive code points that are ASCII whitespace in the string with a single U+0020 SPACE code point.
-    if (!string.contains_any_of(Infra::ASCII_WHITESPACE_CODE_POINTS))
-        return string;
-
-    return strip_and_collapse_whitespace(string.utf16_view());
-}
-
-// https://infra.spec.whatwg.org/#strip-and-collapse-ascii-whitespace
-Utf16String strip_and_collapse_whitespace(Utf16View string)
-{
-    // Replace any sequence of one or more consecutive code points that are ASCII whitespace in the string with a single U+0020 SPACE code point.
-    Utf16StringBuilder builder;
-
-    for (auto code_point : string) {
-        if (Infra::is_ascii_whitespace(code_point)) {
-            if (!builder.view().ends_with(' '))
-                builder.append_ascii(' ');
-            continue;
-        }
-
-        builder.append_code_point(code_point);
-    }
-
-    // ...and then remove any leading and trailing ASCII whitespace from that string.
-    return builder.to_string().trim(Infra::ASCII_WHITESPACE);
-}
-
-// https://infra.spec.whatwg.org/#code-unit-prefix
-bool is_code_unit_prefix(Utf16View potential_prefix, Utf16View input)
-{
-    // 1. Let i be 0.
-    size_t i = 0;
-
-    // 2. While true:
-    while (true) {
-        // 1. If i is greater than or equal to potentialPrefix’s length, then return true.
-        if (i >= potential_prefix.length_in_code_units())
-            return true;
-
-        // 2. If i is greater than or equal to input’s length, then return false.
-        if (i >= input.length_in_code_units())
-            return false;
-
-        // 3. Let potentialPrefixCodeUnit be the ith code unit of potentialPrefix.
-        auto potential_prefix_code_unit = potential_prefix.code_unit_at(i);
-
-        // 4. Let inputCodeUnit be the ith code unit of input.
-        auto input_code_unit = input.code_unit_at(i);
-
-        // 5. Return false if potentialPrefixCodeUnit is not inputCodeUnit.
-        if (potential_prefix_code_unit != input_code_unit)
-            return false;
-
-        // 6. Set i to i + 1.
-        ++i;
-    }
-}
-
-// https://infra.spec.whatwg.org/#scalar-value-string
-ErrorOr<Utf16String> convert_to_scalar_value_string(Utf16View string)
-{
-    // To convert a string into a scalar value string, replace any surrogates with U+FFFD.
-    Utf16StringBuilder scalar_value_builder;
-    for (u32 code_point : string) {
-        if (is_unicode_surrogate(code_point))
-            code_point = 0xFFFD;
-        scalar_value_builder.append_code_point(code_point);
-    }
-    return scalar_value_builder.to_string();
-}
-
-// https://infra.spec.whatwg.org/#code-unit-less-than
-bool code_unit_less_than(Utf16View a, Utf16View b)
-{
-    return a.is_code_unit_less_than(b);
-}
-
-}
-
-FILE: Libraries/LibWebCommon/Infra/Strings.h
-/*
- * Copyright (c) 2022-2023, Linus Groh <linusg@serenityos.org>
- * Copyright (c) 2022, networkException <networkexception@serenityos.org>
- * Copyright (c) 2023, Kenneth Myhra <kennethmyhra@serenityos.org>
- * Copyright (c) 2023, Sam Atkins <atkinssj@serenityos.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/Forward.h>
-#include <AK/String.h>
-#include <AK/Utf16String.h>
-#include <AK/Utf16View.h>
-#include <LibWebCommon/Export.h>
-
-namespace Web::Infra {
-
-WEBCOMMON_API Utf16String normalize_newlines(Utf16String const&);
-WEBCOMMON_API Utf16String normalize_newlines(Utf16View);
-WEBCOMMON_API ErrorOr<String> strip_and_collapse_whitespace(StringView string);
-WEBCOMMON_API Utf16String strip_and_collapse_whitespace(Utf16View string);
-WEBCOMMON_API Utf16String strip_and_collapse_whitespace(Utf16String const& string);
-WEBCOMMON_API bool is_code_unit_prefix(Utf16View potential_prefix, Utf16View input);
-WEBCOMMON_API ErrorOr<Utf16String> convert_to_scalar_value_string(Utf16View string);
-WEBCOMMON_API bool code_unit_less_than(Utf16View a, Utf16View b);
-
-}
-
-FILE: Libraries/LibWebCommon/Infra/Types.h
-/*
- * Copyright (c) 2024, Sam Atkins <sam@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/Types.h>
-#include <AK/UFixedBigInt.h>
-
-namespace Web::Infra {
-
-// https://infra.spec.whatwg.org/#booleans
-// A boolean is either true or false.
-using Boolean = bool;
-
-// https://infra.spec.whatwg.org/#8-bit-unsigned-integer
-// An 8-bit unsigned integer is an integer in the range 0 to 255 (0 to 2^8 − 1), inclusive.
-using Unsigned8BitInteger = u8;
-
-// https://infra.spec.whatwg.org/#16-bit-unsigned-integer
-// A 16-bit unsigned integer is an integer in the range 0 to 65535 (0 to 2^16 − 1), inclusive.
-using Unsigned16BitInteger = u16;
-
-// https://infra.spec.whatwg.org/#32-bit-unsigned-integer
-// A 32-bit unsigned integer is an integer in the range 0 to 4294967295 (0 to 2^32 − 1), inclusive.
-using Unsigned32BitInteger = u32;
-
-// https://infra.spec.whatwg.org/#64-bit-unsigned-integer
-// A 64-bit unsigned integer is an integer in the range 0 to 18446744073709551615 (0 to 2^64 − 1), inclusive.
-using Unsigned64BitInteger = u64;
-
-// https://infra.spec.whatwg.org/#128-bit-unsigned-integer
-// A 128-bit unsigned integer is an integer in the range 0 to 340282366920938463463374607431768211455 (0 to 2^128 − 1), inclusive.
-using Unsigned128BitInteger = u128;
-
-// https://infra.spec.whatwg.org/#8-bit-signed-integer
-// An 8-bit signed integer is an integer in the range −128 to 127 (−2^7 to 2^7 − 1), inclusive.
-using Signed8BitInteger = i8;
-
-// https://infra.spec.whatwg.org/#16-bit-signed-integer
-// A 16-bit signed integer is an integer in the range −32768 to 32767 (−2^15 to 2^15 − 1), inclusive.
-using Signed16BitInteger = i16;
-
-// https://infra.spec.whatwg.org/#32-bit-signed-integer
-// A 32-bit signed integer is an integer in the range −2147483648 to 2147483647 (−2^31 to 2^31 − 1), inclusive.
-using Signed32BitInteger = i32;
-
-// https://infra.spec.whatwg.org/#64-bit-signed-integer
-// A 64-bit signed integer is an integer in the range −9223372036854775808 to 9223372036854775807 (−2^63 to 2^63 − 1), inclusive.
-using Signed64BitInteger = i64;
-
-}
-
-FILE: Libraries/LibWebCommon/Loader/ContentBlocking.cpp
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <AK/CharacterTypes.h>
-#include <LibURL/Parser.h>
-#include <LibWebCommon/Loader/ContentBlocking.h>
-
-namespace Web {
-
-Optional<String> content_blocking_site(URL::URL const& url)
-{
-    if (!url.scheme().is_one_of("http"sv, "https"sv) || !url.host().has_value())
-        return {};
-
-    auto host = url.serialized_host();
-    if (host.ends_with('.'))
-        host = host.substring_view(0, host.length() - 1);
-    if (host.is_empty())
-        return {};
-
-    return host.to_ascii_lowercase_string();
-}
-
-Optional<String> canonical_content_blocking_host(StringView host)
-{
-    if (host.is_empty())
-        return {};
-    if (host.contains(':') && !(host.starts_with('[') && host.ends_with(']')))
-        return {};
-
-    for (auto character : host) {
-        if (is_ascii_control(character) || " /\\?#@*%"sv.contains(character))
-            return {};
-    }
-
-    auto url = URL::Parser::basic_parse(MUST(String::formatted("http://{}/", host)));
-    if (!url.has_value() || url->port().has_value() || !url->username().is_empty() || !url->password().is_empty())
-        return {};
-
-    return content_blocking_site(*url);
-}
-
-}
-
-FILE: Libraries/LibWebCommon/Loader/ContentBlocking.h
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/Optional.h>
-#include <AK/String.h>
-#include <LibURL/URL.h>
-#include <LibWebCommon/Export.h>
-
-namespace Web {
-
-WEBCOMMON_API Optional<String> content_blocking_site(URL::URL const&);
-WEBCOMMON_API Optional<String> canonical_content_blocking_host(StringView);
-
-}
-
-FILE: Libraries/LibWebCommon/Loader/DownloadFilename.cpp
-/*
- * Copyright (c) 2026, Tim Ledbetter <tim.ledbetter@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <AK/LexicalPath.h>
-#include <AK/StringBuilder.h>
-#include <LibWebCommon/Loader/DownloadFilename.h>
-
-namespace Web {
-
-ByteString truncate_filename_to_byte_length(ByteString filename, size_t maximum_byte_length)
-{
-    if (filename.length() <= maximum_byte_length)
-        return filename;
-
-    auto is_utf8_continuation_byte = [](char byte) {
-        return (static_cast<u8>(byte) & 0b1100'0000) == 0b1000'0000;
-    };
-
-    // Avoid truncating in the middle of a multi-byte UTF-8 sequence.
-    auto length = maximum_byte_length;
-    for (size_t i = 0; i < 3; ++i) {
-        if (length == 0 || !is_utf8_continuation_byte(filename[length]))
-            break;
-        --length;
-    }
-    return filename.substring(0, length);
-}
-
-ByteString sanitize_suggested_download_filename(ByteString filename)
-{
-    filename = LexicalPath::basename(move(filename));
-
-    StringBuilder builder;
-    for (auto byte : filename.bytes()) {
-        if (byte == '\0' || byte == '/' || byte == '\\')
-            builder.append('_');
-        else
-            builder.append(static_cast<char>(byte));
-    }
-
-    auto sanitized = builder.to_byte_string();
-    if (sanitized.is_empty() || sanitized == "."sv || sanitized == ".."sv)
-        return "download";
-
-    if (sanitized.length() > maximum_filename_byte_length) {
-        // Preserve the extension when truncating, so the file type is not lost.
-        auto lexical_filename = LexicalPath { sanitized };
-        auto extension = lexical_filename.extension();
-        if (!extension.is_empty() && extension.length() + 1 < maximum_filename_byte_length) {
-            auto truncated_title = truncate_filename_to_byte_length(lexical_filename.title(), maximum_filename_byte_length - extension.length() - 1);
-            return ByteString::formatted("{}.{}", truncated_title, extension);
-        }
-        return truncate_filename_to_byte_length(move(sanitized), maximum_filename_byte_length);
-    }
-    return sanitized;
-}
-
-ByteString numbered_download_filename(ByteString const& filename, u64 index)
-{
-    auto lexical_filename = LexicalPath { filename };
-    auto title = lexical_filename.title();
-    auto extension = lexical_filename.extension();
-    auto number = ByteString::formatted(" ({})", index);
-
-    // NB: The number always fits. The extension is shortened if the number leaves too little room for it, and the title
-    //     takes what remains.
-    auto room_for_extension_and_title = maximum_filename_byte_length - number.length();
-    auto dotted_extension = extension.is_empty() ? ByteString {} : truncate_filename_to_byte_length(ByteString::formatted(".{}", extension), room_for_extension_and_title);
-    auto truncated_title = truncate_filename_to_byte_length(title, room_for_extension_and_title - dotted_extension.length());
-    return ByteString::formatted("{}{}{}", truncated_title, number, dotted_extension);
-}
-
-}
-
-FILE: Libraries/LibWebCommon/Loader/DownloadFilename.h
-/*
- * Copyright (c) 2026, Tim Ledbetter <tim.ledbetter@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/ByteString.h>
-#include <LibWebCommon/Export.h>
-
-namespace Web {
-
-inline constexpr size_t maximum_filename_byte_length = 255;
-
-WEBCOMMON_API ByteString truncate_filename_to_byte_length(ByteString, size_t maximum_byte_length);
-WEBCOMMON_API ByteString sanitize_suggested_download_filename(ByteString);
-// The filename with " (index)" before its extension, shortened to fit the maximum filename length.
-WEBCOMMON_API ByteString numbered_download_filename(ByteString const& filename, u64 index);
-
-}
-
-FILE: Libraries/LibWebCommon/Loader/FileResponseHeaders.cpp
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <AK/ByteString.h>
-#include <AK/Time.h>
-#include <LibCore/MimeData.h>
-#include <LibWebCommon/Loader/FileResponseHeaders.h>
-
-namespace Web {
-
-NonnullRefPtr<HTTP::HeaderList> response_headers_for_file(StringView path, size_t content_length, Optional<time_t> const& modified_time)
-{
-    // For file:// and resource:// URLs, we have to guess the MIME type, since there's no HTTP header to tell us what
-    // it is. We insert a fake Content-Type header here, so that clients can use it to learn the MIME type.
-    auto mime_type = Core::guess_mime_type_based_on_filename(path);
-
-    auto response_headers = HTTP::HeaderList::create({
-        { "Access-Control-Allow-Origin"sv, "null"sv },
-        { "Content-Type"sv, mime_type },
-        { "Content-Length"sv, ByteString::number(content_length) },
-    });
-
-    if (modified_time.has_value()) {
-        auto const datetime = AK::UnixDateTime::from_seconds_since_epoch(modified_time.value());
-        response_headers->set({ "Last-Modified"sv, datetime.to_byte_string("%a, %d %b %Y %H:%M:%S GMT"sv, AK::UnixDateTime::LocalTime::No) });
-    }
-
-    return response_headers;
-}
-
-}
-
-FILE: Libraries/LibWebCommon/Loader/FileResponseHeaders.h
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/NonnullRefPtr.h>
-#include <AK/Optional.h>
-#include <AK/StringView.h>
-#include <LibHTTP/HeaderList.h>
-#include <LibWebCommon/Export.h>
-#include <time.h>
-
-namespace Web {
-
-// The headers of a response to a request for a file: or resource: URL, which has no HTTP headers of its own.
-WEBCOMMON_API NonnullRefPtr<HTTP::HeaderList> response_headers_for_file(StringView path, size_t content_length, Optional<time_t> const& modified_time);
-
-}
-
-FILE: Libraries/LibWebCommon/Loader/LoaderConfigSnapshot.cpp
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <LibWebCommon/Loader/LoaderConfigSnapshot.h>
-
-namespace Web {
-
-SharedSiteCompatibilityData::~SharedSiteCompatibilityData() = default;
-
-}
-
-FILE: Libraries/LibWebCommon/Loader/LoaderConfigSnapshot.h
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/AtomicRefCounted.h>
-#include <AK/NonnullRefPtr.h>
-#include <AK/String.h>
-#include <AK/Vector.h>
-#include <LibURL/Origin.h>
-#include <LibWebCommon/Export.h>
-#include <LibWebCommon/Loader/SiteCompatibility.h>
-
-namespace Web {
-
-// Site compatibility data, which the agents of a process share across their threads.
-struct WEBCOMMON_API SharedSiteCompatibilityData final : public AtomicRefCounted<SharedSiteCompatibilityData> {
-    explicit SharedSiteCompatibilityData(SiteCompatibilityData data)
-        : data(move(data))
-    {
-    }
-    ~SharedSiteCompatibilityData();
-
-    SiteCompatibilityData const data;
-};
-
-// The user agent's settings that a fetch reads.
-struct LoaderConfig {
-    String user_agent;
-    NonnullRefPtr<SharedSiteCompatibilityData const> site_compatibility;
-    Vector<String> preferred_languages;
-    bool enable_global_privacy_control { false };
-
-    String user_agent_for(URL::Origin const& top_level_origin, URL::Origin const& origin) const { return site_compatibility->data.user_agent_for(top_level_origin, origin, user_agent); }
-    bool exposes_experimental_interface(URL::Origin const& top_level_origin, URL::Origin const& origin, StringView name) const { return site_compatibility->data.exposes_experimental_interface(top_level_origin, origin, name); }
-};
-
-// A loader configuration as it was at one moment, which a fetch keeps for its lifetime.
-struct LoaderConfigSnapshot final : public AtomicRefCounted<LoaderConfigSnapshot> {
-    explicit LoaderConfigSnapshot(LoaderConfig config)
-        : config(move(config))
-    {
-    }
-
-    LoaderConfig const config;
-};
-
-}
-
-FILE: Libraries/LibWebCommon/Loader/NavigatorCompatibilityMode.h
-/*
- * Copyright (c) 2026, Andreas Kling <andreas@ladybird.org>
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-namespace Web {
-
-enum class NavigatorCompatibilityMode {
-    Chrome,
-    Gecko,
-    WebKit
-};
-
-}
-
-FILE: Libraries/LibWebCommon/Loader/SiteCompatibility.cpp
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#include <AK/JsonArray.h>
-#include <AK/JsonObject.h>
-#include <AK/StringBuilder.h>
-#include <LibURL/Parser.h>
-#include <LibWebCommon/Loader/SiteCompatibility.h>
-
-namespace Web {
-
-// Only a site's own serialization is accepted, such as "https://example.com", so a rule can't name a subdomain, port or
-// path that matching would ignore.
-static ErrorOr<URL::Site> parse_site(StringView serialized_site)
-{
-    auto url = URL::Parser::basic_parse(serialized_site);
-    if (!url.has_value())
-        return Error::from_string_literal("Site-compatibility rule sites must be URLs");
-
-    auto origin = url->origin();
-    if (origin.is_opaque())
-        return Error::from_string_literal("Site-compatibility rule sites must not be opaque");
-
-    auto site = URL::Site::obtain(origin);
-    if (site.serialize() != serialized_site)
-        return Error::from_string_literal("Site-compatibility rule sites must be serialized sites, such as https://example.com");
-    return site;
-}
-
-static ErrorOr<Vector<String>> parse_sites(JsonObject const& object)
-{
-    auto sites = object.get_array("sites"sv);
-    if (!sites.has_value() || sites->is_empty())
-        return Error::from_string_literal("Site-compatibility rule must contain a non-empty 'sites' array");
-
-    Vector<String> result;
-    TRY(result.try_ensure_capacity(sites->size()));
-    for (size_t i = 0; i < sites->size(); ++i) {
-        auto const& site = sites->at(i);
-        if (!site.is_string())
-            return Error::from_string_literal("Site-compatibility rule sites must be strings");
-        TRY(result.try_append(site.as_string()));
-    }
-    return result;
-}
-
-static ErrorOr<Vector<UserAgentTransformation>> parse_user_agent_transformations(JsonObject const& object)
-{
-    if (!object.has("user_agent"sv))
-        return Vector<UserAgentTransformation> {};
-
-    // A present key must hold a non-empty array: JsonObject::get_array() alone can't tell a missing key from a value
-    // of the wrong type, and a rule with a broken half must fail, not run with the half that parsed.
-    auto transformations = object.get_array("user_agent"sv);
-    if (!transformations.has_value() || transformations->is_empty())
-        return Error::from_string_literal("Site-compatibility rule 'user_agent' must be a non-empty array");
-
-    Vector<UserAgentTransformation> result;
-    TRY(result.try_ensure_capacity(transformations->size()));
-    for (size_t i = 0; i < transformations->size(); ++i) {
-        auto const& transformation = transformations->at(i);
-        if (!transformation.is_string())
-            return Error::from_string_literal("User-Agent transformations must be strings");
-        if (transformation.as_string() == "hide_Ladybird"sv)
-            TRY(result.try_append(UserAgentTransformation::HideLadybird));
-        else if (transformation.as_string() == "hide_Chromium"sv)
-            TRY(result.try_append(UserAgentTransformation::HideChromium));
-        else
-            return Error::from_string_literal("Unknown User-Agent transformation");
-    }
-    return result;
-}
-
-// The names are the ones the IDL bindings gate behind [Experimental]: an interface name for a constructor the global
-// would otherwise hide, or Interface.member for an attribute or operation. A name nothing gates simply never matches.
-static ErrorOr<Vector<String>> parse_exposed_interfaces(JsonObject const& object)
-{
-    if (!object.has("expose_experimental_interfaces"sv))
-        return Vector<String> {};
-
-    auto names = object.get_array("expose_experimental_interfaces"sv);
-    if (!names.has_value() || names->is_empty())
-        return Error::from_string_literal("Site-compatibility rule 'expose_experimental_interfaces' must be a non-empty array");
-
-    Vector<String> result;
-    TRY(result.try_ensure_capacity(names->size()));
-
-    for (size_t i = 0; i < names->size(); ++i) {
-        auto const& name = names->at(i);
-        if (!name.is_string() || name.as_string().is_empty())
-            return Error::from_string_literal("Site-compatibility rule 'expose_experimental_interfaces' entries must be non-empty strings");
-        TRY(result.try_append(name.as_string()));
-    }
-
-    return result;
-}
-
-ErrorOr<SiteCompatibilityRule> SiteCompatibilityRule::from_json(JsonValue const& value)
-{
-    if (!value.is_object())
-        return Error::from_string_literal("Site-compatibility rule must be a JSON object");
-
-    auto const& object = value.as_object();
-    auto transformations = TRY(parse_user_agent_transformations(object));
-    auto exposed_interfaces = TRY(parse_exposed_interfaces(object));
-    if (transformations.is_empty() && exposed_interfaces.is_empty())
-        return Error::from_string_literal("Site-compatibility rule must contain a 'user_agent' or an 'expose_experimental_interfaces' array");
-
-    return create(TRY(parse_sites(object)), move(transformations), move(exposed_interfaces));
-}
-
-ErrorOr<SiteCompatibilityRule> SiteCompatibilityRule::create(Vector<String> serialized_sites, Vector<UserAgentTransformation> transformations, Vector<String> exposed_interfaces)
-{
-    Vector<URL::Site> sites;
-    TRY(sites.try_ensure_capacity(serialized_sites.size()));
-    for (auto const& serialized_site : serialized_sites)
-        TRY(sites.try_append(TRY(parse_site(serialized_site))));
-
-    return SiteCompatibilityRule { move(sites), move(transformations), move(exposed_interfaces) };
-}
-
-SiteCompatibilityRule::SiteCompatibilityRule(Vector<URL::Site> sites, Vector<UserAgentTransformation> transformations, Vector<String> exposed_interfaces)
-    : m_sites(move(sites))
-    , m_user_agent_transformations(move(transformations))
-    , m_exposed_interfaces(move(exposed_interfaces))
-{
-}
-
-bool SiteCompatibilityRule::exposes_experimental_interface(StringView name) const
-{
-    return m_exposed_interfaces.contains_slow(name);
-}
-
-bool SiteCompatibilityRule::matches(URL::Site const& site) const
-{
-    return m_sites.contains_slow(site);
-}
-
-static String remove_product(StringView user_agent, StringView name)
-{
-    StringBuilder builder;
-    bool first = true;
-    for (auto product : user_agent.split_view(' ')) {
-        if (product.starts_with(name) && product.substring_view(name.length()).starts_with('/'))
-            continue;
-        if (!first)
-            builder.append(' ');
-        builder.append(product);
-        first = false;
-    }
-    return MUST(builder.to_string());
-}
-
-String SiteCompatibilityRule::apply_user_agent_transformations(StringView user_agent) const
-{
-    auto transformed_user_agent = MUST(String::from_utf8(user_agent));
-    for (auto transformation : m_user_agent_transformations) {
-        switch (transformation) {
-        case UserAgentTransformation::HideLadybird:
-            transformed_user_agent = remove_product(transformed_user_agent, "Ladybird"sv);
-            break;
-        case UserAgentTransformation::HideChromium:
-            transformed_user_agent = remove_product(transformed_user_agent, "Chrome"sv);
-            break;
-        }
-    }
-    return transformed_user_agent;
-}
-
-static bool rule_applies(SiteCompatibilityRule const& rule, URL::Site const& top_level_site, URL::Site const& site)
-{
-    return rule.matches(top_level_site) || rule.matches(site);
-}
-
-String SiteCompatibilityData::user_agent_for(URL::Origin const& top_level_origin, URL::Origin const& origin, StringView default_user_agent) const
-{
-    auto top_level_site = URL::Site::obtain(top_level_origin);
-    auto site = URL::Site::obtain(origin);
-
-    auto user_agent = MUST(String::from_utf8(default_user_agent));
-    for (auto const& rule : m_rules) {
-        if (rule_applies(rule, top_level_site, site))
-            user_agent = rule.apply_user_agent_transformations(user_agent);
-    }
-    return user_agent;
-}
-
-bool SiteCompatibilityData::exposes_experimental_interface(URL::Origin const& top_level_origin, URL::Origin const& origin, StringView name) const
-{
-    auto top_level_site = URL::Site::obtain(top_level_origin);
-    auto site = URL::Site::obtain(origin);
-
-    for (auto const& rule : m_rules) {
-        if (rule.exposes_experimental_interface(name) && rule_applies(rule, top_level_site, site))
-            return true;
-    }
-    return false;
-}
-
-ErrorOr<SiteCompatibilityData> SiteCompatibilityData::from_json(JsonValue const& value)
-{
-    if (!value.is_array())
-        return Error::from_string_literal("Site-compatibility data must be a JSON array");
-
-    SiteCompatibilityData data;
-    auto const& rules = value.as_array();
-    for (size_t i = 0; i < rules.size(); ++i)
-        data.add_rule(TRY(SiteCompatibilityRule::from_json(rules.at(i))));
-    return data;
-}
-
-}
-
-FILE: Libraries/LibWebCommon/Loader/SiteCompatibility.h
-/*
- * Copyright (c) 2026-present, the Ladybird developers.
- *
- * SPDX-License-Identifier: BSD-2-Clause
- */
-
-#pragma once
-
-#include <AK/Error.h>
-#include <AK/JsonValue.h>
-#include <AK/String.h>
-#include <AK/Vector.h>
-#include <LibURL/Origin.h>
-#include <LibURL/Site.h>
-#include <LibWebCommon/Export.h>
-
-namespace Web {
-
-enum class UserAgentTransformation : u8 {
-    HideLadybird,
-    HideChromium,
-};
-
-class WEBCOMMON_API SiteCompatibilityRule {
-public:
