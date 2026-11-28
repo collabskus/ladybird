@@ -33,6 +33,7 @@
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/EventNames.h>
 #include <LibWeb/HTML/Focus.h>
+#include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/HTML/HTMLIFrameElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLMediaElement.h>
@@ -2281,21 +2282,23 @@ void Page::set_content_blocking_policy(bool enabled, ReadonlySpan<String> disabl
     invalidate_user_style();
 }
 
-Vector<GC::Root<DOM::Document>> Page::documents_in_active_window() const
+// The documents find-in-page searches: the active document, and then those of the navigables nested in it that this
+// process hosts, in tree order.
+Vector<GC::Root<DOM::Document>> Page::documents_to_search() const
 {
     if (!has_local_traversable())
         return {};
-
-    auto documents = HTML::main_thread_event_loop().documents_in_this_event_loop_matching([&](auto& document) {
-        return document.window() == local_traversable()->active_window();
-    });
-
+    Vector<GC::Root<DOM::Document>> documents;
+    for (auto const& navigable : local_traversable()->hosted_inclusive_descendant_navigables()) {
+        if (auto document = navigable->active_document(); document && document->window())
+            documents.append(*document);
+    }
     return documents;
 }
 
 void Page::clear_selection()
 {
-    for (auto const& document : documents_in_active_window()) {
+    for (auto const& document : documents_to_search()) {
         auto selection = document->get_selection();
         if (!selection)
             continue;
@@ -2311,9 +2314,12 @@ Page::FindInPageResult Page::perform_find_in_page_query(FindInPageQuery const& q
     Vector<GC::Root<DOM::Range>> all_matches;
 
     auto active_match = find_in_page_active_match();
+    // Find carries on from the selection in the document the user is in, which can be a nested one.
     auto search_start_range = [&]() -> GC::Ptr<DOM::Range> {
-        auto active_document = local_traversable()->active_document();
-        if (auto selection = active_document ? active_document->get_selection() : nullptr; selection && selection->range())
+        GC::Ptr<DOM::Document> document = local_traversable()->active_document();
+        if (auto focused_navigable = hosted_focused_navigable(); focused_navigable && focused_navigable->active_document())
+            document = focused_navigable->active_document();
+        if (auto selection = document ? document->get_selection() : nullptr; selection && selection->range())
             return selection->range();
         return active_match;
     }();
@@ -2333,7 +2339,7 @@ Page::FindInPageResult Page::perform_find_in_page_query(FindInPageQuery const& q
 
     auto should_update_match_index = false;
     auto active_match_is_still_a_match = false;
-    for (auto const& document : documents_in_active_window()) {
+    for (auto const& document : documents_to_search()) {
         auto matches = document->find_matching_text(query.string, query.case_sensitivity);
         if (search_start_range) {
             if (&search_start_range->start_container()->document() == document.ptr()) {
@@ -2349,7 +2355,9 @@ Page::FindInPageResult Page::perform_find_in_page_query(FindInPageQuery const& q
                         && match.end_offset() == active_match->end_offset();
                 }
                 should_update_match_index = true;
-                m_find_in_page_match_index = new_match_index.value_or(0) + all_matches.size();
+                // With no match after the boundary point in this document, the next one is the first match in the
+                // documents that follow it.
+                m_find_in_page_match_index = new_match_index.value_or(matches.size()) + all_matches.size();
             }
         } else if (GC::Ptr { document.ptr() } == local_traversable()->active_document()) {
             m_find_in_page_match_index = all_matches.size();
@@ -2442,6 +2450,19 @@ void Page::find_in_page_end()
     set_find_in_page_active_match(nullptr);
     if (!active_match || active_match->collapsed())
         return;
+
+    // A match in the value of a text control that has a selection becomes the control's selection, which its caret
+    // follows, rather than the document's.
+    if (auto shadow_root = active_match->start_container()->containing_shadow_root()) {
+        if (auto* control = as_if<HTML::FormAssociatedTextControlElement>(shadow_root->host())) {
+            auto const* input = as_if<HTML::HTMLInputElement>(shadow_root->host());
+            auto value_text = control->form_associated_element_to_text_node();
+            if ((!input || input->selection_or_range_applies()) && value_text && active_match->start_container() == value_text && active_match->end_container() == value_text) {
+                control->set_the_selection_range(active_match->start_offset(), active_match->end_offset());
+                return;
+            }
+        }
+    }
 
     auto selection = active_match->start_container()->document().get_selection();
     if (!selection || selection->range())
