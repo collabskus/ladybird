@@ -681,9 +681,7 @@ static bool is_request_from_an_svg_image(Infrastructure::Request const& request)
 }
 
 // https://fetch.spec.whatwg.org/#concept-main-fetch
-// NB: This is step 10 of main fetch. The WebSocket opening handshake does not go through main fetch yet, so it runs this
-//     step on its own.
-void upgrade_request_to_https_for_known_hsts_host_if_appropriate(Infrastructure::Request& request, Function<bool(String const&)> const& is_known_hsts_host)
+Optional<String> host_to_match_against_known_hsts_hosts(Infrastructure::Request const& request)
 {
     // 10. Set request’s current URL’s scheme to "https" if all of the following conditions are true:
     if (
@@ -694,11 +692,16 @@ void upgrade_request_to_https_for_known_hsts_host_if_appropriate(Infrastructure:
         // - Matching request’s current URL’s host per Known HSTS Host Domain Name Matching results in either a
         //   superdomain match with an asserted includeSubDomains directive or a congruent match (with or without an
         //   asserted includeSubDomains directive) [HSTS]
-        && is_known_hsts_host(request.current_url().host()->get<String>())
         // FIXME: or DNS resolution for the request finds a matching HTTPS RR per section 9.5 of [SVCB].
     ) {
-        request.current_url().set_scheme("https"sv);
+        return request.current_url().host()->get<String>();
     }
+    return {};
+}
+
+void upgrade_request_to_https(Infrastructure::Request& request)
+{
+    request.current_url().set_scheme("https"sv);
 }
 
 // https://fetch.spec.whatwg.org/#concept-main-fetch
@@ -849,6 +852,9 @@ static NonnullRefPtr<PendingResponse> get_response(Infrastructure::FetchParams c
 }
 
 // https://fetch.spec.whatwg.org/#concept-main-fetch
+static RefPtr<PendingResponse> continue_main_fetch(Infrastructure::FetchParams const&, RefPtr<Infrastructure::Response>, Recursive);
+static RefPtr<PendingResponse> continue_main_fetch_after_known_hsts_host_lookup(Infrastructure::FetchParams const&, Engine::KnownHSTSHostProvider&, String const& host, RefPtr<Infrastructure::Response>, Recursive);
+
 RefPtr<PendingResponse> main_fetch(Infrastructure::FetchParams const& fetch_params, ContentSecurityPolicy::ViolationReporter const& report_violation, Engine::KnownHSTSHostProvider& known_hsts_host_provider, Recursive recursive)
 {
     dbgln_if(WEB_FETCH_DEBUG, "Fetch: Running 'main fetch' with: fetch_params @ {}", &fetch_params);
@@ -909,9 +915,22 @@ RefPtr<PendingResponse> main_fetch(Infrastructure::FetchParams const& fetch_para
     }
 
     // 10. Set request’s current URL’s scheme to "https" if all of the following conditions are true:
-    upgrade_request_to_https_for_known_hsts_host_if_appropriate(*request, [&](String const& host) {
-        return known_hsts_host_provider.is_known_hsts_host(fetch_params.controller_token(), host);
-    });
+    auto host = host_to_match_against_known_hsts_hosts(*request);
+    if (!host.has_value())
+        return continue_main_fetch(fetch_params, move(response), recursive);
+    if (auto is_known_hsts_host = known_hsts_host_provider.known_answer(*host); is_known_hsts_host.has_value()) {
+        if (*is_known_hsts_host)
+            upgrade_request_to_https(*request);
+        return continue_main_fetch(fetch_params, move(response), recursive);
+    }
+    return continue_main_fetch_after_known_hsts_host_lookup(fetch_params, known_hsts_host_provider, *host, move(response), recursive);
+}
+
+// https://fetch.spec.whatwg.org/#concept-main-fetch
+// Main fetch continues at step 11.
+static RefPtr<PendingResponse> continue_main_fetch(Infrastructure::FetchParams const& fetch_params, RefPtr<Infrastructure::Response> response, Recursive recursive)
+{
+    auto request = fetch_params.request();
 
     if (recursive == Recursive::Yes) {
         // 12. If response is null, then set response to the result of running the steps corresponding to the first
@@ -948,7 +967,44 @@ RefPtr<PendingResponse> main_fetch(Infrastructure::FetchParams const& fetch_para
     auto start_fetch_input = fetch_params.start_fetch_input(fetch_id, response, make<FetchEventSink>(*controller));
     fetch_executor.post(Engine::Command::StartFetch { move(start_fetch_input) });
 
+    // NB: A fetch stopped, aborted or terminated before it started is stopped once it starts.
+    if (!fetch_params.control_block().is_ongoing())
+        controller->stop_request();
+
     return nullptr;
+}
+
+// https://fetch.spec.whatwg.org/#concept-main-fetch
+// Main fetch continues at step 11.
+static RefPtr<PendingResponse> continue_main_fetch_after_known_hsts_host_lookup(Infrastructure::FetchParams const& fetch_params, Engine::KnownHSTSHostProvider& known_hsts_host_provider, String const& host, RefPtr<Infrastructure::Response> response, Recursive recursive)
+{
+    if (recursive == Recursive::No) {
+        auto controller = GC::make_root(fetch_controller_of(fetch_params));
+        known_hsts_host_provider.look_up(fetch_params, host, [fetch_params = NonnullRefPtr { fetch_params }, response = move(response), controller = move(controller)](bool is_known_hsts_host) mutable {
+            if (is_known_hsts_host)
+                upgrade_request_to_https(fetch_params->request());
+            (void)continue_main_fetch(*fetch_params, move(response), Recursive::No);
+        });
+        return nullptr;
+    }
+
+    NonnullRefPtr engine_record = *fetch_params.engine_record();
+    auto returned_pending_response = PendingResponse::create(fetch_params);
+    known_hsts_host_provider.look_up(fetch_params, host, [fetch_params = NonnullRefPtr { fetch_params }, engine_record, response = move(response), returned_pending_response](bool is_known_hsts_host) mutable {
+        engine_record->defer([fetch_params = move(fetch_params), engine_record, response = move(response), returned_pending_response, is_known_hsts_host]() mutable {
+            if (engine_record->is_stopped()) {
+                returned_pending_response->resolve(Infrastructure::Response::network_error("Fetch was stopped while it looked up a Known HSTS Host"_string));
+                return;
+            }
+            if (is_known_hsts_host)
+                upgrade_request_to_https(fetch_params->request());
+            auto pending_response = continue_main_fetch(*fetch_params, move(response), Recursive::Yes);
+            pending_response->when_loaded([returned_pending_response](NonnullRefPtr<Infrastructure::Response> response) {
+                returned_pending_response->resolve(response);
+            });
+        });
+    });
+    return returned_pending_response;
 }
 
 // https://fetch.spec.whatwg.org/#concept-main-fetch
@@ -1402,13 +1458,13 @@ void finish_fetch_response_handover(GC::Ref<Infrastructure::FetchController> con
         });
 
         // 4. Queue a fetch task to run processResponseEndOfBodyTask with fetchParams’s task destination.
-        Infrastructure::queue_fetch_task(controller, controller->task_destination(), move(process_response_end_of_body_task));
+        controller->queue_fetch_task(move(process_response_end_of_body_task));
     });
 
     // 5. If fetchParams’s process response is non-null, then queue a fetch task to run fetchParams’s process response
     //    given response, with fetchParams’s task destination.
     if (controller->algorithms()->process_response()) {
-        Infrastructure::queue_fetch_task(controller, controller->task_destination(), GC::create_function(GC::Heap::the(), GC::captures(controller, response_view), [](auto& controller, auto& response_view) {
+        controller->queue_fetch_task(GC::create_function(GC::Heap::the(), GC::captures(controller, response_view), [](auto& controller, auto& response_view) {
             controller->algorithms()->process_response()->function()(response_view);
         }));
     }
@@ -1590,7 +1646,7 @@ void finish_fetch_response_handover(GC::Ref<Infrastructure::FetchController> con
             if (read_body_in_parallel) {
                 algorithms->process_response_consume_body()->function()(response_view, Empty {});
             } else {
-                Infrastructure::queue_fetch_task(controller, controller->task_destination(), GC::create_function(GC::Heap::the(), GC::captures(algorithms, response_view), [](auto& algorithms, auto& response_view) {
+                controller->queue_fetch_task(GC::create_function(GC::Heap::the(), GC::captures(algorithms, response_view), [](auto& algorithms, auto& response_view) {
                     // NB: We have to provide fully_read a callback which accepts a ByteBuffer. Since that's not
                     //     nullable, we just invoke process_response_consume_body with a null value manually here.
                     algorithms->process_response_consume_body()->function()(response_view, Empty {});
@@ -3257,7 +3313,9 @@ NonnullRefPtr<PendingResponse> nonstandard_resource_loader_file_or_http_network_
             return;
 
         if (network_transport && control_block->is_ongoing() && engine_record->network_activity_observers().has_devtools_client()) {
-            Engine::Event::TransportActivity::ResponseBodyBytes body_bytes { MUST(Core::ImmutableBytes::copy(data.bytes())) };
+            auto const* file_backed_slice = data.file_backed_slice();
+            auto bytes = file_backed_slice ? file_backed_slice->slice : MUST(Core::ImmutableBytes::copy(data.bytes()));
+            Engine::Event::TransportActivity::ResponseBodyBytes body_bytes { move(bytes) };
             engine_record->report_network_activity(network_transport->request_id(), move(body_bytes));
         }
 

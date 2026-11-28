@@ -149,7 +149,7 @@ public:
     void set_long_stack_traces_enabled(bool);
     Optional<Vector<String>> complete_console_input(Utf16String const& input);
 
-    void find_in_page(Utf16String const& query, bool highlight_all);
+    void find_in_page(Utf16String const& query, bool highlight_all, bool case_sensitive);
     void find_in_page_next_match();
     void find_in_page_end();
 
@@ -211,6 +211,7 @@ public:
     Utf16String get_computed_aria_level(DOM::Element& element);
     void set_accessibility_focus_target(DOM::Element& element);
     void set_accessibility_interested();
+    void set_listen_for_dom_mutations();
 
     static u16 get_echo_server_port();
     static void set_echo_server_port(u16 port);
@@ -219,7 +220,7 @@ public:
 
     WebIDL::ExceptionOr<void> set_hsts_policy(Utf16String const& domain, u64 max_age, bool include_sub_domains);
     WebIDL::ExceptionOr<void> ingest_hsts_header(Utf16String const& url, Utf16String const& header_value);
-    WebIDL::ExceptionOr<bool> is_known_hsts_host(Utf16String const& domain);
+    GC::Ref<WebIDL::Promise> is_known_hsts_host(Utf16String const& domain);
 
     void set_browser_zoom(double factor);
     void set_device_pixel_ratio(double ratio);

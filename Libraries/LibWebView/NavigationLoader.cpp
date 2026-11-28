@@ -15,6 +15,7 @@
 #include <LibThreading/ThreadPool.h>
 #include <LibURL/Parser.h>
 #include <LibURL/Site.h>
+#include <LibWebCommon/Fetch/Infrastructure/HTTP/MIME.h>
 #include <LibWebCommon/Fetch/Infrastructure/URL.h>
 #include <LibWebCommon/HTML/BrowsingContext.h>
 #include <LibWebCommon/HTML/CrossOrigin/OpenerPolicyEnforcement.h>
@@ -116,6 +117,18 @@ Optional<NavigationLoader::ResponseDocument> NavigationLoader::response_document
         .permissions_policy = fetched_navigation_params.permissions_policy,
         .requests_oac = requests_oac,
     };
+}
+
+// NB: The process creating the document shows the response in the PDF viewer if its computed type is a PDF MIME type.
+//     Sniffing in a browsing context computes one only if the supplied type is one, or is undefined or unknown.
+bool NavigationLoader::response_may_be_shown_in_the_pdf_viewer() const
+{
+    auto const* navigation_params = result().navigation_params.get_pointer<Web::HTML::NavigationParamsDescriptor>();
+    if (!navigation_params)
+        return false;
+    auto header_list = m_response_header_list ? NonnullRefPtr { *m_response_header_list } : HTTP::HeaderList::create(navigation_params->response.headers);
+    auto supplied_type = Web::Fetch::Infrastructure::extract_mime_type(header_list);
+    return !supplied_type.has_value() || supplied_type->essence().is_one_of("application/pdf"sv, "text/pdf"sv, "unknown/unknown"sv, "application/unknown"sv);
 }
 
 static Web::HTML::NavigationResponseBodyHandle const* response_body_handle(Web::HTML::NavigationPopulationResult const& result)
@@ -457,10 +470,7 @@ void NavigationLoader::read_local_file_for_response()
         };
         auto local_file = read_local_file();
 
-        auto origin_event_loop = event_loop->take();
-        if (!origin_event_loop.is_alive())
-            return;
-        origin_event_loop->deferred_invoke([weak_this = move(weak_this), local_file = move(local_file)] mutable {
+        event_loop->deferred_invoke([weak_this = move(weak_this), local_file = move(local_file)] mutable {
             if (auto* loader = weak_this.ptr())
                 loader->did_read_local_file_for_response(move(local_file));
         });
@@ -707,6 +717,8 @@ void NavigationLoader::set_document(CanonicalDocument const& document, Canonical
 {
     VERIFY(m_result.has_value());
     m_result->document_id = document.id();
+    // NB: The process that created the navigation params has no say in the PDF viewer's origin.
+    m_result->pdf_viewer_origin = response_may_be_shown_in_the_pdf_viewer() ? URL::Origin::create_opaque() : Optional<URL::Origin> {};
     if (auto top_level_origin = document.top_level_origin(); top_level_origin.has_value())
         m_top_level_site = URL::Site::serialize_for_partitioning(*top_level_origin);
 

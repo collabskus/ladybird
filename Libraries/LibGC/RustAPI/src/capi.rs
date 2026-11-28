@@ -4,11 +4,24 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-//! Declarations of Libraries/LibGC/CAPI.h.
+//! Declarations of Libraries/LibGC/CAPI.h, the C interface through which Rust reaches LibGC. Every crate that reaches
+//! the collector does so through these declarations, and mostly through the safer types of the rest of this crate.
 
 use core::ffi::{c_char, c_int, c_void};
 
-use super::class::CellTypeInfo;
+/// Mirrors GCCellTypeInfo from Libraries/LibGC/CAPI.h, which LibGC dispatches every per-cell operation through.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct CellTypeInfo {
+    pub cell_size: u32,
+    pub alignment: u32,
+    pub kind: u8,
+    pub visit_edges: unsafe extern "C" fn(cell: *mut c_void, visitor: *mut GCVisitor),
+    pub finalize: Option<unsafe extern "C" fn(cell: *mut c_void)>,
+    pub destroy: Option<unsafe extern "C" fn(cell: *mut c_void)>,
+    pub external_memory_size: Option<unsafe extern "C" fn(cell: *const c_void) -> usize>,
+    pub class_name: Option<unsafe extern "C" fn(cell: *const c_void, length: *mut usize) -> *const c_char>,
+}
 
 /// LibGC's heap, which Rust only ever refers to. It has no size and is not Unpin, so a reference to it claims nothing
 /// about the memory LibGC changes behind it.
@@ -142,6 +155,7 @@ unsafe extern "C" {
     pub fn gc_heap_allocate_cell(heap: *mut GCHeap, allocator: *mut GCAllocator) -> *mut c_void;
     pub fn gc_heap_allocate_storage_cell(heap: *mut GCHeap, allocator: *mut GCAllocator) -> *mut c_void;
     pub fn gc_heap_allocator_local_free_list(heap: *mut GCHeap, allocator: *mut GCAllocator) -> *mut *mut c_void;
+    pub fn gc_cell_heap(cell: *const c_void) -> *mut GCHeap;
     pub fn gc_cell_heap_context(cell: *const c_void) -> *mut c_void;
     pub fn gc_cell_type_info(cell: *const c_void) -> *const CellTypeInfo;
     pub fn gc_cell_is_marked(cell: *const c_void) -> bool;
@@ -165,6 +179,7 @@ unsafe extern "C" {
     pub fn gc_root_cell(root: *const GCRoot) -> *mut c_void;
 
     pub fn gc_heap_create_weak_impl(heap: *mut GCHeap, cell: *mut c_void) -> *mut GCWeakImpl;
+    pub fn gc_cell_create_weak_impl(cell: *mut c_void) -> *mut GCWeakImpl;
     pub safe fn gc_weak_impl_null() -> *mut GCWeakImpl;
     pub fn gc_weak_impl_ref(weak_impl: *mut GCWeakImpl);
     pub fn gc_weak_impl_unref(weak_impl: *mut GCWeakImpl);

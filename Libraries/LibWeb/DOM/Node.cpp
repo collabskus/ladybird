@@ -116,7 +116,7 @@
 namespace Web::DOM {
 
 #if ARCH(X86_64) && !defined(AK_OS_WINDOWS)
-static_assert(sizeof(Node) == 96);
+static_assert(sizeof(Node) == 88);
 #endif
 
 static bool final_direct_list_item_does_not_renumber_existing_content(Element const& list_item)
@@ -3235,7 +3235,12 @@ bool Node::is_uninteresting_whitespace_node() const
 
 IterationDecision Node::serialize_child_as_json(JsonArraySerializer<Utf16StringBuilder>& children_array, Node const& child) const
 {
-    if (child.is_uninteresting_whitespace_node())
+    // In a document whose layout is known to be stale, no box says if whitespace renders, so it's left out, as the
+    // whitespace of a text node without a box is.
+    auto is_uninteresting_whitespace = child.document().layout_is_known_stale()
+        ? is<Text>(child) && static_cast<Text const&>(child).data().is_ascii_whitespace()
+        : child.is_uninteresting_whitespace_node();
+    if (is_uninteresting_whitespace)
         return IterationDecision::Continue;
     JsonObjectSerializer<Utf16StringBuilder> child_object = MUST(children_array.add_object());
     child.serialize_tree_as_json(child_object);
@@ -3246,6 +3251,9 @@ IterationDecision Node::serialize_child_as_json(JsonArraySerializer<Utf16StringB
 void Node::serialize_tree_as_json(JsonObjectSerializer<Utf16StringBuilder>& object) const
 {
     Layout::ForcedReadScope read { document() };
+    // A document whose layout is known to be stale, as that of a display: none iframe is (no rendering update lays it
+    // out), is serialized without what its boxes say: They aren't the boxes its nodes would get.
+    auto const* box = document().layout_is_known_stale() ? nullptr : this->layout_node(read);
     MUST(object.add("name"sv, node_name().view()));
     MUST(object.add("id"sv, unique_id().value()));
     bool serialized_content_document = false;
@@ -3281,16 +3289,15 @@ void Node::serialize_tree_as_json(JsonObjectSerializer<Utf16StringBuilder>& obje
             }
         }
 
-        auto const* layout_node = this->layout_node(read);
-        if (layout_node && Painting::has_committed_box(*layout_node)) {
-            MUST(object.add("display"sv, Painting::display(*layout_node).to_string()));
-            if (Painting::could_be_scrolled_by_wheel_event(*layout_node)) {
+        if (box && Painting::has_committed_box(*box)) {
+            MUST(object.add("display"sv, Painting::display(*box).to_string()));
+            if (Painting::could_be_scrolled_by_wheel_event(*box)) {
                 MUST(object.add("scrollable"sv, true));
             }
-            if (!Painting::is_visible(*layout_node)) {
+            if (!Painting::is_visible(*box)) {
                 MUST(object.add("invisible"sv, true));
             }
-            if (Painting::has_stacking_context(*layout_node)) {
+            if (Painting::has_stacking_context(*box)) {
                 MUST(object.add("stackingContext"sv, true));
             }
         }
@@ -3307,7 +3314,7 @@ void Node::serialize_tree_as_json(JsonObjectSerializer<Utf16StringBuilder>& obje
         MUST(object.add("mode"sv, static_cast<DOM::ShadowRoot const&>(*this).mode() == ShadowRootMode::Open ? "open"sv : "closed"sv));
     }
 
-    MUST((object.add("visible"sv, !!layout_node(read))));
+    MUST((object.add("visible"sv, box != nullptr)));
 
     if (auto const* element = as_if<Element>(this)) {
         if (!serialized_content_document)
@@ -3945,9 +3952,16 @@ Layout::Node const* Node::layout_node(Layout::BegunRead const& read) const
 {
     auto const* layout_node = unsafe_layout_node(read);
     // Where only the render state knows whether layout is up to date, asking would make every read of a layout node
-    // wait for it, so only layout the host knows is stale is caught here.
-    if (layout_node)
-        VERIFY(!document().layout_is_known_stale());
+    // wait for it, so only layout the host knows is stale is caught here. Each way the host knows it has an assertion
+    // of its own, so that a failure says which one it was.
+    if (layout_node) {
+        auto staleness = document().known_layout_staleness();
+        VERIFY(staleness != KnownLayoutStaleness::FlownStyleUpdate);
+        VERIFY(staleness != KnownLayoutStaleness::NoLayoutNodeArena);
+        VERIFY(staleness != KnownLayoutStaleness::FrameInFlight);
+        VERIFY(staleness != KnownLayoutStaleness::LayoutOutOfDate);
+        VERIFY(staleness != KnownLayoutStaleness::LayoutTreeNeedsBuild);
+    }
     return layout_node;
 }
 
@@ -4069,7 +4083,7 @@ void Node::queue_mutation_record(Utf16FlyString const& type, Optional<Utf16FlySt
             //    then:
             if (!(node != this && !options.subtree)
                 && !(type == MutationType::attributes && (!options.attributes.has_value() || !options.attributes.value()))
-                && !(type == MutationType::attributes && options.attribute_filter.has_value() && (attribute_namespace.has_value() || !attribute_name.has_value() || !options.attribute_filter->contains_slow(attribute_name.value())))
+                && !(type == MutationType::attributes && options.has_attribute_filter && (attribute_namespace.has_value() || !attribute_name.has_value() || !options.attribute_filter.contains_slow(attribute_name.value())))
                 && !(type == MutationType::characterData && (!options.character_data.has_value() || !options.character_data.value()))
                 && !(type == MutationType::childList && !options.child_list)) {
                 // 1. Let mo be registered’s observer.

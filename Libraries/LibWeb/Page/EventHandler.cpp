@@ -43,11 +43,13 @@
 #include <LibWeb/HTML/HTMLButtonElement.h>
 #include <LibWeb/HTML/HTMLCanvasElement.h>
 #include <LibWeb/HTML/HTMLDialogElement.h>
+#include <LibWeb/HTML/HTMLEmbedElement.h>
 #include <LibWeb/HTML/HTMLHtmlElement.h>
 #include <LibWeb/HTML/HTMLIFrameElement.h>
 #include <LibWeb/HTML/HTMLImageElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLMediaElement.h>
+#include <LibWeb/HTML/HTMLObjectElement.h>
 #include <LibWeb/HTML/HTMLSelectElement.h>
 #include <LibWeb/HTML/HTMLSummaryElement.h>
 #include <LibWeb/HTML/HTMLTextAreaElement.h>
@@ -303,8 +305,16 @@ void EventHandler::visit_edges(JS::Cell::Visitor& visitor) const
 static CSS::UserSelect user_select_used_value_for_caret_position(Layout::BegunRead const& read, Painting::CaretPosition const& caret_position)
 {
     if (auto* layout_node = caret_position.boundary_layout_node(read)) {
-        // NB: The position comes from a hit test on up to date layout, which nothing has changed since.
-        VERIFY(layout_node->document().layout_is_up_to_date());
+        // NB: The position comes from a hit test on up to date layout, which nothing has changed since. Each way the host
+        //     can know that layout isn't up to date has an assertion of its own, so that a failure says which one it was.
+        auto const& document = layout_node->document();
+        auto staleness = document.known_layout_staleness();
+        VERIFY(staleness != DOM::KnownLayoutStaleness::FlownStyleUpdate);
+        VERIFY(staleness != DOM::KnownLayoutStaleness::NoLayoutNodeArena);
+        VERIFY(staleness != DOM::KnownLayoutStaleness::FrameInFlight);
+        VERIFY(staleness != DOM::KnownLayoutStaleness::LayoutOutOfDate);
+        VERIFY(staleness != DOM::KnownLayoutStaleness::LayoutTreeNeedsBuild);
+        VERIFY(document.layout_is_up_to_date());
         return layout_node->user_select_used_value();
     }
     if (auto* layout_node = caret_position.layout_node(read))
@@ -545,7 +555,19 @@ EventResult EventHandler::handle_mousedown(CSSPixelPoint visual_viewport_positio
         if (!has_committed_root_box())
             return EventResult::Accepted;
 
-        if (auto focus_candidate = focus_candidate_for_position(read, visual_viewport_position)) {
+        GC::Ptr<DOM::Node> hit_node;
+        if (auto hit = document->hit_test(read, visual_viewport_position); hit.has_value())
+            hit_node = hit->dom_node();
+        auto editing_host = hit_node ? associated_descendant_editing_host(read, *hit_node) : nullptr;
+
+        document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseDown);
+        if (!has_committed_root_box())
+            return EventResult::Accepted;
+        auto focus_candidate = focus_candidate_for_position(read, visual_viewport_position);
+        // A text control inside the editing host takes the press itself.
+        if (editing_host && !is<HTML::FormAssociatedTextControlElement>(focus_candidate.ptr()))
+            focus_candidate = editing_host;
+        if (focus_candidate) {
             HTML::run_focusing_steps(focus_candidate, nullptr, HTML::FocusTrigger::Click);
         } else {
             // INTEROP: As for a left click, a right click without a focusable target focuses the document's viewport.
@@ -555,6 +577,13 @@ EventResult EventHandler::handle_mousedown(CSSPixelPoint visual_viewport_positio
         // NB: Focusing may have run script that navigated away from the document.
         if (m_navigable->active_document() != document)
             return EventResult::Accepted;
+
+        if (hit_node)
+            move_caret_for_context_menu_press(read, *document, visual_viewport_position, *hit_node, editing_host);
+
+        // NB: Moving the caret fires selectstart, which may have disturbed the world.
+        if (m_navigable->active_document() != document)
+            return EventResult::Accepted;
     }
 
     // FIXME: The spec allows this to be fired following mousedown or mouseup. The native behavior on Windows is to
@@ -562,8 +591,26 @@ EventResult EventHandler::handle_mousedown(CSSPixelPoint visual_viewport_positio
     // NB: The contextmenu event is dispatched even if the page cancelled the pointerdown or mousedown event,
     //     matching other engines. The page can still suppress the native context menu by cancelling the
     //     contextmenu event itself.
-    if (is_context_menu_trigger)
+    if (is_context_menu_trigger) {
+        // NB: A listener may have taken the pressed node out of the document, so the event goes to what is under the
+        //     pointer by now.
+        if (!node->is_connected()) {
+            if (m_navigable->active_document() != document)
+                return EventResult::Accepted;
+            document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseDown);
+            if (!has_committed_root_box())
+                return EventResult::Accepted;
+            auto current_target = target_for_mouse_position(visual_viewport_position);
+            if (!current_target.has_value())
+                return EventResult::Accepted;
+            node = current_target->dom_node();
+            auto* current_target_layout_node = current_target->layout_node(read);
+            if (!node || !current_target_layout_node || !parent_element_for_event_dispatch(*current_target_layout_node, node, layout_node))
+                return EventResult::Accepted;
+            coordinates = compute_mouse_event_coordinates(visual_viewport_position, viewport_position, *layout_node);
+        }
         maybe_show_context_menu(*node, coordinates, screen_position, viewport_position, buttons, modifiers);
+    }
 
     if (dispatch_result != PointerEventDispatchResult::RunDefaultActions)
         return EventResult::Cancelled;
@@ -3720,6 +3767,49 @@ void EventHandler::run_mousedown_default_actions(Layout::BegunRead const& read, 
     }
 }
 
+static bool press_may_start_selection(DOM::Node const& hit_node)
+{
+    for (GC::Ptr<DOM::Node const> node = hit_node; node; node = node->flat_tree_parent()) {
+        if (node->is_editable_or_editing_host() || is<HTML::HTMLTextAreaElement>(*node))
+            return true;
+        if (auto const* input_element = as_if<HTML::HTMLInputElement>(*node))
+            return input_element->has_selectable_text();
+        if (is<HTML::HTMLImageElement>(*node) || is<HTML::HTMLMediaElement>(*node) || is<HTML::HTMLCanvasElement>(*node) || is<HTML::HTMLSelectElement>(*node) || is<HTML::HTMLEmbedElement>(*node))
+            return false;
+        if (auto const* object_element = as_if<HTML::HTMLObjectElement>(*node); object_element && !object_element->shows_fallback_content())
+            return false;
+        if (auto const* html_element = as_if<HTML::HTMLElement>(*node); html_element && html_element->uses_button_layout())
+            return false;
+        if (auto const* element = as_if<DOM::Element>(*node); element && element->creates_a_hyperlink())
+            return false;
+    }
+    return true;
+}
+
+void EventHandler::move_caret_for_context_menu_press(Layout::BegunRead const& read, DOM::Document& document, CSSPixelPoint visual_viewport_position, DOM::Node& hit_node, GC::Ptr<DOM::Node> editing_host)
+{
+    if (!press_may_start_selection(hit_node))
+        return;
+
+    // The caret position may lie in selectable text beside a node that is not selectable itself.
+    if (auto const* hit_layout_node = hit_node.layout_node(read); hit_layout_node && !hit_node.is_editable_or_editing_host() && hit_layout_node->user_select_used_value() == CSS::UserSelect::None)
+        return;
+
+    auto caret_position = caret_position_for_mouse_selection(read, document, visual_viewport_position, hit_node, editing_host);
+    if (!caret_position.has_value() || selection_contains_position(document, *caret_position))
+        return;
+
+    auto user_select = user_select_used_value_for_caret_position(read, *caret_position);
+    if (user_select == CSS::UserSelect::None)
+        return;
+
+    if (!fire_selectstart_event(read, document, visual_viewport_position, caret_position, user_select))
+        return;
+
+    if (initiate_character_selection(document, *caret_position, user_select, false))
+        stop_updating_selection();
+}
+
 // https://w3c.github.io/selection-api/#selectstart-event
 bool EventHandler::dispatch_selectstart_event(DOM::Document& document, DOM::Node& target)
 {
@@ -3815,16 +3905,20 @@ Optional<Painting::CaretPosition> EventHandler::caret_position_for_mouse_selecti
     // NB: Text control padding belongs to the host element, while the selectable text lives in its user-agent shadow
     //     tree. Constrain the hit test to that text so padding clicks snap to its closest caret position.
     Optional<Painting::CaretPosition> caret_position;
+    bool caret_is_in_focused_text_control = false;
     if (auto* text_control = as_if<HTML::FormAssociatedTextControlElement>(document.focused_area().ptr()); text_control && editable_hit_node_before_focus) {
         auto& text_control_element = text_control->text_control_to_html_element();
         if (text_control_element.is_shadow_including_inclusive_ancestor_of(*editable_hit_node_before_focus)) {
-            if (auto selection_scope = text_control->mouse_selection_scope())
+            if (auto selection_scope = text_control->mouse_selection_scope()) {
                 caret_position = document.caret_position_from_point(read, visual_viewport_position, selection_scope);
+                caret_is_in_focused_text_control = caret_position.has_value();
+            }
         }
     }
     if (!caret_position.has_value())
         caret_position = document.caret_position_from_point(read, visual_viewport_position);
-    if (editable_hit_node_before_focus && editable_hit_node_before_focus->is_connected() && editing_host_before_focus && should_use_caret_position_from_editable_hit_node(caret_position, *editable_hit_node_before_focus, *editing_host_before_focus)) {
+    // NB: A text control inside an editing host keeps the caret a press on it places in its own text.
+    if (!caret_is_in_focused_text_control && editable_hit_node_before_focus && editable_hit_node_before_focus->is_connected() && editing_host_before_focus && should_use_caret_position_from_editable_hit_node(caret_position, *editable_hit_node_before_focus, *editing_host_before_focus)) {
         if (auto caret_position_from_hit_node = caret_position_from_editable_hit_node(read, *editable_hit_node_before_focus); caret_position_from_hit_node.has_value())
             caret_position = caret_position_from_hit_node;
     }
@@ -4213,9 +4307,8 @@ void EventHandler::maybe_show_context_menu(GC::Ref<DOM::Node> node, MouseEventCo
         m_navigable->page().record_context_menu_request({}, { .kind = Page::ContextMenuRequest::Kind::Image, .target = *image_element, .position = page_viewport_position, .link_url = move(link_url), .image_mime_type = image_mime_type });
         m_navigable->page().client().page_did_request_image_context_menu(local_root_id, page_viewport_position, move(navigation), "", modifiers, bitmap, move(link_navigation), move(image_mime_type));
     } else if (link) {
-        // Right-clicking link text without an existing selection first selects the word under the pointer, as the
-        // ordinary page context menu does. A selected range is still only offered when the click lands within it.
-        (void)select_context_menu_text(read, document, coordinates);
+        // A selected range is only offered when the click lands within it.
+        (void)select_context_menu_text(read, document, coordinates, link);
         if (link_url.has_value()) {
             auto const& element = link->hyperlink_element_utils_element();
             auto navigation = HTML::prepare_navigation_from_document(*document, link_url.release_value(), element.hyperlink_referrer_policy());
@@ -4640,8 +4733,20 @@ bool EventHandler::initiate_paragraph_selection(DOM::Document& document, Paintin
     return true;
 }
 
-bool EventHandler::select_context_menu_text(Layout::BegunRead const& read, DOM::Document& document, MouseEventCoordinates const& coordinates)
+static constexpr bool context_menu_press_selects_text()
 {
+#if defined(AK_OS_MACOS)
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool EventHandler::select_context_menu_text(Layout::BegunRead const& read, DOM::Document& document, MouseEventCoordinates const& coordinates, HTML::HTMLHyperlinkElementUtils const* link)
+{
+    if (!context_menu_press_selects_text())
+        return false;
+
     auto caret_position = document.caret_position_from_point(read, coordinates.visual_viewport_position);
     if (!caret_position.has_value() || selection_contains_position(document, *caret_position))
         return false;
@@ -4651,6 +4756,22 @@ bool EventHandler::select_context_menu_text(Layout::BegunRead const& read, DOM::
     auto const* hit_layout_text_node = as_if<Layout::TextNode>(caret_position->boundary_layout_node(read));
     if (user_select == CSS::UserSelect::None || !hit_node || !hit_layout_text_node)
         return false;
+
+    // A link's text selects the whole link, unless the link is editable. Text that reaches the link through a shadow tree
+    // is not among the link's descendants, so it selects as a word.
+    GC::Ptr<DOM::Element> link_element = link ? const_cast<DOM::Element*>(&link->hyperlink_element_utils_element()) : nullptr;
+    if (link_element && hit_node->is_descendant_of(*link_element) && !hit_node->is_editable_or_editing_host()) {
+        if (!range_contains_viewport_position(DOM::Range::create(*hit_node, 0, *hit_node, hit_node->length()), coordinates.viewport_position))
+            return false;
+
+        if (!dispatch_selectstart_event(document, *hit_node) || !hit_node->is_descendant_of(*link_element))
+            return false;
+
+        if (auto selection = document.get_selection())
+            set_user_selection(link_element, 0, link_element, link_element->child_count(), selection, user_select);
+        stop_updating_selection();
+        return true;
+    }
 
     // The caret position is merely the boundary closest to the pointer, so only select text if the pointer is on it,
     // which can also be the word ending at that boundary.
@@ -5078,7 +5199,7 @@ bool EventHandler::dispatch_touch_event(PointerState& pointer, DOM::Node& target
         bool has_non_passive_listener = false;
         for (auto* event_target = static_cast<DOM::EventTarget*>(&target); event_target; event_target = event_target->get_parent(*event)) {
             for (auto const& listener : event_target->event_listener_list_matching(name, {})) {
-                if (!listener->removed && listener->passive != true) {
+                if (!listener->removed() && listener->passive() != true) {
                     has_non_passive_listener = true;
                     break;
                 }

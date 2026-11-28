@@ -139,6 +139,21 @@ enum class QuirksMode {
     Yes
 };
 
+// What keeps a document's layout from being up to date, as far as the host knows without reading the render state.
+enum class KnownLayoutStaleness : u8 {
+    NoneKnown,
+    // A style update computed off the main thread isn't applied yet.
+    FlownStyleUpdate,
+    // The document has no layout node arena, so no layout tree either.
+    NoLayoutNodeArena,
+    // A frame is still being rendered off the main thread, or a layout round rendered with it isn't taken in yet.
+    FrameInFlight,
+    // The render state's layout is out of date.
+    LayoutOutOfDate,
+    // The layout tree's update marks ask for a build.
+    LayoutTreeNeedsBuild,
+};
+
 // The parts of the document's environment a style change moves, as the style engine's StyleEnvironment bits. Each
 // restyles the elements whose computation read it.
 enum class StyleEnvironmentChange : u8 {
@@ -675,6 +690,7 @@ public:
     // Whether anything the document's style depends on may have moved since its last style update.
     [[nodiscard]] bool has_style_work(Layout::BegunRead const&) const;
     [[nodiscard]] bool layout_is_known_stale() const;
+    [[nodiscard]] KnownLayoutStaleness known_layout_staleness() const;
     void clear_devtools_layout_inspection_data();
     void sample_animation_effects_needing_style_update();
     void update_style_computer_viewport_rect();
@@ -1655,6 +1671,7 @@ public:
     [[nodiscard]] bool is_decoded_svg() const { return m_is_decoded_svg; }
 
     Vector<GC::Root<Range>> find_matching_text(Utf16View, CaseSensitivity);
+    GC::Ptr<Range> find_first_matching_text(Utf16View, CaseSensitivity, Optional<BoundaryPoint> const& search_start);
 
     void parse_html_from_a_string(Utf16View, HTML::SanitizerConfiguration const* = nullptr);
 
@@ -1907,6 +1924,8 @@ private:
     bool script_edits_for_the_user() const;
 
     void cancel_active_refresh();
+
+    Vector<GC::Root<Range>> find_matching_text(Utf16View, CaseSensitivity, Optional<BoundaryPoint> const& search_start, bool first_match_only);
 
     bool update_is_fully_active() const;
     bool compute_is_fully_active() const;
@@ -2694,9 +2713,6 @@ private:
     // https://html.spec.whatwg.org/multipage/dom.html#concept-document-ancestor-origins-list
     GC::Ptr<HTML::DOMStringList> m_ancestor_origins_list;
 };
-
-template<>
-inline bool Node::fast_is<Document>() const { return is_document(); }
 
 bool is_a_registrable_domain_suffix_of_or_is_equal_to(Utf16View host_suffix_string, URL::Host const& original_host);
 bool is_a_registrable_domain_suffix_of_or_is_equal_to(URL::Host const& host_suffix, URL::Host const& original_host);
