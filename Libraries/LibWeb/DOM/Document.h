@@ -83,6 +83,7 @@
 #include <LibWebCommon/Fullscreen/FullscreenRequestType.h>
 #include <LibWebCommon/HTML/CrossOrigin/OpenerPolicy.h>
 #include <LibWebCommon/HTML/CrossProcessId.h>
+#include <LibWebCommon/HTML/RegistrableDomainSuffix.h>
 #include <LibWebCommon/HTML/SandboxingFlagSet.h>
 #include <LibWebCommon/HTML/UserNavigationInvolvement.h>
 #include <LibWebCommon/HTML/VisibilityState.h>
@@ -375,6 +376,9 @@ public:
 
     u64 form_controls_version() const { return m_form_controls_version; }
     void bump_form_controls_version() { ++m_form_controls_version; }
+
+    // The label elements in this document's tree (not in shadow trees), in tree order.
+    ReadonlySpan<GC::Weak<HTML::HTMLLabelElement>> label_elements() const;
 
     u64 option_selectedness_version() const { return m_option_selectedness_version; }
     void bump_option_selectedness_version() { ++m_option_selectedness_version; }
@@ -1293,6 +1297,7 @@ public:
     // Whether the user changed the value of a text control or the content of an editing host in this document, which
     // they would lose if the document were unloaded without asking them.
     bool had_user_edits() const { return m_had_user_edits; }
+    bool is_inside_script_edit_on_its_own() const { return m_inside_script_edit_on_its_own; }
     void did_make_user_edit();
     WebIDL::ExceptionOr<bool> exec_command_internal(Utf16FlyString const& command, bool show_ui, Utf16View value, DispatchInputEvent, Optional<Utf16FlyString> const& user_input_type = {}, GC::Ptr<StaticRange> deletion_range = nullptr, GC::Ptr<DocumentFragment> pasted_fragment = nullptr);
     WebIDL::ExceptionOr<bool> query_command_enabled(Utf16FlyString const& command);
@@ -1330,15 +1335,13 @@ public:
     void cache_accessible_text(Element const&, CachedAccessibleText) const;
     void invalidate_cached_accessibility_data(Node const&, Optional<Utf16FlyString> const& attribute_name = {}, ReadonlySpan<GC::Ref<Node>> added_nodes = {}, ReadonlySpan<GC::Ref<Node>> removed_nodes = {});
 
-    // A kept record, with the version it got when it was kept: Every record and geometry kept gets a new version, so
-    // the same version means the same data.
-    struct KeptAccessibilityRecord {
-        WebView::AccessibilityNodeData const* data { nullptr };
-        u64 version { 0 };
-    };
-    KeptAccessibilityRecord kept_accessibility_record(Node const&) const;
+    // Fills in the node's data from its kept record and returns the version the record got when it was kept, or returns
+    // 0 when there's none: Every record and geometry kept gets a new version, so the same version means the same data.
+    u64 restore_accessibility_record(Node const&, WebView::AccessibilityNodeData&) const;
     // Returns the version the record gets, or 0 when it isn't kept.
     u64 cache_accessibility_record(Node const&, WebView::AccessibilityNodeData const&) const;
+    // Makes a text leaf's style the one kept for every other text leaf with the same, while records are kept.
+    void intern_accessibility_text_style(WebView::AccessibilityShared<WebView::AccessibilityTextStyle>&) const;
     void invalidate_cached_accessibility_records_after_style_change(Element const&);
 
     // A text node's character geometry, kept with its record from one build to the next along with what layout
@@ -1348,6 +1351,8 @@ public:
         AK_MAKE_NONCOPYABLE(CachedTextGeometry);
 
     public:
+        AK_ALLOC_WITH_KMALLOC;
+
         CachedTextGeometry() = default;
         CachedTextGeometry(CachedTextGeometry&&) = default;
         // Releases the references this held, before taking the other's.
@@ -1364,9 +1369,7 @@ public:
         };
         Vector<Source> sources;
         u64 version { 0 };
-        Vector<Gfx::IntPoint> character_offsets;
-        Vector<i32> line_break_character_offsets;
-        Vector<i32> line_heights;
+        WebView::AccessibilityShared<WebView::AccessibilityTextGeometry> geometry;
     };
     CachedTextGeometry const* cached_text_geometry(Node const&) const;
     // Returns the version the geometry gets, or 0 when it isn't kept.
@@ -2564,6 +2567,8 @@ private:
     Optional<AK::UnixDateTime> m_last_modified;
 
     u64 m_form_controls_version { 0 };
+    mutable Vector<GC::Weak<HTML::HTMLLabelElement>> m_label_elements;
+    mutable u64 m_label_elements_dom_tree_version { NumericLimits<u64>::max() };
     u64 m_option_selectedness_version { 0 };
     mutable Array<u64, to_underlying(HTMLCollectionAttributeInvalidationType::Count)> m_html_collection_attribute_invalidation_type_counts {};
     mutable HTMLCollectionAttributeInvalidationTypes m_html_collection_attribute_invalidation_types { 0 };
@@ -2713,8 +2718,5 @@ private:
     // https://html.spec.whatwg.org/multipage/dom.html#concept-document-ancestor-origins-list
     GC::Ptr<HTML::DOMStringList> m_ancestor_origins_list;
 };
-
-bool is_a_registrable_domain_suffix_of_or_is_equal_to(Utf16View host_suffix_string, URL::Host const& original_host);
-bool is_a_registrable_domain_suffix_of_or_is_equal_to(URL::Host const& host_suffix, URL::Host const& original_host);
 
 }

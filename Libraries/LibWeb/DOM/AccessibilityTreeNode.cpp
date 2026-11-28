@@ -20,6 +20,7 @@
 #include <LibWeb/DOM/Element.h>
 #include <LibWeb/DOM/HTMLCollection.h>
 #include <LibWeb/DOM/Node.h>
+#include <LibWeb/DOM/NodeIdentity.h>
 #include <LibWeb/DOM/Range.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/HTML/HTMLAnchorElement.h>
@@ -39,6 +40,7 @@
 #include <LibWeb/HTML/HTMLTableElement.h>
 #include <LibWeb/HTML/HTMLTableRowElement.h>
 #include <LibWeb/HTML/HTMLTextAreaElement.h>
+#include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/Layout/Box.h>
 #include <LibWeb/Layout/LayoutRustBridge.h>
 #include <LibWeb/Layout/Node.h>
@@ -182,14 +184,46 @@ static Gfx::IntRect accessibility_bounds(Layout::BegunRead const& read, Element 
 // Gecko report for a text leaf (LayoutText::LocalBoundingBoxRectForAccessibility unions its line-box rects;
 // AccessibilityRenderObject::boundingBoxRect takes RenderText::absoluteQuads; LocalAccessible::ParentRelativeBounds
 // unions the text frame's in-flow rects). Empty when the text renders no fragment.
-static Optional<CSSPixelRect> text_bounding_client_rect(Document const& document, Layout::Node const& layout_node)
+// The row layout bound a text node to.
+struct TextRow {
+    Layout::RustFFI::DocumentHost* host { nullptr };
+    Compositing::RustFFI::NodeSlotId slot;
+};
+
+// Reads the text node's row, or nothing when it has none.
+// OPTIMIZATION: A build reads the row of every text node, and the layout node that Node::layout_node() makes for each
+//               would stay alive as long as the row does: tens of megabytes on a long document.
+static Optional<TextRow> text_row(DOM::Text const& text_node, Document const& document, Layout::BegunRead const& read)
 {
+    auto const* arena = document.layout_node_arena_if_created();
+    if (!arena)
+        return {};
+    auto style_node = NodeIdentity::of(text_node).style_node();
+    if (!style_node)
+        return {};
+    VERIFY(!document.layout_is_known_stale());
+    auto slot = Layout::RustFFI::layout_row_bound_to_style_node(arena->host(), &read, style_node.value());
+    if (slot.index == Compositing::RustFFI::NodeSlotId_INVALID.index)
+        return {};
+    return TextRow { arena->host(), slot };
+}
+
+static Optional<CSSPixelRect> text_bounding_client_rect(Document const& document, TextRow row)
+{
+    // The same test as Document::can_compute_client_rects_without_accumulated_visual_contexts_update(), for a row.
+    auto can_skip_visual_context_update = [&] {
+        if (!document.has_layout_box() || !Layout::RustFFI::document_host_visual_contexts_need_update(row.host))
+            return false;
+        auto navigable = document.navigable();
+        bool viewport_scroll_offset_is_zero = !navigable || navigable->viewport_scroll_offset().is_zero();
+        return Layout::RustFFI::layout_script_can_compute_client_rects_without_visual_context_update(row.host, row.slot, viewport_scroll_offset_is_zero);
+    };
     Layout::RustFFI::FfiViewportMapping viewport_mapping {};
-    if (!document.can_compute_client_rects_without_accumulated_visual_contexts_update(layout_node))
+    if (!can_skip_visual_context_update())
         viewport_mapping = Painting::viewport_mapping(document);
     Optional<CSSPixelRect> united;
     Layout::RustFFI::layout_script_text_range_rects(
-        layout_node.document_host(), Layout::Node::slot_id(&layout_node),
+        row.host, row.slot,
         to_underlying(Painting::SelectionState::Full), 0, 0, 0, NumericLimits<size_t>::max(),
         viewport_mapping, &united, [](void* context, CSSPixelRect rect) {
             auto& united = *static_cast<Optional<CSSPixelRect>*>(context);
@@ -242,18 +276,22 @@ static bool fill_text_geometry(WebView::AccessibilityNodeData& node_data, DOM::T
     // origin and height. Text that renders no lines falls back to a single-line font-metrics computation.
     auto utf8 = node_data.name.bytes_as_string_view();
     Utf8View view { utf8 };
+    Vector<Gfx::IntPoint> character_offsets;
+    Vector<i32> line_break_character_offsets;
+    Vector<i32> line_tops;
+    Vector<i32> line_heights;
 
-    auto* layout = text_node.layout_node(read);
+    auto row = text_row(text_node, document, read);
 
     // The caret rect at a DOM offset is document-absolute and spans the height of the text on the line the offset
     // renders on, which is what a line's geometry is read from here.
     auto line_rect_at_offset = [&](size_t offset) -> Optional<CSSPixelRect> {
-        if (!layout)
+        if (!row.has_value())
             return {};
         Compositing::RustFFI::NodeSlotId const no_slot { Compositing::RustFFI::INVALID_NODE_SLOT_INDEX };
         Layout::RustFFI::FfiCaret caret;
-        Layout::RustFFI::layout_script_caret(layout->document_host(),
-            { .node = Layout::Node::slot_id(layout), .offset = offset, .downstream = true, .child_before = no_slot, .child_before_length = 0, .child_after = no_slot },
+        Layout::RustFFI::layout_script_caret(row->host,
+            { .node = row->slot, .offset = offset, .downstream = true, .child_before = no_slot, .child_before_length = 0, .child_after = no_slot },
             {}, &caret);
         if (!caret.found)
             return {};
@@ -261,8 +299,8 @@ static bool fill_text_geometry(WebView::AccessibilityNodeData& node_data, DOM::T
     };
 
     Vector<Layout::RustFFI::FfiVisualLine> lines;
-    if (layout) {
-        Layout::RustFFI::render_state_text_visual_lines(layout->document_host(), Layout::Node::slot_id(layout), &lines,
+    if (row.has_value()) {
+        Layout::RustFFI::render_state_text_visual_lines(row->host, row->slot, &lines,
             [](void* context, Layout::RustFFI::FfiVisualLine line) {
                 static_cast<Vector<Layout::RustFFI::FfiVisualLine>*>(context)->append(line);
             });
@@ -278,7 +316,7 @@ static bool fill_text_geometry(WebView::AccessibilityNodeData& node_data, DOM::T
     }
 
     if (!rendered_lines.is_empty()) {
-        if (auto own_box = text_bounding_client_rect(document, *layout); own_box.has_value())
+        if (auto own_box = text_bounding_client_rect(document, *row); own_box.has_value())
             node_data.bounds = own_box->to_type<int>();
 
         // Report positions relative to the text's own top-left (its leftmost line's left edge and its
@@ -302,7 +340,7 @@ static bool fill_text_geometry(WebView::AccessibilityNodeData& node_data, DOM::T
         x_positions.start_x.resize(text_utf16.length_in_code_units() + 1);
         x_positions.fragment_end_x.resize(text_utf16.length_in_code_units() + 1);
         Layout::RustFFI::layout_script_text_character_x_positions(
-            layout->document_host(), Layout::Node::slot_id(layout), &x_positions,
+            row->host, row->slot, &x_positions,
             [](void* context, size_t offset, float x, bool is_fragment_end) {
                 auto& positions = *static_cast<CharacterXPositions*>(context);
                 auto& list = is_fragment_end ? positions.fragment_end_x : positions.start_x;
@@ -331,10 +369,11 @@ static bool fill_text_geometry(WebView::AccessibilityNodeData& node_data, DOM::T
             // rendered text last reached (a leading run: the first line's start), and the first line starts
             // at character 0, leading run included.
             auto gap_position = rendered_end.value_or(Gfx::IntPoint { line_left_x, line_top_y });
-            while (node_data.character_offsets.size() < line_character_start)
-                node_data.character_offsets.append(gap_position);
-            node_data.line_break_character_offsets.append(node_data.line_break_character_offsets.is_empty() ? 0 : static_cast<i32>(line_character_start));
-            node_data.line_heights.append(line_height);
+            while (character_offsets.size() < line_character_start)
+                character_offsets.append(gap_position);
+            line_break_character_offsets.append(line_break_character_offsets.is_empty() ? 0 : static_cast<i32>(line_character_start));
+            line_tops.append(line_top_y);
+            line_heights.append(line_height);
             // Each character's x is where layout's glyph run puts it. A character layout gives no position
             // to (whitespace that collapsed away) takes no width: It sits where the next positioned character
             // on the line starts, or where the line ends. Only a line layout positions nothing on (e.g. vertical
@@ -376,33 +415,36 @@ static bool fill_text_geometry(WebView::AccessibilityNodeData& node_data, DOM::T
                 }
             }
             for (auto const& x : line_x)
-                node_data.character_offsets.append(Gfx::IntPoint { static_cast<i32>(*x), line_top_y });
+                character_offsets.append(Gfx::IntPoint { static_cast<i32>(*x), line_top_y });
             rendered_end = Gfx::IntPoint { static_cast<i32>(end_x), line_top_y };
         }
         // A trailing run that renders on no line, likewise.
-        while (rendered_end.has_value() && node_data.character_offsets.size() < view.length())
-            node_data.character_offsets.append(*rendered_end);
+        while (rendered_end.has_value() && character_offsets.size() < view.length())
+            character_offsets.append(*rendered_end);
+        node_data.text_geometry.set(WebView::AccessibilityTextGeometry::create(character_offsets, line_break_character_offsets, line_tops, line_heights));
         return true;
     }
     if (font) {
         // Fallback: single-line font-metrics computation.
-        node_data.line_break_character_offsets.append(0);
-        node_data.line_heights.append(node_data.bounds.height());
+        line_break_character_offsets.append(0);
+        line_tops.append(0);
+        line_heights.append(node_data.bounds.height());
         float cumulative = 0;
         for (u32 code_point : view) {
-            node_data.character_offsets.append(Gfx::IntPoint { static_cast<i32>(cumulative), 0 });
+            character_offsets.append(Gfx::IntPoint { static_cast<i32>(cumulative), 0 });
             cumulative += glyph_advance(*font, code_point);
         }
+        node_data.text_geometry.set(WebView::AccessibilityTextGeometry::create(character_offsets, line_break_character_offsets, line_tops, line_heights));
     }
     return false;
 }
 
 // What layout computes a text node's character geometry from, or nothing when that can't be told.
-static Optional<Document::CachedTextGeometry> text_geometry_sources(Layout::Node const& layout)
+static Optional<Document::CachedTextGeometry> text_geometry_sources(TextRow row)
 {
     Document::CachedTextGeometry geometry;
     auto known = Layout::RustFFI::layout_script_text_geometry_sources(
-        layout.document_host(), Layout::Node::slot_id(&layout), &geometry,
+        row.host, row.slot, &geometry,
         [](void* context, Layout::RustFFI::InlineContent const* line_content, i32 x, i32 y) {
             static_cast<Document::CachedTextGeometry*>(context)->sources.append({ line_content, x, y });
         });
@@ -415,9 +457,8 @@ static Optional<Document::CachedTextGeometry> text_geometry_sources(Layout::Node
 // gets: or nothing, when it can't be kept.
 static Optional<u64> keep_text_geometry(WebView::AccessibilityNodeData const& node_data, DOM::Text const& text_node, Document const& document, Document::CachedTextGeometry geometry)
 {
-    geometry.character_offsets = node_data.character_offsets;
-    geometry.line_break_character_offsets = node_data.line_break_character_offsets;
-    geometry.line_heights = node_data.line_heights;
+    // The kept geometry and the node's data share one copy of it.
+    geometry.geometry = node_data.text_geometry;
     if (auto version = document.cache_text_geometry(text_node, move(geometry)))
         return version;
     return {};
@@ -430,9 +471,7 @@ static Optional<u64> fill_volatile_fields(WebView::AccessibilityNodeData& node_d
 {
     node_data.bounds = {};
     node_data.is_focused = false;
-    node_data.character_offsets.clear();
-    node_data.line_break_character_offsets.clear();
-    node_data.line_heights.clear();
+    node_data.text_geometry.clear();
     if (auto const* element = as_if<DOM::Element>(node)) {
         node_data.bounds = accessibility_bounds(read, *element);
         node_data.is_focused = element->is_focused();
@@ -453,15 +492,13 @@ static Optional<u64> fill_volatile_fields(WebView::AccessibilityNodeData& node_d
 
     // Text geometry is the costliest part of a build, so keep it for as long as the lines it came from stay the same.
     // Only its bounds are read again: They're viewport-relative, so scrolling moves them.
-    auto* text_layout = text_node->layout_node(read);
-    auto geometry = text_layout ? text_geometry_sources(*text_layout) : Optional<Document::CachedTextGeometry> {};
+    auto row = text_row(*text_node, document, read);
+    auto geometry = row.has_value() ? text_geometry_sources(*row) : Optional<Document::CachedTextGeometry> {};
     if (geometry.has_value()) {
         if (auto const* kept = document.cached_text_geometry(*text_node); kept && kept->sources == geometry->sources) {
-            if (auto own_box = text_bounding_client_rect(document, *text_layout); own_box.has_value())
+            if (auto own_box = text_bounding_client_rect(document, *row); own_box.has_value())
                 node_data.bounds = own_box->to_type<int>();
-            node_data.character_offsets = kept->character_offsets;
-            node_data.line_break_character_offsets = kept->line_break_character_offsets;
-            node_data.line_heights = kept->line_heights;
+            node_data.text_geometry = kept->geometry;
             return kept->version;
         }
     }
@@ -489,25 +526,31 @@ void AccessibilityTreeNode::serialize_tree_as_node_data(Vector<WebView::Accessib
     // its own rather than by recursion, since a page's DOM can be many thousands of levels deep, and a frame per level
     // would exhaust the thread's stack.
     // The nodes still to serialize, each with its parent's ID at the same index of pending_parent_ids.
+    // And with the point its parent's children's bounds are relative to at the same index of pending_parent_origins.
     GC::RootVector<GC::Ref<AccessibilityTreeNode const>> pending_nodes;
     Vector<i64> pending_parent_ids;
+    Vector<Gfx::IntPoint> pending_parent_origins;
     pending_nodes.append(*this);
     pending_parent_ids.append(parent_id);
+    pending_parent_origins.append({});
     while (!pending_nodes.is_empty()) {
         auto node = pending_nodes.take_last();
         auto node_parent_id = pending_parent_ids.take_last();
-        auto id = node->serialize_node_as_node_data(out, document, read, node_parent_id, tracker);
+        auto node_parent_origin = pending_parent_origins.take_last();
+        Gfx::IntPoint origin;
+        auto id = node->serialize_node_as_node_data(out, document, read, node_parent_id, node_parent_origin, origin, tracker);
         auto children = node->children();
         for (size_t i = children.size(); i > 0; --i) {
             if (should_skip_child_in_node_data(*children[i - 1]))
                 continue;
             pending_nodes.append(*children[i - 1]);
             pending_parent_ids.append(id);
+            pending_parent_origins.append(origin);
         }
     }
 }
 
-i64 AccessibilityTreeNode::serialize_node_as_node_data(Vector<WebView::AccessibilityNodeData>& out, Document const& document, Layout::BegunRead const& read, i64 parent_id, AccessibilityChangeTracker* tracker) const
+i64 AccessibilityTreeNode::serialize_node_as_node_data(Vector<WebView::AccessibilityNodeData>& out, Document const& document, Layout::BegunRead const& read, i64 parent_id, Gfx::IntPoint parent_origin, Gfx::IntPoint& origin, AccessibilityChangeTracker* tracker) const
 {
     WebView::AccessibilityNodeData node_data;
     node_data.parent_id = parent_id;
@@ -519,9 +562,9 @@ i64 AccessibilityTreeNode::serialize_node_as_node_data(Vector<WebView::Accessibi
     // What a change tracker tells this build of the node from the last one by: see AccessibilityChangeTracker::note().
     u64 record_version = 0;
     Optional<u64> geometry_version;
-    if (auto kept = keeps_records ? document.kept_accessibility_record(*value()) : Document::KeptAccessibilityRecord {}; kept.data) {
-        node_data = *kept.data;
-        record_version = kept.version;
+    if (keeps_records)
+        record_version = document.restore_accessibility_record(*value(), node_data);
+    if (record_version != 0) {
         geometry_version = fill_volatile_fields(node_data, *value(), document, read);
     } else {
         if (!value()->is_text())
@@ -554,7 +597,8 @@ i64 AccessibilityTreeNode::serialize_node_as_node_data(Vector<WebView::Accessibi
                 document.cache_accessible_text(element, text);
             }
             node_data.name = move(text.name);
-            node_data.description = move(text.description);
+            if (!text.description.is_empty())
+                node_data.details.ensure().description = move(text.description);
             node_data.bounds = accessibility_bounds(read, element);
 
             // aria-level is a heading's level only on a heading. On a treeitem, row or listitem it's the item's depth,
@@ -583,7 +627,7 @@ i64 AccessibilityTreeNode::serialize_node_as_node_data(Vector<WebView::Accessibi
             if (!live.has_value() && role.has_value())
                 live = ARIA::implicit_aria_live_for_role(*role);
             if (live.has_value())
-                node_data.live = aria_live_name(*live);
+                node_data.details.ensure().live = aria_live_name(*live);
 
             // https://www.w3.org/TR/wai-aria-1.2/#aria-disabled
             auto aria_disabled = element.get_attribute(ARIA::AttributeNames::aria_disabled);
@@ -591,8 +635,9 @@ i64 AccessibilityTreeNode::serialize_node_as_node_data(Vector<WebView::Accessibi
                 node_data.is_disabled = true;
 
             if (auto const* cell = as_if<HTML::HTMLTableCellElement>(element)) {
-                node_data.column_span = static_cast<i32>(cell->col_span());
-                node_data.row_span = static_cast<i32>(cell->row_span());
+                auto& details = node_data.details.ensure();
+                details.column_span = static_cast<i32>(cell->col_span());
+                details.row_span = static_cast<i32>(cell->row_span());
 
                 // The cell's column index: the col_span sum of the cells before it in its row. Its row index isn't
                 // serialized — both bridges derive it from the row's position in the tree.
@@ -604,13 +649,14 @@ i64 AccessibilityTreeNode::serialize_node_as_node_data(Vector<WebView::Accessibi
                         if (auto const* prev_cell = as_if<HTML::HTMLTableCellElement>(prev))
                             col_index += static_cast<i32>(prev_cell->col_span());
                     }
-                    node_data.cell_column_index = col_index;
+                    details.cell_column_index = col_index;
                 }
             }
 
             if (auto const* table = as_if<HTML::HTMLTableElement>(element)) {
+                auto& details = node_data.details.ensure();
                 auto rows = table->rows();
-                node_data.table_row_count = static_cast<i32>(rows->length());
+                details.table_row_count = static_cast<i32>(rows->length());
                 // Column count: maximum over all rows of summed col_span.
                 i32 max_cols = 0;
                 for (u32 i = 0; i < rows->length(); ++i) {
@@ -624,27 +670,27 @@ i64 AccessibilityTreeNode::serialize_node_as_node_data(Vector<WebView::Accessibi
                     }
                     max_cols = max(max_cols, cols);
                 }
-                node_data.table_column_count = max_cols;
+                details.table_column_count = max_cols;
 
                 for (auto const* c = table->first_child(); c; c = c->next_sibling()) {
                     if (c->is_element()
                         && static_cast<DOM::Element const&>(*c).tag_name().equals_ignoring_ascii_case("caption"sv)) {
-                        node_data.table_caption_id = static_cast<i64>(c->unique_id().value());
+                        details.table_caption_id = static_cast<i64>(c->unique_id().value());
                         break;
                     }
                 }
 
                 if (auto summary = table->get_attribute(HTML::AttributeNames::summary); summary.has_value())
-                    node_data.table_summary = summary.release_value().to_utf8();
+                    details.table_summary = summary.release_value().to_utf8();
 
                 // Column headers: first row's th cells (or any row with explicit scope=col). Row headers: first th cell in
                 // each row (or any cell with scope=row).
-                node_data.column_header_ids.resize(max_cols, true);
+                details.column_header_ids.resize(max_cols, true);
                 for (i32 c = 0; c < max_cols; ++c)
-                    node_data.column_header_ids[c] = -1;
-                node_data.row_header_ids.resize(rows->length(), true);
+                    details.column_header_ids[c] = -1;
+                details.row_header_ids.resize(rows->length(), true);
                 for (u32 r = 0; r < rows->length(); ++r)
-                    node_data.row_header_ids[r] = -1;
+                    details.row_header_ids[r] = -1;
 
                 for (u32 row_index = 0; row_index < rows->length(); ++row_index) {
                     auto* row = rows->item(row_index);
@@ -662,11 +708,11 @@ i64 AccessibilityTreeNode::serialize_node_as_node_data(Vector<WebView::Accessibi
                         bool is_th = tag.equals_ignoring_ascii_case("th"sv);
                         if (is_th && (scope == "col"sv || (scope.is_empty() && row_index == 0))) {
                             if (col_index < max_cols)
-                                node_data.column_header_ids[col_index] = cell_id;
+                                details.column_header_ids[col_index] = cell_id;
                         }
                         if (is_th && (scope == "row"sv || (scope.is_empty() && col_index == 0))) {
-                            if (row_index < node_data.row_header_ids.size())
-                                node_data.row_header_ids[row_index] = cell_id;
+                            if (row_index < details.row_header_ids.size())
+                                details.row_header_ids[row_index] = cell_id;
                         }
                         col_index += static_cast<i32>(cell->col_span());
                     }
@@ -684,40 +730,43 @@ i64 AccessibilityTreeNode::serialize_node_as_node_data(Vector<WebView::Accessibi
                 auto type = input->type_state();
                 if (type == TAS::Text || type == TAS::Search || type == TAS::Email || type == TAS::Telephone
                     || type == TAS::URL) {
-                    node_data.value = input->value().to_utf8();
+                    if (auto value = input->value(); !value.is_empty())
+                        node_data.details.ensure().value = value.to_utf8();
                 } else if (type == TAS::Password) {
                     node_data.is_password = true;
-                    node_data.value = MUST(String::repeated(0x25CF, input->value().length_in_code_points()));
+                    if (auto length = input->value().length_in_code_points(); length > 0)
+                        node_data.details.ensure().value = MUST(String::repeated(0x25CF, length));
                 }
             } else if (auto const* text_area = as_if<HTML::HTMLTextAreaElement>(element)) {
-                node_data.value = text_area->value().to_utf8();
+                if (auto value = text_area->value(); !value.is_empty())
+                    node_data.details.ensure().value = value.to_utf8();
             }
 
             // AtkValue fields for numeric-value elements.
             if (auto const* progress = as_if<HTML::HTMLProgressElement>(element)) {
-                node_data.value_numeric = progress->value();
-                node_data.value_minimum = 0.0;
-                node_data.value_maximum = progress->max();
+                node_data.details.ensure().value_numeric = progress->value();
+                node_data.details.ensure().value_minimum = 0.0;
+                node_data.details.ensure().value_maximum = progress->max();
             } else if (auto const* meter = as_if<HTML::HTMLMeterElement>(element)) {
-                node_data.value_numeric = meter->value();
-                node_data.value_minimum = meter->min();
-                node_data.value_maximum = meter->max();
+                node_data.details.ensure().value_numeric = meter->value();
+                node_data.details.ensure().value_minimum = meter->min();
+                node_data.details.ensure().value_maximum = meter->max();
             } else if (auto const* input = as_if<HTML::HTMLInputElement>(element)) {
                 if (input->value_as_number_applies()) {
                     // NB: An input whose value is not a number, such as an empty one, has a NaN valueAsNumber.
                     if (auto number = input->value_as_number(); !isnan(number))
-                        node_data.value_numeric = number;
+                        node_data.details.ensure().value_numeric = number;
                     if (auto min_attr = input->get_attribute(HTML::AttributeNames::min); min_attr.has_value()) {
                         if (auto parsed = min_attr->to_number<double>(); parsed.has_value())
-                            node_data.value_minimum = *parsed;
+                            node_data.details.ensure().value_minimum = *parsed;
                     }
                     if (auto max_attr = input->get_attribute(HTML::AttributeNames::max); max_attr.has_value()) {
                         if (auto parsed = max_attr->to_number<double>(); parsed.has_value())
-                            node_data.value_maximum = *parsed;
+                            node_data.details.ensure().value_maximum = *parsed;
                     }
                     if (auto step_attr = input->get_attribute(HTML::AttributeNames::step); step_attr.has_value()) {
                         if (auto parsed = step_attr->to_number<double>(); parsed.has_value())
-                            node_data.value_step = *parsed;
+                            node_data.details.ensure().value_step = *parsed;
                     }
                 }
             }
@@ -838,17 +887,20 @@ i64 AccessibilityTreeNode::serialize_node_as_node_data(Vector<WebView::Accessibi
                 (void)anchor;
             }
 
-            if (auto accesskey = element.get_attribute(HTML::AttributeNames::accesskey); accesskey.has_value())
-                node_data.keybinding = accesskey.release_value().to_utf8();
+            if (auto accesskey = element.get_attribute(HTML::AttributeNames::accesskey); accesskey.has_value() && !accesskey->is_empty())
+                node_data.details.ensure().keybinding = accesskey.release_value().to_utf8();
 
+            String url;
             if (auto const* anchor = as_if<HTML::HTMLAnchorElement>(element))
-                node_data.url = anchor->href().to_utf8();
+                url = anchor->href().to_utf8();
             else if (auto const* area = as_if<HTML::HTMLAreaElement>(element))
-                node_data.url = area->href().to_utf8();
+                url = area->href().to_utf8();
+            if (!url.is_empty())
+                node_data.details.ensure().url = move(url);
 
             if (auto const* html_element = as_if<HTML::HTMLHtmlElement>(element)) {
-                if (auto lang = html_element->get_attribute(HTML::AttributeNames::lang); lang.has_value())
-                    node_data.language = lang.release_value().to_utf8();
+                if (auto lang = html_element->get_attribute(HTML::AttributeNames::lang); lang.has_value() && !lang->is_empty())
+                    node_data.details.ensure().language = lang.release_value().to_utf8();
             }
 
             // Only the element that has the focus is focused — not the body that activeElement falls back to when nothing
@@ -874,23 +926,24 @@ i64 AccessibilityTreeNode::serialize_node_as_node_data(Vector<WebView::Accessibi
                 auto const* text_reset_values = parent->style_group<CSS::ComputedValues::TextResetValues>();
                 auto const* background_values = parent->style_group<CSS::ComputedValues::BackgroundValues>();
                 if (font_values && text_values) {
+                    WebView::AccessibilityTextStyle text_style;
                     Gfx::Font const* font = nullptr;
                     if (auto layout = parent->layout_node(read)) {
                         font = &layout->first_available_font();
-                        node_data.font_family = font->family().to_string();
+                        text_style.font_family = font->family().to_string();
                     }
-                    node_data.font_size = MUST(String::formatted("{}", font_values->font_size.to_double()));
-                    node_data.font_weight = MUST(String::formatted("{}", font_values->font_weight));
+                    text_style.font_size = MUST(String::formatted("{}", font_values->font_size.to_double()));
+                    text_style.font_weight = MUST(String::formatted("{}", font_values->font_weight));
 
                     switch (font_values->font_style_keyword()) {
                     case CSS::FontStyleKeyword::Italic:
-                        node_data.font_style = "italic"_string;
+                        text_style.font_style = "italic"_string;
                         break;
                     case CSS::FontStyleKeyword::Oblique:
-                        node_data.font_style = "oblique"_string;
+                        text_style.font_style = "oblique"_string;
                         break;
                     default:
-                        node_data.font_style = "normal"_string;
+                        text_style.font_style = "normal"_string;
                         break;
                     }
 
@@ -915,15 +968,18 @@ i64 AccessibilityTreeNode::serialize_node_as_node_data(Vector<WebView::Accessibi
                             break;
                         }
                     }
-                    node_data.text_decoration = decoration_builder.is_empty()
+                    text_style.text_decoration = decoration_builder.is_empty()
                         ? "none"_string
                         : MUST(decoration_builder.to_string());
 
                     auto fg = text_values->color_value();
-                    node_data.color = MUST(String::from_byte_string(fg.to_byte_string_without_alpha()));
+                    text_style.color = MUST(String::from_byte_string(fg.to_byte_string_without_alpha()));
                     auto bg = background_values ? background_values->background_color_value(fg) : Color::Transparent;
                     if (bg.alpha() > 0)
-                        node_data.background_color = MUST(String::from_byte_string(bg.to_byte_string_without_alpha()));
+                        text_style.background_color = MUST(String::from_byte_string(bg.to_byte_string_without_alpha()));
+
+                    node_data.text_style.set(move(text_style));
+                    document.intern_accessibility_text_style(node_data.text_style);
 
                     text_geometry_from_lines = fill_text_geometry(node_data, text_node, font, document, read);
                 }
@@ -935,8 +991,8 @@ i64 AccessibilityTreeNode::serialize_node_as_node_data(Vector<WebView::Accessibi
             // again.
             if (text_geometry_from_lines) {
                 auto const& text_node = static_cast<DOM::Text const&>(*value());
-                if (auto* text_layout = text_node.layout_node(read)) {
-                    if (auto sources = text_geometry_sources(*text_layout); sources.has_value())
+                if (auto row = text_row(text_node, document, read); row.has_value()) {
+                    if (auto sources = text_geometry_sources(*row); sources.has_value())
                         geometry_version = keep_text_geometry(node_data, text_node, document, sources.release_value());
                 }
             }
@@ -974,6 +1030,16 @@ i64 AccessibilityTreeNode::serialize_node_as_node_data(Vector<WebView::Accessibi
         if (should_skip_child_in_node_data(*child))
             continue;
         node_data.child_ids.append(static_cast<i64>(child->value()->unique_id().value()));
+    }
+
+    // OPTIMIZATION: A node's bounds go out relative to its nearest ancestor that has bounds, so a layout that moves a
+    //               subtree, or a scroll, changes the data of only the nodes at the top of it: see
+    //               AccessibilityNodeData::bounds.
+    if (node_data.bounds == Gfx::IntRect {}) {
+        origin = parent_origin;
+    } else {
+        origin = node_data.bounds.location();
+        node_data.bounds.translate_by(-parent_origin.x(), -parent_origin.y());
     }
 
     if (!tracker || tracker->note(node_data, record_version, geometry_version))

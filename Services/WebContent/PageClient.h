@@ -174,7 +174,11 @@ public:
     void clear_pending_dom_mutations();
     void did_delete_all_cookies(u64 request_id);
 
-    void schedule_accessibility_tree_update();
+    enum class AccessibilityUpdateDelay {
+        AdaptToPublishCost,
+        Minimum,
+    };
+    void schedule_accessibility_tree_update(AccessibilityUpdateDelay = AccessibilityUpdateDelay::AdaptToPublishCost);
     // Sends the UI process what changed in the accessibility tree since the last tree sent, or the whole tree.
     void publish_accessibility_tree(bool whole_tree_requested);
 
@@ -399,6 +403,12 @@ private:
     virtual void page_did_request_dismiss_notification_for_testing(u64 notification_id) override;
     virtual void page_did_request_hold_next_notification_show_for_testing() override;
     virtual void page_did_request_fail_held_notification_show_for_testing() override;
+    virtual void page_did_request_make_credential(u64 request_id, Web::HTML::CrossProcessId document_id, Web::WebAuthentication::MakeCredentialRequest const&) override;
+    virtual void page_did_request_get_assertion(u64 request_id, Web::HTML::CrossProcessId document_id, Web::WebAuthentication::GetAssertionRequest const&) override;
+    virtual void page_did_cancel_web_authentication_request(u64 request_id) override;
+    virtual void page_did_focus_web_authentication_field(Web::HTML::CrossProcessId document_id) override;
+    virtual bool page_did_request_is_user_verifying_platform_authenticator_available() override;
+    virtual String page_did_request_virtual_authenticator_command_for_testing(String const& command, String const& parameters) override;
     virtual void page_did_finish_test(Utf16String const& text) override;
     virtual void page_did_set_test_timeout(double milliseconds) override;
     virtual void page_did_receive_reference_test_metadata(JsonValue) override;
@@ -519,6 +529,8 @@ private:
     Optional<Web::HTML::CrossProcessId> m_pending_root_navigable_id;
 
     RefPtr<Core::Timer> m_accessibility_update_timer;
+    AK::Duration m_last_accessibility_publish_duration;
+    Web::UniqueNodeID m_last_accessibility_publish_document_id { 0 };
     // What the UI process was last sent of the accessibility tree, and the number of the last tree sent: Each change
     // names the number of the tree it applies to, so the UI process can tell when it doesn't hold that tree.
     Web::DOM::AccessibilityChangeTracker m_accessibility_change_tracker;

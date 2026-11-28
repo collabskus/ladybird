@@ -19,7 +19,6 @@ namespace Unicode {
 Optional<GeneralCategory> general_category_from_string(StringView);
 bool code_point_has_general_category(u32 code_point, GeneralCategory general_category, CaseSensitivity case_sensitivity = CaseSensitivity::CaseSensitive);
 
-bool code_point_is_printable(u32 code_point);
 bool code_point_has_control_general_category(u32 code_point);
 bool code_point_has_letter_general_category(u32 code_point);
 bool code_point_has_mark_general_category(u32 code_point);
@@ -104,6 +103,9 @@ enum class LineBreakClass {
 };
 
 LineBreakClass line_break_class(u32 code_point);
+
+// Returns the UTF-16 offset of the first forced line break, or the length if there is none.
+size_t find_forced_line_break(Utf16View const&, bool preserve_line_feeds);
 
 enum class JoiningType {
     NonJoining,   // U

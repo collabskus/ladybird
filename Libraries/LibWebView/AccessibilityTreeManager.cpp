@@ -128,8 +128,8 @@ void AccessibilityTreeManager::update_tree(Vector<AccessibilityNodeData> nodes)
             String live_value;
             i64 live_region_id = -1;
             for (auto const* ancestor = &new_node; ancestor;) {
-                if (!ancestor->live.is_empty()) {
-                    live_value = ancestor->live;
+                if (!ancestor->details->live.is_empty()) {
+                    live_value = ancestor->details->live;
                     live_region_id = ancestor->id;
                     break;
                 }
@@ -158,13 +158,14 @@ void AccessibilityTreeManager::update_tree(Vector<AccessibilityNodeData> nodes)
                 continue;
             }
 
-            auto const& old_node = old_it->value;
+            auto const& old_node = *old_it->value;
             if (old_node.name != new_node.name && !new_node.name.is_empty())
                 on_live_region_changed(new_node.name, live_value);
         }
     }
 
     m_nodes.clear();
+    m_nodes.ensure_capacity(sanitized.size());
     m_root_id = root_id;
     m_whole_tree_was_repaired = repaired;
     m_focus_shown_on_root = false;
@@ -174,8 +175,24 @@ void AccessibilityTreeManager::update_tree(Vector<AccessibilityNodeData> nodes)
     for (auto& node : sanitized) {
         if (node.is_focused)
             m_focused_id_from_content = node.id;
-        m_nodes.set(node.id, move(node));
+        intern_text_style(node.text_style);
+        m_nodes.set(node.id, make<AccessibilityNodeData>(move(node)));
     }
+}
+
+void AccessibilityTreeManager::intern_text_style(AccessibilityShared<AccessibilityTextStyle>& style)
+{
+    if (style.is_default())
+        return;
+    if (auto it = m_text_styles.find(style); it != m_text_styles.end()) {
+        style = *it;
+        return;
+    }
+    if (m_text_styles.size() >= max(m_text_styles_size_after_trim * 2, static_cast<size_t>(256))) {
+        m_text_styles.remove_all_matching([](auto const& kept) { return kept.ref_count() == 1; });
+        m_text_styles_size_after_trim = m_text_styles.size();
+    }
+    m_text_styles.set(style);
 }
 
 Optional<Vector<i64>> AccessibilityTreeManager::apply_delta(AccessibilityTreeDelta const& delta)
@@ -228,7 +245,7 @@ Optional<Vector<i64>> AccessibilityTreeManager::apply_delta(AccessibilityTreeDel
 
     auto old_parent_of = [&](i64 id) -> Optional<i64> {
         if (auto it = m_nodes.find(id); it != m_nodes.end())
-            return it->value.parent_id;
+            return it->value->parent_id;
         return {};
     };
     auto keeps_its_child_list = [&](i64 id) { return !changed.contains(id) && !removed.contains(id); };
@@ -248,7 +265,7 @@ Optional<Vector<i64>> AccessibilityTreeManager::apply_delta(AccessibilityTreeDel
     // A child that a replaced child list or a removed node leaves behind has to be removed too, or attached elsewhere;
     // and a removed node can't stay in a child list the delta doesn't replace.
     auto check_left_behind_children = [&](i64 id) {
-        for (auto child_id : m_nodes.get(id)->child_ids) {
+        for (auto child_id : m_nodes.find(id)->value->child_ids) {
             if (!removed.contains(child_id) && !new_parent.contains(child_id))
                 return false;
         }
@@ -338,9 +355,9 @@ Optional<Vector<i64>> AccessibilityTreeManager::apply_delta(AccessibilityTreeDel
             String live_value;
             for (auto id = changed_node.id; id != -1; id = final_parent_of(id)) {
                 auto const* ancestor = final_node(id);
-                if (!ancestor->live.is_empty()) {
+                if (!ancestor->details->live.is_empty()) {
                     live_region_id = id;
-                    live_value = ancestor->live;
+                    live_value = ancestor->details->live;
                     break;
                 }
             }
@@ -352,7 +369,7 @@ Optional<Vector<i64>> AccessibilityTreeManager::apply_delta(AccessibilityTreeDel
                 if (!m_nodes.contains(live_region_id) || announced_regions.contains(live_region_id))
                     continue;
                 announced_regions.set(live_region_id);
-            } else if (old_it->value.name == changed_node.name) {
+            } else if (old_it->value->name == changed_node.name) {
                 continue;
             }
             announcement_texts.append(changed_node.name);
@@ -368,13 +385,14 @@ Optional<Vector<i64>> AccessibilityTreeManager::apply_delta(AccessibilityTreeDel
     }
     for (auto const& [child_id, parent_id] : new_parent) {
         if (!changed.contains(child_id))
-            m_nodes.find(child_id)->value.parent_id = parent_id;
+            m_nodes.find(child_id)->value->parent_id = parent_id;
     }
     for (auto const& changed_node : delta.changed_nodes) {
         auto parent_id = changed_node.id == m_root_id ? -1 : final_parent_of(changed_node.id);
-        auto& stored = m_nodes.ensure(changed_node.id);
+        auto& stored = *m_nodes.ensure(changed_node.id, [] { return make<AccessibilityNodeData>(); });
         stored = changed_node;
         stored.parent_id = parent_id;
+        intern_text_style(stored.text_style);
         if (changed_node.is_focused)
             m_focused_id_from_content = changed_node.id;
         else if (m_focused_id_from_content == changed_node.id)
@@ -386,7 +404,7 @@ Optional<Vector<i64>> AccessibilityTreeManager::apply_delta(AccessibilityTreeDel
     if (m_focus_shown_on_root) {
         m_focus_shown_on_root = false;
         for (auto& [id, node] : m_nodes)
-            node.is_focused = id == m_focused_id_from_content;
+            node->is_focused = id == m_focused_id_from_content;
     }
     ++m_generation;
 
@@ -417,7 +435,7 @@ AccessibilityNodeData const* AccessibilityTreeManager::node(i64 id) const
     auto it = m_nodes.find(id);
     if (it == m_nodes.end())
         return nullptr;
-    return &it->value;
+    return it->value.ptr();
 }
 
 AccessibilityNodeData const* AccessibilityTreeManager::root() const
@@ -464,20 +482,20 @@ void AccessibilityTreeManager::set_focused_node(i64 node_id)
     m_focused_id_from_content = node_id;
     m_focus_shown_on_root = false;
     for (auto& [id, node] : m_nodes)
-        node.is_focused = (id == node_id);
+        node->is_focused = (id == node_id);
 }
 
 void AccessibilityTreeManager::show_focus_on_root()
 {
     m_focus_shown_on_root = true;
     for (auto& [id, node] : m_nodes)
-        node.is_focused = (id == m_root_id);
+        node->is_focused = (id == m_root_id);
 }
 
 Optional<i64> AccessibilityTreeManager::focused_node_id() const
 {
     for (auto const& [id, node] : m_nodes) {
-        if (node.is_focused && id != m_root_id)
+        if (node->is_focused && id != m_root_id)
             return id;
     }
     return {};
@@ -489,9 +507,12 @@ AccessibilityNodeData const* AccessibilityTreeManager::hit_test_recursive(i64 no
     if (!current)
         return nullptr;
 
+    // The children's bounds are relative to this node's top-left, or for a node without bounds, to where its own are.
+    auto children_point = current->bounds == Gfx::IntRect {} ? point : point - current->bounds.location();
+
     // Walk children in reverse order (last painted = on top) to find the deepest hit.
     for (int i = static_cast<int>(current->child_ids.size()) - 1; i >= 0; --i) {
-        auto const* result = hit_test_recursive(current->child_ids[i], point);
+        auto const* result = hit_test_recursive(current->child_ids[i], children_point);
         if (result)
             return result;
     }
@@ -500,6 +521,16 @@ AccessibilityNodeData const* AccessibilityTreeManager::hit_test_recursive(i64 no
         return current;
 
     return nullptr;
+}
+
+Gfx::IntRect AccessibilityTreeManager::bounds_in_viewport(AccessibilityNodeData const& data) const
+{
+    auto bounds = data.bounds;
+    if (bounds == Gfx::IntRect {})
+        return bounds;
+    for (auto const* ancestor = node(data.parent_id); ancestor; ancestor = node(ancestor->parent_id))
+        bounds.translate_by(ancestor->bounds.location());
+    return bounds;
 }
 
 }

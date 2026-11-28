@@ -15,6 +15,7 @@
 #include <LibWeb/Export.h>
 #include <LibWeb/Fetch/Infrastructure/KeepaliveQuotaAccountant.h>
 #include <LibWebCommon/HTML/CrossProcessId.h>
+#include <LibWebCommon/HTML/Scripting/SerializedEnvironment.h>
 #include <LibWebCommon/HTML/Scripting/SerializedEnvironmentSettingsObject.h>
 #include <LibWebCommon/MixedContent/ProhibitsMixedSecurityContexts.h>
 
@@ -23,6 +24,12 @@ namespace Web::Fetch::Infrastructure {
 enum class HasCrossSiteAncestor : u8 {
     No,
     Yes,
+};
+
+// What fetching reads from a settings object beside its environment.
+struct SettingsObjectContext {
+    URL::Origin origin;
+    HasCrossSiteAncestor has_cross_site_ancestor { HasCrossSiteAncestor::No };
 };
 
 // What fetching reads from a request's client.
@@ -44,13 +51,18 @@ struct ClientContext {
         Yes,
     };
 
+    // Whether the global object is a Window whose associated Document is that of a decoded SVG image.
+    enum class IsWindowOfADecodedSVGImage : u8 {
+        No,
+        Yes,
+    };
+
     URL::Origin origin;
     URL::Origin site_for_cookies;
-    URL::URL creation_url;
-    Optional<URL::URL> top_level_creation_url;
-    Optional<URL::Origin> top_level_origin;
+    HTML::SerializedEnvironment environment;
     GlobalKind global_kind { GlobalKind::Other };
     IsWindowOfATopLevelNavigable is_window_of_a_top_level_navigable { IsWindowOfATopLevelNavigable::No };
+    IsWindowOfADecodedSVGImage is_window_of_a_decoded_svg_image { IsWindowOfADecodedSVGImage::No };
     HasCrossSiteAncestor has_cross_site_ancestor { HasCrossSiteAncestor::No };
     HTML::CanUseCrossOriginIsolatedAPIs cross_origin_isolated_capability { HTML::CanUseCrossOriginIsolatedAPIs::No };
     IsSecureContext is_secure_context { IsSecureContext::No };
@@ -107,17 +119,10 @@ struct ReservedClientContext {
         Optional<Parent> parent;
     };
 
-    // A reserved client that is a settings object.
-    struct SettingsObject {
-        URL::Origin origin;
-        HasCrossSiteAncestor has_cross_site_ancestor { HasCrossSiteAncestor::No };
-    };
-
-    URL::URL creation_url;
-    Optional<URL::URL> top_level_creation_url;
-    Optional<URL::Origin> top_level_origin;
+    HTML::SerializedEnvironment environment;
     IsSecureContext is_secure_context { IsSecureContext::No };
-    Variant<Environment, SettingsObject> kind;
+    // A reserved client that is a settings object holds its settings object context.
+    Variant<Environment, SettingsObjectContext> kind;
 };
 
 // A request's reserved client context as it was when the reserved client was set.

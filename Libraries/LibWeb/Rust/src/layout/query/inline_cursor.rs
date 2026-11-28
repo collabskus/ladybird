@@ -11,7 +11,7 @@
 use crate::css::css_enums::{white_space_collapse, writing_mode};
 use crate::css::css_pixels::{CssPixelPoint, CssPixelRect, CssPixels};
 use crate::layout::RenderedTextBoundary;
-use crate::layout::inline_content::LineRecord;
+use crate::layout::inline_content::{ClusterGeometry, LineRecord};
 use crate::layout::node_data::{NodeKind, NodeSlotId};
 use crate::layout::node_facts;
 use crate::painting::paint_read::{PaintRead, PaintRow};
@@ -247,22 +247,29 @@ impl<'a, A: PaintRead> InlineCursor<'a, A> {
         if let Some(offsets) =
             text_fragment::compute_selection_offsets(arena, fragment, SELECTION_STATE_START_AND_END, offset, offset)
         {
-            rect = text_fragment::rect_for_selection_offsets(arena, fragment, offsets);
-            if let Some(coordinate) = fragment
-                .glyph_run
-                .as_ref()
-                .and_then(|run| run.cluster_geometry().x_for_offset(offsets.start, downstream))
-            {
-                let origin = text_fragment::absolute_rect(arena, fragment);
-                let coordinate = CssPixels::nearest_value_for_f32(coordinate);
-                if text_fragment::is_horizontal(fragment) {
-                    rect.x = origin.x + coordinate;
-                } else if text_fragment::runs_upwards(fragment) {
-                    rect.y = origin.bottom() - coordinate - rect.height;
-                } else {
-                    rect.y = origin.y + coordinate;
+            let origin = text_fragment::absolute_rect(arena, fragment);
+            let caret_rect_in = |geometry: Option<&ClusterGeometry>| {
+                let mut rect =
+                    text_fragment::rect_for_selection_offsets_in_geometry(fragment, origin, offsets, || geometry);
+                if let Some(coordinate) = geometry.and_then(|geometry| geometry.x_for_offset(offsets.start, downstream))
+                {
+                    let coordinate = CssPixels::nearest_value_for_f32(coordinate);
+                    if text_fragment::is_horizontal(fragment) {
+                        rect.x = origin.x + coordinate;
+                    } else if text_fragment::runs_upwards(fragment) {
+                        rect.y = origin.bottom() - coordinate - rect.height;
+                    } else {
+                        rect.y = origin.y + coordinate;
+                    }
                 }
-            }
+                rect
+            };
+            // A caret is asked for one at a time, and the accessibility tree asks for one at the start of every line of
+            // text in the document: so a caret doesn't keep its run's geometry alive.
+            rect = match fragment.glyph_run.as_ref() {
+                Some(run) => run.with_cluster_geometry(|geometry| caret_rect_in(Some(geometry))),
+                None => caret_rect_in(None),
+            };
         }
         CaretRect {
             rect,
@@ -733,17 +740,6 @@ impl<'a, A: PaintRead> InlineCursor<'a, A> {
                 rect.y
             }
         };
-        let mut chosen = None;
-        for fragment in self.fragments_on_line(&side, line, accepts) {
-            let rect = text_fragment::absolute_rect(arena, fragment);
-            if chosen.is_none() || inline_start(rect) <= x {
-                chosen = Some((fragment, rect));
-            }
-        }
-        let Some((mut fragment, mut rect)) = chosen else {
-            return self.position_before_forced_break(line);
-        };
-        // INTEROP: A point in the gap between two atomic inlines goes to the one after it.
         let inline_end = |rect: CssPixelRect| {
             if horizontal {
                 rect.right()
@@ -753,26 +749,43 @@ impl<'a, A: PaintRead> InlineCursor<'a, A> {
                 rect.bottom()
             }
         };
+        let mut chosen = None;
+        let mut next = None;
+        let mut rightmost = None;
+        for fragment in self.fragments_on_line(&side, line, accepts) {
+            let rect = text_fragment::absolute_rect(arena, fragment);
+            let start = inline_start(rect);
+            if start <= x {
+                if chosen.is_none_or(|(_, previous)| start >= inline_start(previous)) {
+                    chosen = Some((fragment, rect));
+                }
+            } else if next.is_none_or(|(_, previous)| start < inline_start(previous)) {
+                next = Some((fragment, rect));
+            }
+            rightmost = Some(rightmost.map_or(inline_end(rect), |end: CssPixels| end.max(inline_end(rect))));
+        }
+        let before_all_fragments = chosen.is_none();
+        let Some((mut fragment, mut rect)) = chosen.or(next) else {
+            return self.position_before_forced_break(line);
+        };
+        // INTEROP: A point in the gap between two atomic inlines goes to the one after it.
         if fragment.is_atomic_inline
             && x >= inline_end(rect)
-            && let Some(next) = self
-                .fragments_on_line(&side, line, accepts)
-                .find(|next| inline_start(text_fragment::absolute_rect(arena, next)) > x)
+            && let Some((next, next_rect)) = next
             && next.is_atomic_inline
         {
             fragment = next;
-            rect = text_fragment::absolute_rect(arena, next);
+            rect = next_rect;
         }
         // INTEROP: Past the end of a line, the position is at its end, after whitespace that hangs there, but before
         //          collapsible whitespace, which the line removes.
         if let Some(last) = self.fragments_on_line(&side, line, accepts).last()
             && !last.is_atomic_inline
         {
-            let last_rect = text_fragment::absolute_rect(arena, last);
             let past_line_end = if last.direction == crate::css::css_enums::direction::LTR {
-                x >= inline_end(last_rect)
+                rightmost.is_some_and(|right| x >= right)
             } else {
-                x < inline_start(last_rect)
+                before_all_fragments
             };
             if past_line_end {
                 let collapsible = matches!(

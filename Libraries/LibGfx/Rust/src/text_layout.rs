@@ -6,8 +6,8 @@
 
 use crate::font::{FontFacts, FontHandle};
 use crate::geometry::FloatRect;
+use crate::{glyph_ink, text_shaping};
 use hashbrown::hash_map::EntryRef;
-use std::ffi::c_void;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,18 +44,17 @@ pub struct JoiningContext {
     pub joins_after: bool,
 }
 
-/// A glyph as shaping makes it and as the glyph run readers in C++ read it.
+/// A glyph as shaping makes it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-#[repr(C)]
 pub struct ShapedGlyph {
-    x: f32,
-    y: f32,
-    length_in_code_units: usize,
-    glyph_width: f32,
-    glyph_id: u32,
-    cluster_start: u32,
-    should_paint: bool,
-    is_rtl: bool,
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) length_in_code_units: usize,
+    pub(crate) glyph_width: f32,
+    pub(crate) glyph_id: u32,
+    pub(crate) cluster_start: u32,
+    pub(crate) should_paint: bool,
+    pub(crate) is_rtl: bool,
 }
 
 impl From<PlacedGlyph> for ShapedGlyph {
@@ -153,46 +152,6 @@ impl GlyphPlacement {
     }
 }
 
-unsafe extern "C" {
-    fn ladybird_gfx_shape_text_uncached(
-        font: *const c_void,
-        text_utf16: *const u16,
-        length_in_code_units: usize,
-        text_type: TextType,
-        letter_spacing: f32,
-        word_spacing: f32,
-        joining_context: JoiningContext,
-        vertical_forms: bool,
-        sink: *mut c_void,
-        emit: unsafe extern "C" fn(*mut c_void, *const ShapedGlyph, usize, f32, usize, f32, f32, bool),
-    );
-
-    fn ladybird_gfx_glyph_run_ink_bounding_box(
-        font: *const c_void,
-        glyphs: *const ShapedGlyph,
-        glyph_count: usize,
-        scale: f32,
-        out_rect: *mut f32,
-    );
-
-    fn ladybird_gfx_glyph_run_glyph_intercepts(
-        font: *const c_void,
-        glyphs: *const ShapedGlyph,
-        glyph_count: usize,
-        scale: f32,
-        origin_y: f32,
-        y_top: f32,
-        y_bottom: f32,
-        sink: *mut c_void,
-        push: unsafe extern "C" fn(*mut c_void, f32),
-    );
-}
-
-/// The glyphs of the run in the form that the glyph run readers in C++ read them.
-fn shaped_glyphs_of(glyphs: &GlyphBuffer) -> Vec<ShapedGlyph> {
-    glyphs.placed().map(ShapedGlyph::from).collect()
-}
-
 /// How far synthetic bold can spread the ink of a font's glyphs past their outlines, in device pixels. The rasterizer
 /// decides the stroke, so this allows for the widest it's known to use: It bounds what a run may paint, and isn't a
 /// measurement of its ink.
@@ -268,20 +227,7 @@ pub fn glyph_run_bounding_box(font: &FontHandle, glyphs: &GlyphBuffer, scale: f3
 /// `glyph_run_bounding_box()`, as x, y, width and height. Empty if no painted glyph has ink.
 #[must_use]
 pub fn glyph_run_ink_bounding_box(font: &FontHandle, glyphs: &GlyphBuffer, scale: f32) -> [f32; 4] {
-    let glyphs = shaped_glyphs_of(glyphs);
-    let mut out_rect = [0.0f32; 4];
-    // SAFETY: The handle keeps the font live and the glyph slice stays valid
-    // for the synchronous call, which fills the four floats out_rect points at.
-    unsafe {
-        ladybird_gfx_glyph_run_ink_bounding_box(
-            font.as_raw(),
-            glyphs.as_ptr(),
-            glyphs.len(),
-            scale,
-            out_rect.as_mut_ptr(),
-        );
-    }
-    out_rect
+    glyph_ink::ink_bounding_box(font, glyphs.placed(), scale)
 }
 
 /// Where the ink of the glyphs crosses the band from `y_top` to `y_bottom`, as pairs of left and right edges, leaving out
@@ -297,32 +243,8 @@ pub fn glyph_run_glyph_intercepts(
     y_bottom: f32,
     ignores_cluster: impl Fn(u32) -> bool,
 ) -> Vec<f32> {
-    unsafe extern "C" fn push(sink: *mut c_void, value: f32) {
-        // SAFETY: `sink` is the Vec passed below, live for the synchronous call.
-        unsafe { (*sink.cast::<Vec<f32>>()).push(value) };
-    }
-    let glyphs: Vec<ShapedGlyph> = glyphs
-        .placed()
-        .filter(|placed| !ignores_cluster(placed.cluster_start))
-        .map(ShapedGlyph::from)
-        .collect();
-    let mut intercepts: Vec<f32> = Vec::new();
-    // SAFETY: The handle keeps the font live and the glyph slice stays valid
-    // for the synchronous call; the push callback runs against the local Vec.
-    unsafe {
-        ladybird_gfx_glyph_run_glyph_intercepts(
-            font.as_raw(),
-            glyphs.as_ptr(),
-            glyphs.len(),
-            scale,
-            origin_y,
-            y_top,
-            y_bottom,
-            (&raw mut intercepts).cast(),
-            push,
-        );
-    }
-    intercepts
+    let glyphs = glyphs.placed().filter(|placed| !ignores_cluster(placed.cluster_start));
+    glyph_ink::glyph_intercepts(font, glyphs, scale, origin_y, y_top, y_bottom)
 }
 
 /// A glyph of a run, with where the run places it and what it stands for in the text.
@@ -1155,56 +1077,23 @@ pub fn clear_shaping_cache() {
 }
 
 fn shape_text_uncached(font: &FontHandle, text: &[u16], params: ShapeParams) -> CachedShape {
-    unsafe extern "C" fn emit(
-        sink: *mut c_void,
-        glyphs: *const ShapedGlyph,
-        glyph_count: usize,
-        width: f32,
-        trailing_whitespace_length_in_code_units: usize,
-        trailing_whitespace_advance: f32,
-        trailing_ascii_whitespace_advance: f32,
-        requires_context_for_breaks: bool,
-    ) {
-        // SAFETY: `sink` is the Option<CachedShape> passed below, and the
-        // glyph pointer stays valid for this synchronous callback.
-        let shape = unsafe { &mut *sink.cast::<Option<CachedShape>>() };
-        assert!(glyph_count == 0 || !glyphs.is_null());
-        let glyphs = if glyph_count == 0 {
-            GlyphBuffer::from_shaped(&[])
-        } else {
-            // SAFETY: The C++ side hands a pointer to glyph_count glyphs that
-            // outlive the callback.
-            GlyphBuffer::from_shaped(unsafe { ak::slice_from_raw_parts(glyphs, glyph_count) })
-        };
-        *shape = Some(CachedShape {
-            glyphs,
-            width,
-            trailing_whitespace_length_in_code_units,
-            trailing_whitespace_advance,
-            trailing_ascii_whitespace_advance,
-            requires_context_for_breaks,
-        });
+    let shape = text_shaping::shape_text(
+        font,
+        text,
+        params.text_type,
+        params.letter_spacing,
+        params.word_spacing,
+        params.joining_context,
+        params.vertical_forms,
+    );
+    CachedShape {
+        glyphs: GlyphBuffer::from_shaped(&shape.glyphs),
+        width: shape.width,
+        trailing_whitespace_length_in_code_units: shape.trailing_whitespace_length_in_code_units,
+        trailing_whitespace_advance: shape.trailing_whitespace_advance,
+        trailing_ascii_whitespace_advance: shape.trailing_ascii_whitespace_advance,
+        requires_context_for_breaks: shape.requires_context_for_breaks,
     }
-    // The shape is built in the callback, so a cache miss allocates the glyph
-    // storage once rather than an empty placeholder first.
-    let mut shape: Option<CachedShape> = None;
-    // SAFETY: FontRef keeps the font live and the text slice stays valid for
-    // the synchronous shaping call; emit runs against the local Option.
-    unsafe {
-        ladybird_gfx_shape_text_uncached(
-            font.as_raw(),
-            text.as_ptr(),
-            text.len(),
-            params.text_type,
-            params.letter_spacing,
-            params.word_spacing,
-            params.joining_context,
-            params.vertical_forms,
-            (&raw mut shape).cast(),
-            emit,
-        );
-    }
-    shape.expect("shaping emits exactly one shape")
 }
 
 fn shaped_text_with_baseline_start(shape: &CachedShape, baseline_start_x: f32) -> ShapedText {

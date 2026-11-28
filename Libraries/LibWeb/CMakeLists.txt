@@ -44,6 +44,7 @@ set(SOURCES
     ContentSecurityPolicy/FetchIntegration.cpp
     ContentSecurityPolicy/Policy.cpp
     ContentSecurityPolicy/PolicyList.cpp
+    ContentSecurityPolicy/RequestViolation.cpp
     ContentSecurityPolicy/SecurityPolicyViolationEvent.cpp
     ContentSecurityPolicy/Violation.cpp
     CookieStore/CookieStore.cpp
@@ -335,6 +336,7 @@ set(SOURCES
     Geometry/DOMRectList.cpp
     Geometry/DOMRectReadOnly.cpp
     GPC/GlobalPrivacyControl.cpp
+    HighResolutionTime/Clocks.cpp
     HighResolutionTime/TimeOrigin.cpp
     HTML/AbstractWorker.cpp
     HTML/BitmapDecodedImageData.cpp
@@ -528,6 +530,7 @@ set(SOURCES
     HTML/Parser/IncrementalDocumentParser.cpp
     HTML/Parser/SpeculativeHTMLParser.cpp
     HTML/PluginArray.cpp
+    HTML/PolicyContainerFromFetchResponse.cpp
     HTML/PolicyContainers.cpp
     HTML/PreparedNavigationDescriptor.cpp
     HTML/PopoverTargetAttributes.cpp
@@ -668,6 +671,7 @@ set(SOURCES
     MediaSourceExtensions/SourceBuffer.cpp
     MediaSourceExtensions/SourceBufferList.cpp
     MixedContent/AbstractOperations.cpp
+    MixedContent/SettingsObject.cpp
     Namespace.cpp
     NavigationTiming/PerformanceNavigationTiming.cpp
     NotificationsAPI/Notification.cpp
@@ -871,6 +875,7 @@ set(SOURCES
     WebLocks/LockManager.cpp
     WebLocks/NavigatorLocks.cpp
     WebAssembly/WebAssembly.cpp
+    WebAuthentication/Ceremony.cpp
     WebAudio/AnalyserNode.cpp
     WebAudio/AudioWorklet.cpp
     WebAudio/AudioWorkletGlobalScope.cpp
@@ -1029,6 +1034,8 @@ sync_rust_crate_ffi_headers(
 )
 add_dependencies(LibWeb libweb_rust-ffi-headers)
 target_link_libraries(libweb_bindings_rust INTERFACE LibGfx LibGC LibUnicode)
+# The copy of libgfx_rust in the archive calls HarfBuzz, which it leaves to its users to link.
+target_link_libraries(libweb_bindings_rust INTERFACE $<LINK_ONLY:harfbuzz>)
 test_rust_crate(MANIFEST_PATH Bindings/Rust/Cargo.toml CRATE_NAME libweb_bindings_rust)
 test_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libweb_rust)
 

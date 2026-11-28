@@ -1781,18 +1781,6 @@ void EventHandler::update_hover_after_scroll(HoverUpdateCause cause, CSSPixelPoi
     clear_hover.disarm();
 }
 
-// https://w3c.github.io/uievents/#unicode-character-categories
-static bool produces_character_value(u32 code_point)
-{
-    // A subset of the General Category values that are defined for each Unicode code point. This subset contains all
-    // the Letter (Ll, Lm, Lo, Lt, Lu), Number (Nd, Nl, No), Punctuation (Pc, Pd, Pe, Pf, Pi, Po, Ps) and Symbol (Sc,
-    // Sk, Sm, So) category values.
-    return Unicode::code_point_has_letter_general_category(code_point)
-        || Unicode::code_point_has_number_general_category(code_point)
-        || Unicode::code_point_has_punctuation_general_category(code_point)
-        || Unicode::code_point_has_symbol_general_category(code_point);
-}
-
 // https://github.com/w3c/uievents/issues/183#issuecomment-448091687
 static constexpr bool is_enter_key_or_interoperable_enter_key_combo(UIEvents::KeyCode key, u32 modifiers)
 {
@@ -2139,6 +2127,7 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
     if (native_editing_binding_resolved)
         native_command_document = m_navigable->active_document();
     GC::Ptr<DOM::Node> focused_area_before_keydown = m_navigable->active_document()->focused_area();
+    GC::Ptr<HTML::Navigable> focused_navigable_before_keydown = m_navigable->page().focused_navigable();
     auto dispatch_result = fire_keyboard_event(UIEvents::EventNames::keydown, m_navigable, key, modifiers, code_point, repeat);
     if (dispatch_result != EventResult::Accepted) {
         // A page that handles Tab or Escape itself gets the key, and the writing suggestion is dropped.
@@ -2149,13 +2138,27 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
         return dispatch_result;
     }
 
+    // INTEROP: When keydown moves focus to another navigable, the key fires no keypress and has no default action.
+    if (m_navigable->page().focused_navigable() != focused_navigable_before_keydown)
+        return EventResult::Handled;
+
+    // INTEROP: Space opens the picker of a date or time input on keydown, so it fires no keypress.
+    if (key == UIEvents::Key_Space && !(modifiers & (UIEvents::Mod_Ctrl | UIEvents::Mod_Alt | UIEvents::Mod_Super))) {
+        if (auto* input = as_if<HTML::HTMLInputElement>(m_navigable->active_document()->focused_area().ptr()); input && input->has_date_picker() && input->is_mutable()) {
+            input->show_the_picker_if_applicable();
+            return EventResult::Handled;
+        }
+    }
+
     // https://w3c.github.io/uievents/#event-type-keypress
     // If supported by a user agent, this event MUST be dispatched when a key is pressed down, if and only if that key
     // normally produces a character value.
+    // AD-HOC: The spec's character values cover only letters, numbers, punctuation and symbols. We fire keypress for
+    //         any key that produces a non-control character in the BMP, matching other engines.
     // AD-HOC: For web compat and for interop with other engines, we make an exception here for the Enter key. See:
     //         https://github.com/w3c/uievents/issues/183#issuecomment-448091687 and
     //         https://github.com/w3c/uievents/issues/266#issuecomment-1887917756
-    if ((produces_character_value(code_point) && !should_ignore_keydown_event(code_point, modifiers, should_insert_text))
+    if ((UIEvents::KeyboardEvent::produces_keypress(code_point) && !should_ignore_keydown_event(code_point, modifiers, should_insert_text))
         || is_enter_key_or_interoperable_enter_key_combo(key, modifiers)) {
         dispatch_result = fire_keyboard_event(UIEvents::EventNames::keypress, m_navigable, key, modifiers, code_point, repeat);
         if (dispatch_result != EventResult::Accepted)
@@ -3883,7 +3886,14 @@ Optional<Painting::CaretPosition> EventHandler::prepare_mouse_selection(DOM::Doc
     }
 
     if (focus_candidate) {
+        // NB: A press in a control that has the focus already is no new focus, but the user interacts with the control
+        //     as much as with one that they move to, which a request with conditional mediation waits for.
+        auto was_focused_before = document.focused_area() == focus_candidate;
         HTML::run_focusing_steps(focus_candidate, nullptr, HTML::FocusTrigger::Click);
+        if (auto* input = as_if<HTML::HTMLInputElement>(*focus_candidate); input && was_focused_before)
+            input->user_interacted_with_web_authentication_field();
+        else if (auto* textarea = as_if<HTML::HTMLTextAreaElement>(*focus_candidate); textarea && was_focused_before)
+            textarea->user_interacted_with_web_authentication_field();
     } else {
         // INTEROP: For clicks without a focusable target, focus the clicked document's viewport.
         HTML::run_focusing_steps(&document);

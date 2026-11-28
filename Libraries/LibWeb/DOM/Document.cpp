@@ -324,15 +324,129 @@ void Document::PendingScrollEvent::visit_edges(GC::Cell::Visitor& visitor) const
     visitor.visit(event_target);
 }
 
+struct AccessibilityTextStyleTraits : public DefaultTraits<WebView::AccessibilityShared<WebView::AccessibilityTextStyle>> {
+    static unsigned hash(WebView::AccessibilityShared<WebView::AccessibilityTextStyle> const& style) { return style->hash(); }
+};
+
+// What a node's record keeps of its data: the fields that stay the same from one build to the next until a change to the
+// node or its style could alter them. A build computes the rest again: the bounds, focus, caret, selection, parent,
+// children and text geometry. The ID is the node's.
+// OPTIMIZATION: One of these stays alive for every node of the tree, so it leaves those out rather than keeping a whole
+//               AccessibilityNodeData with them at their defaults.
+struct KeptAccessibilityNodeData {
+    explicit KeptAccessibilityNodeData(WebView::AccessibilityNodeData const& data)
+        : role(data.role)
+        , name(data.name)
+        , details(data.details)
+        , text_style(data.text_style)
+        , heading_level(data.heading_level)
+        , hierarchical_level(data.hierarchical_level)
+        , checked_state(data.checked_state)
+        , expanded_state(data.expanded_state)
+        , pressed_state(data.pressed_state)
+        , is_disabled(data.is_disabled)
+        , is_selected(data.is_selected)
+        , is_editable(data.is_editable)
+        , is_multi_line(data.is_multi_line)
+        , is_password(data.is_password)
+        , is_read_only(data.is_read_only)
+        , is_required(data.is_required)
+        , is_invalid(data.is_invalid)
+        , is_multi_selectable(data.is_multi_selectable)
+        , is_visited(data.is_visited)
+    {
+    }
+
+    void restore(UniqueNodeID id, WebView::AccessibilityNodeData& data) const
+    {
+        data.id = static_cast<i64>(id.value());
+        data.role = role;
+        data.name = name;
+        data.details = details;
+        data.text_style = text_style;
+        data.heading_level = heading_level;
+        data.hierarchical_level = hierarchical_level;
+        data.checked_state = checked_state;
+        data.expanded_state = expanded_state;
+        data.pressed_state = pressed_state;
+        data.is_disabled = is_disabled;
+        data.is_selected = is_selected;
+        data.is_editable = is_editable;
+        data.is_multi_line = is_multi_line;
+        data.is_password = is_password;
+        data.is_read_only = is_read_only;
+        data.is_required = is_required;
+        data.is_invalid = is_invalid;
+        data.is_multi_selectable = is_multi_selectable;
+        data.is_visited = is_visited;
+    }
+
+    FlyString role;
+    String name;
+    WebView::AccessibilityShared<WebView::AccessibilityNodeDetails> details;
+    WebView::AccessibilityShared<WebView::AccessibilityTextStyle> text_style;
+    i32 heading_level;
+    i32 hierarchical_level;
+    WebView::AccessibilityNodeData::CheckedState checked_state;
+    WebView::AccessibilityNodeData::ExpandedState expanded_state;
+    WebView::AccessibilityNodeData::PressedState pressed_state;
+    bool is_disabled;
+    bool is_selected;
+    bool is_editable;
+    bool is_multi_line;
+    bool is_password;
+    bool is_read_only;
+    bool is_required;
+    bool is_invalid;
+    bool is_multi_selectable;
+    bool is_visited;
+};
+// A field added to AccessibilityNodeData has to be either kept above or computed again on every build.
+static_assert(sizeof(WebView::AccessibilityNodeData) == 136);
+
 struct Document::AccessibilityRecordCache {
     AK_ALLOC_WITH_KMALLOC;
     struct Record {
-        WebView::AccessibilityNodeData data;
+        KeptAccessibilityNodeData data;
         u64 version { 0 };
-        Optional<CachedTextGeometry> text_geometry;
+        OwnPtr<CachedTextGeometry> text_geometry;
     };
     HashMap<UniqueNodeID, Record> records;
     u64 next_version { 1 };
+
+    // One style for all the text leaves that have the same. It holds the styles of the records and of the trees handed
+    // over, and lets go of the ones nothing else holds whenever it has grown to twice the size it last had after that.
+    HashTable<WebView::AccessibilityShared<WebView::AccessibilityTextStyle>, AccessibilityTextStyleTraits> text_styles;
+    size_t text_styles_size_after_trim { 0 };
+
+    // OPTIMIZATION: Dropping the records of a whole subtree is put off until the records are next read, so that a
+    //               subtree that's asked to drop its records many times between two reads is walked only once. The
+    //               parser inserting a table's rows and cells one at a time drops the whole table's records each time.
+    HashTable<UniqueNodeID> subtrees_to_drop;
+
+    void drop_subtrees_to_drop()
+    {
+        if (subtrees_to_drop.is_empty())
+            return;
+        for (auto id : subtrees_to_drop) {
+            auto* root = Node::from_unique_id(id);
+            if (!root)
+                continue;
+            root->for_each_shadow_including_inclusive_descendant([&](Node const& descendant) {
+                records.remove(descendant.unique_id());
+                return TraversalDecision::Continue;
+            });
+        }
+        subtrees_to_drop.clear();
+    }
+
+    void clear()
+    {
+        records.clear();
+        subtrees_to_drop.clear();
+        text_styles.clear();
+        text_styles_size_after_trim = 0;
+    }
 };
 
 static void release_text_geometry_sources(Vector<Document::CachedTextGeometry::Source>& sources)
@@ -349,9 +463,7 @@ Document::CachedTextGeometry& Document::CachedTextGeometry::operator=(CachedText
     release_text_geometry_sources(sources);
     sources = move(other.sources);
     version = other.version;
-    character_offsets = move(other.character_offsets);
-    line_break_character_offsets = move(other.line_break_character_offsets);
-    line_heights = move(other.line_heights);
+    geometry = move(other.geometry);
     return *this;
 }
 
@@ -2241,7 +2353,7 @@ void Document::set_url(URL::URL const& url)
 {
     // Link URLs resolve against the document's URL.
     if (m_accessibility_record_cache)
-        m_accessibility_record_cache->records.clear();
+        m_accessibility_record_cache->clear();
     // OPTIMIZATION: Avoid unnecessary work if the URL is already set.
     if (m_url == url)
         return;
@@ -6106,68 +6218,6 @@ Utf16String Document::domain() const
     return utf16_string_from_url_ascii(effective_domain->serialize());
 }
 
-// https://html.spec.whatwg.org/multipage/browsers.html#is-a-registrable-domain-suffix-of-or-is-equal-to
-bool is_a_registrable_domain_suffix_of_or_is_equal_to(Utf16View host_suffix_string, URL::Host const& original_host)
-{
-    // 1. If hostSuffixString is the empty string, then return false.
-    if (host_suffix_string.is_empty())
-        return false;
-
-    // 2. Let hostSuffix be the result of parsing hostSuffixString.
-    auto host_suffix = URL::Parser::parse_host(host_suffix_string);
-
-    // 3. If hostSuffix is failure, then return false.
-    if (!host_suffix.has_value())
-        return false;
-
-    return is_a_registrable_domain_suffix_of_or_is_equal_to(host_suffix.value(), original_host);
-}
-
-static bool ends_with_dot_prefixed_suffix(Utf16View string, Utf16View suffix)
-{
-    if (string.length_in_code_units() <= suffix.length_in_code_units())
-        return false;
-    if (!string.ends_with(suffix))
-        return false;
-    return string.code_unit_at(string.length_in_code_units() - suffix.length_in_code_units() - 1) == '.';
-}
-
-bool is_a_registrable_domain_suffix_of_or_is_equal_to(URL::Host const& host_suffix, URL::Host const& original_host)
-{
-    // 4. If hostSuffix does not equal originalHost, then:
-    if (host_suffix != original_host) {
-        // 1. If hostSuffix or originalHost is not a domain, then return false.
-        // NOTE: This excludes hosts that are IP addresses.
-        if (!host_suffix.has<String>() || !original_host.has<String>())
-            return false;
-        auto const& host_suffix_string = host_suffix.get<String>();
-        auto const& original_host_string = original_host.get<String>();
-
-        // 2. If hostSuffix, prefixed by U+002E (.), does not match the end of originalHost, then return false.
-        if (!ends_with_dot_prefixed_suffix(Utf16View::from_ascii(original_host_string.bytes_as_string_view()), Utf16View::from_ascii(host_suffix_string.bytes_as_string_view())))
-            return false;
-
-        // 3. If any of the following are true:
-        //     * hostSuffix equals hostSuffix's public suffix; or
-        //     * hostSuffix, prefixed by U+002E (.), matches the end of originalHost's public suffix,
-        //    then return false. [URL]
-        if (host_suffix_string == host_suffix.public_suffix())
-            return false;
-
-        auto original_host_public_suffix = original_host.public_suffix();
-        VERIFY(original_host_public_suffix.has_value());
-
-        if (ends_with_dot_prefixed_suffix(Utf16View::from_ascii(original_host_public_suffix->bytes_as_string_view()), Utf16View::from_ascii(host_suffix_string.bytes_as_string_view())))
-            return false;
-
-        // 4. Assert: originalHost's public suffix, prefixed by U+002E (.), matches the end of hostSuffix.
-        VERIFY(ends_with_dot_prefixed_suffix(Utf16View::from_ascii(host_suffix_string.bytes_as_string_view()), Utf16View::from_ascii(original_host_public_suffix->bytes_as_string_view())));
-    }
-
-    // 5. Return true.
-    return true;
-}
-
 // https://html.spec.whatwg.org/multipage/browsers.html#dom-document-domain
 WebIDL::ExceptionOr<void> Document::set_domain(Utf16View domain)
 {
@@ -6415,6 +6465,7 @@ void Document::run_unloading_cleanup_steps()
 void Document::destroy()
 {
     page().active_media_session_tracker().document_became_inactive(*this);
+    page().cancel_web_authentication_requests_of_document(id());
 
     // FIXME: 1. Assert: this is running as part of a task queued on document's relevant agent's event loop.
 
@@ -7073,6 +7124,24 @@ Utf16String Document::dump_accessibility_tree_as_json()
     return builder.to_string();
 }
 
+ReadonlySpan<GC::Weak<HTML::HTMLLabelElement>> Document::label_elements() const
+{
+    // OPTIMIZATION: Every labelable element's labels list looks for the labels in its tree, and a document can have
+    //               thousands of labelable elements but only a handful of labels. So the document finds its labels once
+    //               per change to its tree, rather than each list walking the whole tree for them.
+    // The list holds its labels weakly, so that a label removed from the tree (and the subtree it went with) isn't kept
+    // alive until the list is next asked for.
+    if (m_label_elements_dom_tree_version != dom_tree_version()) {
+        m_label_elements.clear_with_capacity();
+        for_each_in_subtree_of_type<HTML::HTMLLabelElement>([&](auto& label) {
+            m_label_elements.append(label);
+            return TraversalDecision::Continue;
+        });
+        m_label_elements_dom_tree_version = dom_tree_version();
+    }
+    return m_label_elements;
+}
+
 AccessibilityChangeTracker::Change Document::build_accessibility_tree_change(AccessibilityChangeTracker& tracker, bool whole_tree)
 {
     auto document_id = static_cast<i64>(unique_id().value());
@@ -7160,14 +7229,16 @@ void Document::cache_accessible_text(Element const& element, CachedAccessibleTex
         m_cached_accessible_text_depending_on_any_node.set(id);
 }
 
-Document::KeptAccessibilityRecord Document::kept_accessibility_record(Node const& node) const
+u64 Document::restore_accessibility_record(Node const& node, WebView::AccessibilityNodeData& data) const
 {
     if (!m_accessibility_record_cache || m_accessibility_caches_bypassed)
-        return {};
+        return 0;
+    m_accessibility_record_cache->drop_subtrees_to_drop();
     auto it = m_accessibility_record_cache->records.find(node.unique_id());
     if (it == m_accessibility_record_cache->records.end())
-        return {};
-    return { &it->value.data, it->value.version };
+        return 0;
+    it->value.data.restore(it->key, data);
+    return it->value.version;
 }
 
 u64 Document::cache_accessibility_record(Node const& node, WebView::AccessibilityNodeData const& record) const
@@ -7176,26 +7247,37 @@ u64 Document::cache_accessibility_record(Node const& node, WebView::Accessibilit
         return 0;
     if (!m_accessibility_record_cache)
         m_accessibility_record_cache = make<AccessibilityRecordCache>();
-    // Leave out what every build computes again anyway, so it isn't kept, and copied out, for nothing.
-    auto kept = record;
-    kept.bounds = {};
-    kept.is_focused = false;
-    kept.character_offsets.clear();
-    kept.line_break_character_offsets.clear();
-    kept.line_heights.clear();
+    m_accessibility_record_cache->drop_subtrees_to_drop();
     auto version = m_accessibility_record_cache->next_version++;
-    m_accessibility_record_cache->records.set(node.unique_id(), { move(kept), version, {} });
+    m_accessibility_record_cache->records.set(node.unique_id(), { KeptAccessibilityNodeData { record }, version, {} });
     return version;
+}
+
+void Document::intern_accessibility_text_style(WebView::AccessibilityShared<WebView::AccessibilityTextStyle>& style) const
+{
+    if (!m_accessibility_record_cache || m_accessibility_caches_bypassed || style.is_default())
+        return;
+    auto& cache = *m_accessibility_record_cache;
+    if (auto it = cache.text_styles.find(style); it != cache.text_styles.end()) {
+        style = *it;
+        return;
+    }
+    if (cache.text_styles.size() >= max(cache.text_styles_size_after_trim * 2, static_cast<size_t>(256))) {
+        cache.text_styles.remove_all_matching([](auto const& kept) { return kept.ref_count() == 1; });
+        cache.text_styles_size_after_trim = cache.text_styles.size();
+    }
+    cache.text_styles.set(style);
 }
 
 Document::CachedTextGeometry const* Document::cached_text_geometry(Node const& node) const
 {
     if (!m_accessibility_record_cache || m_accessibility_caches_bypassed)
         return nullptr;
+    m_accessibility_record_cache->drop_subtrees_to_drop();
     auto it = m_accessibility_record_cache->records.find(node.unique_id());
-    if (it == m_accessibility_record_cache->records.end() || !it->value.text_geometry.has_value())
+    if (it == m_accessibility_record_cache->records.end() || !it->value.text_geometry)
         return nullptr;
-    return &*it->value.text_geometry;
+    return it->value.text_geometry.ptr();
 }
 
 u64 Document::cache_text_geometry(Node const& node, CachedTextGeometry geometry) const
@@ -7203,12 +7285,13 @@ u64 Document::cache_text_geometry(Node const& node, CachedTextGeometry geometry)
     // The geometry goes with the node's record, so whatever drops the record drops the geometry too.
     if (!m_accessibility_record_cache || m_accessibility_caches_bypassed)
         return 0;
+    m_accessibility_record_cache->drop_subtrees_to_drop();
     auto it = m_accessibility_record_cache->records.find(node.unique_id());
     if (it == m_accessibility_record_cache->records.end())
         return 0;
     geometry.version = m_accessibility_record_cache->next_version++;
     auto version = geometry.version;
-    it->value.text_geometry = move(geometry);
+    it->value.text_geometry = make<CachedTextGeometry>(move(geometry));
     return version;
 }
 
@@ -7232,10 +7315,7 @@ void Document::invalidate_cached_accessibility_data(Node const& node, Optional<U
     auto drop_records_of_subtree = [&](Node const& root) {
         if (!records || records->is_empty())
             return;
-        const_cast<Node&>(root).for_each_shadow_including_inclusive_descendant([&](Node const& descendant) {
-            records->remove(descendant.unique_id());
-            return TraversalDecision::Continue;
-        });
+        m_accessibility_record_cache->subtrees_to_drop.set(root.unique_id());
     };
 
     auto touches_labels = false;
@@ -7356,7 +7436,7 @@ void Document::invalidate_cached_accessibility_data(Node const& node, Optional<U
 
     // Link URLs resolve against the document's base URL.
     if (touches_base_url && records)
-        records->clear();
+        m_accessibility_record_cache->clear();
 }
 
 void Document::invalidate_cached_accessibility_records_after_style_change(Element const& element)
@@ -7383,6 +7463,8 @@ Vector<String> Document::cached_accessibility_record_mismatches()
     update_layout(UpdateLayoutReason::InspectAccessibilityTree);
     if (!m_accessibility_record_cache)
         return {};
+    // The build below bypasses the cache, so it doesn't drop the records that are waiting to be dropped.
+    m_accessibility_record_cache->drop_subtrees_to_drop();
 
     // Leave out what every build computes again anyway.
     auto kept_part = [](WebView::AccessibilityNodeData data) {
@@ -7390,9 +7472,7 @@ Vector<String> Document::cached_accessibility_record_mismatches()
         data.child_ids.clear();
         data.bounds = {};
         data.is_focused = false;
-        data.character_offsets.clear();
-        data.line_break_character_offsets.clear();
-        data.line_heights.clear();
+        data.text_geometry.clear();
         data.caret_offset = -1;
         data.selection_start = -1;
         data.selection_end = -1;
@@ -7406,7 +7486,11 @@ Vector<String> Document::cached_accessibility_record_mismatches()
     Vector<String> mismatches;
     for (auto const& data : fresh) {
         auto cached = m_accessibility_record_cache->records.find(UniqueNodeID { data.id });
-        if (cached == m_accessibility_record_cache->records.end() || kept_part(cached->value.data) == kept_part(data))
+        if (cached == m_accessibility_record_cache->records.end())
+            continue;
+        WebView::AccessibilityNodeData restored;
+        cached->value.data.restore(cached->key, restored);
+        if (kept_part(move(restored)) == kept_part(data))
             continue;
         auto* node = Node::from_unique_id(UniqueNodeID { data.id });
         auto const* element = as_if<Element>(node);
@@ -7438,8 +7522,7 @@ Vector<String> Document::cached_text_geometry_mismatches()
         if (!fresh_data.has_value())
             continue;
         auto const& computed = **fresh_data;
-        if (data.bounds == computed.bounds && data.character_offsets == computed.character_offsets
-            && data.line_break_character_offsets == computed.line_break_character_offsets && data.line_heights == computed.line_heights)
+        if (data.bounds == computed.bounds && data.text_geometry == computed.text_geometry)
             continue;
         mismatches.append(MUST(String::formatted("#text \"{}\": the kept geometry differs from computing it again", data.name)));
     }
@@ -9752,7 +9835,7 @@ void Document::set_design_mode_enabled_state(bool design_mode_enabled)
 
     // Design mode makes the whole document editable.
     if (m_accessibility_record_cache)
-        m_accessibility_record_cache->records.clear();
+        m_accessibility_record_cache->clear();
 
     struct PreviousReadWriteState {
         GC::Ptr<Element> element;

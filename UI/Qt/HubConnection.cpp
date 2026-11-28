@@ -256,6 +256,57 @@ void HubConnection::view_request_permission(u64 view_id, u64 answer_id, WebView:
     });
 }
 
+void HubConnection::view_request_passkey_choice(u64 view_id, u64 answer_id, WebView::PasskeyChoiceKind kind, String rp_id, Vector<Utf16String> options)
+{
+    auto* view = RemoteView::find(view_id);
+    if (!view || !view->on_request_passkey_choice) {
+        async_view_answer_passkey_choice(view_id, answer_id, {});
+        return;
+    }
+    view->on_request_passkey_choice(kind, rp_id, options, [view_id, answer_id](Optional<u32> index) {
+        if (auto* hub = HubConnection::the_if_connected())
+            hub->async_view_answer_passkey_choice(view_id, answer_id, index);
+    });
+}
+
+void HubConnection::view_request_security_key_prompt(u64 view_id, u64 answer_id, WebView::SecurityKeyPromptKind kind, String rp_id)
+{
+    auto* view = RemoteView::find(view_id);
+    if (!view || !view->on_request_security_key_prompt) {
+        async_view_answer(view_id, answer_id, false);
+        return;
+    }
+    view->on_request_security_key_prompt(kind, rp_id, [view_id, answer_id] {
+        if (auto* hub = HubConnection::the_if_connected())
+            hub->async_view_answer(view_id, answer_id, false);
+    });
+}
+
+void HubConnection::view_dismiss_passkey_prompt(u64 view_id)
+{
+    if (auto* view = RemoteView::find(view_id); view && view->on_dismiss_passkey_prompt)
+        view->on_dismiss_passkey_prompt();
+}
+
+void HubConnection::view_request_security_key_pin(u64 view_id, u64 answer_id, WebView::SecurityKeyPinPromptReason reason, String rp_id)
+{
+    auto* view = RemoteView::find(view_id);
+    if (!view || !view->on_request_security_key_pin) {
+        async_view_answer_security_key_pin(view_id, answer_id, {});
+        return;
+    }
+    view->on_request_security_key_pin(reason, rp_id, [view_id, answer_id](Optional<String> pin) {
+        if (auto* hub = HubConnection::the_if_connected())
+            hub->async_view_answer_security_key_pin(view_id, answer_id, move(pin));
+    });
+}
+
+void HubConnection::view_show_passkey_message(u64 view_id, WebView::PasskeyMessage message, String rp_id)
+{
+    if (auto* view = RemoteView::find(view_id); view && view->on_show_passkey_message)
+        view->on_show_passkey_message(message, rp_id);
+}
+
 void HubConnection::view_request_date_picker(u64 view_id, Utf16String input_type, Utf16String value, Utf16String minimum, Utf16String maximum)
 {
     if (auto* view = RemoteView::find(view_id); view && view->on_request_date_picker)
@@ -1046,13 +1097,13 @@ void HubConnection::view_request_screenshot(u64 view_id)
         view->on_request_screenshot();
 }
 
-void HubConnection::view_accessibility_tree_received(u64 view_id, u64 sequence, Vector<WebView::AccessibilityNodeData> nodes)
+void HubConnection::view_accessibility_tree_received(u64 view_id, u64 sequence, WebView::EncodedAccessibilityTree tree)
 {
     if (auto* view = RemoteView::find(view_id); view && view->on_accessibility_tree_received)
-        view->on_accessibility_tree_received(move(sequence), move(nodes));
+        view->on_accessibility_tree_received(move(sequence), move(tree));
 }
 
-void HubConnection::view_accessibility_tree_changed(u64 view_id, u64 base_sequence, u64 sequence, WebView::AccessibilityTreeDelta delta)
+void HubConnection::view_accessibility_tree_changed(u64 view_id, u64 base_sequence, u64 sequence, WebView::EncodedAccessibilityTreeDelta delta)
 {
     if (auto* view = RemoteView::find(view_id); view && view->on_accessibility_tree_changed)
         view->on_accessibility_tree_changed(move(base_sequence), move(sequence), move(delta));

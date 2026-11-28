@@ -8,6 +8,8 @@
 
 #include <AK/Function.h>
 #include <AK/HashMap.h>
+#include <AK/HashTable.h>
+#include <AK/NonnullOwnPtr.h>
 #include <LibGfx/Point.h>
 #include <LibWebCommon/WebView/AccessibilityNodeData.h>
 #include <LibWebView/Export.h>
@@ -35,6 +37,9 @@ public:
     AccessibilityNodeData const* node(i64 id) const;
     AccessibilityNodeData const* root() const;
     AccessibilityNodeData const* hit_test(Gfx::IntPoint point) const;
+    // A node's bounds relative to the viewport. The node holds them relative to its nearest ancestor that has bounds:
+    // see AccessibilityNodeData::bounds.
+    Gfx::IntRect bounds_in_viewport(AccessibilityNodeData const&) const;
     // Marks the node WebContent reports focused.
     void set_focused_node(i64 node_id);
     // Marks the root focused for the assistive technology alone, until the next tree update puts back the focus that
@@ -53,15 +58,29 @@ public:
     Vector<i64> text_leaves_in_order() const;
 
 private:
+    // Takes the point relative to where the node's bounds are relative to.
     AccessibilityNodeData const* hit_test_recursive(i64 node_id, Gfx::IntPoint point) const;
+    // Makes a text leaf's style the one held for every other text leaf with the same.
+    void intern_text_style(AccessibilityShared<AccessibilityTextStyle>&);
 
-    HashMap<i64, AccessibilityNodeData> m_nodes;
+    struct TextStyleTraits : public DefaultTraits<AccessibilityShared<AccessibilityTextStyle>> {
+        static unsigned hash(AccessibilityShared<AccessibilityTextStyle> const& style) { return style->hash(); }
+    };
+
+    // OPTIMIZATION: A tree can have hundreds of thousands of nodes, and a hash table runs partly empty, so the table holds
+    //               pointers to the nodes rather than the nodes themselves.
+    HashMap<i64, NonnullOwnPtr<AccessibilityNodeData>> m_nodes;
     i64 m_root_id { -1 };
     u64 m_sequence { 0 };
     bool m_whole_tree_was_repaired { false };
     Optional<i64> m_focused_id_from_content;
     bool m_focus_shown_on_root { false };
     u64 m_generation { 0 };
+
+    // One style for all the text leaves that have the same. It lets go of the styles no node holds whenever it has grown
+    // to twice the size it last had after that.
+    HashTable<AccessibilityShared<AccessibilityTextStyle>, TextStyleTraits> m_text_styles;
+    size_t m_text_styles_size_after_trim { 0 };
 };
 
 }

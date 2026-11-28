@@ -74,9 +74,9 @@ compile_ipc(Size.ipc SizeCodecs.h)
 
 ladybird_lib(LibGfx gfx)
 
-target_link_libraries(LibGfx PRIVATE LibCompress LibCore LibCrypto LibFileSystem LibTextCodec LibIPC LibUnicode)
+target_link_libraries(LibGfx PRIVATE LibCore LibCrypto LibFileSystem LibTextCodec LibIPC LibUnicode)
 
-target_link_libraries(LibGfx PRIVATE PkgConfig::WOFF2 JPEG::JPEG harfbuzz)
+target_link_libraries(LibGfx PRIVATE JPEG::JPEG harfbuzz)
 
 import_rust_crate(
     MANIFEST_PATH Rust/Cargo.toml
@@ -85,20 +85,14 @@ import_rust_crate(
     FFI_HEADER RustFFI.h
     KEEP_SYMBOLS ladybird_gfx_register_rust_crate_copy
 )
+# The crate calls HarfBuzz and leaves linking it to whatever links the crate, so that a process has one HarfBuzz. The
+# imports of the crates that bundle a copy of this one link it too. They take the library alone, not the include
+# directories of HarfBuzz, which only C++ that includes its headers needs.
+target_link_libraries(libgfx_rust INTERFACE $<LINK_ONLY:harfbuzz>)
 target_link_libraries(LibGfx PRIVATE libgfx_rust)
 
 if (HAS_FONTCONFIG)
     target_link_libraries(LibGfx PRIVATE Fontconfig::Fontconfig)
-endif()
-
-# FIXME: Build vcpkg libraries with clang-cl so they can also build in sanitize.
-# https://github.com/LadybirdBrowser/ladybird/issues/5224
-#   lld-link: error: /failifmismatch: mismatch detected for 'annotate_string':
-#   >>> LibGfx.dir\Font\WOFF2\Loader.cpp.obj has value 1
-#   >>> woff2dec.lib(woff2_dec.cc.obj) has value 0
-# Every TU that includes the standard library carries the value, so the whole target has to go without ASAN.
-if (WIN32 AND ENABLE_ADDRESS_SANITIZER)
-    target_compile_options(LibGfx PRIVATE -fno-sanitize=address)
 endif()
 
 if (APPLE)

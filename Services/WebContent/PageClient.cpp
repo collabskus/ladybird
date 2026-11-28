@@ -1179,6 +1179,12 @@ GC::Ptr<WebContentConsoleClient> PageClient::attach_js_console(Web::DOM::Documen
 
 void PageClient::page_did_finish_loading(Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId document_id)
 {
+    // The UI announces the load from the accessibility tree it holds, so send it the changes still waiting first: They
+    // arrive ahead of the load finishing.
+    if (m_accessibility_update_timer && m_accessibility_update_timer->is_active() && page().accessibility_interested()) {
+        m_accessibility_update_timer->stop();
+        publish_accessibility_tree(false);
+    }
     client().async_did_finish_loading(m_id, navigable_id, document_id);
 }
 
@@ -1282,7 +1288,7 @@ void PageClient::page_did_change_accessibility_tree()
     schedule_accessibility_tree_update();
 }
 
-void PageClient::schedule_accessibility_tree_update()
+void PageClient::schedule_accessibility_tree_update(AccessibilityUpdateDelay delay)
 {
     if (!page().accessibility_interested())
         return;
@@ -1301,8 +1307,32 @@ void PageClient::schedule_accessibility_tree_update()
     // the AT 200 ms after the first of them, and a steadily mutating page gets a fresh tree every 200 ms — the way
     // Gecko (NotificationController::ScheduleProcessing), WebKit (AXObjectCache::deferElementAddedOrRemoved starts
     // m_performCacheUpdateTimer only while it's inactive) and Blink (AXObjectCacheImpl::ScheduleAXUpdate) coalesce.
-    if (!m_accessibility_update_timer->is_active())
-        m_accessibility_update_timer->start();
+    //
+    // OPTIMIZATION: A publish walks the whole tree, so on a huge document it can take longer than the interval, and a
+    //               document that keeps changing (one the parser is still streaming in, e.g.) would then spend nearly
+    //               all its time publishing. So the wait is at least three times as long as the last publish took,
+    //               which keeps publishing to a quarter of the time at most. How long a publish takes depends on its
+    //               document, so a newly navigated-to document starts again from the shortest wait.
+    static constexpr auto MINIMUM_INTERVAL = AK::Duration::from_milliseconds(200);
+
+    // But the AT waits for what its own action changed, so that update comes after the shortest wait, even if a longer
+    // one is already running.
+    if (delay == AccessibilityUpdateDelay::Minimum) {
+        if (!m_accessibility_update_timer->is_active() || m_accessibility_update_timer->interval() > MINIMUM_INTERVAL)
+            m_accessibility_update_timer->restart(MINIMUM_INTERVAL);
+        return;
+    }
+
+    auto last_publish = AK::Duration::zero();
+    if (page().has_local_traversable()) {
+        if (auto document = page().local_traversable()->active_document(); document && document->unique_id() == m_last_accessibility_publish_document_id)
+            last_publish = m_last_accessibility_publish_duration;
+    }
+    auto interval = max(MINIMUM_INTERVAL, last_publish + last_publish + last_publish);
+    // A wait already running is kept, unless it's longer than the document's own: one a slow document armed before the
+    // page navigated away from it.
+    if (!m_accessibility_update_timer->is_active() || m_accessibility_update_timer->interval() > interval)
+        m_accessibility_update_timer->restart(interval);
 }
 
 void PageClient::publish_accessibility_tree(bool whole_tree_requested)
@@ -1316,16 +1346,35 @@ void PageClient::publish_accessibility_tree(bool whole_tree_requested)
         return;
     document->update_layout(Web::DOM::UpdateLayoutReason::InspectAccessibilityTree);
 
+    // Only the tree's own cost sets the wait before the next update, not the layout the page would do anyway.
+    auto start_time = MonotonicTime::now();
+    ScopeGuard record_duration = [&] {
+        m_last_accessibility_publish_duration = MonotonicTime::now() - start_time;
+        m_last_accessibility_publish_document_id = document->unique_id();
+    };
+
     auto change = document->build_accessibility_tree_change(m_accessibility_change_tracker, whole_tree_requested);
     if (change.is_whole_tree) {
-        client().async_did_get_accessibility_tree(m_id, ++m_accessibility_tree_sequence, move(change.nodes));
+        auto tree = WebView::EncodedAccessibilityTree::encode(change.nodes);
+        change.nodes = {};
+        if (tree.is_error()) {
+            dbgln("Unable to encode the accessibility tree: {}", tree.error());
+            return;
+        }
+        client().async_did_get_accessibility_tree(m_id, ++m_accessibility_tree_sequence, tree.release_value());
         return;
     }
     if (change.nodes.is_empty() && change.removed_ids.is_empty())
         return;
+    auto delta = WebView::EncodedAccessibilityTreeDelta::encode({ move(change.nodes), move(change.removed_ids) });
+    if (delta.is_error()) {
+        // The UI notices the gap in the sequence and asks for the whole tree.
+        dbgln("Unable to encode an accessibility tree change: {}", delta.error());
+        ++m_accessibility_tree_sequence;
+        return;
+    }
     auto base_sequence = m_accessibility_tree_sequence++;
-    client().async_did_change_accessibility_tree(m_id, base_sequence, m_accessibility_tree_sequence,
-        WebView::AccessibilityTreeDelta { move(change.nodes), move(change.removed_ids) });
+    client().async_did_change_accessibility_tree(m_id, base_sequence, m_accessibility_tree_sequence, delta.release_value());
 }
 
 void PageClient::page_did_finish_test(Utf16String const& text)
@@ -1483,6 +1532,36 @@ void PageClient::page_did_abandon_notification(u64 notification_id)
 void PageClient::page_did_handle_notification_click(u64 notification_id, bool into_focus)
 {
     client().async_did_handle_notification_click(m_id, notification_id, into_focus);
+}
+
+void PageClient::page_did_request_make_credential(u64 request_id, Web::HTML::CrossProcessId document_id, Web::WebAuthentication::MakeCredentialRequest const& request)
+{
+    client().async_did_request_make_credential(m_id, request_id, document_id, request);
+}
+
+void PageClient::page_did_request_get_assertion(u64 request_id, Web::HTML::CrossProcessId document_id, Web::WebAuthentication::GetAssertionRequest const& request)
+{
+    client().async_did_request_get_assertion(m_id, request_id, document_id, request);
+}
+
+void PageClient::page_did_cancel_web_authentication_request(u64 request_id)
+{
+    client().async_did_cancel_web_authentication_request(m_id, request_id);
+}
+
+void PageClient::page_did_focus_web_authentication_field(Web::HTML::CrossProcessId document_id)
+{
+    client().async_did_focus_web_authentication_field(m_id, document_id);
+}
+
+bool PageClient::page_did_request_is_user_verifying_platform_authenticator_available()
+{
+    return client().did_request_is_user_verifying_platform_authenticator_available(m_id);
+}
+
+String PageClient::page_did_request_virtual_authenticator_command_for_testing(String const& command, String const& parameters)
+{
+    return client().did_request_virtual_authenticator_command_for_testing(m_id, command, parameters);
 }
 
 String PageClient::page_did_request_notifications_state_for_testing()

@@ -247,24 +247,40 @@ WebContentView::WebContentView(QWidget* window, Optional<u64> hub_view_id, WebCo
         // (on Linux, AT-SPI's org.a11y.Status reports IsEnabled or ScreenReaderEnabled, which Gecko's a11y::
         // ShouldA11yBeEnabled() checks too) or has queried a window (-[QNSView activateQtAccessibility] on macOS). One
         // that turns up later gets the tree from accessibilityActiveChanged().
-        if (QAccessible::isActive())
-            fetch_accessibility_tree();
+        if (!QAccessible::isActive())
+            return;
+        // Once asked for the tree, WebContent sends every change to it, a new document's whole tree included, and sends
+        // the changes still waiting ahead of the load finishing (PageClient::page_did_finish_loading()). So the tree held
+        // is the loaded document's already: Announce the load from it rather than have the whole tree built and sent
+        // again.
+        if (m_requested_accessibility_tree) {
+            if (!m_accessibility_whole_tree_pending)
+                did_update_accessibility_tree(Vector<i64> {});
+            return;
+        }
+        fetch_accessibility_tree();
     };
     add_navigation_listener(AK::move(navigation_listener));
     QAccessible::installActivationObserver(this);
 #endif
 
-    on_accessibility_tree_received = [this](u64 sequence, auto nodes) {
+    on_accessibility_tree_received = [this](u64 sequence, auto const& tree) {
+        auto nodes = tree.decode();
+        if (nodes.is_error()) {
+            dbgln("Unable to decode the accessibility tree: {}", nodes.error());
+            return;
+        }
         m_accessibility_whole_tree_pending = false;
-        m_accessibility_manager->update_tree(AK::move(nodes), sequence);
+        m_accessibility_manager->update_tree(nodes.release_value(), sequence);
         did_update_accessibility_tree({});
     };
 
-    on_accessibility_tree_changed = [this](u64 base_sequence, u64 sequence, auto delta) {
+    on_accessibility_tree_changed = [this](u64 base_sequence, u64 sequence, auto const& encoded_delta) {
         // Once the whole tree has been asked for, every change before it arrives is to a tree this view doesn't hold.
         if (m_accessibility_whole_tree_pending)
             return;
-        auto removed_ids = m_accessibility_manager->apply_delta(delta, base_sequence, sequence);
+        auto delta = encoded_delta.decode();
+        auto removed_ids = delta.is_error() ? Optional<Vector<i64>> {} : m_accessibility_manager->apply_delta(delta.value(), base_sequence, sequence);
         if (!removed_ids.has_value()) {
             // A change to a tree this view doesn't hold (one it dropped while it didn't display the tab, e.g.), or one
             // that doesn't fit the tree it holds: Start over from the whole tree.

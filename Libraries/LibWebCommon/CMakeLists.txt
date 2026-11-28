@@ -31,6 +31,7 @@ set(SOURCES
     HTML/PostedMessageDescriptor.cpp
     HTML/POSTResource.cpp
     HTML/PreparedNavigationDescriptor.cpp
+    HTML/RegistrableDomainSuffix.cpp
     HTML/ReplicatedNavigableState.cpp
     HTML/SameDocumentNavigationEntry.cpp
     HTML/SandboxingFlagSet.cpp
@@ -80,9 +81,11 @@ set(SOURCES
     WebDriver/Response.cpp
     WebDriver/TimeoutsConfiguration.cpp
     WebDriver/UserPrompt.cpp
+    WebView/AccessibilityNodeData.cpp
     WebView/Attribute.cpp
     WebView/BrowsingBehavior.cpp
     WebView/ConsoleOutput.cpp
+    WebAuthentication/AuthenticatorMessages.cpp
     WebView/ConsoleOutputBuffer.cpp
     WebView/Debugger.cpp
     WebView/DOMNodeProperties.cpp
