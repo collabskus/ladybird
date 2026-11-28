@@ -8,6 +8,8 @@
 #include <AK/CharacterTypes.h>
 #include <AK/JsonArray.h>
 #include <AK/StringBuilder.h>
+#include <LibHTTP/Method.h>
+#include <LibHTTP/Status.h>
 #include <LibURL/Parser.h>
 #include <LibWebCommon/WebDriver/BiDi.h>
 #include <LibWebCommon/WebDriver/Network.h>
@@ -481,8 +483,13 @@ ErrorOr<InterceptionOverrides, Error> deserialize_interception_overrides(StringV
         // 7. If command parameters contains "method":
         if (auto method = params.get_string("method"sv); method.has_value()) {
             // 2. If method does not match the method token production, return error with error code "invalid argument".
-            if (!HTTP::is_header_name(method->bytes_as_string_view()))
+            if (!HTTP::is_method(method->bytes_as_string_view()))
                 return invalid_argument("Invalid method token"sv);
+
+            // AD-HOC: A forbidden method is invalid too, as RequestServer refuses to send a request with one.
+            if (HTTP::is_forbidden_method(method->bytes_as_string_view()))
+                return invalid_argument("Forbidden method"sv);
+
             result.method = method->to_byte_string();
         }
     }
@@ -492,7 +499,7 @@ ErrorOr<InterceptionOverrides, Error> deserialize_interception_overrides(StringV
         result.body = TRY(deserialize_protocol_bytes(*body));
     if (auto status = params.get("statusCode"sv); status.has_value() && command != "network.continueRequest"sv) {
         result.status = as_js_uint(*status);
-        if (!result.status.has_value() || *result.status < 100 || *result.status > 599)
+        if (!result.status.has_value() || !HTTP::is_valid_status_code(*result.status))
             return invalid_argument("Invalid HTTP status code"sv);
     }
     if (auto reason = params.get_string("reasonPhrase"sv); reason.has_value() && command != "network.continueRequest"sv) {
@@ -502,7 +509,7 @@ ErrorOr<InterceptionOverrides, Error> deserialize_interception_overrides(StringV
     }
     if (auto cookies = params.get_array("cookies"sv); cookies.has_value()) {
         StringBuilder cookie_header;
-        Vector<Header> set_cookie_headers;
+        Vector<ByteString> set_cookie_values;
         for (auto const& value : cookies->values()) {
             auto const& cookie = value.as_object();
             auto name = cookie.get_string("name"sv).release_value();
@@ -541,14 +548,14 @@ ErrorOr<InterceptionOverrides, Error> deserialize_interception_overrides(StringV
             append_attribute("sameSite"sv, "SameSite"sv);
             if (!HTTP::is_header_value(serialized.string_view()))
                 return invalid_argument("Invalid Set-Cookie header"sv);
-            set_cookie_headers.append({ "Set-Cookie"sv, serialized.to_byte_string() });
+            set_cookie_values.append(serialized.to_byte_string());
         }
         if (command == "network.continueRequest"sv) {
             if (!HTTP::is_header_value(cookie_header.string_view()))
                 return invalid_argument("Invalid Cookie header"sv);
             result.cookie_header = cookie_header.to_byte_string();
         } else {
-            result.set_cookie_headers = move(set_cookie_headers);
+            result.set_cookie_values = move(set_cookie_values);
         }
     }
     return result;
