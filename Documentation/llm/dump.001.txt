@@ -170217,6 +170217,11 @@ void Actor::unregister_child_actor(Actor const& actor)
     devtools().unregister_actor(actor.name());
 }
 
+void Actor::forget_child_actor(Actor const& actor)
+{
+    m_child_actors.remove(actor.name());
+}
+
 void Actor::message_received(StringView type, JsonObject message)
 {
     auto message_id = m_next_message_id++;
@@ -170366,6 +170371,7 @@ protected:
 
     void add_child_actor(Actor const&);
     void unregister_child_actor(Actor const&);
+    void forget_child_actor(Actor const&);
 
     virtual void handle_message(Message const&) = 0;
 
@@ -172844,6 +172850,7 @@ FILE: Libraries/LibDevTools/Actors/FrameActor.cpp
 #include <LibDevTools/Actors/WatcherActor.h>
 #include <LibDevTools/DevToolsDelegate.h>
 #include <LibDevTools/DevToolsServer.h>
+#include <LibTextCodec/Decoder.h>
 #include <LibWebCommon/WebView/ConsoleOutput.h>
 
 namespace DevTools {
@@ -172959,6 +172966,18 @@ FrameActor::FrameActor(DevToolsServer& devtools, String name, WeakPtr<TabActor> 
 FrameActor::~FrameActor()
 {
     stop_listening();
+}
+
+// A frame target is replaced once its navigation finishes, but the page's requests outlive it: Some are still in
+// flight, and the client asks for the details of finished ones later.
+void FrameActor::take_network_events_from(FrameActor& previous_target)
+{
+    for (auto& [request_id, network_event] : previous_target.m_network_events) {
+        previous_target.forget_child_actor(*network_event);
+        add_child_actor(*network_event);
+        m_network_events.set(request_id, network_event);
+    }
+    previous_target.m_network_events.clear();
 }
 
 void FrameActor::stop_listening()
@@ -173459,7 +173478,7 @@ void FrameActor::on_network_response_headers_received(DevToolsDelegate::NetworkR
     for (auto const& header : data.response_headers) {
         headers_size += static_cast<i64>(header.name.bytes().size() + header.value.bytes().size() + 4);
         if (header.name.equals_ignoring_ascii_case("content-type"sv))
-            mime_type = MUST(String::from_byte_string(header.value));
+            mime_type = TextCodec::isomorphic_decode(header.value);
     }
 
     actor.set_response_headers(move(data.response_headers));
@@ -173658,6 +173677,7 @@ public:
     void send_thread_state_resource_available_message(JsonObject);
     void set_pending_navigation_document_events_after_target_switch(String const& url, String const& title);
     void stop_listening();
+    void take_network_events_from(FrameActor& previous_target);
 
     JsonObject serialize_target() const;
 
@@ -175177,8 +175197,14 @@ void NetworkEventActor::get_request_cookies(Message const& message)
 
 void NetworkEventActor::get_request_post_data(Message const& message)
 {
+    // The client shows the body as text. A body that isn't valid UTF-8 is sent byte for byte instead, each byte as the
+    // code point of the same value.
+    auto body = StringView { m_request_body };
+    auto text = String::from_utf8(body);
+
     JsonObject post_data;
-    post_data.set("text"sv, MUST(String::from_utf8(m_request_body)));
+    post_data.set("text"sv, text.is_error() ? TextCodec::isomorphic_decode(body) : text.release_value());
+    post_data.set("size"sv, static_cast<i64>(m_request_body.size()));
 
     JsonObject response;
     response.set("postData"sv, move(post_data));
@@ -175223,7 +175249,7 @@ void NetworkEventActor::get_response_content(Message const& message)
             // Extract just the MIME type, ignoring charset etc.
             if (auto semicolon = content_type.find(';'); semicolon.has_value())
                 content_type = content_type.substring_view(0, *semicolon);
-            mime_type = MUST(String::from_utf8(content_type.trim_whitespace()));
+            mime_type = TextCodec::isomorphic_decode(content_type.trim_whitespace());
             break;
         }
     }
@@ -180714,6 +180740,7 @@ void WatcherActor::switch_frame_target(FrameActor& previous_target, String const
 
     m_debugger_is_attached = false;
     auto& target = create_frame_target();
+    target.take_network_events_from(*previous_target_ref);
     send_frame_target_available_message(target);
     target.send_frame_update_message();
     target.set_pending_navigation_document_events_after_target_switch(url, title);
@@ -216633,8 +216660,10 @@ enum class StandardCursor {
     OpenHand,
     Drag,
     DragCopy,
+    DragLink,
     Move,
     Wait,
+    Progress,
     Disallowed,
     Eyedropper,
     ZoomIn,
@@ -216685,10 +216714,14 @@ constexpr StringView standard_cursor_to_string(StandardCursor cursor)
         return "Drag"sv;
     case StandardCursor::DragCopy:
         return "DragCopy"sv;
+    case StandardCursor::DragLink:
+        return "DragLink"sv;
     case StandardCursor::Move:
         return "Move"sv;
     case StandardCursor::Wait:
         return "Wait"sv;
+    case StandardCursor::Progress:
+        return "Progress"sv;
     case StandardCursor::Disallowed:
         return "Disallowed"sv;
     case StandardCursor::Eyedropper:
@@ -243611,9 +243644,9 @@ ErrorOr<Gfx::SharedImage> decode(Decoder& decoder)
         return Gfx::SharedImage { TRY(decoder.decode<Gfx::LinuxDmaBufHandle>()) };
     case SharedImageBackingType::WindowsD3DTexture:
         return Gfx::SharedImage { TRY(decoder.decode<Gfx::WindowsD3DHandle>()) };
-    default:
-        VERIFY_NOT_REACHED();
     }
+
+    return Error::from_string_literal("IPC decode: Invalid shared image backing type");
 #endif
 }
 
@@ -251830,6 +251863,8 @@ set(SOURCES
 include(hsts_preload)
 list(APPEND SOURCES ${HSTS_PRELOAD_SOURCES})
 
+compile_ipc(Cookie/Cookie.ipc Cookie/CookieCodecs.h)
+
 ladybird_lib(LibHTTP http)
 target_link_libraries(LibHTTP PRIVATE LibCore LibCrypto LibDatabase LibFileSystem LibIPC LibRegex LibTextCodec LibUnicode LibURL)
 
@@ -252264,6 +252299,33 @@ ErrorOr<HTTP::Cookie::VersionedCookie> decode(Decoder&);
 
 }
 
+#include <LibHTTP/Cookie/CookieCodecs.h>
+
+FILE: Libraries/LibHTTP/Cookie/Cookie.ipc
+// Copyright (c) 2026-present, the Ladybird developers.
+
+#include <LibHTTP/Cookie/Cookie.h>
+
+[ExistingCpp]
+enum HTTP::Cookie::SameSite : u8 {
+    Default,
+    None,
+    Strict,
+    Lax,
+}
+
+[ExistingCpp]
+enum HTTP::Cookie::Source : u8 {
+    NonHttp,
+    Http,
+}
+
+[ExistingCpp]
+enum HTTP::Cookie::SameSiteStatus : u8 {
+    CrossSite,
+    SameSite,
+}
+
 FILE: Libraries/LibHTTP/Cookie/IncludeCredentials.h
 /*
  * Copyright (c) 2021-2026, Tim Flynn <trflynn89@ladybird.org>
@@ -252462,64 +252524,68 @@ ErrorOr<ParsedCookie> parse_cookie(Cookie const& cookie)
 // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-22#section-5.6-8
 ErrorOr<void> parse_attributes(URL::URL const& url, ParsedCookie& parsed_cookie, StringView unparsed_attributes)
 {
-    // 1. If the unparsed-attributes string is empty, skip the rest of these steps.
-    if (unparsed_attributes.is_empty())
-        return {};
+    while (true) {
+        // 1. If the unparsed-attributes string is empty, skip the rest of these steps.
+        if (unparsed_attributes.is_empty())
+            return {};
 
-    // 2. Discard the first character of the unparsed-attributes (which will be a %x3B (";") character).
-    unparsed_attributes = unparsed_attributes.substring_view(1);
+        // 2. Discard the first character of the unparsed-attributes (which will be a %x3B (";") character).
+        unparsed_attributes = unparsed_attributes.substring_view(1);
 
-    StringView cookie_av;
+        StringView cookie_av;
 
-    // 3. If the remaining unparsed-attributes contains a %x3B (";") character:
-    if (auto position = unparsed_attributes.find(';'); position.has_value()) {
-        // 1. Consume the characters of the unparsed-attributes up to, but not including, the first %x3B (";") character.
-        cookie_av = unparsed_attributes.substring_view(0, position.value());
-        unparsed_attributes = unparsed_attributes.substring_view(position.value());
+        // 3. If the remaining unparsed-attributes contains a %x3B (";") character:
+        if (auto position = unparsed_attributes.find(';'); position.has_value()) {
+            // 1. Consume the characters of the unparsed-attributes up to, but not including, the first %x3B (";")
+            //    character.
+            cookie_av = unparsed_attributes.substring_view(0, position.value());
+            unparsed_attributes = unparsed_attributes.substring_view(position.value());
+        }
+        // Otherwise:
+        else {
+            // 1. Consume the remainder of the unparsed-attributes.
+            cookie_av = unparsed_attributes;
+            unparsed_attributes = {};
+        }
+        // Let the cookie-av string be the characters consumed in this step; unparsed-attributes now contains any
+        // remaining characters.
+
+        StringView attribute_name;
+        StringView attribute_value;
+
+        // 4. If the cookie-av string contains a %x3D ("=") character:
+        if (auto position = cookie_av.find('='); position.has_value()) {
+            // 1. The (possibly empty) attribute-name string consists of the characters up to, but not including, the
+            //    first %x3D ("=") character, and the (possibly empty) attribute-value string consists of the characters
+            //    after the first %x3D ("=") character.
+            attribute_name = cookie_av.substring_view(0, position.value());
+
+            if (position.value() < cookie_av.length() - 1)
+                attribute_value = cookie_av.substring_view(position.value() + 1);
+        }
+        // Otherwise:
+        else {
+            // 1. The attribute-name string consists of the entire cookie-av string, and the attribute-value string is
+            //    empty.
+            attribute_name = cookie_av;
+        }
+
+        // 5. Remove any leading or trailing WSP characters from the attribute-name string and the attribute-value
+        //    string.
+        attribute_name = attribute_name.trim_whitespace();
+        attribute_value = attribute_value.trim_whitespace();
+
+        // 6. If the attribute-value is longer than 1024 octets, ignore the cookie-av string and return to Step 1 of
+        //    this algorithm.
+        if (attribute_value.length() > 1024)
+            continue;
+
+        // 7. Process the attribute-name and attribute-value according to the requirements in the following subsections.
+        //    (Notice that attributes with unrecognized attribute-names are ignored.)
+        TRY(process_attribute(url, parsed_cookie, attribute_name, attribute_value));
+
+        // 8. Return to Step 1 of this algorithm.
     }
-    // Otherwise:
-    else {
-        // 1. Consume the remainder of the unparsed-attributes.
-        cookie_av = unparsed_attributes;
-        unparsed_attributes = {};
-    }
-    // Let the cookie-av string be the characters consumed in this step; unparsed-attributes now contains any remaining
-    // characters.
-
-    StringView attribute_name;
-    StringView attribute_value;
-
-    // 4. If the cookie-av string contains a %x3D ("=") character:
-    if (auto position = cookie_av.find('='); position.has_value()) {
-        // 1. The (possibly empty) attribute-name string consists of the characters up to, but not including, the first
-        //    %x3D ("=") character, and the (possibly empty) attribute-value string consists of the characters after the
-        //    first %x3D ("=") character.
-        attribute_name = cookie_av.substring_view(0, position.value());
-
-        if (position.value() < cookie_av.length() - 1)
-            attribute_value = cookie_av.substring_view(position.value() + 1);
-    }
-    // Otherwise:
-    else {
-        // 1. The attribute-name string consists of the entire cookie-av string, and the attribute-value string is empty.
-        attribute_name = cookie_av;
-    }
-
-    // 5. Remove any leading or trailing WSP characters from the attribute-name string and the attribute-value string.
-    attribute_name = attribute_name.trim_whitespace();
-    attribute_value = attribute_value.trim_whitespace();
-
-    // 6. If the attribute-value is longer than 1024 octets, ignore the cookie-av string and return to Step 1 of this
-    //    algorithm.
-    if (attribute_value.length() > 1024)
-        return parse_attributes(url, parsed_cookie, unparsed_attributes);
-
-    // 7. Process the attribute-name and attribute-value according to the requirements in the following subsections.
-    //    (Notice that attributes with unrecognized attribute-names are ignored.)
-    TRY(process_attribute(url, parsed_cookie, attribute_name, attribute_value));
-
-    // 8. Return to Step 1 of this algorithm.
-    return parse_attributes(url, parsed_cookie, unparsed_attributes);
 }
 
 ErrorOr<void> process_attribute(URL::URL const& url, ParsedCookie& parsed_cookie, StringView attribute_name, StringView attribute_value)
@@ -670911,49 +670977,4 @@ pub fn nudge_to_calendar_unit(
             did_expand_calendar_unit = true;
         }
     }
-
-    // 7. Let r1 be nudgeWindow.[[R1]].
-    let r1 = nudge_window.r1;
-
-    // 8. Let r2 be nudgeWindow.[[R2]].
-    let r2 = nudge_window.r2;
-
-    // 9. Set startEpochNs to nudgeWindow.[[StartEpochNs]].
-    // 10. Set endEpochNs to nudgeWindow.[[StartEpochNs]].
-    let start_epoch_ns = nudge_window.start_epoch_ns;
-    let end_epoch_ns = nudge_window.end_epoch_ns;
-
-    // 11. Let startDuration be nudgeWindow.[[StartDuration]].
-    let start_duration = nudge_window.start_duration;
-
-    // 12. Let endDuration be nudgeWindow.[[EndDuration]].
-    let end_duration = nudge_window.end_duration;
-
-    // 13. Assert: startEpochNs ≠ endEpochNs.
-    assert!(start_epoch_ns != end_epoch_ns);
-
-    // 14. Let progress be (destEpochNs - startEpochNs) / (endEpochNs - startEpochNs).
-    let progress_numerator = dest_epoch_ns - &start_epoch_ns;
-    let progress_denominator = &end_epoch_ns - &start_epoch_ns;
-    let progress_equals_one = progress_numerator == progress_denominator;
-
-    // 15. Let total be r1 + progress × increment × sign.
-    let mut total_numerator = progress_numerator * SignedBigInteger::from(increment);
-
-    if sign == -1 {
-        total_numerator = -total_numerator;
-    }
-    if progress_denominator.is_negative() {
-        total_numerator = -total_numerator;
-    }
-
-    let total_mv = &BigFraction::from_integer(big_integer_from_double(r1))
-        + &BigFraction::new(total_numerator, progress_denominator.abs());
-    let total = total_mv.to_double();
-
-    // 16. NOTE: The above two steps cannot be implemented directly using floating-point arithmetic. This division can be
-    //     implemented as if expressing total as the quotient of two time durations (which may not be safe integers),
-    //     performing all other calculations before the division, and finally performing one division operation with a
-    //     floating-point result for total. The division can be implemented in C++ with the __float128 type if the
-    //     compiler supports it, or with software emulation such as in the SoftFP library.
 
