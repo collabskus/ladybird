@@ -234,8 +234,14 @@ void NetworkEventActor::get_request_cookies(Message const& message)
 
 void NetworkEventActor::get_request_post_data(Message const& message)
 {
+    // The client shows the body as text. A body that isn't valid UTF-8 is sent byte for byte instead, each byte as the
+    // code point of the same value.
+    auto body = StringView { m_request_body };
+    auto text = String::from_utf8(body);
+
     JsonObject post_data;
-    post_data.set("text"sv, MUST(String::from_utf8(m_request_body)));
+    post_data.set("text"sv, text.is_error() ? TextCodec::isomorphic_decode(body) : text.release_value());
+    post_data.set("size"sv, static_cast<i64>(m_request_body.size()));
 
     JsonObject response;
     response.set("postData"sv, move(post_data));
@@ -280,7 +286,7 @@ void NetworkEventActor::get_response_content(Message const& message)
             // Extract just the MIME type, ignoring charset etc.
             if (auto semicolon = content_type.find(';'); semicolon.has_value())
                 content_type = content_type.substring_view(0, *semicolon);
-            mime_type = MUST(String::from_utf8(content_type.trim_whitespace()));
+            mime_type = TextCodec::isomorphic_decode(content_type.trim_whitespace());
             break;
         }
     }

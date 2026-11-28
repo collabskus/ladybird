@@ -5736,6 +5736,89 @@ TEST_CASE(network_event_reports_non_utf8_response_headers)
     EXPECT_EQ(headers[0].as_object().get_string("value"sv).value(), "\xc3\xbf"sv);
 }
 
+static DevTools::DevToolsDelegate::NetworkRequestData make_binary_post_request()
+{
+    ByteBuffer request_body;
+    request_body.append("\xff\xfe\xfd", 3);
+
+    return { .request_id = 100,
+        .url = "https://example.test/upload"_string,
+        .method = "POST"_string,
+        .start_time = UnixDateTime::from_seconds_since_epoch(20),
+        .request_headers = {},
+        .request_body = move(request_body),
+        .initiator_type = "fetch"_string,
+        .referrer_policy = "strict-origin-when-cross-origin"_string,
+        .is_navigation_request = false,
+        .priority = Web::Fetch::Infrastructure::RequestPriority::Auto };
+}
+
+TEST_CASE(network_event_reports_non_utf8_request_body)
+{
+    auto session = create_session();
+    auto& client = *session->client;
+    (void)client.read_message();
+
+    (void)get_frame_target(client, actor_from(get_tab(client), "actor"sv));
+    session->delegate.on_network_request_started(make_binary_post_request());
+    auto network_actor = read_resource(client, "network-event"sv).get_string("actor"sv).release_value();
+
+    auto post_data = client.request(network_actor, "getRequestPostData"sv).get_object("postData"sv).release_value();
+    EXPECT_EQ(post_data.get_string("text"sv).value(), "\xc3\xbf\xc3\xbe\xc3\xbd"sv);
+    EXPECT_EQ(post_data.get_integer<i64>("size"sv).value(), 3);
+}
+
+TEST_CASE(network_event_reports_non_utf8_content_type)
+{
+    auto session = create_session();
+    auto& client = *session->client;
+    (void)client.read_message();
+
+    (void)get_frame_target(client, actor_from(get_tab(client), "actor"sv));
+    session->delegate.on_network_request_started(make_binary_post_request());
+    auto network_actor = read_resource(client, "network-event"sv).get_string("actor"sv).release_value();
+
+    Vector<HTTP::Header> response_headers;
+    response_headers.append({ "Content-Type", ByteString { "text/\xff; charset=\xff", 17 } });
+    session->delegate.on_network_response_headers_received({ .request_id = 100,
+        .status_code = 200,
+        .reason_phrase = "OK"_string,
+        .response_headers = move(response_headers),
+        .cache_state = Requests::CacheState::NotCached });
+
+    auto update = read_resource(client, "network-event"sv, "resources-updated-array"sv);
+    EXPECT_EQ(update.get_object("resourceUpdates"sv)->get_string("mimeType"sv).value(), "text/\xc3\xbf; charset=\xc3\xbf"sv);
+
+    auto content = client.request(network_actor, "getResponseContent"sv).get_object("content"sv).release_value();
+    EXPECT_EQ(content.get_string("mimeType"sv).value(), "text/\xc3\xbf"sv);
+}
+
+TEST_CASE(network_event_outlives_the_frame_target_it_started_on)
+{
+    auto session = create_session();
+    auto& client = *session->client;
+    (void)client.read_message();
+
+    (void)get_frame_target(client, actor_from(get_tab(client), "actor"sv));
+    session->delegate.on_network_request_started(make_binary_post_request());
+    auto network_actor = read_resource(client, "network-event"sv).get_string("actor"sv).release_value();
+
+    // A finished navigation replaces the frame target, while the request is still waiting for its response.
+    session->delegate.emit_navigation_finish();
+    while (client.read_message().get_string("type"sv).value_or({}) != "target-available-form"sv) { }
+
+    session->delegate.on_network_response_headers_received({ .request_id = 100,
+        .status_code = 501,
+        .reason_phrase = "Not Implemented"_string,
+        .response_headers = {},
+        .cache_state = Requests::CacheState::NotCached });
+    auto update = read_resource(client, "network-event"sv, "resources-updated-array"sv);
+    EXPECT_EQ(update.get_object("resourceUpdates"sv)->get_string("status"sv).value(), "501"sv);
+
+    auto post_data = client.request(network_actor, "getRequestPostData"sv).get_object("postData"sv).release_value();
+    EXPECT_EQ(post_data.get_integer<i64>("size"sv).value(), 3);
+}
+
 TEST_CASE(console_network_navigation_and_accessibility)
 {
     auto session = create_session();

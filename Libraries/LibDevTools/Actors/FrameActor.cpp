@@ -20,6 +20,7 @@
 #include <LibDevTools/Actors/WatcherActor.h>
 #include <LibDevTools/DevToolsDelegate.h>
 #include <LibDevTools/DevToolsServer.h>
+#include <LibTextCodec/Decoder.h>
 #include <LibWebCommon/WebView/ConsoleOutput.h>
 
 namespace DevTools {
@@ -135,6 +136,18 @@ FrameActor::FrameActor(DevToolsServer& devtools, String name, WeakPtr<TabActor> 
 FrameActor::~FrameActor()
 {
     stop_listening();
+}
+
+// A frame target is replaced once its navigation finishes, but the page's requests outlive it: Some are still in
+// flight, and the client asks for the details of finished ones later.
+void FrameActor::take_network_events_from(FrameActor& previous_target)
+{
+    for (auto& [request_id, network_event] : previous_target.m_network_events) {
+        previous_target.forget_child_actor(*network_event);
+        add_child_actor(*network_event);
+        m_network_events.set(request_id, network_event);
+    }
+    previous_target.m_network_events.clear();
 }
 
 void FrameActor::stop_listening()
@@ -635,7 +648,7 @@ void FrameActor::on_network_response_headers_received(DevToolsDelegate::NetworkR
     for (auto const& header : data.response_headers) {
         headers_size += static_cast<i64>(header.name.bytes().size() + header.value.bytes().size() + 4);
         if (header.name.equals_ignoring_ascii_case("content-type"sv))
-            mime_type = MUST(String::from_byte_string(header.value));
+            mime_type = TextCodec::isomorphic_decode(header.value);
     }
 
     actor.set_response_headers(move(data.response_headers));
