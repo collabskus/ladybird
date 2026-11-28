@@ -199243,8 +199243,9 @@ public:
     }
 };
 
-// Heap::allocate<T>() takes every cell from T::cell_allocator, and a subclass of T must declare an allocator of its own,
-// so a cell that came from T::cell_allocator is exactly a T. This identifies a cell's type without reading its vtable.
+// Heap::allocate<T>() takes every cell from T::cell_allocator, and a subclass of T must declare an allocator of its own
+// unless it adds no state to T (see Heap::allocate_from_allocator_of_base()), so a cell that came from T::cell_allocator
+// has exactly the layout of a T. This identifies a cell's type without reading its vtable.
 inline bool cell_was_allocated_from(Cell const& cell, CellAllocatorDescriptorBase const& descriptor)
 {
     return &HeapBlock::from_cell(&cell)->cell_allocator().descriptor() == &descriptor;
@@ -199357,6 +199358,7 @@ set(SOURCES
     Cell.cpp
     CellAllocator.cpp
     CrossHeapMember.cpp
+    Function.cpp
     Root.cpp
     RootHashMap.cpp
     RootHashTable.cpp
@@ -199788,6 +199790,21 @@ class WeakHashMap;
 
 }
 
+FILE: Libraries/LibGC/Function.cpp
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <LibGC/Function.h>
+
+namespace GC {
+
+GC_DEFINE_ALLOCATOR(FunctionCell);
+
+}
+
 FILE: Libraries/LibGC/Function.h
 /*
  * Copyright (c) 2023, Andreas Kling <andreas@ladybird.org>
@@ -200070,13 +200087,48 @@ struct FunctionOperationsFor : FunctionOperations {
     R (*invoke)(void* box, Args...) { nullptr };
 };
 
+// The cell of every GC::Function. It holds only the handle to its entry in the heap's function table, whatever the
+// signature of the function, and an entry is checked against the signature before it is invoked. So the functions of
+// all signatures share one allocator: no cell of it can be taken for one with another layout.
+class GC_API FunctionCell : public Cell {
+    GC_CELL(FunctionCell, Cell);
+    GC_DECLARE_ALLOCATOR(FunctionCell);
+
+public:
+    // NB: The captured values die when the cell is swept, not when it is finalized, so that the finalizer of another dead
+    //     cell can still call this function.
+    GC_ALLOW_CELL_DESTRUCTOR virtual ~FunctionCell() override
+    {
+        if (!m_handle.is_valid())
+            return;
+        auto& table = heap().function_table();
+        auto const& slot = table.slot(m_handle);
+        slot.operations->destroy(slot.box);
+        table.free(m_handle);
+        m_handle = {};
+    }
+
+protected:
+    FunctionCell() = default;
+
+    virtual void visit_edges(Visitor& visitor) override
+    {
+        Base::visit_edges(visitor);
+        if (!m_handle.is_valid())
+            return;
+        auto const& slot = heap().function_table().slot(m_handle);
+        slot.operations->visit_edges(slot.box, visitor);
+    }
+
+    FunctionTableHandle m_handle;
+};
+
 template<typename T>
 class Function;
 
 template<typename R, typename... Args>
-class Function<R(Args...)> final : public Cell {
-    GC_CELL(Function, Cell);
-    GC_DECLARE_ALLOCATOR(Function);
+class Function<R(Args...)> final : public FunctionCell {
+    GC_CELL(Function, FunctionCell);
 
 public:
     using Operations = FunctionOperationsFor<R, Args...>;
@@ -200091,14 +200143,14 @@ public:
         static_assert(alignof(Box) <= FunctionTable::box_alignment);
 
         if constexpr (sizeof...(Values) == 0) {
-            auto cell = heap.allocate<Function>();
+            auto cell = heap.allocate_from_allocator_of_base<Function>();
             cell->m_handle = heap.function_table().allocate(CaptureOperations<Callback, Box>::operations, 0).handle;
             return cell;
         } else {
             // NB: A collection waits until the function holds its box. Until then, the captured values may be where a
             //     conservative scan of the stack doesn't look, such as the storage of a temporary Vector of cells.
             DeferGC defer_gc { heap };
-            auto cell = heap.allocate<Function>();
+            auto cell = heap.allocate_from_allocator_of_base<Function>();
             auto allocation = heap.function_table().allocate(CaptureOperations<Callback, Box>::operations, sizeof(Box));
             captures.template make_box<Box>(allocation.box);
             cell->m_handle = allocation.handle;
@@ -200119,30 +200171,8 @@ public:
 
     Function const& function() const { return *this; }
 
-    // NB: The captured values die when the cell is swept, not when it is finalized, so that the finalizer of another dead
-    //     cell can still call this function.
-    GC_ALLOW_CELL_DESTRUCTOR virtual ~Function() override
-    {
-        if (!m_handle.is_valid())
-            return;
-        auto& table = heap().function_table();
-        auto const& slot = table.slot(m_handle);
-        slot.operations->destroy(slot.box);
-        table.free(m_handle);
-        m_handle = {};
-    }
-
 private:
     Function() = default;
-
-    virtual void visit_edges(Visitor& visitor) override
-    {
-        Base::visit_edges(visitor);
-        if (!m_handle.is_valid())
-            return;
-        auto const& slot = heap().function_table().slot(m_handle);
-        slot.operations->visit_edges(slot.box, visitor);
-    }
 
     template<typename Callback, typename Box>
     struct CaptureOperations {
@@ -200164,8 +200194,6 @@ private:
             },
         };
     };
-
-    FunctionTableHandle m_handle;
 };
 
 // Makes a function of a callable that takes everything it uses from its captures. The values named by GC::captures()
@@ -200193,9 +200221,6 @@ static Ref<Function<T>> create_function(Heap& heap, Callable&& function)
     static_assert(Detail::CapturesNothing<RemoveCVReference<Callable>>, "A GC::Function callable captures nothing; name what it uses with GC::captures() and take it as parameters");
     return Function<T>::create(heap, CaptureList<> {}, forward<Callable>(function));
 }
-
-template<typename R, typename... Args>
-GC_DEFINE_ALLOCATOR(Function<R(Args...)>);
 
 }
 
@@ -203049,6 +203074,22 @@ public:
     Ref<T> allocate_with_descriptor(TypeIsolatingCellAllocator<T>& descriptor, Args&&... args)
     {
         return construct_cell<T>(allocate_cell(descriptor), forward<Args>(args)...);
+    }
+
+    // Like allocate(), for a T that adds no state to the class whose allocator it inherits. A cell of that allocator is
+    // then a cell of the class or of any such subclass, and all of them have the layout of the class. The allocator
+    // visits and destroys its cells as the class, so T must not override how a cell is visited, finalized or destroyed.
+    template<typename T, typename... Args>
+    Ref<T> allocate_from_allocator_of_base(Args&&... args)
+    {
+        using AllocatingType = typename decltype(T::cell_allocator)::CellType;
+        static_assert(IsBaseOf<AllocatingType, T> && !IsSame<AllocatingType, T>);
+        static_assert(sizeof(T) == sizeof(AllocatingType) && alignof(T) == alignof(AllocatingType), "A cell that shares the allocator of its base class adds no state to it");
+        static_assert(IsSame<decltype(&T::visit_edges), decltype(&AllocatingType::visit_edges)>
+                && IsSame<decltype(&T::finalize), decltype(&AllocatingType::finalize)>
+                && IsSame<decltype(&T::external_memory_size), decltype(&AllocatingType::external_memory_size)>,
+            "A cell that shares the allocator of its base class is visited and finalized as that class");
+        return construct_cell<T>(allocate_cell(T::cell_allocator), forward<Args>(args)...);
     }
 
     enum class CollectionType {
@@ -217838,6 +217879,7 @@ extern "C" void ladybird_gfx_font_snapshot(void const* font, Gfx::FFI::FfiFontSn
     VERIFY(out_snapshot);
     auto const& typed_font = *static_cast<Gfx::Font const*>(font);
     auto const& metrics = typed_font.pixel_metrics();
+    auto bounding_box_of_all_glyphs = typed_font.typeface().bounding_box_in_font_units();
     *out_snapshot = {
         .id = typed_font.id(),
         .ascent = metrics.ascent,
@@ -217848,6 +217890,16 @@ extern "C" void ladybird_gfx_font_snapshot(void const* font, Gfx::FFI::FfiFontSn
         .zero_advance = metrics.advance_of_ascii_zero,
         .pixel_size = typed_font.pixel_size(),
         .point_size = typed_font.point_size(),
+        .has_bounding_box_of_all_glyphs = !bounding_box_of_all_glyphs.is_empty(),
+        .bounding_box_of_all_glyphs = {
+            .x_min = bounding_box_of_all_glyphs.x_min,
+            .y_min = bounding_box_of_all_glyphs.y_min,
+            .x_max = bounding_box_of_all_glyphs.x_max,
+            .y_max = bounding_box_of_all_glyphs.y_max,
+            .units_per_em = bounding_box_of_all_glyphs.units_per_em,
+        },
+        .synthetic_slant = hb_font_get_synthetic_slant(typed_font.harfbuzz_font()),
+        .has_synthetic_bold = typed_font.synthesis().bold,
     };
 }
 
@@ -233664,6 +233716,18 @@ unsafe extern "C" {
     ) -> u8;
 }
 
+/// The box every glyph of a face fits in, as its `head` table records it: in font units from a glyph's origin, with y
+/// pointing up.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BoundingBoxInFontUnits {
+    pub x_min: i16,
+    pub y_min: i16,
+    pub x_max: i16,
+    pub y_max: i16,
+    pub units_per_em: u16,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FfiFontSnapshot {
@@ -233676,6 +233740,10 @@ pub struct FfiFontSnapshot {
     pub zero_advance: f32,
     pub pixel_size: f32,
     pub point_size: f32,
+    pub has_bounding_box_of_all_glyphs: bool,
+    pub bounding_box_of_all_glyphs: BoundingBoxInFontUnits,
+    pub synthetic_slant: f32,
+    pub has_synthetic_bold: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -233691,6 +233759,12 @@ pub struct FontFacts {
     pub zero_advance: f32,
     pub pixel_size: f32,
     pub point_size: f32,
+    /// None where the face records no box or an empty one, as bitmap-only faces do.
+    pub bounding_box_of_all_glyphs: Option<BoundingBoxInFontUnits>,
+    /// How far a synthetic oblique moves each point of a glyph along the line, per unit of its height above the
+    /// baseline. Zero for a font that is not slanted synthetically.
+    pub synthetic_slant: f32,
+    pub has_synthetic_bold: bool,
 }
 
 // NB: Layout threads read every entry while they count references to it. The alignment puts the reference counts in
@@ -233776,6 +233850,11 @@ impl FontHandle {
                 zero_advance: snapshot.zero_advance,
                 pixel_size: snapshot.pixel_size,
                 point_size: snapshot.point_size,
+                bounding_box_of_all_glyphs: snapshot
+                    .has_bounding_box_of_all_glyphs
+                    .then_some(snapshot.bounding_box_of_all_glyphs),
+                synthetic_slant: snapshot.synthetic_slant,
+                has_synthetic_bold: snapshot.has_synthetic_bold,
             },
             character_advances: std::sync::OnceLock::new(),
             is_emoji_font: LazyVerdict::default(),
@@ -240672,7 +240751,8 @@ FILE: Libraries/LibGfx/Rust/src/text_layout.rs
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use crate::font::FontHandle;
+use crate::font::{FontFacts, FontHandle};
+use crate::geometry::FloatRect;
 use hashbrown::hash_map::EntryRef;
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -240834,14 +240914,6 @@ unsafe extern "C" {
         emit: unsafe extern "C" fn(*mut c_void, *const ShapedGlyph, usize, f32, usize, f32, f32, bool),
     );
 
-    fn ladybird_gfx_glyph_run_bounding_box(
-        font: *const c_void,
-        glyphs: *const ShapedGlyph,
-        glyph_count: usize,
-        scale: f32,
-        out_rect: *mut f32,
-    );
-
     fn ladybird_gfx_glyph_run_ink_bounding_box(
         font: *const c_void,
         glyphs: *const ShapedGlyph,
@@ -240868,22 +240940,75 @@ fn shaped_glyphs_of(glyphs: &GlyphBuffer) -> Vec<ShapedGlyph> {
     glyphs.placed().map(ShapedGlyph::from).collect()
 }
 
+/// How far synthetic bold can spread the ink of a font's glyphs past their outlines, in device pixels. The rasterizer
+/// decides the stroke, so this allows for the widest it's known to use: It bounds what a run may paint, and isn't a
+/// measurement of its ink.
+fn synthetic_bold_outset(facts: &FontFacts, scale: f32) -> f32 {
+    if !facts.has_synthetic_bold {
+        return 0.0;
+    }
+    (facts.pixel_size * scale / 24.0).max(1.0)
+}
+
+/// Conservative bounds of the painted glyphs in device pixels, relative to the run's baseline origin (glyph positions
+/// scaled by `scale`, with the font ascent added to y), as x, y, width and height. The box of the glyph origins is grown
+/// by the box every glyph of the font fits in, or, where the font records no such box, the tight extents of the glyphs
+/// are united instead.
 #[must_use]
 pub fn glyph_run_bounding_box(font: &FontHandle, glyphs: &GlyphBuffer, scale: f32) -> [f32; 4] {
-    let glyphs = shaped_glyphs_of(glyphs);
-    let mut out_rect = [0.0f32; 4];
-    // SAFETY: The handle keeps the font live and the glyph slice stays valid
-    // for the synchronous call, which fills the four floats out_rect points at.
-    unsafe {
-        ladybird_gfx_glyph_run_bounding_box(
-            font.as_raw(),
-            glyphs.as_ptr(),
-            glyphs.len(),
-            scale,
-            out_rect.as_mut_ptr(),
-        );
+    let facts = font.facts();
+    let mut has_painted_glyphs = false;
+    let mut min_x = f32::MAX;
+    let mut min_y = f32::MAX;
+    let mut max_x = f32::MIN;
+    let mut max_y = f32::MIN;
+    for placed in glyphs.placed() {
+        if !placed.glyph.should_paint() {
+            continue;
+        }
+        let origin_x = placed.x * scale;
+        let origin_y = (placed.y + facts.ascent) * scale;
+        if !origin_x.is_finite() || !origin_y.is_finite() {
+            return [0.0; 4];
+        }
+        min_x = min_x.min(origin_x);
+        min_y = min_y.min(origin_y);
+        max_x = max_x.max(origin_x);
+        max_y = max_y.max(origin_y);
+        has_painted_glyphs = true;
     }
-    out_rect
+    if !has_painted_glyphs {
+        return [0.0; 4];
+    }
+
+    let outset = synthetic_bold_outset(facts, scale);
+    let Some(font_bounding_box) = facts.bounding_box_of_all_glyphs else {
+        // NB: HarfBuzz slants the extents of a synthetic oblique itself.
+        let mut bounds = FloatRect::from_array(glyph_run_ink_bounding_box(font, glyphs, scale));
+        if outset > 0.0 && !bounds.is_empty() {
+            bounds = bounds.inflated(outset * 2.0, outset * 2.0);
+        }
+        return [bounds.x, bounds.y, bounds.width, bounds.height];
+    };
+
+    let font_units_to_pixels = facts.pixel_size * scale / f32::from(font_bounding_box.units_per_em);
+    // Font units have y pointing up, device pixels have y pointing down.
+    let mut left = min_x + f32::from(font_bounding_box.x_min) * font_units_to_pixels;
+    let mut right = max_x + f32::from(font_bounding_box.x_max) * font_units_to_pixels;
+    let mut top = min_y - f32::from(font_bounding_box.y_max) * font_units_to_pixels;
+    let mut bottom = max_y - f32::from(font_bounding_box.y_min) * font_units_to_pixels;
+    // A synthetic oblique shifts each point of a glyph along the line by its height above the baseline.
+    if facts.synthetic_slant != 0.0 {
+        let shift_at_top = f32::from(font_bounding_box.y_max) * font_units_to_pixels * facts.synthetic_slant;
+        let shift_at_bottom = f32::from(font_bounding_box.y_min) * font_units_to_pixels * facts.synthetic_slant;
+        left += shift_at_top.min(shift_at_bottom).min(0.0);
+        right += shift_at_top.max(shift_at_bottom).max(0.0);
+    }
+    left -= outset;
+    right += outset;
+    top -= outset;
+    bottom += outset;
+    [left, top, right - left, bottom - top]
 }
 
 /// Tight bounds of the ink of the painted glyphs, from their own extents, in the coordinates of
@@ -244030,18 +244155,8 @@ FILE: Libraries/LibGfx/TextLayout.cpp
 
 namespace Gfx {
 
-// How far synthetic bold can spread the ink of a font's glyphs past their outlines, in device pixels. The rasterizer
-// decides the stroke, so this allows for the widest it's known to use: It bounds what a run may paint, and isn't a
-// measurement of its ink.
-static float synthetic_bold_outset(Font const& font, float scale)
-{
-    if (!font.synthesis().bold)
-        return 0;
-    return max(font.pixel_size() * scale / 24, 1.0f);
-}
-
-// Tight bounds of the ink of the painted glyphs, from their own extents, in the coordinates of glyph_run_bounding_box().
-// Empty if no painted glyph has ink.
+// Tight bounds of the ink of the painted glyphs, from their own extents, in device pixels relative to the run's baseline
+// origin (glyph positions scaled by `scale`, with the font ascent added to y). Empty if no painted glyph has ink.
 static FloatRect glyph_run_ink_bounding_box(Font const& font, ReadonlySpan<ShapedGlyph> glyphs, float scale)
 {
     auto font_ascent = font.pixel_metrics().ascent;
@@ -244072,65 +244187,6 @@ static FloatRect glyph_run_ink_bounding_box(Font const& font, ReadonlySpan<Shape
         };
         bounds.unite(glyph_bounds);
     }
-    return bounds;
-}
-
-FloatRect glyph_run_bounding_box(Font const& font, ReadonlySpan<ShapedGlyph> glyphs, float scale)
-{
-    auto font_ascent = font.pixel_metrics().ascent;
-
-    // NOTE: This is a plain min/max rather than FloatRect::unite(), because a run with a single glyph must still
-    //       produce a (zero-sized) origin box that gets expanded by the font bounds below.
-    bool has_painted_glyphs = false;
-    float min_x = NumericLimits<float>::max();
-    float min_y = NumericLimits<float>::max();
-    float max_x = NumericLimits<float>::lowest();
-    float max_y = NumericLimits<float>::lowest();
-    for (auto const& glyph : glyphs) {
-        if (!glyph.should_paint)
-            continue;
-        auto origin_x = glyph.position.x() * scale;
-        auto origin_y = (glyph.position.y() + font_ascent) * scale;
-        if (!__builtin_isfinite(origin_x) || !__builtin_isfinite(origin_y))
-            return {};
-        min_x = min(min_x, origin_x);
-        min_y = min(min_y, origin_y);
-        max_x = max(max_x, origin_x);
-        max_y = max(max_y, origin_y);
-        has_painted_glyphs = true;
-    }
-    if (!has_painted_glyphs)
-        return {};
-
-    auto font_bounding_box = font.typeface().bounding_box_in_font_units();
-    if (!font_bounding_box.is_empty()) {
-        auto font_units_to_pixels = font.pixel_size() * scale / font_bounding_box.units_per_em;
-        // Font units have y pointing up, device pixels have y pointing down.
-        auto left = min_x + font_bounding_box.x_min * font_units_to_pixels;
-        auto right = max_x + font_bounding_box.x_max * font_units_to_pixels;
-        auto top = min_y - font_bounding_box.y_max * font_units_to_pixels;
-        auto bottom = max_y - font_bounding_box.y_min * font_units_to_pixels;
-        // A synthetic oblique shifts each point of a glyph along the line by its height above the baseline.
-        if (auto angle = font.synthesis().oblique_angle; angle != 0) {
-            auto slant = AK::tan(AK::to_radians(angle));
-            auto shift_at_top = font_bounding_box.y_max * font_units_to_pixels * slant;
-            auto shift_at_bottom = font_bounding_box.y_min * font_units_to_pixels * slant;
-            left += min(0.0f, min(shift_at_top, shift_at_bottom));
-            right += max(0.0f, max(shift_at_top, shift_at_bottom));
-        }
-        auto outset = synthetic_bold_outset(font, scale);
-        left -= outset;
-        right += outset;
-        top -= outset;
-        bottom += outset;
-        return { left, top, right - left, bottom - top };
-    }
-
-    // The font doesn't record an overall bounding box (e.g. bitmap-only fonts), so unite the glyphs' own extents.
-    // NB: HarfBuzz slants the extents of a synthetic oblique itself.
-    auto bounds = glyph_run_ink_bounding_box(font, glyphs, scale);
-    if (auto outset = synthetic_bold_outset(font, scale); outset > 0 && !bounds.is_empty())
-        bounds.inflate(outset * 2, outset * 2);
     return bounds;
 }
 
@@ -244762,7 +244818,6 @@ static_assert(offsetof(Gfx::FFI::ShapedGlyph, should_paint) == offsetof(Gfx::Sha
 extern "C" {
 void ladybird_gfx_shape_text_uncached(void const*, u16 const*, size_t, Gfx::FFI::TextType, float, float, Gfx::FFI::JoiningContext, bool, void*, void (*)(void*, Gfx::FFI::ShapedGlyph const*, size_t, float, size_t, float, float, bool));
 float ladybird_gfx_font_measure_text_width(void const*, u16 const*, size_t);
-void ladybird_gfx_glyph_run_bounding_box(void const*, Gfx::FFI::ShapedGlyph const*, size_t, float, float*);
 void ladybird_gfx_glyph_run_ink_bounding_box(void const*, Gfx::FFI::ShapedGlyph const*, size_t, float, float*);
 void ladybird_gfx_glyph_run_glyph_intercepts(void const*, Gfx::FFI::ShapedGlyph const*, size_t, float, float, float, float, void*, void (*)(void*, float));
 }
@@ -244815,26 +244870,6 @@ extern "C" float ladybird_gfx_font_measure_text_width(
         ? Utf16View {}
         : Utf16View { reinterpret_cast<char16_t const*>(text_utf16), length_in_code_units };
     return Gfx::measure_text_width(text, *static_cast<Gfx::Font const*>(font));
-}
-
-extern "C" void ladybird_gfx_glyph_run_bounding_box(
-    void const* font,
-    Gfx::FFI::ShapedGlyph const* glyphs,
-    size_t glyph_count,
-    float scale,
-    float* out_rect)
-{
-    VERIFY(font);
-    VERIFY(glyphs || glyph_count == 0);
-    VERIFY(out_rect);
-    auto bounds = Gfx::glyph_run_bounding_box(
-        *static_cast<Gfx::Font const*>(font),
-        { reinterpret_cast<Gfx::ShapedGlyph const*>(glyphs), glyph_count },
-        scale);
-    out_rect[0] = bounds.x();
-    out_rect[1] = bounds.y();
-    out_rect[2] = bounds.width();
-    out_rect[3] = bounds.height();
 }
 
 extern "C" void ladybird_gfx_glyph_run_ink_bounding_box(
@@ -244914,12 +244949,6 @@ struct ShapedGlyph {
     bool should_paint { true };
     bool is_rtl { false };
 };
-
-// Conservative bounds of the painted glyphs in device pixels, relative to the run's baseline origin (glyph
-// positions scaled by `scale`, with the font ascent added to y). The bounding box of the glyph origins is
-// expanded by the font's overall glyph bounding box, falling back to tight per-glyph extents when the font
-// doesn't record one.
-[[nodiscard]] FloatRect glyph_run_bounding_box(Font const&, ReadonlySpan<ShapedGlyph>, float scale);
 
 // Pairs of [start, end] device-pixel x values, relative to the run's baseline origin, where glyph ink intersects
 // the horizontal band [y_top, y_bottom]. One pair per painted glyph that has ink inside the band, in run order.
@@ -250062,6 +250091,10 @@ Optional<MemoryCache::Entry const&> MemoryCache::open_entry(URL::URL const& url,
     // - the presented target URI (Section 7.1 of [HTTP]) and that of the stored response match, and
     // - the request method associated with the stored response allows it to be used for the presented request, and
     if (!is_cacheable(method, request_headers))
+        return {};
+
+    // AD-HOC: Client preconditions could make a 304 refer to a different representation. Let the origin evaluate them.
+    if (has_preconditions(request_headers))
         return {};
 
     auto serialized_url = serialize_url_for_cache_storage(url);
@@ -255550,9 +255583,16 @@ FILE: Libraries/LibHTTP/Status.h
 
 namespace HTTP {
 
+// https://www.rfc-editor.org/rfc/rfc9110#section-15
+// All valid status codes are within the range of 100 to 599, inclusive.
+constexpr bool is_valid_status_code(u64 code)
+{
+    return code >= 100 && code <= 599;
+}
+
 constexpr StringView reason_phrase_for_code(u32 code)
 {
-    VERIFY(code >= 100 && code <= 599);
+    VERIFY(is_valid_status_code(code));
 
     // clang-format off
     switch (code) {
@@ -375796,7 +375836,7 @@ consteval JSHostClass make_host_class(u8 kind, StringView name, JSHostClass cons
         | JS_HOST_CLASS_NOT_CACHEABLE_ACROSS_REALMS
         | JS_HOST_CLASS_NOT_ELIGIBLE_FOR_OWN_PROPERTY_ENUMERATION_FAST_PATH;
 
-    u32 allowed_flags = JS_HOST_CLASS_SHARES_ALLOCATOR_WITH_PARENT;
+    u32 allowed_flags = 0;
     switch (kind) {
     case JS_HOST_CLASS_OBJECT:
         allowed_flags |= flags_copied_into_objects | host_object_flags;
@@ -375813,7 +375853,6 @@ consteval JSHostClass make_host_class(u8 kind, StringView name, JSHostClass cons
         VERIFY_NOT_REACHED();
     }
     VERIFY(!(flags & ~allowed_flags));
-    VERIFY(!(flags & JS_HOST_CLASS_SHARES_ALLOCATOR_WITH_PARENT) || parent);
 
     return JSHostClass {
         .kind = kind,
@@ -375983,11 +376022,6 @@ enum {
 
     // Only for JS_HOST_CLASS_FUNCTION, which must then have a construct hook.
     JS_HOST_CLASS_HAS_CONSTRUCTOR = 1 << 8,
-
-    // For every kind. Each host class otherwise gets a cell allocator of its own, so that objects of different classes
-    // never share heap blocks. A class with this flag allocates its objects from its parent's allocator instead, which
-    // suits many classes with few objects each. The parent must be of the same kind.
-    JS_HOST_CLASS_SHARES_ALLOCATOR_WITH_PARENT = 1 << 9,
 };
 
 // The essential internal methods of kind JS_HOST_CLASS_OBJECT, plus engine queries. A completion's payload is the
@@ -488115,7 +488149,6 @@ pub fn generate() -> LayoutHeader {
         JS_HOST_CLASS_NOT_CACHEABLE_FOR_PROPERTY_ABSENCE,
         JS_HOST_CLASS_NOT_ELIGIBLE_FOR_OWN_PROPERTY_ENUMERATION_FAST_PATH,
         JS_HOST_CLASS_HAS_CONSTRUCTOR,
-        JS_HOST_CLASS_SHARES_ALLOCATOR_WITH_PARENT,
         JS_HOST_CLASS_NOT_CACHEABLE_FOR_INDEXED_PROPERTY_ABSENCE,
         JS_HOST_CLASS_NOT_CACHEABLE_ACROSS_REALMS,
         JS_RESOLVED_BINDING_BINDING_NAME,
@@ -525675,10 +525708,9 @@ use crate::layout::host_class::{
     JS_HOST_CLASS_NOT_CACHEABLE_ACROSS_REALMS, JS_HOST_CLASS_NOT_CACHEABLE_FOR_INDEXED_PROPERTY_ABSENCE,
     JS_HOST_CLASS_NOT_CACHEABLE_FOR_PROPERTY_ABSENCE,
     JS_HOST_CLASS_NOT_ELIGIBLE_FOR_OWN_PROPERTY_ENUMERATION_FAST_PATH, JS_HOST_CLASS_OBJECT,
-    JS_HOST_CLASS_REQUIRES_SLOW_ADD_OWN_PROPERTY, JS_HOST_CLASS_SHARES_ALLOCATOR_WITH_PARENT,
-    JS_PROPERTY_LOOKUP_PHASE_OWN_PROPERTY, JS_PROPERTY_LOOKUP_PHASE_PROTOTYPE_CHAIN, JSCompletion, JSGetCacheMetadata,
-    JSHostArrayHooks, JSHostClass, JSHostFunctionHooks, JSHostModuleHooks, JSHostObjectHooks, JSObject,
-    JSSetCacheMetadata,
+    JS_HOST_CLASS_REQUIRES_SLOW_ADD_OWN_PROPERTY, JS_PROPERTY_LOOKUP_PHASE_OWN_PROPERTY,
+    JS_PROPERTY_LOOKUP_PHASE_PROTOTYPE_CHAIN, JSCompletion, JSGetCacheMetadata, JSHostArrayHooks, JSHostClass,
+    JSHostFunctionHooks, JSHostModuleHooks, JSHostObjectHooks, JSObject, JSSetCacheMetadata,
 };
 use crate::layout::object::Object;
 use crate::runtime::completion::ThrowCompletionOr;
@@ -525804,19 +525836,6 @@ impl JSHostClass {
         false
     }
 
-    /// The class whose allocator the cells of this class come from: the nearest one, starting with this class, that
-    /// does not share its parent's.
-    pub fn allocating_class(&'static self) -> &'static JSHostClass {
-        let mut class = self;
-        while class.has_flag(JS_HOST_CLASS_SHARES_ALLOCATOR_WITH_PARENT) {
-            class = class
-                .parent_class()
-                .filter(|parent| parent.kind == class.kind)
-                .expect("a host class that shares its parent's allocator has a parent of its kind");
-        }
-        class
-    }
-
     /// The hooks of a class of kind JS_HOST_CLASS_OBJECT. A table without a hook struct has only ordinary ones.
     pub fn host_object_hooks(&'static self) -> &'static JSHostObjectHooks {
         debug_assert!(self.kind == JS_HOST_CLASS_OBJECT);
@@ -525839,8 +525858,7 @@ impl JSHostClass {
     }
 
     /// Checks what LibJS/HostObjectABI.h requires of a table of `kind`, which the engine then relies on: its kind,
-    /// flags that apply to the kind, a parent of the same kind to share an allocator with, and the hooks the kind
-    /// cannot do without.
+    /// flags that apply to the kind, and the hooks the kind cannot do without.
     pub fn validate(&'static self, kind: u8) {
         assert!(
             self.kind == kind,
@@ -525856,12 +525874,11 @@ impl JSHostClass {
             kind => panic!("{kind} is not a kind of host class"),
         };
         assert!(
-            self.flags & !(flags_of_the_kind | JS_HOST_CLASS_SHARES_ALLOCATOR_WITH_PARENT) == 0,
+            self.flags & !flags_of_the_kind == 0,
             "the host class {} has flags {:#x} that its kind does not have",
             self.class_name(),
             self.flags
         );
-        self.allocating_class();
         if kind == JS_HOST_CLASS_FUNCTION {
             let hooks = self.host_function_hooks();
             assert!(hooks.call.is_some(), "a host function class has a call hook");
@@ -527123,8 +527140,7 @@ unsafe fn host_module_from_abi<'a>(module: *mut JSModule) -> &'a HostModule {
 /// named `filename`, which module loading resolves its imports against. It copies the `requested_module_count`
 /// module requests of `requested_modules`, its [[RequestedModules]]. `host_defined` is its [[HostDefined]] and
 /// `host_data` the embedder's cell for its own state, each a cell of the VM's heap or null, which the module keeps
-/// alive. Each host class gets a cell allocator of its own unless it has JS_HOST_CLASS_SHARES_ALLOCATOR_WITH_PARENT.
-/// Returns an unrooted module. Main thread only.
+/// alive. Returns an unrooted module. Main thread only.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn js_host_module_create(
     vm: *mut JSVM,
@@ -527873,7 +527889,8 @@ pub struct RegisteredHostClass {
 pub type HostClassRegistry = HashMap<usize, RegisteredHostClass, foldhash::fast::RandomState>;
 
 /// The classes derived for host class tables so far, by the address of their JSHostClass. A class lives as long as the
-/// process, and LibGC keeps the blocks of a type apart by its class, so each table must have one class in all VMs.
+/// process, and a cell may outlive the VM that allocated it in a block that another VM reuses, so each table must have
+/// one class in all VMs.
 static DERIVED_CLASSES: LazyLock<Mutex<HashMap<usize, &'static Class, foldhash::fast::RandomState>>> =
     LazyLock::new(Mutex::default);
 
@@ -527920,9 +527937,9 @@ pub fn runtime_class_of_host_class(vm: &Vm, table: &'static JSHostClass) -> &'st
     class
 }
 
-/// The runtime class of `table`, which must be of `kind`, and the allocator its objects come from: the class's own,
-/// or with JS_HOST_CLASS_SHARES_ALLOCATOR_WITH_PARENT, the one that the classes sharing the allocator of its nearest
-/// ancestor without the flag share.
+/// The runtime class of `table`, which must be of `kind`, and the allocator its cells come from: the one that all
+/// the host classes of the kind share. Their cells have one layout, that of the root class of the kind, and each cell
+/// keeps its class, so no cell can be taken for one with another layout.
 pub fn runtime_class_and_allocator_of_host_class(
     vm: &Vm,
     table: &'static JSHostClass,
@@ -527944,13 +527961,9 @@ pub fn runtime_class_and_allocator_of_host_class(
     }
 
     let class = runtime_class_of_host_class(vm, table);
-    let allocating_class = table.allocating_class();
-    let allocator = if core::ptr::eq(allocating_class, table) {
-        vm.heap().runtime_class_allocator(class)
-    } else {
-        vm.heap()
-            .shared_runtime_class_allocator(runtime_class_of_host_class(vm, allocating_class), class)
-    };
+    let allocator = vm
+        .heap()
+        .shared_runtime_class_allocator(root_class_of_kind(kind), class);
     vm.host_classes()
         .borrow_mut()
         .get_mut(&table.identity())
@@ -533054,6 +533067,9 @@ pub struct Class {
     /// Whether LibGC may only trace the cells of this class on the thread that owns their heap, see
     /// traced_on_owner_thread_only().
     owner_thread_only: bool,
+    /// Whether the cells of this class come from the allocator that the classes like it share, see
+    /// shares_allocator().
+    shares_allocator: bool,
     /// The trace of the cells of this class, which type_info.visit_edges calls with the visitor LibGC passes, for
     /// tracing them with a visitor that is not one of LibGC's (see record_cell_slots()).
     pub trace: unsafe fn(cell: *const c_void, visitor: &mut Visitor<'_>),
@@ -533092,6 +533108,18 @@ impl Class {
             matches!(kind, CellKind::Object) == object_methods.is_some(),
             "exactly the object classes have internal methods"
         );
+        // NB: A class that adds no state to the one it extends has cells of the same layout, which nothing can take
+        //     for cells of another layout, so it needs no blocks of its own.
+        let shares_allocator = match parent {
+            Some(parent) => {
+                size_of::<T>() == parent.type_info.cell_size as usize
+                    && align_of::<T>() <= size_of::<&'static Class>()
+                    && kind as u8 == parent.type_info.kind
+                    && core::mem::needs_drop::<T>() == parent.type_info.destroy.is_some()
+                    && !Self::is_movable_id(id)
+            }
+            None => false,
+        };
         Self {
             type_info: CellTypeInfo {
                 cell_size: size_of::<T>() as u32,
@@ -533113,8 +533141,36 @@ impl Class {
             object_methods,
             kind,
             owner_thread_only: false,
+            shares_allocator,
             trace: trace::<T>,
         }
+    }
+
+    /// Whether the cells of this class come from an allocator that it shares with other classes, instead of one of
+    /// its own: that of the nearest class it extends that has one of its own, see allocating_class(). A class shares
+    /// when its cells have the layout of the class it extends and LibGC handles them the same way, so it adds no
+    /// state, traces, finalizes and drops as that class does, and is not movable. Each cell of a shared allocator
+    /// keeps its class in the word after it (see `class_at`). The classes of built-in prototypes and constructors are
+    /// like this: there is one cell of each for a realm, and each would keep a block of its own otherwise.
+    pub const fn shares_allocator(&self) -> bool {
+        self.shares_allocator
+    }
+
+    /// Has the class keep an allocator of its own, as a class must whose cells LibGC handles differently from those
+    /// of the class it extends.
+    pub const fn with_allocator_of_its_own(mut self) -> Self {
+        self.shares_allocator = false;
+        self
+    }
+
+    /// The class whose cells have the layout of the cells of this one, and whose type info LibGC handles them
+    /// through: the nearest one, starting with this class, that does not share an allocator.
+    pub fn allocating_class(&'static self) -> &'static Class {
+        let mut class = self;
+        while class.shares_allocator {
+            class = class.parent.expect("a class that shares an allocator extends another");
+        }
+        class
     }
 
     pub fn kind(&self) -> CellKind {
@@ -533141,8 +533197,12 @@ impl Class {
         if self.is_derived_at_run_time() {
             return false;
         }
+        Self::is_movable_id(self.id)
+    }
+
+    const fn is_movable_id(id: ClassId) -> bool {
         matches!(
-            self.id,
+            id,
             ClassId::ValueStorage
                 | ClassId::Object
                 | ClassId::Array
@@ -533275,7 +533335,7 @@ impl Class {
     /// Creates a class that extends `parent` while the runtime runs, as an embedder needs one for each class of host
     /// object it defines. Its cells have the parent's layout, so it shares the parent's type info and id, and code that
     /// tells classes apart by id sees the parent. It has a name and internal methods of its own, and its cells come from
-    /// an allocator of their own once allocated with Heap::allocate_in(). The class lives as long as the process.
+    /// the allocator that Heap::allocate_in() is given for it. The class lives as long as the process.
     pub fn derive_runtime(
         parent: &'static Class,
         name: &'static str,
@@ -533311,6 +533371,8 @@ impl Class {
             object_methods,
             kind: parent.kind,
             owner_thread_only: parent.owner_thread_only,
+            // NB: Heap::allocate_in() chooses the allocator of a class derived at run time.
+            shares_allocator: false,
             trace: parent.trace,
         }));
         #[cfg(feature = "address-sanitizer")]
@@ -533386,7 +533448,9 @@ unsafe impl Extends<CellHeader> for CellHeader {}
 /// A cell's block starts at the cell's address rounded down to a multiple of BLOCK_SIZE, and holds the class of its
 /// cells at BLOCK_CLASS_OFFSET: the foreign type of the allocator that created the block (see Heap::create_allocator).
 /// The block of an allocator that classes share holds the class they extend with BLOCK_CLASS_TAIL_TAG added, and each of
-/// its cells keeps its own class in the word after the cell_size bytes of that class.
+/// its cells keeps its own class in the word after the cell_size bytes of that class. Classes derived at run time share
+/// one if their embedder asks for it, and the classes define_cell! defines if they add no state to the one they extend
+/// (see Class::shares_allocator()).
 pub const BLOCK_SIZE: usize = 16 * 1024;
 pub const BLOCK_CLASS_OFFSET: usize = 2 * size_of::<usize>();
 pub use crate::layout::cell::BLOCK_CLASS_TAIL_TAG;
@@ -533515,7 +533579,7 @@ impl CellHeaderTail {
 }
 
 impl CellHeader {
-    /// The header of a cell of `class`, which must also be the class of the allocator the cell comes from.
+    /// The header of a cell of `class`, which must also be the class the cell is allocated as.
     pub fn for_class(class: &'static Class) -> Self {
         Self {
             unused: [0; 8],
@@ -533537,6 +533601,10 @@ impl CellHeader {
 /// Finalize implementation, and `external_memory_size` into reporting its ExternalMemorySize. A class that names none
 /// of them inherits them from the class it extends, as C++ subclasses inherit virtual methods, so the Finalize
 /// implementation of a subclass has to finalize its base as well.
+///
+/// A cell type that adds no field to the one it extends, and names none of these or `traced_on`, shares an allocator
+/// with the other such types (see Class::shares_allocator()). LibGC then traces and drops its cells as the type it
+/// extends, so it must derive Trace and must not implement Drop.
 macro_rules! define_cell {
     ($type:ident, $kind:ident $(, extends: [$parent:ident $(, $ancestor:ident)*])? $(, methods: $methods:path)? $(, finalize: $finalize:ident)? $(, external_memory_size: $external_memory_size:ident)? $(, traced_on: $traced_on:ident)?) => {
         const _: () = {
@@ -533551,7 +533619,7 @@ macro_rules! define_cell {
                 )
                 .with_external_memory_size(define_cell!(@external_memory_size $type [$($parent)?] [$($external_memory_size)?]));
                 $(let class = define_cell!(@traced_on $traced_on class);)?
-                class
+                define_cell!(@allocator class [$($finalize)?] [$($external_memory_size)?] [$($traced_on)?])
             };
 
             // SAFETY: Checked by the asserts in Class::new and the cell's #[repr(C)] layout.
@@ -533567,6 +533635,10 @@ macro_rules! define_cell {
         };
     };
     (@traced_on owner_thread_only $class:ident) => { $class.traced_on_owner_thread_only() };
+    (@allocator $class:ident [] [] []) => { $class };
+    (@allocator $class:ident [$($finalize:ident)?] [$($external_memory_size:ident)?] [$($traced_on:ident)?]) => {
+        $class.with_allocator_of_its_own()
+    };
     (@parent) => { None };
     (@parent $parent:ident) => { Some(<$parent as $crate::gc::class::GcCell>::CLASS) };
     (@methods [] []) => { None };
@@ -534223,8 +534295,9 @@ impl HeapAllocator {
     }
 }
 
-/// The allocator of a class derived at run time, which only the cells of that class come from, as each C++ class that
-/// declares GC_DECLARE_ALLOCATOR has one of its own. It belongs to the heap that created it and lives as long as it.
+/// The allocator that the cells of a class derived at run time come from: one that the class shares with the other
+/// classes of its layout, or for the class of an embedder's cells, one of its own, as each C++ class that declares
+/// GC_DECLARE_ALLOCATOR has. It belongs to the heap that created it and lives as long as it.
 #[derive(Clone, Copy)]
 pub struct RuntimeClassAllocator {
     class: &'static Class,
@@ -534344,6 +534417,11 @@ impl Heap {
 
     /// Where the head of the local free list of the allocator of `class` is, for code that allocates its cells itself.
     pub fn local_free_list_of(&self, class: &'static Class) -> Option<NonNull<*mut c_void>> {
+        assert!(
+            !class.shares_allocator(),
+            "a {} keeps its class after it, which only Heap::allocate() writes",
+            class.name
+        );
         self.allocator_for(class).local_free_list()
     }
 
@@ -534382,6 +534460,23 @@ impl Heap {
     pub fn allocate<T: GcCell>(&self, build: impl FnOnce(&DeferGc<'_>) -> T) -> Gc<T> {
         const { assert!(size_of::<T>() >= MIN_CELL_SIZE) };
         let allocator = self.allocator_for(T::CLASS);
+        if T::CLASS.shares_allocator() {
+            let initialize_tail = |tail: *mut u8| {
+                // SAFETY: A cell of a shared allocator has room for its class right after the T, 8-byte aligned.
+                unsafe { tail.cast::<&'static Class>().write(T::CLASS) };
+            };
+            // SAFETY: The allocator is the one that the cell's static class shares, whose cells have the size of a T
+            //         and a word, and the alignment of the class with the same layout that T extends.
+            return unsafe {
+                self.allocate_with(
+                    allocator,
+                    size_of::<T>() + size_of::<&'static Class>(),
+                    AllocationKind::Cell,
+                    build,
+                    initialize_tail,
+                )
+            };
+        }
         // SAFETY: The allocator is the one of the cell's static class, whose cells have the size and alignment of a T.
         unsafe { self.allocate_with(allocator, size_of::<T>(), AllocationKind::Cell, build, |_| {}) }
     }
@@ -534664,7 +534759,7 @@ impl Heap {
             // SAFETY: The allocator is live and has not allocated yet.
             unsafe { capi::gc_allocator_set_traced_on_owner_thread_only(raw.as_ptr()) };
         }
-        // NB: The classes derived at run time that share an allocator are never movable.
+        // NB: The classes that share an allocator are never movable, even if the class they extend is.
         if class.is_movable() && !class_in_tail {
             // SAFETY: The allocator is live and has not allocated yet.
             unsafe { capi::gc_allocator_set_movable(raw.as_ptr()) };
@@ -534672,20 +534767,6 @@ impl Heap {
         // SAFETY: The heap and the allocator are live.
         let local_free_list = unsafe { capi::gc_heap_allocator_local_free_list(self.raw.as_ptr(), raw.as_ptr()) };
         HeapAllocator { raw, local_free_list }
-    }
-
-    /// The allocator of `class`, a class derived at run time, which the first call for the class creates.
-    pub fn runtime_class_allocator(&self, class: &'static Class) -> RuntimeClassAllocator {
-        assert!(
-            class.is_derived_at_run_time(),
-            "the cells of {} come from the allocator of its id",
-            class.name
-        );
-        RuntimeClassAllocator {
-            class,
-            allocator: self.allocator_kept_by_class_address(class),
-            class_in_tail: false,
-        }
     }
 
     /// The allocator of `class`, a class derived at run time that shares the allocator of `allocating_class`, a class it
@@ -534710,8 +534791,17 @@ impl Heap {
             class.name,
             allocating_class.name
         );
-        let allocator = self
-            .shared_class_allocators
+        RuntimeClassAllocator {
+            class,
+            allocator: self.shared_allocator_of(allocating_class),
+            class_in_tail: true,
+        }
+    }
+
+    /// The allocator that the classes with the layout of `allocating_class` share, which the first call for the class
+    /// creates. Its cells have a word more than those of the class, for the class of each cell.
+    fn shared_allocator_of(&self, allocating_class: &'static Class) -> HeapAllocator {
+        self.shared_class_allocators
             .borrow_mut()
             .entry(core::ptr::from_ref(allocating_class) as usize)
             .or_insert_with(|| {
@@ -534726,12 +534816,7 @@ impl Heap {
                     _type_info: type_info,
                 }
             })
-            .allocator;
-        RuntimeClassAllocator {
-            class,
-            allocator,
-            class_in_tail: true,
-        }
+            .allocator
     }
 
     /// The allocator of `class`, the class of an embedder's cells, which the first call for the class creates. Such
@@ -534782,6 +534867,11 @@ impl Heap {
             class.name
         );
         assert!(
+            !class.shares_allocator(),
+            "{} shares an allocator, whose cells all have one size",
+            class.name
+        );
+        assert!(
             class.id != ClassId::EmbedderCell,
             "the class of an embedder's cells, {}, shares its id",
             class.name
@@ -534826,8 +534916,12 @@ impl Heap {
             "the cells of an embedder class, {}, come from the allocator kept by its address",
             class.name
         );
-        // SAFETY: The class and its name are static, so they outlive the allocator.
-        let allocator = unsafe { self.create_allocator(&raw const class.type_info, class, false) };
+        let allocator = if class.shares_allocator() {
+            self.shared_allocator_of(class.allocating_class())
+        } else {
+            // SAFETY: The class and its name are static, so they outlive the allocator.
+            unsafe { self.create_allocator(&raw const class.type_info, class, false) }
+        };
         slot.set(Some(allocator));
         allocator
     }
@@ -534946,8 +535040,12 @@ impl Drop for Heap {
         // SAFETY: This owns the heap. The allocators outlive it, as LibGC requires.
         unsafe {
             capi::gc_heap_destroy(self.raw.as_ptr());
+            // NB: The classes that share an allocator each keep it by their id, and it is destroyed once, below.
+            let shared = self.shared_class_allocators.get_mut();
             for allocator in self.allocators.iter().filter_map(Cell::get) {
-                capi::gc_allocator_destroy(allocator.raw.as_ptr());
+                if !shared.values().any(|shared| shared.allocator.raw == allocator.raw) {
+                    capi::gc_allocator_destroy(allocator.raw.as_ptr());
+                }
             }
             for allocator in self.runtime_class_allocators.get_mut().values() {
                 capi::gc_allocator_destroy(allocator.raw.as_ptr());
@@ -564290,7 +564388,6 @@ pub const JS_HOST_CLASS_IMMUTABLE_PROTOTYPE: u32 = 1 << 5;
 pub const JS_HOST_CLASS_NOT_CACHEABLE_FOR_PROPERTY_ABSENCE: u32 = 1 << 6;
 pub const JS_HOST_CLASS_NOT_ELIGIBLE_FOR_OWN_PROPERTY_ENUMERATION_FAST_PATH: u32 = 1 << 7;
 pub const JS_HOST_CLASS_HAS_CONSTRUCTOR: u32 = 1 << 8;
-pub const JS_HOST_CLASS_SHARES_ALLOCATOR_WITH_PARENT: u32 = 1 << 9;
 pub const JS_HOST_CLASS_NOT_CACHEABLE_FOR_INDEXED_PROPERTY_ABSENCE: u32 = 1 << 10;
 pub const JS_HOST_CLASS_NOT_CACHEABLE_ACROSS_REALMS: u32 = 1 << 11;
 
@@ -670889,142 +670986,3 @@ pub fn bubble_relative_duration(
                 // 1. Let months be duration.[[Date]].[[Months]] + sign.
                 let months = duration.date.months + f64::from(sign);
 
-                // 2. Let endDuration be ? AdjustDateDurationRecord(duration.[[Date]], 0, 0, months).
-                adjust_date_duration_record(vm, &duration.date, 0.0, Some(0.0), Some(months))?
-            }
-            // iii. Else,
-            else {
-                // 1. Assert: unit is WEEK.
-                assert!(unit == Unit::Week);
-
-                // 2. Let weeks be duration.[[Date]].[[Weeks]] + sign.
-                let weeks = duration.date.weeks + f64::from(sign);
-
-                // 3. Let endDuration be ? AdjustDateDurationRecord(duration.[[Date]], 0, weeks).
-                adjust_date_duration_record(vm, &duration.date, 0.0, Some(weeks), None)?
-            };
-
-            // iv. Let end be ? CalendarDateAdd(calendar, isoDateTime.[[ISODate]], endDuration, CONSTRAIN).
-            let end = calendar_date_add(vm, calendar, iso_date_time.iso_date, &end_duration, Overflow::Constrain)?;
-
-            // v. Let endDateTime be CombineISODateAndTimeRecord(end, isoDateTime.[[Time]]).
-            let end_date_time = combine_iso_date_and_time_record(end, iso_date_time.time);
-
-            // vi. If timeZone is UNSET, then
-            //     1. Let endEpochNs be GetUTCEpochNanoseconds(endDateTime).
-            // vii. Else,
-            //     1. Let endEpochNs be ? GetEpochNanosecondsFor(timeZone, endDateTime, COMPATIBLE).
-            let end_epoch_ns = epoch_nanoseconds_of(vm, &end_date_time, time_zone)?;
-
-            // viii. Let beyondEnd be nudgedEpochNs - endEpochNs.
-            let beyond_end = nudged_epoch_ns - &end_epoch_ns;
-
-            // ix. If beyondEnd < 0, let beyondEndSign be -1; else if beyondEnd > 0, let beyondEndSign be 1; else let beyondEndSign be 0.
-            let beyond_end_sign = time_duration_sign(&beyond_end);
-
-            // x. If beyondEndSign ≠ -sign, then
-            if beyond_end_sign != -sign {
-                // 1. Set duration to CombineDateAndTimeDuration(endDuration, 0).
-                duration = combine_date_and_time_duration(end_duration, TimeDuration::zero());
-            }
-            // xi. Else,
-            else {
-                // 1. Set done to true.
-                done = true;
-            }
-        }
-
-        // c. Set unitIndex to unitIndex - 1.
-        unit_index -= 1;
-    }
-
-    // 7. Return duration.
-    Ok(duration)
-}
-
-// 7.5.38 RoundRelativeDuration ( duration, originEpochNs, destEpochNs, isoDateTime, timeZone, calendar, largestUnit, increment, smallestUnit, roundingMode ), https://tc39.es/proposal-temporal/#sec-temporal-roundrelativeduration
-#[allow(clippy::too_many_arguments)]
-pub fn round_relative_duration(
-    vm: &Vm,
-    duration: InternalDuration,
-    origin_epoch_ns: &SignedBigInteger,
-    dest_epoch_ns: &SignedBigInteger,
-    iso_date_time: &ISODateTime,
-    time_zone: Option<Utf16View<'_>>,
-    calendar: Utf16View<'_>,
-    largest_unit: Unit,
-    increment: u64,
-    smallest_unit: Unit,
-    rounding_mode: RoundingMode,
-) -> ThrowCompletionOr<InternalDuration> {
-    // 1. Let irregularLengthUnit be false.
-    // 2. If IsCalendarUnit(smallestUnit) is true, set irregularLengthUnit to true.
-    // 3. If timeZone is not UNSET and smallestUnit is DAY, set irregularLengthUnit to true.
-    let irregular_length_unit = is_calendar_unit(smallest_unit) || (time_zone.is_some() && smallest_unit == Unit::Day);
-
-    // 4. If InternalDurationSign(duration) < 0, let sign be -1; else let sign be 1.
-    let sign: i8 = if internal_duration_sign(&duration) < 0 { -1 } else { 1 };
-
-    // 5. If irregularLengthUnit is true, then
-    let nudge_result = if irregular_length_unit {
-        // a. Let record be ? NudgeToCalendarUnit(sign, duration, originEpochNs, destEpochNs, isoDateTime, timeZone, calendar, increment, smallestUnit, roundingMode).
-        let record = nudge_to_calendar_unit(
-            vm,
-            sign,
-            &duration,
-            origin_epoch_ns,
-            dest_epoch_ns,
-            iso_date_time,
-            time_zone,
-            calendar,
-            increment,
-            smallest_unit,
-            rounding_mode,
-        )?;
-
-        // b. Let nudgeResult be record.[[NudgeResult]].
-        record.nudge_result
-    }
-    // 6. Else if timeZone is not UNSET, then
-    else if let Some(time_zone) = time_zone {
-        // a. Let nudgeResult be ? NudgeToZonedTime(sign, duration, isoDateTime, timeZone, calendar, increment, smallestUnit, roundingMode).
-        nudge_to_zoned_time(
-            vm,
-            sign,
-            &duration,
-            iso_date_time,
-            time_zone,
-            calendar,
-            increment,
-            smallest_unit,
-            rounding_mode,
-        )?
-    }
-    // 7. Else,
-    else {
-        // a. Let nudgeResult be ? NudgeToDayOrTime(duration, destEpochNs, largestUnit, increment, smallestUnit, roundingMode).
-        nudge_to_day_or_time(
-            vm,
-            &duration,
-            dest_epoch_ns,
-            largest_unit,
-            increment,
-            smallest_unit,
-            rounding_mode,
-        )?
-    };
-
-    // 8. Set duration to nudgeResult.[[Duration]].
-    let mut duration = nudge_result.duration;
-
-    // 9. If nudgeResult.[[DidExpandCalendarUnit]] is true and smallestUnit is not WEEK, then
-    if nudge_result.did_expand_calendar_unit && smallest_unit != Unit::Week {
-        // a. Let startUnit be LargerOfTwoTemporalUnits(smallestUnit, DAY).
-        let start_unit = larger_of_two_temporal_units(smallest_unit, Unit::Day);
-
-        // b. Set duration to ? BubbleRelativeDuration(sign, duration, nudgeResult.[[NudgedEpochNs]], isoDateTime, timeZone, calendar, largestUnit, startUnit).
-        duration = bubble_relative_duration(
-            vm,
-            sign,
-            duration,
-            &nudge_result.nudged_epoch_ns,
